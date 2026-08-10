@@ -1,0 +1,182 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">备份记录</div>
+    <div class="page-sub">查看、筛选与下载历史备份文件 · 支持 PITR / 对象级 / 副本克隆</div>
+  </div>
+  <div>
+    <button class="btn btn-outline-secondary btn-sm" onclick="refreshRecords()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+    <div class="btn-group btn-group-sm" role="group">
+      <button class="btn btn-outline-primary" onclick="exportRecords('csv')" title="CSV 导出"><i class="bi bi-filetype-csv"></i> CSV</button>
+      <button class="btn btn-outline-primary" onclick="exportRecords('docx')" title="Word 报告"><i class="bi bi-file-earmark-word"></i> Word</button>
+      <button class="btn btn-outline-primary" onclick="exportRecords('pdf')" title="PDF 报告"><i class="bi bi-file-earmark-pdf"></i> PDF</button>
+    </div>
+    <input type="text" class="form-control d-inline-block w-auto" id="recordSearch" placeholder="搜索业务系统 / IP…">
+    <select class="form-select d-inline-block w-auto" id="filterTask">
+      <option value="">全部任务</option>
+    </select>
+  </div>
+</div>
+<div class="page-card">
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>业务系统</th><th>备份 IP</th><th>备份类型</th><th>备份时间</th><th>耗时</th>
+        <th>状态</th><th>大小</th><th>校验</th><th>CDC 基线</th>
+        <th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="recordTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 备份日志查看 模态框（失败记录可点，详情展示 message/路径/校验） -->
+<div class="modal fade" id="recordLogModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-file-text"></i> 备份任务日志 <small class="text-muted ms-2" id="rl_record_id"></small></h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="row g-3 mb-3">
+          <div class="col-md-3"><div class="border rounded p-2 bg-light"><div class="text-muted small">任务</div><div id="rl_task" class="fw-bold"></div></div></div>
+          <div class="col-md-2"><div class="border rounded p-2 bg-light"><div class="text-muted small">类型</div><div id="rl_backup_type" class="fw-bold"></div></div></div>
+          <div class="col-md-2"><div class="border rounded p-2 bg-light"><div class="text-muted small">数据库</div><div id="rl_db_type" class="fw-bold"></div></div></div>
+          <div class="col-md-2"><div class="border rounded p-2 bg-light"><div class="text-muted small">状态</div><div id="rl_status" class="fw-bold"></div></div></div>
+          <div class="col-md-3"><div class="border rounded p-2 bg-light"><div class="text-muted small">大小</div><div id="rl_size" class="fw-bold"></div></div></div>
+        </div>
+        <div class="row g-3 mb-3">
+          <div class="col-md-6"><div class="border rounded p-2 bg-light"><div class="text-muted small">开始时间</div><div id="rl_started_at" class="font-monospace small"></div></div></div>
+          <div class="col-md-6"><div class="border rounded p-2 bg-light"><div class="text-muted small">完成时间</div><div id="rl_finished_at" class="font-monospace small"></div></div></div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label fw-bold"><i class="bi bi-exclamation-triangle text-danger"></i> 错误信息 / 结果说明</label>
+          <pre class="form-control bg-light font-monospace small" id="rl_message" style="min-height:140px; max-height:400px; overflow:auto; white-space:pre-wrap; word-break:break-all;"></pre>
+          <button class="btn btn-sm btn-outline-secondary mt-1" onclick="navigator.clipboard.writeText(document.getElementById('rl_message').textContent).then(()=>toast('已复制到剪贴板','success'))"><i class="bi bi-clipboard"></i> 复制日志</button>
+        </div>
+        <div class="row g-3">
+          <div class="col-md-12"><div class="border rounded p-2 bg-light"><div class="text-muted small">备份文件路径</div><div id="rl_backup_path" class="font-monospace small"></div></div></div>
+        </div>
+        <div class="row g-3 mt-1">
+          <div class="col-md-6"><div class="border rounded p-2 bg-light"><div class="text-muted small">SHA256 校验和</div><div id="rl_checksum" class="font-monospace small text-truncate"></div></div></div>
+          <div class="col-md-3"><div class="border rounded p-2 bg-light"><div class="text-muted small">CDC 基线</div><div id="rl_cdc" class="font-monospace small"></div></div></div>
+          <div class="col-md-3"><div class="border rounded p-2 bg-light"><div class="text-muted small">耗时</div><div id="rl_duration" class="font-monospace small"></div></div></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- PITR 任意时间点恢复 模态框 -->
+<div class="modal fade" id="pitrModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-clock-history"></i> 任意时间点恢复 (PITR)</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="pitr_record_id">
+        <div class="mb-3">
+          <label class="form-label">目标恢复时间 *</label>
+          <input type="datetime-local" class="form-control" id="pitr_target_time">
+          <div class="form-text">格式：YYYY-MM-DDTHH:MM:SS，将恢复到该时刻之前的数据状态</div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">目标主机 *</label>
+          <div class="input-group">
+            <select class="form-select" id="pitr_target_host">
+              <option value="">— 选择已纳管 SSH 主机 —</option>
+            </select>
+            <button class="btn btn-outline-primary" type="button" id="pitrAddHostBtn" title="管理 SSH 主机">+</button>
+          </div>
+          <div class="form-text">或直接输入（无纳管主机时）：</div>
+          <div class="row g-2 mt-1">
+            <div class="col-md-4">
+              <input class="form-control form-control-sm" id="pitr_direct_host" placeholder="IP / 主机名">
+            </div>
+            <div class="col-md-2">
+              <input class="form-control form-control-sm" id="pitr_direct_port" type="number" placeholder="端口" value="22">
+            </div>
+            <div class="col-md-3">
+              <input class="form-control form-control-sm" id="pitr_direct_user" placeholder="SSH 用户" value="root">
+            </div>
+            <div class="col-md-3">
+              <input class="form-control form-control-sm" id="pitr_direct_password" type="password" placeholder="SSH 密码">
+            </div>
+          </div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">目标库（可选）</label>
+          <input class="form-control" id="pitr_target_db" placeholder="默认沿用备份库名">
+        </div>
+        <div class="alert alert-info py-2 mb-0">
+          <small>PITR 流程：<strong>全量恢复</strong> + 调用 <code>mysqlbinlog</code> replay 到目标时间</small>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="pitrSubmitBtn">开始恢复</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 对象级精准恢复 模态框 -->
+<div class="modal fade" id="objectModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-bullseye"></i> 对象级精准恢复</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="object_record_id">
+        <div class="mb-3">
+          <label class="form-label">对象名 *</label>
+          <input class="form-control" id="object_name" placeholder="MySQL: 表名; PG: public.users 或 schema">
+          <div class="form-text">仅恢复指定表/schema，其余数据不动</div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">目标主机 *</label>
+          <div class="input-group">
+            <select class="form-select" id="object_target_host">
+              <option value="">— 选择已纳管 SSH 主机 —</option>
+            </select>
+            <button class="btn btn-outline-primary" type="button" id="objectAddHostBtn" title="管理 SSH 主机">+</button>
+          </div>
+          <div class="form-text">或直接输入（无纳管主机时）：</div>
+          <div class="row g-2 mt-1">
+            <div class="col-md-4">
+              <input class="form-control form-control-sm" id="object_direct_host" placeholder="IP / 主机名">
+            </div>
+            <div class="col-md-2">
+              <input class="form-control form-control-sm" id="object_direct_port" type="number" placeholder="端口" value="22">
+            </div>
+            <div class="col-md-3">
+              <input class="form-control form-control-sm" id="object_direct_user" placeholder="SSH 用户" value="root">
+            </div>
+            <div class="col-md-3">
+              <input class="form-control form-control-sm" id="object_direct_password" type="password" placeholder="SSH 密码">
+            </div>
+          </div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">目标库（可选）</label>
+          <input class="form-control" id="object_target_db" placeholder="默认沿用备份库名">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="objectSubmitBtn">开始恢复</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}

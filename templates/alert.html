@@ -1,0 +1,302 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+  /* 告警页专属样式 —— 颜色一律引用 app.css Design Tokens，禁止硬编码 */
+  .pred-toggle {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; padding: 0; border: 1px solid var(--border-base);
+    border-radius: var(--radius-sm); background: var(--card-bg);
+    color: var(--text-secondary); cursor: pointer; line-height: 1;
+    font-size: var(--font-size-xs); transition: background .12s ease, color .12s ease;
+  }
+  .pred-toggle:hover { background: var(--primary-bg); color: var(--primary-hover); border-color: var(--primary-light); }
+  .pred-toggle.open { background: var(--primary-bg); color: var(--primary-hover); border-color: var(--primary-light); }
+  .pred-toggle i { transition: transform .15s ease; }
+  .pred-toggle.open i { transform: rotate(90deg); }
+
+  .pred-detail-cell { background: var(--page-bg); padding: var(--space-md) !important; }
+  .pred-subtable { margin-bottom: 0; font-size: var(--font-size-xs); background: var(--card-bg); }
+  .pred-subtable thead th {
+    font-size: var(--font-size-xs); font-weight: var(--weight-semibold);
+    color: var(--text-secondary); white-space: nowrap;
+    border-bottom: 1px solid var(--border-strong);
+  }
+  .pred-subtable td { vertical-align: middle; }
+  .pred-subtable .err-text {
+    display: inline-block; max-width: 260px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom;
+    font-family: var(--font-family-code, monospace); color: var(--text-secondary);
+  }
+  .pred-detail-title {
+    font-size: var(--font-size-xs); color: var(--text-secondary);
+    margin-bottom: var(--space-sm); font-weight: var(--weight-medium);
+  }
+  .pred-evidence { font-size: var(--font-size-xs); color: var(--text-muted); margin-top: var(--space-sm); }
+
+  /* 数据验证卡片区 */
+  .verify-stat {
+    border: 1px solid var(--border-base); border-radius: var(--radius-lg);
+    padding: var(--space-md); background: var(--card-bg); height: 100%;
+  }
+  .verify-stat .vs-label { font-size: var(--font-size-xs); color: var(--text-muted); }
+  .verify-stat .vs-value {
+    font-size: var(--font-size-xxl); font-weight: var(--weight-semibold);
+    color: var(--text-primary); line-height: 1.25;
+  }
+  .verify-stat .vs-sub { font-size: var(--font-size-xs); color: var(--text-secondary); }
+  .verify-layer {
+    display: inline-flex; align-items: center; gap: var(--space-xs);
+    border: 1px solid var(--border-base); border-radius: var(--radius-md);
+    padding: var(--space-xs) var(--space-sm); font-size: var(--font-size-xs);
+    color: var(--text-secondary); background: var(--card-bg);
+  }
+  .verify-layer strong { color: var(--text-primary); font-weight: var(--weight-medium); }
+  .verify-layer.off { color: var(--text-muted); background: var(--page-bg); }
+</style>
+
+<div class="page-header">
+  <h4 class="page-title"><i class="bi bi-bell"></i> AI 预测告警</h4>
+  <p class="text-muted mb-0">规则 + 轻量统计引擎：预测备份失败 / 数据验证 / 存储不足 / 链路劣化 / 演练超期 / RPO 突破</p>
+</div>
+
+<!-- 预测说明 -->
+<div class="page-card mb-3">
+  <div class="d-flex align-items-start gap-2">
+    <i class="bi bi-info-circle text-info fs-5"></i>
+    <div>
+      <strong>预测说明：</strong>本引擎基于<strong>规则 + 轻量统计</strong>（基于备份记录失败率、存储用量、链路健康、演练合规）预测未来风险，
+      <strong>不是机器学习推断</strong>。预测依据详见每条记录的「依据」列。风险评分 0–100，≥40 为 medium，≥65 为 high，≥85 为 critical。
+    </div>
+  </div>
+</div>
+
+<!-- 操作栏 -->
+<div class="page-card mb-3">
+  <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <div class="d-flex gap-2">
+      <button class="btn btn-primary btn-sm" onclick="runAnalysis()">
+        <i class="bi bi-lightning-charge me-1"></i>立即分析
+      </button>
+      <button class="btn btn-outline-secondary btn-sm" onclick="loadAlerts()">
+        <i class="bi bi-arrow-clockwise me-1"></i>刷新
+      </button>
+    </div>
+    <div class="text-muted small" id="alertSummary">—</div>
+  </div>
+</div>
+
+<!-- 各 metric 风险卡片 -->
+<div class="row g-3 mb-3" id="metricCards">
+  <div class="col-md-6 col-xl-4">
+    <div class="page-card metric-card" data-metric="backup_fail">
+      <div class="metric-card-head">
+        <i class="bi bi-x-octagon"></i><span>备份失败</span>
+        <span class="badge level-badge ms-auto" id="bl_backup_fail">—</span>
+      </div>
+      <div class="progress mt-2" style="height:8px;">
+        <div class="progress-bar" id="pb_backup_fail" style="width:0%"></div>
+      </div>
+      <div class="metric-score" id="sc_backup_fail">风险评分 —</div>
+    </div>
+  </div>
+  <div class="col-md-6 col-xl-4">
+    <div class="page-card metric-card" data-metric="verify_fail">
+      <div class="metric-card-head">
+        <i class="bi bi-patch-check"></i><span>数据验证</span>
+        <span class="badge level-badge ms-auto" id="bl_verify_fail">—</span>
+      </div>
+      <div class="progress mt-2" style="height:8px;">
+        <div class="progress-bar" id="pb_verify_fail" style="width:0%"></div>
+      </div>
+      <div class="metric-score" id="sc_verify_fail">风险评分 —</div>
+    </div>
+  </div>
+  <div class="col-md-6 col-xl-4">
+    <div class="page-card metric-card" data-metric="storage_full">
+      <div class="metric-card-head">
+        <i class="bi bi-hdd-stack"></i><span>存储将满</span>
+        <span class="badge level-badge ms-auto" id="bl_storage_full">—</span>
+      </div>
+      <div class="progress mt-2" style="height:8px;">
+        <div class="progress-bar" id="pb_storage_full" style="width:0%"></div>
+      </div>
+      <div class="metric-score" id="sc_storage_full">风险评分 —</div>
+    </div>
+  </div>
+  <div class="col-md-6 col-xl-4">
+    <div class="page-card metric-card" data-metric="link_degraded">
+      <div class="metric-card-head">
+        <i class="bi bi-diagram-3"></i><span>链路劣化</span>
+        <span class="badge level-badge ms-auto" id="bl_link_degraded">—</span>
+      </div>
+      <div class="progress mt-2" style="height:8px;">
+        <div class="progress-bar" id="pb_link_degraded" style="width:0%"></div>
+      </div>
+      <div class="metric-score" id="sc_link_degraded">风险评分 —</div>
+    </div>
+  </div>
+  <div class="col-md-6 col-xl-4">
+    <div class="page-card metric-card" data-metric="drill_overdue">
+      <div class="metric-card-head">
+        <i class="bi bi-calendar-x"></i><span>演练超期</span>
+        <span class="badge level-badge ms-auto" id="bl_drill_overdue">—</span>
+      </div>
+      <div class="progress mt-2" style="height:8px;">
+        <div class="progress-bar" id="pb_drill_overdue" style="width:0%"></div>
+      </div>
+      <div class="metric-score" id="sc_drill_overdue">风险评分 —</div>
+    </div>
+  </div>
+  <div class="col-md-6 col-xl-4">
+    <div class="page-card metric-card" data-metric="rpo_breach">
+      <div class="metric-card-head">
+        <i class="bi bi-hourglass-split"></i><span>RPO 突破</span>
+        <span class="badge level-badge ms-auto" id="bl_rpo_breach">—</span>
+      </div>
+      <div class="progress mt-2" style="height:8px;">
+        <div class="progress-bar" id="pb_rpo_breach" style="width:0%"></div>
+      </div>
+      <div class="metric-score" id="sc_rpo_breach">风险评分 —</div>
+    </div>
+  </div>
+</div>
+
+<!-- 数据验证卡片区（metric = verify_fail） -->
+<div class="page-card mb-3">
+  <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+    <h6 class="mb-0"><i class="bi bi-patch-check me-1"></i>备份数据验证</h6>
+    <span class="text-muted small" id="verifyUpdatedAt">—</span>
+  </div>
+  <div id="verifyEmpty" class="text-muted text-center py-4">
+    <i class="bi bi-shield-slash" style="font-size:1.75rem"></i>
+    <div class="mt-2 small">暂无数据验证结果。点击上方「立即分析」执行完整性（L1）与可用性（L2）校验。</div>
+  </div>
+  <div id="verifyBody" class="d-none">
+    <div class="row g-3">
+      <div class="col-md-6 col-xl-3">
+        <div class="verify-stat">
+          <div class="vs-label">验证通过率</div>
+          <div class="vs-value" id="vfPassRate">—</div>
+          <div class="vs-sub" id="vfPassSub">—</div>
+        </div>
+      </div>
+      <div class="col-md-6 col-xl-3">
+        <div class="verify-stat">
+          <div class="vs-label">未校验占比</div>
+          <div class="vs-value" id="vfUnverified">—</div>
+          <div class="vs-sub" id="vfUnverifiedSub">—</div>
+        </div>
+      </div>
+      <div class="col-md-6 col-xl-3">
+        <div class="verify-stat">
+          <div class="vs-label">风险等级</div>
+          <div class="vs-value" id="vfLevel">—</div>
+          <div class="vs-sub" id="vfScore">—</div>
+        </div>
+      </div>
+      <div class="col-md-6 col-xl-3">
+        <div class="verify-stat">
+          <div class="vs-label">最近成功验证</div>
+          <div class="vs-value" style="font-size:var(--font-size-md)" id="vfLastVerified">—</div>
+          <div class="vs-sub" id="vfStale">—</div>
+        </div>
+      </div>
+    </div>
+    <div class="d-flex flex-wrap gap-2 mt-3" id="vfLayers"></div>
+    <div class="table-responsive mt-3" id="vfTaskWrap">
+      <div class="pred-detail-title">未通过校验的任务</div>
+      <table class="table table-sm pred-subtable">
+        <thead>
+          <tr><th>任务</th><th>类型</th><th>近7天失败</th><th>近30天失败</th><th>最近失败</th><th>原因摘要</th><th>风险分</th><th>建议动作</th></tr>
+        </thead>
+        <tbody id="vfTaskTable"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- 近期预测列表 -->
+<div class="page-card mb-3">
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <h6 class="mb-0"><i class="bi bi-list-ul me-1"></i>近期预测</h6>
+    <div class="d-flex gap-2 align-items-center">
+      <span class="text-muted small d-none d-lg-inline">带 <i class="bi bi-chevron-right"></i> 的行可展开查看任务级明细</span>
+      <select class="form-select form-select-sm" id="predMetricFilter" style="width:auto;" onchange="loadAlerts()">
+        <option value="">全部 metric</option>
+        <option value="backup_fail">备份失败</option>
+        <option value="verify_fail">数据验证</option>
+        <option value="storage_full">存储将满</option>
+        <option value="link_degraded">链路劣化</option>
+        <option value="drill_overdue">演练超期</option>
+        <option value="rpo_breach">RPO 突破</option>
+      </select>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle">
+      <thead>
+        <tr>
+          <th style="width:32px"></th>
+          <th>时间</th><th>指标</th><th>关联任务</th><th>预测内容</th>
+          <th>风险等级</th><th>评分</th><th>依据</th><th>模型来源</th>
+        </tr>
+      </thead>
+      <tbody id="predTable">
+        <tr><td colspan="9" class="text-muted text-center">暂无预测记录</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 依据详情模态框 -->
+<div class="modal fade" id="basisModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h6 class="modal-title" id="basisModalTitle">预测依据</h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+      </div>
+      <div class="modal-body" id="basisModalBody"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 配置区 -->
+<div class="page-card mb-3">
+  <h6 class="mb-3"><i class="bi bi-gear me-1"></i>AI 告警配置</h6>
+  <div class="row g-3">
+    <div class="col-md-3">
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" id="cfg_enabled" checked>
+        <label class="form-check-label" for="cfg_enabled">启用 AI 预测</label>
+      </div>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small">记录阈值（最低级别）</label>
+      <select class="form-select form-select-sm" id="cfg_min_level">
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+      </select>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small">自动通知级别</label>
+      <select class="form-select form-select-sm" id="cfg_notify_on">
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+        <option value="critical">critical</option>
+      </select>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small">分析周期（小时）</label>
+      <input type="number" class="form-control form-control-sm" id="cfg_interval" value="6" min="1">
+    </div>
+  </div>
+  <div class="mt-3">
+    <button class="btn btn-primary btn-sm" onclick="saveAlertConfig()">
+      <i class="bi bi-save me-1"></i>保存配置
+    </button>
+  </div>
+  <div class="alert alert-danger d-none mt-3" id="alertCfgError"></div>
+</div>
+{% endblock %}

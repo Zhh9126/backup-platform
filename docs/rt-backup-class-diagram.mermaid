@@ -1,0 +1,287 @@
+classDiagram
+    %% ================= 现有平台（复用，不改契约） =================
+    class BackupEngine {
+        <<existing>>
+        +str db_type
+        +str adapter_tier
+        +backup(backup_type) BackupResult
+        +restore(backup_path, **kwargs) BackupResult
+        +check_client() tuple
+        +_should_simulate() tuple
+    }
+    class FileBackupEngine {
+        <<existing, enhanced>>
+        +str db_type = "file"
+        +_snapshot_path(namespace) str
+        +_load_snapshot() dict
+        +_save_snapshot(snapshot, full_path) None
+        +_diff_against_snapshot(sf, snap) tuple
+        +_atomic_write_archive(writer, path) None
+        +_build_restore_chain(path, chain_override) list
+        +capture_increment(out_dir, tag) BackupResult
+        +ensure_base_full() BackupResult
+    }
+    class BackupResult {
+        <<existing dataclass>>
+        +bool success
+        +str backup_path
+        +int size_bytes
+        +str checksum
+        +str binlog_file
+        +int binlog_pos
+        +str wal_lsn
+    }
+
+    %% ================= 数据类型 core/rt_backup/types.py =================
+    class RtConfig {
+        <<dataclass>>
+        +int task_id
+        +str capture_kind
+        +str engine
+        +bool enabled
+        +str mode
+        +int interval_sec
+        +int debounce_sec
+        +str consistency
+        +int rpo_target_sec
+        +int log_retention_days
+        +from_task(task)$ RtConfig
+    }
+    class ChangeBatch {
+        <<dataclass>>
+        +str detected_at
+        +List~str~ changed
+        +List~str~ deleted
+        +int total_files
+        +str trigger
+        +bool is_empty()
+    }
+    class RecoveryPoint {
+        <<dataclass>>
+        +int id
+        +int task_id
+        +int parent_rp_id
+        +str rp_kind
+        +str rp_type
+        +str pit_at
+        +int pit_seq
+        +str consistency
+        +str binlog_file
+        +int binlog_pos
+        +str wal_lsn
+        +str object_key
+        +int size_bytes
+        +str checksum
+        +int storage_tier
+    }
+    class RtHealth {
+        <<dataclass>>
+        +int task_id
+        +str daemon_status
+        +str health
+        +int lag_sec
+        +int rpo_actual_sec
+        +int rpo_target_sec
+        +str last_rp_at
+        +str position_label
+        +bool is_breach()
+    }
+    class RestorePlan {
+        <<dataclass>>
+        +int task_id
+        +str kind
+        +str target_ts
+        +RecoveryPoint base_point
+        +List~RecoveryPoint~ chain
+        +List~str~ archives
+        +str stop_binlog_file
+        +int stop_binlog_pos
+        +str stop_lsn
+        +bool complete
+        +str gap_reason
+    }
+
+    %% ================= 文件变更捕获 =================
+    class FileChangeWatcher {
+        <<abstract>>
+        +str impl_key
+        +str display_name
+        +List~str~ required_packages
+        +is_available(source_cfg)$ tuple
+        +__init__(task, rt_config, on_batch, logger)
+        +start() None
+        +stop(timeout) None
+        +is_alive() bool
+        +poll_once() ChangeBatch
+        +request_flush(reason) None
+        +stats() dict
+    }
+    class PollingWatcher {
+        +str impl_key = "polling"
+        -Thread _thread
+        -Event _stop
+        -FileBackupEngine _engine
+        +poll_once() ChangeBatch
+        -_loop() None
+        -_list_source() dict
+    }
+    class WatchdogWatcher {
+        +str impl_key = "watchdog"
+        -Observer _observer
+        -PollingWatcher _fallback
+        -bool _dirty
+        -float _last_event_at
+        +poll_once() ChangeBatch
+        -_on_any_event(event) None
+        -_debounce_loop() None
+    }
+    class WatcherFactory {
+        <<module watchers/__init__>>
+        +create_watcher(task, rt_config, on_batch, logger)$ FileChangeWatcher
+        +probe_capabilities()$ dict
+    }
+
+    %% ================= DB 日志捕获 =================
+    class CDCDaemon {
+        <<abstract>>
+        +str engine_key
+        +str display_name
+        +List~str~ required_clients
+        +__init__(task, rt_config, repo, logger)
+        +check_client() tuple
+        +start() bool
+        +stop(timeout) None
+        +is_alive() bool
+        +tick() dict
+        +current_position() dict
+        +source_position() dict
+        +seal_ready_segments() List~dict~
+        +resume_from(state) None
+        #_popen(cmd, env, cwd) Popen
+        #_kill(proc, timeout) None
+    }
+    class MySQLBinlogDaemon {
+        +str engine_key = "mysql"
+        +List~str~ required_clients = ["mysqlbinlog"]
+        -Popen _proc
+        -str _start_file
+        +seal_ready_segments() List~dict~
+        -_build_cmd() List~str~
+        -_flush_binary_logs() bool
+        -_detect_rotation() List~str~
+    }
+    class PgWalDaemon {
+        +str engine_key = "postgresql"
+        +List~str~ required_clients = ["pg_receivewal"]
+        -Popen _proc
+        -str _slot_name
+        +seal_ready_segments() List~dict~
+        -_ensure_slot() bool
+        -_drop_slot() bool
+        -_scan_partial() List~str~
+    }
+    class SimulatedCDCDaemon {
+        +str engine_key = "simulated"
+        +note : DEMO_MODE 伪造位点前进
+    }
+
+    %% ================= 编排与服务 =================
+    class LogRepository {
+        +__init__(task_id, root)
+        +live_dir() str
+        +sealed_dir(day) str
+        +base_dir() str
+        +inc_dir(day) str
+        +seal(src_path, kind) dict
+        +save_state(state) None
+        +load_state() dict
+        +make_bundle(points, max_mb) dict
+        +disk_usage() dict
+        +prune(before_ts) int
+    }
+    class RecoveryJournal {
+        +append(task_id, point) RecoveryPoint
+        +list_points(task_id, start, end, kind, limit) List~RecoveryPoint~
+        +latest(task_id, kind) RecoveryPoint
+        +nearest_before(task_id, target_ts, kind) RecoveryPoint
+        +resolve_chain(task_id, target_ts) List~RecoveryPoint~
+        +validate_chain(chain) tuple
+        +mark_uploaded(rp_id, set_id, tier, bundle_key) None
+        +mark_verified(rp_id, ok, msg) None
+        +prune(task_id, retention_days) int
+        +timeline(task_id, start, end, buckets) dict
+    }
+    class FileRtCapture {
+        +__init__(task, rt_config, repo, journal, logger)
+        +start() bool
+        +stop(timeout) None
+        +is_alive() bool
+        +tick() dict
+        +flush_now(reason) RecoveryPoint
+        -_on_batch(batch) None
+        -_ensure_base() RecoveryPoint
+    }
+    class RtSupervisor {
+        <<singleton>>
+        +start() bool
+        +stop(timeout) None
+        +is_running() bool
+        +reconcile() dict
+        +status() dict
+        +status_of(task_id) RtHealth
+        +trigger_now(task_id, reason) dict
+        +restart_worker(task_id) dict
+        -_acquire_lock() bool
+        -_renew_lock() None
+        -_loop() None
+        -_spawn_worker(task) object
+    }
+    class RtHealthMonitor {
+        +check_all() list
+        +check_task(task_id) RtHealth
+        +compute_rpo(task_id) int
+        -_notify_breach(task, health) None
+        -_record_ai_metric(task, health) None
+    }
+    class PITRRestore {
+        +__init__(logger)
+        +list_points(task_id, start, end) list
+        +build_plan(task_id, target_ts) RestorePlan
+        +restore_file(task_id, target_ts, target_dir, **kw) BackupResult
+        +restore_db(task_id, target_ts, target, **kw) BackupResult
+        -_apply_file_chain(plan, target_dir) BackupResult
+        -_replay_mysql(plan, target) BackupResult
+        -_replay_pg(plan, target) BackupResult
+    }
+
+    %% ================= 关系 =================
+    BackupEngine <|-- FileBackupEngine
+    FileBackupEngine ..> BackupResult : returns
+
+    FileChangeWatcher <|-- PollingWatcher
+    FileChangeWatcher <|-- WatchdogWatcher
+    WatchdogWatcher o-- PollingWatcher : fallback flush
+    WatcherFactory ..> FileChangeWatcher : creates
+    FileChangeWatcher ..> ChangeBatch : emits
+
+    CDCDaemon <|-- MySQLBinlogDaemon
+    CDCDaemon <|-- PgWalDaemon
+    CDCDaemon <|-- SimulatedCDCDaemon
+
+    RtSupervisor o-- FileRtCapture : manages
+    RtSupervisor o-- CDCDaemon : manages
+    RtSupervisor ..> RtConfig : reads
+    RtSupervisor ..> RtHealth : publishes
+
+    FileRtCapture o-- FileChangeWatcher : uses
+    FileRtCapture o-- FileBackupEngine : delegates diff/tar
+    FileRtCapture o-- LogRepository : writes
+    FileRtCapture o-- RecoveryJournal : appends
+    CDCDaemon o-- LogRepository : writes
+
+    RecoveryJournal ..> RecoveryPoint : manages
+    PITRRestore o-- RecoveryJournal : queries
+    PITRRestore o-- FileBackupEngine : reuses restore
+    PITRRestore ..> RestorePlan : builds
+    RtHealthMonitor ..> RecoveryJournal : queries
+    RtHealthMonitor ..> RtHealth : returns

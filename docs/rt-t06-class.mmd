@@ -1,0 +1,192 @@
+classDiagram
+    %% ================= T03 既有骨架（不可修改） =================
+    class CDCDaemon {
+        <<abstract>>
+        +str engine_key
+        +str display_name
+        +list required_clients
+        +bool is_simulated
+        +bool seal_all_immediately
+        +dict task
+        +RtConfig rt
+        +LogRepository repo
+        +str degrade_reason
+        +str last_error
+        +Popen proc
+        +__init__(task, rt_config, repo, logger)
+        +check_client() tuple$
+        +is_available(task) tuple$
+        +start() None*
+        +tick() list
+        +seal_ready_segments(force) list
+        +stop() None
+        +is_alive() bool
+        +current_position() dict
+        +source_position() dict
+        +lag_seconds() int
+        +resume_from(position) None
+        +state() dict
+        +describe() dict
+        #_popen(cmd, cwd, env) Popen
+        #_kill() None
+        #_auth_env() dict
+        #_is_stalled(path) bool
+    }
+
+    class SimulatedCDCDaemon {
+        +engine_key = "simulated"
+        +is_simulated = True
+        +start() None
+        +tick() list
+    }
+
+    class MySQLBinlogDaemon {
+        +engine_key = "mysql_binlog"
+        +required_clients = ["mysqlbinlog"]
+        +start() None
+        +source_position() dict
+    }
+
+    %% ================= T06 新增：流式（push）分支 =================
+    class PostgresWALDaemon {
+        +engine_key = "pg_wal"
+        +required_clients = ["pg_receivewal"]
+        +CLIENT_CANDIDATES = ("pg_receivewal",)
+        +SLOT_CREATE_SQL
+        +CURRENT_LSN_SQL
+        +DEFAULT_PORT = 5432
+        +PASSWORD_ENV_KEYS = ("PGPASSWORD",)
+        +start() None
+        +seal_ready_segments(force) list
+        +source_position() dict
+        +lag_seconds() int
+        #_import_driver() tuple
+        #_resolve_client() str
+        #_ensure_slot() None
+        #_receive_cmd(binary, outdir) list
+        #_auth_env() dict
+        #_position_for_segment(name) dict
+    }
+
+    class KingbaseWALDaemon {
+        +engine_key = "kingbase_wal"
+        +display_name = "Kingbase WAL 流式捕获"
+        +required_clients = ["sys_receivewal"]
+        +CLIENT_CANDIDATES = ("sys_receivewal","pg_receivewal")
+        +SLOT_CREATE_SQL = sys_create_physical_replication_slot
+        +CURRENT_LSN_SQL = sys_current_wal_lsn
+        +DEFAULT_PORT = 54321
+        +PASSWORD_ENV_KEYS = ("KINGBASEPASSWORD","PGPASSWORD")
+        +is_simulated = False
+        #_import_driver() tuple
+        #_current_lsn_fallbacks() list
+    }
+
+    %% ================= T06 新增：拉取（pull）分支 =================
+    class PollingLogMinerDaemon {
+        <<abstract>>
+        +bool seal_all_immediately = True
+        +str POSITION_KEY = "wal_lsn"
+        +str POSITION_LABEL = "SCN"
+        +int FETCH_LIMIT = 5000
+        +bool _running
+        +conn _conn
+        +str _last_pos
+        +str _start_pos
+        +int _seq
+        +start() None
+        +tick() list
+        +stop() None
+        +is_alive() bool
+        +current_position() dict
+        +source_position() dict
+        +lag_seconds() int
+        +resume_from(position) None
+        #_import_driver() tuple*
+        #_connect() object*
+        #_probe_source(conn) tuple*
+        #_current_position_value(conn) str*
+        #_fetch_changes(conn, from_pos, to_pos) tuple*
+        #_write_segment(rows, pos_from, pos_to) str
+        #_segment_name(pos_from, pos_to) str
+        #_close() None
+    }
+
+    class OracleLogMinerDaemon {
+        +engine_key = "oracle_logminer"
+        +display_name = "Oracle LogMiner 日志捕获"
+        +required_clients = []
+        +is_simulated = False
+        +POSITION_LABEL = "SCN"
+        +DEFAULT_PORT = 1521
+        #_import_driver() tuple
+        #_connect() object
+        #_probe_source(conn) tuple
+        #_current_position_value(conn) str
+        #_fetch_changes(conn, from_scn, to_scn) tuple
+        #_add_logfiles(conn, from_scn, to_scn) int
+        #_start_logmnr(conn, from_scn, to_scn) None
+        #_end_logmnr(conn) None
+        #_dsn() str
+    }
+
+    class DamengLogMnrDaemon {
+        +engine_key = "dameng_logmnr"
+        +display_name = "达梦 DM_LOGMNR 日志捕获"
+        +required_clients = []
+        +is_simulated = False
+        +POSITION_LABEL = "LSN"
+        +DEFAULT_PORT = 5236
+        #_import_driver() tuple
+        #_connect() object
+        #_probe_source(conn) tuple
+        #_current_position_value(conn) str
+        #_fetch_changes(conn, from_lsn, to_lsn) tuple
+        #_ensure_packages(conn) bool
+        #_add_arch_files(conn, from_lsn) int
+    }
+
+    %% ================= 工厂与消费方 =================
+    class CDCFactory {
+        <<module core.cdc>>
+        +dict CDC_REGISTRY
+        +dict ENGINE_DAEMON_MAP
+        +create_daemon(task, rt_config, repo, logger) CDCDaemon
+        +probe_clients() dict
+        +supported_engines() tuple
+    }
+
+    class DbRtCapture {
+        +CDCDaemon daemon
+        +LogRepository repo
+        +RecoveryJournal journal
+        +start() None
+        +tick() list
+        +health() RtHealth
+        #_daemon_position_fields(position) dict
+        #_position_label(position) str
+        #_persist_state(health) None
+    }
+
+    class LogRepository {
+        +seal(path, kind) str
+        +save_state(data) None
+        +load_state() dict
+        +inflight_dir() str
+    }
+
+    CDCDaemon <|-- SimulatedCDCDaemon
+    CDCDaemon <|-- MySQLBinlogDaemon
+    CDCDaemon <|-- PostgresWALDaemon
+    PostgresWALDaemon <|-- KingbaseWALDaemon : 继承复用（钩子化）
+    CDCDaemon <|-- PollingLogMinerDaemon
+    PollingLogMinerDaemon <|-- OracleLogMinerDaemon
+    PollingLogMinerDaemon <|-- DamengLogMnrDaemon
+
+    CDCFactory ..> KingbaseWALDaemon : 注册/实例化
+    CDCFactory ..> OracleLogMinerDaemon : 注册/实例化
+    CDCFactory ..> DamengLogMnrDaemon : 注册/实例化
+    CDCFactory ..> SimulatedCDCDaemon : 降级兜底
+    DbRtCapture --> CDCFactory : create_daemon()
+    DbRtCapture --> CDCDaemon : 持有 daemon
+    CDCDaemon --> LogRepository : seal / save_state

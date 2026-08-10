@@ -1,0 +1,108 @@
+sequenceDiagram
+    autonumber
+    participant SUP as RtSupervisor
+    participant CAP as DbRtCapture
+    participant FAC as core.cdc.create_daemon
+    participant ORA as OracleLogMinerDaemon
+    participant KB as KingbaseWALDaemon
+    participant DRV as oracledb / ksycopg2
+    participant PROC as sys_receivewal(子进程)
+    participant REPO as LogRepository
+    participant JNL as RecoveryJournal
+
+    Note over SUP,JNL: ===== 阶段一：守护选型与启动 =====
+    SUP->>CAP: _build_worker(task) → DbRtCapture(task)
+    CAP->>FAC: create_daemon(task, rt_config, repo)
+    alt DEMO_MODE=on 或 demo_only 或 rt_mode=sample
+        FAC-->>CAP: SimulatedCDCDaemon(degrade_reason="演示模式")
+    else db_type=oracle
+        FAC->>ORA: is_available(task)
+        ORA->>DRV: _import_driver() → oracledb / cx_Oracle
+        alt 驱动缺失
+            ORA-->>FAC: (False, "未安装 oracledb，请 pip install oracledb")
+            FAC-->>CAP: SimulatedCDCDaemon(degrade_reason=原因)
+        else 驱动可用
+            ORA-->>FAC: (True, "")
+            FAC-->>CAP: OracleLogMinerDaemon
+        end
+    else db_type=kingbase
+        FAC->>KB: is_available(task)
+        KB->>KB: check_client() 探测 sys_receivewal / pg_receivewal
+        alt 两者均缺失
+            KB-->>FAC: (False, "未找到 sys_receivewal/pg_receivewal")
+            FAC-->>CAP: SimulatedCDCDaemon(degrade_reason=原因)
+        else 任一可用
+            KB-->>FAC: (True, "")
+            FAC-->>CAP: KingbaseWALDaemon
+        end
+    end
+
+    Note over SUP,JNL: ===== 阶段二：Oracle 拉取式启动 =====
+    CAP->>CAP: ensure_base() 确保恢复链头 db-full
+    CAP->>ORA: start()
+    ORA->>REPO: load_state() → {"scn": "1245331"}
+    ORA->>ORA: resume_from({"wal_lsn": "1245331"})
+    ORA->>DRV: _connect() → connect(dsn, user, pwd)
+    ORA->>DRV: _probe_source() 校验 LOG_MODE=ARCHIVELOG + LOGMINING 权限
+    alt 非归档模式 / 无权限
+        ORA-->>CAP: RuntimeError("数据库未开启归档模式")
+        CAP->>CAP: 就地降级 SimulatedCDCDaemon + degrade_reason
+    else 预检通过
+        ORA->>ORA: _running = True（无子进程，is_alive() 返回 _running）
+    end
+
+    Note over SUP,JNL: ===== 阶段三：Oracle 周期抽取（每 tick）=====
+    loop 每 RT_DB_SEAL_INTERVAL_SEC 秒
+        SUP->>CAP: tick()
+        CAP->>ORA: tick()
+        ORA->>DRV: SELECT CURRENT_SCN FROM V$DATABASE → to_scn
+        alt to_scn <= _last_pos（无新变更）
+            ORA-->>CAP: []
+        else 有新变更
+            ORA->>DRV: _add_logfiles(from_scn, to_scn) 挂载归档+在线日志
+            ORA->>DRV: DBMS_LOGMNR.START_LOGMNR(startScn, endScn, DICT_FROM_ONLINE_CATALOG)
+            ORA->>DRV: SELECT SCN, TIMESTAMP, SEG_OWNER, TABLE_NAME, OPERATION, SQL_REDO FROM V$LOGMNR_CONTENTS
+            DRV-->>ORA: rows
+            ORA->>DRV: DBMS_LOGMNR.END_LOGMNR
+            ORA->>ORA: _write_segment(rows) → inflight/ora_<from>_<to>.jsonl（原子写）
+            ORA->>ORA: _last_pos = to_scn
+            ORA-->>CAP: [段路径]
+        end
+        CAP->>ORA: seal_ready_segments()
+        ORA->>REPO: seal(path, kind="db-log")
+        REPO-->>ORA: sealed 路径
+        ORA->>REPO: save_state({"scn": to_scn})
+        ORA-->>CAP: [{"path":..., "position":{"wal_lsn":from,"wal_end_lsn":to}}]
+        CAP->>JNL: append(task_id, rp_kind="db-log", wal_lsn, wal_end_lsn, parent_id)
+        JNL-->>CAP: RecoveryPoint
+        CAP->>CAP: _persist_state() → rt_capture_state.last_wal_lsn = to_scn
+    end
+
+    Note over SUP,JNL: ===== 阶段四：Kingbase 流式捕获（复用 PG 路径）=====
+    CAP->>KB: start()
+    KB->>REPO: load_state() → {"wal_lsn": "0/1A000060"}
+    KB->>DRV: _import_driver() → ksycopg2 / psycopg2
+    KB->>DRV: _ensure_slot() SELECT sys_create_physical_replication_slot('bk_rt_<task>')
+    KB->>PROC: _popen([sys_receivewal, -D inflight, -S slot, --no-loop])
+    Note right of PROC: _auth_env() 同时注入<br/>KINGBASEPASSWORD 与 PGPASSWORD
+    loop 每 tick
+        SUP->>CAP: tick()
+        CAP->>KB: seal_ready_segments()
+        KB->>KB: 扫描 inflight/，跳过 *.partial，只封 24 位十六进制段
+        KB->>REPO: seal(段, kind="db-log")
+        KB->>REPO: save_state({"wal_lsn": 末段 LSN})
+        CAP->>JNL: append(rp_kind="db-log", wal_lsn, wal_end_lsn)
+    end
+    CAP->>KB: source_position()
+    KB->>DRV: SELECT sys_current_wal_lsn()（回落 pg_current_wal_lsn / sys_current_xlog_location）
+
+    Note over SUP,JNL: ===== 阶段五：停机收尾 =====
+    SUP->>CAP: stop()
+    CAP->>ORA: stop()
+    ORA->>DRV: END_LOGMNR + 关闭连接，_running=False
+    ORA->>ORA: seal_ready_segments(force=True)
+    CAP->>KB: stop()
+    KB->>PROC: _kill() SIGTERM → 等待 → SIGKILL
+    KB->>KB: seal_ready_segments(force=True)
+    CAP->>JNL: 补登记 _collect_orphan_segments()
+    CAP->>CAP: _persist_state(daemon_status="stopped")

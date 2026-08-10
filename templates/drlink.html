@@ -1,0 +1,180 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+  /* 容灾链路页专属样式 —— 颜色一律引用 app.css Design Tokens，禁止硬编码 */
+  .link-steps { display: flex; align-items: center; gap: var(--space-sm); margin-bottom: var(--space-md); flex-wrap: wrap; }
+  .link-step-chip {
+    display: inline-flex; align-items: center; gap: var(--space-xs);
+    padding: var(--space-xs) var(--space-sm); border-radius: var(--radius-md);
+    border: 1px solid var(--border-base); background: var(--page-bg);
+    color: var(--text-muted); font-size: var(--font-size-xs);
+  }
+  .link-step-chip .n {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 18px; height: 18px; border-radius: 50%;
+    background: var(--border-base); color: var(--text-secondary);
+    font-weight: var(--weight-semibold);
+  }
+  .link-step-chip.active {
+    border-color: var(--primary-light); background: var(--primary-bg); color: var(--primary-hover);
+  }
+  .link-step-chip.active .n { background: var(--primary); color: var(--card-bg); }
+  .link-step-chip.done { border-color: var(--success); color: var(--success); background: var(--success-light); }
+  .link-step-chip.done .n { background: var(--success); color: var(--card-bg); }
+  .link-step-sep { color: var(--text-muted); font-size: var(--font-size-xs); }
+
+  .src-group-title {
+    font-size: var(--font-size-xs); font-weight: var(--weight-medium);
+    color: var(--text-secondary); margin: var(--space-md) 0 var(--space-sm);
+  }
+  .src-group-title:first-child { margin-top: 0; }
+  .src-option {
+    display: block; border: 1px solid var(--border-base); border-radius: var(--radius-lg);
+    padding: var(--space-md); margin-bottom: var(--space-sm); cursor: pointer;
+    transition: border-color .12s ease, background .12s ease;
+  }
+  .src-option:hover { border-color: var(--primary-light); background: var(--primary-bg); }
+  .src-option.selected { border-color: var(--primary); background: var(--primary-bg); }
+  .src-option .src-name { font-weight: var(--weight-medium); color: var(--text-primary); }
+  .src-option .src-meta { font-size: var(--font-size-xs); color: var(--text-secondary); margin-top: var(--space-xs); }
+  .src-option .src-meta code { font-size: var(--font-size-xs); }
+
+  .link-src-line { font-size: var(--font-size-xs); color: var(--text-secondary); margin-top: var(--space-xs); }
+  .link-src-line .bi-hdd-network, .link-src-line .bi-broadcast { color: var(--primary); }
+  .link-src-stale {
+    display: inline-flex; align-items: center; gap: var(--space-xs);
+    font-size: var(--font-size-xs); color: var(--warning);
+    background: var(--warning-light); border: 1px solid var(--warning);
+    border-radius: var(--radius-sm); padding: 1px var(--space-sm); margin-top: var(--space-xs);
+  }
+  .link-src-stale button {
+    border: none; background: none; padding: 0; color: var(--warning);
+    text-decoration: underline; font-size: var(--font-size-xs); cursor: pointer;
+  }
+</style>
+
+<div class="page-header">
+  <h4 class="page-title"><i class="bi bi-diagram-3"></i> 容灾链路 HA</h4>
+  <p class="text-muted mb-0">双运营商专线智能选路 · 日志间隙自动填补 · 备端只读一致性校验</p>
+</div>
+
+<!-- 操作栏 -->
+<div class="page-card mb-3">
+  <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <div class="d-flex gap-2">
+      <button class="btn btn-primary btn-sm" onclick="openLinkModal()">
+        <i class="bi bi-plus-lg me-1"></i>新增容灾链路
+      </button>
+      <button class="btn btn-outline-secondary btn-sm" onclick="loadLinks()">
+        <i class="bi bi-arrow-clockwise me-1"></i>刷新
+      </button>
+    </div>
+    <div class="text-muted small" id="linkSummary">—</div>
+  </div>
+</div>
+
+<!-- 链路列表 -->
+<div id="linkEmpty" class="page-card text-center text-muted d-none">
+  <i class="bi bi-diagram-3" style="font-size:2rem"></i>
+  <div class="mt-2">暂无容灾链路，点击「新增容灾链路」开始配置</div>
+</div>
+<div class="row g-3" id="linkList"></div>
+
+<!-- 链路编辑模态框 -->
+<div class="modal fade" id="linkModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="linkModalTitle">新增容灾链路</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="l_id">
+        <input type="hidden" id="l_source_kind" value="manual">
+        <input type="hidden" id="l_source_id" value="">
+
+        <!-- 步骤指示 -->
+        <div class="link-steps" id="linkSteps">
+          <span class="link-step-chip active" id="linkStepChip1"><span class="n">1</span>选择数据源</span>
+          <i class="bi bi-chevron-right link-step-sep"></i>
+          <span class="link-step-chip" id="linkStepChip2"><span class="n">2</span>确认链路参数</span>
+        </div>
+
+        <!-- ===== 第一步：选择数据源 ===== -->
+        <div id="linkStep1">
+          <p class="text-muted" style="font-size:var(--font-size-sm)">
+            选择一个已有的<strong>数据同步任务</strong>或<strong>实时保护任务</strong>作为链路数据源，
+            主站点 / 备站点 / 路由策略将自动回填（回填后仍可在第二步手工调整）。
+          </p>
+          <!-- 无可用数据源引导 -->
+          <div class="alert alert-warning py-2 d-none" role="alert" id="linkNoSource" style="font-size:var(--font-size-sm)">
+            <i class="bi bi-exclamation-triangle"></i> 暂无可用数据源，无法创建容灾链路。
+            <a href="/sync" class="alert-link ms-1">去创建数据同步任务 →</a>
+            <a href="/rt-timeline" class="alert-link ms-2">去开启实时保护 →</a>
+          </div>
+          <div id="linkSourceList"></div>
+          <div class="form-check mt-2">
+            <input class="form-check-input" type="checkbox" id="l_manual_mode">
+            <label class="form-check-label text-muted" for="l_manual_mode" style="font-size:var(--font-size-xs)">
+              手工模式（不关联数据源，全部字段手工填写；仅用于兼容存量链路）
+            </label>
+          </div>
+        </div>
+
+        <!-- ===== 第二步：链路参数 ===== -->
+        <div class="row g-3 d-none" id="linkStep2">
+          <div class="col-12" id="linkSrcSummary"></div>
+          <div class="col-md-6">
+            <label class="form-label">链路名称 *</label>
+            <input class="form-control" id="l_name" placeholder="如 北京-上海核心交易库容灾">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">状态</label>
+            <select class="form-select" id="l_status">
+              <option value="standby">standby 待命</option>
+              <option value="active">active 主用</option>
+              <option value="filling">filling 补传中</option>
+              <option value="broken">broken 中断</option>
+            </select>
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">启用</label>
+            <select class="form-select" id="l_enabled">
+              <option value="1">启用</option>
+              <option value="0">停用</option>
+            </select>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">主站点</label>
+            <input class="form-control" id="l_primary_site" placeholder="如 北京 IDC-A">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">备站点</label>
+            <input class="form-control" id="l_dr_site" placeholder="如 上海 IDC-B">
+          </div>
+          <div class="col-12">
+            <label class="form-label">多专线路由策略（JSON）</label>
+            <textarea class="form-control" id="l_route_policy" rows="6" placeholder='[{"provider":"联通专线","endpoint":"10.20.0.1:3306","priority":1,"enabled":true}]'></textarea>
+            <div class="form-text">留空则使用默认双运营商专线（联通/电信）。字段：provider / endpoint / priority / enabled。</div>
+          </div>
+          <div class="col-12">
+            <label class="form-label">备注</label>
+            <input class="form-control" id="l_note" placeholder="可选">
+          </div>
+        </div>
+        <div class="alert alert-danger d-none mt-3" id="linkFormError"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-outline-secondary d-none" id="linkPrevBtn" onclick="linkGotoStep(1)">
+          <i class="bi bi-chevron-left"></i> 上一步
+        </button>
+        <button class="btn btn-primary" id="linkNextBtn" onclick="linkGotoStep(2)">
+          下一步 <i class="bi bi-chevron-right"></i>
+        </button>
+        <button class="btn btn-primary d-none" id="saveLinkBtn" onclick="saveLink()">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

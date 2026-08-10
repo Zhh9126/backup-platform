@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">运维运营分析</div>
+    <div class="page-sub">超长备份 / 超频备份统计与阈值配置 · 支持 Excel 导出</div>
+  </div>
+  <div>
+    <button class="btn btn-outline-secondary btn-sm" onclick="loadOperations()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+    <button class="btn btn-outline-primary btn-sm" onclick="openThresholdsModal()" title="阈值设置"><i class="bi bi-sliders"></i> 阈值设置</button>
+    <button class="btn btn-success btn-sm" onclick="exportExcel()" title="导出 Excel"><i class="bi bi-file-earmark-excel"></i> 导出 Excel</button>
+  </div>
+</div>
+
+<!-- 当前规则定义横条 -->
+<div class="rule-summary" id="ruleSummaryBar">
+  <i class="bi bi-info-circle"></i>
+  <span id="ruleSummaryText">加载中…</span>
+</div>
+
+<!-- KPI 卡片 -->
+<div class="kpi-grid">
+  <div class="card-stat card-stat-warning">
+    <div class="stat-icon"><i class="bi bi-hourglass-split"></i></div>
+    <div class="stat-num" id="st_long_running">0</div>
+    <div class="stat-label">超长备份</div>
+  </div>
+  <div class="card-stat card-stat-danger">
+    <div class="stat-icon"><i class="bi bi-lightning-charge"></i></div>
+    <div class="stat-num" id="st_frequency">0</div>
+    <div class="stat-label">超频备份</div>
+  </div>
+  <div class="card-stat card-stat-info">
+    <div class="stat-icon"><i class="bi bi-collection"></i></div>
+    <div class="stat-num" id="st_total_records">0</div>
+    <div class="stat-label">总备份记录</div>
+  </div>
+</div>
+
+<!-- 超长备份 -->
+<div class="page-card mt-3">
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <div>
+      <div class="card-title" id="longTitle">超长备份</div>
+      <div class="quality-sub" id="longTableTitle"></div>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>备份时间</th><th>数据库类型</th><th>任务</th><th>备份类型</th>
+        <th>耗时</th><th>大小</th><th>超长原因</th><th>状态</th>
+      </tr></thead>
+      <tbody id="longRunningTbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 超频备份 -->
+<div class="page-card mt-3">
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <div>
+      <div class="card-title" id="freqTitle">超频备份</div>
+      <div class="quality-sub" id="freqTableTitle"></div>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>任务</th><th>数据库类型</th><th>次数</th><th>窗口开始</th><th>窗口结束</th><th>关联记录</th>
+      </tr></thead>
+      <tbody id="frequencyTbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 阈值设置 modal -->
+<div class="modal fade" id="thresholdsModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-sliders"></i> 备份质量阈值设置</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-label">超长判定规则</label>
+            <select class="form-select" id="th_long_rule" onchange="updateThresholdsPreview()">
+              <option value="speed">按速度（数据量/预期速度）</option>
+              <option value="fixed">按固定时长</option>
+              <option value="both">两者任一</option>
+            </select>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">固定超长阈值（分钟）</label>
+            <input class="form-control" id="th_long_minutes" type="number" min="1" oninput="updateThresholdsPreview()">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">预期速度（GB/h）</label>
+            <input class="form-control" id="th_expected_speed" type="number" min="1" oninput="updateThresholdsPreview()">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">速度浮动容忍度（%）</label>
+            <input class="form-control" id="th_tolerance" type="number" min="0" oninput="updateThresholdsPreview()">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">超频窗口（分钟）</label>
+            <input class="form-control" id="th_freq_window" type="number" min="1" oninput="updateThresholdsPreview()">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">窗口内触发次数</label>
+            <input class="form-control" id="th_freq_count" type="number" min="2" oninput="updateThresholdsPreview()">
+          </div>
+        </div>
+        <div class="alert alert-light mt-3 small" id="thPreview"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary btn-sm" onclick="saveThresholds()"><i class="bi bi-check2"></i> 保存并应用</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/bkp-core.js?v=2026080201"></script>
+<script src="/static/js/operations.js?v=2026080201"></script>
+{% endblock %}

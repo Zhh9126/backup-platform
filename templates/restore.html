@@ -1,0 +1,240 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+  /* 恢复页专属样式 —— 颜色一律引用 app.css Design Tokens，禁止硬编码 */
+  .restore-selected {
+    border: 1px solid var(--primary-light); border-left: 3px solid var(--primary);
+    border-radius: var(--radius-lg); background: var(--primary-bg);
+    padding: var(--space-md); transition: border-color .15s ease, background .15s ease;
+  }
+  .restore-selected .rs-head {
+    display: flex; align-items: center; gap: var(--space-sm); flex-wrap: wrap;
+    font-size: var(--font-size-md); font-weight: var(--weight-semibold); color: var(--text-primary);
+  }
+  .restore-selected .rs-head .bi-check-circle-fill { color: var(--primary); }
+  .restore-selected .rs-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: var(--space-sm) var(--space-md); margin-top: var(--space-sm);
+  }
+  .restore-selected .rs-item { font-size: var(--font-size-xs); }
+  .restore-selected .rs-item .rs-label { color: var(--text-muted); display: block; }
+  .restore-selected .rs-item .rs-value { color: var(--text-primary); font-weight: var(--weight-medium); }
+  .restore-selected .rs-item .rs-value code { font-size: var(--font-size-xs); }
+
+  #r_progress_wrap .progress { height: 6px; background: var(--border-base); }
+  #r_progress_wrap .progress-bar { background: var(--primary); }
+  .restore-row-new { animation: restoreHighlight 3s ease-out 1; }
+  @keyframes restoreHighlight {
+    0%, 55% { background: var(--primary-light); }
+    100% { background: transparent; }
+  }
+</style>
+
+<div class="toolbar">
+  <div>
+    <div class="page-title">数据恢复</div>
+    <div class="page-sub">从备份记录恢复到源实例或跨主机恢复</div>
+  </div>
+  <button class="btn btn-outline-secondary btn-sm" onclick="loadRestoreForm()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+</div>
+
+<div class="page-card mb-3">
+  <form id="restoreForm" onsubmit="event.preventDefault();submitRestore();">
+    <!-- 步骤 1：选择备份类型 -->
+    <h6 class="border-bottom pb-2 mb-3"><i class="bi bi-1-circle"></i> 选择备份类型</h6>
+    <div class="row g-3 mb-3">
+      <div class="col-md-12">
+        <div class="btn-group btn-group-lg w-100" role="group">
+          <input type="radio" class="btn-check" name="r_type" id="r_type_db" value="db" checked onchange="onRestoreTypeChange()">
+          <label class="btn btn-outline-primary" for="r_type_db">
+            <i class="bi bi-database"></i> 数据库恢复 <span class="badge bg-secondary ms-2" id="r_db_count">0</span>
+          </label>
+          <input type="radio" class="btn-check" name="r_type" id="r_type_file" value="file" onchange="onRestoreTypeChange()">
+          <label class="btn btn-outline-success" for="r_type_file">
+            <i class="bi bi-folder2-open"></i> 文件恢复 <span class="badge bg-secondary ms-2" id="r_file_count">0</span>
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <!-- 步骤 2：选择备份记录 -->
+    <h6 class="border-bottom pb-2 mb-3"><i class="bi bi-2-circle"></i> 选择备份记录</h6>
+    <div class="row g-3 mb-3">
+      <div class="col-md-4">
+        <label class="form-label">业务系统 / 任务名</label>
+        <input class="form-control" id="r_search" placeholder="输入关键字搜索..." oninput="filterRestoreRecords()"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();filterRestoreRecords();}">
+      </div>
+      <div class="col-md-4">
+        <label class="form-label">IP / 主机</label>
+        <input class="form-control" id="r_search_ip" placeholder="输入 IP 搜索..." oninput="filterRestoreRecords()"
+               onkeydown="if(event.key==='Enter'){event.preventDefault();filterRestoreRecords();}">
+      </div>
+      <div class="col-md-4">
+        <label class="form-label">备份记录 *</label>
+        <select class="form-select" id="r_record" required onchange="onRecordChange()" size="1"></select>
+      </div>
+    </div>
+    <!-- 选中记录卡片（替代原 alert-info 单行长文本） -->
+    <div class="row g-3 mb-3" id="r_record_info_row" style="display:none">
+      <div class="col-md-12">
+        <div class="restore-selected" id="r_record_card">
+          <div class="rs-head">
+            <i class="bi bi-check-circle-fill"></i>
+            <span id="rs_title">—</span>
+            <span class="ms-auto" id="rs_verified"></span>
+          </div>
+          <div class="rs-grid">
+            <div class="rs-item"><span class="rs-label">备份时间</span><span class="rs-value" id="rs_time">-</span></div>
+            <div class="rs-item"><span class="rs-label">文件大小</span><span class="rs-value" id="rs_size">-</span></div>
+            <div class="rs-item"><span class="rs-label">存储层</span><span class="rs-value" id="rs_tier">-</span></div>
+            <div class="rs-item"><span class="rs-label">源主机 / 库</span><span class="rs-value" id="rs_source">-</span></div>
+            <div class="rs-item"><span class="rs-label">记录号</span><span class="rs-value" id="rs_recno">-</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 步骤 3：恢复参数 -->
+    <h6 class="border-bottom pb-2 mb-3"><i class="bi bi-3-circle"></i> 恢复参数</h6>
+
+    <!-- ===== 数据库恢复模式选择 ===== -->
+    <div class="row g-3 mb-3" id="r_mode_db_row">
+      <div class="col-md-12">
+        <div class="form-check">
+          <input class="form-check-input" type="radio" name="r_mode" id="r_mode_same" value="same" checked onchange="onRestoreModeChange()">
+          <label class="form-check-label" for="r_mode_same">恢复到源任务（使用备份时的连接信息）</label>
+        </div>
+        <div class="form-check">
+          <input class="form-check-input" type="radio" name="r_mode" id="r_mode_remote" value="remote" onchange="onRestoreModeChange()">
+          <label class="form-check-label" for="r_mode_remote">跨主机恢复（指定目标主机 + 库名）</label>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== 数据库恢复：目标库名（恢复到源任务时显示） ===== -->
+    <div class="row g-3 mb-3" id="r_db_same_row">
+      <div class="col-md-6">
+        <label class="form-label">目标库 / 实例</label>
+        <input class="form-control" id="r_target_db_same" placeholder="默认沿用备份中的库名">
+        <div class="form-text">恢复到源实例时，可指定新库名（部分数据库支持）</div>
+      </div>
+    </div>
+
+    <!-- ===== 数据库恢复：跨主机目标 ===== -->
+    <div class="row g-3 mb-3" id="r_db_remote_row" style="display:none">
+      <div class="col-md-12">
+        <div class="card bg-light">
+          <div class="card-body py-2">
+            <label class="form-label fw-bold">目标主机信息</label>
+            <div class="row g-2">
+              <div class="col-md-6">
+                <label class="form-label small">选择纳管主机</label>
+                <select class="form-select form-select-sm" id="r_db_target_host_sel">
+                  <option value="">— 选择已纳管 SSH 主机 —</option>
+                </select>
+              </div>
+              <div class="col-md-6 d-flex align-items-end">
+                <span class="text-muted small">或直接输入（无需纳管）:</span>
+              </div>
+            </div>
+            <div class="row g-2 mt-1">
+              <div class="col-md-4">
+                <input class="form-control form-control-sm" id="r_db_direct_host" placeholder="IP / 主机名">
+              </div>
+              <div class="col-md-2">
+                <input class="form-control form-control-sm" id="r_db_direct_port" placeholder="端口" value="22">
+              </div>
+              <div class="col-md-3">
+                <input class="form-control form-control-sm" id="r_db_direct_user" placeholder="SSH 用户" value="root">
+              </div>
+              <div class="col-md-3">
+                <input class="form-control form-control-sm" id="r_db_direct_password" type="password" placeholder="SSH 密码">
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="col-md-6 mt-2">
+        <label class="form-label">目标库 / 实例</label>
+        <input class="form-control" id="r_target_db_remote" placeholder="指定目标数据库名">
+      </div>
+    </div>
+
+    <!-- ===== 文件恢复：目标目录 + 目标主机 ===== -->
+    <div class="row g-3 mb-3" id="r_file_row" style="display:none">
+      <div class="col-md-6">
+        <label class="form-label">目标恢复目录 *</label>
+        <input class="form-control font-monospace" id="r_target_dir" placeholder="例: /data/restore 或 C:\restore">
+        <div class="form-text">tar.gz 将解压到此目录</div>
+      </div>
+      <div class="col-md-12 mt-2">
+        <div class="card bg-light">
+          <div class="card-body py-2">
+            <label class="form-label fw-bold">目标主机信息 *</label>
+            <div class="row g-2">
+              <div class="col-md-6">
+                <label class="form-label small">选择纳管主机</label>
+                <select class="form-select form-select-sm" id="r_file_target_host_sel">
+                  <option value="">— 选择已纳管 SSH 主机 —</option>
+                </select>
+              </div>
+              <div class="col-md-6 d-flex align-items-end">
+                <span class="text-muted small">或直接输入（无需纳管）:</span>
+              </div>
+            </div>
+            <div class="row g-2 mt-1">
+              <div class="col-md-4">
+                <input class="form-control form-control-sm" id="r_file_direct_host" placeholder="IP / 主机名">
+              </div>
+              <div class="col-md-2">
+                <input class="form-control form-control-sm" id="r_file_direct_port" placeholder="端口" value="22">
+              </div>
+              <div class="col-md-3">
+                <input class="form-control form-control-sm" id="r_file_direct_user" placeholder="SSH 用户" value="root">
+              </div>
+              <div class="col-md-3">
+                <input class="form-control form-control-sm" id="r_file_direct_password" type="password" placeholder="SSH 密码">
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="row g-3 mb-3">
+      <div class="col-md-4">
+        <label class="form-label">操作人</label>
+        <input class="form-control" id="r_operator" placeholder="可选">
+      </div>
+    </div>
+
+    <div class="col-12">
+      <button class="btn btn-warning" type="submit" id="r_submit_btn"><i class="bi bi-arrow-counterclockwise"></i> 执行恢复</button>
+      <span class="form-text ms-2 text-danger">⚠ 恢复会覆盖目标数据，请谨慎操作；跨主机恢复需确保目标有相应解压工具。</span>
+      <!-- 提交进度 / 结果状态条 -->
+      <div class="mt-3 d-none" id="r_progress_wrap">
+        <div class="progress" role="progressbar" aria-label="恢复进度">
+          <div class="progress-bar progress-bar-striped progress-bar-animated" style="width:100%"></div>
+        </div>
+        <div class="form-text mt-1" id="r_progress_text">正在提交恢复请求…</div>
+      </div>
+      <div class="alert py-2 mt-3 d-none" id="r_result_bar"></div>
+    </div>
+  </form>
+</div>
+
+<div class="page-card">
+  <h6 style="font-size:var(--font-size-base);font-weight:600;color:var(--text-primary);margin-bottom:var(--space-md)">恢复记录</h6>
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>记录ID</th><th>业务系统</th><th>备份类型</th><th>备份时间</th>
+        <th>目标主机/目录</th><th>目标库</th>
+        <th>恢复开始</th><th>状态</th><th>操作人</th><th>说明</th>
+      </tr></thead>
+      <tbody id="restoreTable"></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

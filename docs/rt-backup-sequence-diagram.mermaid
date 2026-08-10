@@ -1,0 +1,252 @@
+%% ============================================================
+%% 准 CDP 实时备份系统 —— 时序图集合
+%% 对应 docs/rt-backup-design.md 第 4 章
+%% 共 4 个时序图：4.1 启动对账 / 4.2 文件捕获 / 4.3 DB 日志流捕获 / 4.4 PITR 恢复
+%% ============================================================
+
+%% ---------------- 4.1 守护启动与对账 ----------------
+```mermaid
+sequenceDiagram
+    autonumber
+    participant RUN as run.py:19
+    participant SCH as core/scheduler.py<br/>start_scheduler()
+    participant SUP as RtSupervisor
+    participant LK as instance/<br/>rt_supervisor.lock
+    participant MD as models / db
+    participant W1 as FileRtCapture<br/>(file 任务)
+    participant W2 as MySQLBinlogDaemon<br/>(mysql 任务)
+
+    RUN->>SCH: start_scheduler()
+    SCH->>SCH: _register(task) × N（现有）
+    SCH->>SCH: _register_inspection/lifecycle/clone/ai/drill（现有）
+    SCH->>SUP: _register_rt_backup(sched)
+
+    SUP->>LK: _acquire_lock()  O_CREAT|O_EXCL
+    alt 抢锁成功（或接管陈旧锁）
+        LK-->>SUP: ok，写入 {pid, host, started_at}
+        SUP->>SUP: 启动主循环线程 (daemon=True)
+    else 抢锁失败（另一 worker 已持有）
+        LK-->>SUP: busy
+        SUP-->>SCH: return False（本进程只跑 Flask，不跑守护）
+    end
+
+    SCH->>SCH: add_job(rt_health, Interval(1min), max_instances=1, coalesce=True)
+    SCH->>SCH: add_job(rt_prune,  Interval(1h),   max_instances=1, coalesce=True)
+    SCH->>SCH: add_job(rt_watchdog, Interval(5min), max_instances=1, coalesce=True)
+
+    loop 每 RT_SUPERVISOR_TICK_SEC（默认 10s）
+        SUP->>LK: _renew_lock() 更新 mtime 心跳
+        SUP->>MD: SELECT * FROM backup_tasks WHERE rt_enabled=1 AND enabled=1
+        MD-->>SUP: [task...]
+        SUP->>SUP: reconcile() 对账内存 worker 表
+
+        alt 新增 file 任务
+            SUP->>W1: create + start()
+            W1->>W1: create_watcher() → 能力探测/降级决策
+            W1->>W1: ensure_base_full() 若无快照基准
+        end
+        alt 新增 mysql 任务
+            SUP->>W2: create + start()
+            W2->>W2: check_client() mysqlbinlog
+            W2->>W2: resume_from(rt_capture_state) 或 SHOW MASTER STATUS
+            W2->>W2: _popen(mysqlbinlog --raw --stop-never)
+        end
+
+        par 并行 tick 所有 worker
+            SUP->>W1: tick()
+            and
+            SUP->>W2: tick()
+        end
+        SUP->>MD: UPSERT rt_capture_state（状态/位点/lag/health）
+
+        alt worker 死亡
+            SUP->>SUP: 指数退避 [5,15,60,180,600]s 后重启
+            SUP->>MD: restart_count += 1
+            alt restart_count > RT_MAX_RESTART
+                SUP->>MD: daemon_status='failed'（停止重试，等人工复位）
+            end
+        end
+    end
+```
+
+%% ---------------- 4.2 文件近实时捕获 → 三级存储 ----------------
+```mermaid
+sequenceDiagram
+    autonumber
+    participant FS as 源目录<br/>(local / remote SSH)
+    participant WT as WatchdogWatcher<br/>(或 PollingWatcher)
+    participant CAP as FileRtCapture
+    participant ENG as FileBackupEngine<br/>(core/engines/file.py)
+    participant REPO as LogRepository
+    participant JNL as RecoveryJournal
+    participant MD as models / SQLite
+    participant TIER as tier_replication
+    participant NTF as notifier
+
+    alt 事件驱动（local + watchdog 可用）
+        FS-->>WT: inotify / ReadDirectoryChangesW 事件
+        WT->>WT: _dirty=True，记录 last_event_at
+        WT->>WT: 静默 rt_debounce_sec(5s) 后触发
+    else 轮询兜底（默认 / remote / 降级）
+        WT->>WT: 每 rt_interval_sec(180s) 定时触发
+    end
+
+    WT->>WT: poll_once()
+    WT->>ENG: _get_local_file_list / _get_remote_file_list (file.py:249/:266)
+    ENG-->>WT: {rel: (size, mtime)}
+    WT->>ENG: _load_snapshot(namespace='rt') (file.py:432)
+    ENG-->>WT: 上次基准快照
+    WT->>ENG: _diff_against_snapshot() (file.py:483)
+    ENG-->>WT: (changed, deleted)
+    WT-->>CAP: on_batch(ChangeBatch)
+
+    alt 无变化
+        CAP->>MD: 仅更新 last_capture_at（不产生恢复点，不产生垃圾归档）
+    else 有变化
+        CAP->>REPO: inc_dir(today) 目录准备
+        CAP->>ENG: capture_increment(out_dir, tag=ts)
+        ENG->>ENG: _tar_files / _tar_remote_files (file.py:607/:620)
+        ENG->>ENG: _atomic_write_archive (file.py:576) 【Windows 文件锁防护】
+        ENG->>ENG: _save_snapshot(sf) (file.py:469) 【提交新基准】
+        ENG-->>CAP: BackupResult(backup_path, size, checksum)
+
+        CAP->>JNL: append(task_id, {rp_kind:'file-inc', pit_at, parent_rp_id,<br/>object_key, checksum, changed_files, storage_tier:1})
+        JNL->>MD: INSERT recovery_journal
+        MD-->>JNL: rp_id
+        CAP->>MD: UPDATE rt_capture_state(last_rp_at, rpo_actual_sec, bytes_today)
+
+        alt 达到聚合阈值（≥RT_UPLOAD_BATCH_MB 或 ≥RT_UPLOAD_INTERVAL_MIN）
+            CAP->>REPO: make_bundle(points, max_mb)
+            REPO-->>CAP: bundle_path
+            CAP->>MD: models.create_backup_set({set_type:'incremental',<br/>storage_tier:1, object_key:bundle_path, parent_set_id:base_set_id})
+            MD-->>CAP: set_id
+            CAP->>TIER: replicate_async(bundle_path, task, record_id) (tier_replication.py:182)
+            TIER-->>CAP: 异步上 L2(MinIO)/L3(S3)
+            CAP->>JNL: mark_uploaded(rp_ids, set_id, tier, bundle_key)
+        end
+    end
+
+    alt 捕获失败 / RPO 超标
+        CAP->>NTF: Notifier(task).notify("failure", title, text) (notifier.py:128)
+    end
+```
+
+%% ---------------- 4.3 数据库日志流捕获（MySQL 为例） ----------------
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SUP as RtSupervisor
+    participant D as MySQLBinlogDaemon
+    participant P as mysqlbinlog 子进程
+    participant SRC as MySQL 源库
+    participant REPO as LogRepository
+    participant JNL as RecoveryJournal
+    participant MD as models / SQLite
+    participant AI as ai_alert / notifier
+
+    SUP->>D: start()
+    D->>D: check_client("mysqlbinlog")
+    alt 二进制缺失
+        D->>MD: daemon_status='degraded'<br/>degrade_reason='mysqlbinlog 不在 PATH'
+        D->>AI: 告警「未落盘日志，PITR 不可用」
+        Note over D: 回落为 30s 位点采样模式（仅供 RPO 展示）
+    else 正常
+        D->>MD: SELECT last_binlog_file/pos FROM rt_capture_state
+        alt 有历史位点
+            MD-->>D: mysql-bin.000123 / 4
+        else 首次启动
+            D->>SRC: restore_extras.capture_mysql_cdc() = SHOW MASTER STATUS
+            SRC-->>D: mysql-bin.000123 / 15420
+        end
+        D->>P: _popen(mysqlbinlog --read-from-remote-server --raw<br/>--to-last-log --stop-never<br/>--stop-never-slave-server-id=10000+task_id<br/>--result-file=repo.live_dir()/  mysql-bin.000123)
+        Note over P,SRC: 长连接持续拉流，env MYSQL_PWD 传密码
+        P->>SRC: COM_BINLOG_DUMP
+        SRC-->>P: binlog 事件流（持续）
+        P->>REPO: 写 live/mysql-bin.000123（持续追加）
+        D->>MD: daemon_status='running', pid=P.pid
+    end
+
+    loop Supervisor 每 tick（10s）
+        SUP->>D: tick()
+        D->>P: poll() 探活
+        D->>REPO: stat(live/*) 取最新文件 size/mtime
+        D->>SRC: source_position()（每 6 tick 一次，降低源库压力）
+        D->>D: lag_sec = now - live_tail_mtime
+
+        alt 子进程已退出 或 位点连续 6 tick 停滞
+            D->>MD: last_error, consecutive_fail += 1
+            D-->>SUP: alive=False → 触发退避重启（resume_from 上次位点）
+            D->>AI: notifier.notify("failure", "[实时备份] binlog 捕获停滞")
+        end
+
+        alt 距上次封存 ≥ RT_DB_SEAL_INTERVAL_SEC（300s）
+            D->>SRC: FLUSH BINARY LOGS  【强制 rotate，把恢复点间隔压到 5 分钟】
+            SRC-->>P: 新 binlog 文件开始推送
+            P->>REPO: 创建 live/mysql-bin.000124
+            D->>D: _detect_rotation() 发现新文件 → 前一个已完整
+            D->>REPO: seal(live/mysql-bin.000123, kind='db-log')
+            REPO->>REPO: 移入 sealed/YYYYMMDD/ + sha256_file (db.py:562)
+            REPO-->>D: {path, size, checksum}
+            D->>JNL: append({rp_kind:'db-log', rp_type:'log-segment',<br/>pit_at, binlog_file:'000123', binlog_pos:4,<br/>binlog_end_file:'000123', binlog_end_pos:<size>,<br/>object_key:sealed_path, checksum})
+            JNL->>MD: INSERT recovery_journal
+            D->>REPO: save_state({binlog_file:'000124', pos:4}) 原子写 state.json
+            D->>MD: UPDATE rt_capture_state(last_binlog_file/pos, last_rp_at, lag_sec, health)
+        end
+    end
+```
+
+%% ---------------- 4.4 PITR 恢复（时间轴选点 → 执行） ----------------
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as 运维/DBA
+    participant WEB as /rt_backup 时间轴<br/>(Bootstrap5 + 原生 JS)
+    participant API as api/rt_backup.py<br/>(挂 api_bp)
+    participant JNL as RecoveryJournal
+    participant PIT as PITRRestore
+    participant ENG as FileBackupEngine
+    participant RX as restore_extras
+    participant TGT as 目标（目录 / 数据库实例）
+    participant MD as restore_records
+
+    U->>WEB: 打开实时备份页，选中任务
+    WEB->>API: GET /api/rt_backup/tasks/{id}/timeline?from&to
+    API->>JNL: timeline(task_id, start, end, buckets=200)
+    JNL-->>API: {buckets, points, gaps}
+    API-->>WEB: DB=连续日志带 / File=离散节点 + 缺口红条
+
+    U->>WEB: 拖拽/点选 2026-07-31 14:35:07
+    WEB->>API: GET /api/rt_backup/tasks/{id}/resolve?ts=...
+    API->>PIT: build_plan(task_id, target_ts)
+    PIT->>JNL: resolve_chain(task_id, target_ts)
+    JNL-->>PIT: [base-full, inc1..incN] 或 [db-full, seg1..segM]
+    PIT->>JNL: validate_chain(chain)  校验 checksum / 位点连续 / 文件存在
+    JNL-->>PIT: (ok, reason)
+    PIT-->>API: RestorePlan(complete, chain, stop_pos, gap_reason)
+    API-->>WEB: 展示：将恢复到 mysql-bin.000123:88214，涉及 1 全量 + 12 段
+
+    U->>WEB: 确认恢复（填目标目录 / 目标实例）
+    WEB->>API: POST /api/rt_backup/restore {task_id, target_ts, target}
+    API->>MD: models.create_restore({status:'running', ...})
+
+    alt 文件任务
+        API->>PIT: restore_file(task_id, target_ts, target_dir)
+        PIT->>ENG: restore(chain[-1], chain_override=chain, target_db=target_dir)
+        loop 按 pit_at 升序
+            ENG->>TGT: tarfile.extractall(filter=_restore_FILTER) (file.py:753-757)
+        end
+        ENG-->>PIT: BackupResult
+    else 数据库任务
+        API->>PIT: restore_db(task_id, target_ts, target)
+        PIT->>TGT: ① 导入最近全量（backup_records.backup_path）
+        PIT->>RX: ② mysqlbinlog --stop-datetime=target_ts<br/>【日志源 = sealed/ 本地仓库，非源库现场】
+        RX->>TGT: 重放至 stop_binlog_file:stop_binlog_pos
+        Note over PIT,TGT: PG 分支：解包基础备份 + recovery.signal<br/>restore_command 指向 sealed/ + recovery_target_time
+        RX-->>PIT: 结果
+    end
+
+    PIT-->>API: BackupResult
+    API->>MD: UPDATE restore_records(status, message)
+    API-->>WEB: {ok, message, restored_to}
+    WEB-->>U: 恢复完成，恢复记录页可查
+```

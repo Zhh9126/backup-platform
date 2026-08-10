@@ -1,0 +1,33 @@
+{
+  "id": "mongodb-database-tools",
+  "name": "MongoDB Database Tools",
+  "version": "100.10.0",
+  "category": "mongodb",
+  "description": "MongoDB 官方逻辑备份工具集：mongodump / mongorestore / mongoexport / mongoimport / bsondump / mongofiles。",
+  "required_clients": ["mongodump", "mongorestore"],
+  "supports": ["mongodb"],
+  "tags": ["逻辑备份", "MongoDB", "官方工具"],
+  "icon": "bi-database",
+  "homepage": "https://www.mongodb.com/try/download/database-tools",
+  "offline_first": true,
+  "packages": {
+    "linux": {
+      "fallback": {
+        "url": "https://fastdl.mongodb.org/tools/db/mongodb-database-tools-linux-x86_64-100.10.0.tgz",
+        "extract_dir": "/opt/mongodb-tools",
+        "binaries": ["bin/mongodump", "bin/mongorestore"]
+      },
+      "package_managers": {
+        "apt": {
+          "command": "DEBIAN_FRONTEND=noninteractive apt-get install -y mongodb-database-tools",
+          "binaries": ["mongodump", "mongorestore"]
+        },
+        "yum": {
+          "command": "cat > /etc/yum.repos.d/mongodb-org-7.0.repo << 'EOF'\n[mongodb-org-7.0]\nname=MongoDB Repository\nbaseurl=https://repo.mongodb.org/yum/redhat/8/mongodb-org/7.0/x86_64/\ngpgcheck=1\nenabled=1\ngpgkey=https://www.mongodb.org/static/pgp/server-7.0.asc\nEOF\nyum install -y mongodb-database-tools",
+          "binaries": ["mongodump", "mongorestore"]
+        }
+      }
+    }
+  },
+  "verify_after_install": ["mongodump --version"]
+}

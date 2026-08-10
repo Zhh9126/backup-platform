@@ -1,0 +1,12 @@
+{
+  "simulated": true,
+  "note": "该文件为演示/兜底占位备份，并非真实数据。原因: 任务标记为演示(demo_only)",
+  "task_id": 26,
+  "task_name": "phase2-demo-mysql",
+  "db_type": "mysql",
+  "host": "127.0.0.1",
+  "port": 3306,
+  "db_name": "demodb",
+  "backup_type": "incremental",
+  "generated_at": "2026-07-30T10:28:28+08:00"
+}

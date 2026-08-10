@@ -1,0 +1,93 @@
+classDiagram
+    class RtSupervisor {
+        <<T03 新建>>
+        -dict _workers
+        -RLock _lock
+        -Thread _thread
+        -Event _stop
+        +start() bool
+        +stop(timeout) None
+        +reconcile() dict
+        +status() dict
+        +status_of(task_id) RtHealth
+        +trigger_now(task_id, reason) dict
+        +restart_worker(task_id) dict
+        -_acquire_lock() bool
+        -_renew_lock() None
+        -_release_lock() None
+        -_loop() None
+        -_tick_worker(tid, w) None
+        -_backoff_restart(tid) None
+    }
+
+    class CDCDaemon {
+        <<T03 新建, abstract>>
+        +str engine_key
+        +list required_clients
+        +check_client() tuple
+        +start() bool
+        +stop(timeout) None
+        +is_alive() bool
+        +tick() dict
+        +current_position() dict
+        +source_position() dict
+        +seal_ready_segments() list
+        +resume_from(state) None
+        #_popen(cmd, env) Popen
+        #_kill(proc, timeout) None
+        #_drain_stderr(proc) None
+    }
+
+    class MySQLBinlogDaemon {
+        <<T03 新建>>
+        +engine_key = "mysql"
+        -_detect_rotation() list
+        -_flush_binary_logs() bool
+    }
+    class PgWalDaemon {
+        <<T03 新建>>
+        +engine_key = "postgresql"
+        -_scan_partial() list
+        -_ensure_slot() bool
+        -_drop_slot() bool
+    }
+    class SimulatedCDCDaemon {
+        <<T03 新建>>
+        +engine_key = "simulated"
+        -_fake_advance() dict
+    }
+
+    class FileRtCapture {
+        <<T02 新建>>
+        +start() bool
+        +stop(timeout) None
+        +is_alive() bool
+        +tick() dict
+        +trigger_now(reason) dict
+    }
+
+    class LogRepository {
+        <<T01 已完成>>
+        +live_dir() str
+        +sealed_dir(day) str
+        +seal(src, kind) dict
+        +save_state(state) None
+        +load_state() dict
+        +disk_usage() dict
+    }
+    class RecoveryJournal {
+        <<T01 已完成>>
+        +append(task_id, point) RecoveryPoint
+        +resolve_chain(task_id, ts) list
+        +validate_chain(chain) tuple
+    }
+
+    CDCDaemon <|-- MySQLBinlogDaemon
+    CDCDaemon <|-- PgWalDaemon
+    CDCDaemon <|-- SimulatedCDCDaemon
+    RtSupervisor o-- CDCDaemon : DB 任务 worker
+    RtSupervisor o-- FileRtCapture : 文件任务 worker
+    CDCDaemon --> LogRepository : seal 段
+    CDCDaemon --> RecoveryJournal : append db-log
+    FileRtCapture --> LogRepository
+    FileRtCapture --> RecoveryJournal

@@ -1,0 +1,37 @@
+{
+  "id": "pgbackrest",
+  "name": "pgBackRest",
+  "version": "2.50",
+  "category": "postgresql",
+  "description": "pgBackRest：PostgreSQL 可靠的全量/增量/差异物理备份与 PITR 恢复工具，比 pg_basebackup 更强大。",
+  "required_clients": ["pgbackrest"],
+  "supports": ["postgresql"],
+  "tags": ["物理备份", "增量备份", "PITR", "PostgreSQL"],
+  "icon": "bi-arrow-counterclockwise",
+  "homepage": "https://pgbackrest.org/",
+  "offline_first": true,
+  "packages": {
+    "linux": {
+      "fallback": {
+        "url": "https://github.com/pgbackrest/pgbackrest/archive/refs/tags/release/2.50.tar.gz",
+        "extract_dir": "/opt/pgbackrest",
+        "binaries": ["bin/pgbackrest"]
+      },
+      "package_managers": {
+        "apt": {
+          "command": "DEBIAN_FRONTEND=noninteractive apt-get install -y pgbackrest",
+          "binaries": ["pgbackrest"]
+        },
+        "yum": {
+          "command": "yum install -y pgbackrest",
+          "binaries": ["pgbackrest"]
+        }
+      }
+    }
+  },
+  "verify_after_install": ["pgbackrest version"],
+  "post_install_tips": [
+    "需要配置 /etc/pgbackrest.conf 与 PostgreSQL 的 archive_command",
+    "首次使用前请创建专用存储目录并配置 stanza"
+  ]
+}

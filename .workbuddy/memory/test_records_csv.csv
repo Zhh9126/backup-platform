@@ -1,0 +1,20 @@
+﻿备份记录报告
+生成时间,2026-07-19 14:38:44
+
+ID,任务ID,类型,备份方式,开始时间,完成时间,耗时(s),状态,大小,路径,校验和,备注
+28,14,mysql,full,2026-07-19T14:24:08+08:00,2026-07-19T14:24:10+08:00,2.0,failed,0 B,,,本机与SSH远程均失败: [Errno None] Unable to connect to port 22 on 127.0.0.1
+27,13,mysql,full,2026-07-19T14:23:44+08:00,2026-07-19T14:23:45+08:00,1.0,failed,0 B,,,mysqldump 失败: 
+26,2,file,full,2026-07-18T18:36:59+08:00,2026-07-18T18:37:00+08:00,1.0,success,133 B,E:\tmp\20260718_183659__OA__full.tar.gz,8806e0523afcfc74,全量备份完成 | 1 个源 | 133 B
+25,2,file,full,2026-07-18T18:31:44+08:00,2026-07-18T18:31:45+08:00,1.0,success,133 B,E:\tmp\20260718_183144__OA__full.tar.gz,f8316aa27d45f796,全量备份完成 | 1 个源 | 133 B
+24,2,file,full,2026-07-18T18:28:27+08:00,,,running,0 B,,,
+23,2,file,full,2026-07-18T18:27:05+08:00,2026-07-18T18:27:20+08:00,15.0,failed,0 B,,,timed out
+22,2,file,full,2026-07-18T18:25:53+08:00,2026-07-18T18:26:08+08:00,15.0,failed,0 B,,,timed out
+21,2,file,full,2026-07-18T18:24:09+08:00,2026-07-18T18:24:09+08:00,0.0,success,0 B,,,执行异常: property 'extra' of 'FileBackupEngine' object has no setter
+18,3,mysql,full,2026-07-18T18:06:09+08:00,2026-07-18T18:06:10+08:00,1.0,success,20 B,E:\备份管理平台\backup_platform\backups\mysql\3_mysql\20260718_180610__mysql__full.sql.gz,8419dd48d45c2c85,通过 SSH 在数据库服务器(root@192.168.220.150:22)执行 mysqldump 成功 | 20 B
+17,3,mysql,full,2026-07-18T18:04:58+08:00,2026-07-18T18:05:13+08:00,15.0,failed,0 B,,,本机与远程均失败: timed out
+13,2,file,full,2026-07-17T16:47:00+08:00,,,running,0 B,,,
+12,3,mysql,full,2026-07-17T16:46:33+08:00,2026-07-17T16:46:33+08:00,0.0,simulated,382 B,E:\备份管理平台\backup_platform\backups\mysql\3_mysql\20260717_164633__mysql__full.sim,,"仿真备份(占位)成功；缺少客户端工具: mysqldump, mysql（请安装并在 PATH 中）"
+10,2,file,full,2026-07-17T16:23:32+08:00,,,running,0 B,,,
+9,2,file,full,2026-07-17T16:22:59+08:00,,,running,0 B,,,
+4,2,file,full,2026-07-17T16:06:08+08:00,,,running,0 B,,,
+3,2,file,full,2026-07-17T16:05:09+08:00,,,running,0 B,,,

@@ -1,0 +1,34 @@
+{
+  "id": "percona-xtrabackup-24",
+  "name": "Percona XtraBackup 2.4",
+  "version": "2.4.29",
+  "category": "mysql",
+  "description": "Percona XtraBackup 2.4：兼容 MySQL 5.7 / MariaDB 10.2-10.4 的热物理备份工具。",
+  "required_clients": ["xtrabackup"],
+  "supports": ["mysql", "mariadb"],
+  "max_mysql_version": "5.7.99",
+  "tags": ["物理备份", "热备份", "Percona", "MySQL5.7"],
+  "icon": "bi-hdd-rack",
+  "homepage": "https://www.percona.com/software/database-documentations/percona-xtrabackup",
+  "offline_first": true,
+  "packages": {
+    "linux": {
+      "fallback": {
+        "url": "https://downloads.percona.com/downloads/Percona-XtraBackup-2.4/Percona-XtraBackup-2.4.29/binary/tarball/percona-xtrabackup-2.4.29-Linux-x86_64.glibc2.12.tar.gz",
+        "extract_dir": "/opt/xtrabackup24",
+        "binaries": ["bin/xtrabackup"]
+      },
+      "package_managers": {
+        "apt": {
+          "command": "DEBIAN_FRONTEND=noninteractive apt-get install -y wget gnupg lsb-release && wget -qO - https://repo.percona.com/apt/percona-release_latest.generic_all.deb | DEBIAN_FRONTEND=noninteractive dpkg -i && DEBIAN_FRONTEND=noninteractive apt-get install -y percona-xtrabackup-24",
+          "binaries": ["xtrabackup"]
+        },
+        "yum": {
+          "command": "yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm && yum install -y percona-xtrabackup-24",
+          "binaries": ["xtrabackup"]
+        }
+      }
+    }
+  },
+  "verify_after_install": ["xtrabackup --version"]
+}

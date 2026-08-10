@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">容灾演练</div>
+    <div class="page-sub">演练—评估—改进闭环：验证备份可恢复性，发现流程漏洞</div>
+  </div>
+  <button class="btn btn-primary" id="newDrillBtn"><i class="bi bi-activity"></i> 新建演练</button>
+  <button class="btn btn-outline-secondary btn-sm" onclick="loadDrills()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+</div>
+
+<div class="page-card">
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>名称</th><th>任务</th><th>演练类型</th><th>状态</th>
+        <th>评分</th><th>RTO</th><th>RPO</th><th>完成时间</th>
+        <th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="drillTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 趋势与基线 -->
+<div class="page-card mt-3">
+  <div class="card-section-title"><i class="bi bi-graph-up"></i> RTO/RPO 趋势与评分基线</div>
+  <div class="row g-3">
+    <div class="col-lg-8">
+      <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+        <label class="form-label mb-0">趋势时间窗</label>
+        <div class="d-flex align-items-center gap-2">
+          <select class="form-select form-select-sm" id="trendTaskFilter" style="width:auto" onchange="loadDrillTrend()">
+            <option value="">全部任务</option>
+          </select>
+          <select class="form-select form-select-sm" id="trendDays" style="width:auto" onchange="loadDrillTrend()">
+            <option value="30">近 30 天</option>
+            <option value="90" selected>近 90 天</option>
+            <option value="180">近 180 天</option>
+          </select>
+        </div>
+      </div>
+      <div id="trendChart" style="min-height:240px"></div>
+      <div class="d-flex gap-3 mt-2 small">
+        <span><i class="bi bi-square-fill" style="color:#0D9488"></i> RTO（恢复耗时）</span>
+        <span><i class="bi bi-square-fill" style="color:#0F766E"></i> RPO（数据丢失窗口）</span>
+      </div>
+      <div class="small text-muted mt-1" id="trendSummary"></div>
+    </div>
+    <div class="col-lg-4">
+      <label class="form-label">评分基线对比（按任务 vs 保护策略目标）</label>
+      <select class="form-select form-select-sm mb-2" id="baselineTask" onchange="loadDrillBaseline()"></select>
+      <div id="baselineCards"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 季度演练排程 -->
+<div class="page-card mt-3">
+  <div class="card-section-title"><i class="bi bi-calendar-check"></i> 季度演练排程（制度化）</div>
+  <form id="scheduleForm" class="row g-3">
+    <div class="col-md-2">
+      <label class="form-label">启用排程</label>
+      <div class="form-check form-switch mt-2">
+        <input class="form-check-input" type="checkbox" id="schEnabled">
+      </div>
+    </div>
+    <div class="col-md-2">
+      <label class="form-label">频率</label>
+      <select class="form-select" id="schFrequency">
+        <option value="quarterly">每季度</option>
+        <option value="monthly">每月</option>
+        <option value="weekly">每周</option>
+      </select>
+    </div>
+    <div class="col-md-4">
+      <label class="form-label">目标任务（可多选）</label>
+      <select class="form-select" id="schTargets" multiple size="3"></select>
+    </div>
+    <div class="col-md-2">
+      <label class="form-label">下次执行</label>
+      <div id="schNextRun" class="mt-2 small text-muted">—</div>
+    </div>
+    <div class="col-md-2 d-flex align-items-end gap-2">
+      <button type="button" class="btn btn-primary btn-sm" id="schSaveBtn"><i class="bi bi-save"></i> 保存</button>
+      <button type="button" class="btn btn-outline-secondary btn-sm" id="schRunBtn"><i class="bi bi-play-fill"></i> 立即执行</button>
+    </div>
+  </form>
+  <div class="small text-muted mt-2">排程到期后将自动对所选任务触发一次全量恢复演练，并自动推进下次执行时间；同时与 AI 告警的「演练超期(drill_overdue)」判定联动。</div>
+</div>
+
+<!-- 新建演练 模态框 -->
+<div class="modal fade" id="drillModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">新建容灾演练</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label class="form-label">演练名称 *</label>
+          <input class="form-control" id="drill_name" placeholder="如 Q3 恢复演练">
+        </div>
+        <div class="mb-3">
+          <label class="form-label">关联备份任务</label>
+          <select class="form-select" id="drill_task_id"></select>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">演练类型</label>
+          <select class="form-select" id="drill_type">
+            <option value="full_recovery">全量恢复演练</option>
+            <option value="partial">对象级恢复演练</option>
+            <option value="table_recovery">单表恢复演练</option>
+          </select>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">演练时间</label>
+          <input type="datetime-local" class="form-control" id="drill_scheduled">
+        </div>
+        <div class="mb-3">
+          <label class="form-label">备注</label>
+          <textarea class="form-control" id="drill_notes" rows="2" placeholder="可填写演练说明"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="drillSaveBtn">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 演练详情 模态框 -->
+<div class="modal fade" id="drillReportModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">演练报告</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <pre id="drillReportContent" style="background:#1E293B;color:#E2E8F0;padding:16px;border-radius:8px;max-height:60vh;overflow-y:auto;font-size:13px;line-height:1.6;white-space:pre-wrap;"></pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="alert alert-info mt-3" role="alert">
+  <i class="bi bi-info-circle"></i> <strong>演练机制</strong>：参考论文《标准化容灾演练体系》，核心系统建议<strong>每季度一次全流程切换演练</strong>，重要系统每半年一次。演练自动验证备份有效性并生成评分报告，得分<60 需立即整改。
+</div>
+{% endblock %}

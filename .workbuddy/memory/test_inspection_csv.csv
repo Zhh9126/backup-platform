@@ -1,0 +1,25 @@
+﻿备份任务巡检报告
+生成时间,2026-07-19 14:38:43
+
+ID,任务ID,任务名,类型,巡检时间,结果,详情,触发方式
+21,2,OA,file,2026-07-19T14:34:27+08:00,pass,[ok] SSH 主机: 已纳管 mysql; [ok] 目标目录: 本地 E:\tmp; [ok] 调度: 手动执行（无调度）; [ok] 上次运行: 最近一次状态：success,manual
+20,3,mysql,mysql,2026-07-19T14:34:27+08:00,warn,[ok] 连通性: 源已配置（客户端缺失(mysql)，无法验证连接）; [warn] 调度: 已启用但未配置调度，可能长期无新备份; [ok] 上次运行: 最近一次状态：success,manual
+19,13,test-api-renamed,mysql,2026-07-19T14:34:27+08:00,fail,[ok] 连通性: 源已配置（客户端缺失(mysql)，无法验证连接）; [warn] 调度: 已启用但未配置调度，可能长期无新备份; [fail] 上次运行: 最近一次备份失败,manual
+18,14,test-api-renamed,mysql,2026-07-19T14:34:27+08:00,fail,[ok] 连通性: 源已配置（客户端缺失(mysql)，无法验证连接）; [warn] 调度: 已启用但未配置调度，可能长期无新备份; [fail] 上次运行: 最近一次备份失败,manual
+17,2,OA,file,2026-07-19T14:24:33+08:00,pass,[ok] SSH 主机: 已纳管 mysql; [ok] 目标目录: 本地 E:\tmp; [ok] 调度: 手动执行（无调度）; [ok] 上次运行: 最近一次状态：success,manual
+16,3,mysql,mysql,2026-07-19T14:24:33+08:00,warn,[ok] 连通性: 源已配置（客户端缺失(mysql)，无法验证连接）; [warn] 调度: 已启用但未配置调度，可能长期无新备份; [ok] 上次运行: 最近一次状态：success,manual
+15,13,test-api-renamed,mysql,2026-07-19T14:24:33+08:00,fail,[ok] 连通性: 源已配置（客户端缺失(mysql)，无法验证连接）; [warn] 调度: 已启用但未配置调度，可能长期无新备份; [fail] 上次运行: 最近一次备份失败,manual
+14,14,test-api-renamed,mysql,2026-07-19T14:24:33+08:00,fail,[ok] 连通性: 源已配置（客户端缺失(mysql)，无法验证连接）; [warn] 调度: 已启用但未配置调度，可能长期无新备份; [fail] 上次运行: 最近一次备份失败,manual
+13,15,test-api-renamed,mysql,2026-07-19T14:24:33+08:00,fail,[ok] 连通性: 源已配置（客户端缺失(mysql)，无法验证连接）; [warn] 调度: 已启用但未配置调度，可能长期无新备份; [fail] 上次运行: 最近一次备份失败,manual
+12,2,OA,file,2026-07-18T18:42:38+08:00,pass,[ok] SSH 主机: 已纳管 mysql; [ok] 目标目录: 本地 E:\tmp; [ok] 调度: 手动执行（无调度）; [ok] 上次运行: 最近一次状态：success,manual
+11,3,mysql,mysql,2026-07-18T18:42:38+08:00,warn,[ok] 连通性: 源已配置（客户端缺失(mysql)，无法验证连接）; [warn] 调度: 已启用但未配置调度，可能长期无新备份; [ok] 上次运行: 最近一次状态：success,manual
+10,2,OA,file,2026-07-18T18:39:39+08:00,warn,[warn] 连通性: 未知数据库类型: file; [warn] 调度: 未启用或未配置调度，可能长期无新备份; [ok] 上次运行: 最近一次状态：success,manual
+9,3,mysql,mysql,2026-07-18T18:39:39+08:00,warn,[warn] 连通性: 客户端缺失(mysql)，无法验证连接; [warn] 调度: 未启用或未配置调度，可能长期无新备份; [ok] 上次运行: 最近一次状态：success,manual
+8,2,OA,file,2026-07-18T18:37:59+08:00,warn,[warn] 连通性: 未知数据库类型: file; [warn] 调度: 未启用或未配置调度，可能长期无新备份; [ok] 上次运行: 最近一次状态：success,manual
+7,3,mysql,mysql,2026-07-18T18:37:59+08:00,warn,[warn] 连通性: 客户端缺失(mysql)，无法验证连接; [warn] 调度: 未启用或未配置调度，可能长期无新备份; [ok] 上次运行: 最近一次状态：success,manual
+6,2,OA,file,2026-07-18T18:02:43+08:00,warn,[warn] 连通性: 未知数据库类型: file; [warn] 调度: 未启用或未配置调度，可能长期无新备份; [warn] 上次运行: 从未执行过备份,manual
+5,3,mysql,mysql,2026-07-18T18:02:43+08:00,warn,[warn] 连通性: 客户端缺失(mysql)，无法验证连接; [warn] 调度: 未启用或未配置调度，可能长期无新备份; [ok] 上次运行: 最近一次状态：simulated,manual
+4,2,OA,file,2026-07-18T18:00:06+08:00,warn,[warn] 连通性: 未知数据库类型: file; [warn] 调度: 未启用或未配置调度，可能长期无新备份; [warn] 上次运行: 从未执行过备份,manual
+3,3,mysql,mysql,2026-07-18T18:00:06+08:00,warn,[warn] 连通性: 客户端缺失(mysql)，无法验证连接; [warn] 调度: 未启用或未配置调度，可能长期无新备份; [ok] 上次运行: 最近一次状态：simulated,manual
+2,2,OA,file,2026-07-18T17:58:45+08:00,warn,[warn] 连通性: 未知数据库类型: file; [warn] 调度: 未启用或未配置调度，可能长期无新备份; [warn] 上次运行: 从未执行过备份,manual
+1,3,mysql,mysql,2026-07-18T17:58:45+08:00,warn,[warn] 连通性: 客户端缺失(mysql)，无法验证连接; [warn] 调度: 未启用或未配置调度，可能长期无新备份; [ok] 上次运行: 最近一次状态：simulated,manual

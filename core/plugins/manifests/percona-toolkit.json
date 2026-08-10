@@ -1,0 +1,33 @@
+{
+  "id": "percona-toolkit",
+  "name": "Percona Toolkit",
+  "version": "3.5.7",
+  "category": "mysql",
+  "description": "Percona Toolkit：业界领先的 MySQL/MariaDB 命令行工具集（pt-online-schema-change、pt-table-checksum 等），常用于一致性校验与备份校验。",
+  "required_clients": ["pt-online-schema-change", "pt-table-checksum", "pt-mysql-summary"],
+  "supports": ["mysql", "mariadb"],
+  "tags": ["工具集", "Percona", "MySQL", "校验"],
+  "icon": "bi-tools",
+  "homepage": "https://www.percona.com/database-tools/percona-toolkit",
+  "offline_first": true,
+  "packages": {
+    "linux": {
+      "fallback": {
+        "url": "https://downloads.percona.com/downloads/percona-toolkit/3.5.7/binary/tarball/percona-toolkit-3.5.7_x86_64.tar.gz",
+        "extract_dir": "/opt/percona-toolkit",
+        "binaries": ["bin/pt-online-schema-change", "bin/pt-table-checksum", "bin/pt-mysql-summary"]
+      },
+      "package_managers": {
+        "apt": {
+          "command": "DEBIAN_FRONTEND=noninteractive apt-get install -y percona-toolkit",
+          "binaries": ["pt-online-schema-change", "pt-table-checksum", "pt-mysql-summary"]
+        },
+        "yum": {
+          "command": "yum install -y percona-toolkit",
+          "binaries": ["pt-online-schema-change", "pt-table-checksum", "pt-mysql-summary"]
+        }
+      }
+    }
+  },
+  "verify_after_install": ["pt-mysql-summary --help"]
+}

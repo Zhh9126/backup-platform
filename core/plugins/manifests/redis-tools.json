@@ -1,0 +1,33 @@
+{
+  "id": "redis-tools",
+  "name": "Redis 客户端工具 (redis-cli)",
+  "version": "7.4",
+  "category": "redis",
+  "description": "Redis 官方命令行客户端 redis-cli，用于 RDB 快照拉取与基础运维。",
+  "required_clients": ["redis-cli"],
+  "supports": ["redis"],
+  "tags": ["RDB快照", "Redis", "命令行"],
+  "icon": "bi-lightning-charge",
+  "homepage": "https://redis.io/docs/getting-started/",
+  "offline_first": true,
+  "packages": {
+    "linux": {
+      "fallback": {
+        "url": "https://github.com/redis-windows/redis-windows/releases/download/7.4.0/redis-7.4.0-windows-x64.zip",
+        "extract_dir": "/opt/redis-tools",
+        "binaries": ["redis-cli"]
+      },
+      "package_managers": {
+        "apt": {
+          "command": "DEBIAN_FRONTEND=noninteractive apt-get install -y redis-tools",
+          "binaries": ["redis-cli"]
+        },
+        "yum": {
+          "command": "yum install -y redis",
+          "binaries": ["redis-cli"]
+        }
+      }
+    }
+  },
+  "verify_after_install": ["redis-cli --version"]
+}

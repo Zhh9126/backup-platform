@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block content %}
+<link rel="stylesheet" href="/static/css/agent.css">
+
+<div class="agent-wrap" id="agentWrap">
+
+  <!-- ============ 左侧：会话栏 ============ -->
+  <aside class="agent-side">
+    <div class="agent-side-head">
+      <span class="agent-side-title">会话</span>
+      <div class="agent-side-actions">
+        <button class="btn btn-sm btn-outline-primary" type="button" id="agentNewBtn" title="新建对话">
+          <i class="bi bi-plus"></i>
+        </button>
+        <button class="btn btn-sm btn-outline-secondary" type="button" id="agentRefreshBtn" title="刷新会话列表">
+          <i class="bi bi-arrow-clockwise"></i>
+        </button>
+      </div>
+    </div>
+
+    <div class="agent-session-list" id="agentSessionList">
+      <div class="agent-session-empty">正在加载会话…</div>
+    </div>
+
+    <div class="agent-session-foot" id="agentSessionFoot">共 0 个会话</div>
+  </aside>
+
+  <!-- ============ 右侧：对话主区 ============ -->
+  <section class="agent-main">
+
+    <div class="agent-header">
+      <button class="agent-side-toggle" type="button" id="agentSideToggle" title="收起 / 展开会话栏" aria-label="收起或展开会话栏">
+        <i class="bi bi-list"></i>
+      </button>
+      <div class="agent-header-text">
+        <div class="agent-current-title" id="agentCurrentTitle">未选择会话</div>
+        <div class="agent-current-meta" id="agentCurrentMeta">请新建或选择一个会话</div>
+      </div>
+    </div>
+
+    <div class="agent-msg-area" id="agentMessages">
+      <div class="agent-empty">
+        <i class="bi bi-robot"></i>
+        <div class="ae-title">AI 智能助手</div>
+        <div>可查询备份任务、巡检结果与存储用量，涉及危险操作时会先向你确认。</div>
+        <div class="agent-actions agent-empty-actions">
+          <span class="agent-tip" data-tip="列出所有备份任务">列出所有备份任务</span>
+          <span class="agent-tip" data-tip="最近备份有没有失败？">最近备份有没有失败？</span>
+          <span class="agent-tip" data-tip="帮我跑一次巡检">帮我跑一次巡检</span>
+          <span class="agent-tip" data-tip="查询存储用量">查询存储用量</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="agent-compose">
+      <textarea class="agent-input" id="agentInput" rows="1"
+                placeholder="输入问题，例如：列出所有备份任务 / 帮我跑一次巡检"></textarea>
+
+      <div class="agent-compose-bottom">
+        <span class="agent-status" id="agentStatusHint">就绪</span>
+        <button class="agent-send" type="button" id="agentSendBtn" title="发送（Enter 发送，Shift+Enter 换行）">
+          <i class="bi bi-send"></i>
+        </button>
+      </div>
+
+      <div class="agent-actions">
+        <span class="agent-tip" data-tip="列出所有备份任务">列出所有备份任务</span>
+        <span class="agent-tip" data-tip="最近备份有没有失败？">最近备份有没有失败？</span>
+        <span class="agent-tip" data-tip="帮我跑一次巡检">帮我跑一次巡检</span>
+        <span class="agent-tip" data-tip="查询存储用量">查询存储用量</span>
+      </div>
+    </div>
+
+  </section>
+</div>
+
+<!-- ============ 危险操作确认弹窗 ============ -->
+<div class="modal fade" id="agentConfirmModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-shield-exclamation me-2"></i>确认执行危险操作</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="agent-confirm-row">
+          <span class="agent-confirm-label">工具</span>
+          <span class="agent-confirm-tool" id="agentConfirmTool">-</span>
+        </div>
+        <div class="agent-confirm-row">
+          <span class="agent-confirm-label">参数</span>
+          <pre class="agent-confirm-args" id="agentConfirmArgs">{}</pre>
+        </div>
+        <div class="agent-confirm-row">
+          <span class="agent-confirm-label">原因</span>
+          <span class="agent-confirm-reason" id="agentConfirmReason">-</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" type="button" id="agentConfirmReject">取消</button>
+        <button class="btn btn-danger" type="button" id="agentConfirmApprove">确认执行</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  /*
+   * 说明：app.js 中快捷提问的点击委托绑定在 #agentMessages 上（空状态里的 .agent-tip 可直接生效）。
+   * 输入区 .agent-compose 内的 .agent-tip 不在该委托范围内，此处仅补一段作用域受限的转发逻辑：
+   * 填充 #agentInput 后复用现有的 #agentSendBtn 点击流程，不重复实现任何业务逻辑。
+   */
+  (function bindAgentComposeTips() {
+    var compose = document.querySelector(".agent-compose");
+    if (!compose) return;
+    compose.addEventListener("click", function (ev) {
+      var tip = ev.target.closest ? ev.target.closest(".agent-tip") : null;
+      if (!tip) return;
+      var input = document.getElementById("agentInput");
+      var sendBtn = document.getElementById("agentSendBtn");
+      if (!input || input.disabled) return;
+      input.value = tip.getAttribute("data-tip") || tip.textContent || "";
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      if (sendBtn) sendBtn.click();
+    });
+  })();
+</script>
+{% endblock %}

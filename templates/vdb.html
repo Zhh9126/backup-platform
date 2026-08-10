@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">虚拟数据库（VDB / 测试库管理）</div>
+    <div class="page-sub">从备份快速拉起隔离的测试库实例，一份副本 1:N 多场景复用</div>
+  </div>
+  <button class="btn btn-outline-secondary btn-sm" onclick="loadVdbs()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+</div>
+
+<div class="page-card">
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>实例名</th><th>类型</th><th>源记录</th>
+        <th>端口</th><th>连接串</th><th>状态</th>
+        <th>创建时间</th><th>过期时间</th><th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="vdbTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="alert alert-info mt-3" role="alert">
+  <i class="bi bi-info-circle"></i> <strong>使用说明</strong>：在「备份记录」页选中某条成功记录 → 点击「克隆」按钮 → 填实例名和 TTL → 系统将自动创建新库并导入数据。
+  过期后系统自动 DROP 清理。
+</div>
+{% endblock %}

@@ -1,0 +1,88 @@
+# AI Agent Sequence Diagrams
+
+## 7.1 普通问答流程
+
+sequenceDiagram
+    participant U as 用户
+    participant FE as agent.js
+    participant API as /api/agent/chat
+    participant AG as AIAgent
+    participant SM as SessionManager
+    participant LLM as 外部LLM
+
+    U->>FE: 输入"什么是RPO？"
+    FE->>API: POST {session_id, message}
+    API->>AG: process_message(session_id, msg)
+    AG->>SM: build_context(session_id, max_tokens=4000)
+    SM-->>AG: [system, 历史5条, 当前msg]
+    AG->>AG: _build_system_prompt() + _compose_messages()
+    AG->>LLM: _call_model(prompt)
+    LLM-->>AG: {"type":"answer","content":"RPO是..."}
+    AG->>AG: _parse_response → 纯问答
+    AG->>SM: add_message(role=assistant, content)
+    AG-->>API: {type:"answer", content:"RPO是..."}
+    API-->>FE: JSON response
+    FE-->>U: 渲染回答气泡
+
+## 7.2 工具调用流程
+
+sequenceDiagram
+    participant U as 用户
+    participant FE as agent.js
+    participant API as /api/agent/chat
+    participant AG as AIAgent
+    participant SM as SessionManager
+    participant TE as ToolExecutor
+    participant BAPI as 业务API
+    participant LLM as 外部LLM
+
+    U->>FE: "最近备份有没有失败？"
+    FE->>API: POST {session_id, message}
+    API->>AG: process_message(session_id, msg)
+    AG->>SM: build_context(session_id)
+    AG->>LLM: _call_model(prompt+历史)
+    LLM-->>AG: {"type":"tool_call","tool":"list_recent_records","args":{"limit":10}}
+    AG->>AG: _parse_tool_call → 不需确认
+    AG->>SM: add_message(role=assistant, tool_calls=...)
+    AG->>TE: execute_tool("list_recent_records", {limit:10})
+    TE->>BAPI: GET /api/backup-records?limit=10 (内部HTTP+cookie透传)
+    BAPI-->>TE: {records: [...]}
+    TE-->>AG: {ok:true, result:{records}}
+    AG->>SM: add_message(role=tool, tool_result=...)
+    AG->>LLM: 再次调用(ReAct第二轮: 历史+工具结果+请求综合回答)
+    LLM-->>AG: {"type":"answer","content":"最近10条记录中有2条失败..."}
+    AG->>SM: add_message(role=assistant, content=...)
+    AG-->>API: {type:"answer", content:"最近10条...", tool_trace:[...]}
+    API-->>FE: JSON response
+    FE-->>U: 渲染回答 + 工具调用卡片
+
+## 7.3 危险操作确认流程
+
+sequenceDiagram
+    participant U as 用户
+    participant FE as agent.js
+    participant API as /api/agent/chat
+    participant AG as AIAgent
+    participant LLM as 外部LLM
+    participant CONF as 确认API
+    participant TE as ToolExecutor
+
+    U->>FE: "帮我跑一次全量巡检"
+    FE->>API: POST {session_id, message}
+    API->>AG: process_message(session_id, msg)
+    AG->>LLM: _call_model(prompt+历史)
+    LLM-->>AG: {"type":"confirm_required","tool":"run_inspection","args":{"scope":"full"},"reason":"全量巡检影响性能"}
+    AG->>AG: 检查 Tool.requires_confirm=true ✓
+    AG-->>API: {type:"confirm_required", tool, args, reason, pending_id}
+    API-->>FE: JSON response
+    FE->>FE: 弹出确认对话框"全量巡检影响性能，是否继续？"
+    U->>FE: 点击"确认执行"
+    FE->>CONF: POST /api/agent/confirm {pending_id, confirmed:true}
+    CONF->>AG: confirm_execute(pending_id)
+    AG->>TE: execute_tool("run_inspection", {scope:"full"})
+    TE-->>AG: {ok:true, result:{report_id, summary}}
+    AG->>LLM: 综合回答
+    LLM-->>AG: {"type":"answer","content":"全量巡检已完成..."}
+    AG-->>CONF: {type:"answer", content:"巡检已完成..."}
+    CONF-->>FE: JSON response
+    FE-->>U: 渲染结果

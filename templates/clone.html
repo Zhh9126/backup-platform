@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">克隆服务</div>
+    <div class="page-sub">标准化克隆：申请 → ITSM 审批 → 拉起 VDB → 生命周期 → 自动销毁</div>
+  </div>
+  <button class="btn btn-primary" id="newCloneBtn"><i class="bi bi-plus-lg"></i> 申请克隆</button>
+  <button class="btn btn-outline-secondary btn-sm" onclick="loadClones()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+</div>
+
+<div class="page-card">
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>源备份记录</th><th>源库类型</th><th>目标环境</th><th>状态</th>
+        <th>ITSM 工单</th><th>申请人</th><th>到期</th><th>VDB</th>
+        <th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="cloneTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 申请克隆 模态框 -->
+<div class="modal fade" id="cloneModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">申请克隆</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label class="form-label">源备份记录 *</label>
+          <select class="form-select" id="c_source_record_id"></select>
+          <div class="form-text">选择一个已生成的备份记录作为克隆源（将从中拉起隔离测试库）。</div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">目标环境 *</label>
+          <input class="form-control" id="c_target_env" placeholder="如 test / dev / staging">
+        </div>
+        <div class="mb-3">
+          <label class="form-label">申请人</label>
+          <input class="form-control" id="c_requested_by" placeholder="默认 anonymous">
+        </div>
+        <div class="mb-3">
+          <label class="form-label">备注</label>
+          <textarea class="form-control" id="c_note" rows="2" placeholder="可填写用途说明"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="cloneSaveBtn">提交申请</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="alert alert-info mt-3" role="alert">
+  <i class="bi bi-info-circle"></i> <strong>克隆服务标准化</strong>：开发自助申请 → <code>ITSM</code> 审批（默认内置审批，可插拔钉钉 / ServiceNow）→ 审批通过后按源库类型拉起 VDB 实例 → 到期自动销毁。DEMO 模式下克隆自动仿真，无需真实数据库客户端。
+</div>
+{% endblock %}

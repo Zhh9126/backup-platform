@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">恢复记录</div>
+    <div class="page-sub">查看与追溯历次数据恢复操作结果</div>
+  </div>
+  <div>
+    <input type="text" class="form-control d-inline-block w-auto" id="restoreRecordSearch" placeholder="搜索业务系统 / IP…">
+  </div>
+</div>
+<div class="page-card">
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>备份记录</th><th>业务系统</th><th>备份 IP</th><th>备份类型</th><th>备份时间</th>
+        <th>目标主机</th><th>目标库</th><th>恢复开始</th><th>状态</th><th>操作人</th><th>说明</th>
+      </tr></thead>
+      <tbody id="restoreRecordsTable"></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

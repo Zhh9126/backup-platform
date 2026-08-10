@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">巡检</div>
+    <div class="page-sub">对备份任务做健康体检：连通性、调度、最近运行状态；发现异常第一时间通知</div>
+  </div>
+  <button class="btn btn-primary" id="runInspectionBtn"><i class="bi bi-shield-check"></i> 立即巡检</button>
+  <button class="btn btn-outline-secondary btn-sm" onclick="refreshInspection()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+  <div class="btn-group btn-group-sm" role="group">
+    <button class="btn btn-outline-primary" onclick="exportInspection('csv')" title="CSV 导出"><i class="bi bi-filetype-csv"></i> CSV</button>
+    <button class="btn btn-outline-primary" onclick="exportInspection('docx')" title="Word 报告"><i class="bi bi-file-earmark-word"></i> Word</button>
+    <button class="btn btn-outline-primary" onclick="exportInspection('pdf')" title="PDF 报告"><i class="bi bi-file-earmark-pdf"></i> PDF</button>
+  </div>
+</div>
+
+<!-- 巡检调度配置卡 -->
+<div class="page-card mb-3">
+  <div class="card-section-title"><i class="bi bi-clock-history"></i> 定时巡检</div>
+  <p class="form-text-hint mb-3">配置后由后台调度器按 cron 表达式自动巡检（与「立即巡检」并存，定时结果也会记录到下方表格，触发方式标记为 schedule）。</p>
+  <div class="row g-3 align-items-end">
+    <div class="col-md-2">
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" id="ins_enabled">
+        <label class="form-check-label" for="ins_enabled">启用定时巡检</label>
+      </div>
+    </div>
+    <div class="col-md-4">
+      <label class="form-label">Cron 表达式</label>
+      <input class="form-control font-monospace" id="ins_cron" placeholder="0 9 * * *">
+      <div class="form-text">每日 9 点：<code>0 9 * * *</code>　|　每 6 小时：<code>0 */6 * * *</code>　|　每周一 8 点：<code>0 8 * * 1</code></div>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label">下次执行</label>
+      <div class="form-control-plaintext" id="ins_next_run"><span class="text-muted">未启用</span></div>
+    </div>
+    <div class="col-md-3 text-end">
+      <button class="btn btn-primary" id="insSaveBtn"><i class="bi bi-save"></i> 保存并生效</button>
+    </div>
+  </div>
+</div>
+
+<div class="page-card">
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>任务</th><th>类型</th><th>状态</th>
+        <th>明细</th><th>触发</th><th>时间</th>
+      </tr></thead>
+      <tbody id="inspectionTable"></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

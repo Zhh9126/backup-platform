@@ -1,0 +1,202 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">系统设置</div>
+    <div class="page-sub">调度状态、平台信息</div>
+  </div>
+</div>
+
+<div class="row g-3 mb-3">
+  <div class="col-md-6">
+    <div class="page-card">
+      <h6 style="font-size:var(--font-size-base);font-weight:600;color:var(--text-primary);margin-bottom:var(--space-md)">调度器</h6>
+      <div id="schedInfo" class="small"></div>
+      <button class="btn btn-sm btn-outline-primary mt-2" id="reloadSchedBtn">
+        <i class="bi bi-arrow-repeat"></i> 重新加载调度
+      </button>
+    </div>
+  </div>
+  <div class="col-md-6">
+    <div class="page-card">
+      <h6 style="font-size:var(--font-size-base);font-weight:600;color:var(--text-primary);margin-bottom:var(--space-md)">平台信息</h6>
+      <div id="metaInfo" class="small"></div>
+    </div>
+  </div>
+</div>
+
+<div class="page-card">
+  <div class="card-section-title"><i class="bi bi-bell"></i> 通知配置</div>
+  <p class="form-text-hint mb-3">备份/同步失败、巡检异常时，通过以下渠道第一时间告警。邮件渠道使用 SMTP 发送。</p>
+  <div class="row g-3">
+    <div class="col-12">
+      <div class="form-check form-check-inline">
+        <input class="form-check-input" type="checkbox" id="n_enabled">
+        <label class="form-check-label">启用通知</label>
+      </div>
+      <div class="form-check form-check-inline">
+        <input class="form-check-input" type="checkbox" id="n_on_success">
+        <label class="form-check-label">成功时通知</label>
+      </div>
+      <div class="form-check form-check-inline">
+        <input class="form-check-input" type="checkbox" id="n_on_failure" checked>
+        <label class="form-check-label">失败时通知</label>
+      </div>
+    </div>
+    <div class="col-md-4"><label class="form-label">SMTP 主机</label>
+      <input class="form-control" id="n_smtp_host" placeholder="如 smtp.qq.com / smtp.163.com / smtp.gmail.com">
+      <div class="form-text">注意是 SMTP <b>服务器地址</b>，不是邮箱地址本身</div>
+    </div>
+    <div class="col-md-2"><label class="form-label">端口</label>
+      <input class="form-control" id="n_smtp_port" type="number" value="465">
+      <div class="form-text">QQ/163/Gmail: 465(SSL) 或 587(STARTTLS)</div>
+    </div>
+    <div class="col-md-3"><label class="form-label">SMTP 用户</label><input class="form-control" id="n_smtp_user" placeholder="完整邮箱地址"></div>
+    <div class="col-md-3"><label class="form-label">SMTP 密码 / 授权码</label>
+      <input class="form-control" id="n_smtp_password" type="password" placeholder="留空表示不修改">
+      <div class="form-text">
+        <span class="text-danger">QQ/163/Gmail 必须用「<b>授权码</b>」，不是登录密码。</span>
+        <span class="text-muted d-block" id="n_pw_status">已保存（页面不回显明文，留在 DB 加密）</span>
+      </div>
+    </div>
+    <div class="col-md-4"><label class="form-label">发件人</label><input class="form-control" id="n_from_addr" placeholder="backup@your.com"></div>
+    <div class="col-md-5"><label class="form-label">收件人（逗号分隔）</label><input class="form-control" id="n_to" placeholder="ops@your.com, dba@your.com"></div>
+    <div class="col-md-3 d-flex align-items-end">
+      <div class="form-check">
+        <input class="form-check-input" type="checkbox" id="n_use_tls" checked>
+        <label class="form-check-label">使用 TLS/SSL（推荐）</label>
+      </div>
+    </div>
+    <div class="col-12">
+      <button class="btn btn-primary" id="saveNotifyBtn"><i class="bi bi-save"></i> 保存通知配置</button>
+      <button class="btn btn-outline-info ms-2" id="testNotifyBtn" type="button"><i class="bi bi-envelope-paper"></i> 发送测试邮件</button>
+      <span class="form-text ms-2 text-muted">先「保存」再「测试」，失败会有具体错误提示</span>
+    </div>
+  </div>
+</div>
+
+<!-- AI 预测告警配置 -->
+<div class="page-card">
+  <div class="card-section-title"><i class="bi bi-robot"></i> AI 预测告警配置</div>
+  <p class="form-text-hint mb-3">规则 + 轻量统计引擎预测备份失败 / 存储将满 / 链路劣化 / 演练超期 / RPO 突破风险。配置也可在「AI 预测告警」页面修改。</p>
+  <div class="row g-3">
+    <div class="col-md-3">
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" id="ai_cfg_enabled" checked>
+        <label class="form-check-label" for="ai_cfg_enabled">启用 AI 预测</label>
+      </div>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small">记录阈值（最低级别）</label>
+      <select class="form-select form-select-sm" id="ai_cfg_min_level">
+        <option value="low">low</option>
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+      </select>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small">自动通知级别</label>
+      <select class="form-select form-select-sm" id="ai_cfg_notify_on">
+        <option value="medium">medium</option>
+        <option value="high">high</option>
+        <option value="critical">critical</option>
+      </select>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small">分析周期（小时）</label>
+      <input type="number" class="form-control form-control-sm" id="ai_cfg_interval" value="6" min="1">
+    </div>
+  </div>
+  <div class="mt-3">
+    <button class="btn btn-primary btn-sm" id="saveAiConfigBtn">
+      <i class="bi bi-save me-1"></i>保存 AI 告警配置
+    </button>
+  </div>
+  <div class="alert alert-danger d-none mt-3" id="aiCfgError"></div>
+</div>
+
+<!-- AI 模型接入配置 -->
+<div class="page-card">
+  <div class="card-section-title">
+    <i class="bi bi-cpu me-1"></i> AI 模型接入配置
+    <span class="badge ms-2" id="aiModelStatusBadge">未配置</span>
+  </div>
+  <p class="form-text-hint mb-3">配置远程大模型 API 或本地模型路径，启用后 AI 预测引擎将调用模型进行深度推理；未启用或模型调用失败时自动降级到规则引擎。</p>
+
+  <!-- 折叠开关 -->
+  <div class="mb-2">
+    <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse" data-bs-target="#aiModelConfigCollapse" aria-expanded="false">
+      <i class="bi bi-chevron-expand me-1"></i>展开/折叠模型配置
+    </button>
+  </div>
+
+  <div class="collapse" id="aiModelConfigCollapse">
+    <div class="row g-3">
+      <div class="col-md-3">
+        <div class="form-check form-switch">
+          <input class="form-check-input" type="checkbox" id="ai_model_enabled">
+          <label class="form-check-label" for="ai_model_enabled">启用模型推理</label>
+        </div>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small">厂商</label>
+        <select class="form-select form-select-sm" id="ai_model_provider" onchange="toggleAiModelProviderFields()">
+          <option value="openai">OpenAI</option>
+          <option value="moma">中国移动 MoMA</option>
+          <option value="zhipu">智谱 Zhipu</option>
+          <option value="qwen">通义千问 Qwen</option>
+          <option value="deepseek">DeepSeek</option>
+          <option value="anthropic">Anthropic</option>
+          <option value="ollama">Ollama</option>
+          <option value="local">本地模型</option>
+          <option value="custom">自定义</option>
+        </select>
+      </div>
+      <div class="col-md-6 ai-model-remote-field">
+        <label class="form-label small">端点 URL</label>
+        <input type="text" class="form-control form-control-sm" id="ai_model_endpoint" placeholder="如 https://api.openai.com 或 http://localhost:11434">
+      </div>
+      <div class="col-md-6 ai-model-remote-field">
+        <label class="form-label small">API Key</label>
+        <input type="password" class="form-control form-control-sm" id="ai_model_api_key" placeholder="留空表示不修改已保存的密钥">
+        <div class="form-text"><span id="aiApiKeyStatus" class="text-muted">未设置</span></div>
+      </div>
+      <div class="col-md-6 ai-model-remote-field">
+        <label class="form-label small">模型名</label>
+        <input type="text" class="form-control form-control-sm" id="ai_model_model_name" placeholder="如 gpt-4o-mini / claude-3-5-sonnet / qwen2.5:7b">
+        <div class="form-text" id="aiModelQuickSelect">
+          <span class="text-muted small">快速选择：</span>
+          <!-- 动态填充：由 JS 根据 provider_presets 渲染 -->
+        </div>
+      </div>
+      <div class="col-md-6 ai-model-local-field d-none">
+        <label class="form-label small">本地模型路径</label>
+        <input type="text" class="form-control form-control-sm" id="ai_model_local_path" placeholder="如 /data/models/qwen2.5-7b">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small">请求超时（秒）</label>
+        <input type="number" class="form-control form-control-sm" id="ai_model_timeout" value="30" min="5" max="120">
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small">最大输入字符</label>
+        <input type="number" class="form-control form-control-sm" id="ai_model_max_chars" value="8000" min="500" max="50000">
+      </div>
+      <div class="col-md-12">
+        <label class="form-label small">自定义提示词模板（可选，留空用默认模板）</label>
+        <textarea class="form-control form-control-sm" id="ai_model_prompt_template" rows="3" placeholder="可用占位符：{metric} {predicted_content} {basis_json} {details_json}"></textarea>
+      </div>
+      <div class="col-md-12 d-flex gap-2 align-items-center">
+        <button class="btn btn-primary btn-sm" id="saveAiModelConfigBtn">
+          <i class="bi bi-save me-1"></i>保存模型配置
+        </button>
+        <button class="btn btn-outline-info btn-sm" id="testAiModelBtn" type="button">
+          <i class="bi bi-plug me-1"></i>测试连接
+        </button>
+      </div>
+    </div>
+  </div>
+  <div class="alert alert-danger d-none mt-3" id="aiModelCfgError"></div>
+  <div class="alert alert-success d-none mt-3" id="aiModelTestResult"></div>
+  <div class="small text-muted d-none mt-1" id="aiModelTestHint"></div>
+</div>
+{% endblock %}

@@ -1,0 +1,7 @@
+backups/packages/ 
+*.tar.xz 
+*.tar.gz 
+*.gz 
+logs/ 
+*.pyc 
+__pycache__/ 

@@ -1,0 +1,354 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">数据库部署</div>
+    <div class="page-sub">在新建空机器上部署数据库实例（用于恢复演练）</div>
+  </div>
+  <button class="btn btn-primary" id="newDeployBtn"><i class="bi bi-rocket-takeoff"></i> 新建部署</button>
+  <button class="btn btn-outline-secondary btn-sm" onclick="loadDeployments()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+</div>
+
+<div class="alert alert-info py-2 mb-3" role="alert">
+  <i class="bi bi-info-circle"></i> <strong>使用说明</strong>：本功能用于在<strong>全新安装的 Linux 主机</strong>上部署空数据库实例供恢复演练使用。目标主机需提前安装好 OpenSSH 服务，并配置 root 账号免密或密码认证。所有默认参数已预填，请根据实际需要调整后开始部署。
+</div>
+
+<div class="page-card">
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>名称</th><th>类型</th><th>主机</th><th>版本</th><th>端口/SID</th>
+        <th>进度</th><th>状态</th><th>开始</th><th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="deployTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 新建/编辑部署模态框 -->
+<div class="modal fade" id="deployModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="deployModalTitle">新建部署</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <form id="deployForm">
+          <input type="hidden" id="d_id">
+
+          <!-- ===== 基本信息 ===== -->
+          <h6 class="border-bottom pb-2 mb-3"><i class="bi bi-info-square"></i> 基本信息</h6>
+          <div class="row g-3 mb-3">
+            <div class="col-md-4">
+              <label class="form-label">部署名称 *</label>
+              <input class="form-control" id="d_name" placeholder="例如: MySQL 9.3 恢复演练库" required>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">数据库类型 *</label>
+              <select class="form-select" id="d_db_type" onchange="onDeployTypeChange()">
+                <option value="mysql">MySQL</option>
+                <option value="mariadb">MariaDB</option>
+                <option value="postgresql">PostgreSQL</option>
+                <option value="oracle">Oracle</option>
+                <option value="kingbase">kingbase</option>
+                <option value="dameng">DM 达梦</option>
+                <option value="redis">Redis</option>
+                <option value="mongodb">MongoDB</option>
+              </select>
+            </div>
+            <div class="col-md-4 d-flex align-items-end">
+              <button type="button" class="btn btn-outline-secondary w-100" onclick="loadDefaultParams()">📋 重置为默认参数</button>
+            </div>
+          </div>
+
+          <!-- ===== 节点/主机配置 ===== -->
+          <h6 class="border-bottom pb-2 mb-3"><i class="bi bi-hdd-network"></i> 节点配置（<span class="text-danger">目标应为新装 Linux 主机</span>）</h6>
+          <div class="row g-2 mb-2">
+            <div class="col-12">
+              <div class="btn-group btn-group-sm" role="group">
+                <input type="radio" class="btn-check" name="hostMode" id="hostModeManaged" checked onchange="toggleHostMode()">
+                <label class="btn btn-outline-primary" for="hostModeManaged"><i class="bi bi-hdd-network"></i> 纳管主机</label>
+                <input type="radio" class="btn-check" name="hostMode" id="hostModeDirect" onchange="toggleHostMode()">
+                <label class="btn btn-outline-primary" for="hostModeDirect"><i class="bi bi-keyboard"></i> 直接输入 IP / 账号 / 密码</label>
+              </div>
+            </div>
+          </div>
+          <div class="row g-3 mb-3">
+            <!-- 模式1：纳管主机 -->
+            <div class="col-md-6" id="hostManagedGroup">
+              <label class="form-label">目标主机（SSH 纳管）*</label>
+              <select class="form-select" id="d_host_id">
+                <option value="">— 请选择已纳管的 SSH 主机 —</option>
+              </select>
+            </div>
+            <!-- 模式2：直接输入 -->
+            <div class="col-md-12" id="hostDirectGroup" style="display:none">
+              <div class="row g-3">
+                <div class="col-md-4">
+                  <label class="form-label">主机 IP *</label>
+                  <input class="form-control" id="d_direct_host" placeholder="例如: 192.168.1.100">
+                </div>
+                <div class="col-md-2">
+                  <label class="form-label">SSH 端口</label>
+                  <input type="number" class="form-control" id="d_direct_port" value="22">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label">SSH 用户 *</label>
+                  <input class="form-control" id="d_direct_user" value="root">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label">SSH 密码 *</label>
+                  <input class="form-control" id="d_direct_password" type="password" placeholder="root 密码">
+                </div>
+              </div>
+            </div>
+            <div class="col-md-6" id="hostnameGroup">
+              <label class="form-label">主机名（hostname）</label>
+              <input class="form-control" id="d_hostname" placeholder="db-node01">
+            </div>
+            <div class="col-md-6" id="rootPwdGroup">
+              <label class="form-label">系统 root 密码</label>
+              <input class="form-control" id="d_root_password" type="password" placeholder="用于 sudo 操作（直接输入模式下自动用 SSH 密码）">
+            </div>
+          </div>
+
+          <!-- ===== 安装包 ===== -->
+          <h6 class="border-bottom pb-2 mb-3"><i class="bi bi-archive"></i> 安装包</h6>
+          <div class="row g-3 mb-2">
+            <div class="col-md-12">
+              <div class="btn-group btn-group-sm" role="group">
+                <input type="radio" class="btn-check" name="pkgSource" id="pkgSrcUpload" checked onchange="togglePkgSource()">
+                <label class="btn btn-outline-primary" for="pkgSrcUpload"><i class="bi bi-cloud-upload"></i> 本地上传（推荐）</label>
+                <input type="radio" class="btn-check" name="pkgSource" id="pkgSrcRemote" onchange="togglePkgSource()">
+                <label class="btn btn-outline-primary" for="pkgSrcRemote"><i class="bi bi-terminal"></i> 目标主机已有</label>
+              </div>
+            </div>
+          </div>
+          <div class="row g-3 mb-3">
+            <div class="col-md-8" id="pkgUploadBlock">
+              <label class="form-label">选择安装包文件（.tar.gz/.zip/.iso 等）</label>
+              <input class="form-control" type="file" id="d_package_file" accept=".tar.gz,.tgz,.tar.xz,.zip,.iso,.bin,.run,.tar,.tar.bz2">
+              <div class="form-text">文件将上传到本平台暂存，部署时由平台 SFTP 推送至目标主机。上传大文件请耐心等待。</div>
+            </div>
+            <div class="col-md-8" id="pkgRemoteBlock" style="display:none">
+              <label class="form-label">安装包路径（目标主机上的完整路径）</label>
+              <input class="form-control" id="d_package_path" placeholder="/tmp/mysql-9.3.0-linux-glibc2.17-x86_64.tar.xz">
+              <div class="form-text">请提前将安装包上传到目标主机的 /tmp 目录</div>
+            </div>
+            <input type="hidden" id="d_package_path">
+            <div class="col-md-4">
+              <label class="form-label">数据库版本</label>
+              <input class="form-control" id="d_version" placeholder="例如: 9.3.0">
+            </div>
+          </div>
+
+          <!-- ===== 数据库核心参数 ===== -->
+          <h6 class="border-bottom pb-2 mb-3"><i class="bi bi-sliders"></i> 数据库核心参数（默认值已预填，可调整）</h6>
+          <div class="row g-3 mb-3" id="d_core_params">
+            <div class="col-md-6">
+              <label class="form-label">安装目录（BASE_DIR）</label>
+              <input class="form-control" id="d_base_dir" placeholder="/usr/local/mysql">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">数据目录（DATA_DIR）</label>
+              <input class="form-control" id="d_data_dir" placeholder="/data/mysql">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">服务端口</label>
+              <input class="form-control" id="d_port" type="number" placeholder="3306">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">管理员密码</label>
+              <input class="form-control" id="d_password" type="text" placeholder="默认见脚本">
+            </div>
+          </div>
+
+          <!-- ===== 各数据库高级参数区块 ===== -->
+          <!-- MySQL -->
+          <div id="d_extra_mysql" class="row g-3 mb-3 d-extra-params">
+            <div class="col-md-3">
+              <label class="form-label">字符集</label>
+              <select class="form-select" id="d_mysql_charset">
+                <option>utf8mb4</option><option>utf8</option><option>gbk</option><option>latin1</option>
+              </select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">最大连接数</label>
+              <input class="form-control" id="d_mysql_max_conn" type="number" value="200">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">InnoDB buffer (MB)</label>
+              <input class="form-control" id="d_mysql_buffer" type="number" value="512">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">server-id</label>
+              <input class="form-control" id="d_mysql_server_id" type="number" value="1">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">是否开启 binlog</label>
+              <select class="form-select" id="d_mysql_binlog"><option value="1">是</option><option value="0">否</option></select>
+            </div>
+          </div>
+
+          <!-- PostgreSQL -->
+          <div id="d_extra_pg" class="row g-3 mb-3 d-extra-params" style="display:none">
+            <div class="col-md-3">
+              <label class="form-label">编码</label>
+              <select class="form-select" id="d_pg_encoding"><option>UTF8</option><option>LATIN1</option><option>GBK</option></select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">最大连接数</label>
+              <input class="form-control" id="d_pg_max_conn" type="number" value="100">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">shared_buffers</label>
+              <select class="form-select" id="d_pg_shared_buf"><option>128MB</option><option>256MB</option><option>512MB</option><option>1GB</option></select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">WAL 级别</label>
+              <select class="form-select" id="d_pg_wal"><option>replica</option><option>minimal</option><option>logical</option></select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">初始化本地化</label>
+              <input class="form-control" id="d_pg_locale" value="zh_CN.UTF-8">
+            </div>
+          </div>
+
+          <!-- Oracle -->
+          <div id="d_extra_oracle" class="row g-3 mb-3 d-extra-params" style="display:none">
+            <div class="col-md-3">
+              <label class="form-label">SID / 服务名</label>
+              <input class="form-control" id="d_ora_sid" value="orcl">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">字符集</label>
+              <select class="form-select" id="d_ora_charset"><option>AL32UTF8</option><option>ZHS16GBK</option></select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">国家字符集</label>
+              <select class="form-select" id="d_ora_ncharset"><option>AL16UTF16</option><option>UTF8</option></select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">内存百分比</label>
+              <input class="form-control" id="d_ora_mem" type="number" value="40" min="10" max="90">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">是否 CDB</label>
+              <select class="form-select" id="d_ora_cdb"><option value="1">是</option><option value="0">否</option></select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">PDB 名称（CDB=是时需填）</label>
+              <input class="form-control" id="d_ora_pdb" value="pdb">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">OS 用户密码</label>
+              <input class="form-control" id="d_ora_os_pwd" type="password" value="oracle">
+            </div>
+          </div>
+
+          <!-- Kingbase -->
+          <div id="d_extra_kingbase" class="row g-3 mb-3 d-extra-params" style="display:none">
+            <div class="col-md-3">
+              <label class="form-label">兼容模式</label>
+              <select class="form-select" id="d_kb_mode"><option>pg</option><option>oracle</option></select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">编码</label>
+              <select class="form-select" id="d_kb_encoding"><option>UTF8</option><option>GBK</option></select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">最大连接数</label>
+              <input class="form-control" id="d_kb_max_conn" type="number" value="200">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">shared_buffers</label>
+              <select class="form-select" id="d_kb_shared_buf"><option>256MB</option><option>1GB</option><option>2GB</option></select>
+            </div>
+          </div>
+
+          <!-- Dameng -->
+          <div id="d_extra_dameng" class="row g-3 mb-3 d-extra-params" style="display:none">
+            <div class="col-md-3">
+              <label class="form-label">实例名</label>
+              <input class="form-control" id="d_dm_instance" value="DMSERVER">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">字符集</label>
+              <select class="form-select" id="d_dm_charset"><option value="0">GB18030</option><option value="1">UTF-8</option><option value="2">EUC-KR</option></select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">页大小(KB)</label>
+              <select class="form-select" id="d_dm_page"><option>8</option><option>16</option><option>32</option></select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">大小写敏感</label>
+              <select class="form-select" id="d_dm_case"><option value="1">是</option><option value="0">否</option></select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">SYSDBA 密码</label>
+              <input class="form-control" id="d_dm_sysdba" value="Dameng123">
+            </div>
+          </div>
+
+          <!-- Redis -->
+          <div id="d_extra_redis" class="row g-3 mb-3 d-extra-params" style="display:none">
+            <div class="col-md-3">
+              <label class="form-label">最大内存</label>
+              <input class="form-control" id="d_redis_maxmem" value="1gb">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">淘汰策略</label>
+              <select class="form-select" id="d_redis_evict"><option>allkeys-lru</option><option>volatile-lru</option><option>noeviction</option></select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">AOF 持久化</label>
+              <select class="form-select" id="d_redis_aof"><option value="yes">开启</option><option value="no">关闭</option></select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">集群模式端口（多实例）</label>
+              <input class="form-control" id="d_redis_cluster" type="number" placeholder="留空=单机模式">
+            </div>
+          </div>
+
+          <!-- MongoDB -->
+          <div id="d_extra_mongo" class="row g-3 mb-3 d-extra-params" style="display:none">
+            <div class="col-md-3">
+              <label class="form-label">副本集名称</label>
+              <input class="form-control" id="d_mongo_repl" placeholder="留空=单机模式">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">WiredTiger 缓存(GB)</label>
+              <input class="form-control" id="d_mongo_cache" type="number" value="1" step="0.5">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">开启认证</label>
+              <select class="form-select" id="d_mongo_auth"><option value="1">是</option><option value="0">否</option></select>
+            </div>
+          </div>
+
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="deploySaveBtn">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 日志查看模态框 -->
+<div class="modal fade" id="deployLogModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">部署日志 - <span id="logTitle"></span></h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <pre id="deployLogContent" style="background:#1E293B;color:#E2E8F0;padding:16px;border-radius:8px;max-height:60vh;overflow-y:auto;font-size:13px;line-height:1.6;white-space:pre-wrap;"></pre>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

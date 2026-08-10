@@ -1,0 +1,107 @@
+%% 业务系统字段化与记录展示四要素 v2 —— 类图 / 数据结构与接口
+%% 源设计：docs/record-display-v2-design.md §6
+classDiagram
+    class BackupTask {
+        +int id
+        +str name
+        +str biz_system
+        +str db_type
+        +str host
+        +int port
+        +str backup_type
+        +int enabled
+        +str created_at
+        +str updated_at
+    }
+
+    class BackupRecord {
+        +int id
+        +int task_id
+        +str db_type
+        +str backup_type
+        +str started_at
+        +str status
+        +int size_bytes
+        +str backup_path
+    }
+
+    class RestoreRecord {
+        +int id
+        +int task_id
+        +int record_id
+        +str target_host
+        +str started_at
+        +str status
+        +str operator
+    }
+
+    class RecordRowDTO {
+        +int id
+        +int task_id
+        +str biz_system
+        +str biz_label
+        +str task_name
+        +str host_ip
+        +str db_type_display
+        +str backup_type_display
+        +str started_at
+    }
+
+    class ModelsModule {
+        +list TASK_FIELDS
+        +compute_biz_label(biz_system, name) str
+        +normalize_host_ip(raw) str
+        +create_task(data) int
+        +update_task(task_id, data) bool
+        +get_task(task_id) dict
+        +_decorate(row, include_secret) dict
+        +list_records(task_id, keyword, limit) list
+        +list_restores(limit, keyword) list
+    }
+
+    class DbModule {
+        +str SCHEMA
+        +init_schema() None
+        +query(sql, params) list
+        +execute(sql, params) int
+    }
+
+    class TasksApi {
+        +create_task() Response
+        +update_task(task_id) Response
+        +import_tasks() Response
+        +_validate_biz_system(value, required) str
+    }
+
+    class RecordsApi {
+        +list_records() Response
+        +export_records() Response
+    }
+
+    class RestoreApi {
+        +list_records_enriched() Response
+        +list_restores() Response
+    }
+
+    class AppJsFormatter {
+        +fmtRecordLabel(r) str
+        +fmtBizCell(r) str
+        +openTaskModal(task) void
+        +saveTask() void
+        +openFileTaskModal(task) void
+        +saveFileTask() void
+        +renderRestoreRecords() void
+        +onRecordChange() void
+    }
+
+    BackupTask "1" --> "0..*" BackupRecord : task_id
+    BackupTask "1" --> "0..*" RestoreRecord : task_id
+    BackupRecord "1" --> "0..*" RestoreRecord : record_id
+    ModelsModule ..> BackupTask : reads/writes
+    ModelsModule ..> RecordRowDTO : builds via LEFT JOIN
+    ModelsModule ..> DbModule : uses
+    DbModule ..> BackupTask : ALTER ADD biz_system
+    TasksApi ..> ModelsModule : create/update/get
+    RecordsApi ..> ModelsModule : list_records
+    RestoreApi ..> ModelsModule : list_records/list_restores
+    AppJsFormatter ..> RecordRowDTO : consumes biz_label only

@@ -1,0 +1,66 @@
+classDiagram
+    class BackupTask {
+        +int id
+        +str name
+        +str db_type
+        +str host
+        +int rt_enabled
+        +str rt_mode
+        +int rt_interval_sec
+    }
+    class RtTask {
+        +int id
+        +int task_id
+        +str rt_mode
+        +int capture_interval
+        +str health_status
+        +int rpo_current_seconds
+    }
+    class SyncTask {
+        +int id
+        +str name
+        +str src_host
+        +int src_port
+        +str tgt_host
+        +int tgt_port
+        +str last_status
+    }
+    class DisasterLink {
+        +int id
+        +str name
+        +str primary_site
+        +str dr_site
+        +str route_policy
+        +str source_kind
+        +int source_id
+        +str consistency_result
+    }
+    class BackupRecord {
+        +int id
+        +int task_id
+        +str status
+        +str message
+        +str checksum
+        +int verified
+        +str verify_msg
+    }
+    class AlertPrediction {
+        +int id
+        +str metric
+        +float risk_score
+        +str details
+        +str basis
+    }
+    class AIPredictor {
+        +analyze_backup_failure_risk() dict
+        +analyze_backup_verify_risk() dict
+        +analyze_link_health() dict
+        +run_all_checks() dict
+    }
+    BackupTask "1" -- "0..1" RtTask : rt_enabled=1 扩展
+    BackupTask "1" -- "*" BackupRecord : 产出
+    DisasterLink ..> SyncTask : source_kind='sync_task' 引用
+    DisasterLink ..> BackupTask : source_kind='rt_task' 引用
+    AIPredictor ..> BackupRecord : 按 task_id 分组消费
+    AIPredictor ..> DisasterLink : 联动源 last_status
+    AIPredictor --> AlertPrediction : 写入 details.task_details

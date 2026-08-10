@@ -1,0 +1,32 @@
+sequenceDiagram
+    participant U as 运维(浏览器)
+    participant JS as app.js loadAlerts
+    participant API as api/ai_alert.py
+    participant P as AIPredictor
+    participant M as core/models
+    participant DB as SQLite
+
+    U->>JS: 打开 /alert 或点「立即分析」
+    JS->>API: POST /api/alerts/run
+    API->>P: run_all_checks()
+    P->>P: predict_with_ai("backup_fail")
+    P->>M: list_records(limit=200)
+    M->>DB: SELECT * FROM backup_records ORDER BY id DESC
+    DB-->>M: records[]
+    P->>M: list_tasks()
+    M-->>P: {id: task} 索引
+    P->>P: group by task_id → fail_7d/30d/last_error/suggestion
+    P-->>P: details.task_details[] + details.evidence
+    P->>P: predict_with_ai("verify_fail")
+    P->>M: list_records() 读 verified/verify_msg/checksum
+    P->>P: L1 sha256 比对 / L2 魔数探测（限流抽样）
+    P->>M: create_alert_prediction(details=JSON)
+    M->>DB: INSERT INTO alert_predictions
+    API-->>JS: {ok, summary{results:5}}
+    JS->>API: GET /api/alerts/predictions
+    API->>M: list_alert_predictions() + _ap_to_dict()
+    M-->>API: details 已反序列化为 dict
+    API-->>JS: {predictions:[{details:{task_details:[...]}}]}
+    JS->>U: 渲染预测行 + ▶ 展开任务明细子表
+    U->>JS: 点击 ▶
+    JS->>U: toggle d-none 显示子表(任务/失败次数/原因/建议)

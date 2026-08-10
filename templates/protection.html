@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+  <h4 class="page-title"><i class="bi bi-shield-lock"></i> 保护策略</h4>
+  <p class="text-muted mb-0">分层分级数据保护：核心（近实时）/ 重要（分钟级）/ 一般（小时级）RPO-RTO SLA</p>
+</div>
+
+<!-- 操作栏 -->
+<div class="page-card mb-3">
+  <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <div class="d-flex gap-2">
+      <button class="btn btn-primary btn-sm" onclick="openPolicyModal()">
+        <i class="bi bi-plus-lg me-1"></i>新建策略
+      </button>
+      <button class="btn btn-outline-secondary btn-sm" onclick="loadPolicies()">
+        <i class="bi bi-arrow-clockwise me-1"></i>刷新
+      </button>
+    </div>
+    <div class="text-muted small">
+      <i class="bi bi-info-circle me-1"></i>策略绑定到任务后，其等级 / 适配层 / RPO / RTO 自动写入任务
+    </div>
+  </div>
+</div>
+
+<!-- 空状态 -->
+<div id="emptyState" class="page-card text-center py-5 d-none">
+  <i class="bi bi-shield-lock display-1 text-primary"></i>
+  <h6 class="mt-2">还没有任何保护策略</h6>
+  <p class="text-muted">保护策略定义不同业务等级的数据保护强度（RPO/RTO）、备份方式与复制链路。<br>建议先创建「核心 / 重要 / 一般」三级策略，再绑定到相应任务。</p>
+  <button type="button" class="btn btn-primary btn-sm" onclick="openPolicyModal()"><i class="bi bi-plus-lg me-1"></i>立即创建第一个保护策略</button>
+</div>
+
+<!-- 策略表格 -->
+<div class="page-card" id="policyCard">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead>
+        <tr>
+          <th style="width:48px;">#</th>
+          <th>策略名称</th>
+          <th>保护等级</th>
+          <th>RPO 目标</th>
+          <th>RTO 目标</th>
+          <th>备份方式</th>
+          <th>状态</th>
+          <th>已绑定任务</th>
+          <th class="text-end">操作</th>
+        </tr>
+      </thead>
+      <tbody id="policyTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ========== 新建/编辑策略模态框 ========== -->
+<div class="modal fade" id="policyModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="policyModalTitle">新建保护策略</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <form id="policyForm">
+          <input type="hidden" id="p_id">
+          <div class="row g-3">
+            <div class="col-md-7">
+              <label class="form-label">策略名称 *</label>
+              <input type="text" class="form-control" id="p_name" required placeholder="如 核心交易库保护策略">
+            </div>
+            <div class="col-md-5">
+              <label class="form-label">保护等级 *</label>
+              <select class="form-select" id="p_level" onchange="onLevelChange()">
+                <option value="core">核心（近实时 RPO≈0）</option>
+                <option value="important">重要（分钟级 RPO）</option>
+                <option value="general" selected>一般（小时级 RPO）</option>
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">RPO 目标（分钟）</label>
+              <input type="number" class="form-control" id="p_rpo" min="0" value="240">
+              <div class="form-text">0 表示近实时（强同步 / 准同步）。</div>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">RTO 目标（分钟）</label>
+              <input type="number" class="form-control" id="p_rto" min="0" value="240">
+            </div>
+          </div>
+
+          <hr class="my-3">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <h6 class="text-muted mb-0"><i class="bi bi-gear me-1"></i>策略细节（JSON）</h6>
+            <button type="button" class="btn btn-outline-secondary btn-sm" onclick="fillPolicyDefaults()">
+              <i class="bi bi-magic me-1"></i>按等级填充默认
+            </button>
+          </div>
+          <div class="mb-3">
+            <label class="form-label small text-muted">备份策略（类型/模式/频率/并行度）</label>
+            <textarea class="form-control font-code" id="p_backup_strategy" rows="4" placeholder='{"type":"full","mode":"logical","frequency":"P1D","incremental":false,"parallel":1}'></textarea>
+          </div>
+          <div class="mb-3">
+            <label class="form-label small text-muted">链路策略（复制/容灾链路选择）</label>
+            <textarea class="form-control font-code" id="p_link_strategy" rows="3" placeholder='{"replication":"async","cross_site":false,"consistency":"eventual"}'></textarea>
+          </div>
+          <div class="mb-2">
+            <label class="form-label small text-muted">保留策略（保留/生命周期）</label>
+            <textarea class="form-control font-code" id="p_retention" rows="3" placeholder='{"days":14,"count":50,"lifecycle":{"l1_to_l2_days":7}}'></textarea>
+          </div>
+
+          <div class="form-check mt-2">
+            <input class="form-check-input" type="checkbox" id="p_enabled" checked>
+            <label class="form-check-label" for="p_enabled">启用</label>
+          </div>
+        </form>
+      </div>
+      <div id="pFormError" class="px-3 pb-1 small text-danger d-none"></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn btn-primary" id="pSaveBtn" onclick="savePolicy()">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ========== 绑定任务模态框 ========== -->
+<div class="modal fade" id="bindModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="bindModalTitle">绑定任务到策略</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <div class="text-muted small" id="bindHint">勾选要绑定到该策略的备份任务：</div>
+          <div class="form-check form-check-inline">
+            <input class="form-check-input" type="checkbox" id="bindSelectAll" onchange="toggleBindAll(this.checked)">
+            <label class="form-check-label small" for="bindSelectAll">全选 / 全不选</label>
+          </div>
+        </div>
+        <div class="table-responsive" style="max-height:50vh;">
+          <table class="table table-sm table-hover align-middle mb-0">
+            <thead>
+              <tr>
+                <th style="width:40px;"></th>
+                <th>任务</th>
+                <th>类型</th>
+                <th>当前策略</th>
+              </tr>
+            </thead>
+            <tbody id="bindTable"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn btn-primary" id="bindSaveBtn" onclick="saveBind()">保存绑定</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

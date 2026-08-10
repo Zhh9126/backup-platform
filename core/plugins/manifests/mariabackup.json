@@ -1,0 +1,33 @@
+{
+  "id": "mariabackup",
+  "name": "MariaDB Backup (mariabackup)",
+  "version": "10.11",
+  "category": "mariadb",
+  "description": "MariaDB 官方物理热备份工具 mariabackup（基于 Percona XtraBackup），用于 MariaDB 10.1+ 全量与增量备份。",
+  "required_clients": ["mariabackup"],
+  "supports": ["mariadb"],
+  "tags": ["物理备份", "热备份", "MariaDB"],
+  "icon": "bi-hdd-rack",
+  "homepage": "https://mariadb.com/kb/en/mariabackup-overview/",
+  "offline_first": true,
+  "packages": {
+    "linux": {
+      "fallback": {
+        "url": "https://archive.mariadb.org/mariadb-10.11.6/bintar-linux-systemd-x86_64/mariadb-10.11.6-linux-systemd-x86_64.tar.gz",
+        "extract_dir": "/opt/mariadb-backup",
+        "binaries": ["bin/mariabackup"]
+      },
+      "package_managers": {
+        "apt": {
+          "command": "DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-backup",
+          "binaries": ["mariabackup"]
+        },
+        "yum": {
+          "command": "yum install -y MariaDB-backup",
+          "binaries": ["mariabackup"]
+        }
+      }
+    }
+  },
+  "verify_after_install": ["mariabackup --version"]
+}

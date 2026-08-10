@@ -1,0 +1,135 @@
+%% 业务系统字段化与记录展示四要素 v2 —— 时序图集
+%% 源设计：docs/record-display-v2-design.md §5
+%% 共 5 个流程：新建任务 / 编辑存量任务 / 记录页加载与搜索 / 恢复页下拉与详情 / 导出报表
+
+%% ---------- 5.1 新建任务（必填校验 + 白名单落库） ----------
+sequenceDiagram
+    participant U as 运维工程师
+    participant M as tasks.html 弹窗
+    participant JS as app.js saveTask
+    participant API as api/tasks.py POST /api/tasks
+    participant MD as core/models.create_task
+    participant DB as SQLite backup_tasks
+
+    U->>M: 填写 业务系统=OA办公系统 / 任务名=mysql-增量-v2
+    U->>M: 点击保存
+    M->>JS: saveTask()
+    JS->>JS: data.biz_system = $("t_biz_system").value.trim()
+    alt biz_system 为空
+        JS-->>U: toast 请填写业务系统（前端拦截，不发请求）
+    else 非空
+        JS->>API: POST /api/tasks {name, biz_system, db_type, ...}
+        API->>API: 校验 db_type 支持性
+        API->>API: 校验 name 非空
+        API->>API: _validate_biz_system 非空且长度<=64
+        alt 校验失败
+            API-->>JS: 400 {error: 业务系统为必填}
+            JS-->>U: toast 错误信息
+        else 校验通过
+            API->>MD: create_task(data)
+            MD->>MD: data = {k: data.get(k) for k in TASK_FIELDS}
+            Note over MD: TASK_FIELDS 必须含 biz_system<br/>否则此处静默丢弃且无任何报错
+            MD->>DB: INSERT INTO backup_tasks (... biz_system ...)
+            DB-->>MD: task_id
+            MD-->>API: task_id
+            API-->>JS: 201 {id, ok:true}
+            JS-->>U: toast 任务已创建 + 刷新列表
+        end
+    end
+
+%% ---------- 5.2 编辑存量任务（D2 预填，解必填死锁） ----------
+sequenceDiagram
+    participant U as 运维工程师
+    participant JS as app.js editTask
+    participant API as api/tasks.py GET /api/tasks/id
+    participant MD as core/models.get_task
+    participant CB as models.compute_biz_label
+
+    U->>JS: 点击 任务#2 OA 的「编辑」
+    JS->>API: GET /api/tasks/2
+    API->>MD: get_task(2)
+    MD->>MD: _decorate(row)
+    MD->>CB: compute_biz_label(biz_system=None, name="OA")
+    CB-->>MD: "OA"  (R2 回退分支)
+    MD-->>API: {id:2, name:"OA", biz_system:null, biz_label:"OA", ...}
+    API-->>JS: 200 JSON
+    JS->>JS: openTaskModal(task)
+    JS->>JS: $("t_biz_system").value = task.biz_label  → "OA"
+    Note over JS: 前端不写 biz_system || name，只读 biz_label
+    JS-->>U: 弹窗业务系统框已是 OA，可直接保存
+    U->>JS: 直接点保存
+    JS->>API: PUT /api/tasks/2 {biz_system:"OA", ...}
+    API->>API: biz_system 键存在且非空 → 校验通过
+    Note over API: 隐式回退 → 显式取值，无信息损失
+
+%% ---------- 5.3 备份记录页加载与搜索（四要素下发） ----------
+sequenceDiagram
+    participant U as 值班主管
+    participant JS as app.js loadRecords
+    participant API as api/records.py GET /api/records
+    participant MD as core/models.list_records
+    participant DB as SQLite
+    participant F as app.js fmtBizCell
+
+    U->>JS: 打开 /records 或在搜索框输入 OA
+    JS->>API: GET /api/records?keyword=OA
+    API->>MD: list_records(keyword="OA", limit=500)
+    MD->>DB: SELECT br.*, bt.name AS task_name, bt.host AS host_raw,<br/>bt.biz_system AS biz_system FROM backup_records br<br/>LEFT JOIN backup_tasks bt ON br.task_id = bt.id<br/>WHERE (bt.name LIKE ? OR bt.host LIKE ? OR bt.biz_system LIKE ?)
+    DB-->>MD: rows
+    loop 每一行
+        MD->>MD: host_ip = normalize_host_ip(host_raw)
+        MD->>MD: biz_label = compute_biz_label(biz_system, task_name)
+        MD->>MD: db_type_display / backup_type_display
+    end
+    MD-->>API: rows 含 biz_label
+    API->>API: 补 size_human
+    API-->>JS: JSON 数组
+    loop 每一行
+        JS->>F: fmtBizCell(r)
+        F-->>JS: biz_label + #task_id / host_ip 双行
+    end
+    JS-->>U: 10 列表格渲染（无备份方式列，colspan=10）
+
+%% ---------- 5.4 数据恢复页：下拉 + 详情卡片（含 P1-1 正则清理） ----------
+sequenceDiagram
+    participant U as 运维工程师
+    participant JS as app.js initRestore
+    participant RE as api/restore.py GET /records/enriched
+    participant MD as core/models.list_records
+    participant RR as renderRestoreRecords
+    participant OC as onRecordChange
+
+    JS->>RE: GET /api/records/enriched
+    RE->>MD: list_records(limit=500)
+    MD-->>RE: rows 含 biz_label
+    RE->>RE: 白名单拼装，必须显式补 biz_label
+    RE-->>JS: [{id, task_id, biz_label, host_ip, db_type_display, started_at, ...}]
+    JS->>JS: window.RESTORE_RECORDS = 成功/仿真记录
+    JS->>RR: renderRestoreRecords()
+    RR->>RR: 按 r.biz_label 过滤（原为 r.task_name）
+    RR->>RR: option 文本 = fmtRecordLabel(r)  四要素
+    RR-->>U: 下拉显示 #59 OA @ 192.168.220.150 · 文件 · 时间
+    U->>OC: 选中某条记录
+    OC->>OC: ip = rec.host_ip（P1-1：删除 source_host 正则二次提取）
+    OC->>OC: rs_title = biz_label + db_type_display badge
+    Note over OC: 移除 backup_type badge，四要素对齐
+    OC-->>U: 详情卡片展示
+
+%% ---------- 5.5 导出报表（D4：保留备份方式 + 新增业务系统） ----------
+sequenceDiagram
+    participant U as 运维工程师
+    participant JS as app.js exportRecords
+    participant API as api/records.py GET /records/export
+    participant MD as core/models.list_records
+    participant RP as core/reports.build_report
+
+    U->>JS: 点击导出 csv/docx/pdf
+    JS->>API: GET /api/records/export?format=csv
+    API->>MD: list_records(limit=5000)
+    MD-->>API: rows 含 biz_label + backup_type
+    API->>API: headers 13 列（第3位插入「业务系统」，保留「备份方式」）
+    API->>API: table 行按相同序位插入 r.biz_label
+    Note over API: len(headers) == len(row) 必须成立
+    API->>RP: build_report(fmt, 标题, summary, headers, table)
+    RP-->>API: (mime, ext, content)
+    API-->>U: 附件下载

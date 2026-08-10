@@ -1,0 +1,38 @@
+{
+  "id": "percona-xtrabackup-80",
+  "name": "Percona XtraBackup 8.0",
+  "version": "8.0.35",
+  "category": "mysql",
+  "description": "Percona XtraBackup 8.0：MySQL 8.0 数据库热物理备份工具，支持全量与增量备份。",
+  "required_clients": ["xtrabackup"],
+  "supports": ["mysql"],
+  "min_version": "8.0.0",
+  "tags": ["物理备份", "热备份", "Percona", "MySQL8"],
+  "icon": "bi-hdd-rack",
+  "homepage": "https://www.percona.com/downloads",
+  "offline_first": true,
+  "packages": {
+    "linux": {
+      "fallback": {
+        "url": "https://downloads.percona.com/downloads/Percona-XtraBackup-8.0/Percona-XtraBackup-8.0.35-36/binary/tarball/percona-xtrabackup-8.0.35-36-Linux-x86_64.glibc2.31.tar.gz",
+        "extract_dir": "/opt/xtrabackup",
+        "binaries": ["bin/xtrabackup"]
+      },
+      "package_managers": {
+        "apt": {
+          "command": "DEBIAN_FRONTEND=noninteractive apt-get install -y wget gnupg lsb-release && wget -qO - https://repo.percona.com/apt/percona-release_latest.generic_all.deb | DEBIAN_FRONTEND=noninteractive dpkg -i && percona-release enable-only ps-80 release && DEBIAN_FRONTEND=noninteractive apt-get install -y percona-xtrabackup-80",
+          "binaries": ["xtrabackup"]
+        },
+        "yum": {
+          "command": "yum install -y https://repo.percona.com/yum/percona-release-latest.noarch.rpm && percona-release enable-only ps-80 release && yum install -y percona-xtrabackup-80",
+          "binaries": ["xtrabackup"]
+        }
+      }
+    }
+  },
+  "verify_after_install": ["xtrabackup --version"],
+  "post_install_tips": [
+    "将 xtrabackup 所在目录加入系统 PATH：export PATH=/opt/xtrabackup/bin:$PATH",
+    "或创建软链接：ln -s /opt/xtrabackup/bin/xtrabackup /usr/local/bin/xtrabackup"
+  ]
+}

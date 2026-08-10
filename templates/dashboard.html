@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+  /* ===== 仪表盘特有美化 ===== */
+  .health-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px 18px;
+  }
+  .health-item {
+    background: #f8fafc;
+    border: 1px solid var(--bs-border-color);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  .health-item .hd-label {
+    font-size: 12px;
+    color: #64748b;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+  .health-item .hd-bar {
+    height: 6px;
+    background: #e2e8f0;
+    border-radius: 999px;
+    overflow: hidden;
+  }
+  .health-item .hd-bar > span {
+    display: block;
+    height: 100%;
+    border-radius: 999px;
+    transition: width .3s ease;
+  }
+  .health-item .hd-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-top: 6px;
+    font-size: 12px;
+  }
+  .health-item .hd-meta b { font-size: 16px; color: #0f172a; }
+  .hd-good { background: linear-gradient(90deg, #34d399, #10b981); }
+  .hd-warn { background: linear-gradient(90deg, #fbbf24, #f59e0b); }
+  .hd-bad  { background: linear-gradient(90deg, #f87171, #ef4444); }
+
+  /* 分布卡片带百分比条 */
+  .dist-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 0;
+    border-bottom: 1px dashed #eef2f7;
+  }
+  .dist-row:last-child { border-bottom: 0; }
+  .dist-row .dr-name {
+    flex: 0 0 90px;
+    font-size: 13px;
+    color: #334155;
+  }
+  .dist-row .dr-bar {
+    flex: 1;
+    height: 6px;
+    background: #eef2f7;
+    border-radius: 999px;
+    overflow: hidden;
+  }
+  .dist-row .dr-bar > span {
+    display: block;
+    height: 100%;
+    border-radius: 999px;
+  }
+  .dist-row .dr-val {
+    flex: 0 0 56px;
+    text-align: right;
+    font-size: 12px;
+    color: #475569;
+  }
+  .dist-empty { color: #94a3b8; font-size: 13px; padding: 8px 0; }
+
+  /* 状态徽章（与 bkp-core.js statusBadge 视觉一致） */
+  .badge-ok   { background: #d1fae5; color: #065f46; }
+  .badge-fail { background: #fee2e2; color: #991b1b; }
+  .badge-sim  { background: #dbeafe; color: #1e40af; }
+  .badge-run  { background: #fef3c7; color: #92400e; }
+
+  /* 模式 chip */
+  .mode-chip {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    background: #eef2ff;
+    color: #4338ca;
+  }
+  .mode-chip.physical { background: #fef3c7; color: #92400e; }
+
+  /* 表格：紧凑可读 */
+  .table-dash { font-size: 13px; }
+  .table-dash th { font-weight: 600; color: #475569; background: #f8fafc; }
+  .table-dash td, .table-dash th { vertical-align: middle; white-space: nowrap; }
+  .table-dash td.col-name { font-weight: 600; color: #0f172a; }
+  .table-dash td.col-time { color: #64748b; font-variant-numeric: tabular-nums; }
+  .table-dash code { color: #475569; }
+</style>
+
+<div class="toolbar">
+  <div>
+    <div class="page-title"><i class="bi bi-speedometer2"></i> 仪表盘</div>
+    <div class="page-sub">备份任务与记录总览</div>
+  </div>
+</div>
+
+<!-- 顶部 4 张统计卡 -->
+<div class="row g-3 mb-4">
+  <div class="col-md-3">
+    <div class="card-stat">
+      <div class="stat-icon"><i class="bi bi-database"></i></div>
+      <div class="stat-num" id="st_db_tasks">-</div>
+      <div class="stat-label">数据库备份任务</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card-stat">
+      <div class="stat-icon"><i class="bi bi-folder2-open"></i></div>
+      <div class="stat-num" id="st_file_tasks">-</div>
+      <div class="stat-label">文件备份任务</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card-stat">
+      <div class="stat-icon"><i class="bi bi-hdd-stack"></i></div>
+      <div class="stat-num" id="st_size">-</div>
+      <div class="stat-label">累计备份体积</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card-stat">
+      <div class="stat-icon"><i class="bi bi-heart-pulse"></i></div>
+      <div class="stat-num" id="st_health">-</div>
+      <div class="stat-label">综合健康评分</div>
+    </div>
+  </div>
+</div>
+
+<!-- 健康详情（美化） -->
+<div class="row g-3 mb-4">
+  <div class="col-12">
+    <div class="card p-3">
+      <div class="d-flex align-items-center justify-content-between mb-2">
+        <h6 class="mb-0"><i class="bi bi-graph-up"></i> 健康详情</h6>
+        <small class="text-muted">分项评分相加 = 综合健康分</small>
+      </div>
+      <div id="healthDetails" class="health-grid"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 主内容：最近记录 + 分布 -->
+<div class="row g-3">
+  <div class="col-md-8">
+    <div class="card p-3">
+      <div class="d-flex align-items-center justify-content-between mb-3">
+        <h6 class="mb-0"><i class="bi bi-clock-history"></i> 最近备份记录</h6>
+        <a href="/records" class="small text-decoration-none">查看全部 <i class="bi bi-arrow-right-short"></i></a>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm table-hover table-dash mb-0">
+          <thead>
+            <tr>
+              <th>任务名称</th>
+              <th>业务系统</th>
+              <th>备份类型</th>
+              <th>备份 IP</th>
+              <th>备份模式</th>
+              <th>备份时长</th>
+              <th>备份量大小</th>
+              <th>状态</th>
+              <th>备份时间</th>
+            </tr>
+          </thead>
+          <tbody id="recentRecords"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card p-3 mb-3">
+      <h6 class="mb-2"><i class="bi bi-pie-chart"></i> 数据库类型分布</h6>
+      <div id="dbDist"></div>
+    </div>
+    <div class="card p-3">
+      <h6 class="mb-2"><i class="bi bi-clipboard-data"></i> 备份状态分布</h6>
+      <div id="statusDist"></div>
+    </div>
+  </div>
+</div>
+{% endblock %}

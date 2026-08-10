@@ -1,0 +1,208 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">数据库备份</div>
+    <div class="page-sub">配置数据库连接、备份类型与调度策略</div>
+  </div>
+  <button class="btn btn-primary" id="newTaskBtn"><i class="bi bi-plus-lg"></i> 新建任务</button>
+  <button class="btn btn-outline-secondary btn-sm" onclick="refreshTasks()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+  <a class="btn btn-outline-info btn-sm" href="/api/tasks/template?type=db" title="下载CSV模板"><i class="bi bi-file-earmark-spreadsheet"></i> 模板</a>
+  <button class="btn btn-outline-success btn-sm" onclick="importTasksCsv()" title="批量导入CSV"><i class="bi bi-upload"></i> 导入</button>
+</div>
+<div class="page-card">
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>业务系统</th><th>名称</th><th>类型</th><th>备份 IP</th><th>端口/库</th><th>备份类型</th><th>备份模式</th>
+        <th>调度</th><th>状态</th><th>上次运行</th><th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="taskTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 任务编辑模态框 -->
+<div class="modal fade" id="taskModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="taskModalTitle">新建备份任务</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <form id="taskForm" onsubmit="return false">
+          <input type="hidden" id="t_id">
+          <ul class="nav nav-tabs mb-3" id="taskTabs" role="tablist">
+            <li class="nav-item"><a class="nav-link active" href="#tab_basic" data-bs-toggle="tab" role="tab">基本信息</a></li>
+            <li class="nav-item"><a class="nav-link" href="#tab_advanced" data-bs-toggle="tab" role="tab">高级选项</a></li>
+            <li class="nav-item"><a class="nav-link" href="#tab_extra" data-bs-toggle="tab" role="tab">类型参数</a></li>
+          </ul>
+          <div class="tab-content">
+            <div class="tab-pane fade show active" id="tab_basic" role="tabpanel">
+              <div class="row g-3">
+                <div class="col-md-6">
+                  <label class="form-label">业务系统 *</label>
+                  <input class="form-control" id="t_biz_system" placeholder="如：OA 办公系统、核心交易库" required>
+                  <div class="form-text">用于备份/恢复记录统一展示；任务名称仅用于任务管理</div>
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label">任务名称 *</label>
+                  <input class="form-control" id="t_name" required>
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label">数据库类型 *</label>
+                  <select class="form-select" id="t_db_type">
+                    <option value="mysql">MySQL</option>
+                    <option value="mariadb">MariaDB</option>
+                    <option value="postgresql">PostgreSQL</option>
+                    <option value="oracle">Oracle</option>
+                    <option value="kingbase">kingbase</option>
+                    <option value="dameng">DM 达梦</option>
+                    <option value="redis">Redis</option>
+                    <option value="mongodb">MongoDB</option>
+                  </select>
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label">备份类型 *</label>
+                  <select class="form-select" id="t_backup_type">
+                    <option value="full">全量备份</option>
+                    <option value="incremental">增量备份</option>
+                  </select>
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label">主机地址 *</label>
+                  <input class="form-control" id="t_host" placeholder="IP 或主机名">
+                </div>
+                <div class="col-md-2">
+                  <label class="form-label">端口 *</label>
+                  <input type="number" class="form-control" id="t_port" value="3306">
+                </div>
+                <div class="col-md-2">
+                  <label class="form-label">用户名</label>
+                  <input class="form-control" id="t_username" value="root">
+                </div>
+                <div class="col-md-2">
+                  <label class="form-label">密码</label>
+                  <input class="form-control" id="t_password" type="password" placeholder="留空表示不修改">
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label">数据库 / 实例名</label>
+                  <input class="form-control" id="t_db_name" placeholder="如: mydb">
+                </div>
+                <div class="col-md-3 d-flex align-items-end">
+                  <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="t_enabled" checked>
+                    <label class="form-check-label">启用</label>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="tab-pane fade" id="tab_advanced" role="tabpanel">
+              <div class="row g-3">
+                <div class="col-md-4">
+                  <label class="form-label">备份模式</label>
+                  <select class="form-select" id="t_backup_mode">
+                    <option value="logical">逻辑备份 (推荐)</option>
+                    <option value="physical">物理备份</option>
+                  </select>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">调度类型</label>
+                  <select class="form-select" id="t_schedule_type">
+                    <option value="none">手动</option>
+                    <option value="cron">Cron 表达式</option>
+                    <option value="interval">间隔(分钟)</option>
+                  </select>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">Cron 表达式 / 间隔分钟</label>
+                  <input class="form-control" id="t_schedule_expr" placeholder="如 0 2 * * * 或 60">
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">保留天数</label>
+                  <input type="number" class="form-control" id="t_retention_days" value="30">
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">远程备份目标</label>
+                  <input class="form-control" id="t_remote_path" placeholder="可选, 如 ssh://user@host:/path">
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">加密密码</label>
+                  <input class="form-control" id="t_encrypt_pwd" type="password" placeholder="可选">
+                </div>
+                <div class="col-md-12">
+                  <label class="form-label">备注</label>
+                  <textarea class="form-control" id="t_remark" rows="2"></textarea>
+                </div>
+              </div>
+            </div>
+            <div class="tab-pane fade" id="tab_extra" role="tabpanel">
+              <div class="alert alert-info py-2 mb-3">
+                <small>根据所选数据库类型显示对应参数。MySQL/PG 可在下方可视化选择库/表；其他类型或高级参数请用右侧 JSON 编辑。</small>
+              </div>
+
+              <!-- MySQL/PostgreSQL 友好的可视化选择（仅在选 mysql/mariadb/postgresql 时显示） -->
+              <div id="t_db_picker" class="mb-3" style="display:none">
+                <div class="row g-2 align-items-end mb-2">
+                  <div class="col-md-8">
+                    <label class="form-label small text-muted">数据库列表（点击按钮连接数据库并拉取）</label>
+                    <div class="input-group">
+                      <button class="btn btn-outline-primary btn-sm" type="button" id="t_db_picker_btn">
+                        <i class="bi bi-arrow-clockwise"></i> 拉取库列表
+                      </button>
+                      <span class="form-control form-control-sm text-muted" id="t_db_picker_status">点击按钮连接数据库并拉取</span>
+                    </div>
+                  </div>
+                </div>
+                <div class="row g-3">
+                  <div class="col-md-4">
+                    <label class="form-label">备份范围</label>
+                    <select class="form-select form-select-sm" id="t_pick_mode">
+                      <option value="single">单库（用「数据库/实例名」）</option>
+                      <option value="schemas">多库（从下面多选）</option>
+                      <option value="tables">单库指定表（库和表都选）</option>
+                      <option value="all">全实例（备份所有库）</option>
+                    </select>
+                    <div class="form-text">决定下方多选的语义</div>
+                  </div>
+                  <div class="col-md-8">
+                    <label class="form-label">已选 <span id="t_pick_count" class="badge bg-secondary">0</span></label>
+                    <select class="form-select form-select-sm" id="t_pick_list" multiple size="6"></select>
+                    <div class="d-flex gap-2 mt-1">
+                      <button class="btn btn-sm btn-outline-secondary" type="button" id="t_pick_all">全选</button>
+                      <button class="btn btn-sm btn-outline-secondary" type="button" id="t_pick_none">清空</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="mt-2 form-check form-check-inline">
+                  <input class="form-check-input" type="checkbox" id="t_schema_only">
+                  <label class="form-check-label">仅结构（不要数据）</label>
+                </div>
+                <div class="form-check form-check-inline">
+                  <input class="form-check-input" type="checkbox" id="t_data_only">
+                  <label class="form-check-label">仅数据（不要建表语句）</label>
+                </div>
+                <div class="mt-1 small text-muted">
+                  提示：单库（不带 schemas/tables）= <code>--databases &lt;db&gt;</code>；多库 = <code>--databases s1 s2 ...</code>；
+                  单库指定表 = <code>mysqldump &lt;db&gt; t1 t2 ...</code>；全实例 = <code>--all-databases</code>。
+                </div>
+              </div>
+
+              <div class="mb-3">
+                <label class="form-label">类型参数 (JSON)</label>
+                <textarea class="form-control font-monospace" id="t_extra_options" rows="8" placeholder='{"key": "value"}'></textarea>
+                <div class="form-text">高级 / 透传参数，例如 <code>--set-gtid-purged=OFF</code> 填 <code>{"extra_args": "--set-gtid-purged=OFF"}</code></div>
+              </div>
+            </div>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="taskSaveBtn">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

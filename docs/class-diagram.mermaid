@@ -1,0 +1,72 @@
+# AI Agent Class Diagram
+
+classDiagram
+    class ToolRegistry {
+        +Dict~str,Tool~ tools
+        +register(tool: Tool) None
+        +get(name: str) Tool
+        +list_for_llm() List~Dict~
+        +list_all() List~Tool~
+    }
+    class Tool {
+        +str name
+        +str description
+        +dict parameters
+        +bool requires_confirm
+        +str api_endpoint
+        +str api_method
+        +execute(args: dict, context: dict) dict
+    }
+    class ToolExecutor {
+        +ToolRegistry registry
+        +str base_url
+        +call_internal_api(endpoint: str, method: str, args: dict, cookies: dict) dict
+        +execute_tool(name: str, args: dict, context: dict) dict
+        +validate_args(tool: Tool, args: dict) dict
+    }
+    class SessionManager {
+        +create_session(user_id: str) AgentSession
+        +get_session(id: str) AgentSession
+        +list_sessions(user_id: str) List
+        +add_message(session_id: str, role: str, content: str, **kwargs) int
+        +get_messages(session_id: str, limit: int) List
+        +delete_session(id: str) bool
+        +build_context(session_id: str, max_tokens: int) List~Dict~
+    }
+    class AIAgent {
+        +ToolRegistry registry
+        +ToolExecutor executor
+        +SessionManager session_mgr
+        +process_message(session_id: str, user_msg: str, context: dict) dict
+        +_react_loop(session_id: str, messages: List) dict
+        +_parse_tool_call(llm_text: str) dict
+        +_build_system_prompt() str
+        +_compose_messages(session_id: str, new_msg: str) List
+        +_call_model_with_messages(messages: List) dict
+    }
+    class AgentSession {
+        +str id
+        +str user_id
+        +str title
+        +str created_at
+        +str updated_at
+        +int message_count
+    }
+    class AgentMessage {
+        +int id
+        +str session_id
+        +str role
+        +str content
+        +dict tool_calls
+        +str tool_name
+        +dict tool_result
+        +int tokens_used
+        +str created_at
+    }
+    ToolRegistry --> Tool : manages
+    ToolExecutor --> ToolRegistry : uses
+    AIAgent --> ToolRegistry : references
+    AIAgent --> ToolExecutor : delegates execution
+    AIAgent --> SessionManager : manages context
+    SessionManager --> AgentSession : CRUD
+    SessionManager --> AgentMessage : CRUD

@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">数据价值挖掘</div>
+    <div class="page-sub">将备份数据脱敏后导出供分析，让「冷备份」转化为「可审计、可用的数据资产」</div>
+  </div>
+  <button class="btn btn-outline-secondary btn-sm" onclick="loadExports()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+</div>
+
+<div class="page-card">
+  <div class="card-section-title"><i class="bi bi-shield-lock"></i> 脱敏导出</div>
+
+  <div class="row g-3">
+    <div class="col-md-6">
+      <label class="form-label">来源备份记录 <span class="text-danger">*</span></label>
+      <select class="form-select" id="dmSource">
+        <option value="">— 请选择备份记录 —</option>
+      </select>
+      <div class="form-text">
+        选择后系统按该记录类型（<span id="dmSchemaLabel">通用</span>）推荐典型列集合。
+      </div>
+    </div>
+    <div class="col-md-6">
+      <label class="form-label">目标表（可选）</label>
+      <select class="form-select" id="dmTable" disabled>
+        <option value="">请先选择来源记录</option>
+      </select>
+      <div class="form-text">选择表后自动带入该表全部列；可手动增删。</div>
+    </div>
+  </div>
+
+  <div class="row g-3 mt-1">
+    <div class="col-md-6">
+      <label class="form-label">导出列（可多选）</label>
+      <select class="form-select" id="dmColumns" multiple size="6"></select>
+      <div class="d-flex gap-2 mt-2">
+        <button class="btn btn-outline-secondary btn-sm" type="button" id="dmAddColumn">+ 添加自定义列</button>
+        <button class="btn btn-outline-secondary btn-sm" type="button" id="dmSelectAll">全选</button>
+        <button class="btn btn-outline-secondary btn-sm" type="button" id="dmClearColumns">清空</button>
+      </div>
+    </div>
+    <div class="col-md-6">
+      <label class="form-label">脱敏规则模板</label>
+      <div class="btn-group" role="group" id="dmRuleTemplates">
+        <button type="button" class="btn btn-outline-primary btn-sm" data-tpl="minimal">最小</button>
+        <button type="button" class="btn btn-outline-primary btn-sm" data-tpl="standard">标准</button>
+        <button type="button" class="btn btn-outline-primary btn-sm active" data-tpl="strict">严格</button>
+      </div>
+      <div class="form-text" id="dmTplDesc">严格（默认）：所有可能含个人信息列均脱敏；IP/Token 哈希不可逆。</div>
+      <div class="mt-2">
+        <label class="form-label">行数</label>
+        <input type="number" id="dmRowCount" class="form-control" value="50" min="1" max="2000">
+      </div>
+    </div>
+  </div>
+
+  <div class="mt-3">
+    <label class="form-label">规则预览（每列最终脱敏含义）</label>
+    <div id="dmRulePreview" class="border rounded p-2 small bg-light">
+      请先选择来源记录与导出列…
+    </div>
+  </div>
+
+  <div class="mt-3">
+    <label class="form-label">脱敏规则（JSON 高级编辑）</label>
+    <textarea class="form-control font-monospace" id="dmMaskRules" rows="3"
+              placeholder='{"phone":"mask","email":"mask","name":"fake"}'>{}</textarea>
+    <div class="form-text">
+      默认按 PII 自动识别；在「规则预览」或这里直接调整即可。
+      <code>mask</code>=部分打码（138****1234）·<code>hash</code>=不可逆哈希 ·
+      <code>drop</code>=删除列 · <code>fake</code>=仿真替换 · <code>none</code>=不脱敏。
+    </div>
+  </div>
+
+  <div class="mt-3">
+    <button class="btn btn-primary" id="dmExportBtn"><i class="bi bi-download"></i> 生成脱敏导出</button>
+  </div>
+</div>
+
+<div class="page-card mt-3">
+  <div class="card-section-title"><i class="bi bi-clock-history"></i> 导出历史</div>
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>来源记录</th><th>列</th><th>脱敏规则</th>
+        <th>行数</th><th>生成时间</th><th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="dmExportTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="alert alert-info mt-3" role="alert">
+  <i class="bi bi-info-circle"></i> <strong>合规说明</strong>：导出文件仅用于分析，敏感字段已脱敏（手机号 138****1234 / 邮箱打码 / 身份证打码 / 姓名仿真替换），
+  文件存放于 <code>backups/anonymized_exports/</code>。请按数据分级与最小必要原则使用。
+</div>
+{% endblock %}

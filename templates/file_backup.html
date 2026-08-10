@@ -1,0 +1,216 @@
+{% extends "base.html" %}
+{% block content %}
+<!-- ============ 主机纳管 ============ -->
+<div class="toolbar">
+  <div>
+    <div class="page-title">文件备份</div>
+    <div class="page-sub">无需安装 Agent，基于 SSH 直连实现文件 / 目录的实时备份与恢复</div>
+  </div>
+  <button class="btn btn-primary" id="newHostBtn"><i class="bi bi-hdd-network"></i> 纳管主机</button>
+  <button class="btn btn-outline-secondary btn-sm" onclick="refreshFileBackup()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+  <a class="btn btn-outline-info btn-sm" href="/api/tasks/template?type=file" title="下载CSV模板"><i class="bi bi-file-earmark-spreadsheet"></i> 模板</a>
+  <button class="btn btn-outline-success btn-sm" onclick="importFileTasksCsv()" title="批量导入CSV"><i class="bi bi-upload"></i> 导入</button>
+</div>
+
+<div class="page-card">
+  <div class="card-section-title"><i class="bi bi-server"></i> 已纳管主机</div>
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>名称</th><th>连接标识</th><th>地址</th><th>认证</th>
+        <th>状态</th><th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="hostTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ============ 文件备份任务 ============ -->
+<div class="page-card mt-4">
+  <div class="card-section-title d-flex justify-content-between align-items-center">
+    <span><i class="bi bi-folder2-open"></i> 文件备份任务</span>
+    <button class="btn btn-sm btn-primary" id="newFileTaskBtn"><i class="bi bi-plus-lg"></i> 新建任务</button>
+  </div>
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>业务系统</th><th>名称</th><th>源</th><th>目标</th><th>备份 IP</th><th>备份类型</th>
+        <th>调度</th><th>状态</th><th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="fileTaskTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ============ 文件备份任务 模态框 ============ -->
+<div class="modal fade" id="fileTaskModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="fileTaskModalTitle">新建文件备份任务</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <form id="fileTaskForm">
+          <input type="hidden" id="f_id">
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">业务系统 *</label>
+              <input class="form-control" id="f_biz_system" placeholder="如：OA 办公系统、核心交易库" required>
+              <div class="form-text">用于备份/恢复记录统一展示；任务名称仅用于任务管理</div>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">任务名称 *</label>
+              <input class="form-control" id="f_name" required>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">备份类型</label>
+              <select class="form-select" id="f_backup_type">
+                <option value="full">全量</option>
+                <option value="incremental">增量</option>
+              </select>
+            </div>
+
+            <div class="col-md-6">
+              <label class="form-label">源类型</label>
+              <select class="form-select" id="f_source_type">
+                <option value="local">本地目录</option>
+                <option value="remote">远程主机 (SSH 无 Agent)</option>
+              </select>
+            </div>
+            <div class="col-md-6 f-remote-only d-none">
+              <label class="form-label">远程主机 *</label>
+              <select class="form-select" id="f_remote_host"></select>
+            </div>
+            <div class="col-12">
+              <label class="form-label">源路径（每行一个）</label>
+              <textarea class="form-control" id="f_source_paths" rows="2" placeholder="/data/app&#10;/etc/nginx/conf.d"></textarea>
+            </div>
+
+            <div class="col-md-6">
+              <label class="form-label">目标类型</label>
+              <select class="form-select" id="f_target_type">
+                <option value="local">本地目录</option>
+                <option value="remote">远程主机 (SSH 无 Agent)</option>
+              </select>
+            </div>
+            <div class="col-md-6 f-target-remote d-none">
+              <label class="form-label">目标远程主机 *</label>
+              <select class="form-select" id="f_target_host"></select>
+            </div>
+            <div class="col-12">
+              <label class="form-label">目标路径 *</label>
+              <input class="form-control" id="f_target_path" placeholder="/backup/file_tasks">
+            </div>
+            <div class="col-12">
+              <label class="form-label">排除规则（每行一个，支持通配符）</label>
+              <textarea class="form-control" id="f_exclude_patterns" rows="2" placeholder="*.tmp&#10;*.log&#10;__pycache__"></textarea>
+            </div>
+
+            <div class="col-md-4">
+              <label class="form-label">调度方式</label>
+              <select class="form-select" id="f_schedule_type">
+                <option value="none">不自动（手动）</option>
+                <option value="cron">Cron 表达式</option>
+                <option value="interval">固定间隔</option>
+              </select>
+            </div>
+            <div class="col-md-4 d-none" id="f_cron_wrap">
+              <label class="form-label">Cron 表达式</label>
+              <input class="form-control" id="f_cron_expr" placeholder="0 2 * * *">
+            </div>
+            <div class="col-md-4 d-none" id="f_interval_wrap">
+              <label class="form-label">间隔（分钟）</label>
+              <input class="form-control" id="f_interval_minutes" type="number" value="60">
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">保留天数</label>
+              <input class="form-control" id="f_retention_days" type="number" value="30">
+            </div>
+
+            <div class="col-12">
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="checkbox" id="f_enabled" checked>
+                <label class="form-check-label">启用</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="checkbox" id="f_demo_only">
+                <label class="form-check-label">演示模式（生成仿真占位备份）</label>
+              </div>
+            </div>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="fileTaskSaveBtn">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 主机纳管 模态框 ============ -->
+<div class="modal fade" id="hostModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="hostModalTitle">纳管主机</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <form id="hostForm">
+          <input type="hidden" id="h_id">
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">主机名称 *</label>
+              <input class="form-control" id="h_name" required>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">系统类型</label>
+              <select class="form-select" id="h_os_type">
+                <option value="linux">Linux</option>
+                <option value="windows">Windows</option>
+              </select>
+            </div>
+            <div class="col-md-8">
+              <label class="form-label">主机地址 *</label>
+              <input class="form-control" id="h_hostname" placeholder="192.168.1.100">
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">端口</label>
+              <input class="form-control" id="h_port" type="number" value="22">
+            </div>
+            <div class="col-md-12">
+              <label class="form-label">用户名</label>
+              <input class="form-control" id="h_username" value="root">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">认证方式</label>
+              <select class="form-select" id="h_auth_type">
+                <option value="password">密码</option>
+                <option value="key">私钥</option>
+              </select>
+            </div>
+            <div class="col-md-6 h-pwd-only">
+              <label class="form-label">密码</label>
+              <input class="form-control" id="h_password" type="password" placeholder="留空表示不修改">
+            </div>
+            <div class="col-12 h-key-only d-none">
+              <label class="form-label">私钥（PEM）</label>
+              <textarea class="form-control" id="h_private_key" rows="4" placeholder="-----BEGIN RSA PRIVATE KEY-----"></textarea>
+            </div>
+            <div class="col-12">
+              <label class="form-label">备注</label>
+              <input class="form-control" id="h_remark" placeholder="可选">
+            </div>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="hostSaveBtn">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,131 @@
+sequenceDiagram
+    autonumber
+    participant SUP as RtSupervisor<br/>(T03)
+    participant CAP as FileRtCapture<br/>【T02 新建】
+    participant WT as create_watcher()<br/>【T01 已完成】
+    participant ENG as FileBackupEngine<br/>【T01 已增强】
+    participant REPO as LogRepository<br/>【T01 已完成】
+    participant JNL as RecoveryJournal<br/>【T01 已完成】
+    participant MD as models
+    participant TIER as tier_replication
+
+    SUP->>CAP: start()
+    CAP->>REPO: load_state() 断点续传
+    CAP->>ENG: has_base_snapshot()
+    alt 无基准
+        CAP->>ENG: ensure_base_full(out_dir=repo.base_dir())
+        ENG-->>CAP: BackupResult(全量)
+        CAP->>JNL: append({rp_kind:'base-full', rp_type:'full', ...})
+    end
+    CAP->>WT: create_watcher(task, rt, self._on_batch)
+    CAP->>WT: watcher.start()
+    CAP->>MD: upsert_rt_state(running, watcher_impl, degrade_reason)
+
+    loop 事件去抖 / 强制 flush（T01 已实现）
+        WT->>WT: poll_once() → _diff_against_snapshot
+        WT-->>CAP: _on_batch(ChangeBatch)
+        alt batch.trigger == 'base'
+            CAP->>ENG: ensure_base_full()
+        else batch 为空
+            CAP->>MD: 仅更新 last_capture_at（不产恢复点）
+        else 有变更
+            CAP->>ENG: capture_increment(out_dir=repo.inc_dir(),<br/>changed, deleted, source_files=batch.snapshot)
+            ENG-->>CAP: BackupResult(archive, size, checksum)
+            CAP->>JNL: append({rp_kind:'file-inc', parent_rp_id, ...})
+            CAP->>MD: upsert_rt_state(last_rp_at, rpo, bytes_today)
+            CAP->>REPO: save_state(pending_rp_ids += rp.id)
+        end
+    end
+
+    SUP->>CAP: tick()
+    CAP->>REPO: disk_usage()
+    alt 达聚合阈值
+        CAP->>REPO: make_bundle(pending_points)
+        CAP->>MD: create_backup_set(...)
+        CAP->>TIER: replicate_async(bundle_path, task, record_id)
+        CAP->>JNL: mark_uploaded(rp_ids, set_id, tier, bundle_key)
+        CAP->>REPO: save_state(pending 清空)
+    end
+
+---
+
+sequenceDiagram
+    autonumber
+    participant RUN as run.py
+    participant SCH as scheduler.start_scheduler()
+    participant SUP as RtSupervisor【T03】
+    participant LK as instance/rt_supervisor.lock
+    participant MD as models
+    participant W as worker<br/>(FileRtCapture / CDCDaemon)
+
+    RUN->>SCH: start_scheduler()
+    SCH->>SCH: 现有 5 个 _register_xxx（不动）
+    SCH->>SUP: _register_rt_backup(sched)
+
+    alt config.RT_BACKUP_ENABLED == False
+        SUP-->>SCH: 直接 return（不抢锁、不起线程）
+    end
+
+    SUP->>LK: _acquire_lock()  O_CREAT|O_EXCL
+    alt 抢锁成功
+        LK-->>SUP: 写 {pid, host, started_at}
+        SUP->>SUP: 起主循环线程 daemon=True
+    else 锁已存在
+        SUP->>LK: stat().st_mtime
+        alt mtime 超 RT_LOCK_STALE_SEC(60s)
+            SUP->>LK: 接管陈旧锁
+        else 锁新鲜
+            SUP-->>SCH: return False（本进程只跑 Flask）
+        end
+    end
+
+    SCH->>SCH: add_job(rt_health,   Interval(1min), max_instances=1, coalesce=True)
+    SCH->>SCH: add_job(rt_prune,    Interval(1h),   max_instances=1, coalesce=True)
+    SCH->>SCH: add_job(rt_watchdog, Interval(5min), max_instances=1, coalesce=True)
+
+    loop 每 RT_SUPERVISOR_TICK_SEC (10s)
+        SUP->>LK: _renew_lock() 更新 mtime
+        SUP->>MD: list_rt_tasks(only_enabled=True)
+        SUP->>SUP: reconcile()：增/删/重启 worker
+        par 并行 tick
+            SUP->>W: tick()
+            W-->>SUP: {alive, lag_sec, position, sealed, error}
+        end
+        SUP->>MD: upsert_rt_state(...)
+        alt worker 死亡
+            SUP->>SUP: 退避 RT_RESTART_BACKOFF_SEC[n]
+            alt restart_count > RT_MAX_RESTART(5)
+                SUP->>MD: daemon_status='failed'（等人工 /restart）
+            end
+        end
+    end
+
+---
+
+graph LR
+    T01["T01 数据模型+仓库+Journal<br/>✅ 已完成 33/33"]
+
+    subgraph B1["批次 1（并行）"]
+        T02["T02 文件近实时捕获<br/>FileRtCapture 收口<br/>4 子任务 / 2 新建"]
+        T03["T03 DB CDC 守护<br/>+Supervisor+调度<br/>6 子任务 / 6 新建"]
+    end
+
+    subgraph B2["批次 2"]
+        T04["T04 PITR+健康+API<br/>6 子任务 / 4 新建"]
+    end
+
+    subgraph B3["批次 3"]
+        T05["T05 前端时间轴<br/>+巡检/AI 集成<br/>5 子任务 / 1 新建"]
+    end
+
+    T01 --> T02
+    T01 --> T03
+    T02 --> T04
+    T03 --> T04
+    T04 --> T05
+
+    style T01 fill:#CCFBF1,stroke:#0D9488,stroke-width:2px
+    style T02 fill:#F0FDFA,stroke:#0D9488,stroke-width:2px
+    style T03 fill:#FEF3C7,stroke:#D97706,stroke-width:3px
+    style T04 fill:#F0FDFA,stroke:#0D9488,stroke-width:2px
+    style T05 fill:#F8FAFC,stroke:#475569,stroke-width:2px

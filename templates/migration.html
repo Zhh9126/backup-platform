@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">迁移保护</div>
+    <div class="page-sub">迁移全流程保护：黄金回退点 + 恢复验证 / 高频增量 / 重心切换与旧库保留</div>
+  </div>
+  <button class="btn btn-primary" id="newMigrationBtn"><i class="bi bi-plus-lg"></i> 新建迁移计划</button>
+  <button class="btn btn-outline-secondary btn-sm" onclick="loadMigrations()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+</div>
+
+<div class="page-card">
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>任务</th><th>阶段</th><th>黄金点记录</th><th>校验</th>
+        <th>旧库保留(天)</th><th>状态</th><th>备注</th>
+        <th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="migrationTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 新建迁移计划 模态框 -->
+<div class="modal fade" id="migrationModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">新建迁移计划</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label class="form-label">关联备份任务（迁移源端生产库）*</label>
+          <select class="form-select" id="m_task_id"></select>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">触发阶段</label>
+          <select class="form-select" id="m_stage">
+            <option value="pre">pre · 黄金回退点（全量备份）</option>
+            <option value="mid">mid · 高频增量保护</option>
+            <option value="post">post · 重心切换 + 旧库保留</option>
+          </select>
+        </div>
+        <div class="mb-3" id="m_old_retention_wrap">
+          <label class="form-label">旧系统备份保留天数（post 阶段生效）</label>
+          <input type="number" class="form-control" id="m_old_retention_days" value="30">
+        </div>
+        <div class="mb-3">
+          <label class="form-label">备注</label>
+          <textarea class="form-control" id="m_note" rows="2" placeholder="可填写迁移说明"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="migrationSaveBtn">保存并触发</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="alert alert-info mt-3" role="alert">
+  <i class="bi bi-info-circle"></i> <strong>迁移全流程保护</strong>：<code>pre</code> 对源端生产库做全量备份作为「黄金回退点」，并做恢复验证；<code>mid</code> 对两端库做高频增量/日志备份；<code>post</code> 稳定后将备份重心切到新体系，旧系统备份按设定天数保留后清理。
+</div>
+{% endblock %}

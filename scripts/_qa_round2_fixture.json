@@ -1,0 +1,136 @@
+{
+  "sources": {
+    "items": [
+      {
+        "db_type": "postgresql",
+        "dr_site": "10.40.0.2:5432/users",
+        "enabled": true,
+        "id": 2,
+        "kind": "sync_task",
+        "last_run_at": "",
+        "last_status": "never",
+        "name": "上海→广州 用户库同步",
+        "primary_site": "10.30.0.7:5432/users",
+        "status": "never"
+      },
+      {
+        "db_type": "mysql",
+        "dr_site": "10.20.0.1:3306/orders",
+        "enabled": true,
+        "id": 1,
+        "kind": "sync_task",
+        "last_run_at": "",
+        "last_status": "never",
+        "name": "北京→上海 订单库同步",
+        "primary_site": "10.10.0.5:3306/orders",
+        "status": "never"
+      },
+      {
+        "db_type": "mysql",
+        "dr_site": "本地日志仓库",
+        "enabled": true,
+        "id": 1,
+        "kind": "rt_task",
+        "last_run_at": "",
+        "last_status": "never",
+        "name": "核心交易库",
+        "primary_site": "10.10.0.9:3306/trade",
+        "rpo_sec": 42,
+        "rt_enabled": true,
+        "rt_mode": "db_cdc",
+        "status": "never"
+      },
+      {
+        "db_type": "mysql",
+        "dr_site": "本地日志仓库",
+        "enabled": true,
+        "id": 2,
+        "kind": "rt_task",
+        "last_run_at": "",
+        "last_status": "never",
+        "name": "风控日志库",
+        "primary_site": "10.11.0.4:3306/riskctl",
+        "rpo_sec": null,
+        "rt_enabled": true,
+        "rt_mode": "db_cdc",
+        "status": "never"
+      }
+    ],
+    "kinds": [
+      "sync_task",
+      "rt_task",
+      "manual"
+    ],
+    "ok": true,
+    "sources": {
+      "rt_task": [
+        {
+          "db_type": "mysql",
+          "dr_site": "本地日志仓库",
+          "enabled": true,
+          "id": 1,
+          "kind": "rt_task",
+          "last_run_at": "",
+          "last_status": "never",
+          "name": "核心交易库",
+          "primary_site": "10.10.0.9:3306/trade",
+          "rpo_sec": 42,
+          "rt_enabled": true,
+          "rt_mode": "db_cdc",
+          "status": "never"
+        },
+        {
+          "db_type": "mysql",
+          "dr_site": "本地日志仓库",
+          "enabled": true,
+          "id": 2,
+          "kind": "rt_task",
+          "last_run_at": "",
+          "last_status": "never",
+          "name": "风控日志库",
+          "primary_site": "10.11.0.4:3306/riskctl",
+          "rpo_sec": null,
+          "rt_enabled": true,
+          "rt_mode": "db_cdc",
+          "status": "never"
+        }
+      ],
+      "sync_task": [
+        {
+          "db_type": "postgresql",
+          "dr_site": "10.40.0.2:5432/users",
+          "enabled": true,
+          "id": 2,
+          "kind": "sync_task",
+          "last_run_at": "",
+          "last_status": "never",
+          "name": "上海→广州 用户库同步",
+          "primary_site": "10.30.0.7:5432/users",
+          "status": "never"
+        },
+        {
+          "db_type": "mysql",
+          "dr_site": "10.20.0.1:3306/orders",
+          "enabled": true,
+          "id": 1,
+          "kind": "sync_task",
+          "last_run_at": "",
+          "last_status": "never",
+          "name": "北京→上海 订单库同步",
+          "primary_site": "10.10.0.5:3306/orders",
+          "status": "never"
+        }
+      ]
+    },
+    "total": 4
+  },
+  "rt_status_stopped": {
+    "ok": true,
+    "running": false,
+    "enabled": true,
+    "driver": "demo",
+    "worker_count": 0,
+    "tick_count": 0,
+    "tick_interval_sec": 5
+  }
+}

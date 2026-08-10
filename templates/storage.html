@@ -1,0 +1,359 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+  <h4 class="page-title"><i class="bi bi-hdd-rack"></i> 备份存储管理</h4>
+  <p class="text-muted mb-0">三重备份体系：MinIO 热数据（L1）→ S3 冷数据（L2）→ 源端本地路径导出（L3）</p>
+</div>
+
+<!-- 三级架构卡片（内嵌目标详情） -->
+<div class="row g-3 mb-3" id="tierOverview">
+  <!-- L1 MinIO 热数据 -->
+  <div class="col-md-4">
+    <div class="page-card tier-card tier-minio">
+      <div class="tier-card-header">
+        <i class="bi bi-cloud-arrow-up"></i>
+        <span>L1 MinIO 热数据</span>
+        <span class="badge bg-warning text-dark tier-badge">热数据</span>
+      </div>
+      <div class="tier-card-body">
+        <div class="tier-stat" id="tier1Stat">加载中...</div>
+        <div class="tier-usage mt-2" id="tier1Usage"></div>
+        <div class="tier-desc">高频访问对象存储，所有备份先写入此处（第一落点）</div>
+        <!-- L1 目标列表（动态填充） -->
+        <div class="tier-targets mt-3" id="tier1Targets"></div>
+      </div>
+    </div>
+  </div>
+  <!-- L2 S3 冷数据 -->
+  <div class="col-md-4">
+    <div class="page-card tier-card tier-s3">
+      <div class="tier-card-header">
+        <i class="bi bi-cloud-check"></i>
+        <span>L2 S3 冷数据</span>
+        <span class="badge bg-info tier-badge">冷归档</span>
+      </div>
+      <div class="tier-card-body">
+        <div class="tier-stat" id="tier2Stat">加载中...</div>
+        <div class="tier-desc">长期归档存储，由 L1 实时推送，异地容灾兜底</div>
+        <div class="tier-targets mt-3" id="tier2Targets"></div>
+      </div>
+    </div>
+  </div>
+  <!-- L3 源端本地路径导出 -->
+  <div class="col-md-4">
+    <div class="page-card tier-card tier-local">
+      <div class="tier-card-header">
+        <i class="bi bi-hdd"></i>
+        <span>L3 源端本地路径</span>
+        <span class="badge bg-secondary tier-badge">离线导出</span>
+      </div>
+      <div class="tier-card-body">
+        <div class="tier-stat" id="tier3Stat">加载中...</div>
+        <div class="tier-desc">服务端本地目录，备份可导出至此供离线转移</div>
+        <div class="tier-targets mt-3" id="tier3Targets"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 依赖状态提示 -->
+<div id="depWarning" class="alert alert-warning d-none" role="alert">
+  <i class="bi bi-exclamation-triangle-fill me-1"></i>
+  <span id="depMsg"></span>
+  <a href="#" onclick="event.preventDefault();showInstallHint()" class="alert-link">查看安装说明</a>
+</div>
+
+<!-- 操作栏 + 复制策略 -->
+<div class="page-card mb-3">
+  <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <div class="d-flex gap-2">
+      <button class="btn btn-primary btn-sm" onclick="openStorageModal()">
+        <i class="bi bi-plus-lg me-1"></i>新增存储目标
+      </button>
+      <button class="btn btn-outline-secondary btn-sm" onclick="loadTargets()">
+        <i class="bi bi-arrow-clockwise me-1"></i>刷新
+      </button>
+    </div>
+    <div class="d-flex gap-3 align-items-center">
+      <div class="form-check form-switch d-inline-block">
+        <input class="form-check-input" type="checkbox" id="autoReplicateSwitch" checked>
+        <label class="form-check-label text-muted" for="autoReplicateSwitch"><small>启用自动复制</small></label>
+      </div>
+      <button class="btn btn-outline-info btn-sm" onclick="openReplicateConfig()">
+        <i class="bi bi-gear me-1"></i>复制策略
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- 冷热分级生命周期策略 -->
+<div class="page-card mb-3">
+  <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+    <div>
+      <h6 class="mb-0"><i class="bi bi-arrow-down-up me-1"></i>冷热分级生命周期</h6>
+      <small class="text-muted">按年龄 / 容量在 L1 MinIO → L2 S3 间自动流转与到期清理</small>
+    </div>
+    <div class="d-flex gap-2">
+      <button class="btn btn-outline-secondary btn-sm" onclick="loadLifecycle()">
+        <i class="bi bi-arrow-clockwise me-1"></i>刷新
+      </button>
+      <button class="btn btn-primary btn-sm" onclick="runLifecycle()">
+        <i class="bi bi-play-fill me-1"></i>立即执行
+      </button>
+    </div>
+  </div>
+  <!-- 各级概览 -->
+  <div class="row g-3 mb-3" id="lifecycleOverview">
+    <div class="col-md-4"><div class="tier-stat" id="lcTier1">加载中...</div></div>
+    <div class="col-md-4"><div class="tier-stat" id="lcTier2">加载中...</div></div>
+    <div class="col-md-4"><div class="tier-stat" id="lcTier3">加载中...</div></div>
+  </div>
+  <!-- 策略配置表单 -->
+  <div class="row g-3">
+    <div class="col-md-3">
+      <label class="form-label small">L1→L2 年龄阈值（天）</label>
+      <input type="number" class="form-control form-control-sm" id="lcL1L2" value="7" min="0">
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small">L2 冷归档保留（天）</label>
+      <input type="number" class="form-control form-control-sm" id="lcL2L3" value="30" min="0">
+      <div class="form-text">L3 源端本地路径为复制终态导出，不参与自动生命周期流转。</div>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small">L1 容量触发阈值（%）</label>
+      <input type="number" class="form-control form-control-sm" id="lcCap" value="85" min="0" max="100">
+    </div>
+    <div class="col-md-3">
+      <label class="form-label small">保留天数（到期清理）</label>
+      <input type="number" class="form-control form-control-sm" id="lcRetain" value="90" min="0">
+    </div>
+  </div>
+  <div class="row g-3 mt-1 align-items-center">
+    <div class="col-auto">
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" id="lcEnabled" checked>
+        <label class="form-check-label small text-muted" for="lcEnabled">启用生命周期</label>
+      </div>
+    </div>
+    <div class="col-auto">
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" id="lcExpiry" checked>
+        <label class="form-check-label small text-muted" for="lcExpiry">启用到期清理</label>
+      </div>
+    </div>
+    <div class="col-auto ms-auto">
+      <button class="btn btn-outline-primary btn-sm" onclick="saveLifecycle()">
+        <i class="bi bi-save me-1"></i>保存策略
+      </button>
+    </div>
+  </div>
+  <div id="lcMsg" class="small mt-2"></div>
+</div>
+
+<!-- 空状态 -->
+<div id="emptyState" class="page-card text-center py-5 d-none">
+  <i class="bi bi-hdd-rack display-1 text-primary"></i>
+  <h6 class="mt-2">还没有任何存储目标</h6>
+  <p class="text-muted">存储目标是备份文件的落点：MinIO 热数据(L1) → S3 冷归档(L2) → 源端本地路径(L3)。<br>建议先添加至少一个 MinIO 或 S3 目标。</p>
+  <button type="button" class="btn btn-primary btn-sm" onclick="openStorageModal()"><i class="bi bi-plus-lg me-1"></i>立即添加第一个存储目标</button>
+</div>
+
+<!-- ========== 新建/编辑存储目标模态框 ========== -->
+<div class="modal fade" id="storageModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="storageModalTitle">新增存储目标</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <form id="storageForm">
+          <input type="hidden" id="st_id">
+
+          <!-- 基本信息 -->
+          <div class="row g-3 mb-3">
+            <div class="col-md-6">
+              <label class="form-label">名称 *</label>
+              <input type="text" class="form-control" id="st_name" required placeholder="如 生产MinIO集群">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">存储类型 *</label>
+              <select class="form-select" id="st_type" required onchange="onStorageTypeChange()">
+                <option value="">— 请选择 —</option>
+                <option value="minio">MinIO 热存储 (L1)</option>
+                <option value="s3">S3 冷存储 (L2)</option>
+                <option value="local">本地存储 (L3)</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- 本地存储专用字段 -->
+          <div id="st_fields_local" class="storage-type-fields d-none">
+            <div class="row g-3">
+              <div class="col-12">
+                <label class="form-label">存储路径</label>
+                <input type="text" class="form-control font-code" id="st_endpoint_local"
+                       placeholder="/data/backups 或 C:\backups"
+                       value="./backups">
+                <div class="form-text">备份文件的本地根目录，需确保进程有读写权限。</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- MinIO/S3 通用字段 -->
+          <div id="st_fields_s3_compat" class="storage-type-fields d-none">
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label class="form-label">Endpoint *</label>
+                <input type="text" class="form-control font-code" id="st_endpoint_s3"
+                       placeholder="minio.example.com:9000 或 s3.amazonaws.com">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Region</label>
+                <input type="text" class="form-control" id="st_region" placeholder="us-east-1 或留空">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Access Key</label>
+                <div class="input-group">
+                  <input type="text" class="form-control font-code" id="st_access_key" placeholder="Access Key ID" autocomplete="off" data-lpignore="true">
+                  <button type="button" class="btn btn-outline-secondary" onclick="toggleReveal('st_access_key')" title="显示/隐藏"><i class="bi bi-eye"></i></button>
+                </div>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Secret Key</label>
+                <div class="input-group">
+                  <input type="password" class="form-control font-code" id="st_secret_key" placeholder="留空表示不修改" autocomplete="new-password" data-lpignore="true">
+                  <button type="button" class="btn btn-outline-secondary" onclick="toggleReveal('st_secret_key')" title="显示/隐藏"><i class="bi bi-eye"></i></button>
+                </div>
+                <div class="form-text">新建时必填；编辑时留空保持原值不变。</div>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Bucket *</label>
+                <input type="text" class="form-control" id="st_bucket" placeholder="my-backup-bucket">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">前缀路径</label>
+                <input type="text" class="form-control font-code" id="st_prefix" placeholder="prod/db-backups">
+                <div class="form-text">对象键名前缀，用于分类组织。</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- S3 额外选项 -->
+          <div id="st_fields_s3_extra" class="storage-type-fields d-none mt-3">
+            <h6 class="text-muted border-bottom pb-2 mb-3"><i class="bi bi-gear me-1"></i>S3 高级选项</h6>
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label class="form-label">存储类</label>
+                <select class="form-select" id="st_storage_class">
+                  <option value="STANDARD">STANDARD（标准）</option>
+                  <option value="STANDARD_IA" selected>STANDARD_IA（低频访问）</option>
+                  <option value="GLACIER">GLACIER（冰川归档）</option>
+                  <option value="DEEP_ARCHIVE">DEEP_ARCHIVE（深度归档）</option>
+                  <option value="INTELLIGENT_TIERING">INTELLIGENT_TIERING（智能分层）</option>
+                </select>
+              </div>
+              <div class="col-md-6">
+                <div class="form-check mt-4">
+                  <input class="form-check-input" type="checkbox" id="st_insecure">
+                  <label class="form-check-label" for="st_insecure">跳过 TLS 校验</label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 公共字段 -->
+          <div class="row g-3 mt-2 pt-3 border-top">
+            <div class="col-md-8">
+              <label class="form-label">备注</label>
+              <input type="text" class="form-control" id="st_remark" placeholder="可选备注信息">
+            </div>
+            <div class="col-md-2">
+              <div class="form-check mt-4">
+                <input class="form-check-input" type="checkbox" id="st_enabled" checked>
+                <label class="form-check-label" for="st_enabled">启用</label>
+              </div>
+            </div>
+            <div class="col-md-2">
+              <div class="form-check mt-4">
+                <input class="form-check-input" type="checkbox" id="st_default">
+                <label class="form-check-label" for="st_default">设为默认</label>
+              </div>
+            </div>
+          </div>
+        </form>
+      </div>
+      <div id="stTestResult" class="px-3 pb-1 small"></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn btn-primary" id="stSaveBtn" onclick="saveStorage()">保存</button>
+        <button type="button" class="btn btn-outline-info d-none" id="stTestBtn" onclick="testStorageConn()">测试连接</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ========== 复制策略配置模态框 ========== -->
+<div class="modal fade" id="replicateConfigModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-arrow-left-right me-1"></i>复制策略配置</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <p class="text-muted small mb-3">配置备份完成后数据的级联复制方向与时机。修改后立即生效。</p>
+
+        <!-- 复制方向 -->
+        <div class="mb-3">
+          <label class="form-label fw-semibold"><i class="bi bi-diagram-3 me-1"></i>复制到以下层级</label>
+          <div class="form-check mb-2">
+            <input class="form-check-input" type="checkbox" id="rep_l1_minio" checked>
+            <label class="form-check-label" for="rep_l1_minio">L1 · MinIO 热数据</label>
+          </div>
+          <div class="form-check mb-2">
+            <input class="form-check-input" type="checkbox" id="rep_l2_s3" checked>
+            <label class="form-check-label" for="rep_l2_s3">L2 · S3 冷数据</label>
+          </div>
+          <div class="form-check mb-2">
+            <input class="form-check-input" type="checkbox" id="rep_l3_local" checked>
+            <label class="form-check-label" for="rep_l3_local">L3 · 源端本地路径导出</label>
+          </div>
+          <div class="form-text">备份完成后，本地备份文件将按勾选项并行复制到对应层级存储目标。</div>
+        </div>
+
+        <!-- 复制时机 -->
+        <div class="mb-3">
+          <label class="form-label fw-semibold"><i class="bi bi-clock me-1"></i>复制时机</label>
+          <select class="form-select" id="rep_timing">
+            <option value="immediate">实时（备份完成后立即执行）</option>
+            <option value="delay_5min">延迟 5 分钟</option>
+            <option value="delay_30min">延迟 30 分钟</option>
+            <option value="delay_1hour">延迟 1 小时</option>
+            <option value="manual">仅手动触发</option>
+          </select>
+        </div>
+
+        <!-- 失败重试 -->
+        <div class="mb-3">
+          <label class="form-label fw-semibold"><i class="bi bi-arrow-repeat me-1"></i>失败处理</label>
+          <div class="row g-2">
+            <div class="col-6">
+              <label class="form-label small text-muted">最大重试次数</label>
+              <input type="number" class="form-control form-control-sm" id="rep_max_retries" value="3" min="0" max="10">
+            </div>
+            <div class="col-6">
+              <label class="form-label small text-muted">重试间隔(秒)</label>
+              <input type="number" class="form-control form-control-sm" id="rep_retry_interval" value="30" min="5" max="300">
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn btn-primary" onclick="saveReplicateConfig()"><i class="bi bi-check-lg me-1"></i>保存策略</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

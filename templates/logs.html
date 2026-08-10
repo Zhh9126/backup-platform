@@ -1,0 +1,236 @@
+{% extends "base.html" %}
+{% block title %}系统日志 - 备份管理平台{% endblock %}
+
+{% block styles %}
+<style>
+  .log-row td {
+    vertical-align: middle;
+    font-size: 13px;
+  }
+  .log-level {
+    display: inline-block;
+    min-width: 60px;
+    text-align: center;
+    font-weight: 600;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+  }
+  .log-level-INFO    { background: #cfe2ff; color: #084298; }
+  .log-level-ERROR   { background: #f8d7da; color: #842029; }
+  .log-level-WARN    { background: #fff3cd; color: #664d03; }
+  .log-level-DEBUG   { background: #e2e3e5; color: #41464b; }
+  .log-level-UNKNOWN { background: #f0f0f0; color: #555; }
+  .log-source {
+    display: inline-block;
+    background: #f1f3f5;
+    color: #495057;
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .log-msg {
+    word-break: break-all;
+    color: #212529;
+  }
+  .log-time {
+    color: #6c757d;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">系统日志</div>
+    <div class="page-sub">集中展示平台运行产生的所有系统级日志，支持按级别、来源筛选和自动刷新</div>
+  </div>
+  <div class="toolbar-actions">
+    <button class="btn btn-light" id="btn-refresh" title="手动刷新">
+      <i class="bi bi-arrow-clockwise"></i> 刷新
+    </button>
+    <label class="btn btn-light mb-0" title="自动刷新">
+      <input type="checkbox" id="auto-refresh" checked style="margin-right:6px;vertical-align:middle;">
+      自动刷新
+    </label>
+    <button class="btn btn-outline-danger" id="btn-clear">
+      <i class="bi bi-trash3"></i> 清空日志
+    </button>
+  </div>
+</div>
+
+<div class="page-card">
+  <div class="d-flex align-items-center flex-wrap" style="gap:12px;">
+    <div class="d-flex align-items-center" style="gap:6px;">
+      <label class="form-label mb-0">级别</label>
+      <select id="filter-level" class="form-select form-select-sm" style="width:120px;">
+        <option value="">全部</option>
+        <option value="INFO">INFO</option>
+        <option value="WARN">WARN</option>
+        <option value="ERROR">ERROR</option>
+        <option value="DEBUG">DEBUG</option>
+      </select>
+    </div>
+    <div class="d-flex align-items-center" style="gap:6px;">
+      <label class="form-label mb-0">来源</label>
+      <select id="filter-source" class="form-select form-select-sm" style="width:160px;">
+        <option value="">全部</option>
+      </select>
+    </div>
+    <div class="d-flex align-items-center" style="gap:6px;">
+      <label class="form-label mb-0">条数</label>
+      <select id="filter-limit" class="form-select form-select-sm" style="width:100px;">
+        <option value="100">100</option>
+        <option value="200" selected>200</option>
+        <option value="500">500</option>
+        <option value="1000">1000</option>
+      </select>
+    </div>
+    <div class="ms-auto text-muted small">
+      共 <span id="log-count">0</span> 条
+      <span class="mx-2">|</span>
+      <span id="log-status">就绪</span>
+    </div>
+  </div>
+</div>
+
+<div class="page-card">
+  <div class="table-responsive">
+    <table class="table table-hover align-middle">
+      <thead>
+        <tr>
+          <th style="width:170px;">时间</th>
+          <th style="width:80px;">级别</th>
+          <th style="width:140px;">来源</th>
+          <th>消息</th>
+        </tr>
+      </thead>
+      <tbody id="log-tbody">
+        <tr><td colspan="4" class="text-center text-muted py-4">加载中…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const api = window.BKP.api;
+
+  const tbody   = $("log-tbody");
+  const status  = $("log-status");
+  const cnt     = $("log-count");
+  const selLvl  = $("filter-level");
+  const selSrc  = $("filter-source");
+  const selLim  = $("filter-limit");
+  const btnRef  = $("btn-refresh");
+  const btnClr  = $("btn-clear");
+  const autoChk = $("auto-refresh");
+
+  let sourcesLoaded = false;
+  let timer = null;
+
+  const escape = (s) =>
+    String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+
+  function render(rows) {
+    if (!rows || !rows.length) {
+      tbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted py-4">暂无日志</td></tr>`;
+      return;
+    }
+    const html = rows.map((r) => {
+      const lvl = (r.level || "UNKNOWN").toUpperCase();
+      const src = escape(r.source || "-");
+      const ts  = escape(r.ts || "-");
+      const msg = escape(r.message || "");
+      return `<tr class="log-row">
+        <td class="log-time">${ts}</td>
+        <td><span class="log-level log-level-${escape(lvl)}">${escape(lvl)}</span></td>
+        <td><span class="log-source">${src}</span></td>
+        <td class="log-msg">${msg}</td>
+      </tr>`;
+    }).join("");
+    tbody.innerHTML = html;
+  }
+
+  async function loadSources() {
+    try {
+      const r = await api("GET", "/api/logs");
+      if (r && r.ok && Array.isArray(r.sources)) {
+        const cur = selSrc.value;
+        selSrc.innerHTML = `<option value="">全部</option>` +
+          r.sources.map((s) => `<option value="${escape(s)}">${escape(s)}</option>`).join("");
+        if (cur && r.sources.includes(cur)) selSrc.value = cur;
+        sourcesLoaded = true;
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  async function loadLogs() {
+    const params = new URLSearchParams();
+    if (selLvl.value) params.set("level", selLvl.value);
+    if (selSrc.value) params.set("source", selSrc.value);
+    params.set("limit", selLim.value || "200");
+    status.textContent = "加载中…";
+    try {
+      const r = await api("GET", "/api/logs?" + params.toString());
+      if (r && r.ok) {
+        render(r.logs || []);
+        cnt.textContent = r.count || 0;
+        if (!sourcesLoaded && Array.isArray(r.sources)) {
+          const cur = selSrc.value;
+          selSrc.innerHTML = `<option value="">全部</option>` +
+            r.sources.map((s) => `<option value="${escape(s)}">${escape(s)}</option>`).join("");
+          if (cur && r.sources.includes(cur)) selSrc.value = cur;
+          sourcesLoaded = true;
+        }
+        status.textContent = "就绪";
+      } else {
+        status.textContent = "加载失败";
+      }
+    } catch (e) {
+      status.textContent = "加载失败：" + (e && e.message ? e.message : e);
+    }
+  }
+
+  function scheduleAuto() {
+    if (timer) { clearInterval(timer); timer = null; }
+    if (autoChk.checked) {
+      timer = setInterval(loadLogs, 5000);
+    }
+  }
+
+  selLvl.addEventListener("change", loadLogs);
+  selSrc.addEventListener("change", loadLogs);
+  selLim.addEventListener("change", loadLogs);
+  btnRef.addEventListener("click", loadLogs);
+  autoChk.addEventListener("change", scheduleAuto);
+
+  btnClr.addEventListener("click", async () => {
+    if (!confirm("确认清空全部系统日志？此操作不可恢复。")) return;
+    try {
+      const r = await api("POST", "/api/logs/clear", {});
+      if (r && r.ok) {
+        BKP.toast && BKP.toast(`已清空 ${r.deleted} 条日志`, "success");
+        loadLogs();
+      } else {
+        BKP.toast && BKP.toast("清空失败", "danger");
+      }
+    } catch (e) {
+      BKP.toast && BKP.toast("清空失败：" + (e && e.message ? e.message : e), "danger");
+    }
+  });
+
+  // 首屏：先加载日志（自带 source 列表），再启动自动刷新
+  loadLogs().then(() => scheduleAuto());
+})();
+</script>
+{% endblock %}

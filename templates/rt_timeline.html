@@ -1,0 +1,396 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+  /* 时间轴专属样式 —— 颜色一律引用 app.css Design Tokens，禁止硬编码 */
+  .rt-stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: var(--space-md); }
+  .rt-stat {
+    background: var(--card-bg); border: 1px solid var(--border-base);
+    border-radius: var(--radius-lg); padding: var(--space-md);
+    box-shadow: var(--shadow-card);
+  }
+  .rt-stat .rt-stat-label { font-size: var(--font-size-xs); color: var(--text-muted); letter-spacing: .02em; }
+  .rt-stat .rt-stat-value { font-size: var(--font-size-xxl); font-weight: var(--weight-semibold); color: var(--text-primary); line-height: 1.2; }
+  .rt-stat .rt-stat-sub { font-size: var(--font-size-xs); color: var(--text-secondary); }
+
+  .rt-daemon-bar {
+    display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-md);
+    padding: var(--space-sm) var(--space-md); border-radius: var(--radius-md);
+    background: var(--primary-bg); border: 1px solid var(--primary-light);
+    font-size: var(--font-size-sm); color: var(--text-secondary);
+  }
+  .rt-daemon-bar .rt-kv strong { color: var(--text-primary); font-weight: var(--weight-medium); }
+
+  .rt-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: var(--space-xs); vertical-align: middle; }
+  .rt-dot.green { background: var(--success); }
+  .rt-dot.yellow { background: var(--warning); }
+  .rt-dot.red { background: var(--error); }
+  .rt-dot.unknown { background: var(--text-muted); }
+
+  /* 时间轴主体 */
+  .rt-axis-wrap { position: relative; padding: var(--space-md) 0 0; }
+  .rt-axis {
+    position: relative; display: flex; align-items: flex-end; gap: 1px;
+    height: 132px; padding: 0 2px;
+    background: linear-gradient(to top, var(--page-bg) 0%, var(--card-bg) 100%);
+    border: 1px solid var(--border-base); border-radius: var(--radius-md);
+    overflow: hidden; cursor: crosshair; user-select: none;
+  }
+  .rt-bucket { flex: 1 1 0; min-width: 1px; height: 100%; display: flex; align-items: flex-end; position: relative; }
+  .rt-bucket i {
+    display: block; width: 100%; min-height: 0;
+    background: var(--primary); border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+    transition: background .12s ease;
+  }
+  .rt-bucket.gap i { background: var(--warning-light); }
+  .rt-bucket.gap::after {
+    content: ""; position: absolute; inset: 0;
+    background: repeating-linear-gradient(45deg, transparent, transparent 3px, var(--warning-light) 3px, var(--warning-light) 6px);
+    opacity: .55; pointer-events: none;
+  }
+  .rt-bucket.empty i { background: var(--border-base); height: 2px !important; }
+  .rt-bucket:hover i { background: var(--primary-hover); }
+  .rt-bucket.selected i { background: var(--primary-hover); }
+  .rt-bucket.selected::before {
+    content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 2px;
+    background: var(--error); transform: translateX(-50%); z-index: 2;
+  }
+
+  .rt-axis-labels { display: flex; justify-content: space-between; margin-top: var(--space-xs); font-size: var(--font-size-xs); color: var(--text-muted); }
+  .rt-legend { display: flex; flex-wrap: wrap; gap: var(--space-md); font-size: var(--font-size-xs); color: var(--text-secondary); margin-top: var(--space-sm); }
+  .rt-legend span i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: var(--space-xs); vertical-align: middle; }
+  .rt-legend .lg-inc i { background: var(--primary); }
+  .rt-legend .lg-gap i { background: var(--warning-light); border: 1px solid var(--warning); }
+  .rt-legend .lg-empty i { background: var(--border-base); }
+  .rt-legend .lg-cursor i { background: var(--error); width: 2px; height: 12px; border-radius: 0; }
+
+  .rt-cursor-panel {
+    border: 1px solid var(--border-base); border-radius: var(--radius-lg);
+    padding: var(--space-md); background: var(--card-bg); height: 100%;
+  }
+  .rt-cursor-ts { font-family: var(--font-family-code); font-size: var(--font-size-md); color: var(--primary); font-weight: var(--weight-semibold); word-break: break-all; }
+  .rt-plan-line { font-size: var(--font-size-sm); color: var(--text-secondary); margin-top: var(--space-sm); }
+  .rt-chip {
+    display: inline-block; padding: 1px var(--space-sm); border-radius: var(--radius-sm);
+    font-size: var(--font-size-xs); background: var(--primary-bg);
+    color: var(--primary-hover); border: 1px solid var(--primary-light);
+  }
+  .rt-chip.warn { background: var(--warning-light); color: var(--warning); border-color: var(--warning); }
+  .rt-chip.err { background: var(--error-light); color: var(--error); border-color: var(--error); }
+  .rt-mono { font-family: var(--font-family-code); font-size: var(--font-size-xs); }
+
+  /* 空状态引导卡（T07） */
+  .rt-empty-icon { font-size: 2.5rem; color: var(--primary); }
+  .rt-steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--space-md); }
+  .rt-step {
+    border: 1px solid var(--border-base); border-radius: var(--radius-lg);
+    padding: var(--space-md); background: var(--card-bg); text-align: left;
+  }
+  .rt-step .rt-step-no {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; border-radius: 50%;
+    background: var(--primary-bg); color: var(--primary-hover);
+    border: 1px solid var(--primary-light);
+    font-size: var(--font-size-xs); font-weight: var(--weight-semibold);
+    margin-right: var(--space-xs);
+  }
+  .rt-step .rt-step-title { font-size: var(--font-size-base); font-weight: var(--weight-medium); color: var(--text-primary); }
+  .rt-step .rt-step-desc { font-size: var(--font-size-xs); color: var(--text-secondary); margin-top: var(--space-xs); }
+</style>
+
+<div class="toolbar">
+  <div>
+    <div class="page-title">实时备份 · PITR 时间轴</div>
+    <div class="page-sub">准 CDP 持续数据保护：数据库日志流 + 文件变更捕获，支持恢复到时间轴上的任意时刻</div>
+  </div>
+  <div class="d-flex gap-2">
+    <button class="btn btn-primary btn-sm" id="rtCreateBtn" type="button" title="从已有备份任务开启实时保护"><i class="bi bi-plus-lg"></i> 创建实时保护任务</button>
+    <button class="btn btn-outline-secondary btn-sm" id="rtReconcileBtn" type="button" title="立即对账任务配置"><i class="bi bi-arrow-repeat"></i> 对账</button>
+    <button class="btn btn-outline-secondary btn-sm" id="rtRefreshBtn" type="button" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+  </div>
+</div>
+
+<!-- 空状态引导卡（无任何 rt_enabled=1 任务时显示） -->
+<div class="page-card text-center d-none" id="rtEmptyState">
+  <i class="bi bi-broadcast-pin rt-empty-icon"></i>
+  <h5 class="mt-3 mb-1" style="font-weight:var(--weight-semibold);color:var(--text-primary)">尚未开启任何实时保护任务</h5>
+  <p class="text-muted mb-4" style="font-size:var(--font-size-base)">
+    实时保护在常规备份之外持续捕获变更，把 RPO 从「小时级」压缩到「秒级 / 分钟级」，并生成可任意选点的 PITR 时间轴。
+  </p>
+  <div class="rt-steps mb-4">
+    <div class="rt-step">
+      <div class="rt-step-title"><span class="rt-step-no">1</span>挑一个已有备份任务</div>
+      <div class="rt-step-desc">实时保护不新建任务，而是在已有备份任务上开启开关，沿用其连接信息与凭据。</div>
+    </div>
+    <div class="rt-step">
+      <div class="rt-step-title"><span class="rt-step-no">2</span>选择捕获模式</div>
+      <div class="rt-step-desc">数据库走 <code>db_cdc</code> 日志流（秒级 PITR）；文件走 <code>file_polling</code> 变更轮询（分钟级）。</div>
+    </div>
+    <div class="rt-step">
+      <div class="rt-step-title"><span class="rt-step-no">3</span>守护进程持续产出恢复点</div>
+      <div class="rt-step-desc">恢复点自动落入时间轴，可点选任意时刻做 PITR 恢复，并实时监控 RPO 达标率。</div>
+    </div>
+  </div>
+  <div class="d-flex gap-2 justify-content-center flex-wrap">
+    <button class="btn btn-primary" id="rtEmptyCreateBtn" type="button"><i class="bi bi-plus-lg"></i> 创建实时保护任务</button>
+    <a class="btn btn-outline-secondary" href="/tasks"><i class="bi bi-list-task"></i> 去备份任务页</a>
+  </div>
+  <div class="text-muted mt-3" style="font-size:var(--font-size-xs)" id="rtEmptyHint">
+    若备份任务列表也为空，请先到「数据库备份 / 文件备份」页创建一个备份任务。
+  </div>
+</div>
+
+<!-- 守护状态 -->
+<div class="rt-daemon-bar mb-3" id="rtDaemonBar">
+  <span class="rt-kv"><i class="bi bi-broadcast"></i> 守护状态：<strong id="rtDaemonState">加载中…</strong></span>
+  <span class="rt-kv">驱动：<strong id="rtDaemonDriver">-</strong></span>
+  <span class="rt-kv">在管任务：<strong id="rtDaemonWorkers">-</strong></span>
+  <span class="rt-kv">Tick：<strong id="rtDaemonTick">-</strong></span>
+  <span class="rt-kv">最近心跳：<strong id="rtDaemonHeartbeat">-</strong></span>
+  <span class="ms-auto d-flex gap-2">
+    <button class="btn btn-primary btn-sm" id="rtStartBtn" type="button"><i class="bi bi-play-fill"></i> 启动</button>
+    <button class="btn btn-outline-secondary btn-sm" id="rtStopBtn" type="button"><i class="bi bi-stop-fill"></i> 停止</button>
+  </span>
+</div>
+
+<!-- T06：守护 stopped 兜底提示条（默认隐藏，由 app.js rtSyncStoppedHint 控制显隐） -->
+<div class="alert alert-warning d-none d-flex align-items-center gap-2 py-2 mb-3" role="alert"
+     id="rtStoppedHint" style="font-size:var(--font-size-sm)">
+  <i class="bi bi-exclamation-triangle-fill"></i>
+  <span>守护进程未启动，实时保护暂不产生恢复点</span>
+  <button class="btn btn-warning btn-sm ms-auto" id="rtStoppedHintStartBtn" type="button">
+    <i class="bi bi-play-fill"></i> 启动守护
+  </button>
+</div>
+
+<!-- 健康统计 -->
+<div class="rt-stat-row mb-3" id="rtStatRow">
+  <div class="rt-stat">
+    <div class="rt-stat-label">受保护任务</div>
+    <div class="rt-stat-value" id="rtStatTotal">-</div>
+    <div class="rt-stat-sub" id="rtStatDist">-</div>
+  </div>
+  <div class="rt-stat">
+    <div class="rt-stat-label">RPO 达标率</div>
+    <div class="rt-stat-value" id="rtStatCompliance">-</div>
+    <div class="rt-stat-sub" id="rtStatBreach">-</div>
+  </div>
+  <div class="rt-stat">
+    <div class="rt-stat-label">今日恢复点</div>
+    <div class="rt-stat-value" id="rtStatPoints">-</div>
+    <div class="rt-stat-sub" id="rtStatBytes">-</div>
+  </div>
+  <div class="rt-stat">
+    <div class="rt-stat-label">当前任务实际 RPO</div>
+    <div class="rt-stat-value" id="rtStatRpo">-</div>
+    <div class="rt-stat-sub" id="rtStatRpoTarget">-</div>
+  </div>
+</div>
+
+<!-- 时间轴 -->
+<div class="page-card" id="rtTimelineCard">
+  <div class="card-section-title"><i class="bi bi-bar-chart-steps"></i> 恢复点时间轴</div>
+  <div class="row g-3 align-items-end mb-2">
+    <div class="col-md-4">
+      <label class="form-label">实时保护任务</label>
+      <select class="form-select" id="rtTaskSelect">
+        <option value="">— 加载中 —</option>
+      </select>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label">时间范围</label>
+      <select class="form-select" id="rtRangeSelect">
+        <option value="3600">最近 1 小时</option>
+        <option value="21600">最近 6 小时</option>
+        <option value="86400" selected>最近 24 小时</option>
+        <option value="259200">最近 3 天</option>
+        <option value="604800">最近 7 天</option>
+        <option value="0">全部可恢复窗口</option>
+      </select>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label">分桶精度</label>
+      <select class="form-select" id="rtBucketSelect">
+        <option value="60">60 格（粗）</option>
+        <option value="120" selected>120 格</option>
+        <option value="240">240 格（细）</option>
+      </select>
+    </div>
+    <div class="col-md-2">
+      <button class="btn btn-outline-secondary w-100" id="rtTriggerBtn" type="button" title="对当前任务立即捕获一次"><i class="bi bi-lightning-charge"></i> 立即捕获</button>
+    </div>
+  </div>
+
+  <div class="rt-axis-wrap">
+    <div class="rt-axis" id="rtAxis"></div>
+    <div class="rt-axis-labels">
+      <span id="rtAxisStart">-</span>
+      <span id="rtAxisMid">-</span>
+      <span id="rtAxisEnd">-</span>
+    </div>
+    <div class="rt-legend">
+      <span class="lg-inc"><i></i>恢复点密度</span>
+      <span class="lg-gap"><i></i>缺口区间（该时段无有效恢复点）</span>
+      <span class="lg-empty"><i></i>无数据</span>
+      <span class="lg-cursor"><i></i>已选时间点</span>
+      <span class="ms-auto text-muted">点击柱体选点 · 支持键盘 ← → 微调</span>
+    </div>
+  </div>
+</div>
+
+<!-- 选点详情 + 恢复 -->
+<div class="row g-3 mt-1" id="rtDetailRow">
+  <div class="col-lg-5">
+    <div class="rt-cursor-panel">
+      <div class="card-section-title"><i class="bi bi-crosshair"></i> 已选恢复时间点</div>
+      <div class="rt-cursor-ts" id="rtCursorTs">尚未选点</div>
+      <div class="rt-plan-line" id="rtPlanSummary">在时间轴上点击任意位置以生成恢复计划。</div>
+      <div class="rt-plan-line" id="rtPlanChain"></div>
+      <div class="rt-plan-line" id="rtPlanGap"></div>
+      <div class="d-flex gap-2 mt-3">
+        <button class="btn btn-primary" id="rtRecoverBtn" type="button" disabled><i class="bi bi-arrow-counterclockwise"></i> 恢复到此刻</button>
+        <button class="btn btn-outline-secondary" id="rtLatestBtn" type="button"><i class="bi bi-skip-end"></i> 跳到最新</button>
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-7">
+    <div class="page-card h-100 mb-0">
+      <div class="card-section-title"><i class="bi bi-list-columns-reverse"></i> 恢复点明细（最近 200 条）</div>
+      <div class="table-responsive" style="max-height: 340px; overflow-y: auto;">
+        <table class="table table-hover table-sm align-middle mb-0">
+          <thead><tr>
+            <th>时间</th><th>类型</th><th>位点 / 变更</th><th>大小</th><th>校验</th><th class="text-end">操作</th>
+          </tr></thead>
+          <tbody id="rtPointTable">
+            <tr><td colspan="6" class="text-center text-muted py-4">请选择任务</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 创建实时保护任务模态框（T07）：在已有备份任务上开启 rt_enabled -->
+<div class="modal fade" id="rtCreateModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-broadcast-pin"></i> 创建实时保护任务</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+      </div>
+      <div class="modal-body">
+        <div class="alert alert-info py-2" role="alert" style="font-size:var(--font-size-sm)">
+          <i class="bi bi-info-circle"></i>
+          实时保护<strong>不会新建备份任务</strong>，而是在已有备份任务上置 <code>rt_enabled=1</code> 并创建实时扩展行，沿用其连接信息。
+        </div>
+
+        <!-- 无可选备份任务时的引导 -->
+        <div class="alert alert-warning py-2 d-none" role="alert" id="rtCreateNoCandidate" style="font-size:var(--font-size-sm)">
+          <i class="bi bi-exclamation-triangle"></i>
+          <span id="rtCreateNoCandidateMsg">暂无可开启实时保护的备份任务。</span>
+          <a href="/tasks" class="alert-link ms-1">去创建数据库备份任务 →</a>
+          <a href="/file_backup" class="alert-link ms-2">去创建文件备份任务 →</a>
+        </div>
+
+        <div id="rtCreateFields">
+          <div class="mb-3">
+            <label class="form-label" for="rtCreateTaskSel">选择备份任务 *</label>
+            <select class="form-select" id="rtCreateTaskSel"></select>
+            <div class="form-text">按「数据库 · 秒级日志 PITR」与「文件 · 分钟级变更捕获」分组；括号内为该任务的目标 RPO。</div>
+          </div>
+          <div class="row g-3">
+            <div class="col-md-4">
+              <label class="form-label" for="rtCreateMode">捕获模式 *</label>
+              <select class="form-select" id="rtCreateMode">
+                <option value="db_cdc">db_cdc · 数据库日志流</option>
+                <option value="file_polling">file_polling · 文件变更轮询</option>
+                <option value="auto">auto · 按引擎自动选择</option>
+              </select>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label" for="rtCreateInterval">捕获间隔（秒）</label>
+              <input type="number" class="form-control" id="rtCreateInterval" value="180" min="5" step="5">
+            </div>
+            <div class="col-md-4">
+              <label class="form-label" for="rtCreateRpo">目标 RPO（秒）</label>
+              <input type="number" class="form-control" id="rtCreateRpo" value="300" min="5" step="5">
+            </div>
+          </div>
+          <div class="alert alert-danger d-none mt-3" id="rtCreateError"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn btn-primary" id="rtCreateSubmitBtn"><i class="bi bi-check2-circle"></i> 开启实时保护</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 恢复确认模态框 -->
+<div class="modal fade" id="rtRecoverModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-arrow-counterclockwise"></i> 按时间点恢复（PITR）</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+      </div>
+      <div class="modal-body">
+        <div class="alert alert-warning py-2" role="alert">
+          <i class="bi bi-exclamation-triangle"></i> 恢复会覆盖目标端数据，请确认目标信息无误。演示模式（DEMO_MODE=on）下仅做仿真校验，不写目标端。
+        </div>
+        <div class="mb-3">
+          <div class="rt-stat-label">恢复目标时间点</div>
+          <div class="rt-cursor-ts" id="rtModalTs">-</div>
+          <div class="rt-plan-line" id="rtModalSummary">-</div>
+        </div>
+        <div id="rtModalFileFields">
+          <label class="form-label">目标目录 *</label>
+          <input type="text" class="form-control" id="rtTargetDir" placeholder="/tmp/rt_restore">
+          <div class="form-text">恢复链将按「基准全量 → 增量（时间升序）」顺序解包到该目录。</div>
+        </div>
+        <div id="rtModalDbFields" class="row g-2" style="display:none;">
+          <div class="col-md-6">
+            <label class="form-label">目标主机</label>
+            <input type="text" class="form-control" id="rtTargetHost" placeholder="留空=原地恢复">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">端口</label>
+            <input type="number" class="form-control" id="rtTargetPort" placeholder="3306">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">数据库</label>
+            <input type="text" class="form-control" id="rtTargetDb" placeholder="留空=沿用任务配置">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">用户名</label>
+            <input type="text" class="form-control" id="rtTargetUser" placeholder="留空=沿用任务配置">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">密码</label>
+            <input type="password" class="form-control" id="rtTargetPwd" placeholder="留空=沿用任务配置">
+          </div>
+          <div class="col-12">
+            <label class="form-label">PG 数据目录（data_dir）</label>
+            <input type="text" class="form-control" id="rtTargetDataDir" placeholder="仅 PostgreSQL PITR 需要">
+          </div>
+        </div>
+        <div class="form-check mt-3">
+          <input class="form-check-input" type="checkbox" id="rtForceChk">
+          <label class="form-check-label" for="rtForceChk">
+            恢复链不完整时强制恢复（尽力而为，可能得到不一致的数据）
+          </label>
+        </div>
+        <div class="mt-3">
+          <div class="card-section-title"><i class="bi bi-diagram-2"></i> 恢复链预览</div>
+          <pre class="rt-mono mb-0" id="rtModalChain" style="max-height:180px;overflow:auto;background:var(--page-bg);padding:var(--space-sm);border-radius:var(--radius-sm);">-</pre>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn btn-outline-secondary" id="rtDryRunBtn"><i class="bi bi-eyeglasses"></i> 仅校验（Dry Run）</button>
+        <button type="button" class="btn btn-primary" id="rtConfirmRecoverBtn"><i class="bi bi-check2-circle"></i> 确认恢复</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

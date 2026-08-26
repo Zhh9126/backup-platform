@@ -362,3 +362,109 @@ def available_drivers():
             "fallback": bool(cfg.get("fallback_to_pg")),
         }
     return result
+
+
+# ---------------------------------------------------------------------------
+# 驱动文件管理（用于插件页面上传 / 下载 / 删除 jar 包）
+# ---------------------------------------------------------------------------
+
+import re as _re
+from typing import Iterable as _Iterable
+
+
+# 合法 jar 文件名：只允许 ASCII 字母数字、点、下划线、横线
+_JAR_NAME_RE = _re.compile(r"^[A-Za-z0-9._\-]{1,200}\.jar$")
+
+
+def _registered_jar_names() -> set:
+    """返回 DRIVER_CONFIG 中所有 db_type 引用的 jar 文件名集合。"""
+    names = set()
+    for cfg in DRIVER_CONFIG.values():
+        if cfg.get("jar"):
+            names.add(cfg["jar"])
+    return names
+
+
+def list_driver_files() -> list:
+    """列出 drivers/ 目录下所有 jar 文件及其元信息。
+
+    返回: [{"name", "size", "mtime", "registered", "mtime_h"}, ...]
+    """
+    registered = _registered_jar_names()
+    items: list = []
+    if DRIVERS_DIR.exists():
+        for jar in sorted(DRIVERS_DIR.glob("*.jar")):
+            st = jar.stat()
+            items.append({
+                "name": jar.name,
+                "size": st.st_size,
+                "mtime": int(st.st_mtime),
+                "mtime_h": time.strftime("%Y-%m-%d %H:%M:%S",
+                                          time.localtime(st.st_mtime)),
+                "registered": jar.name in registered,
+            })
+    return items
+
+
+def _check_jar_name(name: str) -> str:
+    """校验并返回清理后的 jar 文件名；非法时抛 ValueError。"""
+    if not isinstance(name, str):
+        raise ValueError("name must be str")
+    name = name.strip()
+    if not name:
+        raise ValueError("name is empty")
+    if "/" in name or "\\" in name or ".." in name:
+        raise ValueError("invalid path separator")
+    if not _JAR_NAME_RE.match(name):
+        raise ValueError(
+            "filename must be ASCII alnum/_/- and end with .jar (max 200)"
+        )
+    return name
+
+
+def save_driver_file(name: str, data: bytes) -> dict:
+    """把上传的 jar 内容写入 drivers/。不允许覆盖已存在文件。"""
+    name = _check_jar_name(name)
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 100:
+        raise ValueError("jar too small (<100B)")
+    if len(data) > 200 * 1024 * 1024:
+        raise ValueError("jar too large (>200MB)")
+    # 简单魔数校验：jar/zip 都是 PK\x03\x04
+    if not data.startswith(b"PK\x03\x04"):
+        raise ValueError("not a valid jar/zip file (missing PK magic)")
+    DRIVERS_DIR.mkdir(parents=True, exist_ok=True)
+    dst = DRIVERS_DIR / name
+    if dst.exists():
+        raise ValueError(f"file exists: {name}")
+    dst.write_bytes(data)
+    st = dst.stat()
+    return {
+        "name": name,
+        "size": st.st_size,
+        "mtime": int(st.st_mtime),
+        "registered": name in _registered_jar_names(),
+    }
+
+
+def delete_driver_file(name: str) -> dict:
+    """删除一个 jar：被 DRIVER_CONFIG 引用的不能删；其他允许删除。"""
+    name = _check_jar_name(name)
+    if name in _registered_jar_names():
+        raise ValueError(
+            f"jar '{name}' is registered in DRIVER_CONFIG; "
+            "edit core/jdbc.py to remove the reference first"
+        )
+    p = DRIVERS_DIR / name
+    if not p.exists() or not p.is_file():
+        raise ValueError(f"file not found: {name}")
+    p.unlink()
+    return {"name": name, "deleted": True}
+
+
+def read_driver_file(name: str) -> bytes:
+    """读取一个 jar 的原始字节（供下载接口使用）。"""
+    name = _check_jar_name(name)
+    p = DRIVERS_DIR / name
+    if not p.exists() or not p.is_file():
+        raise FileNotFoundError(name)
+    return p.read_bytes()

@@ -44,10 +44,28 @@ class MinIOStorageBackend(StorageBackend):
         self.bucket = config.get("bucket", "")
         self.region = config.get("region", "") or "us-east-1"
         self.prefix = (config.get("prefix") or "").strip("/")
+        # 解析额外选项（兼容 dict 或 JSON 字符串两种存储形态）
         extra = config.get("extra_options")
+        if isinstance(extra, str) and extra:
+            try:
+                import json
+                extra = json.loads(extra)
+            except Exception:
+                extra = {}
         if not isinstance(extra, dict):
             extra = {}
-        self.secure = not extra.get("insecure", False)
+        # 协议识别：endpoint 显式带 http:// 或 https:// 时按协议决定 secure；
+        # 未带协议时以 extra_options.insecure 覆盖（默认 https）
+        ep = self.endpoint.lower()
+        self.secure = True
+        if ep.startswith("http://"):
+            self.secure = False
+            self.endpoint = self.endpoint[7:]
+        elif ep.startswith("https://"):
+            self.secure = True
+            self.endpoint = self.endpoint[8:]
+        elif extra.get("insecure"):
+            self.secure = False
         self._client = None
 
     def _get_client(self):

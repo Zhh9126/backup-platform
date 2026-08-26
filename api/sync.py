@@ -84,11 +84,30 @@ def delete_task(task_id):
 @login_required
 def run_task(task_id):
     """立即执行一次同步（异步线程，不阻塞请求）。"""
-    task = models.get_sync_task(task_id)
+    task = models.get_sync_task(task_id, include_secret=True)
     if not task:
         return jsonify({"success": False, "message": "同步任务不存在"}), 404
 
     started_at = datetime.now().isoformat(timespec="seconds")
+
+    # 实时同步（Binlog CDC）：后台监听线程常驻，直到手动停止
+    if task.get("sync_mode") == "realtime":
+        from core.sync.realtime_runners import is_running, start_runner
+
+        if is_running(task_id):
+            return jsonify({"success": True, "message": "实时同步已在运行中"})
+        models.update_sync_task(task_id, {
+            "status": "running",
+            "last_status": "running",
+            "last_run_at": started_at,
+            "message": "实时同步启动中（Binlog CDC）...",
+            "updated_at": started_at,
+        })
+        started = start_runner(task_id, run_sync_task, task_id)
+        if not started:
+            return jsonify({"success": False, "message": "实时同步线程启动失败"}), 500
+        return jsonify({"success": True, "message": "实时同步已启动（Binlog CDC 监听中）"})
+
     models.update_sync_task(task_id, {
         "status": "running",
         "last_status": "running",
@@ -118,6 +137,23 @@ def run_task(task_id):
 
     threading.Thread(target=_job, daemon=True).start()
     return jsonify({"success": True, "message": "同步任务已启动"})
+
+
+@sync_bp.route("/sync-tasks/<int:task_id>/stop", methods=["POST"])
+@login_required
+def stop_task(task_id):
+    """停止实时同步（Binlog CDC 监听线程）。"""
+    task = models.get_sync_task(task_id)
+    if not task:
+        return jsonify({"success": False, "message": "同步任务不存在"}), 404
+    if task.get("sync_mode") != "realtime":
+        return jsonify({"success": False, "message": "仅实时同步任务支持停止"}), 400
+    from core.sync.realtime_runners import is_running, stop_runner
+
+    if not is_running(task_id):
+        return jsonify({"success": False, "message": "实时同步未在运行"}), 400
+    res = stop_runner(task_id)
+    return jsonify({"success": True, "data": res, "message": res.get("message", "已停止")})
 
 
 @sync_bp.route("/sync-tasks/<int:task_id>/test/<side>", methods=["POST"])

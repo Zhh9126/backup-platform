@@ -1,9 +1,0 @@
-{
-  "id": "percona-xtrabackup-80",
-  "name": "Percona XtraBackup 8.0",
-  "status": "failed",
-  "method": "fallback_download",
-  "message": "下载/解压失败: HTTP Error 404: Not Found",
-  "progress": 60,
-  "updated_at": "2026-08-01T14:52:03.424421Z"
-}

@@ -34,6 +34,8 @@ class MySQLEngine(BackupEngine):
     display_name = "MySQL"
     # mysqldump 负责导出，mysql 负责执行恢复 SQL
     required_clients = ["mysqldump", "mysql"]
+    # 物理备份：本机已安装的 CLI 工具（任一就绪即可执行物理备份）
+    physical_bundled_tools = ["xtrabackup"]
     # 物理备份：外部插件（至少有一个就放行，不需要全部）
     physical_external_plugins = ["percona-xtrabackup-80", "percona-xtrabackup-24", "mariabackup"]
 
@@ -176,7 +178,10 @@ class MySQLEngine(BackupEngine):
                f"--user={user}", f"--password={pw}",
                f"--host={host}", f"--port={port}", "--no-lock"]
         if comp:
-            cmd += ["--compress=zstd", "--compress-threads=4"]
+            # 最高压缩：zstd 级别取任务 compress_level（上限 19，xtrabackup 支持范围）
+            zl = int(self.task.get("compress_level") or 0)
+            zl = max(1, min(zl, 19)) if zl else 19
+            cmd += ["--compress=zstd", f"--compress-zstd-level={zl}", "--compress-threads=4"]
 
         note = ""
         if backup_type == BackupType.INCREMENTAL:
@@ -209,9 +214,24 @@ class MySQLEngine(BackupEngine):
                                 stderr=ret.stderr, message=f"xtrabackup 失败: {ret.stderr[:500]}")
         # 标记成功
         Path(target_dir, ".success").touch()
+        # 统计备份目录磁盘占用（xtrabackup 含 .zst 压缩时即为压缩后字节；未压缩为原始页大小）
+        size = 0
+        for _root, _dirs, _files in os.walk(target_dir):
+            for _f in _files:
+                try:
+                    size += os.path.getsize(os.path.join(_root, _f))
+                except OSError:
+                    pass
+        # 以 xtrabackup_checkpoints 指纹作为该备份的校验码（内容级标识）
+        checksum = ""
+        cp = os.path.join(target_dir, "xtrabackup_checkpoints")
+        if os.path.isfile(cp):
+            import hashlib as _hl
+            with open(cp, "rb") as _cf:
+                checksum = _hl.sha256(_cf.read()).hexdigest()[:16]
         return BackupResult(success=True, status=BackupStatus.SUCCESS,
-                            backup_path=target_dir, size_bytes=0, duration_sec=dur,
-                            stdout=ret.stdout, simulated=False, checksum="",
+                            backup_path=target_dir, size_bytes=size, duration_sec=dur,
+                            stdout=ret.stdout, simulated=False, checksum=checksum,
                             message=f"MySQL 物理备份(XtraBackup)成功 {note}")
 
     def _backup_physical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
@@ -458,7 +478,26 @@ class MySQLEngine(BackupEngine):
             res.detail_log = "\n".join(logs) + "\n" + (res.detail_log or res.stderr or res.stdout or "")
             return res
 
-        # 1) 先尝试本机直接执行 mysql 恢复
+        # 1) 物理备份产物 -> XtraBackup 物理恢复（prepare + 临时实例校验）
+        if self._is_physical_backup(backup_path):
+            logs.append("[物理恢复] 检测到 XtraBackup 物理备份产物，执行物理恢复")
+            result = self._restore_physical(backup_path, **kwargs)
+            logs.append(f"[物理恢复] success={result.success}, message={result.message}")
+            if result.stdout:
+                logs.append(f"[物理恢复 stdout]\n{result.stdout}")
+            if result.stderr:
+                logs.append(f"[物理恢复 stderr]\n{result.stderr}")
+            if result.success:
+                result.detail_log = "\n".join(logs)
+                return result
+            reason = result.message or "未知错误"
+            logs.append(f"[结果] 物理恢复失败: {reason}")
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path, message=reason,
+                detail_log="\n".join(logs))
+
+        # 2) 逻辑备份 -> 本机直接执行 mysql 恢复
         logs.append("[本机恢复] 尝试本地执行 mysql 恢复...")
         result = self._restore_local(backup_path, **kwargs)
         logs.append(f"[本机恢复] success={result.success}, message={result.message}")
@@ -539,6 +578,200 @@ class MySQLEngine(BackupEngine):
             if res2["returncode"] != 0:
                 self.logger.warning("[%s] 恢复前 RESET MASTER 失败: %s",
                                     self.task_name, res.get("stderr", ""))
+
+    # ------------------------------------------------------------------ #
+    # 物理备份恢复（XtraBackup）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _is_physical_backup(backup_path: str) -> bool:
+        """判断备份产物是否为 XtraBackup 物理备份。"""
+        if not backup_path:
+            return False
+        if os.path.isdir(backup_path):
+            return os.path.isfile(os.path.join(backup_path, "xtrabackup_checkpoints"))
+        return backup_path.endswith((".tar.gz", ".tgz", ".tar", ".xbstream"))
+
+    @staticmethod
+    def _decompress_xtrabackup_dir(work_dir: str) -> int:
+        """批量解压 XtraBackup --compress=zstd 产物中的 .zst 文件（原地替换）。"""
+        try:
+            import zstandard as _zstd
+        except ImportError:
+            raise RuntimeError("缺少 zstandard 库，无法解压 .zst 备份（可用 pip install zstandard）")
+        dctx = _zstd.ZstdDecompressor()
+        cnt = 0
+        for root, _dirs, files in os.walk(work_dir):
+            for fn in files:
+                if fn.endswith(".zst"):
+                    src = os.path.join(root, fn)
+                    dst = src[:-4]
+                    with open(src, "rb") as fi, open(dst, "wb") as fo:
+                        dctx.copy_stream(fi, fo)
+                    os.remove(src)
+                    cnt += 1
+        return cnt
+
+    def _restore_physical(self, backup_path: str, **kwargs) -> BackupResult:
+        """XtraBackup 物理备份恢复：
+
+        1) 解包(tar.gz/xbstream)或复制备份目录到临时工作区（不污染原备份，
+           保证 prepare 后原备份仍可作为后续增量备份的基）；
+        2) 解压 .zst 压缩产物；
+        3) xtrabackup --prepare 应用 redo log；
+        4) 以备份目录启动临时 mysqld（--skip-grant-tables + socket 免密）
+           做可恢复性校验，并查询目标库表数量；
+        5) 关闭临时实例并清理。
+        """
+        target_db = kwargs.get("target_db") or self.task.get("db_name")
+        xtrabackup = shutil.which("xtrabackup") or "/opt/xtrabackup/bin/xtrabackup"
+        if not os.path.isfile(xtrabackup):
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                backup_path=backup_path,
+                                message="物理恢复需要 xtrabackup，请先在插件市场安装 Percona XtraBackup")
+        mysqld = shutil.which("mysqld") or "/opt/database/bin/mysqld"
+        if not os.path.isfile(mysqld):
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                backup_path=backup_path,
+                                message="物理恢复需要本机 mysqld 用于启动临时校验实例")
+        mysql_cli = shutil.which("mysql") or "/opt/database/bin/mysql"
+
+        logs = [f"[物理恢复] 备份产物: {backup_path}",
+                f"[物理恢复] xtrabackup: {xtrabackup}", f"[物理恢复] mysqld: {mysqld}"]
+        tmp = tempfile.mkdtemp(prefix="xb_restore_")
+        start = time.time()
+        sock = f"/tmp/xb_restore_{os.getpid()}_{int(time.time() * 1000)}.sock"
+        pid_file = sock + ".pid"
+        err_file = sock + ".err"
+        proc = None
+        try:
+            # 1) 准备工作目录
+            work = os.path.join(tmp, "data")
+            if backup_path.endswith((".tar.gz", ".tgz")):
+                os.makedirs(work)
+                ret = subprocess.run(["tar", "xzf", backup_path, "-C", work],
+                                     capture_output=True, text=True, timeout=3600)
+                if ret.returncode != 0:
+                    raise RuntimeError(f"解包 tar.gz 失败: {(ret.stderr or '')[:300]}")
+            elif backup_path.endswith(".tar"):
+                os.makedirs(work)
+                ret = subprocess.run(["tar", "xf", backup_path, "-C", work],
+                                     capture_output=True, text=True, timeout=3600)
+                if ret.returncode != 0:
+                    raise RuntimeError(f"解包 tar 失败: {(ret.stderr or '')[:300]}")
+            elif backup_path.endswith(".xbstream"):
+                os.makedirs(work)
+                ret = subprocess.run([xtrabackup, "--xbstream", "-x", "-C", work],
+                                     capture_output=True, text=True, timeout=7200)
+                if ret.returncode != 0:
+                    raise RuntimeError(f"xbstream 解流失败: {(ret.stderr or '')[:300]}")
+            elif os.path.isdir(backup_path):
+                logs.append("[物理恢复] 复制备份目录到临时工作区（避免 prepare 污染原备份/增量基）...")
+                shutil.copytree(backup_path, work)
+            else:
+                raise RuntimeError(f"不支持的物理备份产物: {backup_path}")
+
+            # 2) 解压 .zst（若存在）
+            try:
+                n = self._decompress_xtrabackup_dir(work)
+                if n:
+                    logs.append(f"[物理恢复] 已解压 {n} 个 .zst 文件")
+            except RuntimeError:
+                if not shutil.which("zstd"):
+                    raise
+                logs.append("[物理恢复] python 解压不可用，改用 xtrabackup --decompress")
+                ret = subprocess.run([xtrabackup, "--decompress", f"--target-dir={work}"],
+                                     capture_output=True, text=True, timeout=7200)
+                if ret.returncode != 0:
+                    raise RuntimeError(f"xtrabackup --decompress 失败: {(ret.stderr or '')[:300]}")
+
+            # 3) prepare
+            logs.append("[物理恢复] xtrabackup --prepare 应用 redo log ...")
+            ret = subprocess.run([xtrabackup, "--prepare", f"--target-dir={work}"],
+                                 capture_output=True, text=True, timeout=7200)
+            if ret.returncode != 0:
+                raise RuntimeError(f"xtrabackup --prepare 失败: {(ret.stderr or ret.stdout or '')[-500:]}")
+
+            # 4) 启动临时 mysqld 校验
+            logs.append("[物理恢复] 启动临时 mysqld 实例做可恢复性校验 ...")
+            proc = subprocess.Popen(
+                [mysqld, "--no-defaults",
+                 f"--datadir={work}", f"--socket={sock}",
+                 "--skip-networking", "--skip-grant-tables",
+                 "--user=root", f"--pid-file={pid_file}",
+                 f"--log-error={err_file}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            ready = False
+            for _ in range(90):
+                if proc.poll() is not None:
+                    break
+                r = subprocess.run([mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}",
+                                    "-N", "-e", "SELECT 1"],
+                                   capture_output=True, text=True, timeout=15)
+                if r.returncode == 0 and r.stdout.strip() == "1":
+                    ready = True
+                    break
+                time.sleep(1)
+            if not ready:
+                tail = ""
+                if os.path.exists(err_file):
+                    with open(err_file, errors="replace") as f:
+                        tail = f.read()[-600:]
+                raise RuntimeError(f"临时实例启动超时/失败: {tail or '无错误日志'}")
+
+            # 5) 校验数据可读
+            if target_db:
+                verify_sql = (
+                    f"SELECT CONCAT('tables=', COUNT(*)) FROM information_schema.tables "
+                    f"WHERE table_schema='{target_db}';")
+                label = f"目标库 {target_db}"
+            else:
+                verify_sql = ("SELECT CONCAT('databases=', COUNT(*)) "
+                              "FROM information_schema.schemata;")
+                label = "实例库"
+            r = subprocess.run([mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}",
+                                "-N", "-e", verify_sql],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                raise RuntimeError(f"校验查询失败: {(r.stderr or '')[:300]}")
+            verify_out = r.stdout.strip()
+            logs.append(f"[物理恢复] 校验通过: {label} {verify_out}")
+
+            duration = round(time.time() - start, 3)
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=backup_path, duration_sec=duration,
+                stdout="\n".join(logs) + f"\n[校验] {label} {verify_out}",
+                message=f"MySQL 物理备份(XtraBackup)恢复成功（{label} {verify_out}）")
+        except Exception as e:
+            duration = round(time.time() - start, 3)
+            self.logger.exception("[%s] 物理恢复失败", self.task_name)
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path, duration_sec=duration,
+                stdout="\n".join(logs), stderr=str(e),
+                message=f"MySQL 物理备份恢复失败: {e}")
+        finally:
+            # 关闭临时实例 + 清理
+            try:
+                if proc and proc.poll() is None:
+                    subprocess.run([mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}",
+                                    "-e", "SHUTDOWN"], capture_output=True, timeout=30)
+            except Exception:
+                pass
+            if os.path.exists(pid_file):
+                try:
+                    with open(pid_file) as f:
+                        pid = int(f.read().strip())
+                    os.kill(pid, 9)
+                except Exception:
+                    pass
+            shutil.rmtree(tmp, ignore_errors=True)
+            for p in (sock, pid_file, err_file):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
 
     def _restore_local(self, backup_path: str, **kwargs) -> BackupResult:
         # 连接参数

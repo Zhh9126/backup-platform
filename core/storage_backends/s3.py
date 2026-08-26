@@ -37,7 +37,17 @@ class S3StorageBackend(StorageBackend):
             except Exception:
                 extra = {}
         self.storage_class = extra.get("storage_class", "STANDARD_IA")  # 默认低频访问
-        self.secure = not extra.get("insecure", False)
+        # 协议识别：endpoint 显式带协议时按协议决定 secure，否则以 insecure 覆盖（默认 https）
+        ep = self.endpoint.lower()
+        self.secure = True
+        if ep.startswith("http://"):
+            self.secure = False
+            self.endpoint = self.endpoint[7:]
+        elif ep.startswith("https://"):
+            self.secure = True
+            self.endpoint = self.endpoint[8:]
+        elif extra.get("insecure"):
+            self.secure = False
         self._client = None
 
     def _get_client(self):

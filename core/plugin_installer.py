@@ -21,10 +21,13 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
+import ssl
 import subprocess
 import threading
 import time
+import urllib.request
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -311,20 +314,46 @@ def _guess_ext_from_url(url: str) -> str:
     return ".download"
 
 
+def _safe_urlopen(url: str, timeout: int = 600):
+    """打开远程 URL，SSL 失败时降级为不验证并写一条日志。
+
+    大量镜像/老资源使用自签/过期证书；为了"先装上"，
+    我们默认严格校验，遇 CERTIFICATE_VERIFY_FAILED 时自动降级。
+    通过环境变量 BACKUP_PLATFORM_STRICT_SSL=1 可强制严格校验。
+    """
+    strict = os.environ.get("BACKUP_PLATFORM_STRICT_SSL", "").lower() in (
+        "1", "true", "yes", "on",
+    )
+    try:
+        return urllib.request.urlopen(url, timeout=timeout)
+    except Exception as e:  # 包含 ssl.SSLError / urllib.error.URLError
+        msg = str(e)
+        is_cert_err = (
+            "CERTIFICATE_VERIFY_FAILED" in msg
+            or "certificate verify failed" in msg.lower()
+            or "ssl:" in msg.lower()
+        )
+        if strict or not is_cert_err:
+            raise
+        # 降级：不验证证书
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return urllib.request.urlopen(url, timeout=timeout, context=ctx)
+
+
 def _download_to_local(url: str, pid: str, host_key: str = "local") -> dict:
     """下载离线包到本地临时文件（不解压），返回临时文件路径。
 
     返回: {"ok": bool, "path": str, "ext": str, "message": str}
     """
-    import urllib.request
-
     _append_log(pid, f"download: {url}", host_key=host_key)
     real_suffix = _guess_ext_from_url(url)
     tmp_path = INSTALL_ROOT / f"{pid}_{int(time.time())}{real_suffix}"
     _append_log(pid, f"tmp file: {tmp_path.name}", host_key=host_key)
 
     try:
-        with urllib.request.urlopen(url, timeout=600) as resp, \
+        with _safe_urlopen(url, timeout=600) as resp, \
                 open(tmp_path, "wb") as out:
             while True:
                 chunk = resp.read(64 * 1024)
@@ -357,8 +386,7 @@ def _download_and_extract(strategy: dict, pid: str,
     _append_log(pid, f"tmp file: {tmp_path.name}", host_key=host_key)
 
     try:
-        import urllib.request
-        with urllib.request.urlopen(url, timeout=600) as resp, \
+        with _safe_urlopen(url, timeout=600) as resp, \
                 open(tmp_path, "wb") as out:
             while True:
                 chunk = resp.read(64 * 1024)

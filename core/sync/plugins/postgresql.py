@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """PostgreSQL 同步插件。"""
 import logging
+import re
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal
 from typing import Any, List
 
 from .base import BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader, SyncConfig
@@ -150,19 +153,78 @@ class PostgreSQLSinkWriter(SinkWriter):
             )
             return [r[0] for r in cur.fetchall()]
 
+    # MySQL/通用 DATA_TYPE（无长度后缀） -> PostgreSQL 类型
+    _MYSQL_TYPE_MAP = {
+        "TINYINT": "SMALLINT",      # MySQL BOOL/TINYINT(1) 落 SMALLINT，避免 int->bool 适配问题
+        "SMALLINT": "SMALLINT",
+        "MEDIUMINT": "INTEGER",
+        "INT": "INTEGER",
+        "INTEGER": "INTEGER",
+        "BIGINT": "BIGINT",
+        "YEAR": "SMALLINT",
+        "FLOAT": "REAL",
+        "DOUBLE": "DOUBLE PRECISION",
+        "BOOL": "BOOLEAN",
+        "BOOLEAN": "BOOLEAN",
+        "DATE": "DATE",
+        "DATETIME": "TIMESTAMP",
+        "TIMESTAMP": "TIMESTAMP",
+        "TIME": "TIME",
+        "CHAR": "CHAR",
+        "VARCHAR": "VARCHAR",
+        "TINYTEXT": "TEXT",
+        "TEXT": "TEXT",
+        "MEDIUMTEXT": "TEXT",
+        "LONGTEXT": "TEXT",
+        "BINARY": "BYTEA",
+        "VARBINARY": "BYTEA",
+        "TINYBLOB": "BYTEA",
+        "BLOB": "BYTEA",
+        "MEDIUMBLOB": "BYTEA",
+        "LONGBLOB": "BYTEA",
+        "JSON": "JSONB",
+        "ENUM": "TEXT",
+        "SET": "TEXT",
+        "DECIMAL": "NUMERIC",
+        "NUMERIC": "NUMERIC",
+    }
+
+    _PG_FUNC_DEFAULTS = {
+        "CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP()", "CURRENT_DATE", "CURRENT_TIME",
+        "NOW()", "LOCALTIME", "LOCALTIMESTAMP", "CURRENT_USER", "NULL", "DEFAULT",
+    }
+
     def _map_to_pg_type(self, col: ColumnMeta) -> str:
         t = (col.type or "VARCHAR").upper()
-        if t in ("VARCHAR", "CHAR"):
-            return f"{t}({col.max_length or 255})"
-        if t in ("DECIMAL", "NUMERIC"):
-            return f"{t}({col.numeric_precision or 10},{col.numeric_scale or 0})"
-        if t in ("INT", "BIGINT", "SMALLINT", "INTEGER", "SERIAL", "BIGSERIAL"):
-            return t
-        if t in ("TEXT", "DATE", "TIMESTAMP", "TIMESTAMPTZ", "TIME", "TIMETZ",
-                 "BOOLEAN", "BOOL", "FLOAT", "DOUBLE", "REAL", "JSON", "JSONB",
-                 "BYTEA"):
-            return t
-        return "VARCHAR(255)"
+        base = t.split("(")[0].strip() if "(" in t else t
+        # MySQL 无符号大整数超出 PG BIGINT 范围，落 NUMERIC(20,0)
+        if "UNSIGNED" in t and base in ("BIGINT", "INT", "INTEGER", "MEDIUMINT", "TINYINT", "SMALLINT"):
+            return "NUMERIC(20,0)"
+        pg = self._MYSQL_TYPE_MAP.get(base)
+        if pg is None:
+            return "TEXT"
+        if pg in ("VARCHAR", "CHAR"):
+            return f"{pg}({col.max_length or 255})"
+        if pg == "NUMERIC":
+            return f"NUMERIC({col.numeric_precision or 10},{col.numeric_scale or 0})"
+        return pg
+
+    @staticmethod
+    def _pg_default(value: Any, ctype: str) -> str:
+        """MySQL 列默认值 -> PG 合法 DEFAULT 表达式。"""
+        if value is None:
+            return ""
+        s = str(value).strip()
+        upper = s.upper()
+        if upper in PostgreSQLSinkWriter._PG_FUNC_DEFAULTS:
+            return f" DEFAULT {upper.replace('CURRENT_TIMESTAMP()', 'CURRENT_TIMESTAMP')}"
+        if s == "":
+            return ""
+        if re.fullmatch(r"[+-]?\d+(\.\d+)?", s):
+            return f" DEFAULT {s}"
+        if ctype in ("BOOLEAN", "BOOL") and upper in ("TRUE", "FALSE", "1", "0", "'1'", "'0'"):
+            return " DEFAULT TRUE" if s.strip("'") in ("1", "TRUE") else " DEFAULT FALSE"
+        return f" DEFAULT '{s.replace(chr(39), chr(39) * 2)}'"
 
     def _create_table_sql(self, table: str, columns: List[ColumnMeta]) -> str:
         table_ref = self._table_ref(table)
@@ -171,12 +233,13 @@ class PostgreSQLSinkWriter(SinkWriter):
         for c in columns:
             ctype = self._map_to_pg_type(c)
             null_str = "NULL" if c.nullable else "NOT NULL"
-            default_str = f" DEFAULT {c.default}" if c.default is not None else ""
+            default_str = self._pg_default(c.default, ctype)
             lines.append(f'    "{c.name}" {ctype} {null_str}{default_str}')
             if getattr(c, "is_primary", False):
                 pks.append(c.name)
         if pks:
-            lines.append(f"    PRIMARY KEY ({', '.join(f'\"{k}\"' for k in pks)})")
+            pk_cols = ", ".join('"' + k + '"' for k in pks)
+            lines.append(f"    PRIMARY KEY ({pk_cols})")
         return f"CREATE TABLE IF NOT EXISTS {table_ref} (\n" + ",\n".join(lines) + "\n)"
 
     def prepare_table(self, conn: Any, columns: List[ColumnMeta]) -> None:
@@ -237,6 +300,94 @@ class PostgreSQLSinkWriter(SinkWriter):
             cur.executemany(sql, values)
             conn.commit()
             return cur.rowcount
+
+    # ---- 实时同步（Binlog CDC）----
+
+    def _pg_value(self, v: Any) -> Any:
+        """binlog 值转为 psycopg2 可写值。"""
+        if v is None:
+            return None
+        if isinstance(v, (datetime, date, time, Decimal, bool)):
+            return v
+        if isinstance(v, (bytes, bytearray)):
+            return bytes(v)
+        # MySQL TIME -> timedelta；PG time 列不认 timedelta，转 "HH:MM:SS"
+        if isinstance(v, timedelta):
+            total = int(v.total_seconds())
+            return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"
+        return v
+
+    def apply_binlog_row(self, conn: Any, op: str, schema: str, table: str,
+                         before: dict, after: dict) -> None:
+        """把一条 Binlog 行事件应用到 PG（实时同步，参考 Flink CDC 语义）。
+
+        op: insert | update | delete
+        before/after: 列名 -> 值 字典（binlog_row_image=FULL 时为整行快照）
+        """
+        cfg = self.config
+        t = cfg.target_table or table
+        table_ref = self._table_ref(t)
+
+        def q(name: str) -> str:
+            return self.plugin.normalize_identifier(name, cfg.field_ide)
+
+        pks = self._get_primary_keys(conn, t)
+
+        def build_where(old: dict):
+            parts, vals = [], []
+            for pk in pks:
+                if pk in old:
+                    parts.append(f'"{q(pk)}" = %s')
+                    vals.append(self._pg_value(old[pk]))
+            if not parts:
+                for c in old:
+                    parts.append(f'"{q(c)}" = %s')
+                    vals.append(self._pg_value(old[c]))
+            return parts, vals
+
+        with conn.cursor() as cur:
+            if op == "insert":
+                row = after or before or {}
+                if not row:
+                    return
+                cols = list(row.keys())
+                placeholders = ", ".join(["%s"] * len(cols))
+                col_str = ", ".join(f'"{q(c)}"' for c in cols)
+                vals = tuple(self._pg_value(row[c]) for c in cols)
+                sql = f"INSERT INTO {table_ref} ({col_str}) VALUES ({placeholders})"
+                if pks:
+                    conflict = ", ".join(f'"{q(k)}"' for k in pks)
+                    updates = ", ".join(
+                        f'"{q(c)}" = EXCLUDED."{q(c)}"' for c in cols if c not in pks
+                    )
+                    if updates:
+                        sql += f" ON CONFLICT ({conflict}) DO UPDATE SET {updates}"
+                    else:
+                        sql += " ON CONFLICT DO NOTHING"
+                cur.execute(sql, vals)
+                conn.commit()
+            elif op == "update":
+                if not after:
+                    return
+                old = before or after
+                cols = list(after.keys())
+                set_str = ", ".join(f'"{q(c)}" = %s' for c in cols)
+                vals = [self._pg_value(after[c]) for c in cols]
+                where_parts, where_vals = build_where(old)
+                if not where_parts:
+                    return
+                sql = f"UPDATE {table_ref} SET {set_str} WHERE {' AND '.join(where_parts)}"
+                cur.execute(sql, vals + where_vals)
+                conn.commit()
+            elif op == "delete":
+                if not before:
+                    return
+                where_parts, where_vals = build_where(before)
+                if not where_parts:
+                    return
+                sql = f"DELETE FROM {table_ref} WHERE {' AND '.join(where_parts)}"
+                cur.execute(sql, where_vals)
+                conn.commit()
 
 
 class PostgreSQLPlugin(BasePlugin):

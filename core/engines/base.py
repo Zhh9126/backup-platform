@@ -12,6 +12,7 @@ MongoDB）都继承 BackupEngine，实现 backup() 与 restore()。基类统一�
 """
 import enum
 import os
+import sys
 import json
 import time
 import shutil
@@ -169,9 +170,9 @@ class BackupEngine:
     # 进阶压缩算法优先级：zstd(系统二进制) > zstd(Python 库) > gzip。
     # zstd 压缩率与速度均显著优于传统 gzip；gzip 作为最后的兜底保证任何环境
     # 都能完成备份且可解压恢复。所有算法均<双向可逆>，恢复侧配套解压命令。
-    _ZSTD_LEVEL = 10         # 默认 zstd 级别（基准：综合压缩率 24.3%，比 gzip -6 省 7.5%）
-                               # 磁盘空间极紧张时可调到 19（综合 22.4%，省 14.8%，但更慢）
-    _GZIP_LEVEL = 6          # 兜底 gzip 级别（与原实现保持一致）
+    _ZSTD_LEVEL = 19         # 默认 zstd 级别（最高实用档：压缩率最优，xtrabackup/zstd 均支持到 19）
+                               # 更高要求可任务级 compress_level=22（ultra 模式，更慢）
+    _GZIP_LEVEL = 9          # 兜底 gzip 级别（最高档，压缩率最大）
 
     @staticmethod
     def _compression_enabled() -> bool:
@@ -256,14 +257,14 @@ class BackupEngine:
             cli = self._zstd_cli()
             if cli:
                 return [cli, "-{}".format(lvl), "-c", "-"]
-            # Python 库实现（跨平台、零外部依赖）
-            return ["python", "-c",
+            # Python 库实现（跨平台、零外部依赖）；用当前解释器保证 zstandard 可用
+            return [sys.executable, "-c",
                     "import sys,zstandard as z;"
                     "c=z.ZstdCompressor(level=%d);"
                     "sys.stdout.buffer.write(c.stream_reader(sys.stdin.buffer).read())" % lvl]
         # gzip（Python 标准库，不依赖系统 gzip 二进制）
         lvl = level if level is not None else (self.compress_level or self._GZIP_LEVEL)
-        return ["python", "-c",
+        return [sys.executable, "-c",
                 "import sys,gzip;"
                 "sys.stdout.buffer.write(gzip.compress(sys.stdin.buffer.read(), %d))" % lvl]
 
@@ -279,12 +280,12 @@ class BackupEngine:
             cli = self._zstd_cli()
             if cli:
                 return [cli, "-dc", "-"]
-            return ["python", "-c",
+            return [sys.executable, "-c",
                     "import sys,zstandard as z;"
                     "sys.stdout.buffer.write(z.ZstdDecompressor().stream_reader("
                     "sys.stdin.buffer).read())"]
         # gzip（Python 标准库）
-        return ["python", "-c",
+        return [sys.executable, "-c",
                 "import sys,gzip;"
                 "sys.stdout.buffer.write(gzip.decompress(sys.stdin.buffer.read()))"]
 

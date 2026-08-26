@@ -1,5 +1,6 @@
 # 备份产物
 backups/
+backups
 *.tar.xz
 *.tar.gz
 *.gz
@@ -8,6 +9,8 @@ backups/
 logs/
 *.pyc
 __pycache__/
+.venv/
+venv/
 
 # 运行时数据 / 敏感文件（生产数据库、SECRET_KEY、任务密码密文）
 instance/

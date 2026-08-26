@@ -531,4 +531,133 @@
       delete POLLERS[key];
     }
   }
+
+  // ===================================================================
+  // JDBC 驱动管理（插件市场页内嵌板块）
+  // ===================================================================
+  async function loadJdbc() {
+    try {
+      const st = await api("GET", "/api/jdbc/status");
+      if (st && st.jvm) {
+        const j = st.jvm;
+        let ver = "";
+        const m = /java-1[0-9]-openjdk-([0-9.]+)/.exec(j.path || "");
+        if (m) ver = "Java " + m[1];
+        const label = (j.found && j.started)
+          ? ("JVM 就绪" + (ver ? " · " + ver : ""))
+          : "JVM 不可用";
+        const el = $("jvmStatus");
+        if (el) {
+          el.className = "text-muted small align-self-center";
+          el.textContent = label;
+        }
+      }
+    } catch (e) { /* 不影响驱动列表 */ }
+    await loadJdbcDrivers();
+  }
+
+  async function loadJdbcDrivers() {
+    const body = $("jdbcDriverBody");
+    if (!body) return;
+    try {
+      const data = await api("GET", "/api/jdbc/drivers");
+      const list = data.drivers || [];
+      const cnt = $("jdbcDriverCount");
+      if (cnt) cnt.textContent = list.length;
+      if (!list.length) {
+        body.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-3">暂无驱动，点击右上角"上传驱动 jar"上传</td></tr>';
+        return;
+      }
+      body.innerHTML = list.map((d) => {
+        const size = (d.size >= 1048576) ? (d.size / 1048576).toFixed(1) + " MB" : (d.size / 1024).toFixed(1) + " KB";
+        const badge = d.registered
+          ? '<span class="badge bg-success">已注册</span>'
+          : '<span class="badge bg-secondary">未注册</span>';
+        return '<tr>'
+          + '<td><i class="bi bi-filetype-jar text-info me-1"></i>' + esc(d.name) + "</td>"
+          + "<td>" + size + "</td>"
+          + '<td class="text-muted">' + (d.mtime_h || "") + "</td>"
+          + "<td>" + badge + "</td>"
+          + '<td class="text-end">'
+          + '<a class="btn btn-sm btn-outline-primary" href="/api/jdbc/drivers/' + encodeURIComponent(d.name) + '/download" download title="下载 jar"><i class="bi bi-download"></i> 下载</a> '
+          + '<button class="btn btn-sm btn-outline-danger" data-del="' + encodeURIComponent(d.name) + '" title="删除 jar"><i class="bi bi-trash"></i></button>'
+          + "</td></tr>";
+      }).join("");
+      $$("#jdbcDriverBody button[data-del]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const name = decodeURIComponent(btn.dataset.del);
+          if (!confirm("确定删除驱动 " + name + " ?")) return;
+          try {
+            await api("DELETE", "/api/jdbc/drivers/" + encodeURIComponent(name));
+            toast("已删除驱动 " + name, "success");
+            await loadJdbcDrivers();
+          } catch (e) {
+            toast("删除失败：" + (e.message || e), "danger");
+          }
+        });
+      });
+    } catch (e) {
+      body.innerHTML = '<tr><td colspan="5" class="text-center text-danger py-3">加载失败：' + esc(e.message || e) + "</td></tr>";
+    }
+  }
+
+  function bindJdbc() {
+    const up = $("jdbcUploadInput");
+    if (up) {
+      up.addEventListener("change", async () => {
+        const f = up.files && up.files[0];
+        if (!f) return;
+        const fd = new FormData();
+        fd.append("file", f);
+        try {
+          const resp = await fetch("/api/jdbc/drivers/upload", { method: "POST", body: fd });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok || !data.success) throw new Error((data && (data.error || data.message)) || "上传失败");
+          toast(data.message || "上传成功", "success");
+          up.value = "";
+          await loadJdbcDrivers();
+        } catch (e) {
+          toast("上传失败：" + (e.message || e), "danger");
+        }
+      });
+    }
+    const ref = $("jdbcRefreshBtn");
+    if (ref) ref.addEventListener("click", loadJdbc);
+    const tbtn = $("jdbcTestBtn");
+    if (tbtn) {
+      tbtn.addEventListener("click", async () => {
+        const payload = {
+          db_type: $("jdbcTestType").value,
+          host: $("jdbcTestHost").value || "127.0.0.1",
+          port: parseInt($("jdbcTestPort").value || "0", 10) || 0,
+          db_name: $("jdbcTestDb").value,
+          username: $("jdbcTestUser").value,
+          password: $("jdbcTestPwd").value,
+        };
+        const box = $("jdbcTestResult");
+        box.classList.remove("d-none");
+        box.className = "small mt-2 alert alert-light border";
+        box.textContent = "连接中…";
+        try {
+          const data = await api("POST", "/api/jdbc/test-connection", payload);
+          if (data.success) {
+            box.className = "small mt-2 alert alert-success py-2";
+            box.textContent = data.message
+              + (data.info && data.info.latency_ms != null ? "（" + data.info.latency_ms + "ms）" : "");
+          } else {
+            box.className = "small mt-2 alert alert-danger py-2";
+            box.textContent = data.message || "连接失败";
+          }
+        } catch (e) {
+          box.className = "small mt-2 alert alert-danger py-2";
+          box.textContent = "连接失败：" + (e.message || e);
+        }
+      });
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    bindJdbc();
+    loadJdbc();
+  });
 })();

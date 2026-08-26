@@ -33,6 +33,28 @@ logger = logging.getLogger(__name__)
 
 # ======================== 工具函数 ========================
 
+# sync_mode / save_mode 中文别名 -> 引擎标准值（兼容历史数据与直接入库）
+_SYNC_MODE_ALIASES = {
+    "full": "full", "全量": "full", "全量同步": "full", "全量迁移": "full",
+    "incremental": "incremental", "增量": "incremental", "增量同步": "incremental",
+    "realtime": "realtime", "实时": "realtime", "实时同步": "realtime",
+    "实时同步（Flink CDC）": "realtime", "flink cdc": "realtime", "flink_cdc": "realtime",
+}
+_SAVE_MODE_ALIASES = {
+    "append": "append", "追加": "append", "追加写入": "append", "insert": "append",
+    "overwrite": "overwrite", "覆盖": "overwrite", "覆盖写入": "overwrite", "truncate": "overwrite",
+    "upsert": "upsert", "更新插入": "upsert", "更新或插入": "upsert",
+    "create_if_not_exists": "create_if_not_exists", "不存在则创建": "create_if_not_exists",
+}
+
+
+def _norm_mode(value: str, aliases: Dict[str, str], default: str) -> str:
+    """规范化同步/保存模式：支持中文别名，未知值回退默认。"""
+    if not value:
+        return default
+    return aliases.get(str(value).strip().lower(), default)
+
+
 def _task_to_config(task: Dict[str, Any]) -> SyncConfig:
     """把数据库 sync_tasks 行转为 SyncConfig。"""
     cfg = SyncConfig(
@@ -58,8 +80,8 @@ def _task_to_config(task: Dict[str, Any]) -> SyncConfig:
         tgt_db_name=task.get("tgt_db_name", ""),
         tgt_schema=task.get("tgt_schema", ""),
         target_table=task.get("target_table", ""),
-        sync_mode=task.get("sync_mode") or "full",
-        save_mode=task.get("save_mode") or "append",
+        sync_mode=_norm_mode(task.get("sync_mode"), _SYNC_MODE_ALIASES, "full"),
+        save_mode=_norm_mode(task.get("save_mode"), _SAVE_MODE_ALIASES, "append"),
         column_mapping=task.get("column_mapping") or [],
         field_ide=task.get("field_ide") or "origin",
         incremental_column=task.get("incremental_column", ""),
@@ -151,6 +173,8 @@ class SyncEngine:
             tables = self.list_source_tables()
             logger.info("全库迁移：共 %d 张表", len(tables))
             return tables
+        if cfg.source_tables_list:
+            return [t.strip() for t in cfg.source_tables_list if t and t.strip()]
         if cfg.source_table:
             return [cfg.source_table]
         return []
@@ -158,20 +182,55 @@ class SyncEngine:
     # ---- 核心同步 ----
 
     def run(self, progress_callback=None) -> Dict[str, Any]:
-        """执行同步。支持单表 / 全库迁移。"""
+        """执行同步。支持单表 / 多表 / 全库迁移。"""
         cfg = self.config
         if cfg.sync_mode == "realtime":
-            return {
-                "success": False,
-                "message": (
-                    "实时同步（realtime）需通过 Flink CDC 执行，"
-                    "请使用 /api/sync-tasks/<id>/flink-config 获取配置并下发到 Flink 集群。"
-                ),
-            }
+            return self._run_realtime(progress_callback)
         if cfg.full_db_migrate:
             return self._run_full_migration(progress_callback)
 
-        return self._run_single_table(cfg.source_table, cfg.target_table, progress_callback)
+        # 单表 / 多表：统一从 _get_tables_to_sync 解析（source_table 或 source_tables_list）
+        tables = self._get_tables_to_sync()
+        if not tables:
+            return {
+                "success": False,
+                "message": "未指定要同步的表（source_table / source_tables_list 为空）",
+                "total_read": 0,
+                "total_write": 0,
+                "errors": 0,
+                "duration": 0.0,
+            }
+        if len(tables) == 1:
+            return self._run_single_table(tables[0], cfg.target_table or tables[0], progress_callback)
+
+        # 多表：逐个同步并聚合结果
+        start = datetime.now()
+        total_read = total_write = errors = 0
+        per_table = []
+        for tbl in tables:
+            res = self._run_single_table(tbl, cfg.target_table or tbl, progress_callback)
+            per_table.append({
+                "table": tbl,
+                "success": res.get("success"),
+                "message": res.get("message"),
+                "total_read": res.get("total_read", 0),
+                "total_write": res.get("total_write", 0),
+                "errors": res.get("errors", 0),
+            })
+            total_read += res.get("total_read", 0)
+            total_write += res.get("total_write", 0)
+            errors += res.get("errors", 0)
+        duration = (datetime.now() - start).total_seconds()
+        ok = all(t["success"] for t in per_table)
+        return {
+            "success": ok,
+            "message": f"多表同步完成：{len(tables)} 张表，读取 {total_read} 行，写入 {total_write} 行，错误 {errors} 行",
+            "total_read": total_read,
+            "total_write": total_write,
+            "errors": errors,
+            "duration": duration,
+            "per_table": per_table,
+        }
 
     def _run_single_table(self, src_table: str, dst_table: str,
                           progress_callback=None) -> Dict[str, Any]:
@@ -190,13 +249,14 @@ class SyncEngine:
             src_cur = src_conn.cursor()
             cols_meta = self.reader.list_columns(src_table)
 
+            # 设置表名（reader/writer 共享 config，prepare/write 都读 cfg）
+            cfg.source_table = src_table
+            cfg.target_table = dst_table or src_table
+
             # 写入前：禁用约束（pg2mysql 优化）
             tgt_conn = self.writer.connect()
             self._disable_constraints(tgt_conn)
             self.writer.prepare_table(tgt_conn, cols_meta)
-
-            # 设置 reader 支持 source_table 动态切换
-            self.reader.config.source_table = src_table
 
             while True:
                 result = self.reader.read_batch(src_cur)
@@ -258,6 +318,207 @@ class SyncEngine:
                 "errors": errors,
                 "duration": (datetime.now() - start).total_seconds(),
             }
+
+    # ------------------------------------------------------------------ #
+    # 实时同步（Binlog CDC，参考 Flink CDC 思路在平台内实现）
+    #   全量快照（initial）→ 记录 binlog 位置 → 增量监听 → 事件实时写入目标
+    # ------------------------------------------------------------------ #
+    def _run_realtime(self, progress_callback=None) -> Dict[str, Any]:
+        cfg = self.config
+        if cfg.src_db_type != "mysql":
+            return {"success": False, "message": "实时同步当前仅支持 MySQL 源（Binlog CDC）"}
+        try:
+            from pymysqlreplication import BinLogStreamReader
+            from pymysqlreplication.row_event import (
+                DeleteRowsEvent,
+                TableMapEvent,
+                UpdateRowsEvent,
+                WriteRowsEvent,
+            )
+        except ImportError:
+            return {"success": False,
+                    "message": "缺少 mysql-replication 库，请先 pip install mysql-replication"}
+
+        from .realtime_runners import get_stop_event
+
+        try:
+            import pymysql
+        except ImportError:
+            return {"success": False, "message": "缺少 pymysql 库"}
+
+        # 1) 检查源库 binlog 与当前位点
+        src_conn = pymysql.connect(
+            host=cfg.src_host, port=cfg.src_port or 3306,
+            user=cfg.src_username, password=cfg.src_password,
+            charset="utf8mb4", connect_timeout=8,
+        )
+        try:
+            with src_conn.cursor() as cur:
+                cur.execute("SHOW VARIABLES LIKE 'log_bin'")
+                row = cur.fetchone()
+                if not row or row[1] not in ("ON", "1"):
+                    return {"success": False,
+                            "message": "源库未开启 binlog，无法实时同步。"
+                                       "请配置 log-bin=mysql-bin 且 binlog-format=ROW 后重启 MySQL"}
+                cur.execute("SHOW VARIABLES LIKE 'binlog_format'")
+                row = cur.fetchone()
+                if not row or row[1] != "ROW":
+                    return {"success": False, "message": "源库 binlog_format 必须为 ROW"}
+                cur.execute("SHOW MASTER STATUS")
+                ms = cur.fetchone()
+                if not ms:
+                    return {"success": False, "message": "无法获取源库 binlog 位点"}
+                log_file, log_pos = ms[0], int(ms[1])
+        finally:
+            src_conn.close()
+
+        logger.info("[sync#%s] 实时同步：binlog 位点 %s:%s，先做全量快照", cfg.task_id, log_file, log_pos)
+        models.update_sync_task(cfg.task_id, {
+            "message": f"实时同步启动：全量快照（binlog 位点 {log_file}:{log_pos}）...",
+        })
+
+        # 2) 全量快照（initial 语义：先快照，再按位点追增量，upsert 幂等不重不漏）
+        # 注意：_run_single_table/_run_full_migration 会修改共享 cfg.source_table/target_table
+        # （逐表同步），实时监听阶段必须还原，否则 binlog 事件会被映射到错误的表。
+        orig_source_table, orig_target_table = cfg.source_table, cfg.target_table
+        tables = cfg.source_tables_list or ([cfg.source_table] if cfg.source_table else [])
+        if not tables:
+            try:
+                reader = registry.create_reader(cfg.src_db_type, cfg)
+                tables = reader.list_tables()
+            except Exception:
+                tables = []
+        snapshot = None
+        if tables:
+            snapshot = self._run_full_migration(progress_callback)
+            if not snapshot.get("success") and snapshot.get("errors", 0) > 0:
+                return {"success": False,
+                        "message": f"实时同步全量快照失败：{snapshot.get('message')}"}
+        cfg.source_table, cfg.target_table = orig_source_table, orig_target_table
+        snap_msg = f"全量快照完成（{snapshot.get('total_write', 0)} 行）" if snapshot else "无表，仅监听增量"
+
+        # 3) 增量监听（阻塞循环，直到 stop_event 置位）
+        models.update_sync_task(cfg.task_id, {
+            "status": "running",
+            "last_status": "running",
+            "message": f"实时同步运行中：{snap_msg}，binlog {log_file}:{log_pos}",
+        })
+        stop_ev = get_stop_event(cfg.task_id)
+        stats = {"insert": 0, "update": 0, "delete": 0, "errors": 0, "started": time.time()}
+        last_flush = 0.0
+        writer = None
+        writer_conn = None
+        try:
+            stream = BinLogStreamReader(
+                connection_settings={
+                    "host": cfg.src_host,
+                    "port": cfg.src_port or 3306,
+                    "user": cfg.src_username,
+                    "passwd": cfg.src_password,
+                    "charset": "utf8mb4",
+                },
+                server_id=(cfg.task_id + 10000) % 65535 + 1,
+                blocking=True,
+                only_events=[WriteRowsEvent, UpdateRowsEvent, DeleteRowsEvent, TableMapEvent],
+                # 注意：
+                # 1) 需 python-mysql-replication <1.0（0.46+）。1.x 在 MySQL 5.7（binlog
+                #    无列名 metadata）下表名/列名映射错乱，导致目标端 Unknown column。
+                #    0.46 默认即从 information_schema 取列名，无需 use_column_name_cache 参数。
+                # 2) TableMapEvent 必须放进 only_events：packet 层会跳过不在 allowed_events
+                #    里的事件，若不解析 TableMapEvent，table_map 从不更新，RowsEvent 会
+                #    被映射到错误的表（表名错乱）。
+                # 3) 不要传 only_schemas：0.46 该参数在 packet 解析层有 bug，多表交错时
+                #    同样导致表名错乱。改在事件循环里按 schema 手动过滤。
+                log_file=log_file,
+                log_pos=log_pos,
+                resume_stream=True,
+                auto_position=None,
+            )
+            while not stop_ev.is_set():
+                for event in stream:
+                    if stop_ev.is_set():
+                        break
+                    try:
+                        # 手动按源库过滤（0.46 only_schemas 有表映射 bug，见上注释）
+                        if cfg.src_db_name and getattr(event, "schema", None) != cfg.src_db_name:
+                            continue
+                        if writer is None:
+                            writer = registry.create_writer(cfg.tgt_db_type, cfg)
+                            writer_conn = writer.connect()
+                            self._disable_constraints(writer_conn)
+                        self._apply_binlog_event(writer, writer_conn, event, stats)
+                    except Exception as e:  # noqa: BLE001
+                        stats["errors"] += 1
+                        logger.exception("[sync#%s] 应用 binlog 事件失败", cfg.task_id)
+                        # 写连接可能失效，重建
+                        try:
+                            if writer_conn:
+                                writer.close(conn=writer_conn)
+                        except Exception:
+                            pass
+                        writer, writer_conn = None, None
+                        if stats["errors"] > 50:
+                            raise RuntimeError(f"错误过多({stats['errors']})，实时同步中止: {e}")
+                    now = time.time()
+                    if now - last_flush >= 1.0:
+                        last_flush = now
+                        models.update_sync_task(cfg.task_id, {
+                            "message": (
+                                f"实时同步运行中（{int(now - stats['started'])}s）："
+                                f"新增 {stats['insert']} 更新 {stats['update']} "
+                                f"删除 {stats['delete']} 错误 {stats['errors']} "
+                                f"binlog {log_file}")
+                        })
+        except RuntimeError as e:
+            return {"success": False, "message": str(e)}
+        finally:
+            try:
+                if writer_conn is not None:
+                    self._enable_constraints(writer_conn)
+            except Exception:
+                pass
+            try:
+                if writer_conn is not None:
+                    writer.close(conn=writer_conn)
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+        duration = round(time.time() - stats["started"], 1)
+        msg = (f"实时同步已停止（运行 {duration}s）：新增 {stats['insert']} "
+               f"更新 {stats['update']} 删除 {stats['delete']} 错误 {stats['errors']}")
+        models.update_sync_task(cfg.task_id, {
+            "status": "success",
+            "last_status": "success",
+            "message": msg,
+        })
+        return {"success": True, "message": msg, "duration": duration, **stats}
+
+    def _apply_binlog_event(self, writer, conn: Any, event: Any, stats: Dict[str, Any]) -> None:
+        """把一条 binlog 行事件应用到目标端。"""
+        from pymysqlreplication.row_event import (
+            DeleteRowsEvent,
+            UpdateRowsEvent,
+            WriteRowsEvent,
+        )
+        if isinstance(event, WriteRowsEvent):
+            for r in event.rows:
+                writer.apply_binlog_row(conn, "insert", event.schema, event.table,
+                                        r["values"], None)
+            stats["insert"] += len(event.rows)
+        elif isinstance(event, UpdateRowsEvent):
+            for r in event.rows:
+                writer.apply_binlog_row(conn, "update", event.schema, event.table,
+                                        r["before_values"], r["after_values"])
+            stats["update"] += len(event.rows)
+        elif isinstance(event, DeleteRowsEvent):
+            for r in event.rows:
+                writer.apply_binlog_row(conn, "delete", event.schema, event.table,
+                                        r["values"], None)
+            stats["delete"] += len(event.rows)
 
     def _run_full_migration(self, progress_callback=None) -> Dict[str, Any]:
         """全库迁移模式：遍历所有表依次同步（参考 pg2mysql migrator）。"""
@@ -483,7 +744,7 @@ class SyncEngine:
 
 def run_sync_task(task_id: int, progress_callback=None) -> Dict[str, Any]:
     """外部入口：带 validate/verify 流程。"""
-    task = models.get_sync_task(task_id)
+    task = models.get_sync_task(task_id, include_secret=True)
     if not task:
         return {"success": False, "message": "同步任务不存在"}
     return run_sync_task_with_task(task, progress_callback=progress_callback)

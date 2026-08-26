@@ -124,6 +124,63 @@
   </div>
 </div>
 
+<!-- JDBC 驱动管理 -->
+<div class="page-card mb-4">
+  <div class="d-flex align-items-center justify-content-between mb-3">
+    <h6 class="section-title mb-0">
+      <i class="bi bi-journal-code text-info"></i>
+      JDBC 驱动管理
+      <span class="badge bg-info bg-opacity-75 ms-1" id="jdbcDriverCount">0</span>
+    </h6>
+    <div class="d-flex gap-2">
+      <span class="text-muted small align-self-center" id="jvmStatus">JVM 检测中…</span>
+      <label class="btn btn-outline-primary btn-sm mb-0" for="jdbcUploadInput" title="上传自定义 JDBC 驱动 jar 包">
+        <i class="bi bi-cloud-arrow-up"></i> 上传驱动 jar
+      </label>
+      <input type="file" id="jdbcUploadInput" class="d-none" accept=".jar">
+      <button class="btn btn-outline-secondary btn-sm" id="jdbcRefreshBtn" title="刷新驱动列表">
+        <i class="bi bi-arrow-clockwise"></i> 刷新
+      </button>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-hover table-sm align-middle mb-0">
+      <thead>
+        <tr>
+          <th>驱动 jar</th>
+          <th style="width:100px;">大小</th>
+          <th style="width:170px;">上传时间</th>
+          <th style="width:90px;">注册状态</th>
+          <th style="width:170px;" class="text-end">操作</th>
+        </tr>
+      </thead>
+      <tbody id="jdbcDriverBody">
+        <tr><td colspan="5" class="text-center text-muted py-3">正在加载…</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="mt-3 p-3 bg-light rounded border">
+    <div class="d-flex flex-wrap gap-2 align-items-center">
+      <span class="text-muted small"><i class="bi bi-plug"></i> JDBC 直连测试：</span>
+      <select id="jdbcTestType" class="form-select form-select-sm" style="width:130px;">
+        <option value="mysql">MySQL</option>
+        <option value="mariadb">MariaDB</option>
+        <option value="postgresql">PostgreSQL</option>
+        <option value="oracle">Oracle</option>
+        <option value="dameng">达梦</option>
+        <option value="kingbase">KingbaseES</option>
+      </select>
+      <input id="jdbcTestHost" class="form-control form-control-sm" style="width:140px;" placeholder="主机 127.0.0.1">
+      <input id="jdbcTestPort" class="form-control form-control-sm" style="width:90px;" placeholder="端口">
+      <input id="jdbcTestDb" class="form-control form-control-sm" style="width:130px;" placeholder="库名(可选)">
+      <input id="jdbcTestUser" class="form-control form-control-sm" style="width:120px;" placeholder="用户名">
+      <input id="jdbcTestPwd" type="password" class="form-control form-control-sm" style="width:130px;" placeholder="密码">
+      <button class="btn btn-primary btn-sm" id="jdbcTestBtn"><i class="bi bi-lightning-fill"></i> 测试连接</button>
+    </div>
+    <div id="jdbcTestResult" class="small mt-2 d-none"></div>
+  </div>
+</div>
+
 <!-- 安装日志 modal -->
 <div class="modal fade" id="pluginLogModal" tabindex="-1">
   <div class="modal-dialog modal-lg modal-dialog-scrollable">

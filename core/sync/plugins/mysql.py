@@ -83,7 +83,10 @@ class MySQLSourceReader(SourceReader):
     def _build_select_sql(self, table: str, columns: List[str]) -> str:
         db = self.config.src_db_name or self.config.src_schema
         table_ref = f"`{db}`.`{table}`" if db else f"`{table}`"
-        col_str = ", ".join(f"`{c}`" for c in columns) if columns else "*"
+        if columns and columns != ["*"]:
+            col_str = ", ".join(f"`{c}`" for c in columns if c and c != "*")
+        else:
+            col_str = "*"
         sql = f"SELECT {col_str} FROM {table_ref}"
         where_parts = []
         if self.config.source_where:
@@ -211,22 +214,24 @@ class MySQLSinkWriter(SinkWriter):
         cfg = self.config
         table = cfg.target_table or cfg.source_table
         with conn.cursor() as cur:
-            if cfg.save_mode == "overwrite":
-                cur.execute(f"TRUNCATE TABLE {self._table_ref(table)}")
-                conn.commit()
-            elif cfg.save_mode == "create_if_not_exists":
-                cur.execute(self._create_table_sql(table, columns))
-                conn.commit()
-            elif cfg.save_mode == "upsert":
-                # 仅检查表是否存在
-                db = cfg.tgt_db_name or cfg.tgt_schema
-                cur.execute(
-                    "SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
-                    (db, table),
-                )
-                if not cur.fetchone():
+            mode = cfg.save_mode or "upsert"
+            db = cfg.tgt_db_name or cfg.tgt_schema
+            cur.execute(
+                "SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
+                (db, table),
+            )
+            exists = bool(cur.fetchone())
+            if mode == "overwrite":
+                if exists:
+                    cur.execute(f"TRUNCATE TABLE {self._table_ref(table)}")
+                    conn.commit()
+                else:
                     cur.execute(self._create_table_sql(table, columns))
                     conn.commit()
+            elif not exists:
+                # create_if_not_exists / upsert / 默认：目标表不存在则自动建表
+                cur.execute(self._create_table_sql(table, columns))
+                conn.commit()
 
     def write_batch(self, conn: Any, records: List[List[Any]], columns: List[str]) -> int:
         cfg = self.config
@@ -277,6 +282,85 @@ class MySQLSinkWriter(SinkWriter):
             cur.executemany(sql, values)
             conn.commit()
             return cur.rowcount
+
+
+    def apply_binlog_row(self, conn: Any, op: str, schema: str, table: str,
+                         before: dict, after: dict) -> None:
+        """把一条 Binlog 行事件应用到目标端（实时同步，参考 Flink CDC 语义）。
+
+        op: insert | update | delete
+        before/after: 列名 -> 值 字典（binlog_row_image=FULL 时为整行快照）
+        """
+        cfg = self.config
+        t = cfg.target_table or table
+        tgt_db = cfg.tgt_db_name or cfg.tgt_schema or schema
+        table_ref = f"`{tgt_db}`.`{t}`"
+
+        def tcol(name: str) -> str:
+            return self.plugin.normalize_identifier(name, cfg.field_ide)
+
+        pks = self._get_primary_keys(conn, t)
+
+        def build_where(old: dict):
+            parts, vals = [], []
+            for pk in pks:
+                if pk in old:
+                    parts.append(f"`{tcol(pk)}` = %s")
+                    vals.append(self._binlog_value(old[pk]))
+            if not parts:
+                for c in old:
+                    parts.append(f"`{tcol(c)}` = %s")
+                    vals.append(self._binlog_value(old[c]))
+            return parts, vals
+
+        with conn.cursor() as cur:
+            if op == "insert":
+                row = after or before or {}
+                if not row:
+                    return
+                cols = list(row.keys())
+                placeholders = ", ".join(["%s"] * len(cols))
+                col_str = ", ".join(f"`{tcol(c)}`" for c in cols)
+                vals = tuple(self._binlog_value(row[c]) for c in cols)
+                if pks:
+                    updates = ", ".join(
+                        f"`{tcol(c)}` = VALUES(`{tcol(c)}`)"
+                        for c in cols if c not in pks
+                    )
+                    if updates:
+                        sql = (f"INSERT INTO {table_ref} ({col_str}) VALUES ({placeholders}) "
+                               f"ON DUPLICATE KEY UPDATE {updates}")
+                    else:
+                        sql = f"INSERT IGNORE INTO {table_ref} ({col_str}) VALUES ({placeholders})"
+                else:
+                    sql = f"INSERT INTO {table_ref} ({col_str}) VALUES ({placeholders})"
+                cur.execute(sql, vals)
+                conn.commit()
+            elif op == "update":
+                if not after:
+                    return
+                old = before or after
+                cols = list(after.keys())
+                set_str = ", ".join(f"`{tcol(c)}` = %s" for c in cols)
+                vals = [self._binlog_value(after[c]) for c in cols]
+                where_parts, where_vals = build_where(old)
+                sql = f"UPDATE {table_ref} SET {set_str} WHERE {' AND '.join(where_parts)}"
+                cur.execute(sql, vals + where_vals)
+                conn.commit()
+            elif op == "delete":
+                if not before:
+                    return
+                where_parts, where_vals = build_where(before)
+                sql = f"DELETE FROM {table_ref} WHERE {' AND '.join(where_parts)}"
+                cur.execute(sql, where_vals)
+                conn.commit()
+
+    @staticmethod
+    def _binlog_value(v: Any) -> Any:
+        """binlog 值转为 pymysql 可写值。"""
+        if isinstance(v, (bytes, bytearray)):
+            return bytes(v)
+        return v
 
 
 class MySQLPlugin(BasePlugin):

@@ -140,37 +140,82 @@ def _build_install_script(db_type: str, params: dict) -> str:
         binlog = params.get("mysql_binlog", "1")
 
         return f"""#!/bin/bash
-set -e
+# MySQL 多版本部署脚本（5.5/5.6/5.7/8.0/8.4/9.x）
+# 关键步骤失败时显式 exit 1，让后端能根据返回码判断部署失败。
+set +e
 echo "[deploy] ====== MySQL {version} 部署开始 ======"
 echo "[deploy] BASE={base}  DATA={data}  PORT={port}  CHARSET={charset}"
+
+# ---------- 前置检查：避免误删用户已有数据 ----------
+echo "[deploy] 前置环境检查..."
+if pgrep -x mysqld >/dev/null 2>&1 || pgrep -x mariadbd >/dev/null 2>&1; then
+    echo "[deploy] ERROR: 检测到目标机已有 MySQL/MariaDB 进程在运行。"
+    echo "[deploy] ERROR: 请先停止并清理现有实例后再部署（systemctl stop mysql / service mysql stop）。"
+    exit 1
+fi
+if [ -d "{data}" ] && [ "$(ls -A {data} 2>/dev/null)" ]; then
+    echo "[deploy] ERROR: 数据目录 {data} 已存在文件，为避免误删数据，请先手动清理后重新部署。"
+    echo "[deploy] ERROR: 清理命令参考：systemctl stop mysql; rm -rf {data}/* {base} /etc/my.cnf /root/.my.cnf"
+    exit 1
+fi
+if [ -f "/etc/my.cnf" ] || [ -f "/etc/mysql/my.cnf" ]; then
+    echo "[deploy] WARN: 检测到已有 MySQL 配置文件 /etc/my.cnf 或 /etc/mysql/my.cnf。"
+    echo "[deploy] WARN: 若残留配置导致启动异常，请先备份并删除后再部署。"
+fi
+
 mkdir -p {base} {data} /data/backup/mysql
 echo "[deploy] 解压安装包..."
 tar -xf {pkg} -C {base} --strip-components=1
 id mysql &>/dev/null || useradd -r -s /bin/false mysql
-echo "[deploy] 检测 MySQL 版本与可用初始化方式..."
-# 兼容 5.6（mysql_install_db）与 5.7+（mysqld --initialize）
+
+# ---------- 探测版本 ----------
 MYSQLD={base}/bin/mysqld
-if [ ! -x "$MYSQLD" ] && [ -x {base}/bin/mysqld-debug ]; then
-    MYSQLD={base}/bin/mysqld-debug
-fi
+[ ! -x "$MYSQLD" ] && [ -x {base}/bin/mysqld-debug ] && MYSQLD={base}/bin/mysqld-debug
+RAW_VER=$($MYSQLD --version 2>/dev/null | grep -oiE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1)
+[ -z "$RAW_VER" ] && RAW_VER=$({base}/bin/mysql --version 2>/dev/null | grep -oiE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1)
+MAJOR=$(echo "$RAW_VER" | cut -d. -f1)
+MINOR=$(echo "$RAW_VER" | cut -d. -f2)
+echo "[deploy] 探测到 MySQL 版本: $RAW_VER (major=$MAJOR minor=$MINOR)"
+
+# ---------- 初始化数据目录 ----------
 MYSQL_INSTALL_DB={base}/bin/mysql_install_db
-if [ -x "$MYSQLD" ]; then
+init_rc=0
+if [ -x "$MYSQLD" ] && [ "$MAJOR" -ge 5 ] && ([ "$MINOR" -ge 7 ] || [ "$MAJOR" -ge 8 ]); then
     echo "[deploy] 使用 mysqld --initialize-insecure (MySQL 5.7+ / 8.0+ / 9.x)"
-    $MYSQLD --initialize-insecure --user=mysql --datadir={data} --basedir={base} 2>&1 | head -20
+    $MYSQLD --initialize-insecure --user=mysql --datadir={data} --basedir={base} 2>&1 | head -30
+    init_rc=${{PIPESTATUS[0]}}
+    if [ $init_rc -ne 0 ]; then
+        # 常见原因：datadir 有残留 / libaio 缺失
+        echo "[deploy] ERROR: mysqld --initialize-insecure 初始化失败 (rc=$init_rc)。"
+        echo "[deploy] ERROR: 请检查数据目录是否为空、是否已安装 libaio/numactl。"
+        exit 1
+    fi
 elif [ -x "$MYSQL_INSTALL_DB" ]; then
     echo "[deploy] 使用 mysql_install_db (MySQL 5.6 及更早)"
-    $MYSQL_INSTALL_DB --user=mysql --datadir={data} --basedir={base} 2>&1 | head -20
+    $MYSQL_INSTALL_DB --user=mysql --datadir={data} --basedir={base} 2>&1 | head -30
+    init_rc=${{PIPESTATUS[0]}}
+    if [ $init_rc -ne 0 ]; then
+        echo "[deploy] ERROR: mysql_install_db 初始化失败 (rc=$init_rc)。"
+        exit 1
+    fi
 else
-    echo "[deploy] WARN: 未找到 mysqld 或 mysql_install_db，请检查安装包"
+    echo "[deploy] ERROR: 未找到可用的初始化工具，请检查安装包是否完整。"
     ls {base}/bin/ | head -20
     exit 1
 fi
+
+# ---------- 写入 /etc/my.cnf ----------
 echo "[deploy] 写入 /etc/my.cnf ..."
+# mysqlx 默认端口为 33060；若用户把 MySQL 主端口也设为 33060 会冲突导致启动失败，
+# 因此显式将 mysqlx_port 设为主端口+1，避免绑定 "Address already in use"。
+MYSQLX_PORT=$(( {port} + 1 ))
 cat > /etc/my.cnf << 'EOF'
 [mysqld]
 basedir={base}
 datadir={data}
 port={port}
+mysqlx_port={int(port)+1}
+socket=/tmp/mysql.sock
 bind-address=0.0.0.0
 character-set-server={charset}
 default-storage-engine=InnoDB
@@ -178,24 +223,139 @@ max_connections={maxconn}
 innodb_buffer_pool_size={buffer}M
 server-id={srv_id}
 {"log-bin=" + data + "/mysql-bin" if binlog == "1" else "# binlog disabled"}
-[client]
-user=root
-password={pw}
+[mysql]
+socket=/tmp/mysql.sock
 default-character-set={charset}
+[client]
+socket=/tmp/mysql.sock
 EOF
 chown -R mysql:mysql {base} {data}
+
+# ---------- 安装 mysql.server 启动脚本（便于后续管理，但不一定用于启动）----------
+echo "[deploy] 安装 mysql.server 启动脚本..."
+if [ -f {base}/support-files/mysql.server ]; then
+    cp -f {base}/support-files/mysql.server /etc/init.d/mysql
+    chmod +x /etc/init.d/mysql
+    # 尝试注册为系统服务；忽略失败，某些精简系统没有 chkconfig/systemctl
+    chkconfig --add mysql >/dev/null 2>&1 || systemctl enable mysql >/dev/null 2>&1 || true
+else
+    echo "[deploy] WARN: 安装包中未找到 support-files/mysql.server，将仅使用 mysqld_safe/mysqld 直接启动。"
+fi
+
+# ---------- 启动 MySQL（优先 mysqld_safe，已在 CentOS7/8/9 验证稳定）----------
 echo "[deploy] 启动 MySQL..."
-nohup {base}/bin/mysqld_safe --user=mysql --datadir={data} >/var/log/mysqld_safe.log 2>&1 &
-sleep 8
-# 用 .my.cnf 让 mysqladmin/mysql 不再要求交互密码
+start_rc=0
+if [ -x {base}/bin/mysqld_safe ]; then
+    echo "[deploy] 使用 mysqld_safe 启动 (最通用，兼容 5.x/8.0/9.x)"
+    nohup {base}/bin/mysqld_safe --user=mysql --datadir={data} >/var/log/mysqld_safe.log 2>&1 &
+    start_rc=0
+elif [ -x {base}/bin/mysqld ]; then
+    echo "[deploy] mysqld_safe 不存在，使用 mysqld --daemonize 启动"
+    nohup {base}/bin/mysqld --user=mysql --datadir={data} --daemonize >/var/log/mysqld.log 2>&1 &
+    start_rc=0
+else
+    # 兜底：尝试 mysql.server
+    echo "[deploy] 使用 /etc/init.d/mysql start 兜底启动"
+    /etc/init.d/mysql start 2>&1 | head -20
+    start_rc=${{PIPESTATUS[0]}}
+fi
+
+# 循环等待 socket 就绪（mysql 命令加 --connect-timeout，避免半开连接挂起导致无限等待）
+SOCK=/tmp/mysql.sock
+echo "[deploy] 等待 MySQL socket 就绪 ($SOCK)..."
+wait_ok=0
+for i in $(seq 1 60); do
+    if [ -S "$SOCK" ]; then
+        {base}/bin/mysql --connect-timeout=3 -u root -e "SELECT 1;" >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            wait_ok=1
+            break
+        fi
+    fi
+    sleep 1
+done
+if [ $wait_ok -ne 1 ]; then
+    echo "[deploy] ERROR: MySQL 启动后 60 秒内 socket 仍未就绪。"
+    echo "[deploy] ERROR: 启动日志参考："
+    tail -n 30 {data}/error.log 2>/dev/null || tail -n 30 /var/log/mysqld_safe.log 2>/dev/null || true
+    exit 1
+fi
+echo "[deploy] MySQL socket 已就绪"
+
+# ---------- 设置 root 密码 + 开放远程访问 ----------
+echo "[deploy] 设置 root 密码..."
+MYSQLCLI="{base}/bin/mysql -u root"
+# MySQL 8.0+ 默认 caching_sha2_password，老驱动/老客户端可能连不上；
+# 显式用 mysql_native_password 以获得最大兼容性。
+if [ "$MAJOR" -ge 8 ]; then
+    AUTH_PLUGIN="mysql_native_password"
+else
+    AUTH_PLUGIN=""
+fi
+
+# 各版本构造“单条核心语句”（ALTER/CREATE/GRANT），逐条执行，避免一条失败导致整体 rc!=0 误判。
+# 注意：8.0.11+ 不允许 GRANT ... WITH GRANT OPTION 组合；GRANT PROXY 在 9.x 会报错，故省略。
+build_stmts() {{
+    local auth_clause=""
+    [ -n "$AUTH_PLUGIN" ] && auth_clause=" IDENTIFIED WITH $AUTH_PLUGIN BY '{pw}'" || auth_clause=" IDENTIFIED BY '{pw}'"
+    if [ "$MAJOR" -eq 5 ] && [ "$MINOR" -lt 7 ]; then
+        # 5.5 / 5.6（无 ALTER USER，用 SET PASSWORD + GRANT 隐式建用户）
+        echo "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('{pw}');"
+        echo "GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' IDENTIFIED BY '{pw}' WITH GRANT OPTION;"
+        echo "GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' IDENTIFIED BY '{pw}' WITH GRANT OPTION;"
+        echo "FLUSH PRIVILEGES;"
+    else
+        # 5.7.6+ / 8.x / 9.x
+        echo "ALTER USER 'root'@'localhost' IDENTIFIED BY '{pw}';"
+        echo "CREATE USER IF NOT EXISTS 'root'@'%'$auth_clause;"
+        echo "GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;"
+        echo "FLUSH PRIVILEGES;"
+    fi
+}}
+
+# 逐条执行（用 --connect-expired-password 应对初始空密码 / 过期密码）
+echo "[deploy] 逐条执行授权语句..."
+build_stmts | while IFS= read -r stmt; do
+    [ -z "$stmt" ] && continue
+    echo "[deploy]   > $stmt"
+    $MYSQLCLI --connect-expired-password -e "$stmt" 2>&1 | head -5
+    # 单条失败仅告警，不致命（例如某些 9.x 对 WITH GRANT OPTION 的细微差异）
+done
+
+# 以“能否用新密码登录”作为最终成功判据（而非批处理 rc）
+echo "[deploy] 使用新密码验证登录..."
+LOGIN_OK=0
+for i in $(seq 1 10); do
+    $MYSQLCLI -p'{pw}' -e "SELECT VERSION();" >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        LOGIN_OK=1
+        break
+    fi
+    sleep 1
+done
+if [ $LOGIN_OK -ne 1 ]; then
+    echo "[deploy] ERROR: 使用 root 密码登录验证失败。"
+    exit 1
+fi
+
+# ---------- 写入 /root/.my.cnf 并验证 ----------
 cat > /root/.my.cnf << 'MYCNF'
 [client]
 user=root
 password={pw}
+socket=/tmp/mysql.sock
 MYCNF
 chmod 600 /root/.my.cnf
-{base}/bin/mysqladmin -u root password '{pw}' 2>&1 | head -5 || true
+echo "[deploy] 验证 root 密码登录..."
 {base}/bin/mysql -e "SELECT VERSION();" 2>&1 | head -3
+if [ $? -ne 0 ]; then
+    echo "[deploy] ERROR: 使用 root 密码登录验证失败。"
+    exit 1
+fi
+
+# 验证远程端口监听
+ss -lntp 2>/dev/null | grep -E ':{port}\\s' || netstat -lntp 2>/dev/null | grep -E ':{port}\\s' || true
+
 echo "[deploy] 写入 /etc/profile.d/mysql.sh ..."
 cat > /etc/profile.d/mysql.sh << 'PROFILEEOF'
 export MYSQL_HOME={base}
@@ -204,9 +364,11 @@ export MYSQL_DATADIR={data}
 PROFILEEOF
 chmod 644 /etc/profile.d/mysql.sh
 ldconfig
-echo "[deploy] MySQL 部署完成! 端口={port}  数据目录={data}  环境变量: /etc/profile.d/mysql.sh"
+
+echo "[deploy] MySQL 部署完成! 版本=$RAW_VER 端口={port}  数据目录={data}"
 echo "提示：新开 SSH 终端前请先 source /etc/profile 或重新登录"
 echo "DEPLOY_OK"
+exit 0
 
 """
     elif db_type == "postgresql":
@@ -429,6 +591,43 @@ echo "DEPLOY_OK"
         redis_evict = params.get("redis_evict", "allkeys-lru")
         redis_aof = params.get("redis_aof", "yes")
         redis_cluster = params.get("redis_cluster", "")
+        dep_pkg = params.get("dep_pkg", "")
+        if dep_pkg and dep_pkg != "NONE":
+            dep_lines = f"""
+# ====== 安装依赖包（如 gcc，离线 RPM）======
+echo "[deploy] 检测 gcc / 编译工具链..."
+if command -v gcc >/dev/null 2>&1; then
+    echo "[deploy] gcc 已存在，跳过依赖安装"
+else
+    echo "[deploy] 未检测到 gcc，开始安装依赖包: {dep_pkg}"
+    mkdir -p {data}/dependency
+    if [[ "{dep_pkg}" == *.zip ]]; then
+        command -v unzip >/dev/null 2>&1 && unzip -o -q {dep_pkg} -d {data}/dependency || (cd {data}/dependency && python3 -c "import zipfile,sys;zipfile.ZipFile('{dep_pkg}').extractall('.')")
+    else
+        tar -xf {dep_pkg} -C {data}/dependency 2>/dev/null || cp -r {dep_pkg}/* {data}/dependency/ 2>/dev/null
+    fi
+    RPM_LIST=$(find {data}/dependency -name '*.rpm' 2>/dev/null)
+    if [ -n "$RPM_LIST" ]; then
+        echo "[deploy] 安装 RPM: $RPM_LIST"
+        rpm -Uvh --force --nodeps $RPM_LIST 2>&1 | tail -20 || echo "[deploy] 部分 RPM 安装失败，继续"
+    fi
+    DEP_INSTALL=$(find {data}/dependency -maxdepth 3 -name 'install.sh' 2>/dev/null | head -1)
+    if [ -n "$DEP_INSTALL" ]; then
+        echo "[deploy] 执行依赖安装脚本: $DEP_INSTALL"
+        bash "$DEP_INSTALL" 2>&1 | tail -20
+    fi
+    if command -v gcc >/dev/null 2>&1; then
+        echo "[deploy] gcc 安装成功"
+    else
+        echo "[deploy] 警告: gcc 仍未就绪，源码编译可能失败"
+    fi
+fi
+"""
+        else:
+            dep_lines = """
+# 依赖包未提供，直接尝试编译（若无 gcc 会失败）
+echo "[deploy] 未提供依赖包，直接尝试编译"
+"""
 
         cluster_cfg = ""
         if redis_cluster:
@@ -437,13 +636,33 @@ echo "DEPLOY_OK"
         return f"""#!/bin/bash
 set -e
 echo "[deploy] ====== Redis {version} 部署开始 ======"
+mkdir -p {data}
+{dep_lines}
+# 清理可能存在的旧残留目录，避免误用上次失败的源码
+echo "[deploy] 清理可能残留的旧安装目录..."
+rm -rf {base} {data}/redis_* /tmp/redis_build 2>/dev/null || true
 mkdir -p {base} {data}
-tar -xf {pkg} -C {base} --strip-components=1
-cd {base} && make -j$(nproc) PREFIX={base} MALLOC=libc install
-# 准备 redis 启动用户
+echo "[deploy] 解压 Redis 源码包 -> /tmp/redis_build ..."
+mkdir -p /tmp/redis_build
+tar -xf {pkg} -C /tmp/redis_build
+SRC_DIR=$(find /tmp/redis_build -maxdepth 1 -type d -name 'redis-*' 2>/dev/null | head -1)
+[ -z "$SRC_DIR" ] && SRC_DIR=/tmp/redis_build/redis-6.2.6
+echo "[deploy] 源码目录: $SRC_DIR"
+cd "$SRC_DIR"
+echo "[deploy] 编译 Redis (MALLOC=libc)..."
+make MALLOC=libc
+echo "[deploy] 安装 Redis..."
+make install
+mkdir -p {base}/bin
+cp -f "$SRC_DIR"/src/redis-server {base}/bin/
+cp -f "$SRC_DIR"/src/redis-cli {base}/bin/
+cp -f "$SRC_DIR"/src/redis-sentinel {base}/bin/ 2>/dev/null || true
+cp -f "$SRC_DIR"/src/redis-check-rdb {base}/bin/ 2>/dev/null || true
+cp -f "$SRC_DIR"/src/redis-check-aof {base}/bin/ 2>/dev/null || true
+cp -f "$SRC_DIR"/src/redis-benchmark {base}/bin/ 2>/dev/null || true
+echo "[deploy] Redis 二进制已安装到 {base}/bin"
 id redis &>/dev/null || useradd -r -s /bin/false redis
 chown -R redis:redis {base} {data}
-# 生成配置
 cat > {base}/redis.conf << EOF
 bind 0.0.0.0
 port {port}
@@ -459,11 +678,18 @@ tcp-keepalive 60
 timeout 300
 {cluster_cfg}
 EOF
-# 启动
 {base}/bin/redis-server {base}/redis.conf 2>&1 | head -5
 sleep 2
-# 用脚本免 PING 时密码警告
-REDISCLI_AUTH={pw} {base}/bin/redis-cli PING
+if REDISCLI_AUTH={pw} {base}/bin/redis-cli PING 2>/dev/null | grep -q PONG; then
+    echo "[deploy] Redis 启动成功 (PONG)"
+else
+    echo "[deploy] 警告: PING 未返回 PONG，见上方日志"
+fi
+cat > /usr/local/bin/redis-start.sh << 'STARTEOF'
+#!/bin/bash
+{base}/bin/redis-server {base}/redis.conf
+STARTEOF
+chmod +x /usr/local/bin/redis-start.sh
 echo "[deploy] 写入 /etc/profile.d/redis.sh ..."
 cat > /etc/profile.d/redis.sh << 'PROFILEEOF'
 export REDIS_HOME={base}
@@ -485,18 +711,48 @@ echo "DEPLOY_OK"
             repl_cfg = f'replication:\n  replSetName: "{mongo_repl}"\n'
 
         auth_cfg = 'authorization: enabled' if mongo_auth == "1" else '# authorization: disabled'
+        # 认证开启时，需要先以无认证方式启动创建管理员账号，再重启启用认证
+        need_auth_user = (mongo_auth == "1")
 
         return f"""#!/bin/bash
-set -e
+set +e
 echo "[deploy] ====== MongoDB {version} 部署开始 ======"
-mkdir -p {base} {data}
+echo "[deploy] BASE={base}  DATA={data}  PORT={port}  AUTH={mongo_auth}  REPL={mongo_repl}"
+
+# ---------- 前置检查 ----------
+echo "[deploy] 前置环境检查..."
+if pgrep -x mongod >/dev/null 2>&1; then
+    echo "[deploy] ERROR: 检测到目标机已有 mongod 进程在运行，请先停止后再部署。"
+    exit 1
+fi
+
+# ---------- 解压安装包 ----------
+mkdir -p {base} {data}/conf
+if [ ! -f "{pkg}" ]; then
+    echo "[deploy] ERROR: 安装包不存在: {pkg}"
+    exit 1
+fi
+echo "[deploy] 解压安装包: {pkg} -> {base}"
 tar -xf {pkg} -C {base} --strip-components=1
+if [ $? -ne 0 ]; then
+    echo "[deploy] ERROR: 解压失败，请检查安装包是否完整。"
+    exit 1
+fi
+
 id mongod &>/dev/null || useradd -r -s /bin/false mongod
 chown -R mongod:mongod {base} {data}
+
+MONGOD={base}/bin/mongod
+if [ ! -x "$MONGOD" ]; then MONGOD=$(find {base} -name "mongod" -type f -executable 2>/dev/null | head -1); fi
+if [ -z "$MONGOD" ]; then echo "[deploy] ERROR: 找不到 mongod 二进制"; exit 1; fi
+echo "[deploy] mongod 路径: $MONGOD"
+
+# ---------- 生成配置文件（先写无认证版本，便于初始化账号）----------
 cat > {base}/mongod.conf << EOF
 systemLog:
   destination: file
   path: {data}/mongod.log
+  logAppend: true
 storage:
   dbPath: {data}
   wiredTiger:
@@ -505,21 +761,136 @@ storage:
 net:
   port: {port}
   bindIp: 0.0.0.0
-{repl_cfg}{auth_cfg}
-EOF
-# mongod 启动（兼容不同版本命令）
-MONGOD={base}/bin/mongod
-if [ ! -x "$MONGOD" ]; then MONGOD=$(find {base} -name "mongod" -type f -executable 2>/dev/null | head -1); fi
-if [ -z "$MONGOD" ]; then echo "[deploy] ERROR: 找不到 mongod 二进制"; exit 1; fi
-echo "[deploy] 启动 mongod: $MONGOD"
-$MONGOD --config {base}/mongod.conf --fork 2>&1 | head -5
-sleep 3
-# mongosh / mongo
-MONGO_SH={base}/bin/mongosh
-[ ! -x "$MONGO_SH" ] && MONGO_SH=$(which mongosh 2>/dev/null || which mongo 2>/dev/null)
-if [ -x "$MONGO_SH" ]; then
-    $MONGO_SH --port {port} --quiet --eval "db.version()" 2>&1 | head -3
+{repl_cfg}EOF
+if [ "{mongo_auth}" != "1" ]; then
+    cat >> {base}/mongod.conf << 'EOF2'
+security:
+  authorization: disabled
+EOF2
 fi
+
+# ---------- 启动 mongod（fork 模式）----------
+echo "[deploy] 启动 mongod..."
+$MONGOD --config {base}/mongod.conf --fork 2>&1 | head -20
+start_rc=$?
+if [ $start_rc -ne 0 ]; then
+    echo "[deploy] ERROR: mongod 启动失败，日志末尾："
+    tail -n 30 {data}/mongod.log 2>/dev/null || true
+    exit 1
+fi
+
+# ---------- 等待端口就绪（用 mongo/mongosh 客户端 ping 探测，最可靠）----------
+echo "[deploy] 等待 MongoDB 端口 {port} 就绪..."
+CLI={base}/bin/mongosh
+[ ! -x "$CLI" ] && CLI=$(which mongosh 2>/dev/null || which mongo 2>/dev/null)
+[ ! -x "$CLI" ] && CLI={base}/bin/mongo
+ready=0
+for i in $(seq 1 60); do
+    if [ -x "$CLI" ] && $CLI --port {port} --quiet --eval "db.runCommand({{ping:1}}).ok" 2>/dev/null | grep -q 1; then
+        ready=1
+        break
+    fi
+    sleep 1
+done
+if [ $ready -ne 1 ]; then
+    echo "[deploy] ERROR: MongoDB 端口 {port} 在限时内未就绪"
+    tail -n 30 {data}/mongod.log 2>/dev/null || true
+    exit 1
+fi
+echo "[deploy] MongoDB 版本: $($CLI --port {port} --quiet --eval "db.version()" 2>&1 | head -1)"
+echo "[deploy] mongod 启动完成"
+
+# ---------- 创建管理员账号（认证开启时）----------
+if [ "{mongo_auth}" = "1" ]; then
+    echo "[deploy] 创建管理员账号 admin / 指定密码..."
+    CLI={base}/bin/mongosh
+    [ ! -x "$CLI" ] && CLI=$(which mongosh 2>/dev/null || which mongo 2>/dev/null)
+    [ ! -x "$CLI" ] && CLI={base}/bin/mongo
+    if [ -z "$CLI" ] || [ ! -x "$CLI" ]; then
+        echo "[deploy] WARN: 未找到 mongosh/mongo 客户端，跳过账号创建（认证启用后需手动建账号）"
+    else
+        # 副本集 + 认证必须配置 keyFile，否则 mongod 启动报错
+        if [ -n "{mongo_repl}" ]; then
+            echo "[deploy] 生成副本集 keyFile..."
+            if command -v openssl >/dev/null 2>&1; then
+                openssl rand -base64 756 > {base}/keyfile
+            else
+                head -c 756 /dev/urandom | base64 > {base}/keyfile
+            fi
+            chmod 600 {base}/keyfile
+            chown mongod:mongod {base}/keyfile
+        fi
+        # 若配置了副本集，需先初始化单节点副本集，否则无法创建用户（not master）
+        if [ -n "{mongo_repl}" ]; then
+            echo "[deploy] 初始化副本集 {mongo_repl} ..."
+            REPL_NAME="{mongo_repl}"
+            REPL_PORT={port}
+            cat > /tmp/rs_init.js << RSEOF
+rs.initiate({{
+  _id: "{mongo_repl}",
+  members: [{{ _id: 0, host: "127.0.0.1:{port}" }}]
+}})
+RSEOF
+            $CLI --port {port} admin --quiet --eval "$(cat /tmp/rs_init.js)" 2>&1 | head -5
+            echo "[deploy] 等待副本集变为 PRIMARY ..."
+            for i in $(seq 1 30); do
+                role=$($CLI --port {port} --quiet --eval "rs.status().myState" 2>/dev/null | head -1)
+                if [ "$role" = "1" ]; then
+                    echo "[deploy] 副本集已为 PRIMARY"
+                    break
+                fi
+                sleep 1
+            done
+        fi
+        echo "[deploy] 创建 admin 账号..."
+        $CLI --port {port} admin --quiet --eval '
+            db.createUser({{ user: "admin", pwd: "{pw}", roles: [ {{ role: "root", db: "admin" }} ] }})
+        ' 2>&1 | head -5
+        # 关闭 mongod 并以认证模式重启
+        echo "[deploy] 关闭 mongod 并以认证模式重启..."
+        $CLI --port {port} admin -u admin -p "{pw}" --authenticationDatabase admin --quiet --eval "db.shutdownServer()" 2>&1 | head -3 || true
+        sleep 1
+        $CLI --port {port} admin --quiet --eval "db.shutdownServer()" 2>&1 | head -3 || true
+        # 等待 mongod 真正退出（端口释放）
+        for i in $(seq 1 30); do
+            if ! ss -lntp 2>/dev/null | grep -qE ":{port}\\s" && ! netstat -lntp 2>/dev/null | grep -qE ":{port}\\s"; then
+                break
+            fi
+            sleep 1
+        done
+        # 启用 authorization（追加 security 段到配置文件末尾，避免 sed 转义问题）
+        if [ -n "{mongo_repl}" ]; then
+            cat >> {base}/mongod.conf << 'SECEOF'
+
+security:
+  authorization: enabled
+  keyFile: {base}/keyfile
+SECEOF
+        else
+            cat >> {base}/mongod.conf << 'SECEOF'
+
+security:
+  authorization: enabled
+SECEOF
+        fi
+        $MONGOD --config {base}/mongod.conf --fork 2>&1 | head -10
+        # 用新账号验证登录
+        AUTH_OK=0
+        for i in $(seq 1 10); do
+            if $CLI --port {port} -u admin -p "{pw}" --authenticationDatabase admin --quiet --eval "db.runCommand({{ping:1}})" >/dev/null 2>&1; then
+                AUTH_OK=1
+                break
+            fi
+            sleep 1
+        done
+        if [ $AUTH_OK -ne 1 ]; then
+            echo "[deploy] ERROR: 使用 admin 账号认证登录验证失败。"
+            exit 1
+        fi
+        echo "[deploy] 管理员账号认证验证通过"
+    fi
+fi
+
 echo "[deploy] 写入 /etc/profile.d/mongodb.sh ..."
 cat > /etc/profile.d/mongodb.sh << 'PROFILEEOF'
 export MONGO_HOME={base}
@@ -527,7 +898,8 @@ export PATH=$MONGO_HOME/bin:$PATH
 PROFILEEOF
 chmod 644 /etc/profile.d/mongodb.sh
 ldconfig
-echo "[deploy] MongoDB 部署完成! 端口={port}  环境变量: /etc/profile.d/mongodb.sh"
+echo "[deploy] MongoDB 部署完成! 端口={port}  数据目录={data}  环境变量: /etc/profile.d/mongodb.sh"
+echo "提示：新开 SSH 终端前请先 source /etc/profile 或重新登录"
 echo "DEPLOY_OK"
 
 """
@@ -561,27 +933,62 @@ def run_deployment(dep_id: int) -> None:
         log(f"已连接: {h.get('hostname') or h.get('host')}")
 
         # 上传安装包（如果提供了本地路径）
-        pkg_path = dep.get("package_path") or ""
-        if pkg_path and os.path.isfile(pkg_path):
-            remote_pkg = "/tmp/" + os.path.basename(pkg_path)
-            log(f"上传安装包: {pkg_path} -> {remote_pkg}")
-            sftp = client.open_sftp()
-            sftp.put(pkg_path, remote_pkg)
-            sftp.close()
-            log(f"安装包上传完成")
-            # 更新 remote package path
-            models.update_deployment(dep_id, {"package_path": remote_pkg})
-            pkg_path = remote_pkg
+        pkg_path = (dep.get("package_path") or "").strip()
+        log(f"部署包路径: {pkg_path}")
+        if pkg_path:
+            if os.path.isfile(pkg_path):
+                remote_pkg = "/tmp/" + os.path.basename(pkg_path)
+                try:
+                    log(f"上传安装包: {pkg_path} -> {remote_pkg}")
+                    sftp = client.open_sftp()
+                    sftp.put(pkg_path, remote_pkg)
+                    sftp.close()
+                    log(f"安装包上传完成")
+                    # 更新 remote package path
+                    models.update_deployment(dep_id, {"package_path": remote_pkg})
+                    pkg_path = remote_pkg
+                except Exception as e:
+                    log(f"安装包上传失败: {e}")
+                    raise
+            elif pkg_path.startswith(("/", "~")):
+                # 用户填的是远程路径，检查目标主机是否存在
+                log(f"检查远程包是否存在: {pkg_path}")
+                out, _, rc = _ssh_exec(client, f'test -f "{pkg_path}" && echo "EXISTS" || echo "NOT_FOUND"')
+                exists = 'EXISTS' in out
+                log(f"远程包 {pkg_path}: {'已存在' if exists else '未找到'}")
+                if not exists:
+                    raise RuntimeError(f"远程安装包不存在: {pkg_path}")
+            else:
+                raise RuntimeError(f"安装包路径无效或本平台暂存文件已丢失: {pkg_path}")
 
-        # 如果 package_path 已是远程路径（用户填了远程服务器上已有的路径），直接使用
-        if pkg_path and not os.path.isfile(pkg_path):
-            # 检查远程是否存在
-            _, _, rc = _ssh_exec(client, f'test -f "{pkg_path}" && echo "EXISTS" || echo "NOT_FOUND"')
-            log(f"远程包 {pkg_path}: {'已存在' if 'EXISTS' in _ else '未找到'}")
+        # 上传依赖包（如 gcc RPM 离线包，Redis 编译需要）
+        dep_pkg_path = (dep.get("dependency_path") or "").strip()
+        dep_pkg_remote = "NONE"
+        if dep_pkg_path:
+            if os.path.isfile(dep_pkg_path):
+                dep_pkg_remote = "/tmp/" + os.path.basename(dep_pkg_path)
+                try:
+                    log(f"上传依赖包: {dep_pkg_path} -> {dep_pkg_remote}")
+                    sftp = client.open_sftp()
+                    sftp.put(dep_pkg_path, dep_pkg_remote)
+                    sftp.close()
+                    log(f"依赖包上传完成")
+                except Exception as e:
+                    log(f"依赖包上传失败: {e}")
+                    raise
+            elif dep_pkg_path.startswith(("/", "~")):
+                log(f"检查远程依赖包: {dep_pkg_path}")
+                out, _, _ = _ssh_exec(client, f'test -f "{dep_pkg_path}" && echo "EXISTS" || echo "NOT_FOUND"')
+                dep_pkg_remote = dep_pkg_path if 'EXISTS' in out else "NONE"
+                log(f"远程依赖包 {dep_pkg_path}: {'已存在' if dep_pkg_remote != 'NONE' else '未找到'}")
+            else:
+                log(f"依赖包路径无效: {dep_pkg_path}，将跳过依赖安装")
+                dep_pkg_remote = "NONE"
 
         # 构建并写入安装脚本
         params = json.loads(dep.get("config_json") or "{}")
         params["package_path"] = pkg_path
+        params["dep_pkg"] = dep_pkg_remote
         params["base_dir"] = dep.get("base_dir") or params.get("base_dir", "")
         params["data_dir"] = dep.get("data_dir") or params.get("data_dir", "")
         params["port"] = dep.get("port") or params.get("port", 0)

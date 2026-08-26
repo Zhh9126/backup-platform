@@ -5,9 +5,46 @@ import io
 from flask import request, jsonify, make_response
 
 from auth import login_required
-from core import models, scheduler
+from core import models, scheduler, db
 from core.engines import supported_types, get_engine
 from . import api_bp
+
+# 各类型拉库时过滤的系统库/模板库
+_LIST_DB_SKIP = {
+    "mysql": {"information_schema", "performance_schema", "mysql", "sys"},
+    "mariadb": {"information_schema", "performance_schema", "mysql", "sys"},
+    "postgresql": {"template0", "template1"},
+    "kingbase": {"template0", "template1"},
+}
+
+
+def _fetch_db_list(db_type: str, task: dict):
+    """拉取库列表：优先原有连接方式（SSH/本机客户端），失败或为空时回退 JDBC 通道。
+
+    返回 (databases, via_jdbc, error)。databases 为空且 error 非空表示整体失败。
+    """
+    original_err = ""
+    try:
+        eng = get_engine(db_type, task, "", None)
+        dbs = eng.list_databases()
+        if dbs:
+            return dbs, False, None
+        original_err = "原有连接方式（SSH/本机客户端）未返回库列表"
+    except Exception as e:
+        original_err = f"{e}"
+    try:
+        from core import jdbc
+        dbs = jdbc.list_databases(
+            db_type,
+            task.get("host") or "127.0.0.1",
+            int(task.get("port") or 0) or None,
+            task.get("db_name") or "",
+            task.get("username") or "",
+            db.decrypt_secret(task.get("password") or ""),
+        )
+        return dbs, True, None
+    except Exception as e2:
+        return None, True, f"原有连接方式失败: {original_err}；JDBC 兜底失败: {e2}"
 
 # 业务系统字段长度上限（字符数，中文按 1 计；设计 §10 A2）
 BIZ_SYSTEM_MAX_LEN = 64
@@ -39,32 +76,26 @@ def list_task_databases(task_id):
     MySQL/MariaDB: SHOW DATABASES
     PostgreSQL:     SELECT datname FROM pg_database WHERE NOT datistemplate
     Kingbase:       同 PG（兼容协议）
+    Oracle/达梦:    通过 JDBC 拉取 schema 列表
     其他类型：返回 []
+    原有连接方式失败时自动回退 JDBC 通道（core/jdbc.py）。
     """
     task = models.get_task(task_id, include_secret=True)
     if not task:
         return jsonify({"error": "任务不存在"}), 404
     db_type = task.get("db_type")
-    if db_type in ("mysql", "mariadb"):
-        try:
-            eng = get_engine(db_type, task, "", None)
-            dbs = eng.list_databases()
-            # 过滤系统库
-            skip = {"information_schema", "performance_schema", "mysql", "sys"}
-            dbs = [d for d in dbs if d not in skip]
-            return jsonify({"databases": dbs, "type": "databases"})
-        except Exception as e:
-            return jsonify({"error": f"拉取失败: {e}", "databases": []}), 500
-    elif db_type in ("postgresql", "kingbase"):
-        try:
-            eng = get_engine(db_type, task, "", None)
-            dbs = eng.list_databases()
-            skip = {"template0", "template1"}
-            dbs = [d for d in dbs if d not in skip]
-            return jsonify({"databases": dbs, "type": "schemas"})
-        except Exception as e:
-            return jsonify({"error": f"拉取失败: {e}", "databases": []}), 500
-    return jsonify({"databases": [], "type": "none"})
+    if db_type not in _LIST_DB_SKIP:
+        return jsonify({"databases": [], "type": "none"})
+    dbs, via_jdbc, err = _fetch_db_list(db_type, task)
+    if err and not dbs:
+        return jsonify({"error": f"拉取失败: {err}", "databases": []}), 500
+    skip = _LIST_DB_SKIP[db_type]
+    dbs = [d for d in (dbs or []) if d not in skip]
+    return jsonify({
+        "databases": dbs,
+        "type": "schemas" if db_type in ("postgresql", "kingbase") else "databases",
+        "via_jdbc": via_jdbc,
+    })
 
 
 @api_bp.route("/tasks", methods=["GET"])

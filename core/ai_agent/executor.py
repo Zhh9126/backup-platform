@@ -56,8 +56,6 @@ class ToolExecutor:
 
         # 危险工具拦截：不直接执行，返回确认标记
         if tool.requires_confirm:
-            # scope=full 的巡检更需要确认；scope=quick 或无 scope 可考虑放行
-            # MVP 统一拦截所有 requires_confirm=True 的工具
             reason = self._build_confirm_reason(tool, args)
             _logger.info(f"工具 '{tool_name}' 需要确认: {reason}")
             return {
@@ -71,11 +69,19 @@ class ToolExecutor:
         validated = self._validate_args(tool, args)
         if validated.get("error"):
             return {"ok": False, "error": validated["error"]}
+        args = validated.get("args", args)
 
-        # 构造内部 HTTP 请求
+        # 优先本地 Python 函数执行：避免内部 HTTP 的 session/cookie 认证问题，更快更稳定
+        if tool.executor:
+            try:
+                _logger.info(f"工具 '{tool_name}' 本地执行，参数: {args}")
+                return tool.executor(args, context)
+            except Exception as e:
+                _logger.exception(f"工具 '{tool_name}' 本地执行异常，回退到 HTTP: {e}")
+
+        # 回退：内部 HTTP 调用（兼容旧逻辑；需 request_headers 中的 Cookie）
         api_path = self._resolve_path(tool.api_path, args)
         url = f"{self.base_url}{api_path}"
-
         request_headers = context.get("request_headers", {})
 
         try:
@@ -86,7 +92,7 @@ class ToolExecutor:
             else:
                 return {"ok": False, "error": f"不支持的 HTTP 方法: {tool.api_method}"}
 
-            _logger.info(f"工具 '{tool_name}' 执行成功: {url}")
+            _logger.info(f"工具 '{tool_name}' HTTP 执行成功: {url}")
             return result
 
         except urllib.error.HTTPError as e:

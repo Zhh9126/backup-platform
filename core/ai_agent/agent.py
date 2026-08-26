@@ -72,7 +72,7 @@ _pending_confirms: Dict[str, Dict] = {}
 
 # ---- ReAct System Prompt ----
 
-SYSTEM_PROMPT_TEMPLATE = """你是数据备份管理平台的 AI 智能助手。你可以回答运维知识问题，也可以通过工具执行备份/巡检/查询等操作。
+SYSTEM_PROMPT_TEMPLATE = """你是数据备份管理平台的 AI 智能助手。你可以回答运维知识问题，也可以通过工具查询备份/巡检/存储/告警信息，或执行备份/巡检操作。
 
 ## 可用工具
 
@@ -80,45 +80,79 @@ SYSTEM_PROMPT_TEMPLATE = """你是数据备份管理平台的 AI 智能助手。
 
 ## 输出格式
 
-你必须严格按以下 JSON 格式输出（不要包含任何其他文字）：
+你必须严格按以下 JSON 格式输出，不要输出任何 JSON 以外的解释文字：
 
 ### 纯问答（不调用工具）：
 ```json
 {{"type": "answer", "content": "你的回答文本"}}
 ```
 
-### 调用工具：
+### 调用查询类工具（无需确认）：
 ```json
 {{"type": "tool_call", "tool": "工具名", "args": {{参数对象}}}}
 ```
 
-### 需要确认的危险操作：
+### 需要确认的危险操作（备份、巡检）：
 ```json
 {{"type": "confirm_required", "tool": "工具名", "args": {{参数对象}}, "reason": "需要确认的原因"}}
 ```
 
 ## Few-shot 示例
 
+用户: "列出所有备份任务"
+助手: ```json
+{{"type": "tool_call", "tool": "list_tasks", "args": {{}}}}
+```
+
 用户: "最近备份有没有失败？"
 助手: ```json
 {{"type": "tool_call", "tool": "list_recent_records", "args": {{"limit": 10}}}}
 ```
 
+用户: "查询存储用量"
+助手: ```json
+{{"type": "tool_call", "tool": "get_storage_usage", "args": {{}}}}
+```
+
+用户: "查询最近的 AI 预测告警"
+助手: ```json
+{{"type": "tool_call", "tool": "list_alert_predictions", "args": {{"days": 7}}}}
+```
+
 用户: "帮我跑一次生产库巡检"
 助手: ```json
-{{"type": "confirm_required", "tool": "run_inspection", "args": {{"scope": "quick"}}, "reason": "巡检操作会影响数据库性能，请确认"}}
+{{"type": "confirm_required", "tool": "run_inspection", "args": {{"scope": "quick"}}, "reason": "巡检操作会短暂影响数据库性能，请确认是否继续？"}}
+```
+
+用户: "立即执行备份任务 5"
+助手: ```json
+{{"type": "confirm_required", "tool": "run_backup_task", "args": {{"task_id": "5"}}, "reason": "即将执行备份任务 5，该操作会对数据库产生实际影响，请确认是否继续？"}}
 ```
 
 用户: "什么是RPO？"
 助手: ```json
-{{"type": "answer", "content": "RPO（Recovery Point Objective）是恢复点目标，指灾难发生后允许丢失的数据量时间窗口…"}}
+{{"type": "answer", "content": "RPO（Recovery Point Objective）是恢复点目标，指灾难发生后允许丢失的数据量时间窗口。"}}
+```
+
+用户: "查询存储用量"
+助手: ```json
+{{"type": "tool_call", "tool": "get_storage_usage", "args": {{}}}}
+```
+
+工具返回: {{"ok": true, "message": "", "data": {{"target_name": "本地存储", "path": "/data/backups", "total_gb": 500, "used_gb": 120, "free_gb": 380, "used_percent": 24}}}}
+助手: ```json
+{{"type": "answer", "content": "当前本地存储（/data/backups）总空间 500 GB，已用 120 GB（24%），剩余 380 GB，空间充足。"}}
 ```
 
 ## 约束
-1. 一次只调用一个工具
-2. 涉及执行操作（备份/巡检）时必须先确认
-3. 不确定参数时回答"请提供更多信息"
-4. 绝不虚构 task_id，不确定时先用 list_tasks 查询"""
+1. 一次只调用一个工具。
+2. 涉及执行操作（run_backup_task / run_inspection）时必须先返回 confirm_required，不能直接执行。
+3. 查询类工具（list_tasks / list_recent_records / get_storage_usage / list_alert_predictions / get_inspection_report）不需要确认，直接调用。
+4. 不确定参数时，先使用 list_tasks 等查询工具获取信息，再决定下一步。
+5. 绝不虚构 task_id、target_id 等 ID，不确定时先用 list_tasks 查询。
+6. get_storage_usage 不指定 target_id 时默认查询默认本地存储。
+7. 你给出的 content 要简洁、面向用户，不要包含 JSON 结构、代码围栏或 "type"/"tool"/"args" 等技术字段。
+8. 当消息历史中已经包含某工具的返回结果（role=tool）时，必须直接输出 answer 总结该结果，禁止再次调用同一工具。"""
 
 
 class AIAgent:
@@ -160,7 +194,7 @@ class AIAgent:
             system_prompt = self._build_system_prompt()
 
             # 3. ReAct 循环
-            result = self._react_loop(session_id, system_prompt, context)
+            result = self._react_loop(session_id, system_prompt, context, user_message)
 
             return result
 
@@ -207,32 +241,35 @@ class AIAgent:
         _pending_confirms.pop(session_id, None)
 
         try:
-            # 保存助手消息（确认执行意图）
-            self.session_mgr.add_assistant_message(
-                session_id,
-                content=f"用户已确认执行 {tool_name}，正在执行...",
-                tool_calls=[{"name": tool_name, "args": args}],
-            )
-
-            # 执行工具（此时不再拦截）
-            # 为确认执行，临时将 requires_confirm 标记为 False
+            # 执行工具（确认后不再拦截）
             tool = self.registry.get(tool_name)
             if tool and tool.requires_confirm:
-                # 直接通过 executor 的内部 HTTP 调用执行
                 result = self._execute_tool_directly(tool_name, args, context)
             else:
                 result = self.executor.execute(tool_name, args, context)
 
-            # 保存工具结果
+            # 保存工具结果（作为上下文给 LLM 综合；LLM 失败时也会被展示）
             self.session_mgr.add_tool_message(session_id, tool_name, result)
 
-            # 再次调用 LLM 综合回答
+            # 尝试让 LLM 生成综合回答
             system_prompt = self._build_system_prompt()
             messages = self.session_mgr.build_messages_for_llm(
                 session_id, system_prompt, "")
 
             llm_result = self._call_model_with_messages(messages)
-            assistant_content = self._extract_answer_from_llm(llm_result)
+            assistant_content = None
+            if llm_result.get("error") == "AI_MODEL_DISABLED":
+                assistant_content = self._format_tool_result_to_answer(tool_name, result)
+            else:
+                text = self._extract_content_from_llm_result(llm_result)
+                if text:
+                    parsed = self._parse_response(text)
+                    if parsed.get("type") == "answer" and parsed.get("content"):
+                        assistant_content = parsed["content"]
+
+            # LLM 综合失败或模型未启用时，直接用工具结果生成格式化回答
+            if not assistant_content:
+                assistant_content = self._format_tool_result_to_answer(tool_name, result)
 
             # 保存最终助手回答
             self.session_mgr.add_assistant_message(session_id, assistant_content)
@@ -249,13 +286,14 @@ class AIAgent:
             return {"ok": False, "type": "error", "content": f"执行操作时出错: {str(e)}"}
 
     def _react_loop(self, session_id: str, system_prompt: str,
-                    context: Dict) -> Dict[str, Any]:
+                    context: Dict, user_message: str = "") -> Dict[str, Any]:
         """ReAct 循环：最多 MAX_REACT_ROUNDS 轮工具调用后强制输出。
 
         Args:
             session_id: 会话 ID
             system_prompt: system prompt
             context: 执行上下文
+            user_message: 用户原始输入（LLM 不可用时的兜底意图识别用）
 
         Returns:
             最终结果 dict
@@ -277,7 +315,25 @@ class AIAgent:
             llm_text = self._extract_content_from_llm_result(llm_result)
 
             if not llm_text:
-                # LLM 返回空内容，降级为错误消息
+                # LLM 返回空内容：区分模型未启用与其他调用失败
+                if llm_result.get("error") == "AI_MODEL_DISABLED":
+                    error_msg = "AI 问答助手未配置模型：请在【系统设置 → AI 告警/助手】中启用并配置大模型服务（OpenAI/兼容 API、模型名称、API Key）后再试。"
+                    self.session_mgr.add_assistant_message(session_id, error_msg)
+                    return {"ok": False, "type": "error", "content": error_msg}
+
+                # 若上一轮已执行工具但 LLM 综合失败，直接基于工具结果 fallback
+                if tool_trace:
+                    fallback = self._format_tool_trace_to_answer(tool_trace)
+                    self.session_mgr.add_assistant_message(session_id, fallback_placeholder := fallback)
+                    return {"ok": True, "type": "answer", "content": fallback, "tool_trace": tool_trace}
+
+                # LLM 完全不可用（网络/超时/未配置）且尚未执行任何工具：
+                # 启用本地意图识别兜底，确保用户每次提问都有实质信息返回，
+                # 而不是空白或"模型未返回内容"的无意义提示。
+                fb = self._fallback_intent_handle(session_id, user_message, context)
+                if fb:
+                    return fb
+
                 error_msg = "AI 模型未返回有效内容，请稍后重试"
                 self.session_mgr.add_assistant_message(session_id, error_msg)
                 return {"ok": False, "type": "error", "content": error_msg}
@@ -313,12 +369,19 @@ class AIAgent:
                         "content": error_content,
                     }
 
-                # 保存助手消息（含工具调用意图）
-                self.session_mgr.add_assistant_message(
-                    session_id,
-                    content=f"正在调用工具 {tool_name}...",
-                    tool_calls=[{"name": tool_name, "args": args}],
-                )
+                # 防御性检查：查询类工具已经拿到结果就不要再重复调用，
+                # 避免 LLM 陷入死循环导致最后只能返回兜底文案
+                if not tool.requires_confirm and any(
+                    step.get("name") == tool_name for step in tool_trace
+                ):
+                    fallback_content = self._format_tool_trace_to_answer(tool_trace)
+                    self.session_mgr.add_assistant_message(session_id, fallback_content)
+                    return {
+                        "ok": True,
+                        "type": "answer",
+                        "content": fallback_content,
+                        "tool_trace": tool_trace,
+                    }
 
                 # 检查是否需要确认
                 if tool.requires_confirm:
@@ -439,14 +502,14 @@ class AIAgent:
                     "tool_trace": tool_trace,
                 }
 
-        # 超过最大轮数，强制输出
+        # 超过最大轮数，强制输出：用工具结果格式化兜底，确保用户能看到实际数据
         _logger.warning(f"ReAct 循环超过 {MAX_REACT_ROUNDS} 轮，强制输出")
-        self.session_mgr.add_assistant_message(
-            session_id, "经过多轮工具调用后，以上是相关信息汇总。如需进一步操作，请继续提问。")
+        fallback_content = self._format_tool_trace_to_answer(tool_trace)
+        self.session_mgr.add_assistant_message(session_id, fallback_content)
         return {
             "ok": True,
             "type": "answer",
-            "content": "经过多轮工具调用后，以上是相关信息汇总。如需进一步操作，请继续提问。",
+            "content": fallback_content,
             "tool_trace": tool_trace,
         }
 
@@ -473,7 +536,7 @@ class AIAgent:
         ai_model = cfg.get("ai_model", {})
 
         if not ai_model.get("enabled"):
-            return {"ok": False, "error": "AI 模型未启用"}
+            return {"ok": False, "error": "AI_MODEL_DISABLED"}
 
         # 将多轮对话格式拼接为单条 prompt（适配现有 _call_model 接口）
         prompt_parts = []
@@ -632,7 +695,292 @@ class AIAgent:
         cleaned = self._strip_structural_noise(text)
         if cleaned and cleaned.strip():
             return cleaned
-        return POST_ACTION_FALLBACK
+        return ""
+
+    def _format_tool_trace_to_answer(self, tool_trace: List[Dict]) -> str:
+        """将工具执行链路格式化为自然语言回答（LLM 综合失败时 fallback）。"""
+        if not tool_trace:
+            return POST_ACTION_FALLBACK
+        parts = []
+        for step in tool_trace:
+            tool_name = step.get("name", "")
+            result = step.get("result", {})
+            formatted = self._format_tool_result_to_answer(tool_name, result)
+            parts.append(formatted)
+        return "\n\n".join(parts)
+
+    def _format_tool_result_to_answer(self, tool_name: str, result: Dict) -> str:
+        """将单个工具结果格式化为面向用户的文本。"""
+        if not isinstance(result, dict):
+            return f"工具 {tool_name} 返回格式异常，请稍后重试。"
+
+        ok = result.get("ok")
+        message = result.get("message") or ""
+        data = result.get("data")
+        error = result.get("error")
+
+        if not ok:
+            return f"操作未成功：{error or message or '未知错误'}"
+
+        # 根据工具类型做格式化展示
+        if tool_name == "list_tasks":
+            rows = data or []
+            if not rows:
+                return "当前没有任何备份任务。"
+            lines = ["当前共有 {} 个备份任务：".format(len(rows))]
+            lines.append("| ID | 名称 | 数据库类型 | 备份模式 | 主机 | 状态 |")
+            lines.append("|---|---|---|---|---|---|")
+            for r in rows[:30]:
+                lines.append(
+                    "| {} | {} | {} | {} | {} | {} |".format(
+                        r.get("id", "-"),
+                        (r.get("name") or "-").replace("|", "\\|"),
+                        r.get("db_type") or "-",
+                        r.get("backup_mode") or "-",
+                        "{}:{}".format(r.get("host") or "-", r.get("port") or "-") if r.get("host") else "-",
+                        r.get("last_status") or "-",
+                    )
+                )
+            return "\n".join(lines)
+
+        if tool_name == "list_recent_records":
+            rows = data or []
+            if not rows:
+                return "最近没有备份执行记录。"
+            lines = ["最近 {} 条备份记录如下：".format(len(rows))]
+            lines.append("| 记录ID | 任务 | 类型 | 状态 | 大小 | 开始时间 | 仿真 |")
+            lines.append("|---|---|---|---|---|---|---|")
+            for r in rows[:30]:
+                size = r.get("size_bytes")
+                size_str = "-"
+                if size:
+                    size_str = "{:.2f} MB".format(size / (1024 * 1024)) if size > 1024 * 1024 else "{:.2f} KB".format(size / 1024)
+                sim = "是" if r.get("is_simulated") else "否"
+                lines.append(
+                    "| {} | {} | {} | {} | {} | {} | {} |".format(
+                        r.get("id", "-"),
+                        (r.get("task_name") or "-").replace("|", "\\|"),
+                        r.get("backup_type") or "-",
+                        r.get("status") or "-",
+                        size_str,
+                        r.get("started_at") or "-",
+                        sim,
+                    )
+                )
+            return "\n".join(lines)
+
+        if tool_name == "get_storage_usage":
+            d = data or {}
+            return (
+                "存储目标：{}（{}）\n"
+                "总空间：{} GB，已用：{} GB，可用：{} GB\n"
+                "使用率：{}%".format(
+                    d.get("target_name", "-"),
+                    d.get("path", "-"),
+                    d.get("total_gb", "-"),
+                    d.get("used_gb", "-"),
+                    d.get("free_gb", "-"),
+                    d.get("used_percent", "-"),
+                )
+            )
+
+        if tool_name == "list_alert_predictions":
+            rows = data or []
+            if not rows:
+                return "最近没有 AI 预测告警。"
+            lines = ["最近 AI 预测告警（共 {} 条）：".format(len(rows))]
+            lines.append("| 指标 | 风险等级 | 分数 | 预测时间 | 内容 |")
+            lines.append("|---|---|---|---|---|")
+            for r in rows[:20]:
+                lines.append(
+                    "| {} | {} | {} | {} | {} |".format(
+                        r.get("metric") or "-",
+                        r.get("risk_level") or "-",
+                        r.get("risk_score") or "-",
+                        r.get("predicted_at") or "-",
+                        (r.get("predicted_content") or "-").replace("|", "\\|"),
+                    )
+                )
+            return "\n".join(lines)
+
+        if tool_name == "get_inspection_report":
+            d = data or {}
+            detail = d.get("detail")
+            if isinstance(detail, dict):
+                items = detail.get("items") or []
+                lines = ["巡检报告 #{}（{}）：".format(d.get("id", "-"), d.get("status", "-"))]
+                lines.append("| 检查项 | 结果 | 说明 |")
+                lines.append("|---|---|---|")
+                for item in items[:30]:
+                    lines.append(
+                        "| {} | {} | {} |".format(
+                            (item.get("name") or "-").replace("|", "\\|"),
+                            item.get("result") or "-",
+                            (item.get("message") or "-").replace("|", "\\|"),
+                        )
+                    )
+                return "\n".join(lines)
+            return message or "巡检报告已生成。"
+
+        if tool_name == "run_backup_task":
+            d = data or {}
+            if d.get("accepted"):
+                return "备份任务已提交后台执行，可在备份记录页面查看进度。"
+            status = d.get("status", "未知")
+            return "备份任务执行结果：{}。{}".format(status, message)
+
+        if tool_name == "run_inspection":
+            d = data or {}
+            return (
+                "巡检完成：共 {} 项，通过 {}，警告 {}，失败 {}。".format(
+                    d.get("total", "-"),
+                    d.get("pass", "-"),
+                    d.get("warn", "-"),
+                    d.get("fail", "-"),
+                )
+                + ("\n详细检查项：\n" + "\n".join(
+                    "- {}: {}".format(
+                        (i.get("name") or "-").replace("|", "\\|"),
+                        (i.get("message") or "").replace("|", "\\|"),
+                    )
+                    for i in d.get("items", [])
+                ) if d.get("items") else "")
+            )
+
+        # 默认：返回 message 或简短 JSON
+        if message:
+            return message
+        try:
+            import json as _json
+            return _json.dumps(data, ensure_ascii=False, default=str)[:1000]
+        except Exception:
+            return "操作已完成。"
+
+    # 内置运维知识库（LLM 不可用时的纯问答兜底）
+    _KNOWLEDGE_BASE = {
+        "rpo": "RPO（Recovery Point Objective，恢复点目标）：灾难发生后允许丢失的数据量对应的时间窗口。例如 RPO=5 分钟，表示最多容忍丢失最近 5 分钟的数据。",
+        "rto": "RTO（Recovery Time Objective，恢复时间目标）：从灾难发生到业务系统恢复可用所允许的最大停机时间。例如 RTO=2 小时，表示必须在 2 小时内恢复服务。",
+        "全量备份": "全量备份（Full Backup）：对指定数据源进行完整拷贝，恢复快但占用空间大、耗时长，通常作为增量/差异备份的基线。",
+        "增量备份": "增量备份（Incremental Backup）：仅备份自上次备份（任意类型）以来变化的数据，节省空间但恢复需依赖完整链。",
+        "差异备份": "差异备份（Differential Backup）：备份自上次全量备份以来所有变化的数据，恢复只需全量+最新差异，空间介于全量与增量之间。",
+        "物理备份": "物理备份：直接拷贝数据库的数据文件/目录（如 pg_basebackup、xtrabackup），恢复快、一致性好，但要求与源环境兼容。",
+        "逻辑备份": "逻辑备份：导出数据为 SQL 或逻辑格式（如 mysqldump、pg_dump、mongodump），跨版本/跨平台兼容性好，但恢复较慢。",
+        "pg_basebackup": "pg_basebackup 是 PostgreSQL 官方物理备份工具，通过流复制协议拉取整个数据目录，常配合 -Ft（tar）与 -z（压缩）生成基础备份，用于 PITR 基线。",
+        "gtid": "GTID（Global Transaction ID，全局事务标识）：MySQL 用于唯一标记每个已提交事务，便于主从复制与故障切换；恢复含 GTID 的 dump 到非空实例时需先 RESET MASTER。",
+    }
+
+    def _fallback_intent_handle(self, session_id: str, user_message: str,
+                               context: Dict) -> Optional[Dict]:
+        """LLM 不可用时的本地意图识别兜底。
+
+        根据关键词将用户问题路由到：
+        - 知识库纯问答（RPO/RT0/备份概念等）
+        - 查询类工具（list_tasks / list_recent_records / get_storage_usage 等）
+        - 危险操作类工具：返回确认请求（不直接执行）
+
+        返回 dict 或 None（无法识别时交给上层错误提示）。
+        """
+        if not user_message:
+            return None
+        text = user_message.strip().lower()
+
+        # 1) 知识库纯问答
+        for kw, answer in self._KNOWLEDGE_BASE.items():
+            if kw in text:
+                self.session_mgr.add_assistant_message(session_id, answer)
+                return {"ok": True, "type": "answer", "content": answer}
+
+        # 2) 危险操作类（需确认）—— 注意：先排除"列出/查询"类意图
+        is_query_intent = any(k in text for k in
+                              ("列出", "所有任务", "任务列表", "有哪些任务", "有哪些备份",
+                               "查询", "查看", "显示", "多少", "列表", "巡检报告", "巡检结果", "告警", "预测", "风险"))
+        if not is_query_intent and any(k in text for k in
+                                       ("执行备份", "跑备份", "备份一下", "立即备份", "开始备份", "做一次备份", "手动备份")):
+            # 尝试从文本提取 task id
+            import re
+            m = re.search(r"任务\s*#?\s*(\d+)", user_message)
+            tid = m.group(1) if m else None
+            args = {"task_id": tid} if tid else {}
+            reason = (f"即将执行备份任务 {tid}，该操作会对数据库产生实际影响，请确认是否继续？"
+                      if tid else "即将执行备份任务，请确认任务 ID 后继续？")
+            tool_call_id = str(uuid.uuid4())
+            _pending_confirms[session_id] = {
+                "tool_call_id": tool_call_id,
+                "tool_name": "run_backup_task",
+                "args": args,
+                "reason": reason,
+                "context": context,
+            }
+            return {
+                "ok": True,
+                "type": "confirm_required",
+                "content": reason,
+                "pending_confirm": {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": "run_backup_task",
+                    "args": args,
+                    "reason": reason,
+                },
+            }
+        if not is_query_intent and any(k in text for k in ("巡检", "检查一遍", "跑一次巡检", "执行巡检", "做一次巡检")):
+            scope = "full" if "全量" in text else "quick"
+            reason = ("全量巡检会对数据库性能产生较大影响，请确认是否继续？"
+                      if scope == "full" else "巡检操作会短暂影响数据库性能，请确认是否继续？")
+            tool_call_id = str(uuid.uuid4())
+            _pending_confirms[session_id] = {
+                "tool_call_id": tool_call_id,
+                "tool_name": "run_inspection",
+                "args": {"scope": scope},
+                "reason": reason,
+                "context": context,
+            }
+            return {
+                "ok": True,
+                "type": "confirm_required",
+                "content": reason,
+                "pending_confirm": {
+                    "tool_call_id": tool_call_id,
+                    "tool_name": "run_inspection",
+                    "args": {"scope": scope},
+                    "reason": reason,
+                },
+            }
+
+        # 3) 查询类工具
+        if any(k in text for k in ("所有任务", "备份任务", "任务列表", "有哪些任务", "列出任务")):
+            return self._run_fallback_tool(session_id, "list_tasks", {}, context)
+        if any(k in text for k in ("失败", "最近备份", "备份记录", "上次的备份", "备份情况", "有没有失败")):
+            return self._run_fallback_tool(session_id, "list_recent_records", {"limit": 10}, context)
+        if any(k in text for k in ("存储", "空间", "磁盘", "用量", "容量")):
+            return self._run_fallback_tool(session_id, "get_storage_usage", {}, context)
+        if any(k in text for k in ("告警", "预测", "风险", "预警")):
+            return self._run_fallback_tool(session_id, "list_alert_predictions", {"days": 7}, context)
+        if any(k in text for k in ("巡检报告", "巡检结果", "检查报告")):
+            return self._run_fallback_tool(session_id, "get_inspection_report", {}, context)
+        if any(k in text for k in ("巡检任务", "所有巡检")):
+            return self._run_fallback_tool(session_id, "list_tasks", {}, context)
+
+        # 无法识别：返回 None，由上层给出通用提示
+        return None
+
+    def _run_fallback_tool(self, session_id: str, tool_name: str, args: Dict,
+                          context: Dict) -> Dict:
+        """兜底执行单个查询工具并格式化结果。"""
+        tool = self.registry.get(tool_name)
+        if not tool:
+            return None
+        exec_result = self.executor.execute(tool_name, args, context)
+        if not isinstance(exec_result, dict):
+            exec_result = {"ok": False, "error": "工具返回格式异常"}
+        self.session_mgr.add_tool_message(session_id, tool_name, exec_result)
+        content = self._format_tool_result_to_answer(tool_name, exec_result)
+        self.session_mgr.add_assistant_message(session_id, content)
+        return {
+            "ok": True,
+            "type": "answer",
+            "content": content,
+            "tool_trace": [{"name": tool_name, "args": args, "result": exec_result}],
+        }
 
     def _parse_response(self, llm_text: str) -> Dict:
         """解析 LLM 输出文本，支持多种格式。
@@ -977,6 +1325,8 @@ class AIAgent:
                                context: Dict) -> Dict:
         """直接执行工具（绕过 requires_confirm 检查，用于确认后的执行）。
 
+        优先走本地 Python executor，避免内部 HTTP 认证问题。
+
         Args:
             tool_name: 工具名
             args: 参数
@@ -993,8 +1343,16 @@ class AIAgent:
         validated = self.executor._validate_args(tool, args)
         if validated.get("error"):
             return {"ok": False, "error": validated["error"]}
+        args = validated.get("args", args)
 
-        # 构造 HTTP 请求
+        # 优先本地 Python 函数执行
+        if tool.executor:
+            try:
+                return tool.executor(args, context)
+            except Exception as e:
+                _logger.exception(f"确认执行本地工具失败 {tool_name}: {e}")
+
+        # 回退到内部 HTTP
         api_path = self.executor._resolve_path(tool.api_path, args)
         url = f"{self.executor.base_url}{api_path}"
         request_headers = context.get("request_headers", {})

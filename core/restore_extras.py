@@ -84,11 +84,15 @@ def mysql_pitr_restore(backup_path: str, target_time: str, target: dict) -> Dict
     if backup_path.endswith(".gz"):
         out = subprocess.run(["gunzip", "-k", backup_path], capture_output=True, text=True)
         actual = backup_path[:-3]
+    # 安全整改：目标库名必须是合法 MySQL 标识符，防参数注入
+    db_name = str(target.get("db") or "")
+    if db_name and not re.match(r"^[A-Za-z0-9_$]{1,64}$", db_name):
+        return {"ok": False, "message": "目标库名不合法（仅允许字母/数字/下划线/$，最长 64）"}
     # 2) 全量导入
     env = os.environ.copy()
     if target.get("password"):
         env["MYSQL_PWD"] = target["password"]
-    db_arg = f" {target.get('db','')}" if target.get("db") else ""
+    db_arg = f" {db_name}" if db_name else ""
     cmd_full = ["mysql", "-h", str(target.get("host") or "127.0.0.1"),
                 "-P", str(target.get("port") or 3306),
                 "-u", str(target.get("user") or "root")] + db_arg.split()
@@ -98,12 +102,13 @@ def mysql_pitr_restore(backup_path: str, target_time: str, target: dict) -> Dict
     if r.returncode != 0:
         return {"ok": False, "message": f"全量恢复失败: {r.stderr[:200]}"}
     # 3) 找到对应 binlog 文件（简化：从备份路径推断或在 binlog 目录查最新）
-    binlog_file = target.get("binlog_file")
+    binlog_file = os.path.basename(target.get("binlog_file") or "")
     binlog_pos = target.get("binlog_pos", 0)
     if not binlog_file:
         return {"ok": True, "message": "全量恢复成功（无 binlog 位置信息，未执行增量 replay）",
                 "skipped_replay": True}
     # 4) 调用 mysqlbinlog replay 到 target_time
+    # 安全整改：binlog 文件名仅取 basename，防路径穿越
     binlog_path = os.path.join(target.get("binlog_dir", "/var/lib/mysql"), binlog_file)
     if not os.path.exists(binlog_path):
         return {"ok": True, "message": f"全量恢复成功（找不到 binlog {binlog_path}，未执行增量）",

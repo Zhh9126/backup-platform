@@ -144,6 +144,31 @@
   </div>
 </div>
 
+<!-- 重删 & 存储池统计（参照白皮书 §2.4 全局重删） -->
+<div class="row g-3 mb-4">
+  <div class="col-md-4">
+    <div class="card-stat">
+      <div class="stat-icon"><i class="bi bi-diagram-3"></i></div>
+      <div class="stat-num" id="st_dedup_ratio">-</div>
+      <div class="stat-label">全局重删比</div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card-stat">
+      <div class="stat-icon"><i class="bi bi-piggy-bank"></i></div>
+      <div class="stat-num" id="st_dedup_saved">-</div>
+      <div class="stat-label">累计节省空间</div>
+    </div>
+  </div>
+  <div class="col-md-4">
+    <div class="card-stat">
+      <div class="stat-icon"><i class="bi bi-shield-lock"></i></div>
+      <div class="stat-num" id="st_encrypt_enabled">-</div>
+      <div class="stat-label">存储池加密任务</div>
+    </div>
+  </div>
+</div>
+
 <!-- 健康详情（美化） -->
 <div class="row g-3 mb-4">
   <div class="col-12">

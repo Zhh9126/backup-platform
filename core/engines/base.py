@@ -5,8 +5,10 @@
 所有具体数据库引擎（MySQL / PostgreSQL / Oracle / Kingbase / DM / Redis /
 MongoDB）都继承 BackupEngine，实现 backup() 与 restore()。基类统一提供：
 - 客户端工具探测（check_client）
-- 演示/兜底模式（客户端缺失时生成“标记仿真”的占位备份）
+- 网络重试机制（_with_network_retry / _retry_ssh_call）
 - 通用命令执行、环境变量注入、输出目录解析
+
+注意：自 2026-08-14 起不再提供仿真/兜底占位备份；客户端或连接缺失即失败。
 """
 import enum
 import os
@@ -14,11 +16,59 @@ import json
 import time
 import shutil
 import subprocess
+import functools
 from dataclasses import dataclass
 from typing import Optional, List
 
 import config
 import core.db as db
+
+
+def _is_network_error(exc: Exception) -> bool:
+    """判断异常是否属于可重试的网络/连接错误。"""
+    msg = str(exc).lower()
+    network_keywords = (
+        "connection", "connect", "network", "timeout", "refused", "reset",
+        "broken pipe", "no route to host", "eof", "ssh", "sftp", "socket"
+    )
+    return any(k in msg for k in network_keywords)
+
+
+def _with_network_retry(retries=None, delay=None, backoff=2.0):
+    """装饰器：对网络/连接类错误进行重试。
+
+    retries: 最大重试次数（默认读取 config.BACKUP_RETRY_MAX 或 3）
+    delay: 首次重试间隔秒数（默认读取 config.BACKUP_RETRY_DELAY 或 5）
+    backoff: 退避倍数
+    """
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            max_retries = retries if retries is not None else getattr(
+                config, "BACKUP_RETRY_MAX", 3)
+            base_delay = delay if delay is not None else getattr(
+                config, "BACKUP_RETRY_DELAY", 5)
+            last_exc = None
+            for attempt in range(max_retries + 1):
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as e:
+                    last_exc = e
+                    if attempt >= max_retries or not _is_network_error(e):
+                        raise
+                    wait = base_delay * (backoff ** attempt)
+                    # 从 logger 所在实例取 logger；否则用 print
+                    logger = getattr(args[0], "logger", None) if args else None
+                    msg = (f"[{fn.__name__}] 网络/连接错误，"
+                           f"{wait:.0f}s 后第 {attempt + 1}/{max_retries} 次重试: {e}")
+                    if logger:
+                        logger.warning(msg)
+                    else:
+                        print(msg)
+                    time.sleep(wait)
+            raise last_exc
+        return wrapper
+    return deco
 
 
 class BackupType(str, enum.Enum):
@@ -63,6 +113,7 @@ class BackupResult:
     # 校验结果
     verified: bool = False
     verify_msg: str = ""
+    detail_log: str = ""
 
 
 class BackupEngine:
@@ -84,6 +135,10 @@ class BackupEngine:
     adapter_tier: str = "peripheral_api"
     # 该类引擎依赖的客户端可执行文件名（用于 PATH 探测）
     required_clients: List[str] = []
+    # 物理备份：数据库自带工具（如 rman / pg_basebackup / dmrman）
+    physical_bundled_tools: List[str] = []
+    # 物理备份：外部插件 plugin_id（如 percona-xtrabackup-80 / mariabackup）
+    physical_external_plugins: List[str] = []
 
     def __init__(self, task: dict, storage_root: str, logger=None):
         self.task = task
@@ -144,6 +199,42 @@ class BackupEngine:
             return "zstd"
         return "gzip"
 
+    @property
+    def compress_level(self) -> int:
+        """任务级压缩级别：0 表示跟随引擎默认（_ZSTD_LEVEL / _GZIP_LEVEL）。
+
+        仅在 compress=1（开启压缩）且 compress_level>0 时生效。
+        """
+        if not self._compression_enabled():
+            return 0
+        try:
+            lv = int(self.task.get("compress_level") or 0)
+        except (TypeError, ValueError):
+            lv = 0
+        return lv
+
+    @property
+    def bandwidth_limit(self) -> int:
+        """任务级限速（KB/s）：0 表示不限制。"""
+        try:
+            bw = int(self.task.get("bandwidth_limit") or 0)
+        except (TypeError, ValueError):
+            bw = 0
+        return bw
+
+    def _pv_throttle(self) -> List[str]:
+        """返回 pv 限速管道片段（KB/s → 字节/秒）。
+
+        仅当 bandwidth_limit>0 且系统存在 ``pv`` 时返回有效片段；
+        否则返回空列表（调用方用 ``+ self._pv_throttle()`` 直接拼接，无需判空）。
+        缺 pv 时由调用方在日志中提示「限速被跳过」。
+        """
+        bw = self.bandwidth_limit
+        if not bw or not shutil.which("pv"):
+            return []
+        # pv -L 接受字节/秒；KB/s → 字节/秒
+        return ["pv", "-L", f"{bw * 1024}"]
+
     def pipe_compress(self, algo: str = None, level: int = None) -> List[str]:
         """返回可插入「数据管道」的压缩命令（stdin→stdout 流式压缩）。
 
@@ -154,12 +245,14 @@ class BackupEngine:
         - zstd: 流式压缩，恢复侧用配套解压命令，天然可逆。
         - gzip: 流式压缩（Python gzip 标准库），恢复侧用配套解压命令。
         - none: 不压缩（cat 透传）。
+
+        level 为 None 时，优先使用任务级 compress_level（>0），否则用引擎默认值。
         """
         algo = algo or self._resolve_compress_algo()
         if algo == "none":
             return ["cat"]
         if algo == "zstd":
-            lvl = level if level is not None else self._ZSTD_LEVEL
+            lvl = level if level is not None else (self.compress_level or self._ZSTD_LEVEL)
             cli = self._zstd_cli()
             if cli:
                 return [cli, "-{}".format(lvl), "-c", "-"]
@@ -169,7 +262,7 @@ class BackupEngine:
                     "c=z.ZstdCompressor(level=%d);"
                     "sys.stdout.buffer.write(c.stream_reader(sys.stdin.buffer).read())" % lvl]
         # gzip（Python 标准库，不依赖系统 gzip 二进制）
-        lvl = level if level is not None else self._GZIP_LEVEL
+        lvl = level if level is not None else (self.compress_level or self._GZIP_LEVEL)
         return ["python", "-c",
                 "import sys,gzip;"
                 "sys.stdout.buffer.write(gzip.compress(sys.stdin.buffer.read(), %d))" % lvl]
@@ -219,45 +312,171 @@ class BackupEngine:
             return False, "缺少客户端工具: " + ", ".join(missing) + "（请安装并在 PATH 中）"
         return True, "ok"
 
-    def preflight(self) -> (bool, str):
-        """备份前置检查：检测依赖客户端是否就绪。
+    def _preflight_remote_physical(self, ssh_host: dict) -> (bool, str):
+        """物理备份远端前置检查：在 SSH 远端主机上探测工具是否就绪。
 
-        - 客户端全部就绪：返回 (True, "ok")
-        - 客户端缺失：
-            * 物理备份：硬失败，提示前往【备份插件】安装对应客户端
-            * 逻辑备份：返回 (True, detail)；上层在 DEMO_MODE 开启或
-              _should_simulate() 返回 True 时会走仿真兜底
+        检查顺序：
+        1. 自带工具（physical_bundled_tools）：plugin_runtime.remote_check_clients
+        2. 外部插件（physical_external_plugins）：plugin_catalog.check_installed_on_host
+           —— 外部插件只需有一个就绪即放行（如 MySQL 的多个 xtrabackup 变体）
+
+        缺工具返回 (False, "远端未安装 X，请到备份插件页为该主机安装")；
+        全部就绪返回 (True, "ok")。
         """
-        ok, detail = self.check_client()
-        if ok:
+        from core import plugin_runtime, plugin_catalog
+
+        # 1. 自带工具
+        if self.physical_bundled_tools:
+            chk = plugin_runtime.remote_check_clients(
+                ssh_host, self.physical_bundled_tools)
+            if not chk["installed"]:
+                missing = ", ".join(chk["missing"])
+                return (False,
+                        f"远端未安装 {missing}，请到备份插件页为该主机安装"
+                        f"或确认数据库自带工具路径")
             return True, "ok"
-        # 物理备份：禁止仿真兜底，必须有真实客户端
+
+        # 2. 外部插件：至少有一个就绪即放行
+        if self.physical_external_plugins:
+            for pid in self.physical_external_plugins:
+                try:
+                    st = plugin_catalog.check_installed_on_host(pid, ssh_host)
+                    if st.get("installed"):
+                        return True, f"远端已安装 {pid}"
+                except Exception:
+                    continue
+            return (False,
+                    f"远端未安装任何物理备份插件（{', '.join(self.physical_external_plugins)}），"
+                    f"请到备份插件页为该主机安装")
+
+        # 既无自带工具也无外部插件声明（不该到达此处）
+        return True, "ok"
+
+    def _preflight_remote_logical(self, ssh_host: dict) -> (bool, str):
+        """逻辑备份远端前置检查：在 SSH 主机上探测 required_clients 是否就绪。"""
+        from core import remote_dump
+        if not self.required_clients:
+            return True, "ok"
+        missing = []
+        for tool in self.required_clients:
+            if not remote_dump.remote_has_tool(ssh_host, tool):
+                missing.append(tool)
+        if missing:
+            return False, (
+                "远端 SSH 主机缺少客户端工具: " + ", ".join(missing) +
+                "（请安装并在 PATH 中）"
+            )
+        return True, "远端工具就绪"
+
+    def preflight(self) -> (bool, str):
+        """备份前置检查：检测依赖是否就绪。
+
+        - 物理备份：先查远端（SSH 主机上的物理工具），再查本机自带工具。
+          不依赖 check_client()（那是逻辑备份工具检查）。
+        - 逻辑备份：优先 check_client()；本机缺失时，若任务目标有 SSH 主机，
+          则到远端探测 required_clients，远端有即放行。不再仿真兜底。
+        """
         try:
             mode = self.backup_mode
         except Exception:
             mode = BackupMode.LOGICAL
+
         if mode == BackupMode.PHYSICAL:
+            # 物理备份：先查远端
+            try:
+                from core import remote_dump
+                ssh_host = remote_dump.resolve_ssh_host(self.task)
+            except Exception:
+                ssh_host = None
+            if ssh_host:
+                ok2, msg2 = self._preflight_remote_physical(ssh_host)
+                if ok2:
+                    return True, f"远端工具就绪（{msg2}）"
+                return False, msg2
+            # 无远端，查本机自带工具
+            if self.physical_bundled_tools:
+                missing = [t for t in self.physical_bundled_tools
+                           if not shutil.which(t)]
+                if not missing:
+                    return True, "本机已检测到物理备份工具"
+            # 无远端也无本机自带工具
+            _, detail = self.check_client()
             return False, (
-                f"{detail}。当前任务为【物理备份】，需要真实客户端；"
-                f"请前往【备份插件】页安装「{self.db_type}」对应的物理备份插件后重试。"
+                f"{detail}。物理备份需要远端或本机具备对应工具，"
+                f"请前往【备份插件】页为该主机安装，或纳管 SSH 主机。"
             )
-        # 逻辑备份：允许仿真，detail 透传给上层
-        return True, detail
+
+        # 逻辑备份：本机有客户端直接放行
+        ok, detail = self.check_client()
+        if ok:
+            return True, "ok"
+
+        # 本机缺失时，若目标主机已纳管 SSH，则去远端探测
+        try:
+            from core import remote_dump
+            ssh_host = remote_dump.resolve_ssh_host(self.task)
+        except Exception:
+            ssh_host = None
+        if ssh_host:
+            ok2, msg2 = self._preflight_remote_logical(ssh_host)
+            if ok2:
+                return True, msg2
+            return False, msg2
+
+        return False, detail
+
+    def verify_record(self, record: dict, options: dict = None) -> BackupResult:
+        """恢复校验：验证一条备份记录是否可恢复。
+
+        基类默认实现仅做通用检查（文件存在、非空、checksum）。
+        各具体引擎可覆盖本方法实现数据库相关的深度校验（如 xtrabackup --prepare、
+        pg_verifybackup 等）。
+        """
+        options = options or {}
+        backup_path = record.get("backup_path") or record.get("output_path") or ""
+        db_type = record.get("db_type") or self.db_type
+        if not backup_path:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="备份路径为空，无法校验")
+        if not os.path.exists(backup_path):
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message=f"备份文件不存在: {backup_path}")
+        size = os.path.getsize(backup_path)
+        if size == 0:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="备份文件大小为 0")
+        # checksum 校验（简单 SHA256 或 CRC）
+        checksum = record.get("checksum") or ""
+        if checksum and checksum.startswith("sha256:"):
+            import hashlib
+            h = hashlib.sha256()
+            try:
+                with open(backup_path, "rb") as f:
+                    while True:
+                        chunk = f.read(4 << 20)
+                        if not chunk:
+                            break
+                        h.update(chunk)
+                if h.hexdigest() != checksum.split(":", 1)[1]:
+                    return BackupResult(success=False, status=BackupStatus.FAILED,
+                                        message="SHA256 校验失败")
+            except Exception as e:
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                    message=f"校验文件失败: {e}")
+        if backup_path.endswith(".sim"):
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="不支持仿真备份，请删除该记录后重新执行真实备份",
+                                verified=False)
+        return BackupResult(success=True, status=BackupStatus.SUCCESS,
+                            message=f"{db_type}: backup files verified",
+                            verified=True, size_bytes=size)
 
     def _should_simulate(self) -> (bool, str):
-        """根据 DEMO_MODE 与客户端可用性，决定是否走仿真兜底。"""
-        if self.task.get("demo_only"):
-            return True, "任务标记为演示(demo_only)"
-        mode = config.DEMO_MODE
-        if mode == "on":
-            return True, "DEMO_MODE=on 强制仿真"
-        if mode == "off":
-            return False, ""
-        # auto：客户端缺失则仿真
-        ok, detail = self.check_client()
-        return (not ok), detail
+        """不再走仿真兜底，永远返回 False。"""
+        return False, ""
 
-    def _run(self, cmd: List[str], env_extra: dict = None, timeout: int = 3600) -> dict:
+    def _run(self, cmd: List[str], env_extra: dict = None, timeout: int = 3600,
+             input_file: str = None) -> dict:
         env = os.environ.copy()
         # 注入解密后的密码到环境变量，避免明文出现在进程参数中
         pw = db.decrypt_secret(self.task.get("password") or "")
@@ -265,11 +484,19 @@ class BackupEngine:
             env["DB_BACKUP_PASSWORD"] = pw
         if env_extra:
             env.update(env_extra)
+
+        # 跨平台兼容：MySQL/PostgreSQL 等引擎在 POSIX 下用 `sh -c "<script>"`
+        # 串联管道；Windows 没有 `sh`，需翻译为 `cmd /c` 执行，否则会抛出
+        # FileNotFoundError(WinError 2)，导致本机备份/恢复直接失败。
+        if len(cmd) == 3 and cmd[0] == "sh" and cmd[1] == "-c":
+            cmd = self._translate_shell_script(cmd[2])
+
         self.logger.info("[%s] 执行命令: %s", self.task_name, " ".join(
             c if not c.startswith("DB_BACKUP_PASSWORD") else "***" for c in cmd))
         try:
             proc = subprocess.run(
                 cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                input=self._read_decompressed(input_file) if input_file else None,
                 timeout=timeout)
             out = proc.stdout.decode("utf-8", "ignore")
             err = proc.stderr.decode("utf-8", "ignore")
@@ -278,6 +505,75 @@ class BackupEngine:
             return {"returncode": -1, "stdout": "", "stderr": "命令执行超时"}
         except FileNotFoundError as e:
             return {"returncode": -2, "stdout": "", "stderr": f"命令不存在: {e}"}
+
+    def _run_with_stdin(self, cmd: List[str], text: str, env_extra: dict = None,
+                        timeout: int = 3600) -> dict:
+        """执行命令并把一段文本作为 stdin 喂入（跨平台，不依赖 shell 管道）。"""
+        env = os.environ.copy()
+        pw = db.decrypt_secret(self.task.get("password") or "")
+        if pw:
+            env["DB_BACKUP_PASSWORD"] = pw
+        if env_extra:
+            env.update(env_extra)
+        if len(cmd) == 3 and cmd[0] == "sh" and cmd[1] == "-c":
+            cmd = self._translate_shell_script(cmd[2])
+        self.logger.info("[%s] 执行命令(stdin): %s", self.task_name, " ".join(
+            c if not c.startswith("DB_BACKUP_PASSWORD") else "***" for c in cmd))
+        try:
+            proc = subprocess.run(
+                cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                input=text.encode("utf-8", "ignore"),
+                timeout=timeout)
+            return {"returncode": proc.returncode,
+                    "stdout": proc.stdout.decode("utf-8", "ignore"),
+                    "stderr": proc.stderr.decode("utf-8", "ignore")}
+        except subprocess.TimeoutExpired:
+            return {"returncode": -1, "stdout": "", "stderr": "命令执行超时"}
+        except FileNotFoundError as e:
+            return {"returncode": -2, "stdout": "", "stderr": f"命令不存在: {e}"}
+
+    def _translate_shell_script(self, script: str) -> List[str]:
+        """把 `sh -c "<script>"` 形式的命令翻译为当前平台可执行的命令。
+
+        - POSIX（有 sh）：原样返回 ["sh", "-c", script]。
+        - Windows（无 sh）：去掉 `set -o pipefail` 等 bash 专有语法，将单引号
+          替换为双引号（Windows cmd 只认双引号），再交给 `cmd /c` 执行。
+          这样既保留了管道 `|`、输入重定向 `< file`、以及 `mysql < file` 等
+          标准用法，又避免了 `WinError 2 系统找不到指定的文件`（找不到 sh）。
+        """
+        if getattr(os, "name", "") == "nt" or not shutil.which("sh"):
+            s = script
+            # 移除 bash 专有选项（cmd 不支持）
+            s = s.replace("set -o pipefail;", "").replace("set -o pipefail", "")
+            # 单引号包裹的路径/字符串在 cmd 下需改为双引号（前提是脚本中
+            # 不存在双引号与单引号混用的冲突场景，备份引擎脚本满足此约束）
+            s = s.replace("'", '"')
+            return ["cmd", "/c", s.strip()]
+        return ["sh", "-c", script]
+
+    def _read_decompressed(self, path: str) -> bytes:
+        """读取备份文件内容（自动按扩展名解压），返回喂给子进程 stdin 的字节。"""
+        if not path:
+            return b""
+        lower = path.lower()
+        if lower.endswith(".gz"):
+            import gzip
+            with gzip.open(path, "rb") as f:
+                return f.read()
+        if lower.endswith(".zst"):
+            zstd = self._zstd_module()
+            if zstd is not None:
+                dctx = zstd.ZstdDecompressor()
+                with open(path, "rb") as f:
+                    return dctx.stream_reader(f).read()
+            zcli = self._zstd_cli()
+            if zcli:
+                r = subprocess.run([zcli, "-dc", path], stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, timeout=600)
+                if r.returncode == 0:
+                    return r.stdout
+        with open(path, "rb") as f:
+            return f.read()
 
     def _timestamp(self) -> str:
         return time.strftime("%Y%m%d_%H%M%S")
@@ -289,36 +585,17 @@ class BackupEngine:
         return d
 
     def _simulate_backup(self, backup_type: BackupType, reason: str) -> BackupResult:
-        """生成标记仿真的占位备份文件，使平台在无客户端环境也能运行/演示。"""
-        d = self._output_dir()
-        ts = self._timestamp()
-        fname = f"{ts}__{self.task_name}__{backup_type.value}.sim"
-        fpath = os.path.join(d, fname)
-        payload = {
-            "simulated": True,
-            "note": "该文件为演示/兜底占位备份，并非真实数据。原因: " + reason,
-            "task_id": self.task_id,
-            "task_name": self.task_name,
-            "db_type": self.db_type,
-            "host": self.task.get("host"),
-            "port": self.task.get("port"),
-            "db_name": self.task.get("db_name"),
-            "backup_type": backup_type.value,
-            "generated_at": db.now_iso(),
-        }
-        with open(fpath, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        size = os.path.getsize(fpath)
-        self.logger.warning("[%s] 生成仿真备份(占位): %s | %s", self.task_name, fpath, reason)
+        """不再支持仿真/兜底占位备份。保留方法仅为了兼容旧调用。"""
         return BackupResult(
-            success=True, status=BackupStatus.SIMULATED, backup_path=fpath,
-            size_bytes=size, simulated=True,
-            message="仿真备份(占位)成功；" + reason)
+            success=False, status=BackupStatus.FAILED,
+            message=f"缺少必要客户端/连接，无法执行真实备份: {reason}")
 
-    def _simulate_restore(self, backup_path: str, reason: str) -> BackupResult:
+    def _simulate_restore(self, backup_path: str, reason: str,
+                          detail_log: str = "") -> BackupResult:
+        """不再支持仿真/兜底占位恢复。保留方法仅为了兼容旧调用。"""
         return BackupResult(
-            success=True, status=BackupStatus.SIMULATED, backup_path=backup_path,
-            simulated=True, message="仿真恢复(占位)成功；" + reason)
+            success=False, status=BackupStatus.FAILED,
+            message=f"缺少必要客户端/连接，无法执行真实恢复: {reason}")
 
     def _write_dump_file(self, data: bytes, backup_type: BackupType,
                           ssh_host: dict, ext: str, label: str) -> BackupResult:
@@ -340,6 +617,61 @@ class BackupEngine:
             checksum=checksum,
             message=f"通过 SSH 在数据库服务器({hk})执行 {label} 成功 | {db.human_size(size)}",
         )
+
+    # ---------------- 远程优先回退策略 ----------------
+    def _try_remote_then_local(self, remote_fn, local_fn, label: str) -> BackupResult:
+        """先尝试在 SSH 备份机/数据库服务器执行，失败再回退到本机。
+
+        这是为了解决"备份平台所在机器没有 mysqldump 等客户端"的问题：
+        数据库服务器本身通常自带这些命令，因此优先在远端执行，把数据流
+        通过 SSH 拉回到备份平台落盘。只有在远端也没有命令或 SSH 不可用
+        时，才回退到本机执行。
+        """
+        from core import remote_dump
+        ssh_host = remote_dump.resolve_ssh_host(self.task)
+        remote_error = None
+
+        if ssh_host:
+            hk = ssh_host.get("host_key", "unknown")
+            self.logger.info("[%s] %s: 优先尝试远程主机 %s", self.task_name, label, hk)
+            max_retries = getattr(config, "BACKUP_RETRY_MAX", 3)
+            base_delay = getattr(config, "BACKUP_RETRY_DELAY", 5)
+            for attempt in range(max_retries + 1):
+                try:
+                    result = remote_fn(ssh_host)
+                    if result and result.success:
+                        return result
+                    remote_error = result.message if result else "远程执行未返回成功结果"
+                    # 非网络错误直接结束重试
+                    break
+                except Exception as e:
+                    remote_error = str(e)
+                    if attempt < max_retries and _is_network_error(e):
+                        wait = base_delay * (2 ** attempt)
+                        self.logger.warning(
+                            "[%s] %s 远程执行网络错误，%s 后第 %d/%d 次重试: %s",
+                            self.task_name, label, wait, attempt + 1, max_retries, remote_error)
+                        time.sleep(wait)
+                        continue
+                    self.logger.warning("[%s] %s 远程执行失败: %s", self.task_name, label, remote_error)
+                    break
+        else:
+            remote_error = "未配置 SSH 备份机"
+
+        self.logger.info("[%s] %s: 远程不可用，回退到本机执行", self.task_name, label)
+        try:
+            result = local_fn()
+            if result and result.success:
+                return result
+            local_error = result.message if result else "本机执行未返回成功结果"
+        except FileNotFoundError as e:
+            local_error = f"命令不存在: {e}"
+        except Exception as e:
+            local_error = str(e)
+
+        msg = f"{label} 失败。远程: {remote_error or '未尝试'}；本机: {local_error or '未尝试'}。" \
+              f"请在数据库服务器上纳管 SSH 主机，或在备份平台安装对应客户端。"
+        return BackupResult(success=False, status=BackupStatus.FAILED, message=msg)
 
     # ---------------- 子类需实现 ----------------
     def backup(self, backup_type: BackupType) -> BackupResult:

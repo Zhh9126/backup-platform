@@ -124,6 +124,13 @@ def cross_host_restore(db_type: str, backup_path: str, target_host_info: dict,
         log(f"上传完成: 远端 {up_size} bytes")
 
         # 构造恢复命令
+        # PostgreSQL/Kingbase 的工具可能不在 PATH（旧版 /usr/bin/psql 无法
+        # 完成 SCRAM 认证），需从运行中进程解析正确版本，注入命令构造。
+        if db_type == "postgresql":
+            from core.remote_dump import _resolve_remote_bin
+            extra = dict(extra)
+            extra["_pg_psql_bin"] = _resolve_remote_bin(client, "psql") or "psql"
+            extra["_pg_restore_bin"] = _resolve_remote_bin(client, "pg_restore") or "pg_restore"
         cmd = _build_restore_cmd(db_type, remote, target_db, extra, target_host_info)
         log(f"远程执行: {cmd[:200]}")
         out, err, rc = _remote_exec_logged(client, cmd, timeout=7200, log=log)
@@ -167,13 +174,22 @@ def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
         else:
             pre = ""
         target = f"'{target_db}'" if target_db else ""
-        return f"{pre}mysql -h {host} -P {port} -u {user} -p'{pw_esc}' {target} < '{actual}'"
+        # 恢复前清空 GTID，避免含 GTID_PURGED 的备份导入时报 1840
+        reset_sql = "RESET MASTER"
+        return (
+            f"{pre}mysql -h {host} -P {port} -u {user} -p'{pw_esc}' -e '{reset_sql}' && "
+            f"mysql -h {host} -P {port} -u {user} -p'{pw_esc}' {target} < '{actual}'"
+        )
 
     elif db_type == "postgresql":
         host = extra.get("source_host") or "127.0.0.1"
         port = extra.get("source_port") or 5432
         user = extra.get("source_username") or "postgres"
         pw = extra.get("source_password") or ""
+        # 优先使用从运行中进程解析出的正确版本工具（避免 PATH 中旧版
+        # /usr/bin/psql 因 SCRAM 认证失败）
+        psql_bin = extra.get("_pg_psql_bin") or "psql"
+        pg_restore_bin = extra.get("_pg_restore_bin") or "pg_restore"
         actual = remote_pkg
         if remote_pkg.endswith(".gz"):
             actual = remote_pkg[:-3]
@@ -181,9 +197,11 @@ def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
         else:
             pre = ""
         if remote_pkg.endswith(".dump"):
-            return f"{pre}pg_restore -h {host} -p {port} -U {user} -d '{target_db or 'postgres'}' -c '{actual}'"
+            return (f"export PGPASSWORD='{pw}'; {pre}{pg_restore_bin} "
+                    f"-h {host} -p {port} -U {user} -d '{target_db or 'postgres'}' -c '{actual}'")
         target = f"-d '{target_db}'" if target_db else ""
-        return f"export PGPASSWORD='{pw}'; {pre}psql -h {host} -p {port} -U {user} {target} -f '{actual}'"
+        return (f"export PGPASSWORD='{pw}'; {pre}{psql_bin} "
+                f"-h {host} -p {port} -U {user} {target} -f '{actual}'")
 
     elif db_type == "oracle":
         # Oracle 用 impdp，依赖服务端 DIRECTORY；这里用 cat | sqlldr 之类不现实

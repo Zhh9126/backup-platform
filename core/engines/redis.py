@@ -30,6 +30,8 @@ class RedisEngine(BackupEngine):
     db_type = "redis"
     display_name = "Redis"
     required_clients = ["redis-cli"]
+    # 物理备份：外部插件 redis-tools
+    physical_external_plugins = ["redis-tools"]
 
     def _redis_cli_args(self):
         """构造 redis-cli 连接基础参数（不含密码，密码走环境变量）。"""
@@ -40,14 +42,46 @@ class RedisEngine(BackupEngine):
     def backup(self, backup_type: BackupType) -> BackupResult:
         """执行 Redis 备份（RDB 快照）。
 
-        流程：先仿真检测；否则检查客户端；成功则调用 self._run 生成 RDB 文件，
-        按 returncode 判定，并计算 size_bytes 与 checksum。
+        优先在 SSH 备份机/数据库服务器执行 redis-cli --rdb，失败再回退本机。
         """
         if self.task.get("demo_only"):
             return self._simulate_backup(backup_type, "任务标记为演示(demo_only)")
         if config.DEMO_MODE == "on":
             return self._simulate_backup(backup_type, "DEMO_MODE=on 强制仿真")
 
+        # 统一处理增量/差异 -> 快照
+        if backup_type in (BackupType.INCREMENTAL, BackupType.DIFFERENTIAL):
+            backup_type = BackupType.SNAPSHOT
+
+        return self._try_remote_then_local(
+            lambda ssh_host: self._backup_remote(ssh_host, backup_type),
+            lambda: self._backup_local(backup_type),
+            "Redis RDB 备份(redis-cli)",
+        )
+
+    def _backup_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
+        """在 SSH 备份机执行 redis-cli --rdb -，把 RDB 数据流拉回到本地落盘。"""
+        from core import remote_dump
+        import time
+        t0 = time.time()
+        data, _ = remote_dump.remote_db_dump(self.task, ssh_host, "redis")
+        duration = round(time.time() - t0, 3)
+        out_dir = self._output_dir()
+        ts = self._timestamp()
+        rdb_path = os.path.join(out_dir, "%s.rdb" % ts)
+        with open(rdb_path, "wb") as f:
+            f.write(data)
+        size = os.path.getsize(rdb_path)
+        checksum = db.sha256_file(rdb_path)
+        self.logger.info("[%s] Redis 远程备份完成: %s (%d bytes)", self.task_name, rdb_path, size)
+        return BackupResult(
+            success=True, status=BackupStatus.SUCCESS,
+            backup_path=rdb_path, size_bytes=size, duration_sec=duration,
+            simulated=False, checksum=checksum,
+            message="Redis RDB 远程快照备份成功")
+
+    def _backup_local(self, backup_type: BackupType) -> BackupResult:
+        """本机执行 Redis 备份（RDB 快照）。"""
         # 客户端可用性检查
         ok, detail = self.check_client()
         if not ok:
@@ -55,10 +89,8 @@ class RedisEngine(BackupEngine):
                 success=False, status=BackupStatus.FAILED,
                 message="备份失败: " + detail)
 
-        # 3. 准备输出目录与文件名
         out_dir = self._output_dir()
         ts = self._timestamp()
-        # Redis 仅支持 RDB 全量快照；增量/差异统一回退为快照
         note = ""
         if backup_type in (BackupType.INCREMENTAL, BackupType.DIFFERENTIAL):
             note = ("Redis 逻辑增量需 AOF/主从复制，RDB 为全量快照；"
@@ -66,17 +98,13 @@ class RedisEngine(BackupEngine):
             backup_type = BackupType.SNAPSHOT
         rdb_path = os.path.join(out_dir, "%s.rdb" % ts)
 
-        # 4. 构造命令：redis-cli -h host -p port --rdb 本地路径
-        #    密码通过 REDISCLI_AUTH 环境变量传递，避免明文进入 argv
         cmd = self._redis_cli_args() + ["--rdb", rdb_path]
         env_extra = {"REDISCLI_AUTH": self.task.get("password") or ""}
 
-        start = db.now_iso()
         t0 = __import__("time").time()
         res = self._run(cmd, env_extra=env_extra, timeout=3600)
         duration = __import__("time").time() - t0
 
-        # 5. 按 returncode 判定结果
         if res["returncode"] != 0:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,

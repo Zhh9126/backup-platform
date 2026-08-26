@@ -1,124 +1,342 @@
 {% extends "base.html" %}
+{% block title %}数据同步{% endblock %}
 {% block content %}
-<div class="toolbar">
+<div class="toolbar mb-3">
   <div>
-    <div class="page-title">数据同步</div>
-    <div class="page-sub">纳管数据库并实时/定时将数据同步至目标库（无需安装 Agent）</div>
+    <h2 class="page-title">数据同步</h2>
+    <p class="page-sub">DataX/LinkUp 风格：Source Reader → 统一类型 → Sink Writer，支持字段映射与增量同步</p>
   </div>
-  <button class="btn btn-primary" id="newSyncBtn"><i class="bi bi-plus-lg"></i> 新建同步任务</button>
-</div>
-
-<div class="page-card mb-3">
-  <div class="table-responsive" style="flex:1">
-    <table class="table table-hover align-middle mb-0">
-      <thead><tr>
-        <th>ID</th><th>名称</th><th>源</th><th>目标</th>
-        <th>调度</th><th>状态</th><th>上次运行</th><th class="text-end">操作</th>
-      </tr></thead>
-      <tbody id="syncTaskTable"></tbody>
-    </table>
+  <div>
+    <button class="btn btn-outline-secondary" id="btnRefresh"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+    <button class="btn btn-primary" id="btnNew"><i class="bi bi-plus-lg"></i> 新建同步任务</button>
   </div>
 </div>
 
-<div class="card-section-title"><i class="bi bi-arrow-repeat"></i> 最近同步记录</div>
 <div class="page-card">
-  <div class="table-responsive" style="flex:1">
-    <table class="table table-hover align-middle mb-0">
-      <thead><tr>
-        <th>ID</th><th>同步任务</th><th>开始</th><th>结束</th>
-        <th>状态</th><th>说明</th>
-      </tr></thead>
-      <tbody id="syncRecordTable"></tbody>
-    </table>
-  </div>
+  <table class="table table-hover mb-0">
+    <thead>
+      <tr>
+        <th>ID</th>
+        <th>任务名称</th>
+        <th>源 → 目标</th>
+        <th>表映射</th>
+        <th>同步/写入模式</th>
+        <th>状态</th>
+        <th>上次运行</th>
+        <th>消息</th>
+        <th style="min-width:180px">操作</th>
+      </tr>
+    </thead>
+    <tbody id="taskTableBody">
+      <tr><td colspan="9" class="text-center text-muted">加载中...</td></tr>
+    </tbody>
+  </table>
 </div>
 
-<!-- 同步任务模态框 -->
-<div class="modal fade" id="syncModal" tabindex="-1">
-  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+<!-- Modal -->
+<div class="modal fade" id="taskModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-xl">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title" id="syncModalTitle">新建同步任务</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        <h5 class="modal-title" id="modalTitle">新建同步任务</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
       </div>
       <div class="modal-body">
-        <form id="syncForm">
-          <input type="hidden" id="s_id">
-          <div class="row g-3">
-            <div class="col-md-12">
-              <label class="form-label">同步任务名称 *</label>
-              <input class="form-control" id="s_name" required>
+        <form id="taskForm">
+          <input type="hidden" id="taskId">
+
+          <div class="row g-3 mb-3">
+            <div class="col-md-4">
+              <label class="form-label">任务名称</label>
+              <input type="text" class="form-control" id="name" required>
             </div>
-            <div class="col-md-6">
-              <label class="form-label">源类型 *</label>
-              <select class="form-select" id="s_source_type">
-                <option value="managed">托管数据库（引用已有备份任务）</option>
-                <option value="manual">手动填写连接</option>
+            <div class="col-md-4">
+              <label class="form-label">源类型</label>
+              <select class="form-select" id="sourceType">
+                <option value="manual">手动配置</option>
+                <option value="managed">引用现有备份任务</option>
               </select>
             </div>
-            <div class="col-md-6 s-managed-only">
-              <label class="form-label">源（已纳管数据库）*</label>
-              <select class="form-select" id="s_source_task_id"></select>
+            <div class="col-md-4">
+              <label class="form-label">源备份任务 ID（managed 时）</label>
+              <input type="number" class="form-control" id="sourceTaskId" placeholder="可选">
             </div>
-            <div class="col-12 s-manual-only d-none">
+          </div>
+
+          <ul class="nav nav-tabs mb-3" id="syncTab" role="tablist">
+            <li class="nav-item" role="presentation">
+              <button class="nav-link active" id="conn-tab" data-bs-toggle="tab" data-bs-target="#conn" type="button" role="tab">连接配置</button>
+            </li>
+            <li class="nav-item" role="presentation">
+              <button class="nav-link" id="map-tab" data-bs-toggle="tab" data-bs-target="#map" type="button" role="tab">字段映射</button>
+            </li>
+            <li class="nav-item" role="presentation">
+              <button class="nav-link" id="schedule-tab" data-bs-toggle="tab" data-bs-target="#schedule" type="button" role="tab">调度</button>
+            </li>
+          </ul>
+
+          <div class="tab-content">
+            <!-- 连接配置 -->
+            <div class="tab-pane fade show active" id="conn" role="tabpanel">
+              <div class="row">
+                <div class="col-md-6">
+                  <h6 class="fw-bold mb-3">源端（Source）</h6>
+                  <div class="row g-3">
+                    <div class="col-6">
+                      <label class="form-label">数据库类型</label>
+                      <select class="form-select" id="srcDbType"></select>
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label">端口</label>
+                      <input type="number" class="form-control" id="srcPort" value="3306">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label">主机</label>
+                      <input type="text" class="form-control" id="srcHost" placeholder="127.0.0.1">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label">用户名</label>
+                      <input type="text" class="form-control" id="srcUsername">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label">密码</label>
+                      <input type="password" class="form-control" id="srcPassword">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label">数据库名</label>
+                      <input type="text" class="form-control" id="srcDbName">
+                    </div>
+                    <div class="col-6" id="srcSchemaWrap" style="display:none">
+                      <label class="form-label">Schema</label>
+                      <input type="text" class="form-control" id="srcSchema" value="public">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label">源表</label>
+                      <input type="text" class="form-control" id="sourceTable">
+                    </div>
+                    <div class="col-12">
+                      <button type="button" class="btn btn-outline-primary btn-sm" id="btnTestSrc"><i class="bi bi-lightning"></i> 测试源连接</button>
+                      <button type="button" class="btn btn-outline-info btn-sm" id="btnLoadSrcCols"><i class="bi bi-list-columns"></i> 加载源字段</button>
+                    </div>
+                  </div>
+                </div>
+                <div class="col-md-6">
+                  <h6 class="fw-bold mb-3">目标端（Target）</h6>
+                  <div class="row g-3">
+                    <div class="col-6">
+                      <label class="form-label">数据库类型</label>
+                      <select class="form-select" id="tgtDbType"></select>
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label">端口</label>
+                      <input type="number" class="form-control" id="tgtPort" value="3306">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label">主机</label>
+                      <input type="text" class="form-control" id="tgtHost" placeholder="127.0.0.1">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label">用户名</label>
+                      <input type="text" class="form-control" id="tgtUsername">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label">密码</label>
+                      <input type="password" class="form-control" id="tgtPassword">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label">数据库名</label>
+                      <input type="text" class="form-control" id="tgtDbName">
+                    </div>
+                    <div class="col-6" id="tgtSchemaWrap" style="display:none">
+                      <label class="form-label">Schema</label>
+                      <input type="text" class="form-control" id="tgtSchema" value="public">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label">目标表</label>
+                      <input type="text" class="form-control" id="targetTable">
+                    </div>
+                    <div class="col-12">
+                      <button type="button" class="btn btn-outline-primary btn-sm" id="btnTestTgt"><i class="bi bi-lightning"></i> 测试目标连接</button>
+                      <button type="button" class="btn btn-outline-info btn-sm" id="btnLoadTgtCols"><i class="bi bi-list-columns"></i> 加载目标字段</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <hr class="my-4">
+              <h6 class="fw-bold mb-3">同步策略</h6>
               <div class="row g-3">
-                <div class="col-md-4"><label class="form-label">源数据库类型</label>
-                  <select class="form-select" id="s_src_db_type"></select></div>
-                <div class="col-md-4"><label class="form-label">源主机</label>
-                  <input class="form-control" id="s_src_host" placeholder="127.0.0.1"></div>
-                <div class="col-md-4"><label class="form-label">源端口</label>
-                  <input class="form-control" id="s_src_port" type="number"></div>
-                <div class="col-md-4"><label class="form-label">源用户</label>
-                  <input class="form-control" id="s_src_username"></div>
-                <div class="col-md-4"><label class="form-label">源密码</label>
-                  <input class="form-control" id="s_src_password" type="password"></div>
-                <div class="col-md-4"><label class="form-label">源库/实例</label>
-                  <input class="form-control" id="s_src_db_name"></div>
+                <div class="col-md-3">
+                  <label class="form-label">同步模式</label>
+                  <select class="form-select" id="syncMode"></select>
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label">写入模式</label>
+                  <select class="form-select" id="saveMode"></select>
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label">字段命名风格</label>
+                  <select class="form-select" id="fieldIde"></select>
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label">批量大小</label>
+                  <input type="number" class="form-control" id="batchSize" value="1000" min="1">
+                </div>
+                <div class="col-md-6" id="incrementalWrap" style="display:none">
+                  <div class="row g-3">
+                    <div class="col-6">
+                      <label class="form-label">增量列</label>
+                      <input type="text" class="form-control" id="incrementalColumn" placeholder="如 id / update_time">
+                    </div>
+                    <div class="col-6">
+                      <label class="form-label">增量起始值</label>
+                      <input type="text" class="form-control" id="incrementalValue" placeholder="留空则从全量开始">
+                    </div>
+                  </div>
+                </div>
+                <div class="col-md-6" id="realtimeWrap" style="display:none">
+                  <label class="form-label">Flink CDC 配置（JSON）</label>
+                  <textarea class="form-control" id="flinkConfig" rows="2" placeholder='{"checkpoint.interval":"60000"}'></textarea>
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label">源端 WHERE 条件</label>
+                  <input type="text" class="form-control" id="sourceWhere" placeholder="status=1">
+                </div>
+                <div class="col-md-3">
+                  <label class="form-label">容错条数（0=不容错）</label>
+                  <input type="number" class="form-control" id="errorThreshold" value="0" min="0">
+                </div>
+              </div>
+
+              <hr class="my-4">
+              <h6 class="fw-bold mb-3">高级选项（pg2mysql 风格）</h6>
+              <div class="row g-3">
+                <div class="col-md-4">
+                  <div class="form-check form-switch">
+                    <input class="form-check-input" type="checkbox" id="fullDbMigrate">
+                    <label class="form-check-label" for="fullDbMigrate">全库迁移（同步所有表）</label>
+                    <div class="form-text">启用后将一次性同步源库中所有表，忽略单表配置</div>
+                  </div>
+                </div>
+                <div class="col-md-4">
+                  <div class="form-check form-switch">
+                    <input class="form-check-input" type="checkbox" id="validateBeforeRun">
+                    <label class="form-check-label" for="validateBeforeRun">执行前 Schema 校验</label>
+                    <div class="form-text">先检查列兼容性（类型/长度），不兼容则拒绝执行</div>
+                  </div>
+                </div>
+                <div class="col-md-4">
+                  <div class="form-check form-switch">
+                    <input class="form-check-input" type="checkbox" id="verifyAfterRun">
+                    <label class="form-check-label" for="verifyAfterRun">执行后数据校验</label>
+                    <div class="form-text">同步完成后逐行比对源/目标数据是否一致</div>
+                  </div>
+                </div>
               </div>
             </div>
-            <div class="col-12"><div class="card-section-title mb-2"><i class="bi bi-arrow-right"></i> 目标数据库</div></div>
-            <div class="col-md-4"><label class="form-label">目标类型 *</label>
-              <select class="form-select" id="s_tgt_db_type"></select></div>
-            <div class="col-md-4"><label class="form-label">目标主机 *</label>
-              <input class="form-control" id="s_tgt_host" placeholder="192.168.1.200"></div>
-            <div class="col-md-4"><label class="form-label">目标端口</label>
-              <input class="form-control" id="s_tgt_port" type="number"></div>
-            <div class="col-md-4"><label class="form-label">目标用户</label>
-              <input class="form-control" id="s_tgt_username"></div>
-            <div class="col-md-4"><label class="form-label">目标密码</label>
-              <input class="form-control" id="s_tgt_password" type="password"></div>
-            <div class="col-md-4"><label class="form-label">目标库/实例</label>
-              <input class="form-control" id="s_tgt_db_name"></div>
-            <div class="col-md-6">
-              <label class="form-label">调度方式</label>
-              <select class="form-select" id="s_schedule_type">
-                <option value="none">不自动（手动）</option>
-                <option value="cron">Cron 表达式</option>
-                <option value="interval">固定间隔</option>
-              </select>
+
+            <!-- 字段映射 -->
+            <div class="tab-pane fade" id="map" role="tabpanel">
+              <div class="d-flex justify-content-between align-items-center mb-2">
+                <div>
+                  <button type="button" class="btn btn-sm btn-outline-primary" id="btnSameNameMap"><i class="bi bi-link-45deg"></i> 同名映射</button>
+                  <button type="button" class="btn btn-sm btn-outline-primary ms-2" id="btnSameRowMap"><i class="bi bi-link"></i> 同行映射</button>
+                  <button type="button" class="btn btn-sm btn-outline-danger ms-2" id="btnClearMap"><i class="bi bi-x-lg"></i> 清空映射</button>
+                </div>
+                <small class="text-muted">先点击源字段，再点击目标字段建立映射；点击连线可删除</small>
+              </div>
+              <div class="mapping-panel position-relative" id="mappingPanel">
+                <svg class="mapping-svg" id="mappingSvg"></svg>
+                <div class="row g-0 h-100">
+                  <div class="col-5">
+                    <div class="field-header">来源字段</div>
+                    <div class="field-list" id="srcFields"></div>
+                  </div>
+                  <div class="col-2"></div>
+                  <div class="col-5">
+                    <div class="field-header">目标字段</div>
+                    <div class="field-list" id="tgtFields"></div>
+                  </div>
+                </div>
+              </div>
             </div>
-            <div class="col-md-6 d-none" id="s_cron_wrap">
-              <label class="form-label">Cron 表达式（分 时 日 月 周）</label>
-              <input class="form-control" id="s_cron_expr" placeholder="0 2 * * *">
-            </div>
-            <div class="col-md-6 d-none" id="s_interval_wrap">
-              <label class="form-label">间隔（分钟）</label>
-              <input class="form-control" id="s_interval_minutes" type="number" value="60">
-            </div>
-            <div class="col-12">
-              <div class="form-check form-check-inline">
-                <input class="form-check-input" type="checkbox" id="s_enabled" checked>
-                <label class="form-check-label">启用</label>
+
+            <!-- 调度 -->
+            <div class="tab-pane fade" id="schedule" role="tabpanel">
+              <div class="row g-3">
+                <div class="col-md-4">
+                  <label class="form-label">调度类型</label>
+                  <select class="form-select" id="scheduleType">
+                    <option value="none">不调度</option>
+                    <option value="cron">Cron 表达式</option>
+                    <option value="interval">间隔分钟</option>
+                  </select>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">Cron 表达式</label>
+                  <input type="text" class="form-control" id="cronExpr" placeholder="0 2 * * *">
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">间隔分钟</label>
+                  <input type="number" class="form-control" id="intervalMinutes" placeholder="60">
+                </div>
               </div>
             </div>
           </div>
         </form>
       </div>
       <div class="modal-footer">
-        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-        <button class="btn btn-primary" id="syncSaveBtn">保存</button>
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn btn-primary" id="btnSave"><i class="bi bi-save"></i> 保存</button>
       </div>
     </div>
   </div>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<style>
+.mapping-panel {
+  height: 420px;
+  border: 1px solid var(--bs-border-color);
+  border-radius: 0.375rem;
+  overflow: hidden;
+  background: #f8f9fa;
+}
+.mapping-svg {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 2;
+  pointer-events: none;
+}
+.mapping-svg .map-line { pointer-events: stroke; cursor: pointer; }
+.field-header {
+  padding: 0.5rem 0.75rem;
+  font-weight: 600;
+  background: #e9ecef;
+  border-bottom: 1px solid var(--bs-border-color);
+}
+.field-list {
+  height: calc(420px - 41px);
+  overflow-y: auto;
+  padding: 0.5rem;
+}
+.field-item {
+  padding: 0.5rem 0.75rem;
+  margin-bottom: 0.5rem;
+  background: #fff;
+  border: 1px solid var(--bs-border-color);
+  border-radius: 0.375rem;
+  cursor: pointer;
+  transition: all 0.15s;
+  position: relative;
+  z-index: 3;
+}
+.field-item:hover { border-color: #0d6efd; }
+.field-item.active { border-color: #0d6efd; background: #e7f1ff; }
+.field-item.mapped { border-color: #198754; background: #e8f5e9; }
+.field-item .field-name { font-weight: 500; }
+.field-item .field-type { font-size: 0.75rem; color: #6c757d; }
+</style>
+<script src="/static/js/sync.js?v=2026081102"></script>
 {% endblock %}

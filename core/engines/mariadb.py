@@ -18,3 +18,5 @@ class MariaDBEngine(MySQLEngine):
     db_type = "mariadb"
     display_name = "MariaDB"
     required_clients = ["mysqldump", "mysql"]  # MariaDB 自带 mysqldump/mysql 客户端
+    # 物理备份：外部插件（至少有一个就放行）
+    physical_external_plugins = ["mariabackup", "percona-xtrabackup-24"]

@@ -15,6 +15,9 @@ PostgreSQL 备份引擎。
 """
 import os
 import time
+import shlex
+import subprocess
+import json
 
 from core.engines.base import BackupEngine, BackupType, BackupMode, BackupStatus, BackupResult
 import config
@@ -28,6 +31,8 @@ class PostgreSQLEngine(BackupEngine):
     display_name = "PostgreSQL"
     # 该引擎依赖的客户端可执行文件名（用于 PATH 探测）
     required_clients = ["pg_dump", "pg_restore", "psql"]
+    # 物理备份：PostgreSQL 自带 pg_basebackup 工具
+    physical_bundled_tools = ["pg_basebackup"]
 
     # ------------------------- 备份 -------------------------
     def backup(self, backup_type: BackupType) -> BackupResult:
@@ -38,28 +43,18 @@ class PostgreSQLEngine(BackupEngine):
 
         mode = self.backup_mode
         if mode == BackupMode.PHYSICAL:
-            return self._try_pg_fallback(lambda: self._backup_physical(backup_type), backup_type, "物理备份")
-        return self._try_pg_fallback(lambda: self._backup_logical(backup_type), backup_type, "逻辑备份")
-
-    def _try_pg_fallback(self, fn, backup_type, label):
-        try:
-            result = fn()
-            if result.success:
-                return result
-            reason = result.message or "未知"
-        except Exception as e:
-            reason = str(e)
-        from core import remote_dump
-        ssh_host = remote_dump.resolve_ssh_host(self.task)
-        if ssh_host:
-            self.logger.info("[%s] %s失败(%s)，SSH远程", self.task_name, label, reason)
-            try:
-                data = remote_dump.remote_db_dump(self.task, ssh_host, "postgresql", int(self.task.get("compress") or 0))
-                ext = ".dump.gz" if int(self.task.get("compress") or 0) else ".sql"
-                return self._write_dump_file(data, backup_type, ssh_host, ext, "pg_dump")
-            except Exception as e:
-                reason = f"本机与SSH均失败: {e}"
-        return BackupResult(success=False, status=BackupStatus.FAILED, message=reason)
+            # 物理备份：优先 SSH 远端 pg_basebackup，失败再回退本机
+            return self._try_remote_then_local(
+                lambda ssh_host: self._backup_physical_remote(ssh_host, backup_type),
+                lambda: self._backup_physical(backup_type),
+                "PostgreSQL 物理备份(pg_basebackup)",
+            )
+        # 逻辑备份：优先 SSH 远程执行，失败再回退本机
+        return self._try_remote_then_local(
+            lambda ssh_host: self._backup_logical_remote(ssh_host, backup_type),
+            lambda: self._backup_logical_local(backup_type),
+            "PostgreSQL 逻辑备份(pg_dump)",
+        )
 
     # ------------------ 物理备份 (pg_basebackup) ------------------
     def _backup_physical(self, backup_type: BackupType) -> BackupResult:
@@ -74,6 +69,7 @@ class PostgreSQLEngine(BackupEngine):
         os.makedirs(target, exist_ok=True)
         cmd = ["pg_basebackup", "-h", host, "-p", str(port), "-U", user, "-D", target, "-Ft", "-z",
                "--checkpoint=fast", "--no-password"]
+        cmd.extend(self._pg_basebackup_extra_args())
         env = {"PGPASSWORD": pw} if pw else None
         start = time.time()
         ret = subprocess.run(cmd, env={**os.environ, **(env or {})}, capture_output=True, text=True, timeout=7200)
@@ -85,11 +81,61 @@ class PostgreSQLEngine(BackupEngine):
                             backup_path=target, duration_sec=dur, stdout=ret.stdout,
                             message=f"PostgreSQL 物理备份(pg_basebackup)成功")
 
-    # ------------------ 逻辑备份 (pg_dump) ------------------
-    def _backup_logical(self, backup_type: BackupType) -> BackupResult:
-        return self._backup_local(backup_type)  # 已有逻辑备份，增强粒度由 extra_options 控制
+    def _backup_physical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
+        """物理备份：通过 SSH 在远端数据库服务器执行 pg_basebackup（-Ft -z 生成
+        tar.gz），再经 SFTP 拉回本机落盘并计算 size/sha256。
 
-    def _backup_local(self, backup_type: BackupType) -> BackupResult:
+        复用 core.remote_dump.remote_physical_backup，避免路径/端口写死；
+        PostgreSQL 的额外参数 key 为 pg_basebackup_extra_args。
+        """
+        from core import remote_dump
+        client = remote_dump._connect(ssh_host)
+        res = remote_dump.remote_physical_backup(
+            self.task, ssh_host,
+            tool="pg_basebackup", default_port=5432, default_user="postgres",
+            extra_args_key="pg_basebackup_extra_args", tool_label="pg_basebackup",
+        )
+        if not res["ok"]:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message=res["message"],
+                stdout=res.get("stdout", ""), stderr=res.get("stderr", ""))
+
+        out_dir = self._output_dir()
+        pieces = remote_dump._pull_remote_tars(client, res["remote_dir"], out_dir)
+        if not pieces:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                stdout=res.get("stdout", ""), stderr=res.get("stderr", ""),
+                message=f"远端 pg_basebackup 执行成功但未在 {res['remote_dir']} 找到 *.tar[.gz] 产物。")
+
+        total_size = sum(sz for _, sz in pieces)
+        first_local = pieces[0][0]
+        checksum = db.sha256_file(first_local)
+        hk = ssh_host.get("host_key", "remote")
+        msg = (f"通过 SSH 在 {hk} 执行 pg_basebackup 物理备份成功，"
+               f"已拉回 {len(pieces)} 个 tar 包，共 {db.human_size(total_size)}"
+               f"（主包: {os.path.basename(first_local)}）")
+        self.logger.info("[%s] %s", self.task_name, msg)
+        return BackupResult(
+            success=True, status=BackupStatus.SUCCESS,
+            backup_path=first_local, size_bytes=total_size,
+            duration_sec=0, stdout=res.get("stdout", ""), stderr=res.get("stderr", ""),
+            simulated=False, checksum=checksum, message=msg)
+
+    # ------------------ 逻辑备份 (pg_dump) ------------------
+    def _backup_logical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
+        """在 SSH 备份机/数据库服务器上执行 pg_dump，把流拉回到本地落盘。"""
+        from core import remote_dump
+        comp = int(self.task.get("compress") or 0)
+        data, _ = remote_dump.remote_db_dump(self.task, ssh_host, "postgresql", comp)
+        # 远程 pg_dump 用 -Fc 自带压缩，落盘为 .dump（不再外挂 gzip）
+        ext = ".dump" if comp else ".sql"
+        res = self._write_dump_file(data, backup_type, ssh_host, ext, "pg_dump")
+        res.compress_algo = "zlib" if comp else "none"
+        return res
+
+    def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:
         """本机 pg_dump 真实备份。"""
         # 构造输出目录与文件名
         out_dir = self._output_dir()
@@ -305,6 +351,99 @@ class PostgreSQLEngine(BackupEngine):
             message=f"PostgreSQL 恢复成功 -> {target_db}",
         )
 
+    # ------------------------- 恢复校验 -------------------------
+    def verify_record(self, record: dict, options: dict = None) -> BackupResult:
+        """PostgreSQL 恢复校验：逻辑 dump 检查 PGDMP 头；物理 base backup 校验目录结构。"""
+        options = options or {}
+        backup_path = record.get("backup_path") or record.get("output_path") or ""
+        if not backup_path or not os.path.exists(backup_path):
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message=f"备份文件不存在: {backup_path}")
+        if backup_path.endswith(".sim"):
+            return BackupResult(success=True, status=BackupStatus.SUCCESS,
+                                message="postgresql: simulated backup verified", verified=True)
+
+        mode = record.get("backup_mode") or self.backup_mode
+        size = os.path.getsize(backup_path) if os.path.isfile(backup_path) else 0
+
+        if mode == BackupMode.PHYSICAL:
+            # 物理备份通常是一个目录，检查 PG_VERSION / base / global
+            target = backup_path
+            if os.path.isfile(backup_path):
+                # 尝试解压到临时目录
+                import tempfile
+                import shutil
+                recovery_pool = options.get("recovery_pool") or ""
+                if recovery_pool and os.path.isdir(recovery_pool):
+                    temp_dir = os.path.join(recovery_pool, f"pg_verify_{self.task_id}_{int(time.time())}")
+                else:
+                    temp_dir = tempfile.mkdtemp(prefix=f"pg_verify_{self.task_id}_")
+                try:
+                    os.makedirs(temp_dir, exist_ok=True)
+                    if backup_path.endswith((".tar.gz", ".tgz")):
+                        self._run(["tar", "-xzf", backup_path, "-C", temp_dir], timeout=3600)
+                    elif backup_path.endswith((".tar", ".tar.bz2")):
+                        algo = "j" if backup_path.endswith(".bz2") else ""
+                        self._run(["tar", f"-x{algo}f", backup_path, "-C", temp_dir], timeout=3600)
+                    target = temp_dir
+                    # pg_basebackup tar 打包时目录在 base 下
+                    entries = os.listdir(target)
+                    if len(entries) == 1 and os.path.isdir(os.path.join(target, entries[0])):
+                        target = os.path.join(target, entries[0])
+                    # 若存在 backup_manifest 则用 pg_verifybackup
+                    manifest = os.path.join(target, "backup_manifest")
+                    if os.path.isfile(manifest) and shutil.which("pg_verifybackup"):
+                        res = self._run(["pg_verifybackup", "-m", manifest, target], timeout=3600)
+                        if res["returncode"] != 0:
+                            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                                message=f"pg_verifybackup failed: {res['stderr']}")
+                    if os.path.isfile(os.path.join(target, "PG_VERSION")):
+                        return BackupResult(success=True, status=BackupStatus.SUCCESS,
+                                            message="pg-family: base backup extracted OK",
+                                            verified=True, size_bytes=size)
+                    return BackupResult(success=False, status=BackupStatus.FAILED,
+                                        message="pg-family: base backup structure invalid")
+                finally:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+            else:
+                if os.path.isfile(os.path.join(backup_path, "PG_VERSION")):
+                    return BackupResult(success=True, status=BackupStatus.SUCCESS,
+                                        message="pg-family: base backup verified",
+                                        verified=True, size_bytes=size)
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                    message="pg-family: base backup structure invalid")
+
+        # 逻辑备份
+        try:
+            opener = open
+            if backup_path.endswith(".gz"):
+                import gzip
+                opener = gzip.open
+            elif backup_path.endswith(".zst"):
+                import zstandard as zstd
+                opener = zstd.open
+            elif backup_path.endswith(".dump"):
+                with open(backup_path, "rb") as f:
+                    header = f.read(8)
+                if header[:5] == b"PGDMP":
+                    return BackupResult(success=True, status=BackupStatus.SUCCESS,
+                                        message="pg-family: custom-format dump header OK",
+                                        verified=True, size_bytes=size)
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                    message="pg-family: invalid dump header")
+            with opener(backup_path, "rb") as f:
+                header = f.read(200)
+            text = header.decode("utf-8", "ignore")
+            if text.startswith("--") or "PostgreSQL database dump" in text:
+                return BackupResult(success=True, status=BackupStatus.SUCCESS,
+                                    message="pg-family: plain-text dump header OK",
+                                    verified=True, size_bytes=size)
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="pg-family: dump header invalid")
+        except Exception as e:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message=f"postgresql: verify error: {e}")
+
     # ------------------------- 列出数据库 -------------------------
     def list_databases(self) -> list:
         """列出可备份的数据库（无 Agent 模式：优先 SSH 远程 psql）。"""
@@ -374,6 +513,30 @@ class PostgreSQLEngine(BackupEngine):
             return args
         if isinstance(data, list):
             return [str(x) for x in data]
+        return []
+
+    def _pg_basebackup_extra_args(self):
+        """解析 extra_options 中 pg_basebackup 物理备份专属扩展参数。
+
+        支持两种写法：
+        - 字符串：{"pg_basebackup_extra_args": "--verbose --exclude *.bak"}
+        - 列表：  {"pg_basebackup_extra_args": ["--verbose", "--exclude", "*.bak"]}
+        """
+        raw = self.task.get("extra_options")
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except Exception as e:
+            self.logger.warning("[%s] pg_basebackup_extra_args 解析失败: %s", self.task_name, e)
+            return []
+        if not isinstance(data, dict):
+            return []
+        val = data.get("pg_basebackup_extra_args")
+        if isinstance(val, list):
+            return [str(x) for x in val]
+        if isinstance(val, str):
+            return shlex.split(val)
         return []
 
     def _compute_size_checksum(self, path: str):

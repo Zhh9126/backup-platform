@@ -16,6 +16,8 @@ sys_restore / ksql 三件套，用法分别与 pg_dump / pg_restore / psql 一�
 """
 import os
 import time
+import shlex
+import subprocess
 
 import config
 import core.db as db
@@ -34,6 +36,8 @@ class KingbaseEngine(BackupEngine):
     db_type = "kingbase"
     display_name = "kingbase"
     required_clients = ["sys_dump", "sys_restore", "ksql"]
+    # 物理备份：Kingbase 自带 sys_basebackup 工具
+    physical_bundled_tools = ["sys_basebackup"]
 
     # ------------------------------------------------------------------
     # 辅助方法
@@ -103,8 +107,18 @@ class KingbaseEngine(BackupEngine):
 
         # 按备份模式分发
         if self.backup_mode == BackupMode.PHYSICAL:
-            return self._backup_physical(backup_type)
-        return self._backup_logical(backup_type)
+            # 物理备份：优先 SSH 远端 sys_basebackup，失败再回退本机
+            return self._try_remote_then_local(
+                lambda ssh_host: self._backup_physical_remote(ssh_host, backup_type),
+                lambda: self._backup_physical(backup_type),
+                "Kingbase 物理备份(sys_basebackup)",
+            )
+        # 逻辑备份：优先 SSH 远程执行，失败再回退本机
+        return self._try_remote_then_local(
+            lambda ssh_host: self._backup_logical_remote(ssh_host, backup_type),
+            lambda: self._backup_logical_local(backup_type),
+            "Kingbase 逻辑备份(sys_dump)",
+        )
 
     def _backup_physical(self, backup_type: BackupType) -> BackupResult:
         """物理备份：sys_basebackup。"""
@@ -123,7 +137,60 @@ class KingbaseEngine(BackupEngine):
                             backup_path=target, duration_sec=dur,
                             message="Kingbase 物理备份(sys_basebackup)成功")
 
-    def _backup_logical(self, backup_type: BackupType) -> BackupResult:
+    def _backup_physical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
+        """物理备份：通过 SSH 在远端 KingbaseES 服务器执行 sys_basebackup（-Ft -z
+        生成 tar.gz），再经 SFTP 拉回本机落盘并计算 size/sha256。
+
+        复用 core.remote_dump.remote_physical_backup，避免路径/端口写死；
+        Kingbase 客户端兼容 PG 鉴权（读取 PGPASSWORD）。
+        """
+        from core import remote_dump
+        client = remote_dump._connect(ssh_host)
+        res = remote_dump.remote_physical_backup(
+            self.task, ssh_host,
+            tool="sys_basebackup", default_port=54321, default_user="system",
+            extra_args_key="sys_basebackup_extra_args", tool_label="sys_basebackup",
+        )
+        if not res["ok"]:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message=res["message"],
+                stdout=res.get("stdout", ""), stderr=res.get("stderr", ""))
+
+        out_dir = self._output_dir()
+        pieces = remote_dump._pull_remote_tars(client, res["remote_dir"], out_dir)
+        if not pieces:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                stdout=res.get("stdout", ""), stderr=res.get("stderr", ""),
+                message=f"远端 sys_basebackup 执行成功但未在 {res['remote_dir']} 找到 *.tar[.gz] 产物。")
+
+        total_size = sum(sz for _, sz in pieces)
+        first_local = pieces[0][0]
+        checksum = db.sha256_file(first_local)
+        hk = ssh_host.get("host_key", "remote")
+        msg = (f"通过 SSH 在 {hk} 执行 sys_basebackup 物理备份成功，"
+               f"已拉回 {len(pieces)} 个 tar 包，共 {db.human_size(total_size)}"
+               f"（主包: {os.path.basename(first_local)}）")
+        self.logger.info("[%s] %s", self.task_name, msg)
+        return BackupResult(
+            success=True, status=BackupStatus.SUCCESS,
+            backup_path=first_local, size_bytes=total_size,
+            duration_sec=0, stdout=res.get("stdout", ""), stderr=res.get("stderr", ""),
+            simulated=False, checksum=checksum, message=msg)
+
+    def _backup_logical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
+        """在 SSH 备份机/数据库服务器上执行 sys_dump，把流拉回到本地落盘。"""
+        from core import remote_dump
+        comp = int(self.task.get("compress") or 0)
+        data, _ = remote_dump.remote_db_dump(self.task, ssh_host, "kingbase", comp)
+        # 远程 sys_dump 用 -Fc 自带压缩，落盘为 .dump（不再外挂 gzip）
+        ext = ".dump" if comp else ".sql"
+        res = self._write_dump_file(data, backup_type, ssh_host, ext, "sys_dump")
+        res.compress_algo = "zlib" if comp else "none"
+        return res
+
+    def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:
         """逻辑备份：sys_dump（沿用原有实现）。"""
         # 客户端探测
         ok, detail = self.check_client()

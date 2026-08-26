@@ -60,14 +60,9 @@
     <!-- 步骤 2：选择备份记录 -->
     <h6 class="border-bottom pb-2 mb-3"><i class="bi bi-2-circle"></i> 选择备份记录</h6>
     <div class="row g-3 mb-3">
-      <div class="col-md-4">
-        <label class="form-label">业务系统 / 任务名</label>
-        <input class="form-control" id="r_search" placeholder="输入关键字搜索..." oninput="filterRestoreRecords()"
-               onkeydown="if(event.key==='Enter'){event.preventDefault();filterRestoreRecords();}">
-      </div>
-      <div class="col-md-4">
-        <label class="form-label">IP / 主机</label>
-        <input class="form-control" id="r_search_ip" placeholder="输入 IP 搜索..." oninput="filterRestoreRecords()"
+      <div class="col-md-8">
+        <label class="form-label">搜索（业务系统名称 / IP）</label>
+        <input class="form-control" id="r_search" placeholder="输入业务系统名称或 IP 搜索（如 交易库 / 192.168.220.133）" oninput="filterRestoreRecords()"
                onkeydown="if(event.key==='Enter'){event.preventDefault();filterRestoreRecords();}">
       </div>
       <div class="col-md-4">

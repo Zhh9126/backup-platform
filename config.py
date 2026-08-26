@@ -7,10 +7,18 @@
 不要直接把明文提交到版本库。
 """
 import os
+import sys
 import json
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+# 运行时根目录：
+# - 普通源码运行：项目根目录（本文件所在目录）。
+# - PyInstaller one-file 冻结：可执行文件所在目录（用于持久化 backups/instance/logs，
+#   这些目录不能放在临时解压目录 _MEIPASS，否则每次启动都丢失）。
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 
 # ---------- 路径 ----------
 BACKUP_ROOT = os.environ.get("BACKUP_ROOT", str(BASE_DIR / "backups"))
@@ -21,16 +29,50 @@ LOG_DIR = Path(os.environ.get("LOG_DIR", str(BASE_DIR / "logs")))
 # ---------- Web ----------
 WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("WEB_PORT", "8080"))
-SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me-please")
+
+
+def _load_or_create_secret_key() -> str:
+    """安全整改：SECRET_KEY 不再使用公开默认值。
+
+    优先级：环境变量 SECRET_KEY > instance/auth_secret.json（自动生成并持久化，
+    保证重启后会话不失效）> 兜底随机值（每次启动不同，会话会失效）。
+    """
+    env_key = os.environ.get("SECRET_KEY")
+    if env_key:
+        return env_key
+    _key_file = INSTANCE_DIR / "auth_secret.json"
+    try:
+        INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
+        if _key_file.exists():
+            _data = json.loads(_key_file.read_text(encoding="utf-8"))
+            if _data.get("secret_key"):
+                return _data["secret_key"]
+        import secrets as _secrets
+        _key = _secrets.token_hex(32)
+        _key_file.write_text(json.dumps({"secret_key": _key}), encoding="utf-8")
+        return _key
+    except Exception:
+        import secrets as _secrets
+        return _secrets.token_hex(32)
+
+
+SECRET_KEY = _load_or_create_secret_key()
 WEB_USERNAME = os.environ.get("WEB_USERNAME", "admin")
+# 生产环境务必通过环境变量 WEB_PASSWORD 或 config.json 覆盖默认口令
 WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "admin123")
 SESSION_TIMEOUT = int(os.environ.get("SESSION_TIMEOUT", "28800"))  # 秒
 
+# ---------- 登录安全（暴力破解防护） ----------
+LOGIN_MAX_FAILS = int(os.environ.get("LOGIN_MAX_FAILS", "5"))        # 连续失败次数上限
+LOGIN_LOCK_MINUTES = int(os.environ.get("LOGIN_LOCK_MINUTES", "15"))  # 达到上限后锁定分钟数
+
+# ---------- 备份重试 ----------
+BACKUP_RETRY_MAX = int(os.environ.get("BACKUP_RETRY_MAX", "3"))
+BACKUP_RETRY_DELAY = int(os.environ.get("BACKUP_RETRY_DELAY", "5"))
+
 # ---------- 演示/兜底模式 ----------
-# auto: 客户端工具缺失时自动生成“标记仿真”的占位备份，平台照常运行/演示
-# on  : 强制仿真（不调用任何外部客户端）
-# off : 强制真实（客户端缺失则任务失败）
-DEMO_MODE = os.environ.get("DEMO_MODE", "off").lower()
+# 自 2026-08-14 起不再支持仿真/兜底占位备份；该配置保留为兼容但强制按 off 处理。
+DEMO_MODE = "off"
 
 # ---------- 调度 ----------
 SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "true").lower() == "true"
@@ -62,6 +104,7 @@ DB_DISPLAY_NAMES = {
 # 备份方式（backup_type）中文映射：full / incremental / differential
 BACKUP_TYPE_DISPLAY_NAMES = {
     "full": "全量", "incremental": "增量", "differential": "差异",
+    "mixed": "组合",
 }
 
 # 备份模式（backup_mode）中文映射：logical / physical

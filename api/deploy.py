@@ -59,18 +59,15 @@ def create_deployment():
         return jsonify({"error": "数据库类型必填"}), 400
     if not data.get("host_id") and not data.get("direct_host"):
         return jsonify({"error": "请选择已纳管主机或直接输入 IP/账号/密码"}), 400
-    # 把 direct_* 合并到 config_json（因为表结构没这些列）
-    if data.get("direct_host") and not data.get("host_id"):
+    # 初始化/校验 config_json
+    cfg = {}
+    try:
+        cfg = json.loads(data.get("config_json") or "{}")
+    except Exception:
         cfg = {}
-        try:
-            cfg = json.loads(data.get("config_json") or "{}")
-        except Exception:
-            cfg = {}
-        cfg["direct_host"] = data.get("direct_host")
-        cfg["direct_port"] = data.get("direct_port") or 22
-        cfg["direct_user"] = data.get("direct_user") or "root"
-        cfg["direct_password"] = data.get("direct_password") or ""
-        data["config_json"] = json.dumps(cfg, ensure_ascii=False)
+    data["config_json"] = json.dumps(cfg, ensure_ascii=False)
+    data["direct_port"] = data.get("direct_port") or 22
+    data["direct_user"] = data.get("direct_user") or "root"
     dep_id = models.create_deployment(data)
     return jsonify({"id": dep_id, "ok": True}), 201
 
@@ -92,6 +89,15 @@ def update_deployment(dep_id):
     data = request.get_json(force=True, silent=True) or {}
     if not models.get_deployment(dep_id):
         return jsonify({"error": "部署记录不存在"}), 404
+    # 初始化/校验 config_json
+    cfg = {}
+    try:
+        cfg = json.loads(data.get("config_json") or "{}")
+    except Exception:
+        cfg = {}
+    data["config_json"] = json.dumps(cfg, ensure_ascii=False)
+    data["direct_port"] = data.get("direct_port") or 22
+    data["direct_user"] = data.get("direct_user") or "root"
     models.update_deployment(dep_id, data)
     return jsonify({"ok": True})
 

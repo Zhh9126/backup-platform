@@ -1,72 +1,88 @@
-# AI Agent Class Diagram
-
 classDiagram
-    class ToolRegistry {
-        +Dict~str,Tool~ tools
-        +register(tool: Tool) None
-        +get(name: str) Tool
-        +list_for_llm() List~Dict~
-        +list_all() List~Tool~
-    }
-    class Tool {
-        +str name
-        +str description
-        +dict parameters
-        +bool requires_confirm
-        +str api_endpoint
-        +str api_method
-        +execute(args: dict, context: dict) dict
-    }
-    class ToolExecutor {
-        +ToolRegistry registry
-        +str base_url
-        +call_internal_api(endpoint: str, method: str, args: dict, cookies: dict) dict
-        +execute_tool(name: str, args: dict, context: dict) dict
-        +validate_args(tool: Tool, args: dict) dict
-    }
-    class SessionManager {
-        +create_session(user_id: str) AgentSession
-        +get_session(id: str) AgentSession
-        +list_sessions(user_id: str) List
-        +add_message(session_id: str, role: str, content: str, **kwargs) int
-        +get_messages(session_id: str, limit: int) List
-        +delete_session(id: str) bool
-        +build_context(session_id: str, max_tokens: int) List~Dict~
-    }
-    class AIAgent {
-        +ToolRegistry registry
-        +ToolExecutor executor
-        +SessionManager session_mgr
-        +process_message(session_id: str, user_msg: str, context: dict) dict
-        +_react_loop(session_id: str, messages: List) dict
-        +_parse_tool_call(llm_text: str) dict
-        +_build_system_prompt() str
-        +_compose_messages(session_id: str, new_msg: str) List
-        +_call_model_with_messages(messages: List) dict
-    }
-    class AgentSession {
-        +str id
-        +str user_id
-        +str title
-        +str created_at
-        +str updated_at
-        +int message_count
-    }
-    class AgentMessage {
+    class SSHHost {
         +int id
-        +str session_id
-        +str role
-        +str content
-        +dict tool_calls
-        +str tool_name
-        +dict tool_result
-        +int tokens_used
-        +str created_at
+        +str name
+        +str host_key
+        +str hostname
+        +int port
+        +str username
+        +str password
+        +str os_type
     }
-    ToolRegistry --> Tool : manages
-    ToolExecutor --> ToolRegistry : uses
-    AIAgent --> ToolRegistry : references
-    AIAgent --> ToolExecutor : delegates execution
-    AIAgent --> SessionManager : manages context
-    SessionManager --> AgentSession : CRUD
-    SessionManager --> AgentMessage : CRUD
+    class PluginManifest {
+        +str id
+        +str name
+        +str category
+        +list required_clients
+        +list supports
+        +dict packages
+        +list verify_after_install
+    }
+    class PluginHostState {
+        +int id
+        +int host_id
+        +str host_key
+        +str plugin_id
+        +str status
+        +str version
+        +str method
+        +str extract_dir
+        +str found_paths
+        +str message
+    }
+    class PluginRuntime {
+        +BUNDLED_PHYSICAL_TOOLS dict
+        +bundled_physical_tools(db_type) list
+        +external_plugins_for_db_type(db_type) list
+        +remote_detect_os(ssh_host) str
+        +remote_detect_package_manager(ssh_host) str
+        +remote_check_clients(ssh_host, tools) dict
+        +remote_bin_version(ssh_host, bin, args) str
+    }
+    class PluginCatalog {
+        +load_all() dict
+        +check_installed(manifest, ssh_host) dict
+        +check_installed_on_host(plugin_id, ssh_host) dict
+        +list_plugins(host_id) list
+        +get_plugin(pid, host_id) dict
+        +recommend_for_host(db_types, host_id) list
+        +external_plugins_for_host(host_id) list
+    }
+    class PluginInstaller {
+        +install(plugin_id, host_id) dict
+        +uninstall(plugin_id, host_id) dict
+        +get_state(plugin_id, host_id) dict
+        +_select_strategy(manifest, ssh_host) dict
+        +_remote_run_command(ssh_host, cmd, key) dict
+        +_download_then_sftp_extract(ssh_host, strategy, key) dict
+        +_verify_remote(manifest, ssh_host, key) dict
+        +_upsert_state(key, plugin_id, host_id, host_key, state) None
+    }
+    class RemoteDump {
+        +_connect(ssh_host) client
+        +_wrap_login(shell) str
+        +_resolve_remote_bin(client, tool) str
+        +remote_has_tool(ssh_host, tool) bool
+        +remote_exec_capture(ssh_host, shell, timeout) dict
+        +sftp_put(ssh_host, local_path, remote_path) None
+    }
+    class BackupEngine {
+        +db_type str
+        +required_clients list
+        +physical_bundled_tools list
+        +physical_external_plugins list
+        +check_client() tuple
+        +preflight() tuple
+        +_preflight_remote_physical(ssh_host) tuple
+    }
+
+    PluginInstaller --> PluginCatalog : 读 manifest / 状态
+    PluginInstaller --> SSHHost : 解析安装目标
+    PluginInstaller --> RemoteDump : 远端执行 / SFTP
+    PluginInstaller --> PluginHostState : 写入状态
+    PluginCatalog --> PluginManifest : 加载
+    PluginCatalog --> PluginHostState : 读状态
+    PluginCatalog --> PluginRuntime : 远端探测
+    BackupEngine --> PluginRuntime : 分类 + 远端检查
+    BackupEngine --> PluginCatalog : check_installed_on_host
+    BackupEngine --> RemoteDump : resolve_ssh_host

@@ -9,8 +9,8 @@ mysqldump 与 mysql 完成逻辑备份与恢复。
 - 明文密码绝不进入命令行参数，统一写入临时选项文件
   (.cnf, 权限 0600)，命令中以 --defaults-extra-file 引用，
   结束（或异常）时务必删除该临时文件。
-- 备份/恢复均优先走 _should_simulate() 仿真兜底（DEMO_MODE、
-  客户端缺失、demo_only 等场景），保证平台在无客户端环境也可演示。
+- 自 2026-08-14 起不再提供仿真/兜底占位备份；客户端或连接
+  缺失时任务直接失败。
 - 仅使用 Python 标准库 + 外部客户端，不引入任何第三方依赖。
 """
 import os
@@ -34,6 +34,8 @@ class MySQLEngine(BackupEngine):
     display_name = "MySQL"
     # mysqldump 负责导出，mysql 负责执行恢复 SQL
     required_clients = ["mysqldump", "mysql"]
+    # 物理备份：外部插件（至少有一个就放行，不需要全部）
+    physical_external_plugins = ["percona-xtrabackup-80", "percona-xtrabackup-24", "mariabackup"]
 
     # ------------------------------------------------------------------ #
     # 内部辅助：临时选项文件（承载明文密码，避免泄露到进程参数）
@@ -72,6 +74,24 @@ class MySQLEngine(BackupEngine):
         except (json.JSONDecodeError, ValueError, TypeError):
             return {}
 
+    def _server_version(self, host: str = None, port: int = None):
+        """探测目标 MySQL 大/中版本号，返回 (major, minor) 元组。
+
+        用于在不同版本间切换兼容的命令行选项（如 GTID 相关参数）。
+        探测失败时保守返回 (8, 0)，即按现代版本处理。
+        """
+        try:
+            res = self._exec_sql("SELECT VERSION();", host=host, port=port)
+            if res.get("returncode") != 0:
+                return (8, 0)
+            out = res.get("stdout", "") or ""
+            m = __import__("re").search(r"(\d+)\.(\d+)\.", out)
+            if m:
+                return (int(m.group(1)), int(m.group(2)))
+        except Exception:
+            pass
+        return (8, 0)
+
     def _add_target(self, dump_args: list, db_name: str, extra: dict) -> None:
         """根据 extra_options 决定 mysqldump 的库/表范围。"""
         tables = extra.get("tables") or []
@@ -100,60 +120,42 @@ class MySQLEngine(BackupEngine):
         quoted = " ".join(shlex.quote(a) for a in dump_args)
         comp = self.pipe_compress(algo)
         comp_str = " ".join(shlex.quote(c) for c in comp)
+        pv = self._pv_throttle()
+        pv_str = (" | " + " ".join(shlex.quote(p) for p in pv)) if pv else ""
         if algo == "none":
-            # 纯文本：直接重定向
+            # 纯文本：直接重定向（限速不适配纯文本重定向，仅压缩路径限速）
             return f"{quoted} > {shlex.quote(out_path)}"
         if raw_path:
-            # mysqldump | tee 原始副本 | 压缩 > 产物
+            # mysqldump | tee 原始副本 | [pv 限速] | 压缩 > 产物
             return (f"set -o pipefail; {quoted} | tee {shlex.quote(raw_path)} "
-                    f"| {comp_str} > {shlex.quote(out_path)}")
-        return f"set -o pipefail; {quoted} | {comp_str} > {shlex.quote(out_path)}"
+                    f"{pv_str} | {comp_str} > {shlex.quote(out_path)}")
+        return f"set -o pipefail; {quoted}{pv_str} | {comp_str} > {shlex.quote(out_path)}"
 
     # ------------------------------------------------------------------ #
     # 备份
     # ------------------------------------------------------------------ #
     def backup(self, backup_type: BackupType) -> BackupResult:
-        if self.task.get("demo_only"):
-            return self._simulate_backup(backup_type, "任务标记为演示(demo_only)")
-        if config.DEMO_MODE == "on":
-            return self._simulate_backup(backup_type, "DEMO_MODE=on 强制仿真")
+        # demo_only / DEMO_MODE 不再触发仿真，统一走真实备份；失败即失败。
 
         # 按备份模式分发：物理备份 vs 逻辑备份
         mode = self.backup_mode
         if mode == BackupMode.PHYSICAL:
-            return self._try_or_fallback(lambda: self._backup_physical(backup_type),
-                                         backup_type, "物理备份")
-        # 默认：逻辑备份（mysqldump）
-        return self._try_or_fallback(lambda: self._backup_logical(backup_type),
-                                     backup_type, "逻辑备份")
-
-    def _try_or_fallback(self, fn, backup_type, label):
-        """尝试本机执行 → SSH远程 → 返回错误。"""
-        try:
-            result = fn()
-            if result.success:
-                return result
-            reason = result.message or "未知错误"
-        except Exception as e:
-            reason = str(e)
-
-        from core import remote_dump
-        ssh_host = remote_dump.resolve_ssh_host(self.task)
-        if ssh_host:
-            self.logger.info("[%s] %s失败(%s)，改用SSH远程dump", self.task_name, label, reason)
-            try:
-                data = remote_dump.remote_db_dump(
-                    self.task, ssh_host, "mysql",
-                    int(self.task.get("compress") or 0))
-                ext = ".sql.gz" if int(self.task.get("compress") or 0) else ".sql"
-                return self._write_dump_file(data, backup_type, ssh_host, ext, "mysqldump")
-            except Exception as e:
-                reason = f"本机与SSH远程均失败: {e}"
-        return BackupResult(success=False, status=BackupStatus.FAILED, message=reason)
+            # 物理备份：优先 SSH 远端 xtrabackup/mariabackup，失败再回退本机
+            return self._try_remote_then_local(
+                lambda ssh_host: self._backup_physical_remote(ssh_host, backup_type),
+                lambda: self._backup_physical(backup_type),
+                "MySQL 物理备份(XtraBackup)",
+            )
+        # 逻辑备份：优先 SSH 远程执行，失败再回退本机
+        return self._try_remote_then_local(
+            lambda ssh_host: self._backup_logical_remote(ssh_host, backup_type),
+            lambda: self._backup_logical_local(backup_type),
+            "MySQL 逻辑备份(mysqldump)",
+        )
 
     # ------------------ 物理备份 (XtraBackup) ------------------
     def _backup_physical(self, backup_type: BackupType) -> BackupResult:
-        """物理备份：xtrabackup 全量/增量。参照 mysql_backup_webtool/物理备份.txt。"""
+        """物理备份：xtrabackup 全量/增量。"""
         xtrabackup = shutil.which("xtrabackup") or "/opt/xtrabackup/bin/xtrabackup"
         if not os.path.isfile(xtrabackup):
             return BackupResult(success=False, status=BackupStatus.FAILED,
@@ -212,8 +214,129 @@ class MySQLEngine(BackupEngine):
                             stdout=ret.stdout, simulated=False, checksum="",
                             message=f"MySQL 物理备份(XtraBackup)成功 {note}")
 
+    def _backup_physical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
+        """物理备份：通过 SSH 在远端数据库服务器以 xtrabackup/mariabackup 执行
+        全量物理备份，打包 tar.gz 后经 SFTP 拉回本机落盘并计算 size/sha256。
+
+        - 密码写入远端临时 my.cnf（0600），经 --defaults-extra-file 引用，避免
+          明文出现在进程参数(ps)中。
+        - xtrabackup 连接数据库走 TCP（--host/--port），故 SSH 登录身份无需是
+          数据库 OS 用户；远端目录 /tmp 世界可写，无需额外 chown。
+        - incremental/differential 在远端无基准目录跟踪，统一按全量(full)执行。
+        """
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+
+        ts = self._timestamp()
+        host = self.task.get("host") or "127.0.0.1"
+        port = self.task.get("port") or 3306
+        user = self.task.get("username") or "root"
+        pw = db.decrypt_secret(self.task.get("password") or "")
+
+        client = remote_dump._connect(ssh_host)
+        # 探测 xtrabackup，找不到回退 mariabackup
+        tool = remote_dump._resolve_remote_bin(client, "xtrabackup")
+        if not tool:
+            tool = remote_dump._resolve_remote_bin(client, "mariabackup")
+        if not tool:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message="远端主机未找到 xtrabackup / mariabackup，无法执行远端物理备份；"
+                        "请在远端安装 Percona XtraBackup 或 MariaDB Backup。")
+
+        remote_tmp = f"/tmp/mysql_xtra_{ts}"
+        remote_tar = f"{remote_tmp}.tar.gz"
+        remote_cnf = "/tmp/bk_xtrabackup.cnf"
+        sftp = client.open_sftp()
+        try:
+            # 1) 写临时 my.cnf（承载明文密码，0600，避免 ps 泄露）
+            with sftp.open(remote_cnf, "w") as f:
+                f.write(f"[client]\nuser={user}\npassword={pw}\n")
+            try:
+                sftp.chmod(remote_cnf, 0o600)
+            except Exception:
+                pass
+
+            # 2) 创建远端备份目录（/tmp 世界可写，无需 chown）
+            prep = f"mkdir -p {remote_tmp}"
+            _ssh_exec_pipe(client, remote_dump._wrap_login(prep), timeout=60)
+
+            # 3) 远端执行：xtrabackup --backup -> tar czf（密码不在命令行）
+            inner = (
+                f"{tool} --backup --target-dir={remote_tmp} "
+                f"--defaults-extra-file={remote_cnf} "
+                f"--host={shlex.quote(host)} --port={port} --no-lock "
+                f"&& tar czf {remote_tar} -C {remote_tmp} ."
+            )
+            wrapped = remote_dump._wrap_login(inner)
+            start = time.time()
+            out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=7200)
+            duration = round(time.time() - start, 3)
+            out_text = out.decode("utf-8", "replace") if isinstance(out, bytes) else out
+            self.logger.info("[%s] 远端 xtrabackup 返回 rc=%s", self.task_name, rc)
+
+            if rc != 0:
+                snippet = (out_text or err)[-1200:]
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    duration_sec=duration, stdout=out_text, stderr=err,
+                    message=f"远端 XtraBackup 物理备份失败(rc={rc}): {snippet}")
+
+            # 4) SFTP 拉回 tar.gz 到本机，计算真实 size + sha256
+            out_dir = self._output_dir()
+            os.makedirs(out_dir, exist_ok=True)
+            local_path = os.path.join(out_dir, f"xtrabackup_{ts}.tar.gz")
+            sftp.get(remote_tar, local_path)
+
+            size = os.path.getsize(local_path)
+            checksum = db.sha256_file(local_path)
+            hk = ssh_host.get("host_key", "remote")
+            msg = (f"通过 SSH 在 {hk} 以 {os.path.basename(tool)} 执行 MySQL 物理备份成功，"
+                   f"已拉回 {local_path} ({db.human_size(size)})")
+            self.logger.info("[%s] %s", self.task_name, msg)
+
+            # 清理远端临时目录与 tar 包（best-effort，失败不致命）
+            try:
+                _ssh_exec_pipe(client, remote_dump._wrap_login(
+                    f"rm -rf {remote_tmp} {remote_tar}"), timeout=60)
+            except Exception:
+                pass
+
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=local_path, size_bytes=size, duration_sec=duration,
+                stdout=out_text, stderr=err, simulated=False,
+                checksum=checksum, message=msg)
+        finally:
+            try:
+                sftp.remove(remote_cnf)
+            except Exception:
+                pass
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
     # ------------------ 逻辑备份 (mysqldump) ------------------
-    def _backup_logical(self, backup_type: BackupType) -> BackupResult:
+    def _backup_logical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
+        """在 SSH 备份机/数据库服务器上执行 mysqldump，把流拉回到本地落盘。"""
+        from core import remote_dump
+        # 与本地逻辑备份对齐：统一由全局 COMPRESS_BY_DEFAULT 控制，远端优先 zstd
+        enable = getattr(config, "COMPRESS_BY_DEFAULT", True)
+        comp = 1 if enable else 0
+        extra = self._parse_extra_options()
+        # 默认禁用 GTID_PURGED；用户可通过 gtid_purged=true 显式保留。
+        extra_args = "--set-gtid-purged=OFF" if not extra.get("gtid_purged") else ""
+        data, compressed = remote_dump.remote_db_dump(self.task, ssh_host, "mysql", comp, extra_args)
+        # compressed 反映远端实际是否压缩（缺 zstd 时 remote_dump 会降级为不压缩）
+        suffix = ".sql.zst" if compressed else ".sql"
+        res = self._write_dump_file(data, backup_type, ssh_host, suffix, "mysqldump")
+        res.compress_algo = "zstd" if compressed else "none"
+        if not compressed and enable:
+            res.message = (res.message or "") + "（远端未安装 zstd，已降级为不压缩）"
+        return res
+
+    def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:
         """逻辑备份：mysqldump。支持分库/分表/仅结构/仅数据。"""
         host = self.task.get("host") or "127.0.0.1"
         port = self.task.get("port") or 3306
@@ -238,6 +361,15 @@ class MySQLEngine(BackupEngine):
                 "--host", str(host), "--port", str(port),
                 "--single-transaction", "--routines", "--triggers", "--events",
             ]
+
+            # 默认禁用 GTID_PURGED，避免恢复到已有 GTID 的实例时报 1840。
+            # 用户可通过 extra_options.gtid_purged=true 显式保留 GTID 信息。
+            # 版本兼容：GTID 自 5.6 引入，5.5 及更早版本无 GTID，
+            # 此时 --set-gtid-purged 选项本身不存在，传了会直接报错，故跳过。
+            if not extra.get("gtid_purged"):
+                major, minor = self._server_version(host=str(host), port=int(port))
+                if (major, minor) >= (5, 6):
+                    dump_args.append("--set-gtid-purged=OFF")
 
             note = ""
             # 分库/分表/仅结构/仅数据
@@ -312,22 +444,30 @@ class MySQLEngine(BackupEngine):
     # 恢复
     # ------------------------------------------------------------------ #
     def restore(self, backup_path: str, **kwargs) -> BackupResult:
-        if self.task.get("demo_only"):
-            return self._simulate_restore(backup_path, "任务标记为演示(demo_only)")
-        if config.DEMO_MODE == "on":
-            return self._simulate_restore(backup_path, "DEMO_MODE=on 强制仿真")
+        logs = [f"[MySQL 恢复] 备份文件: {backup_path}",
+                f"[MySQL 恢复] 任务: {self.task_name} ({self.task.get('host')}:{self.task.get('port')})"]
+
+        # demo_only / DEMO_MODE 不再触发仿真；客户端或连接缺失直接失败。
 
         # 0) 跨主机恢复：SFTP 推送到目标主机 → SSH 远程执行 mysql
         target_host_info = kwargs.get("target_host_info")
         if target_host_info:
             target_db = kwargs.get("target_db") or self.task.get("db_name") or ""
-            self.logger.info("[%s] 跨主机恢复 -> %s", self.task_name,
-                             target_host_info.get("hostname"))
-            return self._try_cross_host_restore(backup_path, target_host_info, target_db)
+            logs.append(f"[跨主机恢复] 目标: {target_host_info.get('hostname')}, 目标库: {target_db}")
+            res = self._try_cross_host_restore(backup_path, target_host_info, target_db)
+            res.detail_log = "\n".join(logs) + "\n" + (res.detail_log or res.stderr or res.stdout or "")
+            return res
 
         # 1) 先尝试本机直接执行 mysql 恢复
+        logs.append("[本机恢复] 尝试本地执行 mysql 恢复...")
         result = self._restore_local(backup_path, **kwargs)
+        logs.append(f"[本机恢复] success={result.success}, message={result.message}")
+        if result.stdout:
+            logs.append(f"[本机恢复 stdout]\n{result.stdout}")
+        if result.stderr:
+            logs.append(f"[本机恢复 stderr]\n{result.stderr}")
         if result.success:
+            result.detail_log = "\n".join(logs)
             return result
 
         # 2) 本机失败 -> 尝试通过 SSH 在数据库服务器执行恢复
@@ -335,28 +475,70 @@ class MySQLEngine(BackupEngine):
         from core import remote_dump
         ssh_host = remote_dump.resolve_ssh_host(self.task)
         if ssh_host and os.path.exists(backup_path):
+            hk = ssh_host.get("host_key")
+            logs.append(f"[远程恢复] 本机恢复失败({reason})，改用 SSH 在数据库服务器执行恢复 (host={hk})")
             self.logger.info(
                 "[%s] 本机恢复失败(%s)，改用 SSH 在数据库服务器执行恢复 (host=%s)",
-                self.task_name, reason, ssh_host.get("host_key"))
+                self.task_name, reason, hk)
             try:
                 with open(backup_path, "rb") as f:
                     dump_bytes = f.read()
+                logs.append(f"[远程恢复] 备份文件读取完成，大小 {len(dump_bytes)} bytes")
                 remote_dump.remote_db_restore(
                     self.task, ssh_host, "mysql", dump_bytes)
                 target_db = kwargs.get("target_db") or self.task.get("db_name")
+                msg = "通过 SSH 在数据库服务器恢复成功" + (f"（目标库: {target_db}）" if target_db else "")
+                logs.append(f"[远程恢复] {msg}")
                 return BackupResult(
                     success=True, status=BackupStatus.SUCCESS,
-                    backup_path=backup_path,
-                    message="通过 SSH 在数据库服务器恢复成功"
-                            + (f"（目标库: {target_db}）" if target_db else ""))
+                    backup_path=backup_path, message=msg,
+                    detail_log="\n".join(logs))
             except Exception as e:
                 self.logger.error("[%s] 远程恢复也失败: %s", self.task_name, e)
                 reason = f"本机与远程恢复均失败: {e}"
+                logs.append(f"[远程恢复] 失败: {e}")
 
         # 3) 返回真实错误
+        logs.append(f"[结果] 失败原因: {reason}")
         return BackupResult(
             success=False, status=BackupStatus.FAILED,
-            backup_path=backup_path, message=reason)
+            backup_path=backup_path, message=reason,
+            detail_log="\n".join(logs))
+
+    def _exec_sql(self, sql: str, host: str = None, port: int = None,
+                  target_db: str = None) -> dict:
+        """通过 mysql 客户端执行一条 SQL，返回 {"returncode", "stdout", "stderr"}。"""
+        user = self.task.get("username") or ""
+        pw = db.decrypt_secret(self.task.get("password") or "")
+        host = host or self.task.get("host") or "127.0.0.1"
+        port = port or self.task.get("port") or 3306
+        cnf = self._make_cnf(user, pw)
+        try:
+            args = [
+                "mysql",
+                f"--defaults-extra-file={cnf}",
+                "--host", str(host),
+                "--port", str(port),
+            ]
+            if target_db:
+                args.append(target_db)
+            # 将 SQL 以 stdin 喂入 mysql，避免 shell 管道在 Windows 下不可用
+            return self._run_with_stdin(args, sql)
+        finally:
+            self._cleanup_cnf(cnf)
+
+    def _reset_gtid_before_restore(self, host: str = None, port: int = None) -> None:
+        """恢复前清空目标库 GTID，避免导入含 GTID_PURGED 的备份时报 1840。
+
+        注意：这会清空 binlog 与 GTID 状态，仅应在恢复/演练环境中使用。
+        """
+        res = self._exec_sql("RESET MASTER;", host=host, port=port)
+        if res["returncode"] != 0:
+            # 8.4+ 改为 RESET BINARY LOGS AND GTID_EXECUTION，老版本会报语法错误
+            res2 = self._exec_sql("RESET BINARY LOGS AND GTID_EXECUTION;", host=host, port=port)
+            if res2["returncode"] != 0:
+                self.logger.warning("[%s] 恢复前 RESET MASTER 失败: %s",
+                                    self.task_name, res.get("stderr", ""))
 
     def _restore_local(self, backup_path: str, **kwargs) -> BackupResult:
         # 连接参数
@@ -371,6 +553,9 @@ class MySQLEngine(BackupEngine):
         try:
             cnf = self._make_cnf(user, pw)
 
+            # 恢复前先清空 GTID，避免 1840 错误
+            self._reset_gtid_before_restore(host=host, port=port)
+
             # mysql 客户端基础参数
             mysql_args = [
                 "mysql",
@@ -380,19 +565,13 @@ class MySQLEngine(BackupEngine):
             ]
             if target_db:
                 mysql_args.append(target_db)
-            quoted = " ".join(shlex.quote(a) for a in mysql_args)
 
-            # 依据压缩算法选择解压流式恢复或直接恢复
-            # 统一使用 pipe_decompress：zstd(.zst) / gzip(.gz) 均可正确解压恢复
-            # 加 set -o pipefail 防止解压失败时 mysql 仍执行成功
-            if backup_path.endswith((".gz", ".zst")):
-                dec = self.pipe_decompress("zstd" if backup_path.endswith(".zst") else "gzip")
-                dec_str = " ".join(shlex.quote(c) for c in dec)
-                inner = f"set -o pipefail; {dec_str} {shlex.quote(backup_path)} | {quoted}"
-            else:
-                inner = f"{quoted} < {shlex.quote(backup_path)}"
-
-            res = self._run(["sh", "-c", inner])
+            # 跨平台恢复：把备份文件（自动解压）作为 mysql 的 stdin 喂入，
+            # 不再使用 shell 重定向 `< "含中文/空格路径"`，避免 Windows 下
+            # `cmd /c` 报 "文件名、目录名或卷标语法不正确"，也避免 POSIX 下
+            # 依赖 `sh` 造成命令不存在。压缩文件在基类 _read_decompressed
+            # 中统一解压，保证 zstd / gzip 均可正确恢复。
+            res = self._run(mysql_args, input_file=backup_path)
             duration = round(time.time() - start, 3)
             if res["returncode"] != 0:
                 return BackupResult(
@@ -409,6 +588,97 @@ class MySQLEngine(BackupEngine):
                         + (f"（目标库: {target_db}）" if target_db else "（沿用备份中的库名）"))
         finally:
             self._cleanup_cnf(cnf)
+
+    # ------------------------------------------------------------------ #
+    # 恢复校验
+    # ------------------------------------------------------------------ #
+    def verify_record(self, record: dict, options: dict = None) -> BackupResult:
+        """MySQL 恢复校验：逻辑备份检查 SQL 头；物理备份尝试 xtrabackup --prepare。"""
+        options = options or {}
+        backup_path = record.get("backup_path") or record.get("output_path") or ""
+        if not backup_path or not os.path.exists(backup_path):
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message=f"备份文件不存在: {backup_path}")
+        if backup_path.endswith(".sim"):
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="mysql: 不支持仿真备份校验，请使用真实备份", verified=False)
+
+        mode = record.get("backup_mode") or self.backup_mode
+        size = os.path.getsize(backup_path)
+
+        # 物理备份：优先 xtrabackup --prepare --apply-log-only
+        if mode == BackupMode.PHYSICAL:
+            xtrabackup = shutil.which("xtrabackup") or shutil.which("mariabackup")
+            if xtrabackup:
+                import tempfile
+                import shutil as _shutil
+                recovery_pool = options.get("recovery_pool") or ""
+                if recovery_pool and os.path.isdir(recovery_pool):
+                    temp_dir = os.path.join(recovery_pool, f"verify_{self.task_id}_{int(time.time())}")
+                else:
+                    temp_dir = tempfile.mkdtemp(prefix=f"mysql_verify_{self.task_id}_")
+                try:
+                    os.makedirs(temp_dir, exist_ok=True)
+                    is_xbstream = backup_path.endswith(".xbstream")
+                    if is_xbstream:
+                        # 先解压 xbstream
+                        extract_cmd = [xtrabackup, "--extract",
+                                       f"--target-dir={temp_dir}",
+                                       f"--stream=xbstream", "<", backup_path]
+                        res = self._run(["sh", "-c", " ".join(extract_cmd)], timeout=3600)
+                        if res["returncode"] != 0:
+                            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                                message=f"mysql: xbstream extract failed: {res['stderr']}")
+                    else:
+                        # 复制/解压 tar 到临时目录
+                        if backup_path.endswith((".tar.gz", ".tgz")):
+                            self._run(["tar", "-xzf", backup_path, "-C", temp_dir], timeout=3600)
+                        elif backup_path.endswith((".tar", ".tar.bz2")):
+                            algo = "j" if backup_path.endswith(".bz2") else ""
+                            self._run(["tar", f"-x{algo}f", backup_path, "-C", temp_dir], timeout=3600)
+                        else:
+                            _shutil.copytree(backup_path, temp_dir, dirs_exist_ok=True)
+                    prepare_cmd = [xtrabackup, "--prepare",
+                                   f"--target-dir={temp_dir}"]
+                    res = self._run(prepare_cmd, timeout=7200)
+                    if res["returncode"] != 0:
+                        return BackupResult(success=False, status=BackupStatus.FAILED,
+                                            message=f"mysql: xtrabackup prepare failed: {res['stderr']}")
+                    return BackupResult(success=True, status=BackupStatus.SUCCESS,
+                                        message="mysql: xbstream extracted and prepared",
+                                        verified=True, size_bytes=size)
+                finally:
+                    if os.path.isdir(temp_dir):
+                        _shutil.rmtree(temp_dir, ignore_errors=True)
+            else:
+                return BackupResult(success=True, status=BackupStatus.SUCCESS,
+                                    message="mysql: xtrabackup not available, file verified",
+                                    verified=True, size_bytes=size)
+
+        # 逻辑备份：检查文件头
+        try:
+            opener = open
+            if backup_path.endswith(".gz"):
+                import gzip
+                opener = gzip.open
+            elif backup_path.endswith(".zst"):
+                import zstandard as zstd
+                opener = zstd.open
+            with opener(backup_path, "rb") as f:
+                header = f.read(200)
+            if not header:
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                    message="mysql: dump header empty")
+            text = header.decode("utf-8", "ignore")
+            if any(text.startswith(p) for p in ("--", "/*!", "/*M!", "DROP TABLE", "CREATE TABLE")):
+                return BackupResult(success=True, status=BackupStatus.SUCCESS,
+                                    message="mysql: logical dump header verified",
+                                    verified=True, size_bytes=size)
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="mysql: dump header invalid")
+        except Exception as e:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message=f"mysql: verify error: {e}")
 
     # ------------------------------------------------------------------ #
     # 合成全量（增量链合并，Phase 1）
@@ -442,10 +712,12 @@ class MySQLEngine(BackupEngine):
                 elif s.get("set_type") == "incremental":
                     incs.append(s)
 
-        # 2) DEMO / 客户端缺失：生成仿真合成全量
+        # 2) 客户端缺失直接失败，不再生成仿真合成全量
         sim, _reason = self._should_simulate()
         if sim:
-            return self._synthesize_full_simulated(base, incs, target_storage_tier)
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message=f"缺少必要客户端/连接，无法合成全量: {_reason}")
 
         # 3) 物理模式：xtrabackup 合并
         if self.backup_mode == BackupMode.PHYSICAL:
@@ -455,44 +727,23 @@ class MySQLEngine(BackupEngine):
         return self._synthesize_full_logical(base, incs, target_storage_tier)
 
     def _synthesize_full_simulated(self, base, incs, target_storage_tier):
-        d = self._output_dir()
-        ts = self._timestamp()
-        fname = f"{ts}__{self.task_name}__synthetic_full.sim"
-        fpath = os.path.join(d, fname)
-        chain = []
-        if base:
-            chain.append(base.get("object_key") or f"set#{base.get('id')}")
-        chain += [i.get("object_key") or f"set#{i.get('id')}" for i in incs]
-        payload = {
-            "simulated": True,
-            "note": "合成全量(仿真)：将增量链合并为一份完整备份集的占位产物",
-            "task_id": self.task_id, "task_name": self.task_name,
-            "db_type": self.db_type,
-            "chain": chain, "merged_incremental_count": len(incs),
-            "generated_at": db.now_iso(),
-        }
-        with open(fpath, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        size = os.path.getsize(fpath)
-        self.logger.info("[%s] 合成全量(仿真) 完成，合并 %d 个增量",
-                         self.task_name, len(incs))
+        """已不再使用，保留方法签名仅作兼容。"""
         return BackupResult(
-            success=True, status=BackupStatus.SIMULATED,
-            backup_path=fpath, size_bytes=size, simulated=True,
-            checksum=db.sha256_file(fpath),
-            message=f"合成全量(仿真)成功，合并 {len(incs)} 个增量")
+            success=False, status=BackupStatus.FAILED,
+            message="不再支持仿真合成全量")
 
     def _synthesize_full_physical(self, base, incs, target_storage_tier):
         xtrabackup = shutil.which("xtrabackup") or "/opt/xtrabackup/bin/xtrabackup"
         if not os.path.isfile(xtrabackup) or not base or not base.get("object_key"):
-            # 缺少 xtrabackup 或全量基：退化为仿真，保证链路闭环
-            self.logger.warning(
-                "[%s] 物理合成全量缺少 xtrabackup 或全量基，退化仿真",
-                self.task_name)
-            return self._synthesize_full_simulated(base, incs, target_storage_tier)
+            # 缺少 xtrabackup 或全量基：直接失败
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message="物理合成全量缺少 xtrabackup 或全量基")
         base_dir = base["object_key"]
         if not os.path.isdir(base_dir):
-            return self._synthesize_full_simulated(base, incs, target_storage_tier)
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message="物理合成全量基目录不存在: " + str(base_dir))
         # 按增量顺序逐层 prepare（--incremental-dir 可重复叠加）
         cmd = [xtrabackup, "--prepare", f"--target-dir={base_dir}"]
         for inc in incs:
@@ -561,10 +812,7 @@ class MySQLEngine(BackupEngine):
 
         至少传入一对（pos 或 datetime）。
         """
-        if self.task.get("demo_only") or config.DEMO_MODE == "on":
-            return self._simulate_backup(
-                BackupType.INCREMENTAL,
-                "演示环境 binlog 抽取以仿真方式返回")
+        # 不再支持仿真；客户端/连接缺失即失败
 
         # mysqlbinlog 必须就绪
         mb = shutil.which("mysqlbinlog")

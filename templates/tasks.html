@@ -64,11 +64,58 @@
                   </select>
                 </div>
                 <div class="col-md-3">
+                  <label class="form-label">备份方式 *</label>
+                  <select class="form-select" id="t_backup_mode">
+                    <option value="logical">逻辑备份 (推荐)</option>
+                    <option value="physical">物理备份</option>
+                  </select>
+                </div>
+                <div class="col-md-3">
                   <label class="form-label">备份类型 *</label>
                   <select class="form-select" id="t_backup_type">
                     <option value="full">全量备份</option>
                     <option value="incremental">增量备份</option>
+                    <option value="mixed">组合（全量+增量）</option>
                   </select>
+                </div>
+                <div class="col-md-9 d-none" id="t_mixed_schedule_box">
+                  <div class="alert alert-light py-2 mb-2 small text-muted" id="t_schedule_tip">
+                    组合备份：分别设置「全量」与「增量」的运行星期与时间。例如全量勾选周一 02:00，增量勾选周二~周日 02:00。不勾选任何星期 = 该子任务不自动调度（可手动触发）。
+                  </div>
+                  <div class="row g-3">
+                    <div class="col-md-6 border-end" id="t_full_schedule_col">
+                      <label class="form-label text-primary">全量调度（按天）</label>
+                      <div class="d-flex flex-wrap gap-1 mb-2" id="t_full_days">
+                        <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="0" id="t_full_d0"><label class="form-check-label small" for="t_full_d0">一</label></div>
+                        <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="1" id="t_full_d1"><label class="form-check-label small" for="t_full_d1">二</label></div>
+                        <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="2" id="t_full_d2"><label class="form-check-label small" for="t_full_d2">三</label></div>
+                        <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="3" id="t_full_d3"><label class="form-check-label small" for="t_full_d3">四</label></div>
+                        <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="4" id="t_full_d4"><label class="form-check-label small" for="t_full_d4">五</label></div>
+                        <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="5" id="t_full_d5"><label class="form-check-label small" for="t_full_d5">六</label></div>
+                        <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="6" id="t_full_d6"><label class="form-check-label small" for="t_full_d6">日</label></div>
+                      </div>
+                      <div class="input-group input-group-sm">
+                        <span class="input-group-text">时间</span>
+                        <input type="time" class="form-control" id="t_full_time" value="02:00">
+                      </div>
+                    </div>
+                    <div class="col-md-6" id="t_incremental_schedule_col">
+                      <label class="form-label text-success">增量调度（按天）</label>
+                      <div class="d-flex flex-wrap gap-1 mb-2" id="t_incremental_days">
+                        <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="0" id="t_inc_d0"><label class="form-check-label small" for="t_inc_d0">一</label></div>
+                        <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="1" id="t_inc_d1"><label class="form-check-label small" for="t_inc_d1">二</label></div>
+                        <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="2" id="t_inc_d2"><label class="form-check-label small" for="t_inc_d2">三</label></div>
+                        <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="3" id="t_inc_d3"><label class="form-check-label small" for="t_inc_d3">四</label></div>
+                        <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="4" id="t_inc_d4"><label class="form-check-label small" for="t_inc_d4">五</label></div>
+                        <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="5" id="t_inc_d5"><label class="form-check-label small" for="t_inc_d5">六</label></div>
+                        <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="6" id="t_inc_d6"><label class="form-check-label small" for="t_inc_d6">日</label></div>
+                      </div>
+                      <div class="input-group input-group-sm">
+                        <span class="input-group-text">时间</span>
+                        <input type="time" class="form-control" id="t_incremental_time" value="02:00">
+                      </div>
+                    </div>
+                  </div>
                 </div>
                 <div class="col-md-6">
                   <label class="form-label">主机地址 *</label>
@@ -101,39 +148,36 @@
             <div class="tab-pane fade" id="tab_advanced" role="tabpanel">
               <div class="row g-3">
                 <div class="col-md-4">
-                  <label class="form-label">备份模式</label>
-                  <select class="form-select" id="t_backup_mode">
-                    <option value="logical">逻辑备份 (推荐)</option>
-                    <option value="physical">物理备份</option>
-                  </select>
-                </div>
-                <div class="col-md-4">
-                  <label class="form-label">调度类型</label>
-                  <select class="form-select" id="t_schedule_type">
-                    <option value="none">手动</option>
-                    <option value="cron">Cron 表达式</option>
-                    <option value="interval">间隔(分钟)</option>
-                  </select>
-                </div>
-                <div class="col-md-4">
-                  <label class="form-label">Cron 表达式 / 间隔分钟</label>
-                  <input class="form-control" id="t_schedule_expr" placeholder="如 0 2 * * * 或 60">
-                </div>
-                <div class="col-md-4">
                   <label class="form-label">保留天数</label>
                   <input type="number" class="form-control" id="t_retention_days" value="30">
-                </div>
-                <div class="col-md-4">
-                  <label class="form-label">远程备份目标</label>
-                  <input class="form-control" id="t_remote_path" placeholder="可选, 如 ssh://user@host:/path">
                 </div>
                 <div class="col-md-4">
                   <label class="form-label">加密密码</label>
                   <input class="form-control" id="t_encrypt_pwd" type="password" placeholder="可选">
                 </div>
-                <div class="col-md-12">
-                  <label class="form-label">备注</label>
-                  <textarea class="form-control" id="t_remark" rows="2"></textarea>
+                <div class="col-md-4">
+                  <label class="form-label">存储池加密</label>
+                  <div class="form-check form-switch mt-2">
+                    <input class="form-check-input" type="checkbox" id="t_encrypt_pool">
+                    <label class="form-check-label" for="t_encrypt_pool">启用 AES-256-GCM 存储池加密</label>
+                  </div>
+                  <div class="form-text">需在服务端设置环境变量 BACKUP_POOL_KEY；否则备份时自动跳过加密</div>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">流量控制（限速）</label>
+                  <div class="input-group input-group-sm">
+                    <input type="number" class="form-control" id="t_bandwidth_limit" min="0" value="0">
+                    <span class="input-group-text">KB/s</span>
+                  </div>
+                  <div class="form-text">0 = 不限速；Linux 部署机需安装 pv 才能生效</div>
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">压缩级别</label>
+                  <div class="input-group input-group-sm">
+                    <input type="number" class="form-control" id="t_compress_level" min="0" max="22" value="0">
+                    <span class="input-group-text">0=默认</span>
+                  </div>
+                  <div class="form-text">0 跟随引擎默认（zstd 10）；1~22 自定义压缩级别</div>
                 </div>
               </div>
             </div>
@@ -151,7 +195,16 @@
                       <button class="btn btn-outline-primary btn-sm" type="button" id="t_db_picker_btn">
                         <i class="bi bi-arrow-clockwise"></i> 拉取库列表
                       </button>
+                      <button class="btn btn-outline-secondary btn-sm" type="button" id="t_jdbc_test_btn"
+                              title="通过 JDBC 驱动直连数据库测试连通性（无需 SSH / 数据库客户端）">
+                        <i class="bi bi-plugin"></i> JDBC 测试
+                      </button>
                       <span class="form-control form-control-sm text-muted" id="t_db_picker_status">点击按钮连接数据库并拉取</span>
+                    </div>
+                  </div>
+                  <div id="t_jdbc_test_result" class="col-md-8 d-none">
+                    <div class="alert alert-light border small py-2 mb-0" id="t_jdbc_test_msg">
+                      <i class="bi bi-plug"></i> <span></span>
                     </div>
                   </div>
                 </div>

@@ -199,4 +199,87 @@
   <div class="alert alert-success d-none mt-3" id="aiModelTestResult"></div>
   <div class="small text-muted d-none mt-1" id="aiModelTestHint"></div>
 </div>
+
+<!-- 存储池加密密钥 (KMS) -->
+<div class="page-card">
+  <div class="card-section-title">
+    <i class="bi bi-shield-lock me-1"></i> 存储池加密密钥（KMS）
+    <span class="badge ms-2" id="poolCryptoStatusBadge">未启用</span>
+  </div>
+  <p class="form-text-hint mb-3">
+    配置 AES-256-GCM 存储池加密的主密钥来源。备份任务勾选「存储池加密」后，落盘产物以密文存储（参照白皮书 §2.6）。
+    支持两种来源：<b>本地密钥库</b>（平台托管主密钥，存于数据库，页面不回显明文）或 <b>外部 KMS</b>（运行时从 KMS 拉取主密钥）。
+    环境变量 <code>BACKUP_POOL_KEY</code> 优先级最高，会覆盖本页面配置。
+  </p>
+
+  <div class="row g-3">
+    <div class="col-md-3">
+      <label class="form-label small">密钥来源</label>
+      <select class="form-select form-select-sm" id="pc_mode" onchange="togglePoolCryptoFields()">
+        <option value="local">本地密钥库</option>
+        <option value="kms">外部 KMS</option>
+      </select>
+    </div>
+
+    <!-- 本地密钥库 -->
+    <div class="col-md-9" id="pc_local_fields">
+      <label class="form-label small">主密钥（明文填写一次，存库不回显）</label>
+      <input type="password" class="form-control form-control-sm" id="pc_pool_key"
+             placeholder="建议 ≥16 位随机字符串，如 openssl rand -hex 32">
+      <div class="form-text" id="pc_local_status">尚未保存</div>
+    </div>
+
+    <!-- KMS -->
+    <div class="col-md-12 d-none" id="pc_kms_fields">
+      <div class="row g-3">
+        <div class="col-md-3">
+          <label class="form-label small">KMS 厂商</label>
+          <select class="form-select form-select-sm" id="pc_kms_provider">
+            <option value="custom">自托管 / 通用</option>
+            <option value="aws">AWS KMS</option>
+            <option value="aliyun">阿里云 KMS</option>
+            <option value="tencent">腾讯云 KMS</option>
+            <option value="vault">HashiCorp Vault</option>
+          </select>
+        </div>
+        <div class="col-md-5">
+          <label class="form-label small">KMS Endpoint</label>
+          <input type="text" class="form-control form-control-sm" id="pc_kms_endpoint"
+                 placeholder="如 https://kms.your-intranet/decrypt">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label small">Key ID / 密钥句柄</label>
+          <input type="text" class="form-control form-control-sm" id="pc_kms_key_id" placeholder="如 alias/backup-pool-key">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label small">Access Key</label>
+          <input type="text" class="form-control form-control-sm" id="pc_kms_access_key">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label small">Secret</label>
+          <input type="password" class="form-control form-control-sm" id="pc_kms_secret" placeholder="留空表示不修改">
+        </div>
+        <div class="col-md-4">
+          <label class="form-label small">本地回退主密钥</label>
+          <input type="password" class="form-control form-control-sm" id="pc_local_fallback_key"
+                 placeholder="KMS 不可达时回退（可选）">
+        </div>
+        <div class="col-12">
+          <button class="btn btn-outline-info btn-sm" id="pcTestKmsBtn" type="button">
+            <i class="bi bi-plug me-1"></i>测试 KMS 连通性
+          </button>
+          <span class="form-text ms-2 text-muted" id="pc_kms_test_result"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-12 d-flex gap-2 align-items-center">
+      <button class="btn btn-primary btn-sm" id="pcSaveBtn">
+        <i class="bi bi-save me-1"></i>保存加密密钥配置
+      </button>
+      <span class="form-text ms-2 text-muted" id="pc_save_result"></span>
+    </div>
+  </div>
+  <div class="alert alert-danger d-none mt-3" id="pcError"></div>
+</div>
 {% endblock %}

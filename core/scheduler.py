@@ -268,7 +268,7 @@ def _execute_backup(task: dict, backup_type: str = None,
 
 
 def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
-    from core.engines.base import BackupResult
+    from core.engines.base import BackupResult, BackupStatus
     # 解析保护策略：取该任务的并行度/备份策略（供调度与并发控制参考）
     try:
         from core.policy import policy_service
@@ -295,14 +295,14 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
         # 备份前置检查：物理备份必须有真实客户端；逻辑备份允许仿真兜底
         pre_ok, pre_detail = engine.preflight()
         if not pre_ok:
-            result = BackupResult(success=False, message=pre_detail)
+            result = BackupResult(success=False, status=BackupStatus.FAILED, message=pre_detail)
             _logger.warning("备份前置检查失败 task=%s: %s", task["id"], pre_detail)
         else:
             if pre_detail and pre_detail != "ok":
                 _logger.info("备份前置提示 task=%s: %s", task["id"], pre_detail)
             result = engine.backup(bt)
     except Exception as e:
-        result = BackupResult(success=False, message=f"执行异常: {e}")
+        result = BackupResult(success=False, status=BackupStatus.FAILED, message=f"执行异常: {e}")
         _logger.exception("备份异常 task=%s", task["id"])
 
     finished = db.now_iso()
@@ -426,17 +426,23 @@ def run_restore_now(record_id: int, target_host: str = None,
     if not rec:
         return None
     task = models.get_task(rec["task_id"], include_secret=True)
-    from core.engines.base import BackupResult
+    from core.engines.base import BackupResult, BackupStatus
     started = db.now_iso()
     # 解析目标主机：优先 target_host_id（纳管主机），其次直接输入
     target_host_info = None
     target_host_label = target_host or ""
+    detail_log_lines = [f"[开始] 恢复任务: task={task['id']} {task['name']}",
+                        f"[开始] 备份记录 ID: {record_id}, 路径: {rec.get('backup_path')}",
+                        f"[开始] 目标库: {target_db or '-'}",
+                        f"[开始] 操作人: {operator or '-'}",
+                        f"[开始] 启动时间: {started}"]
     if target_host_id:
         from core import ssh_hosts as ssh_mod
         target_host_info = ssh_mod.get_host(target_host_id, include_secret=True)
         if not target_host_info:
             return None
         target_host_label = f"{target_host_info.get('hostname')}:{target_host_info.get('port',22)} (跨主机)"
+        detail_log_lines.append(f"[目标主机] 纳管主机 ID={target_host_id}, {target_host_label}")
     elif target_host and (target_host_user or target_host_password):
         # 直接输入模式：从 target_host 字符串 "user@host:port" 解析，密码独立传入
         import re
@@ -451,6 +457,7 @@ def run_restore_now(record_id: int, target_host: str = None,
             target_host_label = f"{target_host_info['hostname']}:{target_host_info['port']} (直接输入)"
         else:
             target_host_label = target_host
+        detail_log_lines.append(f"[目标主机] 直接输入: {target_host_label}")
     rid = models.create_restore({
         "task_id": rec["task_id"], "record_id": record_id,
         "target_host": target_host_label, "target_db": target_db,
@@ -463,29 +470,79 @@ def run_restore_now(record_id: int, target_host: str = None,
         result = engine.restore(rec["backup_path"], target_host=target_host,
                                 target_host_info=target_host_info,
                                 target_db=target_db)
+        detail_log_lines.append(f"[引擎结果] success={result.success}, status={getattr(result, 'status', '-')}")
+        detail_log_lines.append(f"[引擎结果] message={getattr(result, 'message', '')}")
+        if getattr(result, "stdout", None):
+            detail_log_lines.append(f"[引擎 stdout]\n{result.stdout}")
+        if getattr(result, "stderr", None):
+            detail_log_lines.append(f"[引擎 stderr]\n{result.stderr}")
     except Exception as e:
-        result = BackupResult(success=False, message=f"恢复异常: {e}")
+        result = BackupResult(success=False, status=BackupStatus.FAILED, message=f"恢复异常: {e}")
         _logger.exception("恢复异常 record=%s", record_id)
+        detail_log_lines.append(f"[异常] {e}")
     finished = db.now_iso()
+    detail_log_lines.append(f"[结束] 完成时间: {finished}")
+    detail_log = "\n".join(detail_log_lines)
+    # 合并引擎自身可能已生成的 detail_log
+    engine_detail = getattr(result, "detail_log", "")
+    if engine_detail:
+        detail_log = engine_detail + "\n" + detail_log
     status = result.status if hasattr(result, "status") else (
         "success" if result.success else "failed")
     db.execute(
-        "UPDATE restore_records SET finished_at=?, status=?, message=? WHERE id=?",
-        (finished, status, getattr(result, "message", ""), rid))
+        "UPDATE restore_records SET finished_at=?, status=?, message=?, detail_log=? WHERE id=?",
+        (finished, status, getattr(result, "message", ""), detail_log, rid))
     db.add_log("INFO" if result.success else "ERROR", "scheduler",
                f"restore record={record_id} -> {status}")
     return models.list_restores(limit=1)[0]
 
 
 # ------------------------- 调度器 -------------------------
-def _make_trigger(task: dict):
-    st = task.get("schedule_type")
-    if st == "cron" and task.get("cron_expr"):
+# 组合调度「按天选择」：用户侧 0=周一,...,6=周日 → APScheduler day_of_week 名字
+_DOW_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def _parse_schedule_days(value) -> str:
+    """将 '0,1,2'（0=周一）解析为 APScheduler 的 day_of_week 表达式（mon,tue,wed）。
+
+    空 / 非法 → 返回空串（表示不限制星期，沿用 cron 表达式自身的 dow 位）。
+    """
+    if not value:
+        return ""
+    parts = []
+    for tok in str(value).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            idx = int(tok)
+        except ValueError:
+            continue
+        if 0 <= idx <= 6:
+            parts.append(_DOW_NAMES[idx])
+    return ",".join(parts)
+
+
+def _make_trigger(task: dict, st_key: str = "schedule_type", expr_key: str = "cron_expr",
+                  minutes_key: str = "interval_minutes", days_key: str = None):
+    st = task.get(st_key)
+    if st == "cron" and task.get(expr_key):
         from apscheduler.triggers.cron import CronTrigger
-        return CronTrigger.from_crontab(task["cron_expr"])
-    if st == "interval" and task.get("interval_minutes"):
+        dow = _parse_schedule_days(task.get(days_key)) if days_key else ""
+        if dow:
+            # 用户指定了运行星期：覆盖 cron 表达式自身的「周几」位，
+            # 仅在其列出的星期触发（如全量=周一、增量=周二~周日）。
+            try:
+                minute, hour, day, month, _ = str(task[expr_key]).split()
+                return CronTrigger(minute=minute, hour=hour, day=day, month=month,
+                                   day_of_week=dow)
+            except ValueError:
+                # cron 表达式不是标准 5 段，回退到原样
+                return CronTrigger.from_crontab(task[expr_key])
+        return CronTrigger.from_crontab(task[expr_key])
+    if st == "interval" and task.get(minutes_key):
         from apscheduler.triggers.interval import IntervalTrigger
-        return IntervalTrigger(minutes=int(task["interval_minutes"]))
+        return IntervalTrigger(minutes=int(task[minutes_key]))
     return None
 
 
@@ -564,11 +621,11 @@ def _verify_backup(task: dict, backup_path: str, checksum: str = None,
     return True, f"通过（{size} bytes）{suffix}"
 
 
-def _job_wrapper(task_id: int):
+def _job_wrapper(task_id: int, backup_type: str = None):
     try:
-        run_task_now(task_id)
+        run_task_now(task_id, backup_type=backup_type)
     except Exception:
-        _logger.exception("调度任务执行异常 task=%s", task_id)
+        _logger.exception("调度任务执行异常 task=%s backup_type=%s", task_id, backup_type)
 
 
 def _inspection_job_wrapper():
@@ -727,6 +784,46 @@ def _register_ai_alert(sched):
     _logger.info("[ai_alert] 已注册周期分析任务，间隔 %d 小时", hours)
 
 
+def _synthesize_job_wrapper():
+    """调度触发的自动合成全量：运行 core.synthesize.run_auto_synthesis()。"""
+    try:
+        from core import synthesize as syn
+        result = syn.run_auto_synthesis()
+        _logger.info("[synthesize] 调度完成: %s", result)
+    except Exception:
+        _logger.exception("[synthesize] 自动合成调度异常")
+
+
+def _register_synthesize(sched):
+    """注册自动合成全量周期任务（默认每周日 03:00）。
+
+    落实 CDM "系统内自动合成全量"：永远增量 → 定期合成全量，
+    中间增量副本由 lifecycle 按 chain_status='merged' 回收。
+    可通过 system_config.synthesize_config 调整（cron 表达式）。
+    """
+    from apscheduler.triggers.cron import CronTrigger
+    cron = "0 3 * * 0"  # 每周日 03:00
+    try:
+        from core import synthesize as syn
+        cfg = syn._load_config()
+        if cfg.get("cron"):
+            cron = cfg["cron"]
+    except Exception:
+        pass
+    try:
+        trig = CronTrigger.from_crontab(cron)
+    except Exception as e:
+        _logger.warning("[synthesize] cron 非法(%s)，回退默认", e)
+        trig = CronTrigger.from_crontab("0 3 * * 0")
+    try:
+        sched.remove_job("synthesize_full")
+    except Exception:
+        pass
+    sched.add_job(_synthesize_job_wrapper, trig, id="synthesize_full",
+                  replace_existing=True, misfire_grace_time=86400)
+    _logger.info("[synthesize] 已注册自动合成全量任务，cron=%s", cron)
+
+
 # ------------------------- Phase 4：季度演练排程 -------------------------
 def _drill_schedule_job_wrapper():
     """调度触发的季度演练：运行 DrillEngine.run_scheduled_drill()。
@@ -759,14 +856,100 @@ def _register_drill_schedule(sched):
     _logger.info("[drill] 已注册季度演练排程周期检查（每 24h）")
 
 
-def _register(sched, task: dict, prefix: str = "task"):
-    trig = _make_trigger(task)
-    if not trig:
+# ------------------------- 恢复校验调度 -------------------------
+def _restore_verify_job_wrapper(policy_id: int):
+    """调度触发的恢复校验：调用 restore_verify.run_restore_verify_policy。"""
+    try:
+        from core import restore_verify as rv
+        result = rv.run_restore_verify_policy(policy_id)
+        _logger.info("[restore_verify] 策略 %s 执行完成: success=%s",
+                     policy_id, result.get("success"))
+    except Exception:
+        _logger.exception("[restore_verify] 策略 %s 调度执行异常", policy_id)
+
+
+def _register_restore_verify(sched):
+    """注册所有启用的恢复校验策略为独立的周期 job。
+
+    - 按策略的 schedule_type(cron/interval) 构造触发器；
+    - 注册到 APScheduler，job id = rv_policy_<id>，reload 时幂等复用；
+    - 调度类型非 cron/interval（如 manual）或触发器非法时跳过（仍保留立即触发入口）。
+    """
+    try:
+        policies = models.list_restore_verify_policies(enabled_only=True)
+    except Exception as e:
+        _logger.warning("[restore_verify] 读取策略失败: %s", e)
         return
+    for p in policies or []:
+        st = p.get("schedule_type")
+        trig = None
+        if st == "cron" and p.get("cron_expr"):
+            from apscheduler.triggers.cron import CronTrigger
+            try:
+                trig = CronTrigger.from_crontab(p["cron_expr"])
+            except Exception as e:
+                _logger.warning("[restore_verify] 策略 %s cron 非法: %s", p.get("id"), e)
+        elif st == "interval" and p.get("interval_minutes"):
+            from apscheduler.triggers.interval import IntervalTrigger
+            trig = IntervalTrigger(minutes=int(p["interval_minutes"]))
+        if not trig:
+            continue
+        job_id = "rv_policy_" + str(p["id"])
+        try:
+            sched.remove_job(job_id)
+        except Exception:
+            pass
+        sched.add_job(_restore_verify_job_wrapper, trig, id=job_id,
+                      replace_existing=True, args=[p["id"]],
+                      misfire_grace_time=3600)
+        _logger.info("[restore_verify] 策略 %s 已注册调度(%s)", p.get("id"), st)
+
+
+def _register(sched, task: dict, prefix: str = "task"):
     wrapper = _job_wrapper if prefix == "task" else _job_wrapper_sync
-    sched.add_job(wrapper, trig, id=f"{prefix}_{task['id']}",
-                  replace_existing=True, args=[task["id"]],
-                  misfire_grace_time=3600)
+    if prefix != "task":
+        trig = _make_trigger(task)
+        if not trig:
+            return
+        sched.add_job(wrapper, trig, id=f"{prefix}_{task['id']}",
+                      replace_existing=True, args=[task["id"]],
+                      misfire_grace_time=3600)
+        return
+
+    # 普通任务：单一调度
+    if not task.get("mixed_backup"):
+        trig = _make_trigger(task)
+        if not trig:
+            return
+        sched.add_job(wrapper, trig, id=f"task_{task['id']}",
+                      replace_existing=True, args=[task["id"], None],
+                      misfire_grace_time=3600)
+        return
+
+    # 混合备份（全量 + 增量）：分别注册两个子调度
+    base_args = [task["id"]]
+    full_trig = _make_trigger(
+        task, st_key="full_schedule_type", expr_key="full_schedule_expr",
+        minutes_key="full_schedule_expr",
+        days_key="full_schedule_days")  # interval 时复用 expr 存分钟数
+    if full_trig:
+        sched.add_job(wrapper, full_trig, id=f"task_{task['id']}_full",
+                      replace_existing=True, args=base_args + ["full"],
+                      misfire_grace_time=3600)
+        _logger.info("任务 %s 已注册全量调度", task["id"])
+
+    # 增量调度：优先使用增量专属字段，未设置则回退到任务主调度
+    inc_trig = _make_trigger(
+        task, st_key="incremental_schedule_type", expr_key="incremental_schedule_expr",
+        minutes_key="incremental_schedule_expr",
+        days_key="incremental_schedule_days")
+    if not inc_trig and task.get("schedule_type") and (task.get("cron_expr") or task.get("interval_minutes")):
+        inc_trig = _make_trigger(task)
+    if inc_trig:
+        sched.add_job(wrapper, inc_trig, id=f"task_{task['id']}_incremental",
+                      replace_existing=True, args=base_args + ["incremental"],
+                      misfire_grace_time=3600)
+        _logger.info("任务 %s 已注册增量调度", task["id"])
 
 
 def _job_wrapper_sync(sync_id: int):
@@ -894,12 +1077,17 @@ def start_scheduler():
     for task in models.list_tasks(enabled=True):
         _register(_scheduler, task)
     for st in models.list_sync_tasks(enabled=True):
+        # 实时同步（Flink CDC）不通过 APScheduler 批跑，由外部 Flink 集群执行
+        if st.get("sync_mode") == "realtime":
+            continue
         _register(_scheduler, st, prefix="sync")
     _register_inspection(_scheduler)
     _register_lifecycle(_scheduler)
     _register_clone_expire(_scheduler)
     _register_ai_alert(_scheduler)
     _register_drill_schedule(_scheduler)
+    _register_restore_verify(_scheduler)
+    _register_synthesize(_scheduler)
     _register_rt_backup(_scheduler)
     _scheduler.start()
     _logger.info("调度器已启动，已注册 %d 个任务", len(_scheduler.get_jobs()))
@@ -918,12 +1106,17 @@ def reload_scheduler():
     for task in models.list_tasks(enabled=True):
         _register(_scheduler, task)
     for st in models.list_sync_tasks(enabled=True):
+        # 实时同步（Flink CDC）不通过 APScheduler 批跑，由外部 Flink 集群执行
+        if st.get("sync_mode") == "realtime":
+            continue
         _register(_scheduler, st, prefix="sync")
     _register_inspection(_scheduler)
     _register_lifecycle(_scheduler)
     _register_clone_expire(_scheduler)
     _register_ai_alert(_scheduler)
     _register_drill_schedule(_scheduler)
+    _register_restore_verify(_scheduler)
+    _register_synthesize(_scheduler)
     # RT 周期任务幂等重注册；Supervisor 主循环 tick 已保留，不重启守护
     if config.RT_BACKUP_ENABLED:
         _register_rt_periodic_jobs(_scheduler)

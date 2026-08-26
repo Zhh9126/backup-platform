@@ -6,7 +6,7 @@ from flask import request, jsonify, send_file
 
 from auth import login_required
 from core import models, data_mining as mining_engine
-from . import api_bp
+from . import api_bp, safe_download_path
 
 
 @api_bp.route("/datamining/exports", methods=["GET"])
@@ -45,9 +45,10 @@ def download_export(export_id):
     exp = models.get_anonymized_export(export_id)
     if not exp:
         return jsonify({"error": "导出记录不存在"}), 404
-    fp = exp.get("file_path")
-    if not fp or not os.path.isfile(fp):
-        return jsonify({"error": "文件不存在"}), 404
+    # 安全整改：仅允许下载备份根目录内的导出文件
+    fp = safe_download_path(exp.get("file_path") or "")
+    if fp is None:
+        return jsonify({"error": "文件不存在或路径不合法"}), 404
     return send_file(
         fp, as_attachment=True,
         download_name=os.path.basename(fp),

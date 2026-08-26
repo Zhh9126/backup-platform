@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>数据备份管理平台</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css" rel="stylesheet">
+  <link href="/static/css/bootstrap.min.css?v=2026080210" rel="stylesheet">
+  <link href="/static/vendor/bootstrap-icons/bootstrap-icons.css?v=2026081401" rel="stylesheet">
   <link href="/static/css/app.css?v=2026080207" rel="stylesheet">
 </head>
 <body data-page="{{ page }}">
@@ -26,19 +26,20 @@
         <div class="nav-group-label">备份管理</div>
         <a class="nav-link {% if page=='tasks' %}active{% endif %}" href="/tasks" title="数据库备份"><i class="bi bi-list-check"></i> <span class="nav-label">数据库备份</span></a>
         <a class="nav-link {% if page=='file_backup' %}active{% endif %}" href="/file_backup" title="文件备份"><i class="bi bi-folder2-open"></i> <span class="nav-label">文件备份</span></a>
-        <a class="nav-link {% if page=='sync' %}active{% endif %}" href="/sync" title="数据同步"><i class="bi bi-arrow-left-right"></i> <span class="nav-label">数据同步</span></a>
         <a class="nav-link {% if page=='storage' %}active{% endif %}" href="/storage" title="存储管理"><i class="bi bi-hdd-rack"></i> <span class="nav-label">存储管理</span></a>
-        <a class="nav-link {% if page=='protection' %}active{% endif %}" href="/protection" title="保护策略"><i class="bi bi-shield-lock"></i> <span class="nav-label">保护策略</span></a>
+        <a class="nav-link {% if page=='protection' %}active{% endif %}" href="/protection" title="备份策略"><i class="bi bi-shield-lock"></i> <span class="nav-label">备份策略</span></a>
         <a class="nav-link {% if page=='plugins' %}active{% endif %}" href="/plugins" title="备份依赖插件（一键安装 xtrabackup / percona / mariabackup 等）"><i class="bi bi-plug"></i> <span class="nav-label">备份插件</span></a>
         <a class="nav-link {% if page=='rt_timeline' %}active{% endif %}" href="/rt-timeline" title="实时备份（准 CDP）"><i class="bi bi-broadcast-pin"></i> <span class="nav-label">实时备份</span></a>
         <div class="nav-group-label">数据恢复管理</div>
         <a class="nav-link {% if page=='restore' %}active{% endif %}" href="/restore" title="数据恢复"><i class="bi bi-arrow-counterclockwise"></i> <span class="nav-label">数据恢复</span></a>
+        <a class="nav-link {% if page=='restore-verify' %}active{% endif %}" href="/restore-verify" title="恢复校验"><i class="bi bi-patch-check"></i> <span class="nav-label">恢复校验</span></a>
         <a class="nav-link {% if page=='deploy' %}active{% endif %}" href="/deploy" title="数据库部署"><i class="bi bi-rocket-takeoff"></i> <span class="nav-label">数据库部署</span></a>
         <div class="nav-group-label">记录</div>
         <a class="nav-link {% if page=='records' %}active{% endif %}" href="/records" title="备份记录"><i class="bi bi-archive"></i> <span class="nav-label">备份记录</span></a>
         <a class="nav-link {% if page=='restore_records' %}active{% endif %}" href="/restore_records" title="恢复记录"><i class="bi bi-clock-history"></i> <span class="nav-label">恢复记录</span></a>
         <div class="nav-group-label">灾备管理</div>
-        <a class="nav-link {% if page=='migration' %}active{% endif %}" href="/migration" title="迁移保护"><i class="bi bi-arrow-repeat"></i> <span class="nav-label">迁移保护</span></a>
+        <a class="nav-link {% if page=='migration' %}active{% endif %}" href="/migration" title="数据迁移"><i class="bi bi-arrow-repeat"></i> <span class="nav-label">数据迁移</span></a>
+        <a class="nav-link {% if page=='sync' %}active{% endif %}" href="/sync" title="数据同步"><i class="bi bi-arrow-left-right"></i> <span class="nav-label">数据同步</span></a>
         <a class="nav-link {% if page=='dr-link' %}active{% endif %}" href="/dr-link" title="容灾链路"><i class="bi bi-diagram-3"></i> <span class="nav-label">容灾链路</span></a>
         <a class="nav-link {% if page=='clone' %}active{% endif %}" href="/clone" title="克隆服务"><i class="bi bi-layers"></i> <span class="nav-label">克隆服务</span></a>
         <div class="nav-group-label">运维</div>
@@ -55,138 +56,6 @@
     <main class="content">
       <div class="content-inner">{% block content %}{% endblock %}</div>
     </main>
-  </div>
-
-  <!-- 通用“新建/编辑任务”模态框（5.6 风格） -->
-  <div class="modal fade" id="taskModal" tabindex="-1">
-    <div class="modal-dialog modal-lg modal-dialog-scrollable">
-      <div class="modal-content">
-        <div class="modal-header">
-          <h5 class="modal-title" id="taskModalTitle">新建备份任务</h5>
-          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-        </div>
-        <div class="modal-body">
-          <form id="taskForm">
-            <input type="hidden" id="t_id">
-            <div class="row g-3">
-              <div class="col-md-6">
-                <label class="form-label">任务名称 *</label>
-                <input class="form-control" id="t_name" required>
-              </div>
-              <div class="col-md-6">
-                <label class="form-label">数据库类型 *</label>
-                <select class="form-select" id="t_db_type" required></select>
-              </div>
-              <div class="col-md-8">
-                <label class="form-label">主机 / 连接地址</label>
-                <input class="form-control" id="t_host" placeholder="127.0.0.1">
-              </div>
-              <div class="col-md-4">
-                <label class="form-label">端口</label>
-                <input class="form-control" id="t_port" type="number">
-              </div>
-              <div class="col-md-4">
-                <label class="form-label">用户名</label>
-                <input class="form-control" id="t_username">
-              </div>
-              <div class="col-md-4">
-                <label class="form-label">密码</label>
-                <input class="form-control" id="t_password" type="password" placeholder="留空表示不修改">
-              </div>
-              <div class="col-md-4">
-                <label class="form-label">数据库 / 实例名</label>
-                <input class="form-control" id="t_db_name" placeholder="如 test_db / service_name">
-              </div>
-              <div class="col-12">
-                <label class="form-label">SSH 主机（备份服务器无客户端时远程执行 dump）</label>
-                <select class="form-select" id="t_ssh_host">
-                  <option value="">— 自动（按数据库地址匹配已纳管主机；本机有客户端时忽略）—</option>
-                </select>
-                <div class="form-text">若备份服务器未安装 mysqldump / pg_dump，将自动 SSH 登录该数据库服务器执行 dump/restore，无需安装 Agent。</div>
-              </div>
-              <div class="col-md-6">
-                <label class="form-label">备份类型</label>
-                <select class="form-select" id="t_backup_type">
-                  <option value="full">全量</option>
-                  <option value="incremental">增量</option>
-                  <option value="differential">差异</option>
-                  <option value="snapshot">快照</option>
-                </select>
-              </div>
-              <div class="col-md-6">
-                <label class="form-label">备份模式</label>
-                <select class="form-select" id="t_backup_mode">
-                  <option value="logical">逻辑备份（mysqldump / pg_dump / expdp）</option>
-                  <option value="physical">物理备份（XtraBackup / pg_basebackup / RMAN）</option>
-                </select>
-              </div>
-              <div class="col-md-6">
-                <label class="form-label">调度方式</label>
-                <select class="form-select" id="t_schedule_type">
-                  <option value="none">不自动（手动）</option>
-                  <option value="cron">Cron 表达式</option>
-                  <option value="interval">固定间隔</option>
-                </select>
-              </div>
-              <div class="col-md-6 d-none" id="t_cron_wrap">
-                <label class="form-label">Cron 表达式（分 时 日 月 周）</label>
-                <input class="form-control" id="t_cron_expr" placeholder="例如 0 2 * * * 表示每天 02:00">
-              </div>
-              <div class="col-md-6 d-none" id="t_interval_wrap">
-                <label class="form-label">间隔（分钟）</label>
-                <input class="form-control" id="t_interval_minutes" type="number" value="60">
-              </div>
-              <div class="col-md-4">
-                <label class="form-label">保留天数</label>
-                <input class="form-control" id="t_retention_days" type="number" value="30">
-              </div>
-              <div class="col-md-4">
-                <label class="form-label">保留份数</label>
-                <input class="form-control" id="t_retention_count" type="number" value="50">
-              </div>
-              <div class="col-md-4">
-                <label class="form-label">存储后端</label>
-                <select class="form-select" id="t_storage_backend">
-                  <option value="local">本地</option>
-                  <option value="sftp">SFTP 远程</option>
-                </select>
-              </div>
-              <div class="col-12 sftp-only d-none">
-                <div class="row g-3">
-                  <div class="col-md-3"><label class="form-label">SFTP 主机</label><input class="form-control" id="t_remote_host"></div>
-                  <div class="col-md-3"><label class="form-label">SFTP 端口</label><input class="form-control" id="t_remote_port" type="number" value="22"></div>
-                  <div class="col-md-3"><label class="form-label">SFTP 用户</label><input class="form-control" id="t_remote_user"></div>
-                  <div class="col-md-3"><label class="form-label">SFTP 密码</label><input class="form-control" id="t_remote_password" type="password"></div>
-                  <div class="col-12"><label class="form-label">SFTP 远程路径</label><input class="form-control" id="t_remote_path" value="/backups"></div>
-                </div>
-              </div>
-              <div class="col-12">
-                <label class="form-label">额外参数（JSON，可选）</label>
-                <textarea class="form-control" id="t_extra_options" rows="2" placeholder='例如 {"schemas":["HR","SCOTT"]} 或 {"use_all_db":true}'></textarea>
-              </div>
-              <div class="col-12">
-                <div class="form-check form-check-inline">
-                  <input class="form-check-input" type="checkbox" id="t_compress" checked>
-                  <label class="form-check-label">压缩</label>
-                </div>
-                <div class="form-check form-check-inline">
-                  <input class="form-check-input" type="checkbox" id="t_demo_only">
-                  <label class="form-check-label">演示模式（始终生成仿真占位备份）</label>
-                </div>
-                <div class="form-check form-check-inline">
-                  <input class="form-check-input" type="checkbox" id="t_enabled" checked>
-                  <label class="form-check-label">启用</label>
-                </div>
-              </div>
-            </div>
-          </form>
-        </div>
-        <div class="modal-footer">
-          <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-          <button class="btn btn-primary" id="taskSaveBtn">保存</button>
-        </div>
-      </div>
-    </div>
   </div>
 
   <!-- 通用二次确认弹窗（7.3） -->
@@ -211,7 +80,7 @@
       <button type="button" class="btn-close me-2 m-auto" data-bs-dismiss="toast"></button></div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="/static/js/bootstrap.bundle.min.js?v=2026080210"></script>
   <script src="/static/js/bkp-core.js?v=2026080208"></script>
   <script src="/static/js/app.js?v=2026080208"></script>
   {% block scripts %}{% endblock %}

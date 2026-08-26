@@ -18,6 +18,10 @@
     </select>
   </div>
 </div>
+<div id="policyFilterBar" class="alert alert-info py-2 mb-3 d-flex justify-content-between align-items-center d-none">
+  <span><i class="bi bi-funnel-fill"></i> 当前按保护策略过滤：<strong id="policyFilterName">—</strong></span>
+  <button class="btn btn-sm btn-outline-secondary" onclick="clearPolicyFilter()">清除过滤</button>
+</div>
 <div class="page-card">
   <div class="table-responsive" style="flex:1">
     <table class="table table-hover align-middle mb-0">

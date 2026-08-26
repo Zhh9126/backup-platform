@@ -43,6 +43,15 @@ CREATE TABLE IF NOT EXISTS backup_tasks (
     schedule_type   TEXT DEFAULT 'none',
     cron_expr       TEXT,
     interval_minutes INTEGER,
+    mixed_backup    INTEGER DEFAULT 0,          -- 0=单类型 1=混合（全量+增量）
+    full_schedule_type   TEXT DEFAULT 'none', -- full/incremental 子调度类型
+    full_schedule_expr   TEXT,                -- full 子调度表达式
+    full_schedule_days   TEXT,                -- full 运行星期，逗号分隔 0(一)~6(日)，空=不限
+    incremental_schedule_type TEXT DEFAULT 'none',
+    incremental_schedule_expr   TEXT,
+    incremental_schedule_days   TEXT,         -- incremental 运行星期，逗号分隔 0(一)~6(日)，空=不限
+    bandwidth_limit  INTEGER DEFAULT 0,       -- 限速 KB/s，0=不限
+    compress_level   INTEGER DEFAULT 0,       -- 压缩级别，0=跟随默认(_ZSTD_LEVEL)
     enabled         INTEGER DEFAULT 1,
     retention_days  INTEGER DEFAULT 30,
     retention_count INTEGER DEFAULT 50,
@@ -74,6 +83,37 @@ CREATE TABLE IF NOT EXISTS protection_policies (
     enabled           INTEGER DEFAULT 1,
     created_at        TEXT,
     updated_at        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS restore_verify_policies (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             INTEGER NOT NULL,
+    name                TEXT,
+    recovery_pool       TEXT DEFAULT '',                  -- 恢复池/恢复目录标识
+    schedule_type       TEXT DEFAULT 'manual',            -- none | cron | interval | manual
+    cron_expr           TEXT,
+    interval_minutes    INTEGER,
+    clone_retention_min INTEGER DEFAULT 30,               -- 克隆保留（分钟）
+    enabled             INTEGER DEFAULT 1,
+    last_run_at         TEXT,
+    last_status         TEXT,
+    last_report_id      INTEGER,
+    created_at          TEXT,
+    updated_at          TEXT
+);
+
+CREATE TABLE IF NOT EXISTS restore_test_reports (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    policy_id    INTEGER,
+    task_id      INTEGER,
+    record_id    INTEGER,                                 -- 基于哪次备份记录
+    db_type      TEXT,
+    status       TEXT,                                    -- running | success | failed
+    duration_sec REAL,
+    message      TEXT,
+    cleaned      INTEGER DEFAULT 0,                       -- 测试克隆/临时文件是否已清理
+    created_at   TEXT,
+    finished_at  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS backup_records (
@@ -108,7 +148,8 @@ CREATE TABLE IF NOT EXISTS restore_records (
     finished_at  TEXT,
     status       TEXT,
     message      TEXT,
-    operator     TEXT
+    operator     TEXT,
+    detail_log   TEXT                            -- 恢复过程详细日志（stdout/stderr/各阶段说明）
 );
 
 CREATE TABLE IF NOT EXISTS system_logs (
@@ -137,33 +178,65 @@ CREATE TABLE IF NOT EXISTS ssh_hosts (
     updated_at  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS plugin_host_state (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    host_id       INTEGER,                  -- ssh_hosts.id；本机=0
+    host_key      TEXT NOT NULL,            -- "user@hostname:port" 或 "local"
+    plugin_id     TEXT NOT NULL,
+    status        TEXT DEFAULT 'uninstalled', -- uninstalled|installing|installed|failed|manual|success_with_warn
+    version       TEXT,                     -- 远端探测到的工具版本
+    method        TEXT,                     -- package_manager|fallback_download|manual_only
+    extract_dir   TEXT,                     -- 远端解压目录 /opt/backup_plugins/<pid>
+    found_paths   TEXT,                     -- JSON {"xtrabackup": "/opt/.../bin/xtrabackup"}
+    message       TEXT,
+    installed_at  TEXT,
+    updated_at    TEXT,
+    UNIQUE(host_key, plugin_id)
+);
+
 CREATE TABLE IF NOT EXISTS sync_tasks (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    name             TEXT NOT NULL,
-    source_type      TEXT DEFAULT 'managed',   -- managed(引用现有备份任务) | manual
-    source_task_id   INTEGER,
-    src_db_type      TEXT,
-    src_host         TEXT,
-    src_port         INTEGER,
-    src_username     TEXT,
-    src_password     TEXT,
-    src_db_name      TEXT,
-    tgt_db_type      TEXT,
-    tgt_host         TEXT,
-    tgt_port         INTEGER,
-    tgt_username     TEXT,
-    tgt_password     TEXT,
-    tgt_db_name      TEXT,
-    schedule_type    TEXT DEFAULT 'none',
-    cron_expr        TEXT,
-    interval_minutes INTEGER,
-    enabled          INTEGER DEFAULT 1,
-    status           TEXT DEFAULT 'never',
-    last_run_at      TEXT,
-    last_status      TEXT,
-    message          TEXT,
-    created_at       TEXT,
-    updated_at       TEXT
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    name               TEXT NOT NULL,
+    source_type        TEXT DEFAULT 'managed',   -- managed(引用现有备份任务) | manual
+    source_task_id     INTEGER,
+    src_db_type        TEXT,
+    src_host           TEXT,
+    src_port           INTEGER,
+    src_username       TEXT,
+    src_password       TEXT,
+    src_db_name        TEXT,
+    src_schema         TEXT,                     -- 源 schema/database
+    tgt_db_type        TEXT,
+    tgt_host           TEXT,
+    tgt_port           INTEGER,
+    tgt_username       TEXT,
+    tgt_password       TEXT,
+    tgt_db_name        TEXT,
+    tgt_schema         TEXT,                     -- 目标 schema/database
+    source_table       TEXT,                     -- 源表名
+    target_table       TEXT,                     -- 目标表名
+    source_tables_list TEXT,                     -- JSON，多表时选中的表列表
+    sync_mode          TEXT DEFAULT 'full',      -- full | incremental | realtime
+    save_mode          TEXT DEFAULT 'append',    -- append | overwrite | upsert | create_if_not_exists
+    column_mapping     TEXT,                     -- JSON 字段映射 [{source,target,type,expr}]
+    field_ide          TEXT DEFAULT 'origin',    -- origin | upper | lower | camel | underscore
+    incremental_column TEXT,                     -- 增量列
+    incremental_value  TEXT,                     -- 增量起始值
+    batch_size         INTEGER DEFAULT 1000,
+    source_where       TEXT,                     -- where 过滤条件
+    error_threshold    INTEGER DEFAULT 0,        -- 0=不容错，N=允许 N 条错误
+    realtime_enabled   INTEGER DEFAULT 0,        -- 实时同步开关（预留 Flink CDC）
+    flink_config       TEXT,                     -- JSON Flink CDC 配置
+    schedule_type      TEXT DEFAULT 'none',
+    cron_expr          TEXT,
+    interval_minutes   INTEGER,
+    enabled            INTEGER DEFAULT 1,
+    status             TEXT DEFAULT 'never',
+    last_run_at        TEXT,
+    last_status        TEXT,
+    message            TEXT,
+    created_at         TEXT,
+    updated_at         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sync_records (
@@ -215,22 +288,26 @@ CREATE TABLE IF NOT EXISTS storage_targets (
 );
 
 CREATE TABLE IF NOT EXISTS deployments (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    name            TEXT NOT NULL,
-    db_type         TEXT NOT NULL,
-    host_id         INTEGER,
-    package_path    TEXT,
-    base_dir        TEXT,
-    data_dir        TEXT,
-    port            INTEGER,
-    password        TEXT,
-    config_json     TEXT,
-    status          TEXT DEFAULT 'pending',
-    progress_pct    INTEGER DEFAULT 0,
-    log_output      TEXT,
-    created_at      TEXT,
-    started_at      TEXT,
-    finished_at     TEXT
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    name              TEXT NOT NULL,
+    db_type           TEXT NOT NULL,
+    host_id           INTEGER,                       -- 纳管主机模式
+    direct_host       TEXT,                          -- 直接输入：IP
+    direct_port       INTEGER DEFAULT 22,            -- 直接输入：SSH 端口
+    direct_user       TEXT DEFAULT 'root',            -- 直接输入：SSH 用户
+    direct_password   TEXT,                          -- 直接输入：SSH 密码
+    package_path      TEXT,
+    base_dir          TEXT,
+    data_dir          TEXT,
+    port              INTEGER,
+    password          TEXT,                          -- 数据库管理员密码
+    config_json       TEXT,
+    status            TEXT DEFAULT 'pending',
+    progress_pct      INTEGER DEFAULT 0,
+    log_output        TEXT,
+    created_at        TEXT,
+    started_at        TEXT,
+    finished_at       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS vdb_instances (
@@ -525,6 +602,11 @@ def init_schema() -> None:
                     conn.execute(f"ALTER TABLE ssh_hosts ADD COLUMN {col} {typedef}")
                 except Exception:
                     pass
+            # 迁移：恢复记录详细日志列
+            try:
+                conn.execute("ALTER TABLE restore_records ADD COLUMN detail_log TEXT")
+            except Exception:
+                pass
             # 迁移：backup_records CDC/校验列
             for col, typedef in [("binlog_file", "TEXT"), ("binlog_pos", "INTEGER"),
                                  ("wal_lsn", "TEXT"), ("verified", "INTEGER DEFAULT 0"),
@@ -560,6 +642,17 @@ def init_schema() -> None:
                     conn.execute(f"ALTER TABLE backup_tasks ADD COLUMN {col} {typedef}")
                 except Exception:
                     pass  # 列已存在，忽略
+            # 迁移：组合调度按天选择 / 限速 / 压缩级别（Phase 2）
+            for col, typedef in [
+                ("full_schedule_days", "TEXT"),
+                ("incremental_schedule_days", "TEXT"),
+                ("bandwidth_limit", "INTEGER DEFAULT 0"),
+                ("compress_level", "INTEGER DEFAULT 0"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE backup_tasks ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass  # 列已存在，忽略
             # 迁移：备份集表（Phase 1 —— 合成全量 / 去重 / 生命周期）
             try:
                 conn.execute(
@@ -569,7 +662,8 @@ def init_schema() -> None:
                     "storage_tier INTEGER DEFAULT 1, object_key TEXT, "
                     "parent_set_id INTEGER, verified INTEGER DEFAULT 0, "
                     "size_bytes INTEGER DEFAULT 0, dedup_saved_bytes INTEGER DEFAULT 0, "
-                    "checksum TEXT, created_at TEXT)")
+                    "checksum TEXT, created_at TEXT, "
+                    "chain_id TEXT, chain_status TEXT DEFAULT 'active')")
             except Exception:
                 pass
             for col, typedef in [
@@ -581,11 +675,33 @@ def init_schema() -> None:
                 ("size_bytes", "INTEGER DEFAULT 0"),
                 ("dedup_saved_bytes", "INTEGER DEFAULT 0"),
                 ("checksum", "TEXT"),
+                ("chain_id", "TEXT"),
+                ("chain_status", "TEXT DEFAULT 'active'"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE backup_sets ADD COLUMN {col} {typedef}")
                 except Exception:
                     pass  # 列已存在，忽略
+
+            # 迁移：全局去重索引（参照鼎甲迪备 §2.4 全局重删）
+            # 以内容哈希(block_hash)为键，跨任务、跨备份集复用同一物理块，
+            # 命中即记账 dedup_saved_bytes，降低存储与网络占用。
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS dedup_index ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "block_hash TEXT NOT NULL, "          # 内容寻址哈希(sha256)
+                    "size_bytes INTEGER DEFAULT 0, "      # 该块原始大小
+                    "ref_count INTEGER DEFAULT 1, "       # 被引用次数(跨任务/集)
+                    "first_task_id INTEGER, "             # 首次写入的任务
+                    "first_set_id INTEGER, "              # 首次写入的备份集
+                    "object_key TEXT, "                   # 实际物理块存储路径
+                    "created_at TEXT)")
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "uq_dedup_block_hash ON dedup_index(block_hash)")
+            except Exception:
+                pass
 
             # 迁移：准 CDP 实时备份（Phase RT）—— backup_tasks 追加 6 列
             for col, typedef in [
@@ -620,6 +736,19 @@ def init_schema() -> None:
             # 存量行为 NULL，由 models.compute_biz_label() 的 R2 规则回退到任务名展示。
             for col, typedef in [
                 ("biz_system", "TEXT"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE backup_tasks ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass  # 列已存在，忽略
+
+            # 迁移：混合备份（全量+增量组合调度）—— backup_tasks 追加 5 列
+            for col, typedef in [
+                ("mixed_backup", "INTEGER DEFAULT 0"),
+                ("full_schedule_type", "TEXT DEFAULT 'none'"),
+                ("full_schedule_expr", "TEXT"),
+                ("incremental_schedule_type", "TEXT DEFAULT 'none'"),
+                ("incremental_schedule_expr", "TEXT"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE backup_tasks ADD COLUMN {col} {typedef}")
@@ -716,6 +845,116 @@ def init_schema() -> None:
                 except Exception:
                     pass  # 列已存在或表刚建好，忽略
 
+            # 迁移：恢复校验策略与测试报告表
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS restore_verify_policies (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id             INTEGER NOT NULL,
+                    name                TEXT,
+                    recovery_pool       TEXT DEFAULT '',
+                    schedule_type       TEXT DEFAULT 'manual',
+                    cron_expr           TEXT,
+                    interval_minutes    INTEGER,
+                    clone_retention_min INTEGER DEFAULT 30,
+                    enabled             INTEGER DEFAULT 1,
+                    last_run_at         TEXT,
+                    last_status         TEXT,
+                    last_report_id      INTEGER,
+                    created_at          TEXT,
+                    updated_at          TEXT
+                );
+                CREATE TABLE IF NOT EXISTS restore_test_reports (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    policy_id    INTEGER,
+                    task_id      INTEGER,
+                    record_id    INTEGER,
+                    db_type      TEXT,
+                    status       TEXT,
+                    duration_sec REAL,
+                    message      TEXT,
+                    cleaned      INTEGER DEFAULT 0,
+                    created_at   TEXT,
+                    finished_at  TEXT
+                );
+            """)
+
+            # 迁移：deployments 表新增直接输入主机字段
+            for col, typedef in [
+                ("direct_host", "TEXT"),
+                ("direct_port", "INTEGER DEFAULT 22"),
+                ("direct_user", "TEXT DEFAULT 'root'"),
+                ("direct_password", "TEXT"),
+                ("dependency_path", "TEXT"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE deployments ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass  # 列已存在或表刚建好，忽略
+            for col, typedef in [("name", "TEXT"), ("last_report_id", "INTEGER")]:
+                try:
+                    conn.execute(f"ALTER TABLE restore_verify_policies ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass
+            for col, typedef in [("finished_at", "TEXT")]:
+                try:
+                    conn.execute(f"ALTER TABLE restore_test_reports ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass
+
+            # 默认配置：自动合成全量（CDM "系统内自动合成全量"）
+            try:
+                _seed_system_config(conn, "synthesize_config", {
+                    "enabled": True, "min_incremental": 2, "cron": "0 3 * * 0"})
+            except Exception:
+                pass
+
+            # 迁移：数据同步任务表扩展（Reader/Writer + 字段映射 + Flink CDC 预留）
+            for col, typedef in [
+                ("src_schema", "TEXT"),
+                ("tgt_schema", "TEXT"),
+                ("source_table", "TEXT"),
+                ("target_table", "TEXT"),
+                ("source_tables_list", "TEXT"),
+                ("sync_mode", "TEXT DEFAULT 'full'"),
+                ("save_mode", "TEXT DEFAULT 'append'"),
+                ("column_mapping", "TEXT"),
+                ("field_ide", "TEXT DEFAULT 'origin'"),
+                ("incremental_column", "TEXT"),
+                ("incremental_value", "TEXT"),
+                ("batch_size", "INTEGER DEFAULT 1000"),
+                ("source_where", "TEXT"),
+                ("error_threshold", "INTEGER DEFAULT 0"),
+                ("realtime_enabled", "INTEGER DEFAULT 0"),
+                ("flink_config", "TEXT"),
+                ("full_db_migrate", "INTEGER DEFAULT 0"),
+                ("validate_before_run", "INTEGER DEFAULT 0"),
+                ("verify_after_run", "INTEGER DEFAULT 0"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE sync_tasks ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass  # 列已存在或表刚建好，忽略
+
+            # 迁移：插件主机状态表（插件服务端化）—— 幂等建表，供存量 DB 补齐
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS plugin_host_state ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "host_id INTEGER, "
+                    "host_key TEXT NOT NULL, "
+                    "plugin_id TEXT NOT NULL, "
+                    "status TEXT DEFAULT 'uninstalled', "
+                    "version TEXT, "
+                    "method TEXT, "
+                    "extract_dir TEXT, "
+                    "found_paths TEXT, "
+                    "message TEXT, "
+                    "installed_at TEXT, "
+                    "updated_at TEXT, "
+                    "UNIQUE(host_key, plugin_id))")
+            except Exception:
+                pass  # 表已存在，忽略
+
             conn.commit()
         finally:
             conn.close()
@@ -744,6 +983,71 @@ def query(sql: str, params: tuple = ()) -> list[dict]:
 def query_one(sql: str, params: tuple = ()) -> dict | None:
     rows = query(sql, params)
     return rows[0] if rows else None
+
+
+# ------------------------- 插件主机状态（plugin_host_state） -------------------------
+# 插件服务端化：以「主机 × 插件」二维维度持久化安装状态。
+# 权威状态落此表；core/plugins/state/*.json 仅承载实时安装进度。
+_PLUGIN_STATE_FIELDS = (
+    "host_id", "status", "version", "method", "extract_dir",
+    "found_paths", "message", "installed_at", "updated_at",
+)
+
+
+def upsert_plugin_host_state(host_key: str, plugin_id: str, fields: dict) -> int:
+    """按 (host_key, plugin_id) 幂等 upsert 一条插件主机状态。
+
+    fields 中可含 host_id/status/version/method/extract_dir/found_paths/
+    message/installed_at/updated_at；host_key 与 plugin_id 由入参决定。
+    返回受影响行的 rowid。
+    """
+    data = {k: fields.get(k) for k in _PLUGIN_STATE_FIELDS}
+    data["host_key"] = host_key
+    data["plugin_id"] = plugin_id
+    data.setdefault("status", "uninstalled")
+    data.setdefault("updated_at", now_iso())
+    cols = list(data.keys())
+    update_cols = [c for c in cols if c not in ("host_key", "plugin_id")]
+    sql = (
+        "INSERT INTO plugin_host_state ({cols}) VALUES ({ph}) "
+        "ON CONFLICT(host_key, plugin_id) DO UPDATE SET {sets}"
+    ).format(
+        cols=",".join(cols),
+        ph=",".join("?" * len(cols)),
+        sets=",".join(f"{c}=excluded.{c}" for c in update_cols),
+    )
+    return execute(sql, tuple(data.values()))
+
+
+def get_plugin_host_state(host_key: str, plugin_id: str) -> dict | None:
+    """按 (host_key, plugin_id) 查询单条插件主机状态。"""
+    return query_one(
+        "SELECT * FROM plugin_host_state WHERE host_key=? AND plugin_id=?",
+        (host_key, plugin_id),
+    )
+
+
+def list_plugin_host_state(host_key: str | None = None,
+                           plugin_id: str | None = None) -> list[dict]:
+    """查询插件主机状态，可按 host_key / plugin_id 过滤。"""
+    sql = "SELECT * FROM plugin_host_state WHERE 1=1"
+    params: list = []
+    if host_key:
+        sql += " AND host_key=?"
+        params.append(host_key)
+    if plugin_id:
+        sql += " AND plugin_id=?"
+        params.append(plugin_id)
+    sql += " ORDER BY updated_at DESC"
+    return query(sql, tuple(params))
+
+
+def delete_plugin_host_state(host_key: str, plugin_id: str) -> None:
+    """删除指定 (host_key, plugin_id) 的插件主机状态。"""
+    execute(
+        "DELETE FROM plugin_host_state WHERE host_key=? AND plugin_id=?",
+        (host_key, plugin_id),
+    )
 
 
 # ------------------------- 加密（敏感字段） -------------------------
@@ -854,3 +1158,14 @@ def set_system_config(key: str, value) -> None:
             conn.commit()
         finally:
             conn.close()
+
+
+def _seed_system_config(conn, key: str, value) -> None:
+    """init_schema 阶段写入默认配置（仅当 key 不存在时），不依赖 _write_lock。"""
+    import json
+    cur = conn.execute("SELECT 1 FROM system_config WHERE key=?", (key,))
+    if cur.fetchone():
+        return
+    conn.execute(
+        "INSERT INTO system_config(key, value) VALUES(?, ?)",
+        (key, json.dumps(value, ensure_ascii=False)))

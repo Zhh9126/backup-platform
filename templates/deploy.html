@@ -129,11 +129,21 @@
             <div class="col-md-8" id="pkgUploadBlock">
               <label class="form-label">选择安装包文件（.tar.gz/.zip/.iso 等）</label>
               <input class="form-control" type="file" id="d_package_file" accept=".tar.gz,.tgz,.tar.xz,.zip,.iso,.bin,.run,.tar,.tar.bz2">
+              <div id="pkgFileInfo" class="form-text mt-1" style="min-height:1.5em"></div>
+              <div id="pkgUploadProgressWrap" class="mt-2 d-none">
+                <div class="d-flex justify-content-between small mb-1">
+                  <span id="pkgUploadProgressText">上传准备中...</span>
+                  <span id="pkgUploadProgressPct">0%</span>
+                </div>
+                <div class="progress" style="height:8px">
+                  <div id="pkgUploadProgressBar" class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" style="width:0%"></div>
+                </div>
+              </div>
               <div class="form-text">文件将上传到本平台暂存，部署时由平台 SFTP 推送至目标主机。上传大文件请耐心等待。</div>
             </div>
             <div class="col-md-8" id="pkgRemoteBlock" style="display:none">
               <label class="form-label">安装包路径（目标主机上的完整路径）</label>
-              <input class="form-control" id="d_package_path" placeholder="/tmp/mysql-9.3.0-linux-glibc2.17-x86_64.tar.xz">
+              <input class="form-control" id="d_package_path_remote" placeholder="/tmp/mysql-9.3.0-linux-glibc2.17-x86_64.tar.xz">
               <div class="form-text">请提前将安装包上传到目标主机的 /tmp 目录</div>
             </div>
             <input type="hidden" id="d_package_path">
@@ -309,6 +319,15 @@
               <label class="form-label">集群模式端口（多实例）</label>
               <input class="form-control" id="d_redis_cluster" type="number" placeholder="留空=单机模式">
             </div>
+            <div class="col-12">
+              <label class="form-label">依赖包（如 gcc 离线 RPM 包，源码编译必需）</label>
+              <div class="input-group">
+                <input class="form-control" id="d_dependency_file" type="file" accept=".tar.gz,.tgz,.zip,.tar">
+                <button class="btn btn-outline-secondary" type="button" id="depUploadBtn">上传</button>
+              </div>
+              <input type="hidden" id="d_dependency_path">
+              <small class="text-muted" id="depUploadHint">支持 .tar.gz/.tgz/.zip 离线依赖包；内容含 *.rpm 时自动 rpm -Uvh 安装</small>
+            </div>
           </div>
 
           <!-- MongoDB -->
@@ -331,7 +350,7 @@
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-        <button class="btn btn-primary" id="deploySaveBtn">保存</button>
+        <button class="btn btn-primary" id="deploySaveBtn">保存并部署</button>
       </div>
     </div>
   </div>

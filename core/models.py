@@ -21,6 +21,9 @@ TASK_FIELDS = [
     "storage_backend", "remote_host", "remote_port", "remote_user",
     "remote_password", "remote_path", "remote_key", "compress",
     "extra_options", "demo_only", "policy_id",
+    "mixed_backup", "full_schedule_type", "full_schedule_expr",
+    "full_schedule_days", "incremental_schedule_type", "incremental_schedule_expr",
+    "incremental_schedule_days", "bandwidth_limit", "compress_level",
 ]
 
 
@@ -43,6 +46,7 @@ def create_task(data: dict) -> int:
     data["enabled"] = 1 if data.get("enabled") not in (0, False, "0", None) else 0
     data["compress"] = 1 if data.get("compress") not in (0, False, "0", None) else 0
     data["demo_only"] = 1 if data.get("demo_only") not in (0, False, "0", None) else 0
+    data["mixed_backup"] = 1 if data.get("mixed_backup") not in (0, False, "0", None) else 0
     for num in ("port", "interval_minutes", "retention_days", "retention_count",
                 "remote_port"):
         if data.get(num) in (None, ""):
@@ -76,7 +80,7 @@ def update_task(task_id: int, data: dict) -> bool:
             if v in (None, ""):
                 continue
             v = db.encrypt_secret(v)
-        elif k in ("enabled", "compress", "demo_only"):
+        elif k in ("enabled", "compress", "demo_only", "mixed_backup"):
             v = 1 if v not in (0, False, "0", None) else 0
         elif k == "policy_id":
             v = v if v not in (0, "", None) else None
@@ -378,6 +382,7 @@ def unbind_all_tasks_by_policy(policy_id: int) -> None:
 _BACKUP_SET_FIELDS = [
     "task_id", "record_id", "set_type", "storage_tier", "object_key",
     "parent_set_id", "verified", "size_bytes", "dedup_saved_bytes", "checksum",
+    "chain_id", "chain_status",
 ]
 
 
@@ -391,6 +396,7 @@ def create_backup_set(data: dict) -> int:
     data["verified"] = 1 if data.get("verified") else 0
     data["size_bytes"] = int(data.get("size_bytes") or 0)
     data["dedup_saved_bytes"] = int(data.get("dedup_saved_bytes") or 0)
+    data["chain_status"] = data.get("chain_status") or "active"
     if data.get("parent_set_id") in (0, "", None):
         data["parent_set_id"] = None
     cols = list(data.keys())
@@ -427,7 +433,8 @@ def list_backup_sets(task_id: int = None, record_id: int = None,
 def update_backup_set(set_id: int, data: dict) -> None:
     """更新备份集字段（白名单）。"""
     allow = {"set_type", "storage_tier", "object_key", "parent_set_id",
-             "verified", "size_bytes", "dedup_saved_bytes", "checksum"}
+             "verified", "size_bytes", "dedup_saved_bytes", "checksum",
+             "chain_id", "chain_status"}
     updates = {k: v for k, v in data.items() if k in allow}
     if not updates:
         return
@@ -530,7 +537,7 @@ def compute_biz_label(biz_system, name) -> str:
     return n or "-"
 
 
-def list_records(task_id: int = None, keyword: str = None, limit: int = 200) -> list:
+def list_records(task_id: int = None, keyword: str = None, policy_id: int = None, limit: int = 200) -> list:
     sql = ("SELECT br.*, bt.name AS task_name, bt.host AS host_raw, "
            "bt.biz_system AS biz_system "
            "FROM backup_records br "
@@ -540,6 +547,9 @@ def list_records(task_id: int = None, keyword: str = None, limit: int = 200) -> 
     if task_id:
         where.append("br.task_id=?")
         params.append(task_id)
+    if policy_id:
+        where.append("bt.policy_id=?")
+        params.append(policy_id)
     if keyword:
         # 搜索三字段并集（设计 §4.1.3）：业务系统新值、旧任务名、主机均可命中。
         # NULL LIKE '%kw%' 在 SQLite 中为假值，不会误命中，无需 COALESCE。
@@ -606,10 +616,15 @@ def list_restores(limit: int = 100, keyword: str = None) -> list:
 # ------------------------- 数据同步任务 -------------------------
 SYNC_FIELDS = [
     "name", "source_type", "source_task_id", "src_db_type", "src_host",
-    "src_port", "src_username", "src_password", "src_db_name",
+    "src_port", "src_username", "src_password", "src_db_name", "src_schema",
     "tgt_db_type", "tgt_host", "tgt_port", "tgt_username", "tgt_password",
-    "tgt_db_name", "schedule_type", "cron_expr", "interval_minutes",
-    "enabled", "status", "message",
+    "tgt_db_name", "tgt_schema", "source_table", "target_table",
+    "source_tables_list", "sync_mode", "save_mode", "column_mapping",
+    "field_ide", "incremental_column", "incremental_value", "batch_size",
+    "source_where", "error_threshold", "realtime_enabled", "flink_config",
+    "full_db_migrate", "validate_before_run", "verify_after_run",
+    "schedule_type", "cron_expr", "interval_minutes", "enabled", "status",
+    "message",
 ]
 
 
@@ -629,6 +644,16 @@ def _decorate_sync(row: dict) -> dict:
             "SELECT name FROM backup_tasks WHERE id=?",
             (row["source_task_id"],))
         row["source_task_name"] = name["name"] if name else None
+    # JSON 字段反序列化，方便前端/执行器直接使用
+    for k in ("column_mapping", "source_tables_list", "flink_config"):
+        v = row.get(k)
+        if isinstance(v, str) and v.strip():
+            try:
+                row[k] = json.loads(v)
+            except Exception:
+                row[k] = [] if k in ("column_mapping", "source_tables_list") else {}
+        elif v is None:
+            row[k] = [] if k in ("column_mapping", "source_tables_list") else {}
     return row
 
 
@@ -748,7 +773,13 @@ def get_sync_record(record_id: int) -> Optional[dict]:
     return db.query_one("SELECT * FROM sync_records WHERE id=?", (record_id,))
 
 
-def list_sync_records(limit: int = 200) -> list:
+def list_sync_records(sync_task_id: int = None, limit: int = 200) -> list:
+    if sync_task_id:
+        return db.query(
+            "SELECT sr.*, st.name AS sync_name FROM sync_records sr "
+            "LEFT JOIN sync_tasks st ON st.id = sr.sync_task_id "
+            "WHERE sr.sync_task_id = ? "
+            "ORDER BY sr.id DESC LIMIT ?", (sync_task_id, limit))
     return db.query(
         "SELECT sr.*, st.name AS sync_name FROM sync_records sr "
         "LEFT JOIN sync_tasks st ON st.id = sr.sync_task_id "
@@ -812,7 +843,9 @@ def clear_logs() -> int:
 # ------------------------- 数据库部署 -------------------------
 def create_deployment(data: dict) -> int:
     from core import db as _db
-    fields = ["name","db_type","host_id","package_path","base_dir","data_dir",
+    fields = ["name","db_type","host_id",
+              "direct_host","direct_port","direct_user","direct_password",
+              "package_path","dependency_path","base_dir","data_dir",
               "port","password","config_json","status"]
     row = {k: data.get(k) for k in fields}
     row["created_at"] = _db.now_iso()
@@ -823,17 +856,49 @@ def create_deployment(data: dict) -> int:
 
 
 def list_deployments() -> list:
-    return db.query("SELECT * FROM deployments ORDER BY id DESC")
+    rows = db.query("SELECT * FROM deployments ORDER BY id DESC")
+    # 关联 ssh_hosts 展示 IP/主机名，避免前端只显示 host_id (#N)
+    hosts = {h["id"]: h for h in db.query("SELECT id, name, host_key, hostname FROM ssh_hosts")}
+    out = []
+    for r in rows:
+        row = dict(r)
+        host = hosts.get(row.get("host_id"))
+        if host:
+            row["host_display"] = host.get("hostname") or host.get("host_key") or ""
+            row["host_name"] = host.get("name") or ""
+        elif row.get("direct_host"):
+            row["host_display"] = row["direct_host"]
+            row["host_name"] = ""
+        else:
+            row["host_display"] = "-"
+            row["host_name"] = ""
+        out.append(row)
+    return out
 
 
 def get_deployment(dep_id: int) -> dict:
-    rows = db.query("SELECT * FROM deployments WHERE id=?", (dep_id,))
-    return rows[0] if rows else None
+    row = db.query_one("SELECT * FROM deployments WHERE id=?", (dep_id,))
+    if not row:
+        return None
+    row = dict(row)
+    host = db.query_one("SELECT name, host_key, hostname FROM ssh_hosts WHERE id=?", (row.get("host_id"),))
+    if host:
+        row["host_display"] = host.get("hostname") or host.get("host_key") or ""
+        row["host_name"] = host.get("name") or ""
+    elif row.get("direct_host"):
+        row["host_display"] = row["direct_host"]
+        row["host_name"] = ""
+    else:
+        row["host_display"] = "-"
+        row["host_name"] = ""
+    return row
 
 
 def update_deployment(dep_id: int, data: dict) -> None:
-    allow = {"status","progress_pct","log_output","started_at","finished_at",
-             "config_json","package_path"}
+    allow = {"name","db_type","host_id","direct_host","direct_port",
+             "direct_user","direct_password",
+             "status","progress_pct","log_output","started_at","finished_at",
+             "config_json","package_path","dependency_path","base_dir","data_dir","port","password"}
     updates = {k: v for k, v in data.items() if k in allow}
     if not updates:
         return
@@ -1928,3 +1993,210 @@ def delete_ai_messages(session_id: str) -> bool:
     """删除某会话的所有消息。"""
     db.execute("DELETE FROM ai_messages WHERE session_id=?", (session_id,))
     return True
+
+
+# ========================== 恢复校验策略 & 恢复测试报告 ==========================
+_RESTORE_VERIFY_POLICY_FIELDS = [
+    "task_id", "name", "recovery_pool", "schedule_type", "cron_expr",
+    "interval_minutes", "clone_retention_min", "enabled",
+]
+
+
+def _rvp_to_dict(row: Optional[dict]) -> Optional[dict]:
+    """将 restore_verify_policies 行转为 dict，数值/布尔字段还原。"""
+    if not row:
+        return None
+    d = dict(row)
+    d["enabled"] = bool(d.get("enabled"))
+    d["clone_retention_min"] = int(d.get("clone_retention_min") or 0)
+    d["interval_minutes"] = int(d.get("interval_minutes") or 0) if d.get("interval_minutes") is not None else None
+    d["task_id"] = int(d.get("task_id") or 0)
+    d["last_report_id"] = int(d.get("last_report_id") or 0) if d.get("last_report_id") is not None else None
+    return d
+
+
+def create_restore_verify_policy(data: dict) -> int:
+    """创建恢复校验策略。返回新策略 id。"""
+    row = {k: data.get(k) for k in _RESTORE_VERIFY_POLICY_FIELDS}
+    now = db.now_iso()
+    row["created_at"] = now
+    row["updated_at"] = now
+    row["enabled"] = 1 if row.get("enabled") not in (0, False, "0", None) else 0
+    row["clone_retention_min"] = int(row.get("clone_retention_min") or 30)
+    if row.get("interval_minutes") in ("", None):
+        row["interval_minutes"] = None
+    else:
+        row["interval_minutes"] = int(row["interval_minutes"])
+    if not row.get("name"):
+        row["name"] = f"校验策略-{now[:10]}"
+    cols = list(row.keys())
+    sql = "INSERT INTO restore_verify_policies ({}) VALUES ({})".format(
+        ",".join(cols), ",".join("?" * len(cols)))
+    return db.execute(sql, tuple(row.values()))
+
+
+def get_restore_verify_policy(policy_id: int) -> Optional[dict]:
+    """按 id 获取恢复校验策略，并关联任务名与 db_type。"""
+    sql = ("SELECT rvp.*, t.name AS task_name, t.db_type AS db_type, "
+           "t.name AS instance_name "
+           "FROM restore_verify_policies rvp "
+           "LEFT JOIN backup_tasks t ON t.id = rvp.task_id "
+           "WHERE rvp.id=?")
+    row = db.query_one(sql, (policy_id,))
+    return _rvp_to_dict(row) if row else None
+
+
+def list_restore_verify_policies(enabled_only: bool = False, task_id: int = None) -> list:
+    """列出恢复校验策略。"""
+    sql = ("SELECT rvp.*, t.name AS task_name, t.db_type AS db_type, "
+           "t.name AS instance_name "
+           "FROM restore_verify_policies rvp "
+           "LEFT JOIN backup_tasks t ON t.id = rvp.task_id WHERE 1=1")
+    params: list = []
+    if enabled_only:
+        sql += " AND rvp.enabled=1"
+    if task_id is not None:
+        sql += " AND rvp.task_id=?"
+        params.append(task_id)
+    sql += " ORDER BY rvp.id DESC"
+    rows = db.query(sql, tuple(params))
+    return [_rvp_to_dict(r) for r in rows]
+
+
+def update_restore_verify_policy(policy_id: int, data: dict) -> bool:
+    """更新恢复校验策略（白名单）。"""
+    allow = set(_RESTORE_VERIFY_POLICY_FIELDS)
+    updates = {k: v for k, v in data.items() if k in allow}
+    if not updates:
+        return False
+    updates["updated_at"] = db.now_iso()
+    if "enabled" in updates:
+        updates["enabled"] = 1 if updates.get("enabled") not in (0, False, "0", None) else 0
+    if "clone_retention_min" in updates:
+        updates["clone_retention_min"] = int(updates["clone_retention_min"] or 30)
+    if "interval_minutes" in updates:
+        if updates.get("interval_minutes") in ("", None):
+            updates["interval_minutes"] = None
+        else:
+            updates["interval_minutes"] = int(updates["interval_minutes"])
+    if "task_id" in updates:
+        updates["task_id"] = int(updates["task_id"] or 0)
+    sets, params = [], []
+    for k, v in updates.items():
+        sets.append(f"{k}=?")
+        params.append(v)
+    params.append(policy_id)
+    db.execute("UPDATE restore_verify_policies SET {} WHERE id=?".format(",".join(sets)), tuple(params))
+    return True
+
+
+def delete_restore_verify_policy(policy_id: int) -> None:
+    """删除恢复校验策略及其测试报告。"""
+    with db._write_lock:
+        conn = db.get_conn()
+        try:
+            conn.execute("DELETE FROM restore_test_reports WHERE policy_id=?", (policy_id,))
+            conn.execute("DELETE FROM restore_verify_policies WHERE id=?", (policy_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def set_restore_verify_status(policy_id: int, last_run_at: str,
+                              last_status: str, last_report_id: int = None) -> None:
+    """更新策略最近一次运行状态。"""
+    sql = ("UPDATE restore_verify_policies SET last_run_at=?, last_status=?, "
+           "last_report_id=?, updated_at=? WHERE id=?")
+    db.execute(sql, (last_run_at, last_status, last_report_id, db.now_iso(), policy_id))
+
+
+# ------------------------- 恢复测试报告 -------------------------
+_RESTORE_TEST_REPORT_FIELDS = [
+    "policy_id", "task_id", "record_id", "db_type", "status",
+    "duration_sec", "message", "cleaned", "created_at", "finished_at",
+]
+
+
+def _rtr_to_dict(row: Optional[dict]) -> Optional[dict]:
+    """将 restore_test_reports 行转为 dict。"""
+    if not row:
+        return None
+    d = dict(row)
+    d["cleaned"] = bool(d.get("cleaned"))
+    d["duration_sec"] = float(d.get("duration_sec") or 0)
+    return d
+
+
+def create_restore_test_report(data: dict) -> int:
+    """创建恢复测试报告（运行中）。返回报告 id。"""
+    row = {k: data.get(k) for k in _RESTORE_TEST_REPORT_FIELDS}
+    now = db.now_iso()
+    row["created_at"] = now
+    row["finished_at"] = None
+    row["cleaned"] = 1 if row.get("cleaned") else 0
+    row["duration_sec"] = float(row.get("duration_sec") or 0)
+    cols = list(row.keys())
+    sql = "INSERT INTO restore_test_reports ({}) VALUES ({})".format(
+        ",".join(cols), ",".join("?" * len(cols)))
+    return db.execute(sql, tuple(row.values()))
+
+
+def get_restore_test_report(report_id: int) -> Optional[dict]:
+    row = db.query_one("SELECT * FROM restore_test_reports WHERE id=?", (report_id,))
+    return _rtr_to_dict(row) if row else None
+
+
+def update_restore_test_report(report_id: int, data: dict) -> None:
+    """更新测试报告（白名单）。"""
+    allow = {"status", "duration_sec", "message", "cleaned", "finished_at"}
+    updates = {k: v for k, v in data.items() if k in allow}
+    if not updates:
+        return
+    if "duration_sec" in updates:
+        updates["duration_sec"] = float(updates["duration_sec"] or 0)
+    if "cleaned" in updates:
+        updates["cleaned"] = 1 if updates.get("cleaned") else 0
+    sets, params = [], []
+    for k, v in updates.items():
+        sets.append(f"{k}=?")
+        params.append(v)
+    params.append(report_id)
+    db.execute("UPDATE restore_test_reports SET {} WHERE id=?".format(",".join(sets)), tuple(params))
+
+
+def list_restore_test_reports(policy_id: int = None, task_id: int = None,
+                              limit: int = 200) -> list:
+    """列出恢复测试报告，可选按策略/任务过滤。"""
+    sql = ("SELECT rtr.*, rvp.name AS policy_name, t.name AS task_name, "
+           "t.name AS instance_name "
+           "FROM restore_test_reports rtr "
+           "LEFT JOIN restore_verify_policies rvp ON rvp.id = rtr.policy_id "
+           "LEFT JOIN backup_tasks t ON t.id = rtr.task_id WHERE 1=1")
+    params: list = []
+    if policy_id is not None:
+        sql += " AND rtr.policy_id=?"
+        params.append(policy_id)
+    if task_id is not None:
+        sql += " AND rtr.task_id=?"
+        params.append(task_id)
+    sql += " ORDER BY rtr.id DESC LIMIT ?"
+    params.append(int(limit))
+    rows = db.query(sql, tuple(params))
+    return [_rtr_to_dict(r) for r in rows]
+
+
+def get_restore_verify_stats() -> dict:
+    """恢复校验仪表盘 KPI。"""
+    total = db.query_one("SELECT COUNT(*) AS c FROM restore_verify_policies")
+    success = db.query_one(
+        "SELECT COUNT(*) AS c FROM restore_test_reports WHERE status=?", ("success",))
+    failed = db.query_one(
+        "SELECT COUNT(*) AS c FROM restore_test_reports WHERE status=?", ("failed",))
+    last = db.query_one(
+        "SELECT created_at FROM restore_test_reports ORDER BY id DESC LIMIT 1")
+    return {
+        "policy_count": int(total["c"] if total else 0),
+        "success_count": int(success["c"] if success else 0),
+        "failed_count": int(failed["c"] if failed else 0),
+        "last_test_at": last["created_at"] if last else None,
+    }

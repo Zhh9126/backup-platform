@@ -28,6 +28,8 @@ class MongoEngine(BackupEngine):
     db_type = "mongodb"
     display_name = "MongoDB"
     required_clients = ["mongodump", "mongorestore"]
+    # 物理备份：外部插件 mongodb-database-tools
+    physical_external_plugins = ["mongodb-database-tools"]
 
     def _parse_extra_options(self) -> dict:
         """解析 task 中的 extra_options（JSON 字符串），返回字典。"""
@@ -49,13 +51,46 @@ class MongoEngine(BackupEngine):
     def backup(self, backup_type: BackupType) -> BackupResult:
         """执行 MongoDB 逻辑备份。
 
-        仿真检测 → 客户端检测 → 构造 mongodump 命令 → 执行 → 按 returncode 判定。
+        优先在 SSH 备份机/数据库服务器执行 mongodump --archive，失败再回退本机。
         """
         if self.task.get("demo_only"):
             return self._simulate_backup(backup_type, "任务标记为演示(demo_only)")
         if config.DEMO_MODE == "on":
             return self._simulate_backup(backup_type, "DEMO_MODE=on 强制仿真")
 
+        return self._try_remote_then_local(
+            lambda ssh_host: self._backup_remote(ssh_host, backup_type),
+            lambda: self._backup_local(backup_type),
+            "MongoDB 逻辑备份(mongodump)",
+        )
+
+    def _backup_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
+        """在 SSH 备份机执行 mongodump --archive，把归档流拉回到本地落盘。"""
+        from core import remote_dump
+        import time
+        # 与本地逻辑备份对齐：统一由全局 COMPRESS_BY_DEFAULT 控制，远端强制 zstd
+        enable = getattr(config, "COMPRESS_BY_DEFAULT", True)
+        compress = 1 if enable else 0
+        t0 = time.time()
+        data, compressed = remote_dump.remote_db_dump(self.task, ssh_host, "mongodb", compress)
+
+        duration = round(time.time() - t0, 3)
+        out_dir = self._output_dir()
+        ts = self._timestamp()
+        ext = ".archive.zst" if compressed else ".archive"
+        archive_path = os.path.join(out_dir, "%s%s" % (ts, ext))
+        with open(archive_path, "wb") as f:
+            f.write(data)
+        size = os.path.getsize(archive_path)
+        return BackupResult(
+            success=True, status=BackupStatus.SUCCESS,
+            backup_path=archive_path, size_bytes=size, duration_sec=duration,
+            compress_algo="zstd" if compress else "none",
+            simulated=False, checksum="",
+            message="MongoDB 远程归档备份成功(mongodump --archive)")
+
+    def _backup_local(self, backup_type: BackupType) -> BackupResult:
+        """本机执行 MongoDB 逻辑备份。"""
         # 1. 客户端检测
         ok, detail = self.check_client()
         if not ok:
@@ -165,6 +200,44 @@ class MongoEngine(BackupEngine):
         target_db = kwargs.get("target_db") or db_name
         compress = int(self.task.get("compress") or 0)
 
+        is_archive = (
+            str(backup_path).endswith(".archive")
+            or str(backup_path).endswith(".archive.gz")
+            or str(backup_path).endswith(".archive.zst")
+        )
+        # 外部压缩的归档需先解压再喂给 mongorestore --archive
+        if str(backup_path).endswith(".archive.zst"):
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(suffix=".archive", delete=False)
+            tmp_path = tmp.name
+            tmp.close()
+            dec = self.pipe_decompress("zstd")
+            rc = subprocess.run(dec + [backup_path, tmp_path])
+            if rc.returncode != 0:
+                os.unlink(tmp_path)
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path,
+                    message="MongoDB 备份解压 zstd 失败(rc=%s)" % rc.returncode)
+            restore_archive = tmp_path
+        elif str(backup_path).endswith(".archive.gz"):
+            # 兼容性：历史远程 gzip 压缩归档（升级前产物）
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(suffix=".archive", delete=False)
+            tmp_path = tmp.name
+            tmp.close()
+            dec = self.pipe_decompress("gzip")
+            rc = subprocess.run(dec + [backup_path, tmp_path])
+            if rc.returncode != 0:
+                os.unlink(tmp_path)
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path,
+                    message="MongoDB 备份解压 gzip 失败(rc=%s)" % rc.returncode)
+            restore_archive = tmp_path
+        else:
+            restore_archive = backup_path
+
         cmd = [
             "mongorestore",
             "--host", str(host),
@@ -173,11 +246,12 @@ class MongoEngine(BackupEngine):
             "--password", str(password),
             "--db", str(target_db),
             "--drop",
-            backup_path,
         ]
+        if is_archive:
+            cmd += ["--archive=%s" % restore_archive]
+        else:
+            cmd += [restore_archive]
         cmd = self._build_auth_args(cmd)
-        if compress == 1:
-            cmd += ["--gzip"]
 
         # 4. 执行命令
         start = __import__("time").time()

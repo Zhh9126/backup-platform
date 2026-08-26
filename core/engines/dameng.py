@@ -26,6 +26,7 @@ DM 达梦（Dameng）逻辑备份/恢复引擎。
 import os
 import time
 import json
+import shlex
 
 import config
 import core.db as db
@@ -45,6 +46,8 @@ class DamengEngine(BackupEngine):
     display_name = "DM 达梦"
     # dexp 负责导出（备份），dimp 负责导入（恢复）
     required_clients = ["dexp", "dimp"]
+    # 物理备份：达梦自带 dmrman 工具
+    physical_bundled_tools = ["dmrman"]
 
     # ---------------- 内部辅助 ----------------
     def _parse_extra(self) -> dict:
@@ -108,15 +111,27 @@ class DamengEngine(BackupEngine):
 
     # ---------------- 备份 ----------------
     def backup(self, backup_type: BackupType) -> BackupResult:
-        """达梦备份：按 backup_mode 分发物理(dmrman)/逻辑(dexp)。"""
+        """达梦备份：按 backup_mode 分发物理(dmrman)/逻辑(dexp)。
+
+        逻辑备份优先在 SSH 备份机/数据库服务器执行 dexp，失败再回退本机。
+        """
         if self.task.get("demo_only"):
             return self._simulate_backup(backup_type, "任务标记为演示(demo_only)")
         if config.DEMO_MODE == "on":
             return self._simulate_backup(backup_type, "DEMO_MODE=on 强制仿真")
 
         if self.backup_mode == BackupMode.PHYSICAL:
-            return self._backup_physical(backup_type)
-        return self._backup_logical(backup_type)
+            # 物理备份：优先 SSH 远端 dmrman，失败再回退本机
+            return self._try_remote_then_local(
+                lambda ssh_host: self._backup_physical_remote(ssh_host, backup_type),
+                lambda: self._backup_physical(backup_type),
+                "达梦 物理备份(dmrman)",
+            )
+        return self._try_remote_then_local(
+            lambda ssh_host: self._backup_logical_remote(ssh_host, backup_type),
+            lambda: self._backup_logical_local(backup_type),
+            "达梦 逻辑备份(dexp)",
+        )
 
     def _backup_physical(self, backup_type: BackupType) -> BackupResult:
         """物理备份：dmrman。"""
@@ -136,7 +151,135 @@ class DamengEngine(BackupEngine):
                             backup_path=out_dir, duration_sec=dur,
                             message="达梦 物理备份(dmrman)成功")
 
-    def _backup_logical(self, backup_type: BackupType) -> BackupResult:
+    def _backup_physical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
+        """物理备份：通过 SSH 在远端达梦服务器以 dmdba 用户执行 dmrman 联机全量
+        备份，再把备份集打成 tar.gz 经 SFTP 拉回本机落盘并计算 size/sha256。
+
+        - dmrman 位于 dmdba 的 DM_HOME/bin 下，故用 `su - dmdba -c`（login shell
+          自动加载 dmdba profile 获得 PATH），失败再回退为直接执行。
+        - 备份目录置于 /home/dmdba 下并 chown 给 dmdba，避免权限拒绝。
+        - 无达梦测试机，本方法仅保证代码正确性与逻辑一致，未做 E2E。
+        """
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+
+        ts = self._timestamp()
+        client = remote_dump._connect(ssh_host)
+        sftp = client.open_sftp()
+        remote_dir = f"/home/dmdba/dm_bkp_{ts}"
+        remote_tar = f"{remote_dir}.tar.gz"
+        remote_script = f"/home/dmdba/dmrman_{ts}.cmd"
+        # dmrman 联机全量备份脚本（TO 后为远端备份目录）
+        script_body = f"BACKUP DATABASE FULL TO '{remote_dir}';\nexit;\n"
+
+        try:
+            # 1) 建目录并 chown 给 dmdba，避免 dmrman 以 dmdba 运行时权限拒绝
+            prep = (f"mkdir -p {remote_dir} && chown dmdba {remote_dir} "
+                    f"&& chmod 755 {remote_dir}")
+            _ssh_exec_pipe(client, remote_dump._wrap_login(prep), timeout=60)
+
+            # 2) 写 dmrman 脚本（644，dmdba 可读）
+            with sftp.open(remote_script, "w") as f:
+                f.write(script_body)
+            try:
+                sftp.chmod(remote_script, 0o644)
+            except Exception:
+                pass
+
+            # 3) 优先以 dmdba 用户执行；失败回退为直接以当前 SSH 用户执行
+            inner = f"dmrman CTLFILE={remote_script}"
+            shell = f"su - dmdba -c {shlex.quote(inner)}"
+            start = time.time()
+            out, err, rc = _ssh_exec_pipe(client, remote_dump._wrap_login(shell), timeout=7200)
+            if rc != 0:
+                self.logger.warning("[%s] su - dmdba 执行 dmrman 失败(rc=%s)，回退直接执行",
+                                    self.task_name, rc)
+                out, err, rc = _ssh_exec_pipe(
+                    client, remote_dump._wrap_login(inner), timeout=7200)
+            duration = round(time.time() - start, 3)
+            out_text = out.decode("utf-8", "replace") if isinstance(out, bytes) else out
+            self.logger.info("[%s] 远端 dmrman 返回 rc=%s", self.task_name, rc)
+
+            if rc != 0:
+                snippet = (out_text or err)[-1200:]
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    duration_sec=duration, stdout=out_text, stderr=err,
+                    message=f"远端 dmrman 物理备份失败(rc={rc}): {snippet}")
+
+            # 4) 把远端备份集打成 tar.gz，再经 SFTP 拉回本机
+            tar_cmd = f"tar czf {remote_tar} -C {remote_dir} ."
+            out2, err2, rc2 = _ssh_exec_pipe(
+                client, remote_dump._wrap_login(tar_cmd), timeout=3600)
+            if rc2 != 0:
+                snippet = (err2 or "")[-800:]
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    duration_sec=duration, stdout=out_text, stderr=err2,
+                    message=f"远端 dmrman 备份集打包失败(rc={rc2}): {snippet}")
+
+            out_dir = self._output_dir()
+            os.makedirs(out_dir, exist_ok=True)
+            local_path = os.path.join(out_dir, f"dmrman_{ts}.tar.gz")
+            sftp.get(remote_tar, local_path)
+
+            size = os.path.getsize(local_path)
+            checksum = db.sha256_file(local_path)
+            hk = ssh_host.get("host_key", "remote")
+            msg = (f"通过 SSH 在 {hk} 以 dmdba 用户执行 dmrman 物理备份成功，"
+                   f"已拉回 {local_path} ({db.human_size(size)})")
+            self.logger.info("[%s] %s", self.task_name, msg)
+
+            # 清理远端备份目录与临时脚本/tar（best-effort，失败不致命）
+            try:
+                _ssh_exec_pipe(client, remote_dump._wrap_login(
+                    f"rm -rf {remote_dir} {remote_tar} {remote_script}"), timeout=60)
+            except Exception:
+                pass
+
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=local_path, size_bytes=size, duration_sec=duration,
+                stdout=out_text, stderr=err, simulated=False,
+                checksum=checksum, message=msg)
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+    def _backup_logical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
+        """在 SSH 备份机执行 dexp，把 dmp 文件通过 SFTP 拉回本地。"""
+        from core import remote_dump
+        import time
+        ts = self._timestamp()
+        userid = self._connect_userid()
+        extra = self._parse_extra()
+        scope = " ".join(self._scope_args(extra))
+        remote_tmp = f"/tmp/dm_bkp_{ts}"
+        remote_dmp = f"{remote_tmp}/{ts}.dmp"
+        remote_log = f"{remote_tmp}/{ts}.log"
+        remote_cmd = (
+            f"mkdir -p {remote_tmp} && "
+            f"dexp USERID={userid} FILE={ts} DIRECTORY={remote_tmp} LOG={ts}.log {scope}"
+        )
+        t0 = time.time()
+        data = remote_dump.remote_exec_and_fetch(ssh_host, remote_cmd, remote_dmp, timeout=7200)
+        duration = round(time.time() - t0, 3)
+        out_dir = self._output_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        local_path = os.path.join(out_dir, f"{ts}.dmp")
+        with open(local_path, "wb") as f:
+            f.write(data)
+        size = os.path.getsize(local_path)
+        checksum = db.sha256_file(local_path)
+        return BackupResult(
+            success=True, status=BackupStatus.SUCCESS,
+            backup_path=local_path, size_bytes=size, duration_sec=duration,
+            simulated=False, checksum=checksum,
+            message=f"达梦 远程逻辑备份(dexp)成功: {local_path}")
+
+    def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:
         """逻辑备份：dexp（沿用原有实现）。"""
         # 客户端探测
         ok, detail = self.check_client()

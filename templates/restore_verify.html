@@ -1,0 +1,151 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">恢复校验</div>
+    <div class="page-sub">制定自动恢复校验策略，定期验证备份可恢复性，并查看恢复测试报告</div>
+  </div>
+  <div>
+    <button class="btn btn-outline-secondary btn-sm" onclick="refreshAll()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+    <button class="btn btn-primary btn-sm" onclick="openPolicyModal()" title="新建校验策略"><i class="bi bi-plus-lg"></i> 新建校验策略</button>
+  </div>
+</div>
+
+<!-- KPI 卡片 -->
+<div class="row g-3 mb-3">
+  <div class="col-md-3">
+    <div class="card-stat">
+      <div class="stat-icon bg-primary bg-opacity-10 text-primary"><i class="bi bi-journal-check"></i></div>
+      <div class="stat-num" id="statPolicyCount">0</div>
+      <div class="stat-label">校验策略</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card-stat">
+      <div class="stat-icon bg-success bg-opacity-10 text-success"><i class="bi bi-check-circle"></i></div>
+      <div class="stat-num" id="statSuccessCount">0</div>
+      <div class="stat-label">测试通过</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card-stat">
+      <div class="stat-icon bg-danger bg-opacity-10 text-danger"><i class="bi bi-x-circle"></i></div>
+      <div class="stat-num" id="statFailedCount">0</div>
+      <div class="stat-label">测试失败</div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card-stat">
+      <div class="stat-icon bg-info bg-opacity-10 text-info"><i class="bi bi-clock-history"></i></div>
+      <div class="stat-num" id="statLastTest">—</div>
+      <div class="stat-label">最近测试</div>
+    </div>
+  </div>
+</div>
+
+<!-- 恢复校验策略 -->
+<div class="page-card mb-3">
+  <div class="d-flex justify-content-between align-items-center px-3 py-2 border-bottom">
+    <div class="fw-bold"><i class="bi bi-shield-check me-1"></i>恢复校验策略</div>
+  </div>
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>数据库实例</th>
+        <th>恢复池</th>
+        <th>调度周期</th>
+        <th>克隆保留(分钟)</th>
+        <th>状态</th>
+        <th>上次运行</th>
+        <th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="policyTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 恢复测试报告 -->
+<div class="page-card">
+  <div class="d-flex justify-content-between align-items-center px-3 py-2 border-bottom">
+    <div class="fw-bold"><i class="bi bi-file-earmark-text me-1"></i>恢复测试报告</div>
+  </div>
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>实例</th>
+        <th>结果</th>
+        <th>耗时</th>
+        <th>已清理</th>
+        <th>时间</th>
+        <th>说明</th>
+      </tr></thead>
+      <tbody id="reportTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 新建/编辑策略模态框 -->
+<div class="modal fade" id="verifyPolicyModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="verifyPolicyModalTitle">新建校验策略</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <form id="verifyPolicyForm">
+          <input type="hidden" id="vp_id">
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">策略名称 *</label>
+              <input class="form-control" id="vp_name" required placeholder="例如：MySQL 每日恢复校验">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">备份任务 *</label>
+              <select class="form-select" id="vp_task_id" required></select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">恢复池 / 恢复目录</label>
+              <input class="form-control" id="vp_recovery_pool" placeholder="用于存放临时恢复文件的目录">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">调度类型 *</label>
+              <select class="form-select" id="vp_schedule_type" required>
+                <option value="manual">手动</option>
+                <option value="cron">Cron 表达式</option>
+                <option value="interval">固定间隔(分钟)</option>
+              </select>
+            </div>
+            <div class="col-md-6" id="cronInput">
+              <label class="form-label">Cron 表达式</label>
+              <input class="form-control" id="vp_cron_expr" placeholder="0 2 * * 1">
+            </div>
+            <div class="col-md-6" id="intervalInput" style="display:none">
+              <label class="form-label">间隔分钟数</label>
+              <input class="form-control" id="vp_interval_minutes" type="number" min="5" placeholder="60">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">克隆保留（分钟）</label>
+              <input class="form-control" id="vp_clone_retention_min" type="number" value="30" min="0">
+            </div>
+            <div class="col-md-6 d-flex align-items-center">
+              <div class="form-check form-switch mt-4">
+                <input class="form-check-input" type="checkbox" id="vp_enabled" checked>
+                <label class="form-check-label" for="vp_enabled">启用策略</label>
+              </div>
+            </div>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="vpSubmitBtn" onclick="saveVerifyPolicy()">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/restore_verify.js?v=2026081101"></script>
+{% endblock %}

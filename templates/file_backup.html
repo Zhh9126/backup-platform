@@ -68,6 +68,7 @@
               <select class="form-select" id="f_backup_type">
                 <option value="full">全量</option>
                 <option value="incremental">增量</option>
+                <option value="mixed">组合（全量+增量）</option>
               </select>
             </div>
 
@@ -108,24 +109,49 @@
             </div>
 
             <div class="col-md-4">
-              <label class="form-label">调度方式</label>
-              <select class="form-select" id="f_schedule_type">
-                <option value="none">不自动（手动）</option>
-                <option value="cron">Cron 表达式</option>
-                <option value="interval">固定间隔</option>
-              </select>
-            </div>
-            <div class="col-md-4 d-none" id="f_cron_wrap">
-              <label class="form-label">Cron 表达式</label>
-              <input class="form-control" id="f_cron_expr" placeholder="0 2 * * *">
-            </div>
-            <div class="col-md-4 d-none" id="f_interval_wrap">
-              <label class="form-label">间隔（分钟）</label>
-              <input class="form-control" id="f_interval_minutes" type="number" value="60">
-            </div>
-            <div class="col-md-4">
               <label class="form-label">保留天数</label>
               <input class="form-control" id="f_retention_days" type="number" value="30">
+            </div>
+
+            <!-- 按天选择调度区 -->
+            <div class="col-12 d-none" id="f_mixed_schedule_box">
+              <div class="alert alert-light py-2 mb-2 small text-muted" id="f_schedule_tip">
+                组合备份：分别设置「全量」与「增量」的运行星期与时间。不勾选任何星期 = 该子任务不自动调度（可手动触发）。
+              </div>
+              <div class="row g-3">
+                <div class="col-md-6 border-end" id="f_full_schedule_col">
+                  <label class="form-label text-primary">全量调度（按天）</label>
+                  <div class="d-flex flex-wrap gap-1 mb-2" id="f_full_days">
+                    <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="0" id="f_full_d0"><label class="form-check-label small" for="f_full_d0">一</label></div>
+                    <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="1" id="f_full_d1"><label class="form-check-label small" for="f_full_d1">二</label></div>
+                    <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="2" id="f_full_d2"><label class="form-check-label small" for="f_full_d2">三</label></div>
+                    <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="3" id="f_full_d3"><label class="form-check-label small" for="f_full_d3">四</label></div>
+                    <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="4" id="f_full_d4"><label class="form-check-label small" for="f_full_d4">五</label></div>
+                    <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="5" id="f_full_d5"><label class="form-check-label small" for="f_full_d5">六</label></div>
+                    <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="6" id="f_full_d6"><label class="form-check-label small" for="f_full_d6">日</label></div>
+                  </div>
+                  <div class="input-group input-group-sm">
+                    <span class="input-group-text">时间</span>
+                    <input type="time" class="form-control" id="f_full_time" value="02:00">
+                  </div>
+                </div>
+                <div class="col-md-6" id="f_incremental_schedule_col">
+                  <label class="form-label text-success">增量调度（按天）</label>
+                  <div class="d-flex flex-wrap gap-1 mb-2" id="f_incremental_days">
+                    <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="0" id="f_inc_d0"><label class="form-check-label small" for="f_inc_d0">一</label></div>
+                    <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="1" id="f_inc_d1"><label class="form-check-label small" for="f_inc_d1">二</label></div>
+                    <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="2" id="f_inc_d2"><label class="form-check-label small" for="f_inc_d2">三</label></div>
+                    <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="3" id="f_inc_d3"><label class="form-check-label small" for="f_inc_d3">四</label></div>
+                    <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="4" id="f_inc_d4"><label class="form-check-label small" for="f_inc_d4">五</label></div>
+                    <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="5" id="f_inc_d5"><label class="form-check-label small" for="f_inc_d5">六</label></div>
+                    <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" value="6" id="f_inc_d6"><label class="form-check-label small" for="f_inc_d6">日</label></div>
+                  </div>
+                  <div class="input-group input-group-sm">
+                    <span class="input-group-text">时间</span>
+                    <input type="time" class="form-control" id="f_incremental_time" value="02:00">
+                  </div>
+                </div>
+              </div>
             </div>
 
             <div class="col-12">
@@ -137,6 +163,28 @@
                 <input class="form-check-input" type="checkbox" id="f_demo_only">
                 <label class="form-check-label">演示模式（生成仿真占位备份）</label>
               </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="checkbox" id="f_encrypt_pool">
+                <label class="form-check-label">存储池加密（AES-256-GCM）</label>
+              </div>
+              <div class="form-text">需在服务端设置环境变量 BACKUP_POOL_KEY；否则备份时自动跳过加密</div>
+            </div>
+
+            <div class="col-md-4">
+              <label class="form-label">流量控制（限速）</label>
+              <div class="input-group input-group-sm">
+                <input type="number" class="form-control" id="f_bandwidth_limit" min="0" value="0">
+                <span class="input-group-text">KB/s</span>
+              </div>
+              <div class="form-text">0 = 不限速；Linux 部署机需安装 pv 才能生效</div>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">压缩级别</label>
+              <div class="input-group input-group-sm">
+                <input type="number" class="form-control" id="f_compress_level" min="0" max="22" value="0">
+                <span class="input-group-text">0=默认</span>
+              </div>
+              <div class="form-text">0 跟随引擎默认（zstd 10）；1~22 自定义压缩级别</div>
             </div>
           </div>
         </form>

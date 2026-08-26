@@ -70,6 +70,17 @@
 
   // ---- 调度列显示 ----
   var scheduleCell = function (t) {
+    if (t.mixed_backup) {
+      const full = t.full_schedule_type === "cron" ? "全 " + cronZh(t.full_schedule_expr)
+        : t.full_schedule_type === "interval" ? "全 每" + (t.full_schedule_expr || "?") + "分"
+        : "全 手动";
+      const inc = t.incremental_schedule_type === "cron" ? "增 " + cronZh(t.incremental_schedule_expr)
+        : t.incremental_schedule_type === "interval" ? "增 每" + (t.incremental_schedule_expr || "?") + "分"
+        : (t.schedule_type === "cron" ? "增 " + cronZh(t.cron_expr)
+          : t.schedule_type === "interval" ? "增 每" + (t.interval_minutes || "?") + "分"
+          : "增 手动");
+      return '<span class="badge bg-primary me-1">组合</span><small class="text-muted">' + esc(full + " / " + inc) + '</small>';
+    }
     if (t.schedule_type === "cron") {
       var cronText = cronZh(t.cron_expr);
       // 空 cron 表达式：仅显示"定时"徽标，不显示占位 —
@@ -86,9 +97,9 @@
     return '<span class="badge bg-secondary">手动</span>';
   };
 
-  // 填充 SSH 主机下拉（数据库任务：无客户端时远程执行 dump）
+  // 填充 SSH 主机下拉（数据库任务：优先远程执行 dump）
   const fillSshHostSelect = (sel, hosts = []) => {
-    const opts = ['<option value="">— 自动（按数据库地址匹配已纳管主机；本机有客户端时忽略）—</option>'];
+    const opts = ['<option value="">— 自动（按数据库地址匹配已纳管主机；远端失败后回退本机）—</option>'];
     (hosts || []).forEach((h) => {
       const label = h.name ? `${esc(h.name)} (${esc(h.host_key)})` : esc(h.host_key);
       opts.push(`<option value="${h.id}">${label}</option>`);
@@ -213,6 +224,20 @@
     const healthColor = health >= 80 ? "var(--success)" : health >= 50 ? "var(--warning)" : "var(--error)";
     $("st_health").innerHTML = `<span style="color:${healthColor}">${health}</span><span class="text-muted" style="font-size:14px">/100</span>`;
 
+    // 存储池加密任务数（来自 dashboard 返回）
+    $("st_encrypt_enabled").textContent = d.encrypt_pool_tasks != null ? d.encrypt_pool_tasks : "-";
+
+    // 全局重删统计（参照白皮书 §2.4 全局重删）
+    try {
+      const ds = await api("GET", "/api/dedup/stats");
+      const s = ds.stats || {};
+      $("st_dedup_ratio").textContent = (s.dedup_ratio_pct != null ? s.dedup_ratio_pct : 0) + "%";
+      $("st_dedup_saved").textContent = s.saved_bytes_human != null ? s.saved_bytes_human : "-";
+    } catch (e) {
+      $("st_dedup_ratio").textContent = "-";
+      $("st_dedup_saved").textContent = "-";
+    }
+
     // 健康详情（4 维分项进度条）
     const healthLines = (d.health_details || []).map(_parseHealthItem).filter(Boolean);
     const $hd = $("healthDetails");
@@ -267,6 +292,30 @@
   }
 
   // ------------------------- 任务管理 -------------------------
+  // 切换备份类型：按天调度区始终显示，根据 full/incremental/mixed 显示对应子区
+  function refreshScheduleByDayBox() {
+    const type = $("t_backup_type")?.value || "full";
+    const box = $("t_mixed_schedule_box");
+    const fullCol = $("t_full_schedule_col");
+    const incCol = $("t_incremental_schedule_col");
+    const tip = $("t_schedule_tip");
+    if (box) {
+      box.style.display = "";
+      box.classList.remove("d-none");
+    }
+    if (fullCol) fullCol.classList.toggle("d-none", type === "incremental");
+    if (incCol) incCol.classList.toggle("d-none", type === "full");
+    if (tip) {
+      if (type === "mixed") {
+        tip.textContent = "组合备份：分别设置「全量」与「增量」的运行星期与时间。不勾选任何星期 = 该子任务不自动调度（可手动触发）。";
+      } else if (type === "full") {
+        tip.textContent = "全量备份：勾选运行星期并设置时间。不勾选任何星期 = 不自动调度（可手动触发）。";
+      } else {
+        tip.textContent = "增量备份：勾选运行星期并设置时间。不勾选任何星期 = 不自动调度（可手动触发）。";
+      }
+    }
+  }
+
   function bindTaskFormEvents() {
     // 切换数据库类型时自动填默认端口
     const dbTypeEl = $("t_db_type");
@@ -276,15 +325,83 @@
         if (p) $("t_port").value = p;
       };
     }
-    // 切换调度类型时切换 placeholder
-    const schedEl = $("t_schedule_type");
-    const schedExprEl = $("t_schedule_expr");
-    if (schedEl && schedExprEl) {
-      schedEl.onchange = () => {
-        if (schedEl.value === "cron") schedExprEl.placeholder = "如: 0 2 * * *";
-        else if (schedEl.value === "interval") schedExprEl.placeholder = "如: 60 (每60分钟)";
-        else schedExprEl.placeholder = "手动执行无需填";
+    // 切换备份类型：按天调度区显隐由顶层 refreshScheduleByDayBox 处理
+    const backupTypeEl = $("t_backup_type");
+    if (backupTypeEl) {
+      backupTypeEl.onchange = () => {
+        refreshScheduleByDayBox();
+        refreshDbPickerVisibility();
       };
+      refreshScheduleByDayBox();
+    }
+  }
+
+  // ---------- 组合调度：按天勾选 + 时间 ⇄ cron/days ----------
+  function _collectDays(prefix) {
+    // prefix: "t_full" / "t_inc" / "f_full" / "f_inc"
+    // 读取对应星期 checkbox 容器（id 形如 t_full_days / f_inc_days），返回数字数组(0=周一)
+    // 兼容 HTML 实际 ID（t_incremental_days 而非 t_inc_days）。
+    // 完全防御式：所有可能返回 undefined 的调用都包 try/catch + 类型检查，
+    // 避免任何边角情况让 _collectDays 抛出中断整个 saveTask。
+    const candidates = [prefix + "_days", prefix + "_incremental_days", "t_incremental_days"];
+    let box = null;
+    for (let i = 0; i < candidates.length; i++) {
+      box = $(candidates[i]);
+      if (box) break;
+    }
+    if (!box || typeof box.querySelectorAll !== "function") return [];
+    let nodes = null;
+    try { nodes = box.querySelectorAll('input[type="checkbox"]'); }
+    catch (_) { return []; }
+    if (!nodes || typeof nodes.length !== "number") return [];
+    const out = [];
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i];
+      if (n && n.checked) {
+        const v = Number(n.value);
+        if (!Number.isNaN(v)) out.push(v);
+      }
+    }
+    return out.sort((a, b) => a - b);
+  }
+
+  function _buildMixedSub(prefix) {
+    // 从「星期勾选 + 时间」生成子调度：type=cron, cron_expr="分 时 * * *", days="0,1,..."
+    const days = _collectDays(prefix);
+    const time = $(prefix + "_time")?.value || "02:00";
+    const [hh, mm] = time.split(":").map((x) => x.padStart(2, "0"));
+    if (!days.length) {
+      return { type: "none", cron_expr: "", interval_minutes: null, days: "" };
+    }
+    return {
+      type: "cron",
+      cron_expr: `${mm} ${hh} * * *`,
+      interval_minutes: null,
+      days: days.join(","),
+    };
+  }
+
+  function _fillMixedSub(prefix, task) {
+    // 回填：把 task.full_schedule_days / full_schedule_expr 还原为星期勾选 + 时间
+    const daysStr = (prefix === "t_full" ? task.full_schedule_days
+      : prefix === "t_inc" ? task.incremental_schedule_days
+      : prefix === "f_full" ? task.full_schedule_days
+      : task.incremental_schedule_days) || "";
+    const days = daysStr ? daysStr.split(",").map((s) => s.trim()).filter(Boolean) : [];
+    const box = $(prefix + "_days");
+    if (box) {
+      box.querySelectorAll('input[type="checkbox"]').forEach((c) => {
+        c.checked = days.includes(c.value);
+      });
+    }
+    const expr = (prefix === "t_full" ? task.full_schedule_expr
+      : prefix === "t_inc" ? task.incremental_schedule_expr
+      : prefix === "f_full" ? task.full_schedule_expr
+      : task.incremental_schedule_expr) || "2 2 * * *";
+    // 从 cron_expr "分 时 * * *" 解析时间（兼容 5 段）
+    const parts = expr.split(/\s+/);
+    if (parts.length >= 2 && $(prefix + "_time")) {
+      $(prefix + "_time").value = `${parts[1].padStart(2, "0")}:${parts[0].padStart(2, "0")}`;
     }
   }
 
@@ -305,20 +422,40 @@
       $("t_db_name").value = task.db_name || "";
       $("t_backup_type").value = task.backup_type || "full";
       $("t_backup_mode").value = task.backup_mode || "logical";
-      $("t_schedule_type").value = task.schedule_type || "none";
-      // 合并显示 cron / interval
-      $("t_schedule_expr").value = task.cron_expr || (task.interval_minutes ? String(task.interval_minutes) : "");
+      // 按天调度回填：单任务主 schedule 映射到对应子区；mixed 同时回填两套
+      const bt = task.backup_type || "full";
+      if (bt === "full") {
+        const fake = Object.assign({}, task, { full_schedule_days: "", full_schedule_expr: task.cron_expr || "" });
+        _fillMixedSub("t_full", fake);
+      } else if (bt === "incremental") {
+        const fake = Object.assign({}, task, { incremental_schedule_days: "", incremental_schedule_expr: task.cron_expr || "" });
+        _fillMixedSub("t_inc", fake);
+      } else {
+        _fillMixedSub("t_full", task);
+        _fillMixedSub("t_inc", task);
+      }
+      // 限速 / 压缩级别 / 保留天数 / 加密
+      $("t_bandwidth_limit").value = task.bandwidth_limit ?? 0;
+      $("t_compress_level").value = task.compress_level ?? 0;
       $("t_retention_days").value = task.retention_days ?? 30;
-      $("t_remote_path").value = task.remote_path || "";
       $("t_encrypt_pwd").value = task.encrypt_pwd || "";
-      $("t_remark").value = task.remark || "";
       $("t_extra_options").value = task.extra_options || "";
       $("t_enabled").checked = !!task.enabled;
+      // 恢复 SSH 备份机选择
+      try {
+        const eo = JSON.parse(task.extra_options || "{}");
+        if ($("t_ssh_host")) $("t_ssh_host").value = eo.ssh_host_id || "";
+        if ($("t_encrypt_pool")) $("t_encrypt_pool").checked = !!eo.encrypt_pool;
+      } catch (e) {
+        if ($("t_ssh_host")) $("t_ssh_host").value = "";
+        if ($("t_encrypt_pool")) $("t_encrypt_pool").checked = false;
+      }
     } else {
       $("taskModalTitle").textContent = "新建备份任务";
       $("t_id").value = "";
       const p = META.default_ports[$("t_db_type").value];
       if (p) $("t_port").value = p;
+      if ($("t_encrypt_pool")) $("t_encrypt_pool").checked = false;
     }
     // 数据库选择器（schema/table 多选）：mysql/mariadb/postgresql/kingbase/oracle/dameng 显示
     // 注：oracle/dameng 引擎 list_databases() 返回空（需用户手工指定 schema），
@@ -340,7 +477,15 @@
         }
       }
     } catch (e) { /* ignore */ }
-    taskModal.show();
+    // 根据备份类型切换按天调度区显示
+    refreshScheduleByDayBox();
+    // 防御：确保模态框实例存在（即使 init 阶段因故未创建也能自愈，避免 taskModal 为 null 时抛错）
+    if (!taskModal) {
+      const el = document.getElementById("taskModal");
+      if (el && window.bootstrap && bootstrap.Modal) taskModal = new bootstrap.Modal(el);
+    }
+    if (taskModal) taskModal.show();
+    else console.error("[openTaskModal] taskModal 实例缺失，无法弹出编辑框");
   }
 
   // 数据库选择器（schema/table 多选）：mysql/mariadb/postgresql/kingbase/oracle/dameng 显示
@@ -394,7 +539,8 @@
       const r = await api("GET", `/api/tasks/${id}/list-databases`);
       const sel = $("t_pick_list");
       sel.innerHTML = (r.databases || []).map(d => `<option value="${esc(d)}">${esc(d)}</option>`).join("");
-      status.textContent = `拉取到 ${r.databases.length} 个${r.type === "schemas" ? "schema" : "数据库"}（已过滤系统库）`;
+      const viaJdbc = !!r.via_jdbc;
+      status.textContent = `拉取到 ${r.databases.length} 个${r.type === "schemas" ? "schema" : "数据库"}（已过滤系统库${viaJdbc ? "，经 JDBC 兜底连接" : ""}）`;
       status.className = "form-control form-control-sm text-success";
       // 若有 eo.schemas/tables，恢复选中
       try {
@@ -408,6 +554,44 @@
     } catch (e) {
       status.textContent = "拉取失败: " + e.message;
       status.className = "form-control form-control-sm text-danger";
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  // JDBC 连接测试（不依赖 SSH/客户端，通过 JDBC 驱动直连）
+  async function jdbcTestConnection() {
+    const btn = $("t_jdbc_test_btn");
+    const box = $("t_jdbc_test_result");
+    const msg = $("t_jdbc_test_msg");
+    if (!btn || !box || !msg) return;
+    const body = {
+      db_type: ($("t_db_type") || {}).value || "",
+      host: ($("t_host") || {}).value || "",
+      port: ($("t_port") || {}).value || "",
+      username: ($("t_username") || {}).value || "",
+      password: ($("t_password") || {}).value || "",
+      db_name: ($("t_db_name") || {}).value || "",
+    };
+    box.classList.remove("d-none");
+    if (!body.db_type || !body.host) {
+      msg.className = "alert alert-warning small py-2 mb-0";
+      msg.innerHTML = '<i class="bi bi-exclamation-triangle"></i> <span>请先填写数据库类型、主机地址（端口）后再测试。</span>';
+      return;
+    }
+    btn.disabled = true;
+    msg.className = "alert alert-info small py-2 mb-0";
+    msg.innerHTML = '<i class="bi bi-plug"></i> <span>JDBC 连接测试中...</span>';
+    try {
+      const r = await api("POST", "/api/jdbc/test-connection", body);
+      const ok = !!r.success;
+      msg.className = `alert ${ok ? "alert-success" : "alert-danger"} small py-2 mb-0`;
+      const icon = ok ? "bi-check-circle" : "bi-x-circle";
+      const ms = r.info && r.info.latency_ms != null ? `（${r.info.latency_ms} ms）` : "";
+      msg.innerHTML = `<i class="bi ${icon}"></i> <span>${esc(r.message || "")}${ms}</span>`;
+    } catch (e) {
+      msg.className = "alert alert-danger small py-2 mb-0";
+      msg.innerHTML = `<i class="bi bi-x-circle"></i> <span>JDBC 测试请求失败: ${esc(e.message || e)}</span>`;
     } finally {
       btn.disabled = false;
     }
@@ -445,6 +629,11 @@
     if (btn && !btn._bound) {
       btn._bound = true;
       btn.onclick = fetchDatabases;
+    }
+    const jdbcBtn = $("t_jdbc_test_btn");
+    if (jdbcBtn && !jdbcBtn._bound) {
+      jdbcBtn._bound = true;
+      jdbcBtn.onclick = jdbcTestConnection;
     }
     const allBtn = $("t_pick_all");
     if (allBtn && !allBtn._bound) {
@@ -489,48 +678,85 @@
   }
 
   async function saveTask() {
-    const id = $("t_id").value;
-    const num = (v) => (v === "" || v == null ? null : Number(v));
-    // 解析 schedule_expr：cron 或 纯数字（分钟）
-    const schedType = $("t_schedule_type").value;
-    const schedExpr = $("t_schedule_expr").value || "";
-    let cron_expr = "", interval_minutes = null;
-    if (schedType === "cron") cron_expr = schedExpr;
-    else if (schedType === "interval") interval_minutes = num(schedExpr);
-    const data = {
-      name: $("t_name").value,
-      biz_system: $("t_biz_system").value.trim(),
-      db_type: $("t_db_type").value,
-      host: $("t_host").value,
-      port: num($("t_port").value),
-      username: $("t_username").value,
-      password: $("t_password").value,
-      db_name: $("t_db_name").value,
-      backup_type: $("t_backup_type").value,
-      backup_mode: $("t_backup_mode").value || "logical",
-      schedule_type: schedType,
-      cron_expr: cron_expr,
-      interval_minutes: interval_minutes,
-      retention_days: Number($("t_retention_days").value || 30),
-      remote_path: $("t_remote_path").value,
-      encrypt_pwd: $("t_encrypt_pwd").value,
-      remark: $("t_remark").value,
-      extra_options: $("t_extra_options").value || "",
-      enabled: $("t_enabled").checked ? 1 : 0,
-    };
-    // taskForm 带 onsubmit="return false"，HTML5 原生校验不保证触发，JS 校验是主防线
-    if (!data.biz_system) { toast("请填写业务系统", "danger"); return; }
-    if (!data.name.trim()) { toast("请填写任务名称", "danger"); return; }
+    // 全面防御：编辑/新建时，模态框的某些字段可能不在当前 tab/不存在，
+    // 任何 $(id) 为 null 都会让 .value 抛 TypeError，导致点保存完全无反应。
+    // 这里把整个函数包进 try/catch（错误用 toast 显示，不再静默），
+    // 并对所有字段读取做 null 安全。涉及类型 / 业务系统 / 任务名等核心
+    // 字段若缺失仍在校验处拦截。
     try {
+      const val = (id, fb = "") => {
+        const e = $(id);
+        return (e && e.value != null) ? e.value : fb;
+      };
+      const chk = (id) => {
+        const e = $(id);
+        return !!(e && e.checked);
+      };
+      const num = (v) => (v === "" || v == null ? null : Number(v));
+      const id = val("t_id");
+      const backupType = val("t_backup_type", "full");
+      const mixed = backupType === "mixed";
+      const fullSched = _buildMixedSub("t_full") || { type: "none", cron_expr: "", days: "" };
+      const incSched  = _buildMixedSub("t_inc")  || { type: "none", cron_expr: "", days: "" };
+      let schedule_type = "none", cron_expr = "", interval_minutes = null;
+      if (backupType === "full") {
+        schedule_type = fullSched.type || "none";
+        cron_expr = fullSched.cron_expr || "";
+      } else if (backupType === "incremental") {
+        schedule_type = incSched.type || "none";
+        cron_expr = incSched.cron_expr || "";
+      }
+      let eo = {};
+      try { eo = JSON.parse(val("t_extra_options", "{}")); } catch (_) { eo = {}; }
+      const sshId = val("t_ssh_host");
+      if (sshId) eo.ssh_host_id = Number(sshId); else delete eo.ssh_host_id;
+      if (chk("t_encrypt_pool")) eo.encrypt_pool = true; else delete eo.encrypt_pool;
+      const data = {
+        name: val("t_name"),
+        biz_system: val("t_biz_system").trim(),
+        db_type: val("t_db_type"),
+        host: val("t_host"),
+        port: num(val("t_port")),
+        username: val("t_username"),
+        password: val("t_password"),
+        db_name: val("t_db_name"),
+        backup_type: backupType,
+        backup_mode: val("t_backup_mode") || "logical",
+        schedule_type: schedule_type,
+        cron_expr: cron_expr,
+        interval_minutes: interval_minutes,
+        mixed_backup: mixed ? 1 : 0,
+        full_schedule_type: mixed ? (fullSched.type || "none") : "none",
+        full_schedule_expr: mixed ? (fullSched.cron_expr || "") : "",
+        full_schedule_days: mixed ? (fullSched.days || "") : "",
+        incremental_schedule_type: mixed ? (incSched.type || "none") : "none",
+        incremental_schedule_expr: mixed ? (incSched.cron_expr || "") : "",
+        incremental_schedule_days: mixed ? (incSched.days || "") : "",
+        bandwidth_limit: num(val("t_bandwidth_limit")) || 0,
+        compress_level: num(val("t_compress_level")) || 0,
+        retention_days: Number(val("t_retention_days") || 30),
+        encrypt_pwd: val("t_encrypt_pwd"),
+        extra_options: JSON.stringify(eo),
+        enabled: chk("t_enabled") ? 1 : 0,
+      };
+      if (!data.biz_system) { toast("请填写业务系统", "danger"); return; }
+      if (!data.name.trim()) { toast("请填写任务名称", "danger"); return; }
       if (id) { await api("PUT", `/api/tasks/${id}`, data); toast("任务已更新"); }
-      else { await api("POST", "/api/tasks", data); toast("任务已创建"); }
-      taskModal.hide();
-      await loadTasks();
-    } catch (e) { toast(e.message, "danger"); }
+      else    { await api("POST", "/api/tasks", data); toast("任务已创建"); }
+      if (taskModal) taskModal.hide();
+      // 注意：刷新列表的失败不应覆盖"已保存"的成功事实。
+      // 否则用户明明看到"任务已创建"却立即被"保存失败"覆盖，
+      // 而且 DB 里任务其实已经在了。这是误导性错误，必须分离。
+      try { await loadTasks(); }
+      catch (e) { console.warn("[saveTask] 刷新列表失败（任务已保存）:", e); }
+    } catch (e) {
+      console.error("[saveTask]", e);
+      toast("保存失败: " + (e && e.message ? e.message : e), "danger");
+    }
   }
 
   async function loadTasks() {
-    const tasks = await api("GET", "/api/tasks?db_type_exclude=file");
+    const tasks = (await api("GET", "/api/tasks?db_type_exclude=file")) || [];
     $("taskTable").innerHTML = tasks.map((t) =>
       `<tr>
         <td>${t.id}</td>
@@ -633,9 +859,12 @@
   async function loadRecords() {
     const tid = $("filterTask").value;
     const kw = ($("recordSearch")?.value || "").trim();
+    const urlParams = new URLSearchParams(location.search);
+    const pid = urlParams.get("policy_id");
     const q = [];
     if (tid) q.push("task_id=" + encodeURIComponent(tid));
     if (kw) q.push("keyword=" + encodeURIComponent(kw));
+    if (pid) q.push("policy_id=" + encodeURIComponent(pid));
     const url = "/api/records" + (q.length ? "?" + q.join("&") : "");
     const recs = await api("GET", url);
     $("recordTable").innerHTML = recs.map((r) => {
@@ -850,7 +1079,35 @@
       clearTimeout(window._recSearchTimer);
       window._recSearchTimer = setTimeout(loadRecords, 300);
     });
+
+    // 保护策略下钻：若 URL 携带 policy_id，显示过滤条并禁用任务下拉框
+    const urlParams = new URLSearchParams(location.search);
+    const pid = urlParams.get("policy_id");
+    if (pid) {
+      try {
+        const pol = await api("GET", "/api/policy/" + pid);
+        const bar = $("policyFilterBar");
+        const nameEl = $("policyFilterName");
+        if (bar && nameEl) {
+          nameEl.textContent = (pol.name || ("策略 #" + pid)) + "（共 " + (pol.bound_task_count || 0) + " 个任务）";
+          bar.classList.remove("d-none");
+        }
+        $("filterTask").disabled = true;
+      } catch (e) {
+        toast("加载保护策略信息失败: " + e.message, "danger");
+      }
+    }
     await loadRecords();
+
+    window.clearPolicyFilter = function () {
+      const url = new URL(location.href);
+      url.searchParams.delete("policy_id");
+      history.replaceState({}, "", url);
+      $("filterTask").disabled = false;
+      const bar = $("policyFilterBar");
+      if (bar) bar.classList.add("d-none");
+      loadRecords();
+    };
   }
   window.refreshRecords = () => { loadRecords(); };
   window.exportRecords = (fmt) => { window.open("/api/records/export?format=" + (fmt || "csv"), "_blank"); };
@@ -1071,8 +1328,8 @@
   function renderRestoreRecords() {
     const records = window.RESTORE_RECORDS || [];
     const recType = document.querySelector('input[name="r_type"]:checked')?.value || 'db';
-    const searchName = ($("r_search")?.value || "").toLowerCase().trim();
-    const searchIp = ($("r_search_ip")?.value || "").toLowerCase().trim();
+    // 统一搜索：业务系统名称 / IP 合并为一个搜索框，二者任一匹配即可
+    const search = ($("r_search")?.value || "").toLowerCase().trim();
     // 按类型过滤
     let filtered = records.filter(r => {
       if (recType === 'db' && r.db_type === 'file') return false;
@@ -1080,13 +1337,11 @@
       return true;
     });
     // 按关键字过滤（业务系统 / IP，使用后端归一化后的 host_ip，避免「本地」被吞）
-    if (searchName || searchIp) {
+    if (search) {
       filtered = filtered.filter(r => {
         const name = (r.biz_label || "").toLowerCase();
         const ip = (r.host_ip || "").toLowerCase();
-        if (searchName && !name.includes(searchName)) return false;
-        if (searchIp && !ip.includes(searchIp)) return false;
-        return true;
+        return name.includes(search) || ip.includes(search);
       });
     }
     const html = filtered.length === 0
@@ -1478,6 +1733,107 @@
         $("testAiModelBtn").innerHTML = oldHtml;
       }
     };
+    // 存储池加密密钥 (KMS)
+    try { await initPoolCrypto(); } catch (e) { /* 忽略 */ }
+  }
+
+  // ------------------------- 存储池加密密钥 (KMS) -------------------------
+  window.togglePoolCryptoFields = function () {
+    const mode = $("pc_mode") ? $("pc_mode").value : "local";
+    if ($("pc_local_fields")) $("pc_local_fields").classList.toggle("d-none", mode !== "local");
+    if ($("pc_kms_fields")) $("pc_kms_fields").classList.toggle("d-none", mode !== "kms");
+  };
+
+  async function initPoolCrypto() {
+    if (!$("pc_mode")) return;
+    togglePoolCryptoFields();
+    // 加载当前配置
+    try {
+      const cfg = await api("GET", "/api/pool-crypto");
+      $("pc_mode").value = cfg.mode || "local";
+      togglePoolCryptoFields();
+      if (cfg.mode === "kms") {
+        $("pc_kms_provider").value = cfg.kms_provider || "custom";
+        $("pc_kms_endpoint").value = cfg.kms_endpoint || "";
+        $("pc_kms_key_id").value = cfg.kms_key_id || "";
+        $("pc_kms_access_key").value = cfg.kms_access_key || "";
+      }
+      const badge = $("poolCryptoStatusBadge");
+      if (badge) {
+        if (cfg.active) {
+          badge.textContent = "已启用";
+          badge.className = "badge ms-2 bg-success";
+        } else {
+          badge.textContent = "未启用";
+          badge.className = "badge ms-2 bg-secondary";
+        }
+      }
+      const ls = $("pc_local_status");
+      if (ls) ls.textContent = cfg.local_key_set ? "已保存主密钥（不回显明文）" : "尚未保存";
+    } catch (e) { /* 忽略 */ }
+
+    // 保存
+    $("pcSaveBtn").onclick = async () => {
+      const mode = $("pc_mode").value;
+      const payload = { mode };
+      if (mode === "local") {
+        payload.pool_key = $("pc_pool_key").value;
+      } else {
+        payload.kms_provider = $("pc_kms_provider").value;
+        payload.kms_endpoint = $("pc_kms_endpoint").value;
+        payload.kms_key_id = $("pc_kms_key_id").value;
+        payload.kms_access_key = $("pc_kms_access_key").value;
+        payload.kms_secret = $("pc_kms_secret").value;
+        payload.local_fallback_key = $("pc_local_fallback_key").value;
+      }
+      const res = $("pc_save_result");
+      const errEl = $("pcError");
+      try {
+        const r = await api("POST", "/api/pool-crypto", payload);
+        res.textContent = r.message || "已保存";
+        res.className = "form-text ms-2 text-success";
+        errEl.classList.add("d-none");
+        const badge = $("poolCryptoStatusBadge");
+        if (badge) { badge.textContent = "已启用"; badge.className = "badge ms-2 bg-success"; }
+        if (r.self_test && !r.self_test.ok) {
+          errEl.textContent = "自检提示: " + (r.self_test.error || "未知");
+          errEl.classList.remove("d-none");
+        }
+        // 保存后清空密钥输入框
+        $("pc_pool_key").value = "";
+        $("pc_kms_secret").value = "";
+        $("pc_local_fallback_key").value = "";
+      } catch (e) {
+        res.textContent = "";
+        errEl.textContent = e.message;
+        errEl.classList.remove("d-none");
+      }
+    };
+
+    // 测试 KMS 连通性
+    const testBtn = $("pcTestKmsBtn");
+    if (testBtn) {
+      testBtn.onclick = async () => {
+        const out = $("pc_kms_test_result");
+        try {
+          const r = await api("POST", "/api/pool-crypto/test", {
+            kms_provider: $("pc_kms_provider").value,
+            kms_endpoint: $("pc_kms_endpoint").value,
+            kms_key_id: $("pc_kms_key_id").value,
+            kms_access_key: $("pc_kms_access_key").value,
+            kms_secret: $("pc_kms_secret").value,
+          });
+          out.textContent = r.message || "KMS 连通成功";
+          out.className = "form-text ms-2 text-success";
+        } catch (e) {
+          out.textContent = (e.message || "KMS 测试失败");
+          out.className = "form-text ms-2 text-danger";
+        }
+      };
+    }
+  }
+  if (typeof window.initPoolCrypto === "undefined") {
+    window.initPoolCrypto = initPoolCrypto;
   }
 
   // 模型厂商切换：local 隐藏远程字段，其他隐藏本地路径
@@ -1561,11 +1917,33 @@
       document.querySelectorAll(".f-target-remote").forEach((el) =>
         el.classList.toggle("d-none", $("f_target_type").value !== "remote"));
     };
-    $("f_schedule_type").onchange = () => {
-      const v = $("f_schedule_type").value;
-      $("f_cron_wrap").classList.toggle("d-none", v !== "cron");
-      $("f_interval_wrap").classList.toggle("d-none", v !== "interval");
+    // 按天选择调度：根据 full/incremental/mixed 显示对应子区
+    function refreshFileScheduleByDayBox() {
+      const type = $("f_backup_type")?.value || "full";
+      const box = $("f_mixed_schedule_box");
+      const fullCol = $("f_full_schedule_col");
+      const incCol = $("f_incremental_schedule_col");
+      const tip = $("f_schedule_tip");
+      if (box) {
+        box.style.display = "";
+        box.classList.remove("d-none");
+      }
+      if (fullCol) fullCol.classList.toggle("d-none", type === "incremental");
+      if (incCol) incCol.classList.toggle("d-none", type === "full");
+      if (tip) {
+        if (type === "mixed") {
+          tip.textContent = "组合备份：分别设置「全量」与「增量」的运行星期与时间。不勾选任何星期 = 该子任务不自动调度（可手动触发）。";
+        } else if (type === "full") {
+          tip.textContent = "全量备份：勾选运行星期并设置时间。不勾选任何星期 = 不自动调度（可手动触发）。";
+        } else {
+          tip.textContent = "增量备份：勾选运行星期并设置时间。不勾选任何星期 = 不自动调度（可手动触发）。";
+        }
+      }
+    }
+    $("f_backup_type").onchange = () => {
+      refreshFileScheduleByDayBox();
     };
+    refreshFileScheduleByDayBox();
   }
 
   function fillHostSelect(sel, hosts, includeEmpty) {
@@ -1591,12 +1969,30 @@
       $("f_target_type").value = extra.target_type || "local";
       $("f_target_path").value = cleanFilePath(extra.target_path || "");
       $("f_exclude_patterns").value = (extra.exclude_patterns || []).join("\n");
-      $("f_schedule_type").value = task.schedule_type || "none";
-      $("f_cron_expr").value = task.cron_expr || "";
-      $("f_interval_minutes").value = task.interval_minutes || 60;
+      // 按天调度回填：单任务主 schedule 映射到对应子区；mixed 同时回填两套
+      const bt = task.backup_type || "full";
+      if (bt === "full") {
+        const fake = Object.assign({}, task, { full_schedule_days: "", full_schedule_expr: task.cron_expr || "" });
+        _fillMixedSub("f_full", fake);
+      } else if (bt === "incremental") {
+        const fake = Object.assign({}, task, { incremental_schedule_days: "", incremental_schedule_expr: task.cron_expr || "" });
+        _fillMixedSub("f_inc", fake);
+      } else {
+        _fillMixedSub("f_full", task);
+        _fillMixedSub("f_inc", task);
+      }
+      // 限速 / 压缩级别 / 保留天数
+      $("f_bandwidth_limit").value = task.bandwidth_limit ?? 0;
+      $("f_compress_level").value = task.compress_level ?? 0;
       $("f_retention_days").value = task.retention_days ?? 30;
       $("f_enabled").checked = !!task.enabled;
       $("f_demo_only").checked = !!task.demo_only;
+      try {
+        const feo = JSON.parse(task.extra_options || "{}");
+        if ($("f_encrypt_pool")) $("f_encrypt_pool").checked = !!feo.encrypt_pool;
+      } catch (e) {
+        if ($("f_encrypt_pool")) $("f_encrypt_pool").checked = false;
+      }
       // 回填远程主机选择（值为 host_key）
       setTimeout(() => {
         if (extra.source_host) $("f_remote_host").value = extra.source_host;
@@ -1608,14 +2004,19 @@
       $("f_source_type").value = "local";
       $("f_target_type").value = "local";
       $("f_backup_type").value = "full";
-      $("f_schedule_type").value = "none";
     }
     fillHostSelect($("f_remote_host"), FILE_HOSTS, true);
     fillHostSelect($("f_target_host"), FILE_HOSTS, true);
     $("f_source_type").dispatchEvent(new Event("change"));
     $("f_target_type").dispatchEvent(new Event("change"));
-    $("f_schedule_type").dispatchEvent(new Event("change"));
-    fileTaskModal.show();
+    $("f_backup_type").dispatchEvent(new Event("change"));
+    // 防御：确保文件备份模态框实例存在（自愈，避免 fileTaskModal 为 null 时抛错）
+    if (!fileTaskModal) {
+      const el = document.getElementById("fileTaskModal");
+      if (el && window.bootstrap && bootstrap.Modal) fileTaskModal = new bootstrap.Modal(el);
+    }
+    if (fileTaskModal) fileTaskModal.show();
+    else console.error("[openFileTaskModal] fileTaskModal 实例缺失，无法弹出编辑框");
   }
 
   function cleanFilePath(path) {
@@ -1641,16 +2042,38 @@
       target_path: cleanFilePath($("f_target_path").value),
       exclude_patterns: $("f_exclude_patterns").value.split("\n").map((s) => s.trim()).filter(Boolean),
       follow_symlinks: false,
+      encrypt_pool: !!($("f_encrypt_pool")?.checked),
     };
+    const backupType = $("f_backup_type").value;
+    const fMixed = backupType === "mixed";
+    const fFull = _buildMixedSub("f_full");
+    const fInc = _buildMixedSub("f_inc");
+    let schedule_type = "none", cron_expr = "", interval_minutes = null;
+    if (backupType === "full") {
+      schedule_type = fFull.type;
+      cron_expr = fFull.cron_expr;
+    } else if (backupType === "incremental") {
+      schedule_type = fInc.type;
+      cron_expr = fInc.cron_expr;
+    }
     const data = {
       name: $("f_name").value,
       biz_system: $("f_biz_system").value.trim(),
       db_type: "file",
       host: sourceType === "remote" ? extra.source_host : "本地",
-      backup_type: $("f_backup_type").value,
-      schedule_type: $("f_schedule_type").value,
-      cron_expr: $("f_cron_expr").value,
-      interval_minutes: num($("f_interval_minutes").value),
+      backup_type: backupType,
+      schedule_type: schedule_type,
+      cron_expr: cron_expr,
+      interval_minutes: interval_minutes,
+      mixed_backup: fMixed ? 1 : 0,
+      full_schedule_type: fMixed ? fFull.type : "none",
+      full_schedule_expr: fMixed ? fFull.cron_expr : "",
+      full_schedule_days: fMixed ? fFull.days : "",
+      incremental_schedule_type: fMixed ? fInc.type : "none",
+      incremental_schedule_expr: fMixed ? fInc.cron_expr : "",
+      incremental_schedule_days: fMixed ? fInc.days : "",
+      bandwidth_limit: num($("f_bandwidth_limit").value) || 0,
+      compress_level: num($("f_compress_level").value) || 0,
       retention_days: Number($("f_retention_days").value || 30),
       retention_count: 50,
       storage_backend: "local",
@@ -1668,7 +2091,7 @@
     try {
       if (id) { await api("PUT", `/api/tasks/${id}`, data); toast("任务已更新"); }
       else { await api("POST", "/api/tasks", data); toast("任务已创建"); }
-      fileTaskModal.hide();
+      if (fileTaskModal) fileTaskModal.hide();
       await loadFileTasks();
     } catch (e) { toast(e.message, "danger"); }
   }
@@ -2056,6 +2479,8 @@
     const kw = ($("restoreRecordSearch")?.value || "").trim();
     const url = kw ? "/api/restores?keyword=" + encodeURIComponent(kw) : "/api/restores";
     const rs = await api("GET", url);
+    // 保存到全局，方便“查看日志”按钮快速读取
+    window.RESTORE_RECORD_ROWS = rs;
     $("restoreRecordsTable").innerHTML = rs.map((r) => {
       // 收编为统一 fmtBizCell（原为内联拼装，缺 #id 且不走 R2）
       return `<tr><td>${r.id}</td><td>${r.record_id}</td>
@@ -2065,9 +2490,10 @@
        <td>${fmtTime(r.backup_started_at)}</td>
        <td>${esc(r.target_host || "-")}</td><td>${esc(r.target_db || "-")}</td>
        <td>${fmtTime(r.started_at)}</td><td>${statusBadge(r.status)}</td>
-       <td>${esc(r.operator || "-")}</td><td>${esc(r.message || "")}</td></tr>`;
+       <td>${esc(r.operator || "-")}</td><td>${esc(r.message || "")}</td>
+       <td><button class="btn btn-sm btn-outline-primary" onclick="showRestoreLog(${r.id})">查看</button></td></tr>`;
     }).join("") ||
-      '<tr><td colspan="12" class="text-muted text-center">暂无恢复记录</td></tr>';
+      '<tr><td colspan="13" class="text-muted text-center">暂无恢复记录</td></tr>';
 
     const sb = $("restoreRecordSearch");
     if (sb && !sb._wired) {
@@ -2078,6 +2504,19 @@
       });
     }
   }
+
+  // 弹窗展示恢复详细日志
+  window.showRestoreLog = (id) => {
+    const r = (window.RESTORE_RECORD_ROWS || []).find(x => x.id === id);
+    const content = r?.detail_log || r?.message || "暂无详细日志";
+    const el = $("restoreLogContent");
+    if (el) el.textContent = content;
+    const modalEl = $("restoreLogModal");
+    if (modalEl) {
+      const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+      modal.show();
+    }
+  };
 
   // ------------------------- 巡检 -------------------------
   const inspBadge = (s) => {
@@ -2155,7 +2594,7 @@
     $("deployTable").innerHTML = deps.map((d) =>
       `<tr>
         <td>${d.id}</td><td>${esc(d.name)}</td><td>${esc(d.db_type)}</td>
-        <td>${d.host_id ? '#'+d.host_id : '-'}</td>
+        <td>${esc(d.host_display || (d.host_id ? '#'+d.host_id : d.direct_host) || '-')}</td>
         <td class="text-truncate" style="max-width:150px" title="${esc(d.base_dir||'')}">${esc(d.base_dir || '-')}</td>
         <td>${d.port || '-'}</td>
         <td>${d.progress_pct ? `<div class="progress" style="height:6px"><div class="progress-bar bg-teal" style="width:${d.progress_pct}%"></div></div><small>${d.progress_pct}%</small>` : '-'}</td>
@@ -2172,13 +2611,40 @@
   window.loadDeployments = loadDeployments;
 
   window.viewDeployLog = async (id, name) => {
-    $("logTitle").textContent = name + " (部署 #" + id + ")";
-    $("deployLogContent").textContent = "加载中...";
-    const d = await api("GET", `/api/deploy/${id}/log`);
-    $("deployLogContent").textContent = d.log || "(暂无日志)";
-    deployLogModal.show();
-    if (d.status === "running") {
-      setTimeout(() => window.viewDeployLog(id, name), 3000);
+    $("logTitle").textContent = name;
+    const el = $("deployLogContent");
+    if (!el.dataset.deployId || Number(el.dataset.deployId) !== Number(id)) {
+      el.textContent = "加载中...";
+      el.dataset.deployId = id;
+      el.dataset.lastLogLen = "0";
+    }
+    try {
+      const d = await api("GET", `/api/deploy/${id}/log`);
+      const logText = d.log || "(暂无日志)";
+      const lastLen = parseInt(el.dataset.lastLogLen || "0", 10);
+      if (logText.length !== lastLen) {
+        // 只追加新增内容，避免全量替换导致闪烁/滚动复位
+        if (lastLen > 0 && logText.startsWith(el.textContent)) {
+          const appended = logText.slice(el.textContent.length);
+          el.appendChild(document.createTextNode(appended));
+        } else {
+          el.textContent = logText;
+        }
+        el.dataset.lastLogLen = String(logText.length);
+        // 保持滚动在底部
+        el.scrollTop = el.scrollHeight;
+      }
+      deployLogModal.show();
+      // 持续轮询直到状态不再是 running
+      clearTimeout(window._deployLogTimer);
+      if (d.status === "running") {
+        window._deployLogTimer = setTimeout(() => window.viewDeployLog(id, name), 2000);
+      } else {
+        // 结束后 2 秒再拉一次最终日志
+        window._deployLogTimer = setTimeout(() => window.viewDeployLog(id, name), 2000);
+      }
+    } catch (e) {
+      el.textContent = "加载日志失败: " + e.message;
     }
   };
 
@@ -2210,18 +2676,54 @@
       $("d_id").value = ""; $("d_name").value = ""; $("d_host_id").value = "";
       $("d_hostname").value = ""; $("d_root_password").value = "";
       $("d_version").value = "";
-      $("d_package_path").value = ""; $("d_package_file").value = "";
+      $("d_package_path").value = ""; $("d_package_path_remote").value = "";
+      $("d_package_file").value = ""; $("pkgFileInfo").textContent = "";
+      _resetPkgProgress();
       $("d_db_type").value = "mysql";
       $("pkgSrcUpload").checked = true;
+      $("hostModeManaged").checked = true;
+      $("d_direct_host").value = ""; $("d_direct_port").value = 22;
+      $("d_direct_user").value = "root"; $("d_direct_password").value = "";
       togglePkgSource();
+      toggleHostMode();
       loadDefaultParams();  // 预填所有默认参数
     } else {
       $("deployModalTitle").textContent = "编辑部署";
       $("d_id").value = dep.id; $("d_name").value = dep.name || "";
-      $("d_db_type").value = dep.db_type; $("d_host_id").value = dep.host_id || "";
+      $("d_db_type").value = dep.db_type;
+      if (dep.direct_host) {
+        $("hostModeDirect").checked = true;
+        $("d_direct_host").value = dep.direct_host || "";
+        $("d_direct_port").value = dep.direct_port || 22;
+        $("d_direct_user").value = dep.direct_user || "root";
+        $("d_direct_password").value = dep.direct_password || "";
+        $("d_host_id").value = "";
+      } else {
+        $("hostModeManaged").checked = true;
+        $("d_host_id").value = dep.host_id || "";
+        $("d_direct_host").value = ""; $("d_direct_port").value = 22;
+        $("d_direct_user").value = "root"; $("d_direct_password").value = "";
+      }
+      toggleHostMode();
       $("d_base_dir").value = dep.base_dir || ""; $("d_data_dir").value = dep.data_dir || "";
       $("d_port").value = dep.port || ""; $("d_password").value = "";
-      $("d_package_path").value = dep.package_path || "";
+      const pp = dep.package_path || "";
+      if (pp.startsWith("/tmp/")) {
+        $("pkgSrcRemote").checked = true;
+        $("d_package_path_remote").value = pp;
+        $("d_package_path").value = "";
+        $("d_package_file").value = ""; $("pkgFileInfo").textContent = "";
+      } else if (pp) {
+        $("pkgSrcUpload").checked = true;
+        $("d_package_path").value = pp;
+        $("d_package_path_remote").value = "";
+      } else {
+        $("pkgSrcUpload").checked = true;
+        $("d_package_path").value = ""; $("d_package_path_remote").value = "";
+        $("d_package_file").value = ""; $("pkgFileInfo").textContent = "";
+      }
+      _resetPkgProgress();
+      togglePkgSource();
       // 回填扩展参数
       let cfg = {};
       try { cfg = JSON.parse(dep.config_json || "{}"); } catch (e) {}
@@ -2306,10 +2808,34 @@
     toast("已加载 " + t + " 默认参数", "info");
   };
 
+  function _resetPkgProgress() {
+    const wrap = $("pkgUploadProgressWrap");
+    if (wrap) wrap.classList.add("d-none");
+    const bar = $("pkgUploadProgressBar");
+    if (bar) { bar.style.width = "0%"; bar.setAttribute("aria-valuenow", "0"); }
+    const txt = $("pkgUploadProgressText");
+    if (txt) txt.textContent = "上传准备中...";
+    const pct = $("pkgUploadProgressPct");
+    if (pct) pct.textContent = "0%";
+  }
+  function _setPkgProgress(pct, text) {
+    const wrap = $("pkgUploadProgressWrap");
+    if (wrap) wrap.classList.remove("d-none");
+    const bar = $("pkgUploadProgressBar");
+    if (bar) { bar.style.width = pct + "%"; bar.setAttribute("aria-valuenow", String(pct)); }
+    const t = $("pkgUploadProgressText");
+    if (t) t.textContent = text || ("已上传 " + pct + "%");
+    const p = $("pkgUploadProgressPct");
+    if (p) p.textContent = pct + "%";
+  }
+
   window.togglePkgSource = () => {
     const isUpload = $("pkgSrcUpload").checked;
     $("pkgUploadBlock").style.display = isUpload ? "" : "none";
     $("pkgRemoteBlock").style.display = isUpload ? "none" : "";
+    _resetPkgProgress();
+    if (isUpload) { $("d_package_path_remote").value = ""; }
+    else { $("d_package_file").value = ""; $("pkgFileInfo").textContent = ""; $("d_package_path").value = ""; }
   };
 
   // 切换节点配置：纳管主机 vs 直接输入 IP
@@ -2384,45 +2910,154 @@
       const dmEl = document.getElementById("deployModal");
       if (dmEl) deployModal = new bootstrap.Modal(dmEl);
       const dlmEl = document.getElementById("deployLogModal");
-      if (dlmEl) deployLogModal = new bootstrap.Modal(dlmEl);
+      if (dlmEl) {
+        deployLogModal = new bootstrap.Modal(dlmEl);
+        dlmEl.addEventListener("hidden.bs.modal", () => {
+          clearTimeout(window._deployLogTimer);
+          window._deployLogTimer = null;
+          const el = $("deployLogContent");
+          if (el) {
+            delete el.dataset.deployId;
+            delete el.dataset.lastLogLen;
+          }
+        });
+      }
       const ndbBtn = $("newDeployBtn");
       if (ndbBtn) ndbBtn.onclick = () => openDeployModal(null);
     } catch (e) {
       console.error("[initDeploy]", e);
     }
+    const dFile = $("d_package_file");
+    if (dFile) dFile.onchange = () => {
+      const file = dFile.files[0];
+      const info = $("pkgFileInfo");
+      _resetPkgProgress();
+      if (!file) { info.textContent = ""; return; }
+      const sz = file.size >= 1073741824 ? (file.size/1073741824).toFixed(2)+" GB" :
+                   file.size >= 1048576 ? (file.size/1048576).toFixed(2)+" MB" :
+                   file.size >= 1024 ? (file.size/1024).toFixed(1)+" KB" : file.size+" B";
+      info.textContent = `已选文件: ${file.name} (${sz})`;
+      $("d_package_path").value = "";
+    };
+    // 依赖包上传（如 gcc 离线 RPM）
+    const depFile = $("d_dependency_file");
+    if (depFile) depFile.onchange = () => {
+      const f = depFile.files[0];
+      const hint = $("depUploadHint");
+      $("d_dependency_path").value = "";
+      if (!f) { if (hint) hint.textContent = "支持 .tar.gz/.tgz/.zip 离线依赖包；内容含 *.rpm 时自动 rpm -Uvh 安装"; return; }
+      const sz = f.size >= 1073741824 ? (f.size/1073741824).toFixed(2)+" GB" :
+                   f.size >= 1048576 ? (f.size/1048576).toFixed(2)+" MB" :
+                   (f.size/1024).toFixed(1)+" KB";
+      if (hint) hint.textContent = `已选依赖包: ${f.name} (${sz})，点击「上传」暂存`;
+    };
+    const depUpBtn = $("depUploadBtn");
+    if (depUpBtn) depUpBtn.onclick = () => {
+      const f = $("d_dependency_file").files[0];
+      if (!f) { toast("请先选择依赖包文件", "warning"); return; }
+      const fd = new FormData(); fd.append("file", f);
+      const xhr = new XMLHttpRequest();
+      xhr.onload = () => {
+        if (xhr.status === 200) {
+          const r = JSON.parse(xhr.responseText);
+          $("d_dependency_path").value = r.path || r.url || "";
+          const hint = $("depUploadHint");
+          if (hint) hint.textContent = `依赖包已暂存: ${f.name}`;
+          toast("依赖包已上传暂存", "success");
+        } else {
+          toast("依赖包上传失败", "danger");
+        }
+      };
+      xhr.onerror = () => toast("依赖包上传失败", "danger");
+      xhr.open("POST", "/api/deploy/upload");
+      xhr.send(fd);
+    };
     const dsbBtn = $("deploySaveBtn");
     if (dsbBtn) dsbBtn.onclick = async () => {
       const id = $("d_id").value;
       if (!$("d_name").value) { toast("请输入部署名称", "warning"); return; }
-      if (!$("d_host_id").value) { toast("请选择目标主机", "warning"); return; }
-      // 1) 如果选择本地上传，先上传到平台暂存
+      const managedMode = $("hostModeManaged").checked;
+      if (managedMode) {
+        if (!$("d_host_id").value) { toast("请选择目标主机", "warning"); return; }
+      } else {
+        if (!$("d_direct_host").value.trim()) { toast("请输入目标主机 IP", "warning"); return; }
+        if (!$("d_direct_user").value.trim()) { toast("请输入 SSH 用户", "warning"); return; }
+      }
+      // 1) 如果选择本地上传，先上传到平台暂存（进度显示在安装包区域）
       let pkgPath = $("d_package_path").value;
       if ($("pkgSrcUpload").checked) {
         const file = $("d_package_file").files[0];
         if (!file) { toast("请选择安装包文件", "warning"); return; }
-        const fd = new FormData(); fd.append("file", file);
-        try {
+        pkgPath = await new Promise((resolve, reject) => {
+          const fd = new FormData(); fd.append("file", file);
+          const xhr = new XMLHttpRequest();
           $("deploySaveBtn").disabled = true;
-          $("deploySaveBtn").innerHTML = "上传中...";
-          const r = await fetch("/api/deploy/upload", { method: "POST", body: fd });
-          const d = await r.json();
-          if (!r.ok) throw new Error(d.error || "上传失败");
-          pkgPath = d.path;
-          toast(`安装包已上传 (${d.size_human})`, "info");
-        } catch (e) { toast("上传失败: " + e.message, "danger");
-          $("deploySaveBtn").disabled = false; $("deploySaveBtn").innerHTML = "保存";
-          return;
-        } finally {
-          $("deploySaveBtn").disabled = false; $("deploySaveBtn").innerHTML = "保存";
-        }
-      } else if (!pkgPath) { toast("请填写目标主机上的安装包路径", "warning"); return; }
+          $("deploySaveBtn").innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>上传中...';
+          _setPkgProgress(0, "准备上传...");
+          xhr.upload.onprogress = (e) => {
+            if (e.lengthComputable) {
+              const pct = Math.min(100, Math.round(e.loaded / e.total * 100));
+              _setPkgProgress(pct, pct < 100 ? "正在上传安装包..." : "上传完成，准备部署...");
+            }
+          };
+          xhr.onload = () => {
+            $("deploySaveBtn").disabled = false;
+            $("deploySaveBtn").innerHTML = '保存并部署';
+            if (xhr.status >= 200 && xhr.status < 300) {
+              try { const d = JSON.parse(xhr.responseText); resolve(d.path); }
+              catch (e) { reject(new Error("上传响应解析失败")); }
+            } else {
+              _setPkgProgress(0, "上传失败");
+              try { const d = JSON.parse(xhr.responseText); reject(new Error(d.error || `上传失败 ${xhr.status}`)); }
+              catch (e) { reject(new Error(`上传失败 ${xhr.status}`)); }
+            }
+          };
+          xhr.onerror = () => {
+            $("deploySaveBtn").disabled = false; $("deploySaveBtn").innerHTML = "保存并部署";
+            _setPkgProgress(0, "网络错误");
+            reject(new Error("网络错误"));
+          };
+          xhr.ontimeout = () => {
+            $("deploySaveBtn").disabled = false; $("deploySaveBtn").innerHTML = "保存并部署";
+            _setPkgProgress(0, "上传超时");
+            reject(new Error("上传超时"));
+          };
+          xhr.open("POST", "/api/deploy/upload");
+          xhr.send(fd);
+        });
+        $("d_package_path").value = pkgPath;
+        toast(`安装包已上传: ${file.name} 已暂存`, "success");
+      } else {
+        pkgPath = $("d_package_path_remote").value.trim();
+        if (!pkgPath) { toast("请填写目标主机上的安装包路径", "warning"); return; }
+      }
+
+      // 依赖包：若已选文件但未点「上传」，这里自动上传
+      let depPath = $("d_dependency_path").value;
+      const depFileEl = $("d_dependency_file");
+      if (!depPath && depFileEl && depFileEl.files[0]) {
+        depPath = await new Promise((resolve) => {
+          const fd = new FormData(); fd.append("file", depFileEl.files[0]);
+          const xhr = new XMLHttpRequest();
+          xhr.onload = () => {
+            if (xhr.status === 200) {
+              const r = JSON.parse(xhr.responseText);
+              $("d_dependency_path").value = r.path || r.url || "";
+              resolve($("d_dependency_path").value);
+            } else { resolve(""); }
+          };
+          xhr.onerror = () => resolve("");
+          xhr.open("POST", "/api/deploy/upload");
+          xhr.send(fd);
+        });
+      }
 
       const data = {
         name: $("d_name").value, db_type: $("d_db_type").value,
-        host_id: Number($("d_host_id").value) || null,
-        direct_host: $("d_direct_host").value || "",
+        host_id: managedMode ? (Number($("d_host_id").value) || null) : null,
+        direct_host: managedMode ? null : ($("d_direct_host").value.trim() || null),
         direct_port: Number($("d_direct_port").value) || 22,
-        direct_user: $("d_direct_user").value || "root",
+        direct_user: $("d_direct_user").value.trim() || "root",
         direct_password: $("d_direct_password").value || "",
         hostname: $("d_hostname").value,
         root_password: $("d_root_password").value,
@@ -2430,6 +3065,7 @@
         port: Number($("d_port").value) || null,
         password: $("d_password").value,
         package_path: pkgPath,
+        dependency_path: depPath || null,
         config_json: JSON.stringify(_collectConfig()),
       };
       if (!data.name) { toast("请输入部署名称", "warning"); return; }
@@ -2437,16 +3073,32 @@
         toast("请选择已纳管主机或直接输入 IP/账号/密码", "warning"); return;
       }
       try {
-        if (id) {
-          await api("PUT", `/api/deploy/${id}`, data);
+        let depId = id ? Number(id) : null;
+        $("deploySaveBtn").disabled = true;
+        $("deploySaveBtn").innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>保存中...';
+        if (depId) {
+          await api("PUT", `/api/deploy/${depId}`, data);
           toast("已更新", "success");
         } else {
           const r = await api("POST", "/api/deploy", data);
-          toast("部署创建成功 #" + r.id, "success");
+          depId = r.id;
+          toast("部署创建成功 #" + depId, "success");
+        }
+        // 保存后立即启动部署
+        $("deploySaveBtn").innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>启动部署...';
+        const runRes = await api("POST", `/api/deploy/${depId}/run`);
+        if (runRes.accepted) {
+          toast("部署已开始，请查看日志监控进度", "success");
         }
         deployModal.hide();
         await loadDeployments();
-      } catch (e) { toast(e.message, "danger"); }
+        setTimeout(() => window.viewDeployLog(depId, $("d_name").value || "部署中"), 800);
+      } catch (e) {
+        toast(e.message, "danger");
+      } finally {
+        $("deploySaveBtn").disabled = false;
+        $("deploySaveBtn").innerHTML = '保存并部署';
+      }
     };
     try { window.DEPLOY_HOSTS = await api("GET", "/api/hosts"); } catch (e) { window.DEPLOY_HOSTS = []; }
     $("d_host_id").innerHTML = '<option value="">— 请选择 —</option>' +
@@ -3183,7 +3835,8 @@
       else if (page === "tasks") await initTasks();
       else if (page === "records") await initRecords();
       else if (page === "file_backup") await initFileBackup();
-      else if (page === "sync") await initSync();
+      // sync 页面由独立的 static/js/sync.js 管理，不再调用 app.js 中的旧版 initSync，
+      // 避免请求 /api/sync/tasks、/api/sync/records 等旧路径造成 404。
       else if (page === "restore_records") await initRestoreRecords();
       else if (page === "restore") await initRestore();
       else if (page === "inspection") await initInspection();
@@ -4184,6 +4837,7 @@
         '<td>' + (p.enabled ? '<span class="badge badge-ok">已启用</span>' : '<span class="badge bg-secondary">已停用</span>') + '</td>' +
         '<td>' + (p.bound_task_count || 0) + ' 个</td>' +
         '<td class="text-end">' +
+          '<button class="btn btn-sm btn-outline-primary me-1" onclick="viewPolicyRecords(' + p.id + ')">备份记录</button>' +
           '<button class="btn btn-sm btn-outline-secondary me-1" onclick="editPolicy(' + p.id + ')">编辑</button>' +
           '<button class="btn btn-sm btn-outline-info me-1" onclick="openBindModal(' + p.id + ')">绑定</button>' +
           '<button class="btn btn-sm btn-outline-danger" onclick="deletePolicy(' + p.id + ')">删除</button>' +
@@ -4292,6 +4946,10 @@
       } catch (e) { toast(e.message, "danger"); }
     };
 
+    window.viewPolicyRecords = function (id) {
+      location.href = "/records?policy_id=" + id;
+    };
+
     window.openBindModal = async function (id) {
       bindPolicyId = id;
       const [policy, tasks] = await Promise.all([
@@ -4360,8 +5018,8 @@
     async function loadTasksInto(sel) {
       try {
         const tasks = await api("GET", "/api/tasks");
-        sel.innerHTML = (tasks || []).map(function (t) {
-          return '<option value="' + t.id + '">#' + t.id + ' ' + esc(t.name) + ' (' + esc(t.db_type) + ')</option>';
+        sel.innerHTML = '<option value="">请选择备份任务</option>' + (tasks || []).map(function (t) {
+          return '<option value="' + t.id + '">' + esc(t.name) + ' (' + esc(t.db_type) + ')</option>';
         }).join("");
       } catch (e) {
         sel.innerHTML = '<option value="">加载任务失败</option>';
@@ -4374,7 +5032,7 @@
         const verified = p.verified
           ? '<span class="badge badge-ok">已校验</span>'
           : '<span class="badge bg-secondary">未校验</span>';
-        const golden = p.golden_backup_record_id ? ('#' + p.golden_backup_record_id) : '-';
+        const golden = p.golden_backup_record_id ? String(p.golden_backup_record_id) : '-';
         const taskLabel = p.task_id ? (esc(p.task_name || ('# ' + p.task_id))) : '-';
         return '<tr>' +
           '<td>' + p.id + '</td>' +

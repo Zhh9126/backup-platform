@@ -9,9 +9,19 @@
 ## 功能特性
 
 ### 备份能力
-- **多数据库支持**：Oracle / MySQL / PostgreSQL / Kingbase / DM / Redis / MongoDB
+- **9 种引擎**：Oracle / MySQL / MariaDB / PostgreSQL / Kingbase / DM / Redis / MongoDB / 文件（本地 + 远程 SSH 无 Agent），统一引擎接口（`connect` / `backup` / `restore` / `verify_record` / `synthesize_full`）。
+- **9 个备份 Skills**（项目 `skills/` 目录，覆盖各引擎最佳实践）：
+  - `mysql-backup`：mysqldump + xtrabackup + binlog PITR
+  - `mariadb-backup`：继承 MySQL，mariabackup
+  - `postgresql-backup`：pg_dump + pg_basebackup + WAL
+  - `oracle-backup`：expdp/exp + RMAN + archivelog PITR
+  - `kingbase-backup`：sys_dump + sys_basebackup
+  - `dameng-backup`：dexp + dmrman
+  - `redis-backup`：RDB 快照
+  - `mongodb-backup`：mongodump
+  - `file-backup`：tar.gz 全量 + 快照增量 + 准 CDP + 恢复链
 - **文件/目录备份**：本地与远程（SSH，无需安装 Agent）源，全量 + 增量（按 size+mtime 比对），`tar.gz` 归档；源主机与目标主机独立。增量基于**源快照**（同一路径的多任务共享基准），归档仅含变化文件，与全量一致直接保存到目标目录根下，不会删除目标目录里的其他文件。Windows 下采用**原子写入**（临时文件 + replace），避免防病毒/句柄锁导致空包
-- **多种备份策略**：全量（full）、增量（incremental）、差异（differential）、快照（snapshot）
+- **多种备份策略**：全量（full）、增量（incremental）、差异（differential）、快照（snapshot）、合成全量（synthesized，由永久增量链自动合成）、**组合备份（mixed：全量+增量）**：任务同时配置全量调度与增量调度，调度器分别注册 `task_<id>_full` 和 `task_<id>_incremental` 两个作业；触发执行时按 `run_task_now(task_id, backup_type)` 覆盖备份类型，任务列表直观显示「组合 全…/增…」
 
 ### 管理与可视化
 - **Web 可视化管理**：仪表盘、数据库备份、文件备份、数据同步、存储管理、保护策略、备份/恢复记录、数据恢复管理、灾备管理、巡检、智能告警、系统设置等
@@ -26,14 +36,23 @@
 - 备份成功后由 `tier_replication` 自动并行复制到各层级；`backup_records.storage_tier` 记录每条备份实际到达的层级（如 `minio+s3+local`）
 - 可配置复制策略（`push_l1_minio` / `push_l2_s3` / `push_l3_local` / 时机 / 重试）
 
-### 数据同步
-- 将源端（可托管现有备份任务或手动填写连接）同步到目标端（手动填写连接）
-- 同源同类型且客户端齐全时执行真实 `dump | load`（MySQL / PostgreSQL），否则仿真
-- 支持连通性探测，失败触发通知
+### 数据同步（DataX/LinkUp 风格 Reader/Writer）
+- **Reader → 统一 Java 类型 → Writer**：参考 DataX 架构，抽象 `SourceReader` / `SinkWriter`，源端读出的数据先转为平台统一类型（STRING/LONG/DOUBLE/DECIMAL/BOOLEAN/DATE/TIME/DATETIME/BYTES），再由目标端写回。
+- **表级同步**：支持选择源表/目标表，MySQL/MariaDB、PostgreSQL 已实现 Reader/Writer，可扩展更多插件。
+- **字段映射可视化**：页面提供左右字段列表，支持「同名映射」「同行映射」「清空映射」「手动点击连线建立映射」，并高亮已映射字段与连线。
+- **写入模式**：`append`（追加）、`overwrite`（覆盖）、`upsert`（更新插入，MySQL ON DUPLICATE KEY / PG ON CONFLICT）、`create_if_not_exists`（表不存在则自动建表）。
+- **增量同步**：可指定增量列与起始值，自动记录断点并更新任务状态。
+- **实时同步（Flink CDC）**：离线任务由 APScheduler 调度；`realtime` 模式通过 Flink CDC 执行，平台提供配置生成接口与任务监控。
+- **全库迁移模式**：启用后可一次性将源库所有表同步到目标库（参考 pg2mysql 全库迁移能力）。
+- **Schema 兼容性校验**（pg2mysql Validator）：执行前先比对源/目标的列类型与长度兼容性，检测超出目标列长度的数据行并列出 ID，不兼容则拒绝执行。
+- **迁移后数据校验**（pg2mysql Verifier）：同步完成后跨库逐行比对源/目标数据是否一致，报告缺失行数与 ID。
+- **约束管理**：写入前自动禁用外键/约束检查（MySQL `SET FOREIGN_KEY_CHECKS=0`，PG `session_replication_role=replica`），写入后恢复，提升大批量同步性能。
+- 失败触发通知，每次运行生成同步记录。
 
 ### 数据恢复与灾备
 - **数据恢复管理**：一键将历史备份恢复到目标实例（数据库）或目标目录（文件）；文件增量恢复时**自动构建恢复链**（先回最近全量，再按时间顺序应用增量），数据库部署（将数据库部署到目标实例）
-- **灾备管理**：迁移保护、容灾链路、克隆服务（创建可独立使用的克隆实例）
+- **数据库部署（Deploy）**：将数据库（MySQL / MongoDB 等）自动部署到目标 Linux 主机，上传安装包 → 生成安装脚本 → 执行安装 → 实时日志轮询；支持单机/副本集、认证开关、keyFile 等。MySQL 部署统一用 `mysqld_safe` 启动、显式错开 mysqlx 端口；MongoDB 部署支持无认证/副本集+认证（keyFile + `rs.initiate`）；部署记录含连接测试、日志与状态。页面：「数据库部署」。
+- **灾备管理**：数据迁移（原「迁移保护」）、数据同步、容灾链路、克隆服务（创建可独立使用的克隆实例）
 
 ### 巡检与健康检查
 - 对任务做连通性 + 调度 + 上次状态体检，判定 `pass` / `warn` / `fail`
@@ -49,6 +68,52 @@
 
 ### 一键恢复
 - 选择历史备份记录恢复到目标实例（数据库）或目标目录（文件）
+
+### 恢复校验（Restore Verify）
+- **验证“备份是否真的可恢复”**：按策略关联备份任务，定期或手动对最近一次成功备份做可恢复性校验（文件存在性 / 大小 / 校验和 / 引擎层恢复演练），生成校验报告。
+- 策略支持 `manual` / `cron` / `interval` 三种调度，可配置恢复池（recovery_pool）与克隆保留时长（clone_retention_min）。
+- 报告含状态、耗时、消息、是否已清理；仪表盘提供成功率 KPI。接口：`/api/restore-verify-*`、`/api/restore-test-reports`。
+
+### 副本管理与底层备份优化（CDM 能力）
+- **永久增量 + 自动合成全量**：以 `chain_id` 串联增量链，当增量份数达到阈值（默认 ≥2）由调度器自动合成一份新全量（`synthesize_full`），并标记被合并的增量为 `merged`，实现副本闭环回收，减少恢复链长度。
+- **重删统计**：合成全量时统计 `dedup_saved_bytes`（被增量叠加后节省的体量），在备份集与副本视图中展示。
+- **副本层级**：备份集支持 `full` / `incremental` / `synthesized` 类型，支持按链追溯与按需回收。
+- 自动合成全量默认每周日 03:00 触发，也可在「存储管理 / 合成全量」页手动触发。接口：`/api/synthesize`。
+
+### 全局重删与存储池加密（白皮书 §2.4 / §2.6）
+- **全局重删（Content-Defined / 内容寻址）**：备份落盘后统一做后处理，按内容 sha256 建全局索引（`dedup_index`），相同块只保留一份，记录引用计数与累计节省空间；仪表盘提供「全局重删比」与「累计节省空间」KPI 卡片。接口：`/api/dedup/stats`、`/api/dedup/scan`。
+- **存储池加密（AES-256-GCM，信封式）**：备份落盘后可选加密，每文件随机 nonce、文件头含 magic + salt + nonce + tag；密钥来源优先级为 `环境变量 BACKUP_POOL_KEY` > `系统设置中托管的密钥（system_config）` > `config.py 默认值`。
+- **密钥托管 / 接入 KMS**：在「系统设置 → 存储池加密密钥（KMS）」卡片中，可选「本地密钥库」（平台托管主密钥，存于数据库、页面不回显明文）或「外部 KMS」（AWS / 阿里云 / 腾讯云 / 自托管 / HashiCorp Vault，运行时从 KMS 拉取主密钥，不可达时失败安全回退到本地回退密钥）。保存后自动跑加密自检（AES-256-GCM 加密→解密闭环），并可「测试 KMS 连通性」。接口：`GET/POST /api/pool-crypto`、`POST /api/pool-crypto/test`。
+- **任务级开关**：数据库备份与文件备份的任务表单均提供「存储池加密」开关（`extra_options.encrypt_pool`），开启后该任务落盘产物为密文；缺密钥时按失败安全策略明文跳过加密（不阻断备份）。
+- 注：全局重删与存储池加密在文件引擎落盘后的统一 `_post_process`（先加密、后重删）阶段触发；数据库备份的加密由引擎层调用同一 `crypto_pool`。
+
+### 备份插件系统（Backup Plugins）
+- **服务端插件市场**：以 manifest 驱动的插件目录，集中管理物理备份所需客户端（如 Percona XtraBackup、MariaDB Backup、pgBackRest、MongoDB Database Tools、Redis Tools、Percona Toolkit）。
+- **Linux Only / 离线下载优先**：部署目标为 Linux，安装策略优先级 `fallback_download > package_manager > manual_only`；缺客户端时在调度前 `preflight` 阶段提示前往插件页安装，逻辑备份允许仿真兜底。
+- 支持一键安装本机所需（`POST /api/plugins/batch-install`）、安装进度轮询、卸载（仅清理本平台离线安装目录）。页面：「备份插件」。
+
+### 备份质量监控
+- 仪表盘 KPI 监控**超长备份**与**超频备份**：超长判定支持 `fixed`（固定分钟）、`speed`（数据量/期望速度，默认 500 GB/h，浮动容忍默认 20%）、`both`（任一即超长）三种规则；超频判定为默认 5 分钟内同任务 ≥3 次。
+- 阈值（`backup_quality_thresholds`）可在仪表盘 / 系统设置通过 Web UI 配置。
+- 备份时长以 `time.monotonic()` 亚秒级精度统计，避免秒级舍入误差。接口：`/api/settings/backup-quality-thresholds`、`/api/records/overrun-stats`。详见 `docs/backup_quality_monitoring.md`。
+
+### 实时管控与 CDP / 时间点恢复（RT & CDC）
+- **实时备份（RT Backup）**：基于 watcher（watchdog / polling）的准实时文件与数据库变更捕获，配合 journal 记录变更流水；支持 PITR（时间点恢复）与快照。
+- **CDC（变更数据捕获）**：针对 Oracle（LogMiner）、达梦（LogMinr）、PostgreSQL（WAL）、MySQL（binlog）的日志解析，支撑准 CDP 级恢复。
+- 引擎位于 `core/rt_backup/` 与 `core/cdc/`；实时管控任务可在「容灾链路」中被引用并做日志间隙填补、备端一致性校验。页面：「实时管控时间线」。
+
+### 演练 / 容灾 / 克隆 / 迁移 / ITSM
+- **恢复演练（Drills）**：对备份做恢复演练并生成趋势与基线，支持季度演练排程，验证 RTO/RPO。页面：「恢复演练」。
+- **数据迁移 / 容灾链路 / 克隆服务**：在「灾备管理」分组下提供数据迁移（原迁移保护）、容灾链路编排、可独立使用的克隆实例；「数据同步」也已归入「灾备管理」分组。
+- **ITSM**：工单/事件对接，备份失败自动建单。
+- **数据价值挖掘**：对备份数据进行价值分析与可视化。页面：「数据价值挖掘」。
+
+### AI 能力
+- **AI 智能体（Agent）**：对话式运维助手（`core/ai_agent/`），基于 ReAct 循环（最多 3 轮工具调用），可调用 7 个工具：
+  - `list_tasks`（列出备份任务）、`list_recent_records`（最近备份记录）、`get_storage_usage`（存储用量）、`list_alert_predictions`（AI 预测告警）、`get_inspection_report`（巡检报告）、`run_backup_task`（执行备份，需确认）、`run_inspection`（执行巡检，需确认）。
+  - 工具结果会被格式化为面向用户的 Markdown 表格/文本；查询类工具无需确认直接执行，危险操作返回 `confirm_required` 由用户二次确认。
+  - **本地兜底（LLM 不可用时）**：当模型端点不可达时，仍可做本地意图识别——知识库纯问答（RPO/RTO/全量/增量/物理/逻辑备份等）、查询类工具直接执行并格式化返回、危险操作返回确认请求，确保"每条提问都有信息"。页面：「智能体」。
+- **AI 智能告警**：基于规则的智能告警分析与归因。页面：「智能告警」。
 
 ---
 
@@ -91,9 +156,32 @@
 │   ├── lifecycle.py       # 生命周期：L1→L2 按龄/按容量下沉 + 到期清理
 │   ├── notifier.py        # 通知（webhook/钉钉/企微/飞书/邮件）
 │   ├── ssh_hosts.py       # SSH 主机纳管（文件备份远程源/目标）
-│   ├── sync.py            # 数据同步引擎
+│   ├── sync/              # 数据同步引擎（Reader/Writer/Plugin 架构）
+│   │   ├── engine.py      # 同步执行器（task → SyncEngine）
+│   │   ├── source.py / sink.py  # Reader/Writer 抽象（已合并入 plugins/base.py）
+│   │   ├── type_mapper.py # 统一 Java 类型映射
+│   │   └── plugins/       # 数据库同步插件
+│   │       ├── base.py    # BasePlugin / SourceReader / SinkWriter
+│   │       ├── mysql.py   # MySQL/MariaDB 插件
+│   │       └── postgresql.py  # PostgreSQL 插件
 │   ├── inspection.py      # 巡检与健康检查引擎
-│   ├── scheduler.py       # APScheduler 调度与单次执行入口
+│   ├── scheduler.py       # APScheduler 调度与单次执行入口（含恢复校验/合成全量注册）
+│   ├── restore_verify.py  # 恢复校验执行器（策略→报告）
+│   ├── global_dedup.py    # 全局重删（内容 sha256 索引，dedup_index）
+│   ├── crypto_pool.py     # 存储池加密（AES-256-GCM 信封式，密钥来源：环境变量/系统设置/KMS）
+│   ├── synthesize.py      # 自动合成全量引擎（永久增量链闭环 + 重删统计）
+│   ├── policy.py          # 备份保护策略引擎
+│   ├── drill.py           # 恢复演练引擎（趋势/基线/排程）
+│   ├── migration.py / disaster_link.py / clone_service.py  # 迁移保护 / 容灾链路 / 克隆
+│   ├── itsm.py            # ITSM 工单对接
+│   ├── data_mining.py     # 数据价值挖掘
+│   ├── ai_agent/          # AI 智能体（agent/session/executor/tools）
+│   ├── ai_alert.py        # AI 智能告警
+│   ├── rt_backup/         # 实时备份（watchers/journal/PITR/supervisor）
+│   ├── cdc/               # 变更数据捕获（Oracle/达梦/PG/MySQL 日志解析）
+│   ├── plugins/           # 备份插件系统（manifests + 安装状态）
+│   ├── plugin_catalog.py / plugin_installer.py  # 插件目录 + 安装器
+│   ├── skills/            # 9 个备份 Skill 文档（mysql/mariadb/postgresql/oracle/kingbase/dameng/redis/mongodb/file）
 │   └── engines/           # 各数据库 + 文件备份引擎（统一接口）
 │       ├── base.py        # 引擎抽象基类与结果对象
 │       ├── mysql.py / postgresql.py / oracle.py / kingbase.py
@@ -104,10 +192,21 @@
 │   ├── hosts.py           # SSH 主机 CRUD + 连接测试
 │   ├── sync.py            # 同步任务 / 记录
 │   ├── inspection.py      # 巡检执行 / 记录 / 排程
-│   ├── system.py          # 系统设置 / 通知配置（UI）
-│   └── tasks.py / records.py / restore.py / ...
+│   ├── system.py          # 系统设置 / 通知配置（UI）/ 备份质量阈值
+│   ├── restore_verify.py  # 恢复校验策略 / 报告 / 立即校验 / 统计
+│   ├── dedup.py           # 全局重删统计（/api/dedup/stats、/api/dedup/scan）
+│   ├── synthesize.py      # 自动合成全量状态 / 手动触发
+│   ├── plugins.py         # 插件市场 / 安装 / 卸载 / 推荐 / 批量安装
+│   ├── drills.py          # 恢复演练任务 / 趋势 / 基线 / 排程
+│   ├── migration.py / link.py / clone.py  # 迁移保护 / 容灾链路 / 克隆
+│   ├── itsm.py / datamining.py  # ITSM / 数据价值挖掘
+│   ├── ai_agent.py / ai_alert.py  # AI 智能体 / AI 智能告警
+│   ├── rt.py              # 实时管控
+│   └── tasks.py / records.py / restore.py / policy.py / lifecycle.py / ...
 ├── templates/             # 前端页面（Bootstrap）
 ├── static/                # CSS / JS
+├── skills/                # 9 份备份 Skill 操作指南（Markdown）
+├── docs/                  # 设计文档（mermaid 架构图、备份质量监控等）
 ├── backups/               # 备份文件落盘目录（运行时生成）
 └── instance/              # SQLite 元数据库（运行时生成）
 ```
@@ -145,6 +244,7 @@ pip install -r requirements.txt
 | `DEMO_MODE` | `auto` / `on` / `off` | `auto` |
 | `SCHEDULER_ENABLED` | 是否启用定时调度 | `true` |
 | `DEFAULT_RETENTION_DAYS` / `DEFAULT_RETENTION_COUNT` | 默认保留天数 / 份数 | `30` / `50` |
+| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | AI 智能体模型端点（不可达时自动本地兜底） | 见 `config.py` |
 
 `DEMO_MODE` 说明：
 - `auto`（默认）：客户端工具缺失时自动生成仿真占位备份，平台照常运行 / 演示
@@ -177,33 +277,46 @@ python run.py
 - **备份管理**
   - 数据库备份：原有「任务管理」页，管理各数据库备份任务（文件任务已在此排除）
   - 文件备份：文件/目录备份（本地与远程 SSH，无 Agent）
-  - 数据同步：库到库的同步任务
-  - 存储管理：三级存储目标（MinIO/S3/本地）配置、容量、复制策略
+  - 存储管理：三级存储目标（MinIO/S3/本地）配置、容量、复制策略、合成全量
   - 保护策略：备份保护策略管理
+  - 备份插件：服务端插件市场（物理备份客户端安装/卸载）
 - **记录**
   - 备份记录：数据库/文件的历史备份、校验值、下载、触发三级复制
   - 恢复记录：历次恢复操作的记录
+  - 恢复校验：恢复校验策略与报告（验证备份可恢复性）
 - **数据恢复管理**
   - 数据恢复：选择备份记录恢复到目标实例/目录
-  - 数据库部署：将数据库部署到目标实例
+  - 数据库部署：将数据库（MySQL / MongoDB 等）自动部署到目标主机
 - **灾备管理**
-  - 迁移保护：数据迁移保护
-  - 容灾链路：容灾链路管理
+  - 数据迁移：数据迁移全流程保护（原「迁移保护」，黄金回退点 + 恢复验证 / 高频增量 / 重心切换与旧库保留）
+  - 数据同步：库到库的同步任务（已从「备份管理」分组移入，作为迁移/容灾的数据源）
+  - 容灾链路：容灾链路管理（引用数据同步 / 实时保护任务，提供智能选路、日志间隙填补、备端一致性校验）
   - 克隆服务：创建可独立使用的克隆实例
+  - 恢复演练：恢复演练任务、趋势、基线、季度排程
+- **实时管控**
+  - 实时管控时间线：RT 实时备份与变更捕获（CDP / PITR）
 - **运维**
   - 巡检：手动/定时体检，判定 `pass` / `warn` / `fail`，`fail` 即告警
   - 智能告警：基于规则的智能告警
   - 数据价值挖掘：备份数据价值挖掘分析
-  - 系统设置：调度器状态、通知配置（Web UI）、SSH 主机纳管、平台信息与日志
+  - 智能体：AI 对话式运维助手（工具调用执行备份/恢复/巡检）
+  - 系统设置：调度器状态、通知配置（Web UI）、备份质量阈值、SSH 主机纳管、平台信息与日志、存储池加密密钥（KMS）托管
 
 典型操作：
 
 1. **数据库备份**：在「数据库备份」新建任务，填写连接、备份类型、调度、保留策略与存储目标。
 2. **文件备份**：在「文件备份」先到「系统设置 → SSH 主机」纳管远程主机，再建文件任务（源/目标可分别选本地或远程）。全量备份生成 `*_full.tar.gz`；增量备份基于**源快照**（同一路径的多任务共享基准），仅打包变化文件，在目标目录根下生成 `*_inc.tar.gz`（与全量归档同级），不会覆盖或删除目标目录里的其他备份或文件。若增量任务找不到历史快照（如全量在修复前执行），会自动回退为全量。
 3. **三级存储**：在「存储管理」分别新增 MinIO（L1）、S3（L2）、本地导出（L3）目标并“测试连接”；备份完成后自动复制到各层级。
-4. **数据同步**：在「数据同步」新增同步任务（源可托管现有备份任务），点击“运行”。
+4. **数据同步**：在「数据同步」新建同步任务，填写源/目标连接，选择源表与目标表；在「字段映射」标签页使用「同名映射」或手动点击字段建立映射；选择写入模式（append/overwrite/upsert/create_if_not_exists）与同步模式（full/incremental/realtime）；点击「运行」执行离线同步，或点击「生成 Flink 配置」下发到 Flink CDC 集群做实时同步。
 5. **巡检**：在「巡检」点击“立即巡检”，查看各项 `pass/warn/fail` 明细；可配置定时巡检。
-6. **数据恢复与灾备**：在「数据恢复」选择备份记录恢复到目标实例/目录；**文件增量恢复会自动先回全量、再按时间顺序应用增量**。在「数据库部署」部署数据库到目标实例；在「灾备管理」进行迁移保护、容灾链路、克隆服务操作。
+6. **数据恢复与灾备**：在「数据恢复」选择备份记录恢复到目标实例/目录；**文件增量恢复会自动先回全量、再按时间顺序应用增量**。在「数据库部署」上传安装包并部署 MySQL / MongoDB 等到目标 Linux 主机（支持副本集、认证、mysqlx 端口错开等），实时查看部署日志。在「灾备管理」进行数据迁移、数据同步、容灾链路、克隆服务、恢复演练操作。
+7. **恢复校验**：在「记录 → 恢复校验」新建策略并关联到某个备份任务，选择调度方式（`manual`/`cron`/`interval`）；点击「立即校验」对最近一次成功备份做可恢复性校验，查看报告与成功率 KPI。
+8. **副本优化**：平台对支持增量备份的引擎自动按 `chain_id` 维护永久增量链；当增量份数达到阈值（默认 ≥2）由调度器在每周日 03:00 自动合成新全量并回收旧增量（副本闭环），合成时计算重删节省量，可在「存储管理 → 合成全量」手动触发或查看状态。
+9. **备份插件**：在「备份管理 → 备份插件」查看已安装 / 市场，对物理备份所需客户端（XtraBackup / MariaDB Backup / pgBackRest 等）一键安装；安装后对应数据库任务的物理备份即可启用。缺客户端时调度前 `preflight` 会提示前往插件页安装。
+10. **备份质量监控**：在「系统设置 → 备份质量阈值」配置超长（固定时长 / 速度阈值 / 两者任一）与超频（同任务单位时间次数）判定规则，仪表盘实时展示超长 / 超频 KPI。
+11. **存储池加密与重删**：在「系统设置 → 存储池加密密钥（KMS）」选择「本地密钥库」或「外部 KMS」并保存（保存后自动跑加密自检）；在数据库/文件备份任务表单勾选「存储池加密」，该任务落盘即为 AES-256-GCM 密文。仪表盘新增「全局重删比 / 累计节省空间 / 存储池加密任务数」三张 KPI 卡，实时反映重删与加密覆盖情况。
+12. **组合备份（全量+增量）**：新建数据库/文件备份任务时选择「组合（全量+增量）」，分别设置全量调度（cron/interval）与增量调度（cron/interval）；调度器会注册两个独立作业，任务列表的调度单元格显示「组合 全…/增…」，执行时按所选类型运行对应备份。
+13. **AI 智能体**：在「智能体」直接与对话式助手交互，提问「列出所有备份任务」「查询存储用量」「最近备份有没有失败？」「什么是RPO？」等；执行备份/巡检类操作时需二次确认。即使 AI 模型端点不可达，平台也会以本地兜底（知识库问答 + 工具直查）返回信息，不会空响应。
 
 ---
 
@@ -286,6 +399,24 @@ L1 = MinIO（热数据，第一落点）、L2 = S3（冷数据归档）、L3 = �
 
 **Q：巡检判定规则是什么？**
 对任务做连通性 + 调度 + 上次状态体检：连通性失败或最近一次备份失败 ⇒ `fail`；无法判定连通性 / 从未运行 / 未配置调度 ⇒ `warn`；均正常 ⇒ `pass`。任一任务 `fail` 会立即告警。
+
+---
+
+## 备份 Skills 文档
+
+`skills/` 目录提供 9 份面向运维人员的备份操作指南（Markdown）：
+
+| Skill | 关键能力 |
+|---|---|
+| `mysql-backup` | `mysqldump` 逻辑 + XtraBackup 物理 + binlog PITR |
+| `mariadb-backup` | 继承 MySQL，`mariabackup` 物理 |
+| `postgresql-backup` | `pg_dump` 逻辑 + `pg_basebackup` 物理 + WAL 归档 |
+| `oracle-backup` | `expdp`/`exp` 逻辑 + RMAN 物理 + archivelog PITR |
+| `kingbase-backup` | `sys_dump` 逻辑 + `sys_basebackup` 物理 |
+| `dameng-backup` | `dexp` 逻辑 + `dmrman` 物理 |
+| `redis-backup` | RDB 快照复制 |
+| `mongodb-backup` | `mongodump` |
+| `file-backup` | `tar.gz` 全量 + 快照增量 + 准 CDP + 恢复链 |
 
 ---
 

@@ -24,6 +24,7 @@ Oracle 客户端前置条件（重要）：
 
 import os
 import json
+import shlex
 import shutil
 import time
 
@@ -49,6 +50,8 @@ class OracleEngine(BackupEngine):
     display_name = "Oracle"
     # 引擎依赖的客户端可执行文件（用于 PATH 探测）
     required_clients = ["expdp", "impdp", "exp", "imp"]
+    # 物理备份：Oracle 自带 RMAN 工具
+    physical_bundled_tools = ["rman"]
 
     # ------------------------------------------------------------------ #
     # 工具方法
@@ -78,6 +81,16 @@ class OracleEngine(BackupEngine):
         port = self.task.get("port") or 1521
         return f"{user}/{pw}@//{host}:{port}/{service}"
 
+    def _service_name(self) -> str:
+        """解析 Oracle service name，按优先级返回非空值。
+
+        优先级：extra_options.service → task.db_name → task.host。
+        三者都为空时返回 ""，调用方应据此返回明确错误（避免静默仿真）。
+        """
+        return (self._parse_extra().get("service")
+                or self.task.get("db_name")
+                or self.task.get("host") or "")
+
     def _client_available(self, name: str) -> bool:
         """判断某个具体客户端是否在 PATH 中可用。"""
         return bool(shutil.which(name))
@@ -89,9 +102,10 @@ class OracleEngine(BackupEngine):
         若 extra_options 指定了 schemas，则按指定模式导出，否则 FULL=Y 全库。
         """
         if not self._client_available("expdp"):
-            # expdp 缺失，无法做服务端导出，转为仿真占位
             self.logger.error("[%s] expdp 不可用，无法执行 Oracle 全量导出", self.task_name)
-            return self._simulate_backup(BackupType.FULL, "expdp 客户端不可用")
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message="expdp 客户端不可用，无法执行 Oracle 全量导出")
 
         schemas = extra.get("schemas")
         if schemas:
@@ -201,49 +215,331 @@ class OracleEngine(BackupEngine):
     # 对外接口
     # ------------------------------------------------------------------ #
     def backup(self, backup_type: BackupType) -> BackupResult:
-        """Oracle 备份：按 backup_mode 分发物理(RMAN)/逻辑(expdp)。"""
-        if self.task.get("demo_only"):
-            return self._simulate_backup(backup_type, "任务标记为演示(demo_only)")
-        if config.DEMO_MODE == "on":
-            return self._simulate_backup(backup_type, "DEMO_MODE=on 强制仿真")
+        """Oracle 备份：按 backup_mode 分发物理(RMAN)/逻辑(expdp/exp)。
+
+        逻辑备份优先在 SSH 备份机/数据库服务器执行 exp，失败再回退本机 expdp/exp。
+        """
+        # demo_only / DEMO_MODE 不再触发仿真，统一走真实备份
 
         if self.backup_mode == BackupMode.PHYSICAL:
-            return self._backup_physical(backup_type)
-        return self._backup_logical(backup_type)
+            # 物理备份优先走 SSH 远端真实 RMAN（Oracle 服务器自带 rman，
+            # 且 db_recovery_file_dest 未配置需显式 FORMAT），失败再回退本机。
+            return self._try_remote_then_local(
+                lambda ssh_host: self._backup_physical_remote(ssh_host, backup_type),
+                lambda: self._backup_physical(backup_type),
+                "Oracle 物理备份(RMAN)",
+            )
+        return self._try_remote_then_local(
+            lambda ssh_host: self._backup_logical_remote(ssh_host, backup_type),
+            lambda: self._backup_logical_local(backup_type),
+            "Oracle 逻辑备份(exp/expdp)",
+        )
 
     def _backup_physical(self, backup_type: BackupType) -> BackupResult:
-        """物理备份：RMAN (参照 oracle_backup_web_tool)。"""
+        """物理备份(本机兜底)：本地执行 RMAN。
+
+        通常本机无 Oracle 客户端/实例，会被 _backup_physical_remote 的 SSH 远端
+        路径优先替代。此处仅作为「无 SSH 主机」时的兜底：若本机确实装有 rman
+        且配置好 ORACLE_HOME / 归档模式，则本地执行；否则如实返回 FAILED
+        （不静默仿真）。显式 FORMAT 以规避 db_recovery_file_dest 未配置问题。
+        """
+        if not shutil.which("rman"):
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message="本机未安装 rman 客户端，无法执行本地物理备份；"
+                        "请通过 SSH 纳管 Oracle 服务器以走远端 RMAN。")
         ts = self._timestamp()
         out_dir = self._output_dir()
         os.makedirs(out_dir, exist_ok=True)
-        import core.db as db
         script = os.path.join(out_dir, f"rman_{ts}.cmd")
-        lines = ["connect target /;"]
+        fmt_db = os.path.join(out_dir, f"ora_bkp_{ts}_%U.bkp")
+        fmt_arch = os.path.join(out_dir, f"ora_bkp_{ts}_arch_%U.bkp")
+        lines = ["RUN {"]
         if backup_type == BackupType.INCREMENTAL:
-            lines.append("BACKUP INCREMENTAL LEVEL 0 DATABASE;")
+            lines.append(
+                f"  BACKUP AS COMPRESSED BACKUPSET INCREMENTAL LEVEL 0 DATABASE "
+                f"FORMAT '{fmt_db}';")
         else:
-            lines.append("BACKUP DATABASE;")
+            lines.append(f"  BACKUP AS COMPRESSED BACKUPSET DATABASE FORMAT '{fmt_db}';")
+        lines.append(
+            f"  BACKUP AS COMPRESSED BACKUPSET ARCHIVELOG ALL FORMAT '{fmt_arch}';")
+        lines.append("}")
         lines.append("exit;")
         with open(script, "w") as f:
             f.write("\n".join(lines))
         start = time.time()
         ret = self._run(["rman", "target", "/", f"@{script}"], timeout=7200)
-        dur = round(time.time()-start, 3)
+        dur = round(time.time() - start, 3)
         if ret["returncode"] != 0:
             return BackupResult(success=False, status=BackupStatus.FAILED,
                                 message=f"RMAN 物理备份失败: {ret.get('stderr','')[:500]}")
         return BackupResult(success=True, status=BackupStatus.SUCCESS,
-                            backup_path=out_dir, duration_sec=dur, stdout=ret.get("stdout",""),
-                            message="Oracle 物理备份(RMAN)成功")
+                            backup_path=out_dir, duration_sec=dur,
+                            stdout=ret.get("stdout", ""),
+                            message="Oracle 物理备份(RMAN)成功(本机)")
 
-    def _backup_logical(self, backup_type: BackupType) -> BackupResult:
+    def _backup_physical_remote(self, ssh_host: dict, backup_type) -> BackupResult:
+        """物理备份：通过 SSH 在远端 Oracle 服务器以 oracle 用户执行 RMAN，
+        并用 SFTP 把生成的备份片拉回本机落盘。
+
+        关键约束（基于对 192.168.220.129 的真实探测）：
+        - Oracle 工具链仅在 oracle 用户 profile 中可用，必须用 `su - oracle -c`
+          执行，不能以 root 直接跑 rman；
+        - db_recovery_file_dest 未配置(size=0) → 必须显式 FORMAT 指定备份路径，
+          否则 ORA-19801；
+        - rman target / @script 已建立连接，脚本内不要再写 connect target /；
+        - 备份片落在远端 /u01/app/oracle/backup/，再经 SFTP 拉回本机。
+        """
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+
+        ts = self._timestamp()
+        bkp_prefix = f"ora_bkp_{ts}_"
+        remote_dir = "/u01/app/oracle/backup"
+        remote_cmd_file = f"{remote_dir}/rman_{ts}.cmd"
+
+        # 1) 组装 RMAN 脚本（注意：rman target / @file 已建立连接，脚本内不要再 connect）
+        if backup_type == BackupType.INCREMENTAL:
+            db_line = (
+                f"  BACKUP AS COMPRESSED BACKUPSET INCREMENTAL LEVEL 0 DATABASE "
+                f"FORMAT '{remote_dir}/{bkp_prefix}%U.bkp';")
+        else:
+            db_line = (
+                f"  BACKUP AS COMPRESSED BACKUPSET DATABASE "
+                f"FORMAT '{remote_dir}/{bkp_prefix}%U.bkp';")
+        rman_script = (
+            "RUN {\n"
+            f"{db_line}\n"
+            f"  BACKUP AS COMPRESSED BACKUPSET ARCHIVELOG ALL "
+            f"FORMAT '{remote_dir}/{bkp_prefix}arch_%U.bkp';\n"
+            "}\n"
+            "exit;\n"
+        )
+
+        client = remote_dump._connect(ssh_host)
+        # 确保远端备份目录存在且 oracle 可写：
+        # SSH 登录身份为 root，故以 root 建目录并把属主改为 oracle
+        # （rman 以 oracle 用户运行，否则会 ORA-19504/ORA-27040 权限拒绝）。
+        prep = (f"mkdir -p {remote_dir} && chown oracle {remote_dir} "
+                f"&& chmod 755 {remote_dir}")
+        _ssh_exec_pipe(client, remote_dump._wrap_login(prep), timeout=60)
+        sftp = client.open_sftp()
+        try:
+            # 写 RMAN 脚本（oracle 可读）
+            with sftp.open(remote_cmd_file, "w") as f:
+                f.write(rman_script)
+            try:
+                sftp.chmod(remote_cmd_file, 0o644)
+            except Exception:
+                pass
+
+            # 3) 远端执行：mkdir 备份目录 + rman target / @script（以 oracle 用户）
+            inner = f"mkdir -p {remote_dir} && rman target / @{remote_cmd_file}"
+            shell = f"su - oracle -c {shlex.quote(inner)}"
+            wrapped = remote_dump._wrap_login(shell)
+            start = time.time()
+            out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=7200)
+            duration = round(time.time() - start, 3)
+            out_text = out.decode("utf-8", "replace") if isinstance(out, bytes) else out
+            err_text = err or ""
+            self.logger.info("[%s] 远端 RMAN 返回 rc=%s, 输出尾部: %s",
+                             self.task_name, rc, (out_text or err_text)[-600:])
+
+            # 成功标志：rc==0 且输出出现 "Finished backup"
+            if rc != 0 or ("Finished backup" not in out_text
+                           and "Finished backup" not in err_text):
+                snippet = (out_text or err_text)[-1200:]
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    duration_sec=duration, stdout=out_text, stderr=err_text,
+                    message=f"远端 RMAN 物理备份失败(rc={rc}): {snippet}")
+
+            # 4) SFTP 拉回所有备份片（匹配前缀 ora_bkp_{ts}_）
+            out_dir = self._output_dir()
+            os.makedirs(out_dir, exist_ok=True)
+            pieces = []
+            for attr in sftp.listdir_attr(remote_dir):
+                fname = attr.filename
+                if fname.startswith(bkp_prefix):
+                    remote_path = f"{remote_dir}/{fname}"
+                    local_path = os.path.join(out_dir, fname)
+                    sftp.get(remote_path, local_path)
+                    pieces.append((local_path, attr.st_size))
+
+            if not pieces:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED, duration_sec=duration,
+                    stdout=out_text, stderr=err_text,
+                    message=f"远端 RMAN 执行成功但未在 {remote_dir} 找到备份片"
+                            f"(前缀 {bkp_prefix})，可能 FORMAT 路径不正确。")
+
+            total_size = sum(sz for _, sz in pieces)
+            # checksum 取首个备份片(主库数据备份)的 sha256；其余片写入清单
+            first_local = pieces[0][0]
+            checksum = db.sha256_file(first_local)
+            manifest = os.path.join(out_dir, f"{ts}_rman_manifest.txt")
+            with open(manifest, "w", encoding="utf-8") as mf:
+                mf.write(f"Oracle RMAN physical backup via SSH\n")
+                mf.write(f"ssh_host: {ssh_host.get('host_key','')}\n")
+                mf.write(f"task: {self.task_name}\n")
+                mf.write(f"backup_type: {backup_type.value}\n")
+                mf.write(f"remote_dir: {remote_dir}\n")
+                for p, sz in pieces:
+                    mf.write(f"{os.path.basename(p)}\t{sz}\t{db.sha256_file(p)}\n")
+
+            hk = ssh_host.get("host_key", "remote")
+            msg = (f"通过 SSH 在 {hk} 以 oracle 用户执行 RMAN 物理备份成功，"
+                   f"已拉回 {len(pieces)} 个备份片，共 {db.human_size(total_size)}"
+                   f"（主片: {os.path.basename(first_local)}）")
+            self.logger.info("[%s] %s", self.task_name, msg)
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=first_local, size_bytes=total_size,
+                duration_sec=duration, stdout=out_text, stderr=err_text,
+                simulated=False, checksum=checksum, message=msg)
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+    def _backup_logical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
+        """在 SSH 备份机(数据库服务器)以 oracle 用户执行 expdp(Data Pump)，
+        再用 SFTP 把 dmp / log 拉回本机落盘，计算真实 size 与 sha256。
+
+        - 连接串优先 system/<pw>@//host:port/service（已在 192.168.220.129 实测
+          可用）；若失败回退 / as sysdba（仍由 oracle 用户执行）。
+        - expdp 的服务端目录 DATA_PUMP_DIR 已存在(/u01/app/oracle/admin/orcl11g/
+          dpdump)，dmp/log 生成在远端，拉回本机即可得真实文件与校验和。
+        """
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+
+        ts = self._timestamp()
+        service = self._service_name()
+        if not service:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message="无法确定连接 service name：请填写 db_name 或服务名(service)")
+
+        extra = self._parse_extra()
+        schemas = extra.get("schemas")
+        if schemas:
+            if isinstance(schemas, list):
+                schemas_arg = ",".join(str(s) for s in schemas)
+            else:
+                schemas_arg = str(schemas)
+            mode_args = f"SCHEMAS={schemas_arg}"
+            mode_desc = f"指定模式(schemas={schemas_arg})"
+        else:
+            mode_args = "FULL=Y"
+            mode_desc = "全库(FULL=Y)"
+
+        host = self.task.get("host") or "127.0.0.1"
+        port = self.task.get("port") or 1521
+        username = self.task.get("username") or "system"
+        pw = db.decrypt_secret(self.task.get("password") or "")
+        conn_easy = f"{username}/{pw}@//{host}:{port}/{service}"
+
+        dp_dir = "/u01/app/oracle/admin/orcl11g/dpdump"
+        remote_dmp = f"{dp_dir}/{ts}.dmp"
+        remote_log = f"{dp_dir}/{ts}.log"
+
+        # 远端脚本：先试 system/<pw>@//host:port/service，失败回退 / as sysdba
+        expdp_sh = (
+            "#!/bin/bash\n"
+            "export ORACLE_HOME=/u01/app/oracle/product/19.0.0/dbhome_1\n"
+            "export ORACLE_SID=orcl11g\n"
+            "export PATH=$ORACLE_HOME/bin:$PATH\n"
+            f"expdp {conn_easy} {mode_args} DIRECTORY=DATA_PUMP_DIR "
+            f"DUMPFILE={ts}.dmp LOGFILE={ts}.log\n"
+            "RC=$?\n"
+            "if [ $RC -ne 0 ]; then\n"
+            f"  echo '[fallback] primary expdp failed (rc=$RC), retry with / as sysdba'\n"
+            f"  expdp \"/ as sysdba\" {mode_args} DIRECTORY=DATA_PUMP_DIR "
+            f"DUMPFILE={ts}.dmp LOGFILE={ts}.log\n"
+            "  RC=$?\n"
+            "fi\n"
+            'echo "EXPDP_RC=$RC"\n'
+            "exit $RC\n"
+        )
+
+        client = remote_dump._connect(ssh_host)
+        sftp = client.open_sftp()
+        try:
+            try:
+                sftp.mkdir("/u01/app/oracle/backup")
+            except IOError:
+                pass
+            remote_sh = f"/u01/app/oracle/backup/expdp_{ts}.sh"
+            with sftp.open(remote_sh, "w") as f:
+                f.write(expdp_sh)
+            try:
+                sftp.chmod(remote_sh, 0o755)
+            except Exception:
+                pass
+
+            inner = f"bash {remote_sh}"
+            shell = f"su - oracle -c {shlex.quote(inner)}"
+            wrapped = remote_dump._wrap_login(shell)
+            start = time.time()
+            out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=7200)
+            duration = round(time.time() - start, 3)
+            out_text = out.decode("utf-8", "replace") if isinstance(out, bytes) else out
+            err_text = err or ""
+            self.logger.info("[%s] 远端 expdp 返回 rc=%s", self.task_name, rc)
+
+            if rc != 0:
+                snippet = (out_text or err_text)[-1500:]
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    duration_sec=duration, stdout=out_text, stderr=err_text,
+                    message=f"远端 expdp 逻辑备份失败(rc={rc}): {snippet}")
+
+            # 校验远端 dmp 确实存在
+            try:
+                dmp_attr = sftp.stat(remote_dmp)
+            except IOError:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    duration_sec=duration, stdout=out_text, stderr=err_text,
+                    message=f"远端 expdp 执行返回成功，但未找到 dmp 文件: {remote_dmp}")
+
+            out_dir = self._output_dir()
+            os.makedirs(out_dir, exist_ok=True)
+            local_dmp = os.path.join(out_dir, f"{ts}.dmp")
+            local_log = os.path.join(out_dir, f"{ts}.log")
+            sftp.get(remote_dmp, local_dmp)
+            try:
+                sftp.get(remote_log, local_log)
+            except IOError:
+                local_log = None  # log 缺失不致命
+
+            size = os.path.getsize(local_dmp)
+            checksum = db.sha256_file(local_dmp)
+            hk = ssh_host.get("host_key", "remote")
+            msg = (f"通过 SSH 在 {hk} 以 oracle 用户执行 expdp({mode_desc})成功，"
+                   f"已拉回 dmp: {local_dmp} ({db.human_size(size)})")
+            self.logger.info("[%s] %s", self.task_name, msg)
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=local_dmp, size_bytes=size, duration_sec=duration,
+                stdout=out_text, stderr=err_text, simulated=False,
+                checksum=checksum, message=msg)
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+    def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:
         """逻辑备份：expdp / exp（沿用原有实现）。"""
 
         ts = self._timestamp()
         extra = self._parse_extra()
-        service = extra.get("service") or self.task.get("db_name") or ""
+        service = self._service_name()
         if not service:
-            msg = "无法确定连接 service name（extra_options.service 与 db_name 均为空）"
+            msg = "无法确定连接 service name（extra_options.service、db_name、host 均为空）"
             self.logger.error("[%s] %s", self.task_name, msg)
             return BackupResult(success=False, status=BackupStatus.FAILED,
                                  message=msg)
@@ -270,10 +566,7 @@ class OracleEngine(BackupEngine):
         流程：先做演示/仿真检测；通过后再根据备份路径判断是服务端导出
         （impdp）还是本机 exp 导出（imp），构造相应恢复命令。
         """
-        if self.task.get("demo_only"):
-            return self._simulate_restore(backup_path, "任务标记为演示(demo_only)")
-        if config.DEMO_MODE == "on":
-            return self._simulate_restore(backup_path, "DEMO_MODE=on 强制仿真")
+        # demo_only / DEMO_MODE 不再触发仿真，统一走真实恢复
 
         # 跨主机恢复（Oracle 用 impdp 模式由 cross_host 处理）
         target_host_info = kwargs.get("target_host_info")
@@ -288,9 +581,9 @@ class OracleEngine(BackupEngine):
                                  message=msg)
 
         extra = self._parse_extra()
-        service = extra.get("service") or self.task.get("db_name") or ""
+        service = self._service_name()
         if not service:
-            msg = "无法确定连接 service name（extra_options.service 与 db_name 均为空）"
+            msg = "无法确定连接 service name（extra_options.service、db_name、host 均为空）"
             self.logger.error("[%s] %s", self.task_name, msg)
             return BackupResult(success=False, status=BackupStatus.FAILED,
                                  message=msg)
@@ -301,7 +594,8 @@ class OracleEngine(BackupEngine):
             # 服务端 Data Pump 导出：使用 impdp 恢复
             if not self._client_available("impdp"):
                 self.logger.error("[%s] impdp 不可用，无法执行服务端恢复", self.task_name)
-                return self._simulate_restore(backup_path, "impdp 客户端不可用")
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                   message="impdp 客户端不可用，无法执行服务端恢复")
             # 形如 server-side:DATA_PUMP_DIR/xxx.dmp
             remainder = backup_path[len("server-side:"):]
             directory, _, dumpfile = remainder.rpartition("/")
@@ -317,7 +611,8 @@ class OracleEngine(BackupEngine):
             # 本机 exp 导出：使用传统 imp 恢复
             if not self._client_available("imp"):
                 self.logger.error("[%s] imp 不可用，无法执行本地恢复", self.task_name)
-                return self._simulate_restore(backup_path, "imp 客户端不可用")
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                   message="imp 客户端不可用，无法执行本地恢复")
             if not os.path.exists(backup_path):
                 msg = f"本地备份文件不存在: {backup_path}"
                 self.logger.error("[%s] %s", self.task_name, msg)

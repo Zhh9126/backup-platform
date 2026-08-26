@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """系统/仪表盘/调度/日志/元信息 API。"""
+import os
+import logging
 from flask import jsonify, request
+import json
+
+logger = logging.getLogger("api.system")
 
 from auth import login_required
 from core import models, scheduler, db
@@ -53,6 +58,15 @@ def dashboard():
     task_biz_map = {t["id"]: t.get("biz_system") or t.get("name") for t in tasks}
     task_host_map = {t["id"]: t.get("host") for t in tasks}
     task_mode_map = {t["id"]: t.get("backup_mode") for t in tasks}
+    # ---- 存储池加密任务数（extra_options.encrypt_pool === true） ----
+    encrypt_pool_tasks = 0
+    for t in tasks:
+        try:
+            _eo = json.loads(t.get("extra_options") or "{}")
+        except Exception:
+            _eo = {}
+        if _eo.get("encrypt_pool") is True:
+            encrypt_pool_tasks += 1
 
     def _enrich(r: dict) -> dict:
         """在 record dict 上补仪表盘需要的展示字段（中文 + 关联任务信息）。"""
@@ -104,6 +118,7 @@ def dashboard():
         "health_score": health,
         "health_details": health_details,
         "compression_pct": comp_ratio,
+        "encrypt_pool_tasks": encrypt_pool_tasks,
     })
 
 
@@ -364,3 +379,132 @@ def test_notify_config():
         }), 400
     except Exception as e:
         return jsonify({"ok": False, "error": f"发送失败: {e}"}), 500
+
+
+# ------------------------- 存储池加密密钥 (KMS) -------------------------
+@api_bp.route("/pool-crypto", methods=["GET"])
+@login_required
+def get_pool_crypto():
+    """返回当前存储池加密密钥配置（不回显密钥明文）。"""
+    import json
+    raw = db.get_system_config("pool_crypto")
+    if not raw:
+        return jsonify({
+            "ok": True,
+            "configured": False,
+            "mode": "local",
+            "active": bool(os.environ.get("BACKUP_POOL_KEY")),
+            "local_key_set": False,
+            "kms_provider": "",
+            "kms_endpoint": "",
+            "kms_key_id": "",
+            "kms_access_key": "",
+            "kms_configured": False,
+        })
+    cfg = json.loads(raw)
+    mode = cfg.get("mode", "local")
+    return jsonify({
+        "ok": True,
+        "configured": True,
+        "mode": mode,
+        "active": True,
+        "local_key_set": bool(cfg.get("pool_key")),
+        "kms_provider": cfg.get("kms_provider", ""),
+        "kms_endpoint": cfg.get("kms_endpoint", ""),
+        "kms_key_id": cfg.get("kms_key_id", ""),
+        "kms_access_key": cfg.get("kms_access_key", ""),
+        "kms_configured": bool(cfg.get("kms_endpoint") and cfg.get("kms_key_id")),
+    })
+
+
+@api_bp.route("/pool-crypto", methods=["POST"])
+@login_required
+def save_pool_crypto():
+    """保存存储池加密密钥配置（本地密钥库 / KMS）。
+
+    body: {
+      mode: "local" | "kms",
+      pool_key: <明文主密钥，仅 local 模式，留空表示不修改>,
+      kms_provider, kms_endpoint, kms_key_id, kms_access_key, kms_secret,
+      local_fallback_key: <KMS 不可达时的回退主密钥>
+    }
+    """
+    import json
+    data = request.get_json(force=True, silent=True) or {}
+    mode = data.get("mode", "local")
+    cfg = {}
+    if mode == "local":
+        # 仅当填写了新密钥才更新（避免每次保存把密钥清空）
+        new_key = (data.get("pool_key") or "").strip()
+        old_raw = db.get_system_config("pool_crypto")
+        old_key = ""
+        if old_raw:
+            try:
+                old_key = json.loads(old_raw).get("pool_key", "")
+            except Exception:
+                old_key = ""
+        cfg = {
+            "mode": "local",
+            "pool_key": new_key or old_key,
+        }
+        if not cfg["pool_key"]:
+            return jsonify({"ok": False, "error": "本地密钥库模式下必须填写主密钥"}), 400
+    else:
+        # KMS 模式：保存连接参数，主密钥运行时从 KMS 拉取
+        cfg = {
+            "mode": "kms",
+            "kms_provider": data.get("kms_provider", "custom"),
+            "kms_endpoint": (data.get("kms_endpoint") or "").strip(),
+            "kms_key_id": (data.get("kms_key_id") or "").strip(),
+            "kms_access_key": (data.get("kms_access_key") or "").strip(),
+            "kms_secret": (data.get("kms_secret") or "").strip(),
+            "local_fallback_key": (data.get("local_fallback_key") or "").strip(),
+        }
+        if not cfg["kms_endpoint"] or not cfg["kms_key_id"]:
+            return jsonify({"ok": False, "error": "KMS 模式需填写 endpoint 与 key_id"}), 400
+    db.set_system_config("pool_crypto", json.dumps(cfg, ensure_ascii=False))
+    # 保存后立即自检：用测试文件加密→解密，验证密钥真实可用
+    try:
+        from core import crypto_pool as cp
+        st = cp.self_test()
+        return jsonify({
+            "ok": True,
+            "self_test": st,
+            "message": "存储池加密密钥已保存，自检通过（AES-256-GCM 可用）",
+        })
+    except Exception as e:
+        logger.warning("pool_crypto 自检失败: %s", e)
+        return jsonify({
+            "ok": True,
+            "self_test": {"ok": False, "error": str(e)},
+            "message": "配置已保存，但密钥自检失败（加密可能未生效，请检查密钥/环境变量）",
+        })
+
+
+@api_bp.route("/pool-crypto/test", methods=["POST"])
+@login_required
+def test_pool_crypto():
+    """测试 KMS 连通性（仅 KMS 模式有意义）。"""
+    import json
+    data = request.get_json(force=True, silent=True) or {}
+    provider = (data.get("kms_provider") or "custom").lower()
+    endpoint = (data.get("kms_endpoint") or "").strip()
+    key_id = (data.get("kms_key_id") or "").strip()
+    if not endpoint or not key_id:
+        return jsonify({"ok": False, "error": "需填写 endpoint 与 key_id"}), 400
+    cfg = {
+        "mode": "kms",
+        "kms_provider": provider,
+        "kms_endpoint": endpoint,
+        "kms_key_id": key_id,
+        "kms_access_key": (data.get("kms_access_key") or "").strip(),
+        "kms_secret": (data.get("kms_secret") or "").strip(),
+    }
+    from core import crypto_pool as cp
+    pw = cp._resolve_kms_passphrase(cfg)
+    if pw:
+        return jsonify({"ok": True, "message": "KMS 连通成功，已取回主密钥明文"})
+    return jsonify({
+        "ok": False,
+        "error": "KMS 不可达或凭证无效（请确认 endpoint/key_id/access_key/secret，或网络是否可达）",
+    }), 400

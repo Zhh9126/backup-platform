@@ -1,7 +1,31 @@
-backups/packages/ 
-*.tar.xz 
-*.tar.gz 
-*.gz 
-logs/ 
-*.pyc 
-__pycache__/ 
+# 备份产物
+backups/
+*.tar.xz
+*.tar.gz
+*.gz
+
+# Python
+logs/
+*.pyc
+__pycache__/
+
+# 运行时数据 / 敏感文件（生产数据库、SECRET_KEY、任务密码密文）
+instance/
+
+# 构建产物
+build/
+dist/
+*.zip
+
+# 日志与崩溃转储
+*.log
+hs_err_pid*
+replay_pid*
+startup*.log
+
+# 本地临时文件（仅根目录，_ 前缀）
+/_*
+
+# 工具会话记忆（含服务器凭据，勿提交）
+.codebuddy/memory/
+.workbuddy/

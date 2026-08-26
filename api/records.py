@@ -7,7 +7,7 @@ from flask import request, jsonify, send_file, Response
 
 from auth import login_required
 from core import models, db, reports
-from . import api_bp
+from . import api_bp, safe_download_path
 
 
 # 超长 / 超频 默认阈值（秒 / 分钟），可由 query string 覆盖
@@ -96,8 +96,9 @@ def compute_expected_duration_sec(size_bytes: int, expected_gb_per_hour: float) 
 @login_required
 def list_records():
     task_id = request.args.get("task_id", type=int)
+    policy_id = request.args.get("policy_id", type=int)
     keyword = request.args.get("keyword", type=str)
-    rows = models.list_records(task_id=task_id, keyword=keyword, limit=500)
+    rows = models.list_records(task_id=task_id, keyword=keyword, policy_id=policy_id, limit=500)
     for r in rows:
         r["size_human"] = db.human_size(r.get("size_bytes") or 0)
     return jsonify(rows)
@@ -121,10 +122,11 @@ def download_record(record_id):
     rec = models.get_record(record_id)
     if not rec or not rec.get("backup_path"):
         return jsonify({"error": "无备份文件可下载"}), 404
-    path = rec["backup_path"]
-    if not os.path.exists(path):
-        return jsonify({"error": "备份文件已不存在（可能已被保留策略清理或位于远程）"}), 404
-    return send_file(path, as_attachment=True)
+    # 安全整改：仅允许下载备份根目录内的文件，防路径穿越/任意文件读取
+    safe_path = safe_download_path(rec["backup_path"])
+    if safe_path is None:
+        return jsonify({"error": "下载路径不合法或文件不存在"}), 400
+    return send_file(safe_path, as_attachment=True)
 
 
 @api_bp.route("/records/export", methods=["GET"])

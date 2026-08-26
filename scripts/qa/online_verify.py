@@ -39,7 +39,7 @@ def run_batch(question, n):
     for i in range(n):
         op = make_opener()
         login(op)
-        sid = create_session(op, f"verify-{question[:6]}-{i}")
+        sid = create_session(op, f"验证-{question[:6]}-{i}")
         t0 = time.time()
         try:
             d = chat(op, sid, question)

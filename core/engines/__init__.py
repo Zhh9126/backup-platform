@@ -92,6 +92,12 @@ def synthesize_full_for_task(task_id: int, target_storage_tier: int = None,
     对每个"全量/合成全量"基集，收集其后续增量（parent_set_id 指向它且
     set_type=incremental），调用对应引擎的 synthesize_full() 完成合并，
     并登记一个新的 set_type=synthetic_full 备份集（parent_set_id 指向链头）。
+
+    永久增量链闭环（参考 CDM 设计）：
+    - 合成全量继承链头的 chain_id（无则生成新链），使整条"永远增量"链可追溯；
+    - 合并完成后，被覆盖的中间增量备份集标记 chain_status='merged'，
+      交由副本生命周期策略统一回收（合成后中间副本释放）；
+    - 估算 dedup_saved_bytes = Σ增量大小 − 合成全量大小（合成即去重收益）。
     返回新生成的合成全量 BackupSet id 列表。
     """
     import config
@@ -113,6 +119,36 @@ def synthesize_full_for_task(task_id: int, target_storage_tier: int = None,
                                      target_storage_tier=target_storage_tier,
                                      target_record_id=base.get("record_id"))
         if res.success and res.backup_path:
+            # 永久增量链：沿用链头 chain_id，无则新建
+            chain_id = base.get("chain_id") or (
+                "chn_%s_%d" % (task_id, int(base["id"])))
+            syn_size = res.size_bytes or 0
+            inc_sum = sum(int(s.get("size_bytes") or 0)
+                          for s in chain if s.get("set_type") == "incremental")
+            dedup_saved = max(inc_sum - syn_size, 0)
+
+            # 合成后做真实可恢复校验（鼎甲迪备 §3.2 强调"合成产物可直接挂载即时恢复"）：
+            # 用引擎自带的 verify_record 对合成产物做存在性/完整性/checksum 校验，
+            # 失败则合成全量不可信，标记为未通过，避免静默造假。
+            verified = 0
+            verify_msg = ""
+            try:
+                rec = {
+                    "backup_path": res.backup_path,
+                    "checksum": res.checksum or "",
+                    "db_type": task.get("db_type"),
+                    "size_bytes": syn_size,
+                }
+                vres = engine.verify_record(rec, options={})
+                verified = 1 if vres.success else 0
+                verify_msg = vres.message or ""
+            except Exception as e:
+                verified = 0
+                verify_msg = f"合成后校验异常: {e}"
+
+            # 真实合并 vs 逻辑重链：用 chain_status 区分，前端可诚实展示
+            chain_status = "synthesized_real" if not res.simulated else "synthesized_sim"
+
             new_id = models.create_backup_set({
                 "task_id": task_id,
                 "record_id": base.get("record_id"),
@@ -120,12 +156,25 @@ def synthesize_full_for_task(task_id: int, target_storage_tier: int = None,
                 "storage_tier": target_storage_tier or base.get("storage_tier", 1),
                 "object_key": res.backup_path,
                 "parent_set_id": base["id"],
-                "verified": 1 if res.verified else 0,
-                "size_bytes": res.size_bytes or 0,
+                "verified": verified,
+                "size_bytes": syn_size,
+                "dedup_saved_bytes": dedup_saved,
                 "checksum": res.checksum or "",
+                "chain_id": chain_id,
+                "chain_status": chain_status,
             })
-            new_ids.append(new_id)
+            # 标记被合并的中间增量：副本生命周期可回收
+            for s in chain:
+                if s.get("set_type") == "incremental":
+                    models.update_backup_set(
+                        s["id"],
+                        {"chain_id": chain_id, "chain_status": "merged"})
             if logger:
-                logger.info("[synthesize] task=%s 合成全量 #%s (合并 %d 个增量)",
-                            task_id, new_id, len(chain) - 1)
+                mode = "物理合并" if not res.simulated else "逻辑重链(缺客户端)"
+                logger.info(
+                    "[synthesize] task=%s 合成全量 #%s (%s, 合并 %d 个增量, "
+                    "去重 %.1fMB, 校验%s)",
+                    task_id, new_id, mode, len(chain) - 1,
+                    dedup_saved / 1048576.0, "通过" if verified else "未通过")
+            new_ids.append(new_id)
     return new_ids

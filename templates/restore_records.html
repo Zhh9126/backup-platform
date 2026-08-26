@@ -14,10 +14,28 @@
     <table class="table table-hover align-middle mb-0">
       <thead><tr>
         <th>ID</th><th>备份记录</th><th>业务系统</th><th>备份 IP</th><th>备份类型</th><th>备份时间</th>
-        <th>目标主机</th><th>目标库</th><th>恢复开始</th><th>状态</th><th>操作人</th><th>说明</th>
+        <th>目标主机</th><th>目标库</th><th>恢复开始</th><th>状态</th><th>操作人</th><th>说明</th><th>详细日志</th>
       </tr></thead>
       <tbody id="restoreRecordsTable"></tbody>
     </table>
+  </div>
+</div>
+
+<!-- 恢复详细日志弹窗 -->
+<div class="modal fade" id="restoreLogModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">恢复详细日志</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <pre id="restoreLogContent" class="bg-light p-3 rounded" style="white-space:pre-wrap; font-size:.85rem; max-height:60vh; overflow:auto;"></pre>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+      </div>
+    </div>
   </div>
 </div>
 {% endblock %}

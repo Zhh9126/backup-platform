@@ -3,6 +3,8 @@
 
 Flask>=3.0
 APScheduler>=3.10          # 后台定时调度（必选）
+jpype1>=1.5                # JDBC 连接方式：JPype 桥接 Java JDBC 驱动（必选）
+jaydebeapi>=1.2.3          # JDBC 连接方式：Python JDBC 桥接层（必选）
 
 # 以下为可选依赖：
 paramiko>=3.0              # SFTP 远程存储上传（如不使用 SFTP 可注释掉）

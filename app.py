@@ -7,13 +7,43 @@ Flask 应用主程序。
 - 注册 REST API 蓝图
 - 提供页面路由（仪表盘 / 任务 / 记录 / 恢复 / 设置 / 登录）
 """
+import os
+import hmac
+import time
+import datetime as _dt
+
 from flask import (Flask, render_template, request, redirect,
                    url_for, session, jsonify)
 
 import config
 import core.db as db
 from auth import login_required
+# 注意：api/__init__.py 已注册 api_bp 的全局鉴权/CSRF 钩子（必须在嵌套蓝图注册前声明）
 from api import api_bp
+
+# ------------------------- 登录安全状态（内存限流） -------------------------
+# ip -> [连续失败次数, 首次失败时间戳]
+_LOGIN_ATTEMPTS = {}
+
+
+def _login_locked(ip: str) -> bool:
+    rec = _LOGIN_ATTEMPTS.get(ip)
+    if not rec:
+        return False
+    count, first = rec
+    if count >= config.LOGIN_MAX_FAILS:
+        if time.time() - first < config.LOGIN_LOCK_MINUTES * 60:
+            return True
+        _LOGIN_ATTEMPTS.pop(ip, None)  # 锁定窗口过期，清零
+    return False
+
+
+def _register_login_fail(ip: str):
+    rec = _LOGIN_ATTEMPTS.setdefault(ip, [0, time.time()])
+    if time.time() - rec[1] > config.LOGIN_LOCK_MINUTES * 60:
+        rec[0] = 0
+        rec[1] = time.time()
+    rec[0] += 1
 
 
 def create_app() -> Flask:
@@ -22,7 +52,28 @@ def create_app() -> Flask:
     app.secret_key = config.SECRET_KEY
     app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024 * 1024  # 20GB（安装包可达 4GB+）
     app.config["BACKUP_ROOT"] = str(config.BACKUP_ROOT)
+    # 会话安全：HttpOnly + SameSite=Lax 缓解 CSRF；会话超时按配置（默认 8 小时）
+    app.config["SESSION_COOKIE_HTTPONLY"] = True
+    app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+    app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
+    app.config["PERMANENT_SESSION_LIFETIME"] = _dt.timedelta(seconds=config.SESSION_TIMEOUT)
     db.init_schema()
+
+    @app.after_request
+    def _security_headers(resp):
+        # 安全响应头（CSP 允许同源 + 内联脚本/样式，兼顾现有页面）
+        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+        resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        resp.headers.setdefault("Referrer-Policy", "same-origin")
+        resp.headers.setdefault("X-XSS-Protection", "1; mode=block")
+        resp.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "font-src 'self' data:; connect-src 'self'",
+        )
+        return resp
+
     app.register_blueprint(api_bp)
 
     # ------------------------- 鉴权 -------------------------
@@ -32,13 +83,27 @@ def create_app() -> Flask:
             data = request.get_json(silent=True) or {}
             u = request.form.get("username") or data.get("username") or ""
             p = request.form.get("password") or data.get("password") or ""
-            if u == config.WEB_USERNAME and p == config.WEB_PASSWORD:
+            ip = request.remote_addr or "unknown"
+            is_json = request.headers.get("Content-Type", "").startswith("application/json")
+            # 暴力破解防护：连续失败达到上限后锁定该 IP
+            if _login_locked(ip):
+                remain = config.LOGIN_LOCK_MINUTES
+                if is_json:
+                    return jsonify({"error": f"登录失败次数过多，IP 已被锁定，请 {remain} 分钟后再试"}), 429
+                return render_template("login.html",
+                                       error=f"登录失败次数过多，IP 已被锁定，请 {remain} 分钟后再试")
+            # 常量时间比较，避免时序侧信道
+            ok = (hmac.compare_digest(u, config.WEB_USERNAME)
+                  and hmac.compare_digest(p, config.WEB_PASSWORD))
+            if ok:
+                _LOGIN_ATTEMPTS.pop(ip, None)
                 session["user"] = u
                 session.permanent = True
-                if request.headers.get("Content-Type", "").startswith("application/json"):
+                if is_json:
                     return jsonify({"ok": True})
                 return redirect(url_for("dashboard_page"))
-            if request.headers.get("Content-Type", "").startswith("application/json"):
+            _register_login_fail(ip)
+            if is_json:
                 return jsonify({"error": "用户名或密码错误"}), 401
             return render_template("login.html", error="用户名或密码错误")
         return render_template("login.html")
@@ -171,6 +236,12 @@ def create_app() -> Flask:
     def operations_page():
         """运维运营分析：超长备份 / 超频备份统计与阈值配置、Excel 导出。"""
         return render_template("operations.html", page="operations")
+
+    @app.route("/restore-verify")
+    @login_required
+    def restore_verify_page():
+        """恢复校验策略与恢复测试报告。"""
+        return render_template("restore_verify.html", page="restore-verify")
 
     return app
 

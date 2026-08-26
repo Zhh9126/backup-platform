@@ -1,10 +1,10 @@
 // -*- coding: utf-8 -*-
-// 备份插件页面 JS（参考 dbcheck 插件市场风格）
-// 卡片网格 + 已安装/市场分区 + 一键安装/卸载
+// 备份插件页面 JS —— 主机维度版
+// 支持目标主机下拉（本机 / SSH 主机），安装/卸载/轮询均带 host_id
 "use strict";
 
 (function () {
-  // ---- bkp-core 别名（避免依赖全局 $ / window.api）----
+  // ---- bkp-core 别名 ----
   const $    = (id) => document.getElementById(id);
   const $$   = (sel, root) => Array.from((root || document).querySelectorAll(sel));
   const api  = (m, u, b) => window.BKP.api(m, u, b);
@@ -12,27 +12,27 @@
   const toast = (msg, type, delay) => window.BKP.toast(msg, type, delay);
 
   // ---- 状态 ----
-  let ALL_PLUGINS  = [];           // 全部插件（/api/plugins）
+  let ALL_PLUGINS  = [];
   let META_INFO    = { current_os: "-", package_manager: "-" };
-  let CATEGORIES   = [];           // 类别清单（数据库类型）
-  let POLLERS      = {};           // pid -> intervalId
-  let CURRENT_FILTER = "all";      // 当前 DB 类型筛选
-  let CURRENT_SEARCH = "";         // 搜索关键字
+  let CATEGORIES   = [];
+  let POLLERS      = {};           // `${pid}@${hostId}` -> intervalId
+  let CURRENT_FILTER = "all";
+  let CURRENT_SEARCH = "";
+  let CURRENT_HOST_ID = 0;         // 0 = 本机
+  let HOST_LIST    = [];           // 主机列表
 
   // ===================================================================
   // 初始化
   // ===================================================================
   document.addEventListener("DOMContentLoaded", async () => {
     bindUI();
-    // 先确保 BKP.META.display_names 已就绪（与 app.js 解耦）
     try {
       const meta = await api("GET", "/api/meta");
       if (meta && meta.display_names) {
         window.BKP.META = Object.assign(window.BKP.META, meta);
       }
-    } catch (e) {
-      // 未登录或失败时不影响渲染
-    }
+    } catch (e) { /* 未登录或失败时不影响渲染 */ }
+    await loadHosts();
     await loadAll();
   });
 
@@ -51,13 +51,49 @@
       });
     }
 
+    const hostSelect = $("hostSelect");
+    if (hostSelect) {
+      hostSelect.addEventListener("change", async (e) => {
+        CURRENT_HOST_ID = parseInt(e.target.value, 10) || 0;
+        // 切换主机时清除所有轮询
+        Object.keys(POLLERS).forEach(k => stopPollingByKey(k));
+        await loadAll();
+      });
+    }
+
     // 关闭日志 modal 时停止该插件的轮询
     const logModalEl = $("pluginLogModal");
     if (logModalEl) {
       logModalEl.addEventListener("hidden.bs.modal", () => {
-        Object.keys(POLLERS).forEach(stopPolling);
+        Object.keys(POLLERS).forEach(k => stopPollingByKey(k));
       });
     }
+  }
+
+  // ===================================================================
+  // 主机列表加载
+  // ===================================================================
+  async function loadHosts() {
+    try {
+      const resp = await api("GET", "/api/plugins/hosts");
+      HOST_LIST = (resp && resp.hosts) || [];
+      const sel = $("hostSelect");
+      if (!sel) return;
+      sel.innerHTML = HOST_LIST.map(h => `
+        <option value="${h.id}" ${h.id === CURRENT_HOST_ID ? "selected" : ""}>
+          ${esc(h.name || h.host_key || "未知")}
+        </option>
+      `).join("");
+    } catch (e) {
+      console.error("加载主机列表失败:", e);
+    }
+  }
+
+  function currentHostName() {
+    const h = HOST_LIST.find(x => x.id === CURRENT_HOST_ID);
+    if (!h) return "本机";
+    if (CURRENT_HOST_ID === 0) return "本机";
+    return h.name || h.host_key || "远端主机";
   }
 
   // ===================================================================
@@ -65,37 +101,41 @@
   // ===================================================================
   async function loadAll() {
     try {
-      // KPI 卡片打加载态
       setStat("statTotal",      "…", "插件总数");
       setStat("statInstalled",   "…", "已安装");
-      setStat("statRecommend",   "…", "本机推荐安装");
+      setStat("statRecommend",   "…", "推荐安装");
       setStat("statSupported",   "…", "当前 OS 支持");
 
+      const hostParam = CURRENT_HOST_ID ? `?host_id=${CURRENT_HOST_ID}` : "";
+      const recParam  = CURRENT_HOST_ID ? `?host_id=${CURRENT_HOST_ID}` : "";
+
       const [listResp, recResp] = await Promise.all([
-        api("GET", "/api/plugins"),
-        api("GET", "/api/plugins/recommend")
+        api("GET", `/api/plugins${hostParam}`),
+        api("GET", `/api/plugins/recommend${recParam}`)
       ]);
 
       ALL_PLUGINS = (listResp && listResp.plugins) || [];
       META_INFO   = {
-        current_os: listResp.current_os || "-",
-        package_manager: listResp.package_manager || "未检测到"
+        current_os: (listResp && listResp.current_os) || "-",
+        package_manager: (listResp && listResp.package_manager) || "未检测到"
       };
       const recCount = (recResp && recResp.count) || 0;
 
-      // 计算 KPI
       const total      = ALL_PLUGINS.length;
       const installed  = ALL_PLUGINS.filter(p => p.installed).length;
       const supported  = ALL_PLUGINS.filter(p => p.os_supported).length;
+
+      const osLabel = CURRENT_HOST_ID ? currentHostName() + " 支持" : (META_INFO.current_os + " 支持");
       setStat("statTotal",     total,        "插件总数");
       setStat("statInstalled",  installed,   "已安装");
-      setStat("statRecommend",  recCount,    "本机推荐安装");
-      setStat("statSupported",  supported,   META_INFO.current_os + " 支持");
+      setStat("statRecommend",  recCount,    "推荐安装");
+      setStat("statSupported",  supported,   osLabel);
 
-      // 类别筛选 chips
+      // 更新已安装区提示文案
+      const hint = $("installedHint");
+      if (hint) hint.textContent = `${currentHostName()} 已具备的备份客户端，可立即用于备份任务`;
+
       renderCategoryFilter();
-
-      // 渲染卡片
       render();
     } catch (e) {
       console.error(e);
@@ -113,7 +153,7 @@
   }
 
   // ===================================================================
-  // 类别筛选（按 supports 数据库类型聚合）
+  // 类别筛选
   // ===================================================================
   function renderCategoryFilter() {
     const wrap = $("categoryFilter");
@@ -141,7 +181,6 @@
         ${esc(it.label)} <span class="filter-count">${it.count}</span>
       </button>
     `).join("");
-    // 绑定
     wrap.querySelectorAll(".filter-pill").forEach(btn => {
       btn.addEventListener("click", () => {
         CURRENT_FILTER = btn.getAttribute("data-key");
@@ -152,7 +191,7 @@
   }
 
   // ===================================================================
-  // 渲染主区（已安装 + 市场 两个分组）
+  // 渲染主区（已安装 + 市场）
   // ===================================================================
   function render() {
     const installedWrap = $("installedWrap");
@@ -160,24 +199,21 @@
     if (!installedWrap || !marketWrap) return;
 
     const filtered = filterAndSort(ALL_PLUGINS);
-
     const installedList = filtered.filter(p => p.installed);
     const marketList    = filtered.filter(p => !p.installed);
 
-    // --- 已安装区 ---
     $("installedCount").textContent = installedList.length;
     if (installedList.length === 0) {
       installedWrap.innerHTML = `
         <div class="plugin-empty">
           <i class="bi bi-inboxes"></i>
-          <div>暂未安装任何插件。请从下方市场挑选，或点击右上角"一键安装本机所需"。</div>
+          <div>${esc(currentHostName())}暂未安装任何插件。请从下方市场挑选，或点击右上角"一键安装所需"。</div>
         </div>`;
     } else {
       installedWrap.innerHTML = installedList.map(renderCard).join("");
       bindCardEvents(installedWrap);
     }
 
-    // --- 市场区 ---
     $("marketCount").textContent = marketList.length;
     if (marketList.length === 0) {
       marketWrap.innerHTML = `
@@ -203,7 +239,6 @@
         return hay.indexOf(CURRENT_SEARCH) >= 0;
       });
     }
-    // 排序：未装在前 + 本机推荐优先 + 类别+名
     r.sort((a, b) => {
       if (a.installed !== b.installed) return a.installed ? 1 : -1;
       if (!!a.recommended !== !!b.recommended) return a.recommended ? -1 : 1;
@@ -213,7 +248,7 @@
   }
 
   // ===================================================================
-  // 渲染单个插件卡片（dbcheck 风格）
+  // 渲染单个插件卡片
   // ===================================================================
   function renderCard(p) {
     const statusBadge = renderStatusBadge(p);
@@ -224,11 +259,9 @@
       <span class="plugin-tag">${esc(t)}</span>
     `).join("");
 
-    // 底部操作按钮
     const actions = renderActions(p);
-
-    // 当前 OS 不可用时给整张卡一个 .disabled 视觉态
     const unavailable = !p.os_supported;
+    const hostLabel = CURRENT_HOST_ID ? `安装到 ${esc(currentHostName())}` : "一键安装";
 
     return `
       <div class="plugin-card ${p.installed ? "is-installed" : "is-market"} ${unavailable ? "is-unavailable" : ""}"
@@ -273,16 +306,16 @@
       return `<span class="plugin-badge plugin-badge-ok"><i class="bi bi-check-circle-fill"></i> 已安装</span>`;
     }
     if (p.recommended) {
-      return `<span class="plugin-badge plugin-badge-recommend"><i class="bi bi-star-fill"></i> 本机推荐</span>`;
+      return `<span class="plugin-badge plugin-badge-recommend"><i class="bi bi-star-fill"></i> 推荐</span>`;
     }
     if (!p.os_supported) {
-      return `<span class="plugin-badge plugin-badge-muted">未适配本机</span>`;
+      return `<span class="plugin-badge plugin-badge-muted">未适配</span>`;
     }
     return `<span class="plugin-badge plugin-badge-idle">待安装</span>`;
   }
 
   function renderActions(p) {
-    // 已安装：卸载 + 查看日志
+    const hostLabel = CURRENT_HOST_ID ? `安装到${esc(currentHostName())}` : "一键安装";
     if (p.installed) {
       return `
         <button class="btn btn-outline-secondary btn-sm" data-act="log">
@@ -292,38 +325,35 @@
           <i class="bi bi-trash"></i> 卸载
         </button>`;
     }
-    // 安装中：查看日志（按钮 disabled）
     if (p.status === "installing") {
       return `
         <button class="btn btn-outline-primary btn-sm" data-act="log">
           <i class="bi bi-file-text"></i> 查看进度
         </button>`;
     }
-    // 失败：重试 + 日志
     if (p.status === "failed") {
       return `
         <button class="btn btn-outline-secondary btn-sm" data-act="log">
           <i class="bi bi-file-text"></i> 日志
         </button>
         <button class="btn btn-primary btn-sm" data-act="install">
-          <i class="bi bi-arrow-clockwise"></i> 重试安装
+          <i class="bi bi-arrow-clockwise"></i> 重试
         </button>`;
     }
-    // 待安装（当前 OS 不支持则禁用）
     if (!p.os_supported) {
       return `
-        <button class="btn btn-outline-secondary btn-sm" disabled title="当前 OS 不支持该插件的自动安装">
+        <button class="btn btn-outline-secondary btn-sm" disabled title="目标主机 OS 不支持该插件的自动安装">
           <i class="bi bi-slash-circle"></i> 不支持
         </button>`;
     }
     return `
-      <button class="btn btn-primary btn-sm" data-act="install">
-        <i class="bi bi-download"></i> 一键安装
+      <button class="btn btn-primary btn-sm" data-act="install" title="${esc(hostLabel)}">
+        <i class="bi bi-download"></i> ${esc(hostLabel)}
       </button>`;
   }
 
   // ===================================================================
-  // 卡片事件（事件代理）
+  // 卡片事件
   // ===================================================================
   function bindCardEvents(root) {
     root.querySelectorAll(".plugin-card").forEach(card => {
@@ -343,17 +373,26 @@
   // ===================================================================
   // 安装 / 卸载 / 批量
   // ===================================================================
+  function hostBody(extra) {
+    const body = extra || {};
+    if (CURRENT_HOST_ID) body.host_id = CURRENT_HOST_ID;
+    return body;
+  }
+
   async function onInstall(pid) {
     try {
-      const r = await api("POST", `/api/plugins/${encodeURIComponent(pid)}/install`);
+      const r = await api("POST", `/api/plugins/${encodeURIComponent(pid)}/install`, hostBody());
       if (!r.ok) {
         toast(r.message || "安装失败", "danger");
         return;
       }
-      toast("已派发安装任务：" + pid, "success");
-      // 立即打开日志 modal 让用户看到进度
+      if (r.installed) {
+        toast(r.message || "已安装，无需重复操作", "success");
+        await loadAll();
+        return;
+      }
+      toast(`已派发安装任务到${currentHostName()}：${pid}`, "success");
       showLog(pid);
-      // 轮询状态
       startPolling(pid);
     } catch (e) {
       toast("安装失败：" + (e.message || e), "danger");
@@ -363,11 +402,12 @@
   async function onUninstall(pid) {
     const p = ALL_PLUGINS.find(x => x.id === pid);
     const label = p ? p.name : pid;
-    if (!confirm(`确认卸载插件 "${label}" ？\n\n说明：\n- 仅清理本平台下载的离线安装目录与状态文件。\n- 通过系统包管理器（apt/yum）安装的二进制仍需手动卸载。`)) {
+    const hostName = currentHostName();
+    if (!confirm(`确认从"${hostName}"卸载插件 "${label}" ？\n\n说明：\n- 仅清理平台管理的离线安装目录与状态文件。\n- 通过系统包管理器（apt/yum）安装的二进制仍需手动卸载。`)) {
       return;
     }
     try {
-      const r = await api("POST", `/api/plugins/${encodeURIComponent(pid)}/uninstall`);
+      const r = await api("POST", `/api/plugins/${encodeURIComponent(pid)}/uninstall`, hostBody());
       if (r.ok) {
         toast(r.message || "卸载完成", "success");
       } else {
@@ -381,17 +421,18 @@
 
   async function onBatchInstall() {
     try {
-      // 调用 /api/plugins/recommend -> 一键安装
-      const rec = await api("GET", "/api/plugins/recommend");
+      const hostName = currentHostName();
+      const hostParam = CURRENT_HOST_ID ? `?host_id=${CURRENT_HOST_ID}` : "";
+      const rec = await api("GET", `/api/plugins/recommend${hostParam}`);
       const ids = (rec.plugins || []).map(p => p.id);
       if (ids.length === 0) {
-        toast("本机暂无可推荐安装的插件（已全部就绪或未配置备份任务）", "dark");
+        toast(`${hostName}暂无可推荐安装的插件（已全部就绪或未配置备份任务）`, "dark");
         return;
       }
-      if (!confirm(`将为本机推荐安装 ${ids.length} 个插件：\n${ids.join("\n")}\n\n是否继续？`)) {
+      if (!confirm(`将为${hostName}推荐安装 ${ids.length} 个插件：\n${ids.join("\n")}\n\n是否继续？`)) {
         return;
       }
-      const r = await api("POST", "/api/plugins/batch-install", { ids });
+      const r = await api("POST", "/api/plugins/batch-install", hostBody({ ids }));
       if (!r.ok) {
         toast(r.error || "派发失败", "danger");
         return;
@@ -399,7 +440,6 @@
       const qd = (r.queued || []).length;
       const fl = (r.failed || []).length;
       toast(`已派发 ${qd} 个任务${fl ? "，失败 " + fl + " 个" : ""}`, qd > 0 ? "success" : "danger");
-      // 批量轮询
       (r.queued || []).forEach(startPolling);
       await loadAll();
     } catch (e) {
@@ -429,9 +469,10 @@
 
   async function refreshLog(pid) {
     try {
+      const hostParam = CURRENT_HOST_ID ? `?host_id=${CURRENT_HOST_ID}` : "";
       const [stateR, logR] = await Promise.all([
-        api("GET",  `/api/plugins/${encodeURIComponent(pid)}/state`),
-        api("GET",  `/api/plugins/${encodeURIComponent(pid)}/log`)
+        api("GET",  `/api/plugins/${encodeURIComponent(pid)}/state${hostParam}`),
+        api("GET",  `/api/plugins/${encodeURIComponent(pid)}/log${hostParam}`)
       ]);
       const st = (stateR && stateR.state) || {};
       const lg = (logR && logR.log) || "";
@@ -460,7 +501,6 @@
         "bg-primary"
       );
 
-      // 状态终态后停止轮询 + 刷新列表
       if (["success", "success_with_warn", "failed", "manual"].includes(status)) {
         stopPolling(pid);
         await loadAll();
@@ -470,15 +510,25 @@
     }
   }
 
+  function pollerKey(pid) {
+    return `${pid}@${CURRENT_HOST_ID}`;
+  }
+
   function startPolling(pid) {
-    if (POLLERS[pid]) return;
-    POLLERS[pid] = setInterval(() => refreshLog(pid), 1500);
+    const key = pollerKey(pid);
+    if (POLLERS[key]) return;
+    POLLERS[key] = setInterval(() => refreshLog(pid), 1500);
   }
 
   function stopPolling(pid) {
-    if (POLLERS[pid]) {
-      clearInterval(POLLERS[pid]);
-      delete POLLERS[pid];
+    const key = pollerKey(pid);
+    stopPollingByKey(key);
+  }
+
+  function stopPollingByKey(key) {
+    if (POLLERS[key]) {
+      clearInterval(POLLERS[key]);
+      delete POLLERS[key];
     }
   }
 })();

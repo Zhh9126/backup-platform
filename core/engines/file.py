@@ -24,6 +24,7 @@ extra_options JSON 结构示例：
 import io
 import os
 import json
+import shlex
 import time
 import tarfile
 import tempfile
@@ -123,21 +124,43 @@ def _get_extra(task: dict) -> dict:
 
 def _get_ssh_client(host_key: str, password: str = None):
     """
-    获取或创建 SSH 连接（带连接池复用）。
+    获取或创建 SSH 连接（带连接池复用 + 活性探测）。
     host_key 格式: "user@hostname:port" 或 "user@hostname"
     密码优先从参数取，其次从 ssh_hosts 表查询。
+
+    背景：长时间空闲后，中间防火墙/NAT 会静默断开 TCP，但 paramiko 的
+    transport.is_active() 仍可能返回 True，导致复用死连接时 exec_command
+    抛出 WinError 10060 等连接超时。本函数在复用前通过轻量 heartbeat
+    探测连接是否真正可用，不可用则丢弃重建。
     """
     import paramiko
 
     with _ssh_lock:
         if host_key in _ssh_pool:
             client = _ssh_pool[host_key]
+            t = None
             try:
-                if client.get_transport() and client.get_transport().is_active():
-                    return client
+                t = client.get_transport()
             except Exception:
                 pass
-            del _ssh_pool[host_key]
+            alive = False
+            if t is not None and t.is_active():
+                try:
+                    # 轻量心跳：发一个 IGNORE 包，若底层连接已死会立即抛异常
+                    t.send_ignore()
+                    alive = True
+                except Exception:
+                    alive = False
+            if alive:
+                return client
+            # 不可用则移出连接池，后续重建
+            try:
+                if t is not None:
+                    t.close()
+                client.close()
+            except Exception:
+                pass
+            _ssh_pool.pop(host_key, None)
 
     # 解析 host_key
     if ":" in host_key and not host_key.startswith("["):
@@ -183,6 +206,13 @@ def _get_ssh_client(host_key: str, password: str = None):
         password=password, timeout=60,
         allow_agent=False, look_for_keys=False,
     )
+    # 启用 TCP keepalive + SSH keepalive，降低中间 NAT/防火墙静默断连概率
+    try:
+        t = client.get_transport()
+        if t is not None:
+            t.set_keepalive(30)
+    except Exception:
+        pass
     with _ssh_lock:
         _ssh_pool[host_key] = client
     return client
@@ -190,6 +220,9 @@ def _get_ssh_client(host_key: str, password: str = None):
 
 def _ssh_exec(client, cmd: str, timeout: int = 30) -> Tuple[str, str, int]:
     """在已连接的 SSH 客户端上执行命令。"""
+    t = client.get_transport()
+    if t is None or not t.is_active():
+        raise RuntimeError("SSH transport dead")
     _, sout, serr = client.exec_command(cmd, timeout=timeout)
     out = sout.read().decode("utf-8", errors="replace")
     err = serr.read().decode("utf-8", errors="replace")
@@ -267,7 +300,7 @@ def _get_local_file_list(base_path: str) -> Dict[str, Tuple[int, int]]:
 def _get_remote_file_list(client, remote_path: str) -> Optional[Dict[str, Tuple[int, int]]]:
     """通过 SSH find 获取远程目录的文件列表。"""
     cmd = (
-        f'cd "{remote_path}" 2>/dev/null && '
+        f'cd {shlex.quote(remote_path)} 2>/dev/null && '
         f'find . -type f -printf "%p\\t%s\\t%T@\\n" 2>/dev/null || true'
     )
     out, err, rc = _ssh_exec(client, cmd, timeout=30)
@@ -358,7 +391,64 @@ class FileBackupEngine(BackupEngine):
 
         duration = round(time.time() - t0, 2)
         result.duration_sec = duration
+        # 落盘后统一后处理：存储池加密(§2.6) + 全局重删(§2.4)，均失败安全
+        self._post_process(result)
         return result
+
+    def _post_process(self, result: BackupResult) -> None:
+        """落盘后统一后处理：存储池加密 → 全局重删。任一环节失败不影响主流程。"""
+        self._apply_pool_encryption(result)
+        self._apply_global_dedup(result)
+
+    def _apply_pool_encryption(self, result: BackupResult) -> None:
+        """存储池加密（鼎甲迪备 §2.6 备份数据加密 / 防泄露）。
+
+        仅当任务开启 encrypt_pool 且配置了主密钥(BACKUP_POOL_KEY)时加密；
+        缺密钥或缺库则跳过（明文落盘并告警），绝不阻断备份。
+        """
+        try:
+            if not self.extra.get("encrypt_pool"):
+                return
+            from core import crypto_pool as cp
+            path = getattr(result, "backup_path", None)
+            if not path or not isinstance(path, str) or not os.path.isfile(path):
+                return
+            if cp.is_encrypted(path):
+                return  # 已加密，避免重复
+            if not os.path.abspath(path).startswith(os.path.abspath(self.storage_root)):
+                return
+            r = cp.encrypt_file(path)
+            if r.get("encrypted"):
+                self.logger.info("[%s] 存储池加密完成: %s",
+                                 self.task_name, db.human_size(r["encrypted_bytes"]))
+                if result.message:
+                    result.message += " | 已加密存储"
+            else:
+                self.logger.warning("[%s] 存储池加密跳过: %s",
+                                    self.task_name, r.get("reason"))
+        except Exception as e:  # 加密失败不影响备份主流程
+            self.logger.warning("[%s] 存储池加密跳过: %s", self.task_name, e)
+
+    def _apply_global_dedup(self, result: BackupResult) -> None:
+        """对本次备份产物做全局切片重删（非阻塞、失败安全）。"""
+        try:
+            from core import global_dedup as gd
+            path = getattr(result, "backup_path", None)
+            if not path or not isinstance(path, str) or not os.path.isfile(path):
+                return
+            # 仅对本地产物重删；远端产物不在本机落盘，跳过
+            if not os.path.abspath(path).startswith(os.path.abspath(self.storage_root)):
+                return
+            res = gd.dedup_file(path, task_id=self.task.get("id"), set_id=None)
+            saved = int(res.get("saved_bytes") or 0)
+            if saved > 0:
+                # 把重删节省追加到结果提示（BackupResult 无 extra 字段，安全附加）
+                self.logger.info("[%s] 全局重删节省 %s 字节",
+                                 self.task_name, db.human_size(saved))
+                if result.message:
+                    result.message += f" | 全局重删节省 {db.human_size(saved)}"
+        except Exception as e:  # 重删失败不影响备份主流程
+            self.logger.warning("[%s] 全局重删跳过: %s", self.task_name, e)
 
     def _full_transfer(self, src: dict, dst: dict) -> BackupResult:
         """全量打包传输（原子写入，避免 Windows 防病毒/句柄锁导致空文件）。"""
@@ -897,7 +987,7 @@ class FileBackupEngine(BackupEngine):
         client = _get_ssh_client(src["host"])
         remote_base = src["paths"][0] if src["paths"] else "/"
         data, err, rc = _ssh_exec_pipe(
-            client, f'tar -C "{remote_base}" -czf - -T -',
+            client, f'tar -C {shlex.quote(remote_base)} -czf - -T -',
             input_data="\n".join(changed).encode("utf-8"),
         )
         if rc != 0:
@@ -911,7 +1001,7 @@ class FileBackupEngine(BackupEngine):
         client = _get_ssh_client(dst["host"])
         remote_dir = dst["path"]
         name = os.path.basename(local_path)
-        _ssh_exec(client, f'mkdir -p "{remote_dir}"')
+        _ssh_exec(client, f'mkdir -p {shlex.quote(remote_dir)}')
         sftp = client.open_sftp()
         try:
             sftp.put(local_path, f"{remote_dir}/{name}")
@@ -937,7 +1027,8 @@ class FileBackupEngine(BackupEngine):
             # 传到远程解压
             client = _get_ssh_client(dst["host"])
             _, e, rc = _ssh_exec_pipe(
-                client, f'mkdir -p "{dst["path"]}" && tar -C "{dst["path"]}" -xzf -',
+                client,
+                f'mkdir -p {shlex.quote(dst["path"])} && tar -C {shlex.quote(dst["path"])} -xzf -',
                 input_data=data,
             )
             if rc != 0:
@@ -954,7 +1045,7 @@ class FileBackupEngine(BackupEngine):
         self.logger.info("[%s] [2/3] 远程打包中 (tar -C %s -czf - .)，请耐心等待...", self.task_name, remote_base)
         t0 = time.time()
         out, err, rc = _ssh_exec_pipe(
-            client, f'tar -C "{remote_base}" -czf - . 2>/dev/null',
+            client, f'tar -C {shlex.quote(remote_base)} -czf - . 2>/dev/null',
             timeout=1800,  # 大目录最多等 30 分钟
         )
         elapsed = round(time.time() - t0, 1)
@@ -984,7 +1075,8 @@ class FileBackupEngine(BackupEngine):
         # 传到目标
         client_dst = _get_ssh_client(dst["host"])
         _, e, rc2 = _ssh_exec_pipe(
-            client_dst, f'mkdir -p "{dst["path"]}" && tar -C "{dst["path"]}" -xzf -',
+            client_dst,
+            f'mkdir -p {shlex.quote(dst["path"])} && tar -C {shlex.quote(dst["path"])} -xzf -',
             input_data=data,
         )
         if rc2 != 0:
@@ -1211,14 +1303,28 @@ class FileBackupEngine(BackupEngine):
 
     # ---------- 先进压缩辅助 ----------
     def _compress_file(self, src_path: str, dst_path: str, algo: str) -> None:
-        """把未压缩 tar(src_path) 用 zstd/gzip 流式压缩为 dst_path（可逆）。"""
+        """把未压缩 tar(src_path) 用 zstd/gzip 流式压缩为 dst_path（可逆）。
+
+        开启限速（bandwidth_limit>0）且系统存在 pv 时，压缩前先用 pv 限速读取
+        源文件，近似控制整体备份吞吐（落盘带宽）。
+        """
         comp = self.pipe_compress(algo)
-        with open(src_path, "rb") as fin, open(dst_path, "wb") as fout:
-            proc = subprocess.Popen(comp, stdin=fin, stdout=fout,
-                                     stderr=subprocess.PIPE)
-            _, err = proc.communicate()
+        pv = self._pv_throttle()
+        if pv:
+            # pv -L <bytes> src_path | comp  （限速读取 → 压缩落盘）
+            cmd = pv + [src_path] + comp
+            with open(dst_path, "wb") as fout:
+                proc = subprocess.Popen(cmd, stdout=fout, stderr=subprocess.PIPE)
+                _, err = proc.communicate()
             if proc.returncode != 0:
                 raise RuntimeError(f"压缩失败({algo}): {err.decode('utf-8','replace')[:300]}")
+        else:
+            with open(src_path, "rb") as fin, open(dst_path, "wb") as fout:
+                proc = subprocess.Popen(comp, stdin=fin, stdout=fout,
+                                         stderr=subprocess.PIPE)
+                _, err = proc.communicate()
+                if proc.returncode != 0:
+                    raise RuntimeError(f"压缩失败({algo}): {err.decode('utf-8','replace')[:300]}")
 
     def _stash_original_size(self, archive_path: str, original: int) -> None:
         """把未压缩原始大小暂存到 <archive>.orig.size，供落库时读取压缩率。"""
@@ -1253,6 +1359,114 @@ class FileBackupEngine(BackupEngine):
         if mpath.startswith("/") or ".." in mpath:
             return None
         return member
+
+    # ---------- 合成全量（鼎甲迪备 §3.2 永久增量 / CDM 合成） ----------
+    def synthesize_full(self, sets: list = None, target_storage_tier: int = None,
+                        target_record_id: int = None) -> BackupResult:
+        """把「全量 + 一串增量」合并为一份新的完整归档（合成全量）。
+
+        文件备份的合成全量 = 按链顺序解压每个归档到临时目录，后写的同名文件
+        覆盖先前的（增量语义），最后把临时目录重新打成一份 tar(.zst/.gz)。
+        产物经 verify_record 校验后可直接作为新的全量基准即时恢复，中间增量
+        副本由生命周期策略按 chain_status='merged' 回收，实现「一次全备永久增备」。
+
+        返回 BackupResult：success 表示合成成功；simulated 恒为 False（真实合并）。
+        """
+        import shutil
+        import tarfile
+
+        sets = sets or self.list_sets()
+        if not sets:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="无可用备份集用于合成")
+        # 链头（full/synthetic_full）+ 其增量（parent_set_id 指向链头）
+        base = next((s for s in sets
+                     if s.get("set_type") in ("full", "synthetic_full")), None)
+        if not base:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="找不到合成基准(full)")
+        chain = [base] + [s for s in sets
+                          if s.get("parent_set_id") == base["id"]
+                          and s.get("set_type") == "incremental"]
+        chain = [c for c in chain if c.get("object_key")
+                 and os.path.isfile(c["object_key"])]
+        if len(chain) < 2:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="增量链不足，无需合成")
+
+        ts = self._timestamp()
+        out_dir = self._output_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        tmp = tempfile.mkdtemp(prefix=".syn_")
+        try:
+            # 1) 按链顺序解压到临时目录（增量覆盖全量）
+            for c in chain:
+                self._extract_archive(c["object_key"], tmp)
+            # 2) 重新打包成合成全量
+            final = os.path.join(out_dir, f"{ts}__{self.task_name}__syn_full.tar")
+            with tarfile.open(final, "w") as tf:
+                for root, _dirs, files in os.walk(tmp):
+                    for fn in files:
+                        fp = os.path.join(root, fn)
+                        arc = os.path.relpath(fp, tmp)
+                        tf.add(fp, arcname=arc)
+            # 3) 先进压缩（zstd 回退 gzip）
+            algo = self._resolve_compress_algo()
+            suffix = "" if algo == "none" else (".zst" if algo == "zstd" else ".gz")
+            final_path = final + suffix
+            self._compress_file(final, final_path, algo)
+            self._stash_original_size(final_path, self._dir_size(tmp))
+            size = os.path.getsize(final_path)
+            checksum = db.sha256_file(final_path)
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=final_path, size_bytes=size,
+                original_size_bytes=self._dir_size(tmp),
+                compress_algo=algo, checksum=checksum,
+                simulated=False,
+                message=f"合成全量完成（合并 {len(chain)-1} 个增量）| {db.human_size(size)}")
+        except Exception as e:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message=f"合成全量失败: {e}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def _extract_archive(self, archive_path: str, dest: str) -> None:
+        """解压 .tar / .tar.gz / .tar.zst 到 dest（复用恢复路径的解压逻辑）。"""
+        import tarfile
+        import subprocess
+        os.makedirs(dest, exist_ok=True)
+        if archive_path.endswith((".zst", ".gz")) and not archive_path.endswith(".tar.gz"):
+            algo = "zstd" if archive_path.endswith(".zst") else "gzip"
+            dec = self.pipe_decompress(algo)
+            fd, tmp_tar = tempfile.mkstemp(suffix=".tar")
+            os.close(fd)
+            proc = subprocess.Popen(dec, stdin=open(archive_path, "rb"),
+                                    stdout=open(tmp_tar, "wb"),
+                                    stderr=subprocess.PIPE)
+            _, err = proc.communicate()
+            if proc.returncode != 0:
+                raise RuntimeError(f"解压失败: {err.decode('utf-8','replace')[:200]}")
+            with tarfile.open(tmp_tar, "r:") as tf:
+                tf.extractall(dest, filter=self._restore_filter)
+            try:
+                os.unlink(tmp_tar)
+            except OSError:
+                pass
+        else:
+            with tarfile.open(archive_path, "r:*") as tf:
+                tf.extractall(dest, filter=self._restore_filter)
+
+    @staticmethod
+    def _dir_size(path: str) -> int:
+        total = 0
+        for root, _d, files in os.walk(path):
+            for fn in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, fn))
+                except OSError:
+                    pass
+        return total
 
     def list_databases(self) -> List[str]:
         """文件引擎无需列举库，返回空。"""

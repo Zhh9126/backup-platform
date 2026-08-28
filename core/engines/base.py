@@ -393,12 +393,18 @@ class BackupEngine:
                 ok2, msg2 = self._preflight_remote_physical(ssh_host)
                 if ok2:
                     return True, f"远端工具就绪（{msg2}）"
-                return False, msg2
-            # 无远端，查本机自带工具
+                # 远端缺失不再直接失败：回退检查本机（执行层远端失败同样会回退本机）
+                self.logger.warning(
+                    "[%s] 远端物理备份工具缺失（%s），转检查本机",
+                    self.task_name, msg2)
+            # 查本机自带工具
             if self.physical_bundled_tools:
                 missing = [t for t in self.physical_bundled_tools
                            if not shutil.which(t)]
                 if not missing:
+                    if ssh_host:
+                        return True, ("远端未安装物理备份工具，本机具备，"
+                                      "将回退本机执行")
                     return True, "本机已检测到物理备份工具"
             # 无远端也无本机自带工具
             _, detail = self.check_client()
@@ -712,10 +718,12 @@ class BackupEngine:
         return models.list_backup_sets(task_id=self.task_id)
 
     def _try_cross_host_restore(self, backup_path: str, target_host_info: dict,
-                                  target_db: str = "") -> BackupResult:
+                                  target_db: str = "", target_port: int = None) -> BackupResult:
         """跨主机恢复：通过 SFTP+SSH 在目标主机执行恢复。
         各引擎如启用跨主机功能，可在 restore() 入口检测 kwargs 中的
         target_host_info 并调用此方法。返回 BackupResult。
+
+        target_port: 目标主机上数据库实例端口；为空时回退到源任务端口。
         """
         from core import cross_host
         from core import ssh_hosts as _ssh
@@ -725,7 +733,7 @@ class BackupEngine:
         # 收集额外参数（密码、连接信息等）
         extra = {
             "source_host": self.task.get("host"),
-            "source_port": self.task.get("port"),
+            "source_port": target_port or self.task.get("port"),
             "source_username": self.task.get("username"),
             "source_password": db.decrypt_secret(self.task.get("password") or ""),
             "source_db": self.task.get("db_name"),

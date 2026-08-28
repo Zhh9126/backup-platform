@@ -234,7 +234,8 @@ class PostgreSQLEngine(BackupEngine):
         target_host_info = kwargs.get("target_host_info")
         if target_host_info:
             target_db = kwargs.get("target_db") or self.task.get("db_name") or ""
-            return self._try_cross_host_restore(backup_path, target_host_info, target_db)
+            return self._try_cross_host_restore(
+                backup_path, target_host_info, target_db, kwargs.get("target_port"))
 
         # 1) 先尝试本机直接恢复
         result = self._restore_local(backup_path, **kwargs)
@@ -266,6 +267,15 @@ class PostgreSQLEngine(BackupEngine):
             success=False, status=BackupStatus.FAILED,
             backup_path=backup_path, message=reason)
 
+    def _pg_db_exists(self, host, port, user, db_name, env_extra) -> bool:
+        """检查目标库是否已存在。"""
+        chk = self._run(
+            ["psql", "--host", str(host), "--port", str(port),
+             "--username", str(user), "-d", "postgres", "-tAc",
+             f"SELECT 1 FROM pg_database WHERE datname = '{db_name.replace(chr(39), chr(39)*2)}'"],
+            env_extra=env_extra, timeout=120)
+        return chk["returncode"] == 0 and chk["stdout"].strip() == "1"
+
     def _restore_local(self, backup_path: str, **kwargs) -> BackupResult:
         """本机 psql/pg_restore 真实恢复。"""
         if not backup_path or not os.path.exists(backup_path):
@@ -283,16 +293,59 @@ class PostgreSQLEngine(BackupEngine):
         # 目标库：优先使用调用方指定，否则回退到任务原始库名
         target_db = kwargs.get("target_db") or self.task.get("db_name")
 
-        # 3) 按文件后缀选择恢复方式
+        env_extra = {"PGPASSWORD": pw} if pw else None
+
+        # 3) 确保目标库存在（PostgreSQL 必须连接一个已存在的库再恢复）。
+        #    先 DROP 再 CREATE：保证恢复是干净、可重复的（与 -C 相比更可靠，
+        #    -C 在目标库同名已存在时会因 "cannot drop the currently open
+        #    database" 而无法重建，导致旧对象残留、恢复失败）。
+        safe_db = target_db.replace('"', '""')
+        if not self._pg_db_exists(host, port, user, target_db, env_extra):
+            chk = self._run(
+                ["psql", "--host", str(host), "--port", str(port),
+                 "--username", str(user), "-d", "postgres",
+                 "-c", f'CREATE DATABASE "{safe_db}"'],
+                env_extra=env_extra, timeout=180)
+            if chk["returncode"] != 0:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path, size_bytes=0,
+                    message=f"创建目标库 {target_db} 失败: {chk['stderr']}",
+                    stderr=chk["stderr"], simulated=False)
+        else:
+            # 目标库已存在：DROP 后重建，保证恢复结果与备份完全一致
+            chk = self._run(
+                ["psql", "--host", str(host), "--port", str(port),
+                 "--username", str(user), "-d", "postgres",
+                 "-c", f'DROP DATABASE IF EXISTS "{safe_db}" WITH (FORCE)'],
+                env_extra=env_extra, timeout=180)
+            if chk["returncode"] != 0:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path, size_bytes=0,
+                    message=f"清理目标库 {target_db} 失败: {chk['stderr']}",
+                    stderr=chk["stderr"], simulated=False)
+            chk = self._run(
+                ["psql", "--host", str(host), "--port", str(port),
+                 "--username", str(user), "-d", "postgres",
+                 "-c", f'CREATE DATABASE "{safe_db}"'],
+                env_extra=env_extra, timeout=180)
+            if chk["returncode"] != 0:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path, size_bytes=0,
+                    message=f"重建目标库 {target_db} 失败: {chk['stderr']}",
+                    stderr=chk["stderr"], simulated=False)
+
+        # 4) 按文件后缀选择恢复方式
         if backup_path.endswith(".dump"):
-            # 自定义格式用 pg_restore，-c 先清理对象、-C 创建库
+            # 自定义格式用 pg_restore（目标库已创建，无需 -C；库已全新无需 -c）
             cmd = [
                 "pg_restore",
                 "--host", str(host),
                 "--port", str(port),
                 "--username", str(user),
                 "--dbname", str(target_db),
-                "-c", "-C",
                 backup_path,
             ]
         elif backup_path.endswith(".sql"):
@@ -317,8 +370,6 @@ class PostgreSQLEngine(BackupEngine):
         extra = self._parse_extra_options()
         if extra:
             cmd.extend(extra)
-
-        env_extra = {"PGPASSWORD": pw} if pw else None
 
         start = time.time()
         ret = self._run(cmd, env_extra=env_extra, timeout=3600)

@@ -419,6 +419,7 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
 
 def run_restore_now(record_id: int, target_host: str = None,
                     target_host_id: int = None, target_db: str = None,
+                    target_port: int = None,
                     operator: str = None,
                     target_host_user: str = None,
                     target_host_password: str = None) -> Optional[dict]:
@@ -469,7 +470,8 @@ def run_restore_now(record_id: int, target_host: str = None,
         engine = get_engine(task["db_type"], task, config.BACKUP_ROOT, _logger)
         result = engine.restore(rec["backup_path"], target_host=target_host,
                                 target_host_info=target_host_info,
-                                target_db=target_db)
+                                target_db=target_db,
+                                target_port=target_port)
         detail_log_lines.append(f"[引擎结果] success={result.success}, status={getattr(result, 'status', '-')}")
         detail_log_lines.append(f"[引擎结果] message={getattr(result, 'message', '')}")
         if getattr(result, "stdout", None):

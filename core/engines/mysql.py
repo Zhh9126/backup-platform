@@ -176,7 +176,8 @@ class MySQLEngine(BackupEngine):
 
         cmd = [xtrabackup, "--backup", f"--target-dir={target_dir}",
                f"--user={user}", f"--password={pw}",
-               f"--host={host}", f"--port={port}", "--no-lock"]
+               f"--host={host}", f"--port={port}", "--no-lock",
+               "--no-server-version-check"]
         if comp:
             # 最高压缩：zstd 级别取任务 compress_level（上限 19，xtrabackup 支持范围）
             zl = int(self.task.get("compress_level") or 0)
@@ -284,7 +285,7 @@ class MySQLEngine(BackupEngine):
             # 3) 远端执行：xtrabackup --backup -> tar czf（密码不在命令行）
             inner = (
                 f"{tool} --backup --target-dir={remote_tmp} "
-                f"--defaults-extra-file={remote_cnf} "
+                f"--defaults-file={remote_cnf} "
                 f"--host={shlex.quote(host)} --port={port} --no-lock "
                 f"&& tar czf {remote_tar} -C {remote_tmp} ."
             )
@@ -377,7 +378,7 @@ class MySQLEngine(BackupEngine):
             # mysqldump 基础参数
             dump_args = [
                 "mysqldump",
-                f"--defaults-extra-file={cnf}",
+                f"--defaults-file={cnf}",
                 "--host", str(host), "--port", str(port),
                 "--single-transaction", "--routines", "--triggers", "--events",
             ]
@@ -474,7 +475,8 @@ class MySQLEngine(BackupEngine):
         if target_host_info:
             target_db = kwargs.get("target_db") or self.task.get("db_name") or ""
             logs.append(f"[跨主机恢复] 目标: {target_host_info.get('hostname')}, 目标库: {target_db}")
-            res = self._try_cross_host_restore(backup_path, target_host_info, target_db)
+            res = self._try_cross_host_restore(
+                backup_path, target_host_info, target_db, kwargs.get("target_port"))
             res.detail_log = "\n".join(logs) + "\n" + (res.detail_log or res.stderr or res.stdout or "")
             return res
 
@@ -555,7 +557,7 @@ class MySQLEngine(BackupEngine):
         try:
             args = [
                 "mysql",
-                f"--defaults-extra-file={cnf}",
+                f"--defaults-file={cnf}",
                 "--host", str(host),
                 "--port", str(port),
             ]
@@ -792,7 +794,7 @@ class MySQLEngine(BackupEngine):
             # mysql 客户端基础参数
             mysql_args = [
                 "mysql",
-                f"--defaults-extra-file={cnf}",
+                f"--defaults-file={cnf}",
                 "--host", str(host),
                 "--port", str(port),
             ]
@@ -1066,7 +1068,7 @@ class MySQLEngine(BackupEngine):
             fname = f"{ts}__{self.task_name}__binlog.sql"
             out_path = os.path.join(out_dir, fname)
 
-            args = [mb, f"--defaults-extra-file={cnf}",
+            args = [mb, f"--defaults-file={cnf}",
                     "--host", str(host), "--port", str(port),
                     "--read-from-remote-server", "--raw",
                     "--stop-never" if not (stop_pos or stop_datetime) else "",
@@ -1209,7 +1211,7 @@ target_dt = '{target_dt}'
             cnf = self._make_cnf(user, pw)
             mysql_args = [
                 "mysql",
-                f"--defaults-extra-file={cnf}",
+                f"--defaults-file={cnf}",
                 "--host", str(host),
                 "--port", str(port),
                 "-N", "-e", "SHOW DATABASES",

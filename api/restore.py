@@ -60,6 +60,7 @@ def create_restore():
         target_host_id=data.get("target_host_id"),
         target_host=data.get("target_host"),
         target_db=data.get("target_db"),
+        target_port=data.get("target_port"),
         operator=data.get("operator"),
         target_host_user=data.get("target_host_user"),
         target_host_password=data.get("target_host_password"),

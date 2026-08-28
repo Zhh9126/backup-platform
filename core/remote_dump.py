@@ -395,7 +395,7 @@ def _remote_mysql_dump(task: dict, ssh_host: dict, compress: int, extra_args: st
 
     # 3) 组装 mysqldump 参数
     args = [
-        mysqldump_bin, f"--defaults-extra-file={remote_cnf}",
+        mysqldump_bin, f"--defaults-file={remote_cnf}",
         "-h", "127.0.0.1", "-P", str(port),
     ]
     if use_st: args.append("--single-transaction")
@@ -448,7 +448,7 @@ def _remote_mysql_dump(task: dict, ssh_host: dict, compress: int, extra_args: st
             # mysql 客户端通常与 mysqldump 同目录
             _mysql_bin = os.path.dirname(mysqldump_bin) + "/mysql"
             _vshell = (
-                f"{shlex.quote(_mysql_bin)} --defaults-extra-file={shlex.quote(remote_cnf)} "
+                f"{shlex.quote(_mysql_bin)} --defaults-file={shlex.quote(remote_cnf)} "
                 f"-h 127.0.0.1 -P {shlex.quote(str(port))} -N -e \"SELECT VERSION();\""
             )
             from core.engines.file import _ssh_exec_pipe
@@ -542,9 +542,12 @@ def _remote_pg_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
     tables = [str(t).strip() for t in (extra.get("tables") or []) if str(t).strip()]
 
     # 基础 args
+    # 注意：不使用 "-f -"（显式指定 stdout）。某些环境（如 PG 14.24 / CentOS7）
+    # 下 pg_dump 的 "-f -" 参数异常导致输出 0 字节；不带 -f 时 pg_dump 默认输出到
+    # stdout，行为一致且兼容性更好。
     base = (
         f"set -o pipefail; export PGPASSWORD={shlex.quote(pw)}; "
-        f"{pgdump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt} -f -"
+        f"{pgdump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt}"
     )
 
     if tables:
@@ -615,7 +618,7 @@ def _remote_kingbase_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
 
     base = (
         f"set -o pipefail; export PGPASSWORD={shlex.quote(pw)}; "
-        f"{dump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt} -f -"
+        f"{dump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt}"
     )
 
     if tables:
@@ -934,7 +937,7 @@ def _remote_list_mysql_databases(task: dict, ssh_host: dict) -> list:
     mysql_bin = _resolve_remote_bin(client, "mysql") or "mysql"
     port = task.get("port") or 3306
     shell = (
-        f"set -o pipefail; {mysql_bin} --defaults-extra-file={remote_cnf} "
+        f"set -o pipefail; {mysql_bin} --defaults-file={remote_cnf} "
         f"-h 127.0.0.1 -P {port} -N -B -e 'SHOW DATABASES'"
     )
     wrapped = _wrap_login(shell)
@@ -1035,7 +1038,7 @@ def _remote_mysql_restore(task: dict, ssh_host: dict, dump_bytes: bytes) -> None
     reset_sql = "RESET MASTER;"
     reset_cmd = (
         f"set -o pipefail; echo {shlex.quote(reset_sql)} | {mysql_bin} "
-        f"--defaults-extra-file={remote_cnf} -h 127.0.0.1 -P {port}"
+        f"--defaults-file={remote_cnf} -h 127.0.0.1 -P {port}"
     )
     reset_wrapped = _wrap_login(reset_cmd)
     try:
@@ -1047,7 +1050,7 @@ def _remote_mysql_restore(task: dict, ssh_host: dict, dump_bytes: bytes) -> None
             reset_sql2 = "RESET BINARY LOGS AND GTID_EXECUTION;"
             reset_cmd2 = (
                 f"set -o pipefail; echo {shlex.quote(reset_sql2)} | {mysql_bin} "
-                f"--defaults-extra-file={remote_cnf} -h 127.0.0.1 -P {port}"
+                f"--defaults-file={remote_cnf} -h 127.0.0.1 -P {port}"
             )
             _out2, err2, rc2 = _ssh_exec_pipe(
                 client, _wrap_login(reset_cmd2), input_data=b"", timeout=300)
@@ -1058,7 +1061,7 @@ def _remote_mysql_restore(task: dict, ssh_host: dict, dump_bytes: bytes) -> None
         pass
 
     shell = (
-        f"set -o pipefail; {mysql_bin} --defaults-extra-file={remote_cnf} "
+        f"set -o pipefail; {mysql_bin} --defaults-file={remote_cnf} "
         f"-h 127.0.0.1 -P {port}"
     )
     wrapped = _wrap_login(shell)
@@ -1084,12 +1087,32 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
     port = task.get("port") or 5432
     # 探测工具路径
     client = _connect(ssh_host)
+    from core.engines.file import _ssh_exec_pipe
+
+    # 0) 远程先 DROP+CREATE 目标库，保证干净恢复。
+    #    pg_restore 的 "-C" 在目标库同名已存在时会因 "cannot drop the
+    #    currently open database" 失败，导致旧对象残留，这里改为两步建库。
+    if db_name:
+        psql_tool = _resolve_remote_bin(client, "psql") or "psql"
+        safe_db = db_name.replace('"', '""')
+        prep = (
+            f"set -o pipefail; export PGPASSWORD={shlex.quote(pw)}; "
+            f"{psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d postgres "
+            f"-c 'DROP DATABASE IF EXISTS \"{safe_db}\" WITH (FORCE);' "
+            f"&& {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d postgres "
+            f"-c 'CREATE DATABASE \"{safe_db}\";'"
+        )
+        _out, perr, prc = _ssh_exec_pipe(
+            client, _wrap_login(prep), input_data=b"", timeout=300)
+        if prc != 0:
+            raise RuntimeError(f"远程重建目标库 {db_name} 失败(rc={prc}): {perr[:600]}")
+
     if is_custom:
         tool = _resolve_remote_bin(client, "pg_restore") or "pg_restore"
         shell = (
             f"set -o pipefail; export PGPASSWORD={shlex.quote(pw)}; "
             f"{tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} "
-            f"-d {shlex.quote(db_name)} -c -C"
+            f"-d {shlex.quote(db_name)}"
         )
     else:
         tool = _resolve_remote_bin(client, "psql") or "psql"
@@ -1099,7 +1122,6 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
             f"-d {shlex.quote(db_name)}"
         )
     wrapped = _wrap_login(shell)
-    from core.engines.file import _ssh_exec_pipe
     _out, err, rc = _ssh_exec_pipe(
         client, wrapped, input_data=dump_bytes, timeout=3600)
     if rc != 0:

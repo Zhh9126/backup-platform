@@ -126,6 +126,25 @@ def cross_host_restore(db_type: str, backup_path: str, target_host_info: dict,
         # 构造恢复命令
         # PostgreSQL/Kingbase 的工具可能不在 PATH（旧版 /usr/bin/psql 无法
         # 完成 SCRAM 认证），需从运行中进程解析正确版本，注入命令构造。
+        if db_type == "mysql":
+            # MySQL 8.4+ 移除了 RESET MASTER，需根据目标实例版本选择重置语句
+            from core.remote_dump import _resolve_remote_bin
+            extra = dict(extra)
+            mysql_bin = _resolve_remote_bin(client, "mysql") or "mysql"
+            mhost, mport = "127.0.0.1", extra.get("source_port") or 3306
+            muser = extra.get("source_username") or "root"
+            mpw = extra.get("source_password") or ""
+            ver_cmd = (f"{mysql_bin} -h {mhost} -P {mport} -u {muser} "
+                       f"-p'{mpw}' -N -e 'SELECT VERSION();' 2>/dev/null")
+            _o, _e, _rc = _remote_exec_logged(client, ver_cmd, timeout=60, log=lambda x: None)
+            _ver = (_o or b"").decode("utf-8", "replace").strip()
+            _parts = _ver.split(".")
+            _maj = int(_parts[0]) if _parts and _parts[0].isdigit() else 0
+            _min = int(_parts[1]) if len(_parts) > 1 and _parts[1].isdigit() else 0
+            if _maj > 8 or (_maj == 8 and _min >= 4):
+                extra["_mysql_reset_sql"] = "RESET BINARY LOGS AND GTIDS"
+            else:
+                extra["_mysql_reset_sql"] = "RESET MASTER"
         if db_type == "postgresql":
             from core.remote_dump import _resolve_remote_bin
             extra = dict(extra)
@@ -160,8 +179,10 @@ def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
                        extra: dict, target_host_info: dict) -> str:
     """构造各 DB 跨主机恢复命令（目标主机上执行）。"""
     base = extra.get("base_dir") or ""
+    # 跨主机恢复统一在目标主机本机执行（127.0.0.1），而不是连接源库地址。
+    # 端口默认取源任务端口（假设目标机运行同端口实例），可由 target_port 覆盖。
     if db_type == "mysql":
-        host = extra.get("source_host") or "127.0.0.1"
+        host = "127.0.0.1"
         port = extra.get("source_port") or 3306
         user = extra.get("source_username") or "root"
         pw = extra.get("source_password") or ""
@@ -175,14 +196,14 @@ def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
             pre = ""
         target = f"'{target_db}'" if target_db else ""
         # 恢复前清空 GTID，避免含 GTID_PURGED 的备份导入时报 1840
-        reset_sql = "RESET MASTER"
+        reset_sql = extra.get("_mysql_reset_sql") or "RESET MASTER"
         return (
             f"{pre}mysql -h {host} -P {port} -u {user} -p'{pw_esc}' -e '{reset_sql}' && "
             f"mysql -h {host} -P {port} -u {user} -p'{pw_esc}' {target} < '{actual}'"
         )
 
     elif db_type == "postgresql":
-        host = extra.get("source_host") or "127.0.0.1"
+        host = "127.0.0.1"
         port = extra.get("source_port") or 5432
         user = extra.get("source_username") or "postgres"
         pw = extra.get("source_password") or ""
@@ -211,7 +232,7 @@ def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
                 f"unzip -o {remote_pkg} -d /tmp/oracle_restore_{int(time.time())} && echo OK")
 
     elif db_type == "kingbase":
-        host = extra.get("source_host") or "127.0.0.1"
+        host = "127.0.0.1"
         port = extra.get("source_port") or 54321
         user = extra.get("source_username") or "SYSTEM"
         pw = extra.get("source_password") or ""
@@ -231,7 +252,7 @@ def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
         return f"redis-cli -h 127.0.0.1 -a '$(echo)' CONFIG SET dir /tmp && redis-cli SHUTDOWN NOSAVE 2>/dev/null; cp {remote_pkg} /tmp/dump.rdb && redis-server --dbfilename dump.rdb --dir /tmp --daemonize yes"
 
     elif db_type == "mongodb":
-        host = extra.get("source_host") or "127.0.0.1"
+        host = "127.0.0.1"
         port = extra.get("source_port") or 27017
         target = f"--db '{target_db}'" if target_db else ""
         return f"mongorestore --host {host} --port {port} {target} --gzip --archive={remote_pkg}"

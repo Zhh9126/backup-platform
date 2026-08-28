@@ -663,12 +663,14 @@ class FileBackupEngine(BackupEngine):
         archive_name = f"{ts}__{self.task_name}__inc.tar.gz"
         archive_path = os.path.join(out_dir, archive_name)
 
-        # 5) 生成仅含变化文件的增量归档（原子写入）
+        # 5) 生成仅含变化文件的增量归档（原子写入）。
+        #    删除清单以 .deleted.txt 写入归档根部，恢复/合成时据此应用删除。
         try:
             if src_type == "local":
-                self._tar_files(base, changed, archive_path)
+                self._tar_files_with_deleted(base, changed, deleted, archive_path)
             else:
                 self._tar_remote_files(changed, src, archive_path)
+                self._append_deleted_manifest(archive_path, deleted)
 
             # 远程目标时，把生成的归档也推送过去
             if dst_type == "remote":
@@ -844,9 +846,10 @@ class FileBackupEngine(BackupEngine):
         try:
             if changed:
                 if src.get("type") == "local":
-                    self._tar_files(base, changed, archive_path)
+                    self._tar_files_with_deleted(base, changed, deleted, archive_path)
                 else:
                     self._tar_remote_files(changed, src, archive_path)
+                    self._append_deleted_manifest(archive_path, deleted)
             else:
                 self._tar_manifest_only(archive_path, deleted)
         except Exception as e:
@@ -996,6 +999,117 @@ class FileBackupEngine(BackupEngine):
             raise RuntimeError("本地写入增量归档失败")
         return True
 
+    # ---------- 删除清单：写入增量归档 / 恢复时应用 ----------
+
+    _MANIFEST_NAMES = (".deleted.txt", ".rt_deleted.txt")
+
+    @staticmethod
+    def _add_text_entry(tf, name: str, lines: List[str]) -> None:
+        """向打开的 tar 中写入一个文本条目（每行一条）。"""
+        payload = "\n".join((ln or "").replace("\\", "/") for ln in lines)
+        payload = (payload + "\n").encode("utf-8")
+        info = tarfile.TarInfo(name=name)
+        info.size = len(payload)
+        info.mtime = int(time.time())
+        tf.addfile(info, io.BytesIO(payload))
+
+    def _tar_files_with_deleted(self, base_path: str, rel_files: List[str],
+                                deleted: List[str], archive_path: str) -> bool:
+        """打包变化文件，并把删除清单(.deleted.txt)一并写入归档（本地源路径）。"""
+        base_path = base_path.replace("\\", "/")
+        algo = self._resolve_compress_algo()
+        suffix = "" if algo == "none" else (".zst" if algo == "zstd" else ".gz")
+        final_path = archive_path + suffix
+        parent = os.path.dirname(archive_path) or "."
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp_tar = tempfile.mkstemp(prefix=".tmp_", suffix=".tar", dir=parent)
+        os.close(fd)
+        try:
+            with tarfile.open(tmp_tar, "w") as tf:
+                for rel in rel_files:
+                    rel_norm = rel.replace("\\", "/")
+                    full = os.path.join(base_path, rel_norm)
+                    if os.path.exists(full) and os.path.isfile(full):
+                        tf.add(full, arcname=rel_norm)
+                if deleted:
+                    self._add_text_entry(tf, ".deleted.txt", deleted)
+            original = os.path.getsize(tmp_tar)
+            if os.path.exists(final_path):
+                os.unlink(final_path)
+            self._compress_file(tmp_tar, final_path, algo)
+            self._stash_original_size(final_path, original)
+        finally:
+            if os.path.exists(tmp_tar):
+                os.unlink(tmp_tar)
+        return True
+
+    def _append_deleted_manifest(self, archive_path: str, deleted: List[str]) -> None:
+        """把删除清单写入 gzip 增量归档（远程源产物固定为 tar.gz）。
+
+        tarfile 不支持 gzip 的追加模式，故采用「重写」：解出原成员后连同
+        .deleted.txt 一起重打包，先写临时文件再原子替换。
+        """
+        if not deleted or not os.path.exists(archive_path):
+            return
+        parent = os.path.dirname(archive_path) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".tmp_", suffix=".tar.gz", dir=parent)
+        os.close(fd)
+        try:
+            with tarfile.open(archive_path, "r:*") as src, \
+                    tarfile.open(tmp, "w:gz") as dst:
+                for m in src.getmembers():
+                    if m.name in self._MANIFEST_NAMES:
+                        continue
+                    f = src.extractfile(m)
+                    if f is not None:
+                        dst.addfile(m, f)
+                    else:
+                        dst.addfile(m)
+                self._add_text_entry(dst, ".deleted.txt", deleted)
+            os.replace(tmp, archive_path)
+        except Exception as e:
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
+            self.logger.debug("[%s] 追加删除清单失败: %s", self.task_name, e)
+
+    def _read_deleted_manifest(self, archive_path: str) -> List[str]:
+        """从增量归档读取删除清单（.deleted.txt / .rt_deleted.txt）。"""
+        try:
+            with tarfile.open(archive_path, "r:*") as tf:
+                for name in self._MANIFEST_NAMES:
+                    try:
+                        m = tf.getmember(name)
+                    except KeyError:
+                        continue
+                    f = tf.extractfile(m)
+                    if not f:
+                        continue
+                    text = f.read().decode("utf-8", "replace")
+                    return [ln.strip() for ln in text.splitlines() if ln.strip()]
+        except Exception as e:
+            self.logger.debug("[%s] 读取删除清单失败: %s", self.task_name, e)
+        return []
+
+    def _apply_deleted(self, target: str, deleted: List[str]) -> None:
+        """把删除清单应用到目标目录（文件/空目录/符号链接）。"""
+        for rel in deleted or []:
+            p = os.path.join(target, rel.replace("\\", "/"))
+            try:
+                if os.path.islink(p):
+                    os.unlink(p)
+                elif os.path.isfile(p):
+                    os.unlink(p)
+                elif os.path.isdir(p):
+                    shutil.rmtree(p)
+                else:
+                    continue
+                self.logger.info("[%s] 应用增量删除: %s", self.task_name, rel)
+            except OSError as e:
+                self.logger.warning("[%s] 删除失败 %s: %s", self.task_name, rel, e)
+
     def _upload_file_to_remote(self, local_path: str, dst: dict):
         """把本地归档上传到远程目标目录。"""
         client = _get_ssh_client(dst["host"])
@@ -1090,11 +1204,12 @@ class FileBackupEngine(BackupEngine):
         if config.DEMO_MODE == "on":
             return self._simulate_restore(backup_path, "DEMO_MODE=on 强制仿真")
 
-        # 0) 跨主机恢复：SFTP 推送到目标主机 → tar 解压
+        # 0) 跨主机恢复：按恢复链(全量+增量) SFTP 推送 → 远程依次解压 → 应用删除清单
         target_host_info = kwargs.get("target_host_info")
         if target_host_info:
             target_dir = kwargs.get("target_db") or kwargs.get("target_host") or "/tmp/restore"
-            return self._try_cross_host_restore(backup_path, target_host_info, target_dir)
+            return self._try_file_cross_host_restore(
+                backup_path, target_host_info, target_dir, kwargs)
 
         target = kwargs.get("target_db") or kwargs.get("target_host") or ""
         if not target:
@@ -1122,27 +1237,11 @@ class FileBackupEngine(BackupEngine):
             os.makedirs(target, exist_ok=True)
             for item in chain:
                 self.logger.info("[%s] 解压归档: %s", self.task_name, item)
-                # 先按压缩算法解压（zstd/gzip 均可恢复），再用 tarfile 释放内容；
-                # 若为非压缩 tar / tarfile 原生可识别格式，直接打开。
-                if item.endswith((".zst", ".gz")) and not item.endswith(".tar.gz"):
-                    dec = self.pipe_decompress("zstd" if item.endswith(".zst") else "gzip")
-                    with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tfh:
-                        tmp_tar = tfh.name
-                    proc = subprocess.Popen(dec, stdin=open(item, "rb"),
-                                            stdout=open(tmp_tar, "wb"),
-                                            stderr=subprocess.PIPE)
-                    _, err = proc.communicate()
-                    if proc.returncode != 0:
-                        raise RuntimeError(f"解压失败: {err.decode('utf-8','replace')[:200]}")
-                    with tarfile.open(tmp_tar, "r:") as tf:
-                        tf.extractall(target, filter=self._restore_filter)
-                    try:
-                        os.unlink(tmp_tar)
-                    except OSError:
-                        pass
-                else:
-                    with tarfile.open(item, "r:*") as tf:
-                        tf.extractall(target, filter=self._restore_filter)
+                self._extract_archive(item, target)
+                # 应用增量删除清单（.deleted.txt），保证恢复结果与源最终状态一致
+                deleted = self._read_deleted_manifest(item)
+                if deleted:
+                    self._apply_deleted(target, deleted)
             types = ",".join(
                 "增量" if "_inc" in os.path.basename(p) else "全量" for p in chain
             )
@@ -1156,8 +1255,124 @@ class FileBackupEngine(BackupEngine):
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,
                 backup_path=backup_path,
-                message=f"恢复失败: {e}",
+                message=f"文件恢复失败: {e}",
             )
+
+    def _try_file_cross_host_restore(self, backup_path: str, target_host_info: dict,
+                                     target_dir: str, kwargs: dict = None) -> BackupResult:
+        """文件跨主机链式恢复：SFTP 推送恢复链(全量+增量) → 远程依次解压 → 应用删除清单。"""
+        from core import cross_host
+        from core import db as _db
+        kwargs = kwargs or {}
+        try:
+            chain = self._build_restore_chain(
+                backup_path, chain_override=kwargs.get("chain_override"))
+        except Exception as e:
+            self.logger.warning("[%s] 构建恢复链失败，仅恢复当前归档: %s", self.task_name, e)
+            chain = []
+        if not chain:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path, message="恢复失败：未找到可恢复的备份链",
+            )
+        target = dict(target_host_info)
+        target["password"] = _db.decrypt_secret(target.get("password") or "")
+
+        def log(msg):
+            self.logger.info("[%s] %s", self.task_name, msg)
+
+        client = None
+        remote_tmp_files = []
+        try:
+            client = cross_host._build_ssh(target)
+            for idx, item in enumerate(chain, 1):
+                base = os.path.basename(item)
+                remote_tmp = (f"/tmp/bk_restore_{time.strftime('%Y%m%d%H%M%S')}_{idx}_{base}")
+                log(f"SFTP 上传 {idx}/{len(chain)}: {item} -> {remote_tmp}")
+                cross_host._sftp_upload(client, item, remote_tmp, log)
+                remote_tmp_files.append(remote_tmp)
+                cmd = (f"mkdir -p '{target_dir}' && tar -xzf '{remote_tmp}' -C '{target_dir}' "
+                       f"--exclude='.deleted.txt' --exclude='.rt_deleted.txt' "
+                       f"&& echo 'OK {idx} {base}'")
+                _o, _e, rc = cross_host._remote_exec_logged(client, cmd, timeout=3600, log=log)
+                if rc != 0:
+                    raise RuntimeError(
+                        f"远程解压失败(rc={rc}): {(_e or b'').decode('utf-8', 'replace')[:200]}")
+                # 应用增量删除清单（若归档含 .deleted.txt）
+                del_cmd = self._remote_deleted_cmd(remote_tmp, target_dir)
+                if del_cmd:
+                    _o2, _e2, rc2 = cross_host._remote_exec_logged(
+                        client, del_cmd, timeout=600, log=log)
+                    if rc2 != 0:
+                        log(f"远程应用删除清单警告(rc={rc2}): "
+                            f"{(_e2 or b'').decode('utf-8', 'replace')[:200]}")
+            types = ",".join(
+                "增量" if "_inc" in os.path.basename(p) else "全量" for p in chain)
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=backup_path,
+                message=f"已恢复至 {target.get('hostname')}:{target_dir} | 链: {types}",
+            )
+        except Exception as e:
+            self.logger.error("[%s] 文件跨主机恢复失败: %s", self.task_name, e)
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path, message=f"跨主机恢复失败: {e}",
+            )
+        finally:
+            if client:
+                try:
+                    if remote_tmp_files:
+                        rm_cmd = " ".join(f"'{p}'" for p in remote_tmp_files)
+                        cross_host._remote_exec_logged(
+                            client, f"rm -f {rm_cmd} 2>/dev/null; true",
+                            timeout=120, log=lambda x: None)
+                except Exception:
+                    pass
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _remote_deleted_cmd(remote_arc: str, target_dir: str) -> str:
+        """构造远程命令：从增量归档读取删除清单并在目标目录删除（base64 内嵌 Python 脚本）。"""
+        import base64
+        script = (
+            "import os, tarfile\n"
+            f"arc = {remote_arc!r}\n"
+            f"d = {target_dir!r}\n"
+            "try:\n"
+            "    tf = tarfile.open(arc, 'r:*')\n"
+            "except Exception:\n"
+            "    raise SystemExit(0)\n"
+            "deleted = 0\n"
+            "for name in ('.deleted.txt', '.rt_deleted.txt'):\n"
+            "    try:\n"
+            "        m = tf.getmember(name)\n"
+            "    except KeyError:\n"
+            "        continue\n"
+            "    data = tf.extractfile(m).read().decode('utf-8', 'replace')\n"
+            "    for line in data.splitlines():\n"
+            "        line = line.strip()\n"
+            "        if not line:\n"
+            "            continue\n"
+            "        p = os.path.join(d, line.replace('\\\\', os.sep))\n"
+            "        try:\n"
+            "            if os.path.islink(p) or os.path.isfile(p):\n"
+            "                os.unlink(p)\n"
+            "            elif os.path.isdir(p):\n"
+            "                os.rmdir(p)\n"
+            "            else:\n"
+            "                continue\n"
+            "            deleted += 1\n"
+            "            print('del', line)\n"
+            "        except OSError:\n"
+            "            pass\n"
+            "print('DELETED_COUNT', deleted)\n"
+        )
+        b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        return f"echo {b64} | base64 -d | python3 -"
 
     def _build_restore_chain(self, backup_path: str,
                              chain_override: List[str] = None) -> List[str]:
@@ -1354,9 +1569,11 @@ class FileBackupEngine(BackupEngine):
 
     @staticmethod
     def _restore_filter(member, path=""):
-        """可选：恢复时过滤危险路径（防止路径穿越）。Python 3.12+ tarfile 会传 2 个参数。"""
+        """恢复时过滤危险路径（防止路径穿越）与增量删除清单文件。Python 3.12+ tarfile 会传 2 个参数。"""
         mpath = member.name
         if mpath.startswith("/") or ".." in mpath:
+            return None
+        if os.path.basename(mpath) in (".deleted.txt", ".rt_deleted.txt"):
             return None
         return member
 
@@ -1399,9 +1616,10 @@ class FileBackupEngine(BackupEngine):
         os.makedirs(out_dir, exist_ok=True)
         tmp = tempfile.mkdtemp(prefix=".syn_")
         try:
-            # 1) 按链顺序解压到临时目录（增量覆盖全量）
+            # 1) 按链顺序解压到临时目录（增量覆盖全量，并应用增量删除清单）
             for c in chain:
                 self._extract_archive(c["object_key"], tmp)
+                self._apply_deleted(tmp, self._read_deleted_manifest(c["object_key"]))
             # 2) 重新打包成合成全量
             final = os.path.join(out_dir, f"{ts}__{self.task_name}__syn_full.tar")
             with tarfile.open(final, "w") as tf:

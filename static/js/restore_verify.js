@@ -67,7 +67,7 @@
         return;
       }
       tb.innerHTML = res.data.map((p) => {
-        const inst = p.instance_name || p.task_name || "任务#" + p.task_id;
+        const inst = p.instance_name || p.task_name || "任务 " + p.task_id;
         return '<tr>' +
           '<td><div class="fw-bold">' + esc(inst) + '</div>' +
           '<div class="small text-muted">' + esc(p.db_type || "-") + '</div></td>' +
@@ -93,7 +93,7 @@
         return;
       }
       tb.innerHTML = res.data.map((r) => {
-        const inst = r.instance_name || r.task_name || "任务#" + r.task_id;
+        const inst = r.instance_name || r.task_name || "任务 " + r.task_id;
         return '<tr>' +
           '<td><div class="fw-bold">' + esc(inst) + '</div>' +
           '<div class="small text-muted">' + esc(r.policy_name || "-") + '</div></td>' +

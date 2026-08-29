@@ -18,6 +18,7 @@ JDBC 连接方式模块
 from __future__ import annotations
 
 import os
+import re
 import time
 import threading
 from pathlib import Path
@@ -192,40 +193,89 @@ def _candidate_jvm_dirs():
     return dirs
 
 
+_last_jvm_major = 0
+
+
+def _jvm_major_version(jdk_dir: Path) -> int:
+    """解析 JDK 根目录的 Java 主版本（release 文件优先，目录名兜底）。"""
+    try:
+        rel = jdk_dir / "release"
+        if rel.is_file():
+            for line in rel.read_text(errors="ignore").splitlines():
+                if line.startswith("JAVA_VERSION"):
+                    val = line.split("=", 1)[1].strip().strip('"')
+                    major = val.split(".")[0]
+                    if major.isdigit():
+                        return int(major)
+    except Exception:
+        pass
+    name = jdk_dir.name
+    m = re.search(r"java-(\d+)", name)
+    if m:
+        n = int(m.group(1))
+        return 8 if n == 1 else n
+    m = re.search(r"1\.(\d+)\.0", name)
+    if m:
+        return 8 if m.group(1) == "8" else int(m.group(1))
+    return 0
+
+
 def _find_jvm():
-    """定位 JVM 动态库路径（Windows jvm.dll / Linux libjvm.so）。"""
+    """定位 JVM 动态库路径（Windows jvm.dll / Linux libjvm.so）。
+
+    JPype 1.6 要求 Java 11+（JDK 8 会报误导性的
+    "Can't find org.jpype.jar support library"），因此候选按
+    Java 主版本降序选择；仅存在 JDK 8 时回退使用。
+    """
+    global _last_jvm_major
+    candidates = []  # (major, jvm_path)
     for jdk in _candidate_jvm_dirs():
         if os.name == "nt":
-            for rel in ("bin/server/jvm.dll", "bin/client/jvm.dll", "jre/bin/server/jvm.dll"):
-                cand = jdk / rel
-                if cand.exists():
-                    return str(cand)
+            rels = ("bin/server/jvm.dll", "bin/client/jvm.dll", "jre/bin/server/jvm.dll")
         else:
-            for rel in ("lib/server/libjvm.so", "jre/lib/server/libjvm.so",
-                        "jre/lib/amd64/server/libjvm.so"):
-                cand = jdk / rel
-                if cand.exists():
-                    return str(cand)
-    return None
+            rels = ("lib/server/libjvm.so", "jre/lib/server/libjvm.so",
+                    "jre/lib/amd64/server/libjvm.so")
+        for rel in rels:
+            cand = jdk / rel
+            if cand.exists():
+                candidates.append((_jvm_major_version(jdk), str(cand)))
+                break
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: -x[0])
+    _last_jvm_major = candidates[0][0]
+    return candidates[0][1]
 
 
 def jvm_info():
     """返回 JVM 探测结果，用于诊断展示。"""
     jvm = _find_jvm()
-    return {
+    info = {
         "found": jvm is not None,
         "path": jvm,
+        "java_major": _last_jvm_major,
         "candidates": [str(p) for p in _candidate_jvm_dirs()],
         "started": _jvm_started,
     }
+    if jvm and _last_jvm_major and _last_jvm_major < 11:
+        info["warning"] = ("当前 JVM 为 Java %d；JPype 1.6 需要 Java 11+，"
+                           "JDK 8 下启动会失败（建议安装 JDK 11+）" % _last_jvm_major)
+    return info
 
 
 def _ensure_jvm():
     """确保 JVM 已启动（全局单例，classpath 包含 drivers/ 下全部 jar）。"""
     global _jvm_started
     with _jvm_lock:
-        if _jvm_started:
-            return
+        import jpype
+        # 守卫：JVM 可能已被其他路径（如 jaydebeapi 自动启动）拉起，
+        # 重复 startJVM 会抛 "JVM is already started"
+        try:
+            if _jvm_started or jpype.isJVMStarted():
+                _jvm_started = True
+                return
+        except Exception:
+            pass
         jvm = _find_jvm()
         if not jvm:
             raise RuntimeError(

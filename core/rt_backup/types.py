@@ -177,7 +177,7 @@ class RtConfig:
             engine=db_type or FILE_DB_TYPE,
             enabled=bool(task.get("rt_enabled")),
             mode=(task.get("rt_mode") or default_mode or "auto"),
-            interval_sec=max(10, _int_or(task.get("rt_interval_sec"), default_interval)),
+            interval_sec=max(5, _int_or(task.get("rt_interval_sec"), default_interval)),
             debounce_sec=max(1, _int_or(config.RT_FILE_DEBOUNCE_SEC, 5)),
             consistency=(task.get("rt_consistency") or "crash"),
             rpo_target_sec=rpo,

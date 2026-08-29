@@ -14,17 +14,82 @@ mysqldump 与 mysql 完成逻辑备份与恢复。
 - 仅使用 Python 标准库 + 外部客户端，不引入任何第三方依赖。
 """
 import os
+import re
 import time
 import json
 import tempfile
 import shlex
 import subprocess
 import shutil
+import concurrent.futures as _futures
 from pathlib import Path
+from typing import List, Optional
 
 import config
 import core.db as db
 from core.engines.base import BackupEngine, BackupType, BackupMode, BackupStatus, BackupResult
+
+
+def _split_sql_by_table(sql_path: str, work_dir: str) -> List[str]:
+    """把 mysqldump 明文 SQL 按表边界拆分成独立段文件。
+
+    依赖 mysqldump 单线程导出顺序：每个表的 ``DROP TABLE IF EXISTS`` /
+    ``CREATE TABLE`` 与其全部 ``INSERT`` 在文件中连续出现，因此按边界
+    拆分后各段可安全并发导入（同表数据不会跨段）。
+
+    边界识别：``DROP TABLE IF EXISTS``（mysqldump 默认每表前缀）或
+    ``CREATE TABLE``（--skip-add-drop-table 时兜底）；DROP 与其对应
+    的 CREATE 必须落在同一段，否则并发时序会出现 "Table already exists"。
+
+    - 每段都会注入会话前缀（SET / USE / CREATE DATABASE 等语句），保证
+      各段可独立并发导入（mysqldump 表名非全限定时依赖 USE 选库）；
+    - 返回段文件路径列表（保持原顺序，便于排查）。
+
+    Args:
+        sql_path: 明文（未压缩）mysqldump 输出文件。
+        work_dir: 段文件输出目录（调用方负责生命周期清理）。
+    """
+    segments: List[str] = []
+    prefix: List[str] = []
+    buf: List[str] = []
+    started = False
+    expect_create = False   # 当前段以 DROP 开头，等待其对应的 CREATE
+    with open(sql_path, "r", errors="replace") as fh:
+        for line in fh:
+            is_drop = re.match(r"^\s*DROP\s+TABLE\b", line, re.IGNORECASE)
+            is_create = re.match(
+                r"^\s*CREATE\s+(?:TABLE\b|TEMPORARY\s+TABLE\b)", line, re.IGNORECASE)
+            if is_drop:
+                if started and not expect_create:
+                    segments.append("".join(buf))
+                    buf = []
+                    buf = list(prefix)  # 新段同样携带会话前缀
+                elif not started:
+                    started = True
+                    buf = list(prefix)
+                expect_create = True
+            elif is_create:
+                if started and not expect_create:
+                    # 无 DROP 的 dump（--skip-add-drop-table）：CREATE 即边界
+                    segments.append("".join(buf))
+                    buf = list(prefix)
+                elif not started:
+                    started = True
+                    buf = list(prefix)
+                expect_create = False
+            if not started:
+                prefix.append(line)
+                continue
+            buf.append(line)
+    if buf:
+        segments.append("".join(buf))
+    files: List[str] = []
+    for idx, seg in enumerate(segments):
+        path = os.path.join(work_dir, "seg_%04d.sql" % idx)
+        with open(path, "w", encoding="utf-8", errors="replace") as fh:
+            fh.write(seg)
+        files.append(path)
+    return files
 
 
 class MySQLEngine(BackupEngine):
@@ -613,6 +678,74 @@ class MySQLEngine(BackupEngine):
                     cnt += 1
         return cnt
 
+    def _restore_parallel(self) -> int:
+        """恢复并行度：逻辑备份表级并发导入 / 物理备份 prepare 并行线程。"""
+        try:
+            return max(1, int(config.RESTORE_PARALLEL))
+        except (TypeError, ValueError):
+            return 1
+
+    def _restore_local_parallel(self, mysql_args: List[str], backup_path: str,
+                                parallel: int) -> Optional[BackupResult]:
+        """表级并行导入：解压 → 按 CREATE TABLE 边界拆分 → N 路并发 mysql 导入。
+
+        依赖 mysqldump 单线程导出顺序（每张表建表+数据连续），拆分后各段
+        可安全并发；任一段失败返回 FAILED 并附失败段信息。无法拆分或解压
+        失败时返回 None，由调用方回退单线程导入。
+        """
+        if not os.path.isfile(backup_path):
+            return None
+        work = tempfile.mkdtemp(prefix=f"mysql_restore_par_{self.task_id}_")
+        started = time.time()
+        try:
+            plain = os.path.join(work, "dump.sql")
+            with open(plain, "wb") as out, open(backup_path, "rb") as fin:
+                dec = self.pipe_decompress()
+                r = subprocess.run(dec, stdin=fin, stdout=out,
+                                   stderr=subprocess.PIPE, timeout=3600)
+            if r.returncode != 0:
+                return None  # 解压失败 → 回退单线程
+            segments = _split_sql_by_table(plain, work)
+            if len(segments) <= 1:
+                return None  # 单表/无法拆分 → 回退单线程
+            n = min(len(segments), max(1, parallel))
+            errors: List[tuple] = []
+            env = os.environ.copy()
+            pw_plain = db.decrypt_secret(self.task.get("password") or "")
+            if pw_plain:
+                env["DB_BACKUP_PASSWORD"] = pw_plain
+
+            def _import_seg(seg_path: str) -> tuple:
+                """单个段导入：段文件句柄直通 stdin（避免读入内存再回灌）。"""
+                with open(seg_path, "rb") as fin:
+                    proc = subprocess.Popen(mysql_args, env=env, stdin=fin,
+                                            stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.PIPE)
+                    rc = proc.wait()
+                err = ""
+                if rc != 0 and proc.stderr:
+                    err = (proc.stderr.read() or b"")[-300:].decode("utf-8", "ignore")
+                return seg_path, rc, err
+
+            with _futures.ThreadPoolExecutor(max_workers=n) as pool:
+                for seg, rc, err in pool.map(_import_seg, segments):
+                    if rc != 0:
+                        errors.append((os.path.basename(seg),
+                                       err or "未知错误"))
+            duration = round(time.time() - started, 3)
+            if errors:
+                detail = "; ".join(f"{name}: {err}" for name, err in errors[:5])
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path, duration_sec=duration,
+                    message=f"MySQL 并行恢复失败（{len(errors)}/{len(segments)} 段）: {detail}")
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=backup_path, duration_sec=duration,
+                message=f"MySQL 恢复成功（表级并行 {n} 路 / {len(segments)} 段）")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
     def _restore_physical(self, backup_path: str, **kwargs) -> BackupResult:
         """XtraBackup 物理备份恢复：
 
@@ -686,9 +819,13 @@ class MySQLEngine(BackupEngine):
                 if ret.returncode != 0:
                     raise RuntimeError(f"xtrabackup --decompress 失败: {(ret.stderr or '')[:300]}")
 
-            # 3) prepare
+            # 3) prepare（并行 apply-log，加快恢复）
             logs.append("[物理恢复] xtrabackup --prepare 应用 redo log ...")
-            ret = subprocess.run([xtrabackup, "--prepare", f"--target-dir={work}"],
+            prep_cmd = [xtrabackup, "--prepare"]
+            if self._restore_parallel() > 1:
+                prep_cmd.append(f"--parallel={self._restore_parallel()}")
+            prep_cmd.append(f"--target-dir={work}")
+            ret = subprocess.run(prep_cmd,
                                  capture_output=True, text=True, timeout=7200)
             if ret.returncode != 0:
                 raise RuntimeError(f"xtrabackup --prepare 失败: {(ret.stderr or ret.stdout or '')[-500:]}")
@@ -806,6 +943,12 @@ class MySQLEngine(BackupEngine):
             # `cmd /c` 报 "文件名、目录名或卷标语法不正确"，也避免 POSIX 下
             # 依赖 `sh` 造成命令不存在。压缩文件在基类 _read_decompressed
             # 中统一解压，保证 zstd / gzip 均可正确恢复。
+            parallel = self._restore_parallel()
+            if parallel > 1:
+                # 表级并行导入：先按 CREATE TABLE 边界拆分 dump，再并发执行
+                res = self._restore_local_parallel(mysql_args, backup_path, parallel)
+                if res is not None:
+                    return res
             res = self._run(mysql_args, input_file=backup_path)
             duration = round(time.time() - start, 3)
             if res["returncode"] != 0:
@@ -873,8 +1016,10 @@ class MySQLEngine(BackupEngine):
                             self._run(["tar", f"-x{algo}f", backup_path, "-C", temp_dir], timeout=3600)
                         else:
                             _shutil.copytree(backup_path, temp_dir, dirs_exist_ok=True)
-                    prepare_cmd = [xtrabackup, "--prepare",
-                                   f"--target-dir={temp_dir}"]
+                    prepare_cmd = [xtrabackup, "--prepare"]
+                    if self._restore_parallel() > 1:
+                        prepare_cmd.append(f"--parallel={self._restore_parallel()}")
+                    prepare_cmd.append(f"--target-dir={temp_dir}")
                     res = self._run(prepare_cmd, timeout=7200)
                     if res["returncode"] != 0:
                         return BackupResult(success=False, status=BackupStatus.FAILED,
@@ -979,8 +1124,11 @@ class MySQLEngine(BackupEngine):
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,
                 message="物理合成全量基目录不存在: " + str(base_dir))
-        # 按增量顺序逐层 prepare（--incremental-dir 可重复叠加）
-        cmd = [xtrabackup, "--prepare", f"--target-dir={base_dir}"]
+        # 按增量顺序逐层 prepare（--incremental-dir 可重复叠加，--parallel 加速）
+        cmd = [xtrabackup, "--prepare"]
+        if self._restore_parallel() > 1:
+            cmd.append(f"--parallel={self._restore_parallel()}")
+        cmd.append(f"--target-dir={base_dir}")
         for inc in incs:
             inc_dir = inc.get("object_key")
             if inc_dir and os.path.isdir(inc_dir):

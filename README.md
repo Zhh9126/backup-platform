@@ -75,6 +75,8 @@
 
 ### 一键恢复
 - 选择历史备份记录恢复到目标实例（数据库）或目标目录（文件）
+- **表级并行导入（MySQL 逻辑备份）**：恢复时自动解压并按表边界（`DROP/CREATE TABLE`）拆分 dump，N 路并发导入（`RESTORE_PARALLEL`，默认 4，环境变量可调），大库恢复显著提速；任一段失败会汇总失败段信息，无法拆分时自动回退单线程
+- **物理恢复并行化**：XtraBackup `--prepare` / 合成全量自动附带 `--parallel=<RESTORE_PARALLEL>`，加速 redo 应用
 
 ### 恢复校验（Restore Verify）
 - **验证“备份是否真的可恢复”**：按策略关联备份任务，定期或手动对最近一次成功备份做可恢复性校验（文件存在性 / 大小 / 校验和 / 引擎层恢复演练），生成校验报告。
@@ -98,6 +100,7 @@
 - **服务端插件市场**：以 manifest 驱动的插件目录，集中管理物理备份所需客户端（如 Percona XtraBackup、MariaDB Backup、pgBackRest、MongoDB Database Tools、Redis Tools、Percona Toolkit）。
 - **Linux Only / 离线下载优先**：部署目标为 Linux，安装策略优先级 `fallback_download > package_manager > manual_only`；缺客户端时在调度前 `preflight` 阶段提示前往插件页安装，逻辑备份允许仿真兜底。
 - 支持一键安装本机所需（`POST /api/plugins/batch-install`）、安装进度轮询、卸载（仅清理本平台离线安装目录）。页面：「备份插件」。
+- **压缩管线增强（zstd）**：逻辑备份压缩自动探测 zstd 版本，≥1.4 时启用 `-T0` 多线程并行 + `--long=27` 长距离匹配（约 128MB 窗口），大备份集压缩率与吞吐双提升；低版本自动回退标准参数。
 
 ### 备份质量监控
 - 仪表盘 KPI 监控**超长备份**与**超频备份**：超长判定支持 `fixed`（固定分钟）、`speed`（数据量/期望速度，默认 500 GB/h，浮动容忍默认 20%）、`both`（任一即超长）三种规则；超频判定为默认 5 分钟内同任务 ≥3 次。
@@ -107,7 +110,9 @@
 ### 实时管控与 CDP / 时间点恢复（RT & CDC）
 - **实时备份（RT Backup）**：基于 watcher（watchdog / polling）的准实时文件与数据库变更捕获，配合 journal 记录变更流水；支持 PITR（时间点恢复）与快照。
 - **CDC（变更数据捕获）**：针对 Oracle（LogMiner）、达梦（LogMinr）、PostgreSQL（WAL）、MySQL（binlog）的日志解析，支撑准 CDP 级恢复。
-- 引擎位于 `core/rt_backup/` 与 `core/cdc/`；实时管控任务可在「容灾链路」中被引用并做日志间隙填补、备端一致性校验。页面：「实时管控时间线」。
+- **位点落盘增强**：捕获位点（`rt_capture_state`）除每 tick 周期落盘外，健康查询（health）同步刷新，页面看到的即最新位点；封存粒度下限降至 5s（`rt_interval_sec` 可配），RPO 恢复点更密集。
+- **RPO 秒级监控告警**：恢复点新鲜度（`rpo_actual_sec`）超过任务目标（`rpo_target_sec`）时自动写入系统日志告警（source=`rt.monitor:<task_id>`，限频 `RT_RPO_ALERT_MIN_SEC` 默认 300s），恢复后自动复位。
+- 引擎位于 `core/rt_backup/` 与 `core/cdc/`；实时管控任务可在「容灾链路」中被引用并做日志间隙填补、备端一致性校验——引用 `rt_task` 源的链路自动接入**真实 binlog 位点**（源库 `SHOW MASTER STATUS` vs 已捕获位点），缺口与一致性按真实滞后判定，无真实位点时回退仿真。页面：「实时管控时间线」。
 
 ### 演练 / 容灾 / 克隆 / 迁移 / ITSM
 - **恢复演练（Drills）**：对备份做恢复演练并生成趋势与基线，支持季度演练排程，验证 RTO/RPO。页面：「恢复演练」。

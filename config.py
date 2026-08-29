@@ -165,6 +165,10 @@ RT_DB_SEAL_INTERVAL_SEC = int(os.environ.get("RT_DB_SEAL_INTERVAL_SEC", "300"))
 RT_DB_RPO_TARGET_SEC = int(os.environ.get("RT_DB_RPO_TARGET_SEC", "30"))
 RT_DB_LOG_RETENTION_DAYS = int(os.environ.get("RT_DB_LOG_RETENTION_DAYS", "7"))
 RT_DB_STALL_TICKS = int(os.environ.get("RT_DB_STALL_TICKS", "6"))        # 停滞判定 tick 数
+# 恢复性能：逻辑备份表级并行导入路数（>1 启用），物理备份 --parallel 线程数
+RESTORE_PARALLEL = int(os.environ.get("RESTORE_PARALLEL", "4"))
+# 实时保护 RPO 超限告警的最小间隔（秒，防止告警刷屏）
+RT_RPO_ALERT_MIN_SEC = int(os.environ.get("RT_RPO_ALERT_MIN_SEC", "300"))
 # 是否允许对源库执行 FLUSH BINARY LOGS 强制轮转（A7：默认开启）
 RT_DB_FLUSH_LOGS = os.environ.get("RT_DB_FLUSH_LOGS", "true").lower() == "true"
 # PG 是否创建物理复制槽（A6：默认开启，保证不丢 WAL，但源库有堆积风险）

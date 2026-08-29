@@ -98,6 +98,7 @@ class DbRtCapture:
         self._state_lock: threading.RLock = threading.RLock()
         self._started: bool = False
         self._tick_count: int = 0
+        self._last_rpo_alert_ts: float = 0.0   # RPO 超限告警限频时间戳
 
         # 运行统计
         self.last_error: str = ""
@@ -267,6 +268,7 @@ class DbRtCapture:
 
         health = self.health()
         self._persist_state(health=health)
+        self._maybe_alert(health)
         try:
             models.update_rt_task(self.task_id, {
                 "is_running": 1 if self.is_alive() else 0,
@@ -589,7 +591,11 @@ class DbRtCapture:
     # 健康与状态持久化
     # ------------------------------------------------------------------
     def health(self) -> RtHealth:
-        """计算当前健康快照。"""
+        """计算当前健康快照（顺带把最新捕获位点落盘，查询即刷新）。"""
+        try:
+            self._persist_state(health=None)
+        except Exception:
+            pass
         last_rp_at = self.last_rp_at
         if not last_rp_at:
             latest = self.journal.latest(self.task_id)
@@ -632,6 +638,31 @@ class DbRtCapture:
         )
         health.health = health.compute_health()
         return health
+
+    def _maybe_alert(self, health: RtHealth) -> None:
+        """RPO 超限秒级监控告警：恢复点新鲜度落后目标时写入系统日志。
+
+        告警限频 ``config.RT_RPO_ALERT_MIN_SEC``（默认 300s），避免刷屏；
+        恢复后自动复位，解除告警。
+        """
+        try:
+            if not health.is_breach():
+                self._last_rpo_alert_ts = 0.0
+                return
+            now = time.time()
+            if self._last_rpo_alert_ts and (now - self._last_rpo_alert_ts) < config.RT_RPO_ALERT_MIN_SEC:
+                return
+            self._last_rpo_alert_ts = now
+            reason = health.degrade_reason or health.last_error or "恢复点延迟增长"
+            msg = (
+                f"[实时保护] 任务#{self.task_id} RPO 超出目标："
+                f"当前 {health.rpo_actual_sec}s > 目标 {self.rt.rpo_target_sec}s"
+                f"（健康灯 {health.health}，{reason}）"
+            )
+            db.add_log("warning", f"rt.monitor:{self.task_id}", msg)
+            self.logger.warning("[rt.monitor] %s", msg)
+        except Exception:
+            pass
 
     def _persist_state(self, health: RtHealth = None) -> None:
         """把运行态写入 ``rt_capture_state``（失败不阻断）。"""

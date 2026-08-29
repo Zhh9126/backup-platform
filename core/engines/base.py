@@ -236,6 +236,29 @@ class BackupEngine:
         # pv -L 接受字节/秒；KB/s → 字节/秒
         return ["pv", "-L", f"{bw * 1024}"]
 
+    _zstd_version_cache: tuple = None
+
+    def _zstd_version(self) -> tuple:
+        """探测系统 zstd CLI 版本 (major, minor)；探测失败返回 (0, 0)。
+
+        用于决定是否启用 -T0（多线程，zstd>=1.3.3）与 --long（长距离匹配，
+        zstd>=1.3.2）。带缓存，仅首次探测。
+        """
+        if self._zstd_version_cache is not None:
+            return self._zstd_version_cache
+        try:
+            import re
+            import subprocess
+            p = subprocess.run(["zstd", "--version"], capture_output=True,
+                               text=True, timeout=5)
+            # 部分版本把版本号打到 stderr，合并读取
+            out = (p.stdout or "") + (p.stderr or "")
+            m = re.search(r"v?(\d+)\.(\d+)", out)
+            self._zstd_version_cache = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+        except Exception:
+            self._zstd_version_cache = (0, 0)
+        return self._zstd_version_cache
+
     def pipe_compress(self, algo: str = None, level: int = None) -> List[str]:
         """返回可插入「数据管道」的压缩命令（stdin→stdout 流式压缩）。
 
@@ -256,6 +279,11 @@ class BackupEngine:
             lvl = level if level is not None else (self.compress_level or self._ZSTD_LEVEL)
             cli = self._zstd_cli()
             if cli:
+                cli_ver = self._zstd_version()
+                if cli_ver and cli_ver >= (1, 4):
+                    # 并行(-T0 自动吃满多核) + 长距离匹配(--long=27≈256MB 窗口)：
+                    # 对结构化 dump（同表大量 INSERT）压缩率显著提升且吞吐更高
+                    return [cli, "-{}".format(lvl), "--long=27", "-T0", "-c", "-"]
                 return [cli, "-{}".format(lvl), "-c", "-"]
             # Python 库实现（跨平台、零外部依赖）；用当前解释器保证 zstandard 可用
             return [sys.executable, "-c",

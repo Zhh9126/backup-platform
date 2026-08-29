@@ -208,7 +208,9 @@ class SyncEngine:
         total_read = total_write = errors = 0
         per_table = []
         for tbl in tables:
-            res = self._run_single_table(tbl, cfg.target_table or tbl, progress_callback)
+            # 多表模式下 cfg.target_table 是单表语义，不能套用到所有表，
+            # 否则每张表都会写入同一目标表（清空他人数据 + 列不匹配全错）
+            res = self._run_single_table(tbl, tbl, progress_callback)
             per_table.append({
                 "table": tbl,
                 "success": res.get("success"),
@@ -286,6 +288,12 @@ class SyncEngine:
                         "errors": errors,
                     })
 
+            # 写入后：提交本表事务（连接 close 不保证 commit，
+            # 未提交事务会在断开时被回滚导致"写入成功却无数据"）
+            try:
+                tgt_conn.commit()
+            except Exception:
+                pass
             # 写入后：恢复约束
             self._enable_constraints(tgt_conn)
 

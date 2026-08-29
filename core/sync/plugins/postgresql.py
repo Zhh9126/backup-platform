@@ -282,7 +282,9 @@ class PostgreSQLSinkWriter(SinkWriter):
         values = [convert_row(r) for r in records]
 
         with conn.cursor() as cur:
-            if cfg.save_mode == "upsert":
+            # save_mode 为空时与 prepare_table 保持同一默认（upsert），
+            # 避免默认语义错位导致主键冲突全量失败（与 MySQL writer 一致）
+            if (cfg.save_mode or "upsert") == "upsert":
                 pks = self._get_primary_keys(conn, table)
                 if pks:
                     conflict_keys = ", ".join(f'"{k}"' for k in pks)

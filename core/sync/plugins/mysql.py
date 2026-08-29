@@ -223,7 +223,12 @@ class MySQLSinkWriter(SinkWriter):
             exists = bool(cur.fetchone())
             if mode == "overwrite":
                 if exists:
-                    cur.execute(f"TRUNCATE TABLE {self._table_ref(table)}")
+                    try:
+                        cur.execute(f"TRUNCATE TABLE {self._table_ref(table)}")
+                    except Exception:
+                        # MySQL 下被外键引用的表 TRUNCATE 会失败(1701)，
+                        # 即使 FOREIGN_KEY_CHECKS=0；降级为 DELETE 清空
+                        cur.execute(f"DELETE FROM {self._table_ref(table)}")
                     conn.commit()
                 else:
                     cur.execute(self._create_table_sql(table, columns))
@@ -263,7 +268,10 @@ class MySQLSinkWriter(SinkWriter):
         col_str = ", ".join(f"`{c}`" for c in target_cols)
 
         with conn.cursor() as cur:
-            if cfg.save_mode == "upsert":
+            # save_mode 为空时与 prepare_table 保持同一默认（upsert），
+            # 避免"默认按 upsert 建表/不清空、写入却走纯 INSERT"的
+            # 语义错位导致主键冲突全量失败
+            if (cfg.save_mode or "upsert") == "upsert":
                 pks = self._get_primary_keys(conn, table)
                 if pks:
                     updates = ", ".join(

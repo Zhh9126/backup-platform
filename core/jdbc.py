@@ -351,6 +351,16 @@ def _to_py(value):
 def test_connection(db_type, host, port, db, user, password, timeout=15):
     """测试 JDBC 连接，返回 (ok, message, info)。"""
     t0 = time.monotonic()
+    # 端口预检：TCP 不通时给出明确提示，避免误导性的
+    # "Communications link failure"（常见原因是端口填错/防火墙）
+    try:
+        import socket
+        with socket.create_connection((host, int(port)), timeout=4):
+            pass
+    except Exception as e:
+        return False, (
+            f"目标 {host}:{port} 端口不可达（{type(e).__name__}）——"
+            "请确认数据库实例已启动、监听端口填写正确，且防火墙已放行该端口"), None
     try:
         conn = connect(db_type, host, port, db, user, password, timeout=timeout)
         cfg = DRIVER_CONFIG.get(db_type, {})

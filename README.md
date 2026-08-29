@@ -35,6 +35,7 @@
 - **L3 源端本地路径导出**（服务端本地文件系统导出，可离线转移）
 - 备份成功后由 `tier_replication` 自动并行复制到各层级；`backup_records.storage_tier` 记录每条备份实际到达的层级（如 `minio+s3+local`）
 - 可配置复制策略（`push_l1_minio` / `push_l2_s3` / `push_l3_local` / 时机 / 重试）
+- **协议识别优化**：存储目标地址支持 `http(s)://` 前缀自动识别（http 直连 / https 加密），并兼容自建/企业 S3 网关的 `insecure` 证书跳过配置
 
 ### 数据同步（DataX/LinkUp 风格 Reader/Writer）
 - **Reader → 统一 Java 类型 → Writer**：参考 DataX 架构，抽象 `SourceReader` / `SinkWriter`，源端读出的数据先转为平台统一类型（STRING/LONG/DOUBLE/DECIMAL/BOOLEAN/DATE/TIME/DATETIME/BYTES），再由目标端写回。
@@ -42,7 +43,7 @@
 - **字段映射可视化**：页面提供左右字段列表，支持「同名映射」「同行映射」「清空映射」「手动点击连线建立映射」，并高亮已映射字段与连线。
 - **写入模式**：`append`（追加）、`overwrite`（覆盖）、`upsert`（更新插入，MySQL ON DUPLICATE KEY / PG ON CONFLICT）、`create_if_not_exists`（表不存在则自动建表）。
 - **增量同步**：可指定增量列与起始值，自动记录断点并更新任务状态。
-- **实时同步（Flink CDC）**：离线任务由 APScheduler 调度；`realtime` 模式通过 Flink CDC 执行，平台提供配置生成接口与任务监控。
+- **实时同步（Binlog CDC）**：离线任务由 APScheduler 调度；`realtime` 模式由 MySQL/PG 插件内置 Binlog/逻辑复制监听（**全量快照 + 增量 DML**），后台线程（`core/sync/realtime_runners.py`）统一管理启停与运行状态，平台提供配置生成接口与任务监控。
 - **全库迁移模式**：启用后可一次性将源库所有表同步到目标库（参考 pg2mysql 全库迁移能力）。
 - **Schema 兼容性校验**（pg2mysql Validator）：执行前先比对源/目标的列类型与长度兼容性，检测超出目标列长度的数据行并列出 ID，不兼容则拒绝执行。
 - **迁移后数据校验**（pg2mysql Verifier）：同步完成后跨库逐行比对源/目标数据是否一致，报告缺失行数与 ID。
@@ -65,6 +66,12 @@
 
 ### 主机与连接纳管
 - **SSH 主机纳管**（`ssh_hosts` 表）：用于文件备份的远程源/目标，密码 XOR + base64 加密，支持连接测试
+
+### JDBC 直连能力
+- **JDBC 连接方式**（`core/jdbc.py`）：通过 JPype/jaydebeapi 桥接 Java JDBC 驱动，实现**不依赖 SSH / 本机客户端**的数据库直连——连接测试、拉取库列表、能力状态。入口：任务表单与「备份插件」页，接口：`/api/jdbc/*`。
+- **支持 6 类数据库**：MySQL / MariaDB / PostgreSQL / Kingbase / Oracle / DM（`drivers/` 目录内置各驱动 jar，支持页面上传 / 下载 / 删除）。
+- **「原有连接方式优先」**：JDBC 仅作为连接测试 / 拉库列表的兜底通道与显式入口，备份执行仍走原有（SSH / 本机客户端）方式。
+- **JVM 全局单例**：classpath 在首次启动时一次性加载 `drivers/` 全部 jar；自动探测 JDK（`JAVA_HOME` / 常见安装路径 / `.jdks` / PATH 推导）。
 
 ### 一键恢复
 - 选择历史备份记录恢复到目标实例（数据库）或目标目录（文件）
@@ -156,8 +163,10 @@
 │   ├── lifecycle.py       # 生命周期：L1→L2 按龄/按容量下沉 + 到期清理
 │   ├── notifier.py        # 通知（webhook/钉钉/企微/飞书/邮件）
 │   ├── ssh_hosts.py       # SSH 主机纳管（文件备份远程源/目标）
+│   ├── jdbc.py            # JDBC 直连（JPype 桥接，连接测试 / 拉库列表）
 │   ├── sync/              # 数据同步引擎（Reader/Writer/Plugin 架构）
 │   │   ├── engine.py      # 同步执行器（task → SyncEngine）
+│   │   ├── realtime_runners.py  # 实时同步（Binlog CDC）后台线程管理
 │   │   ├── source.py / sink.py  # Reader/Writer 抽象（已合并入 plugins/base.py）
 │   │   ├── type_mapper.py # 统一 Java 类型映射
 │   │   └── plugins/       # 数据库同步插件
@@ -173,6 +182,7 @@
 │   ├── policy.py          # 备份保护策略引擎
 │   ├── drill.py           # 恢复演练引擎（趋势/基线/排程）
 │   ├── migration.py / disaster_link.py / clone_service.py  # 迁移保护 / 容灾链路 / 克隆
+│   ├── restore_extras.py  # 跨主机恢复 / 克隆辅助工具（mysql_clone_to_test 等）
 │   ├── itsm.py            # ITSM 工单对接
 │   ├── data_mining.py     # 数据价值挖掘
 │   ├── ai_agent/          # AI 智能体（agent/session/executor/tools）
@@ -190,6 +200,7 @@
 ├── api/                   # REST API 蓝图
 │   ├── storage.py         # 存储目标 CRUD / 测试连接 / 复制 / 复制策略
 │   ├── hosts.py           # SSH 主机 CRUD + 连接测试
+│   ├── jdbc.py            # JDBC 连接测试 / 拉库列表 / 驱动管理
 │   ├── sync.py            # 同步任务 / 记录
 │   ├── inspection.py      # 巡检执行 / 记录 / 排程
 │   ├── system.py          # 系统设置 / 通知配置（UI）/ 备份质量阈值
@@ -206,6 +217,7 @@
 ├── templates/             # 前端页面（Bootstrap）
 ├── static/                # CSS / JS
 ├── skills/                # 9 份备份 Skill 操作指南（Markdown）
+├── drivers/               # JDBC 驱动 jar（mysql/pg/oracle 等，供 core/jdbc.py 加载）
 ├── docs/                  # 设计文档（mermaid 架构图、备份质量监控等）
 ├── backups/               # 备份文件落盘目录（运行时生成）
 └── instance/              # SQLite 元数据库（运行时生成）
@@ -224,6 +236,7 @@ pip install -r requirements.txt
   - `paramiko`（SFTP 远程存储、文件备份远程 SSH 源/目标）
   - `minio`（三级存储 MinIO / S3 驱动，需 `boto3`）
   - `PyYAML`（config.yaml 支持）
+  - `jpype1`、`jaydebeapi`（JDBC 直连能力，另需本机 JDK/JRE 与 `drivers/` 下的驱动 jar）
 
 > 启用三级对象存储时，请安装 `minio` 与 `boto3`：`pip install minio boto3`
 
@@ -262,6 +275,8 @@ python init_db.py
 # 2. 启动平台（同时启动后台调度器）
 python run.py
 ```
+
+> 也可使用 `start.sh` 一键启动（自动注入 JDK 环境与 `BACKUP_ROOT` 后运行 `run.py`）。
 
 浏览器访问 `http://<服务器IP>:8080`，使用默认账号 `admin / admin123` 登录。
 
@@ -376,7 +391,9 @@ python run.py
 - 数据库连接 / SSH 主机密码以混淆方式存储于 SQLite，Web 接口默认不回显明文；生产环境建议结合密钥文件 / 环境变量管理
 - MySQL 等使用临时选项文件（权限 `600`）承载密码，避免明文出现在进程参数中
 - Redis 通过 `REDISCLI_AUTH` 环境变量传密码
-- 请在生产环境务必修改默认登录账号与 `SECRET_KEY`
+- 请在生产环境务必修改默认登录账号与 `SECRET_KEY`（平台支持 `SECRET_KEY` 随机化并持久化，重启不丢失会话密钥）
+- **登录安全加固**：登录失败**暴力破解限流**（多次失败临时锁定）；CSRF 校验提供**同源兜底**（Origin/Referer 校验）；全局注入**安全响应头与 CSP**，缓解 XSS / 点击劫持
+- **接口鉴权与注入防护**：`restore_verify` 系列路由全量鉴权；修复 PITR 参数注入、备份/恢复文件下载**路径穿越**、file 引擎命令注入等风险点
 
 ---
 

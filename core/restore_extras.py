@@ -242,69 +242,146 @@ def pg_restore_object(backup_path: str, object_name: str, target: dict) -> Dict[
 # ============================================================
 # 4. 副本克隆（VDB - Virtual Database）
 # ============================================================
-def mysql_clone_to_test(backup_path: str, instance_name: str, base_port: int = 33060) -> Dict[str, Any]:
+def mysql_clone_to_test(backup_path: str, instance_name: str, base_port: int = 33060,
+                        mysql_host: str = "127.0.0.1", mysql_port: int = 3306,
+                        mysql_user: str = "root", mysql_password: str = "") -> Dict[str, Any]:
     """从备份创建一个新的 MySQL 数据库（通过 create database + restore），返回连接信息。
+
     instance_name: 新库名（要求唯一）
+    - 密码经 MYSQL_PWD 环境变量注入，避免出现在进程参数中；
+    - 支持明文 .sql / .gz / .zst / .bz2 备份，流式解压导入（不落中间文件）；
+    - 导入前剥离 dump 内的 ``CREATE DATABASE`` / ``USE`` 语句（mysqldump 输出
+      依赖 USE 选库，不剥离会把数据写回源库而克隆库为空）。
     """
     env = os.environ.copy()
-    # 默认用本机（克隆场景通常在同一台管理机）
-    cmd_create = ["mysql", "-h", "127.0.0.1", "-P", "3306", "-u", "root", "-N", "-e",
-                  f"CREATE DATABASE IF NOT EXISTS `{instance_name}` CHARACTER SET utf8mb4"]
+    if mysql_password:
+        env["MYSQL_PWD"] = mysql_password
+    base = ["mysql", "-h", mysql_host, "-P", str(mysql_port), "-u", mysql_user]
+    # 1) 创建克隆库
+    cmd_create = base + ["-N", "-e",
+                         f"CREATE DATABASE IF NOT EXISTS `{instance_name}` CHARACTER SET utf8mb4"]
     r = subprocess.run(cmd_create, env=env, capture_output=True, text=True, timeout=10)
     if r.returncode != 0:
         return {"ok": False, "message": f"创建库失败: {r.stderr[:200]}"}
-    # 导入
-    actual = backup_path
-    if backup_path.endswith(".gz"):
-        subprocess.run(["gunzip", "-k", backup_path], capture_output=True)
-        actual = backup_path[:-3]
-    cmd_load = ["mysql", "-h", "127.0.0.1", "-P", "3306", "-u", "root", instance_name]
-    with open(actual, "rb") as f:
-        r = subprocess.run(cmd_load, env=env, stdin=f, capture_output=True, text=True, timeout=3600)
-    if r.returncode != 0:
-        # 回滚
-        subprocess.run(["mysql", "-h", "127.0.0.1", "-P", "3306", "-u", "root", "-N", "-e",
-                        f"DROP DATABASE IF EXISTS `{instance_name}`"], env=env,
-                       capture_output=True, text=True, timeout=10)
-        return {"ok": False, "message": f"导入失败: {r.stderr[:300]}"}
+    # 2) 流式导入：解压 → 剥离库名语句 → 导入目标克隆库
+    lower = (backup_path or "").lower()
+    if lower.endswith(".zst"):
+        dec = ["zstd", "-dc", backup_path]
+    elif lower.endswith(".gz"):
+        dec = ["gzip", "-dc", backup_path]
+    elif lower.endswith(".bz2"):
+        dec = ["bzip2", "-dc", backup_path]
+    else:
+        dec = ["cat", backup_path]
+    # 剥离整行的 CREATE DATABASE ...; 与 USE `db`;（mysqldump 输出均为独立行）
+    strip = ["sed", "-E", "/^[[:space:]]*(CREATE[[:space:]]+DATABASE|USE[[:space:]])/Id"]
+    try:
+        p1 = subprocess.Popen(dec, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        p2 = subprocess.Popen(strip, stdin=p1.stdout, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE)
+        p1.stdout.close()
+        p3 = subprocess.Popen(base + [instance_name], stdin=p2.stdout,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        p2.stdout.close()
+        _, err3 = p3.communicate(timeout=3600)
+        p2.wait()
+        p1.wait()
+        if p3.returncode != 0:
+            raise RuntimeError((err3 or b"").decode("utf-8", "ignore")[:300])
+    except Exception as e:
+        # 回滚克隆库
+        subprocess.run(base + ["-N", "-e", f"DROP DATABASE IF EXISTS `{instance_name}`"],
+                       env=env, capture_output=True, text=True, timeout=10)
+        return {"ok": False, "message": f"导入失败: {str(e)[:300]}"}
     return {"ok": True, "message": f"测试库 {instance_name} 已创建并导入",
-            "connection": f"mysql -h127.0.0.1 -uroot {instance_name}",
+            "connection": f"mysql -h{mysql_host} -u{mysql_user} {instance_name}",
             "instance_name": instance_name,
-            "port": 3306}
+            "port": mysql_port}
 
 
-def pg_clone_to_test(backup_path: str, instance_name: str) -> Dict[str, Any]:
-    """从 PG 备份创建一个新的 schema。"""
+def pg_clone_to_test(backup_path: str, instance_name: str,
+                     pg_host: str = "127.0.0.1", pg_port: int = None,
+                     pg_user: str = "postgres", pg_password: str = "") -> Dict[str, Any]:
+    """从 PG 备份创建一个新的数据库（库级克隆），返回连接信息。
+
+    - 端口默认取环境变量 PGPORT（未设置时 5432）；
+    - ``.dump``（pg_dump -Fc 自定义格式）用 pg_restore 恢复到新建库，
+      纯文本 ``.sql``（可 .gz）用 psql 导入到新建库。
+    """
     env = os.environ.copy()
-    cmd_create = ["psql", "-h", "127.0.0.1", "-p", "5432", "-U", "postgres",
-                  "-d", "postgres", "-c", f"CREATE SCHEMA IF NOT EXISTS {instance_name}"]
-    r = subprocess.run(cmd_create, env=env, capture_output=True, text=True, timeout=10)
+    if pg_password:
+        env["PGPASSWORD"] = pg_password
+    if not pg_port:
+        try:
+            pg_port = int(os.environ.get("PGPORT") or 5432)
+        except ValueError:
+            pg_port = 5432
+    base = ["psql", "-h", pg_host, "-p", str(pg_port), "-U", pg_user]
+    # 1) 建克隆库（先清理同名残留）
+    r = subprocess.run(base + ["-d", "postgres", "-c",
+                               f'DROP DATABASE IF EXISTS "{instance_name}"'],
+                       env=env, capture_output=True, text=True, timeout=30)
+    r = subprocess.run(base + ["-d", "postgres", "-c",
+                               f'CREATE DATABASE "{instance_name}"'],
+                       env=env, capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
-        return {"ok": False, "message": f"创建 schema 失败: {r.stderr[:200]}"}
-    # 导入
-    actual = backup_path
-    if backup_path.endswith(".gz"):
-        subprocess.run(["gunzip", "-k", backup_path], capture_output=True)
-        actual = backup_path[:-3]
-    cmd_load = ["psql", "-h", "127.0.0.1", "-p", "5432", "-U", "postgres", "-d", "postgres", "-f", actual]
-    r = subprocess.run(cmd_load, env=env, capture_output=True, text=True, timeout=3600)
-    if r.returncode != 0:
-        return {"ok": False, "message": f"导入失败: {r.stderr[:300]}"}
-    return {"ok": True, "message": f"测试 schema {instance_name} 已创建并导入",
-            "connection": f"psql -h 127.0.0.1 -U postgres -d postgres -c 'SET search_path TO {instance_name}'",
-            "instance_name": instance_name}
+        return {"ok": False, "message": f"创建库失败: {r.stderr[:200]}"}
+    # 2) 导入
+    lower = (backup_path or "").lower()
+    try:
+        if lower.endswith(".dump"):
+            cmd = ["pg_restore", "-h", pg_host, "-p", str(pg_port), "-U", pg_user,
+                   "-d", instance_name, "--no-owner", "--no-privileges", backup_path]
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=3600)
+            # pg_restore 对个别对象报错也可能整体可用：仅在有输出错误且 rc!=0 时失败
+            if r.returncode != 0:
+                raise RuntimeError(r.stderr[:300])
+        else:
+            if lower.endswith(".gz"):
+                dec = ["gzip", "-dc", backup_path]
+                p1 = subprocess.Popen(dec, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                p2 = subprocess.Popen(base + ["-d", instance_name, "-v", "ON_ERROR_STOP=1",
+                                              "-f", "-"],
+                                      stdin=p1.stdout, stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, env=env)
+                p1.stdout.close()
+                _, err = p2.communicate(timeout=3600)
+                p1.wait()
+                if p2.returncode != 0:
+                    raise RuntimeError((err or b"").decode("utf-8", "ignore")[:300])
+            else:
+                r = subprocess.run(base + ["-d", instance_name, "-v", "ON_ERROR_STOP=1",
+                                           "-f", backup_path],
+                                   env=env, capture_output=True, text=True, timeout=3600)
+                if r.returncode != 0:
+                    raise RuntimeError(r.stderr[:300])
+    except Exception as e:
+        subprocess.run(base + ["-d", "postgres", "-c",
+                               f'DROP DATABASE IF EXISTS "{instance_name}"'],
+                       env=env, capture_output=True, text=True, timeout=30)
+        return {"ok": False, "message": f"导入失败: {str(e)[:300]}"}
+    return {"ok": True, "message": f"测试库 {instance_name} 已创建并导入",
+            "connection": f"psql -h {pg_host} -p {pg_port} -U {pg_user} -d {instance_name}",
+            "instance_name": instance_name,
+            "port": pg_port}
 
 
-def drop_clone(db_type: str, instance_name: str) -> Dict[str, Any]:
-    """清理 VDB 测试库。"""
+def drop_clone(db_type: str, instance_name: str,
+               mysql_password: str = "", pg_password: str = "") -> Dict[str, Any]:
+    """清理 VDB 测试库/库（与 pg_clone_to_test 的库级克隆语义对齐）。"""
     env = os.environ.copy()
+    if mysql_password:
+        env["MYSQL_PWD"] = mysql_password
+    if pg_password:
+        env["PGPASSWORD"] = pg_password
     if db_type == "mysql":
         cmd = ["mysql", "-h", "127.0.0.1", "-P", "3306", "-u", "root", "-N", "-e",
                f"DROP DATABASE IF EXISTS `{instance_name}`"]
     elif db_type == "postgresql":
-        cmd = ["psql", "-h", "127.0.0.1", "-p", "5432", "-U", "postgres",
-               "-d", "postgres", "-c", f"DROP SCHEMA IF EXISTS {instance_name} CASCADE"]
+        pg_port = os.environ.get("PGPORT") or 5432
+        cmd = ["psql", "-h", "127.0.0.1", "-p", str(pg_port), "-U", "postgres",
+               "-d", "postgres", "-c", f'DROP DATABASE IF EXISTS "{instance_name}"']
     else:
         return {"ok": False, "message": f"不支持的类型 {db_type}"}
     r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
-    return {"ok": r.returncode == 0, "message": r.stdout or r.stderr or "OK"}
+    return {"ok": r.returncode == 0, "message": (r.stderr or r.stdout or "OK")[:200]}

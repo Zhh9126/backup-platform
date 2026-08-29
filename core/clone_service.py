@@ -210,11 +210,16 @@ class CloneService:
         # DEMO 仿真：DEMO_MODE != off 时直接仿真成功，避免依赖真实客户端
         simulated = config.DEMO_MODE != "off"
         if not simulated:
+            # 源任务密码：注入克隆目标连接（克隆库通常在本机管理实例）
+            src_task = models.get_task(rec.get("task_id"), include_secret=True) or {}
+            src_password = src_task.get("password") or ""
             try:
                 if db_type == "mysql":
-                    res = restore_extras.mysql_clone_to_test(backup_path, instance_name)
+                    res = restore_extras.mysql_clone_to_test(
+                        backup_path, instance_name, mysql_password=src_password)
                 elif db_type == "postgresql":
-                    res = restore_extras.pg_clone_to_test(backup_path, instance_name)
+                    res = restore_extras.pg_clone_to_test(
+                        backup_path, instance_name, pg_password=src_password)
                 else:
                     res = {"ok": False, "message": f"db_type={db_type} 暂不支持真实克隆"}
                 if not res.get("ok"):
@@ -251,8 +256,16 @@ class CloneService:
         vdb = models.get_vdb(vdb_id)
         if vdb:
             if config.DEMO_MODE == "off":
+                # 源任务密码：注入销毁连接（克隆库在本机管理实例）
+                src_task = models.get_task(vdb.get("task_id"), include_secret=True) or {}
+                src_password = src_task.get("password") or ""
                 try:
-                    restore_extras.drop_clone(vdb.get("db_type"), vdb.get("name"))
+                    res = restore_extras.drop_clone(
+                        vdb.get("db_type"), vdb.get("name"),
+                        mysql_password=src_password, pg_password=src_password)
+                    if not res.get("ok"):
+                        self.logger.warning("[clone] 释放 VDB #%s 失败: %s",
+                                            vdb_id, res.get("message"))
                 except Exception as e:
                     self.logger.warning("[clone] 释放 VDB #%s 失败（忽略）: %s", vdb_id, e)
             try:

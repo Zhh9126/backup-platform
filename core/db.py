@@ -116,6 +116,49 @@ CREATE TABLE IF NOT EXISTS restore_test_reports (
     finished_at  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS data_compare_tasks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    source_db_type  TEXT,
+    source_host     TEXT,
+    source_port     INTEGER,
+    source_username TEXT,
+    source_password TEXT,                                 -- 加密存储
+    source_database TEXT,
+    source_schema   TEXT,                                 -- PG schema / Oracle owner
+    target_db_type  TEXT,
+    target_host     TEXT,
+    target_port     INTEGER,
+    target_username TEXT,
+    target_password TEXT,                                 -- 加密存储
+    target_database TEXT,
+    target_schema   TEXT,
+    tables          TEXT DEFAULT '[]',                    -- JSON 数组；空 = 两端交集
+    enable_checksum INTEGER DEFAULT 0,                    -- 全表校验和（大表慎用）
+    sample_rows     INTEGER DEFAULT 100,                  -- 抽样行数
+    schedule_type   TEXT DEFAULT 'manual',                -- none | cron | interval | manual
+    cron_expr       TEXT,
+    interval_minutes INTEGER,
+    enabled         INTEGER DEFAULT 1,
+    last_run_at     TEXT,
+    last_status     TEXT,
+    last_report_id  INTEGER,
+    created_at      TEXT,
+    updated_at      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS data_compare_reports (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      INTEGER,
+    status       TEXT,                                    -- running | success | failed
+    duration_sec REAL,
+    summary_json TEXT,                                    -- 汇总 KPI JSON
+    tables_json  TEXT,                                    -- 逐表明细 JSON
+    message      TEXT,
+    created_at   TEXT,
+    finished_at  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS backup_records (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id       INTEGER,
@@ -873,6 +916,51 @@ def init_schema() -> None:
                     duration_sec REAL,
                     message      TEXT,
                     cleaned      INTEGER DEFAULT 0,
+                    created_at   TEXT,
+                    finished_at  TEXT
+                );
+            """)
+
+            # 迁移：数据对比任务与报告表（幂等，照顾存量库）
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS data_compare_tasks (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name            TEXT NOT NULL,
+                    source_db_type  TEXT,
+                    source_host     TEXT,
+                    source_port     INTEGER,
+                    source_username TEXT,
+                    source_password TEXT,
+                    source_database TEXT,
+                    source_schema   TEXT,
+                    target_db_type  TEXT,
+                    target_host     TEXT,
+                    target_port     INTEGER,
+                    target_username TEXT,
+                    target_password TEXT,
+                    target_database TEXT,
+                    target_schema   TEXT,
+                    tables          TEXT DEFAULT '[]',
+                    enable_checksum INTEGER DEFAULT 0,
+                    sample_rows     INTEGER DEFAULT 100,
+                    schedule_type   TEXT DEFAULT 'manual',
+                    cron_expr       TEXT,
+                    interval_minutes INTEGER,
+                    enabled         INTEGER DEFAULT 1,
+                    last_run_at     TEXT,
+                    last_status     TEXT,
+                    last_report_id  INTEGER,
+                    created_at      TEXT,
+                    updated_at      TEXT
+                );
+                CREATE TABLE IF NOT EXISTS data_compare_reports (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id      INTEGER,
+                    status       TEXT,
+                    duration_sec REAL,
+                    summary_json TEXT,
+                    tables_json  TEXT,
+                    message      TEXT,
                     created_at   TEXT,
                     finished_at  TEXT
                 );

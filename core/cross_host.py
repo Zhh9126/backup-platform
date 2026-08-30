@@ -225,11 +225,51 @@ def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
                 f"-h {host} -p {port} -U {user} {target} -f '{actual}'")
 
     elif db_type == "oracle":
-        # Oracle 用 impdp，依赖服务端 DIRECTORY；这里用 cat | sqlldr 之类不现实
-        # 简化：写一个 parfile 让用户在目标机执行
-        return (f"echo 'Oracle 跨主机恢复需 impdp，请确保目标主机已配置 DIRECTORY 与 IMP_FULL_DATABASE 权限'; "
-                f"ls -la {remote_pkg}; "
-                f"unzip -o {remote_pkg} -d /tmp/oracle_restore_{int(time.time())} && echo OK")
+        # Oracle 真实 impdp 恢复：动态解析 impdp 与 DATA_PUMP_DIR（不写死路径），
+        # dmp 是 Data Pump 逻辑备份时直接导入；RMAN 物理备份片(.bkp)无法用 impdp，
+        # 如实报错（不伪造成功）。
+        if not remote_pkg.endswith((".dmp", ".dmp.gz")):
+            return (f"echo '[ERROR] RMAN 物理备份片(.bkp)请使用 RMAN 恢复通道"
+                    f"（RESTORE/RECOVER），impdp 不适用'; exit 1;")
+        svc = extra.get("source_db") or target_db or "orcl"
+        port = extra.get("source_port") or 1521
+        user = extra.get("source_username") or "system"
+        pw = extra.get("source_password") or ""
+        conn = f"{user}/{pw}@//127.0.0.1:{port}/{svc}"
+        script = f"""#!/bin/bash
+set -u
+IMPDP=$(su - oracle -c 'command -v impdp' 2>/dev/null | head -1)
+if [ -z "$IMPDP" ]; then
+  IMPDP=$(find /u01/app/oracle/product/*/*/bin /u01/app/oracle/*/bin -maxdepth 1 -name impdp -type f 2>/dev/null | head -1)
+fi
+if [ -z "$IMPDP" ]; then
+  echo "[ERROR] 目标主机未找到 impdp（oracle 用户 PATH 与常见 ORACLE_HOME 目录均无）"
+  exit 127
+fi
+echo "IMPDP=$IMPDP"
+DP=$(su - oracle -c "sqlplus -s / as sysdba" <<'EOSQL' 2>/dev/null | grep '^/' | head -1
+SET HEADING OFF
+SET PAGESIZE 0
+SET FEEDBACK OFF
+SELECT directory_path FROM all_directories WHERE directory_name = 'DATA_PUMP_DIR';
+EXIT;
+EOSQL
+)
+if [ -z "$DP" ]; then
+  echo "[ERROR] 无法在目标主机解析 DATA_PUMP_DIR 实际路径"
+  exit 1
+fi
+echo "DP=$DP"
+cp '{remote_pkg}' "$DP/platform_restore.dmp" || exit 1
+chown oracle:oinstall "$DP/platform_restore.dmp" 2>/dev/null
+su - oracle -c "$IMPDP '{conn}' DIRECTORY=DATA_PUMP_DIR DUMPFILE=platform_restore.dmp LOGFILE=platform_restore.log TABLE_EXISTS_ACTION=REPLACE"
+RC=$?
+tail -30 "$DP/platform_restore.log" 2>/dev/null
+exit $RC
+"""
+        import base64
+        b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        return f"echo {b64} | base64 -d | bash"
 
     elif db_type == "kingbase":
         host = "127.0.0.1"
@@ -262,8 +302,27 @@ def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
         return f"mkdir -p '{target}' && tar -xzf '{remote_pkg}' -C '{target}' && echo '已解压到 {target}'"
 
     elif db_type == "dameng":
+        # DM 真实 dimp 恢复：动态解析 dimp（dmdba 用户 profile → 常见安装目录），
+        # 找不到时如实报错（不伪造成功）。
         dm_pwd = extra.get("dm_sysdba", "Dameng123")
-        return f"echo 'DM 跨主机恢复需要 disql 客户端或 dminit；请在目标机手动执行: disql SYSDBA/{dm_pwd} @ /tmp/import.sql'"
+        dm_port = extra.get("source_port") or 5236
+        script = f"""#!/bin/bash
+set -u
+DIMP=$(su - dmdba -c 'command -v dimp' 2>/dev/null | head -1)
+if [ -z "$DIMP" ]; then
+  DIMP=$(find /dm8/bin /opt/dmdbms/bin /home/dmdba/dmdbms/bin /opt/dm*/bin -maxdepth 1 -name dimp -type f 2>/dev/null | head -1)
+fi
+if [ -z "$DIMP" ]; then
+  echo "[ERROR] 目标主机未找到 dimp（dmdba 用户 PATH 与常见安装目录均无）"
+  exit 127
+fi
+echo "DIMP=$DIMP"
+"$DIMP" SYSDBA/'{dm_pwd}'@localhost:{dm_port} FILE='{remote_pkg}' LOG=/tmp/dm_restore_{int(time.time())}.log
+exit $?
+"""
+        import base64
+        b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+        return f"echo {b64} | base64 -d | bash"
 
     else:
         raise RuntimeError(f"不支持的跨主机恢复类型: {db_type}")

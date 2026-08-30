@@ -446,6 +446,12 @@
         const eo = JSON.parse(task.extra_options || "{}");
         if ($("t_ssh_host")) $("t_ssh_host").value = eo.ssh_host_id || "";
         if ($("t_encrypt_pool")) $("t_encrypt_pool").checked = !!eo.encrypt_pool;
+        // 自定义脚本回填
+        if ($("t_custom_script")) $("t_custom_script").value = eo.custom_script || "";
+        if ($("t_custom_restore")) $("t_custom_restore").value = eo.custom_restore_script || "";
+        if ($("t_custom_artifact_dir")) $("t_custom_artifact_dir").value = eo.custom_artifact_dir || "";
+        if ($("t_custom_timeout")) $("t_custom_timeout").value = eo.custom_timeout || "";
+        toggleCustomBox();
       } catch (e) {
         if ($("t_ssh_host")) $("t_ssh_host").value = "";
         if ($("t_encrypt_pool")) $("t_encrypt_pool").checked = false;
@@ -456,7 +462,13 @@
       const p = META.default_ports[$("t_db_type").value];
       if (p) $("t_port").value = p;
       if ($("t_encrypt_pool")) $("t_encrypt_pool").checked = false;
+      // 重置自定义脚本字段
+      if ($("t_custom_script")) $("t_custom_script").value = "";
+      if ($("t_custom_restore")) $("t_custom_restore").value = "";
+      if ($("t_custom_artifact_dir")) $("t_custom_artifact_dir").value = "";
+      if ($("t_custom_timeout")) $("t_custom_timeout").value = "";
     }
+    toggleCustomBox();
     // 数据库选择器（schema/table 多选）：mysql/mariadb/postgresql/kingbase/oracle/dameng 显示
     // 注：oracle/dameng 引擎 list_databases() 返回空（需用户手工指定 schema），
     //     故展示选择器但拉取结果为空属预期，不影响 CDC 守护配置。
@@ -677,6 +689,14 @@
     }
   }
 
+  // 自定义脚本区块显隐（备份方式 = custom 时展示）
+  function toggleCustomBox() {
+    const box = $("t_custom_box");
+    const sel = $("t_backup_mode");
+    if (box && sel) box.style.display = sel.value === "custom" ? "" : "none";
+  }
+  window.toggleCustomBox = toggleCustomBox;
+
   async function saveTask() {
     // 全面防御：编辑/新建时，模态框的某些字段可能不在当前 tab/不存在，
     // 任何 $(id) 为 null 都会让 .value 抛 TypeError，导致点保存完全无反应。
@@ -711,6 +731,29 @@
       const sshId = val("t_ssh_host");
       if (sshId) eo.ssh_host_id = Number(sshId); else delete eo.ssh_host_id;
       if (chk("t_encrypt_pool")) eo.encrypt_pool = true; else delete eo.encrypt_pool;
+      // 自定义脚本（备份方式 = custom 时必填脚本内容）
+      const customMode = val("t_backup_mode") === "custom";
+      const customScript = ($("t_custom_script") && $("t_custom_script").value) || "";
+      if (customMode && !customScript.trim()) {
+        toast("自定义脚本模式必须填写备份脚本", "danger"); return;
+      }
+      if (customScript.trim()) {
+        eo.custom_script = customScript;
+        if ($("t_custom_restore") && $("t_custom_restore").value.trim())
+          eo.custom_restore_script = $("t_custom_restore").value;
+        else delete eo.custom_restore_script;
+        if ($("t_custom_artifact_dir") && $("t_custom_artifact_dir").value.trim())
+          eo.custom_artifact_dir = $("t_custom_artifact_dir").value.trim();
+        else delete eo.custom_artifact_dir;
+        if ($("t_custom_timeout") && Number($("t_custom_timeout").value))
+          eo.custom_timeout = Number($("t_custom_timeout").value);
+        else delete eo.custom_timeout;
+      } else {
+        delete eo.custom_script;
+        delete eo.custom_restore_script;
+        delete eo.custom_artifact_dir;
+        delete eo.custom_timeout;
+      }
       const data = {
         name: val("t_name"),
         biz_system: val("t_biz_system").trim(),

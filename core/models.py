@@ -2200,3 +2200,240 @@ def get_restore_verify_stats() -> dict:
         "failed_count": int(failed["c"] if failed else 0),
         "last_test_at": last["created_at"] if last else None,
     }
+
+
+# ========================= 数据对比（恢复数据 vs 生产库） =========================
+import json as _json
+
+_DATA_COMPARE_TASK_FIELDS = [
+    "name",
+    "source_db_type", "source_host", "source_port", "source_username",
+    "source_password", "source_database", "source_schema",
+    "target_db_type", "target_host", "target_port", "target_username",
+    "target_password", "target_database", "target_schema",
+    "tables", "enable_checksum", "sample_rows",
+    "schedule_type", "cron_expr", "interval_minutes", "enabled",
+]
+
+_DATA_COMPARE_ENDPOINT_PREFIX = ("source", "target")
+
+
+def _dct_to_dict(row: Optional[dict]) -> Optional[dict]:
+    """将 data_compare_tasks 行转为 dict，敏感字段脱敏、数值字段还原。"""
+    if not row:
+        return None
+    d = dict(row)
+    d["enabled"] = bool(d.get("enabled"))
+    d["enable_checksum"] = bool(d.get("enable_checksum"))
+    d["sample_rows"] = int(d.get("sample_rows") or 100)
+    d["interval_minutes"] = (int(d["interval_minutes"])
+                             if d.get("interval_minutes") is not None else None)
+    d["last_report_id"] = (int(d["last_report_id"])
+                           if d.get("last_report_id") is not None else None)
+    for side in _DATA_COMPARE_ENDPOINT_PREFIX:
+        has_pwd = bool(d.get(side + "_password"))
+        d["has_" + side + "_password"] = has_pwd
+        d[side + "_password"] = ""  # 接口不回显明文
+    try:
+        d["tables"] = _json.loads(d.get("tables") or "[]")
+    except Exception:
+        d["tables"] = []
+    return d
+
+
+def _dct_prepare_row(data: dict) -> dict:
+    """创建/更新前整理字段：加密密码、tables 序列化、数值规范化。"""
+    import core.db as _db
+    row = {k: data.get(k) for k in _DATA_COMPARE_TASK_FIELDS}
+    # 密码：留空不覆盖原值由调用方处理；新值加密存储
+    for side in _DATA_COMPARE_ENDPOINT_PREFIX:
+        pwd = row.get(side + "_password")
+        if pwd in (None, ""):
+            row[side + "_password"] = None
+        else:
+            row[side + "_password"] = _db.encrypt_secret(str(pwd))
+    if row.get("tables") in (None, ""):
+        row["tables"] = "[]"
+    elif not isinstance(row["tables"], str):
+        row["tables"] = _json.dumps(row["tables"], ensure_ascii=False)
+    row["enable_checksum"] = 1 if row.get("enable_checksum") not in (0, False, "0", None) else 0
+    row["enabled"] = 1 if row.get("enabled") not in (0, False, "0", None) else 1
+    row["sample_rows"] = int(row.get("sample_rows") or 100)
+    row["source_port"] = int(row["source_port"]) if row.get("source_port") not in (None, "") else None
+    row["target_port"] = int(row["target_port"]) if row.get("target_port") not in (None, "") else None
+    if row.get("interval_minutes") in ("", None):
+        row["interval_minutes"] = None
+    else:
+        row["interval_minutes"] = int(row["interval_minutes"])
+    return row
+
+
+def create_data_compare_task(data: dict) -> int:
+    """创建数据对比任务。返回新任务 id。"""
+    row = _dct_prepare_row(data)
+    now = db.now_iso()
+    row["created_at"] = now
+    row["updated_at"] = now
+    if not row.get("name"):
+        row["name"] = f"数据对比-{now[:10]}"
+    cols = list(row.keys())
+    sql = "INSERT INTO data_compare_tasks ({}) VALUES ({})".format(
+        ",".join(cols), ",".join("?" * len(cols)))
+    return db.execute(sql, tuple(row.values()))
+
+
+def get_data_compare_task(task_id: int, include_secret: bool = False) -> Optional[dict]:
+    """按 id 获取数据对比任务。默认脱敏；include_secret=True 时返回解密密码。"""
+    row = db.query_one("SELECT * FROM data_compare_tasks WHERE id=?", (task_id,))
+    if not row:
+        return None
+    d = _dct_to_dict(row)
+    if include_secret:
+        import core.db as _db
+        for side in _DATA_COMPARE_ENDPOINT_PREFIX:
+            raw = row.get(side + "_password") or ""
+            d[side + "_password"] = _db.decrypt_secret(raw) if raw else ""
+    return d
+
+
+def list_data_compare_tasks(enabled_only: bool = False) -> list:
+    """列出数据对比任务（脱敏）。"""
+    sql = "SELECT * FROM data_compare_tasks WHERE 1=1"
+    if enabled_only:
+        sql += " AND enabled=1"
+    sql += " ORDER BY id DESC"
+    return [_dct_to_dict(r) for r in db.query(sql)]
+
+
+def update_data_compare_task(task_id: int, data: dict) -> bool:
+    """更新数据对比任务（白名单）。密码留空表示不修改。"""
+    existing = db.query_one("SELECT * FROM data_compare_tasks WHERE id=?", (task_id,))
+    if not existing:
+        return False
+    updates = {k: v for k, v in data.items() if k in _DATA_COMPARE_TASK_FIELDS}
+    if not updates:
+        return False
+    prepared = _dct_prepare_row(updates)
+    # 密码留空 → 不覆盖原密码
+    for side in _DATA_COMPARE_ENDPOINT_PREFIX:
+        if prepared.get(side + "_password") in (None, ""):
+            prepared.pop(side + "_password", None)
+    prepared = {k: v for k, v in prepared.items() if k in updates}
+    if not prepared:
+        return False
+    prepared["updated_at"] = db.now_iso()
+    sets, params = [], []
+    for k, v in prepared.items():
+        sets.append(f"{k}=?")
+        params.append(v)
+    params.append(task_id)
+    db.execute("UPDATE data_compare_tasks SET {} WHERE id=?".format(",".join(sets)),
+               tuple(params))
+    return True
+
+
+def delete_data_compare_task(task_id: int) -> None:
+    """删除数据对比任务及其报告。"""
+    with db._write_lock:
+        conn = db.get_conn()
+        try:
+            conn.execute("DELETE FROM data_compare_reports WHERE task_id=?", (task_id,))
+            conn.execute("DELETE FROM data_compare_tasks WHERE id=?", (task_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def set_data_compare_status(task_id: int, last_run_at: str, last_status: str,
+                            last_report_id: int = None) -> None:
+    """更新对比任务最近一次运行状态。"""
+    db.execute(
+        "UPDATE data_compare_tasks SET last_run_at=?, last_status=?, "
+        "last_report_id=?, updated_at=? WHERE id=?",
+        (last_run_at, last_status, last_report_id, db.now_iso(), task_id))
+
+
+def create_data_compare_report(data: dict) -> int:
+    """创建数据对比报告（运行中）。返回报告 id。"""
+    now = db.now_iso()
+    row = {
+        "task_id": data.get("task_id"),
+        "status": data.get("status") or "running",
+        "duration_sec": float(data.get("duration_sec") or 0),
+        "summary_json": data.get("summary_json"),
+        "tables_json": data.get("tables_json"),
+        "message": data.get("message"),
+        "created_at": now,
+        "finished_at": None,
+    }
+    cols = list(row.keys())
+    sql = "INSERT INTO data_compare_reports ({}) VALUES ({})".format(
+        ",".join(cols), ",".join("?" * len(cols)))
+    return db.execute(sql, tuple(row.values()))
+
+
+def get_data_compare_report(report_id: int) -> Optional[dict]:
+    row = db.query_one("SELECT * FROM data_compare_reports WHERE id=?", (report_id,))
+    if not row:
+        return None
+    d = dict(row)
+    d["duration_sec"] = float(d.get("duration_sec") or 0)
+    for f in ("summary_json", "tables_json"):
+        try:
+            d[f] = _json.loads(d.get(f)) if d.get(f) else None
+        except Exception:
+            pass
+    return d
+
+
+def update_data_compare_report(report_id: int, data: dict) -> None:
+    """更新对比报告。"""
+    allow = {"status", "duration_sec", "summary_json", "tables_json",
+             "message", "finished_at"}
+    updates = {k: v for k, v in data.items() if k in allow}
+    if not updates:
+        return
+    if "duration_sec" in updates:
+        updates["duration_sec"] = float(updates["duration_sec"] or 0)
+    sets, params = [], []
+    for k, v in updates.items():
+        sets.append(f"{k}=?")
+        params.append(v)
+    params.append(report_id)
+    db.execute("UPDATE data_compare_reports SET {} WHERE id=?".format(",".join(sets)),
+               tuple(params))
+
+
+def list_data_compare_reports(task_id: int = None, limit: int = 200) -> list:
+    """列出对比报告（明细字段不展开，供列表页）。"""
+    sql = ("SELECT r.*, t.name AS task_name FROM data_compare_reports r "
+           "LEFT JOIN data_compare_tasks t ON t.id = r.task_id WHERE 1=1")
+    params: list = []
+    if task_id is not None:
+        sql += " AND r.task_id=?"
+        params.append(task_id)
+    sql += " ORDER BY r.id DESC LIMIT ?"
+    params.append(int(limit))
+    rows = []
+    for r in db.query(sql, tuple(params)):
+        d = dict(r)
+        d["duration_sec"] = float(d.get("duration_sec") or 0)
+        rows.append(d)
+    return rows
+
+
+def get_data_compare_stats() -> dict:
+    """数据对比仪表盘 KPI。"""
+    total = db.query_one("SELECT COUNT(*) AS c FROM data_compare_tasks")
+    success = db.query_one(
+        "SELECT COUNT(*) AS c FROM data_compare_reports WHERE status=?", ("success",))
+    failed = db.query_one(
+        "SELECT COUNT(*) AS c FROM data_compare_reports WHERE status=?", ("failed",))
+    last = db.query_one(
+        "SELECT created_at FROM data_compare_reports ORDER BY id DESC LIMIT 1")
+    return {
+        "task_count": int(total["c"] if total else 0),
+        "success_count": int(success["c"] if success else 0),
+        "failed_count": int(failed["c"] if failed else 0),
+        "last_compare_at": last["created_at"] if last else None,
+    }

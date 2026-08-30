@@ -4,6 +4,12 @@
 
 基于 **Python + Flask** 构建，元数据使用 SQLite（零外部依赖、开箱即用）；备份核心通过调用各数据库官方客户端工具或 SSH/SFTP 实现，能以最小依赖在生产环境稳定运行。
 
+> **社区版说明（Community Edition）**
+> 本项目当前发布为**社区版**：免费供个人学习、内部部署与中小规模生产环境使用。
+> 社区版包含全部备份 / 恢复 / 实时管控 / 数据同步 / 灾备演练等核心能力；企业级增强（大规模集群纳管、多租户、商业支持与定制开发）请联系作者洽谈。
+>
+> **联系方式**：📧 `1547358466@qq.com`（问题反馈、功能建议、合作洽谈均可来信）
+
 ---
 
 ## 功能特性
@@ -22,6 +28,7 @@
   - `file-backup`：tar.gz 全量 + 快照增量 + 准 CDP + 恢复链
 - **文件/目录备份**：本地与远程（SSH，无需安装 Agent）源，全量 + 增量（按 size+mtime 比对），`tar.gz` 归档；源主机与目标主机独立。增量基于**源快照**（同一路径的多任务共享基准），归档仅含变化文件，与全量一致直接保存到目标目录根下，不会删除目标目录里的其他文件。Windows 下采用**原子写入**（临时文件 + replace），避免防病毒/句柄锁导致空包
 - **多种备份策略**：全量（full）、增量（incremental）、差异（differential）、快照（snapshot）、合成全量（synthesized，由永久增量链自动合成）、**组合备份（mixed：全量+增量）**：任务同时配置全量调度与增量调度，调度器分别注册 `task_<id>_full` 和 `task_<id>_incremental` 两个作业；触发执行时按 `run_task_now(task_id, backup_type)` 覆盖备份类型，任务列表直观显示「组合 全…/增…」
+- **自定义备份/恢复脚本（全数据库类型通用）**：备份方式选「自定义脚本」即可粘贴 bash 脚本，在数据库服务器（SSH 主机）上执行。平台注入环境变量 `PLATFORM_DB_HOST / PLATFORM_DB_PORT / PLATFORM_DB_USER / PLATFORM_DB_PASSWORD / PLATFORM_DB_NAME / PLATFORM_BACKUP_TYPE / PLATFORM_BACKUP_DIR`（恢复时另有 `PLATFORM_BACKUP_FILE / PLATFORM_RESTORE_DB`）；脚本退出码 0 = 成功，**产物必须写入 `$PLATFORM_BACKUP_DIR`**，平台自动 SFTP 拉回、计算真实大小与 sha256、生成备份记录（支持定时调度与三级存储复制）；可选「恢复脚本」配合使用（备份文件自动推送到目标主机并注入 `PLATFORM_BACKUP_FILE`）。适用于任意自定义备份工具/方案（xtrabackup 定制参数、快照、导出工具、云工具等）
 
 ### 管理与可视化
 - **Web 可视化管理**：仪表盘、数据库备份、文件备份、数据同步、存储管理、保护策略、备份/恢复记录、数据恢复管理、灾备管理、巡检、智能告警、系统设置等
@@ -52,6 +59,7 @@
 
 ### 数据恢复与灾备
 - **数据恢复管理**：一键将历史备份恢复到目标实例（数据库）或目标目录（文件）；文件增量恢复时**自动构建恢复链**（先回最近全量，再按时间顺序应用增量），数据库部署（将数据库部署到目标实例）
+- **数据对比（恢复数据 vs 生产库）**：恢复完成后可对恢复库与原生产库做数据级一致性校验——表清单比对 → 行数比对 → 全表校验和（可选，MySQL=CRC32 / PostgreSQL=hashtext / Oracle=ORA_HASH，跨版本通用语法）→ 抽样行逐列比对（默认 100 行，可配）。支持 MySQL/MariaDB、PostgreSQL/Kingbase、Oracle；连接优先 DB-API 直连（pymysql/psycopg2/oracledb），缺失时自动回退 JDBC 桥接；支持手动 / cron / 间隔调度，报告含逐表差异明细（含不一致行的源/目标值对照）。页面：「数据恢复管理 → 数据对比」
 - **数据库部署（Deploy）**：将数据库（MySQL / MongoDB 等）自动部署到目标 Linux 主机，上传安装包 → 生成安装脚本 → 执行安装 → 实时日志轮询；支持单机/副本集、认证开关、keyFile 等。MySQL 部署统一用 `mysqld_safe` 启动、显式错开 mysqlx 端口；MongoDB 部署支持无认证/副本集+认证（keyFile + `rs.initiate`）；部署记录含连接测试、日志与状态。页面：「数据库部署」。
 - **灾备管理**：数据迁移（原「迁移保护」）、数据同步、容灾链路、克隆服务（创建可独立使用的克隆实例）
 
@@ -142,6 +150,19 @@
 | MongoDB | `mongodump` | `mongorestore` | 通过 `--password` 传密码 |
 
 > 请将上述客户端工具安装到运行平台的 `PATH` 中。缺少客户端时平台仍以“演示模式”运行。
+
+---
+
+## 前端技术选型说明
+
+平台前端采用 **Jinja2 服务端模板 + Bootstrap 5 + 原生 JS（IIFE + `BKP` 工具集）**，
+并针对复杂交互页面提供 **Preact + htm 免构建方案**（试点：`static/js/data_compare_preact.js`）：
+
+- Preact / htm 的 ESM 文件已**本地化**于 `static/vendor/preact/`（约 16KB），配合浏览器原生
+  import map 加载，**零 npm 依赖、零构建步骤、完全离线可用**，契合平台离线独立打包的部署形态；
+- 写法上与 React（组件 + Hooks）几乎一致，未来若升级完整 React + Vite 工具链可平滑迁移；
+- 页面引入方式：模板内声明 import map + `<script type="module">`（参考 `templates/data_compare.html`）；
+- 传统简单页面（表格 + 表单 + 模态框）仍推荐原生 JS，避免过度工程化。
 
 ---
 
@@ -286,6 +307,45 @@ python run.py
 浏览器访问 `http://<服务器IP>:8080`，使用默认账号 `admin / admin123` 登录。
 
 > 沙箱 / 演示环境中没有安装数据库客户端时，平台会自动以“演示模式”运行：新建任务并点击“备份”会生成标记 `simulated` 的占位备份文件，便于验证完整流程。
+
+---
+
+## Docker 部署（含离线运行）
+
+镜像已包含全部 Python 依赖与 JRE（JDBC 桥接用），**运行时无需联网、无需外部安装任何依赖**。
+
+### 从 GitHub 拉取镜像
+
+镜像由 GitHub Actions 自动构建并发布到 GHCR（push 标签 `v*` 或手动触发）：
+
+```bash
+# 公开镜像，直接拉取（离线环境可先在有网机器 docker pull / docker save 后拷贝）
+docker pull ghcr.io/<OWNER>/backup-platform:latest
+
+# 离线环境导入
+docker load -i backup-platform-image.tar.gz
+```
+
+### 运行
+
+```bash
+docker run -d --name backup-platform \
+  -p 8080:8080 \
+  -v /data/backup-platform:/data \
+  -e WEB_PASSWORD=your_password \
+  ghcr.io/<OWNER>/backup-platform:latest
+```
+
+- `/data` 挂载卷持久化：元数据库（`instance/`）、备份文件（`backups/`）、日志（`logs/`）
+- 配置全部走环境变量（`WEB_PORT`、`SECRET_KEY`、`WEB_USERNAME` 等，见上文「配置」）
+- 访问 `http://<主机IP>:8080`，默认账号 `admin / admin123`（**请立即修改**）
+
+### 手动构建镜像
+
+```bash
+docker build -t backup-platform:local .
+docker run --rm -p 8080:8080 backup-platform:local
+```
 
 ---
 

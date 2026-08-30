@@ -111,6 +111,7 @@ BACKUP_TYPE_DISPLAY_NAMES = {
 BACKUP_MODE_DISPLAY_NAMES = {
     "logical": "逻辑备份",
     "physical": "物理备份",
+    "custom": "自定义脚本",
 }
 
 # 备份状态（status）中文映射：仪表盘/记录页统一展示

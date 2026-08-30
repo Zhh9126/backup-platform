@@ -1,0 +1,37 @@
+# 版本控制与 CI
+.git
+.github
+.gitignore
+
+# 运行时数据与敏感信息（绝不入镜像）
+instance/
+backups/
+logs/
+rt_logs/
+rt_files/
+cookies.txt
+login.json
+config.json
+config.yaml
+
+# 文档 / 测试 / 开发辅助
+docs/
+tests/
+scripts/
+*.md
+!README.md
+*.spec
+*.mmd
+*.mermaid
+*.png
+
+# 探针与临时文件
+probe_*
+repro_*
+generated-images/
+JdbcTest.java
+__pycache__/
+*.pyc
+*.pyo
+*.dmp
+*.tar.gz

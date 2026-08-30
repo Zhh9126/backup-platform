@@ -243,6 +243,12 @@ def create_app() -> Flask:
         """恢复校验策略与恢复测试报告。"""
         return render_template("restore_verify.html", page="restore-verify")
 
+    @app.route("/data-compare")
+    @login_required
+    def data_compare_page():
+        """数据对比：验证恢复后的数据与原生产库的一致性。"""
+        return render_template("data_compare.html", page="data-compare")
+
     return app
 
 

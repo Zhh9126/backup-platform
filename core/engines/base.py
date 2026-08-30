@@ -16,6 +16,7 @@ import sys
 import json
 import time
 import shutil
+import shlex
 import subprocess
 import functools
 from dataclasses import dataclass
@@ -23,6 +24,11 @@ from typing import Optional, List
 
 import config
 import core.db as db
+
+
+def shlex_quote(s: str) -> str:
+    """shell 单词安全引用（供自定义脚本环境变量注入使用）。"""
+    return shlex.quote(str(s))
 
 
 def _is_network_error(exc: Exception) -> bool:
@@ -354,7 +360,18 @@ class BackupEngine:
         """
         from core import plugin_runtime, plugin_catalog
 
-        # 1. 自带工具
+        # 1. 自带工具（若引擎声明了服务运行用户如 oracle，先以该用户探测——
+        #    工具往往只在其 profile PATH 中可见，root 探测会误报缺失）
+        check_user = getattr(self, "tool_check_user", None)
+        if self.physical_bundled_tools and check_user:
+            from core import remote_dump
+            missing = [t for t in self.physical_bundled_tools
+                       if not remote_dump.remote_has_tool(ssh_host, t, check_user=check_user)]
+            if missing:
+                return (False,
+                        f"远端 {check_user} 用户环境缺少 {', '.join(missing)}，"
+                        f"请确认数据库软件安装与用户 profile 配置")
+            return True, f"ok（以 {check_user} 用户探测）"
         if self.physical_bundled_tools:
             chk = plugin_runtime.remote_check_clients(
                 ssh_host, self.physical_bundled_tools)
@@ -382,29 +399,54 @@ class BackupEngine:
         return True, "ok"
 
     def _preflight_remote_logical(self, ssh_host: dict) -> (bool, str):
-        """逻辑备份远端前置检查：在 SSH 主机上探测 required_clients 是否就绪。"""
+        """逻辑备份远端前置检查：在 SSH 主机上探测 required_clients 是否就绪。
+
+        - 若引擎声明 tool_check_user（如 Oracle 的工具仅 oracle 用户 profile 可见），
+          则以该用户身份探测；
+        - required_clients 中只要主工具（第一个）就绪即放行，其余缺失仅告警
+          （引擎层有回退逻辑，如 exp 不可用回退 expdp）。
+        """
         from core import remote_dump
         if not self.required_clients:
             return True, "ok"
+        check_user = getattr(self, "tool_check_user", None)
         missing = []
         for tool in self.required_clients:
-            if not remote_dump.remote_has_tool(ssh_host, tool):
+            if not remote_dump.remote_has_tool(ssh_host, tool, check_user=check_user):
                 missing.append(tool)
-        if missing:
+        primary = self.required_clients[0]
+        if primary in missing:
             return False, (
                 "远端 SSH 主机缺少客户端工具: " + ", ".join(missing) +
                 "（请安装并在 PATH 中）"
             )
+        if missing:
+            self.logger.warning(
+                "[%s] 远端部分客户端缺失(%s)，主工具 %s 就绪，放行（引擎内含回退逻辑）",
+                self.task_name, ", ".join(missing), primary)
         return True, "远端工具就绪"
 
     def preflight(self) -> (bool, str):
         """备份前置检查：检测依赖是否就绪。
 
+        - 自定义脚本模式：仅需 SSH 主机，跳过客户端工具检查。
         - 物理备份：先查远端（SSH 主机上的物理工具），再查本机自带工具。
           不依赖 check_client()（那是逻辑备份工具检查）。
         - 逻辑备份：优先 check_client()；本机缺失时，若任务目标有 SSH 主机，
           则到远端探测 required_clients，远端有即放行。不再仿真兜底。
         """
+        try:
+            extra = self._parse_task_extra()
+        except Exception:
+            extra = {}
+        if extra.get("custom_script"):
+            from core import remote_dump
+            ssh_host = remote_dump.resolve_ssh_host(self.task)
+            if not ssh_host:
+                return False, ("自定义脚本模式需要 SSH 主机执行脚本："
+                               "请按数据库地址自动匹配或在本任务中指定 SSH 主机")
+            return True, "自定义脚本模式（SSH 执行，跳过客户端检查）"
+
         try:
             mode = self.backup_mode
         except Exception:
@@ -709,6 +751,251 @@ class BackupEngine:
         return BackupResult(success=False, status=BackupStatus.FAILED, message=msg)
 
     # ---------------- 子类需实现 ----------------
+    # ------------------------------------------------------------------ #
+    # 自定义备份/恢复脚本（全数据库类型通用）
+    # ------------------------------------------------------------------ #
+    def _parse_task_extra(self) -> dict:
+        """解析任务 extra_options（JSON 字符串或 dict），返回 dict。"""
+        raw = self.task.get("extra_options")
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str) and raw.strip():
+            import json as _json
+            try:
+                return _json.loads(raw)
+            except Exception:
+                return {}
+        return {}
+
+    def run_backup(self, backup_type: BackupType) -> BackupResult:
+        """统一备份入口：配置了自定义脚本（extra_options.custom_script）时
+        优先执行用户脚本，否则走引擎原生备份。
+
+        自定义脚本在数据库服务器（SSH 主机）上执行，平台注入 PLATFORM_*
+        环境变量，并把脚本产出的备份文件拉回本机落盘（真实 size/sha256）。
+        """
+        extra = self._parse_task_extra()
+        if not extra.get("custom_script"):
+            return self.backup(backup_type)
+
+        from core import remote_dump
+        ssh_host = remote_dump.resolve_ssh_host(self.task)
+        if not ssh_host:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message="自定义备份脚本需要 SSH 主机执行：请纳管数据库服务器"
+                        "（按任务地址自动匹配）或在任务中指定 SSH 主机")
+        return self._backup_custom_remote(ssh_host, backup_type, extra)
+
+    def _backup_custom_remote(self, ssh_host: dict, backup_type: BackupType,
+                              extra: dict) -> BackupResult:
+        """在数据库服务器上执行用户自定义备份脚本。
+
+        约定：
+        - 脚本以 bash 运行（root 身份），退出码 0 = 成功；
+        - 脚本必须把备份产物写入环境变量 PLATFORM_BACKUP_DIR 指向的目录
+          （平台每次运行为其分配独立子目录，避免污染）；
+        - 平台在脚本执行后扫描该目录，把产物 SFTP 拉回本机并计算
+          真实 size/sha256；无产物视为失败。
+        """
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+        import time as _time
+
+        ts = self._timestamp()
+        task_id = self.task.get("id") or "x"
+        script_body = str(extra.get("custom_script") or "")
+        artifact_dir = (extra.get("custom_artifact_dir") or
+                        f"/var/tmp/platform_backup/{task_id}/{ts}").rstrip("/")
+        timeout_sec = int(extra.get("custom_timeout") or 7200)
+
+        client = remote_dump._connect(ssh_host)
+        sftp = client.open_sftp()
+        try:
+            remote_script = f"/tmp/platform_custom_{task_id}_{ts}.sh"
+            with sftp.open(remote_script, "w") as f:
+                f.write(script_body if script_body.endswith("\n") else script_body + "\n")
+            try:
+                sftp.chmod(remote_script, 0o700)
+            except Exception:
+                pass
+
+            pw = db.decrypt_secret(self.task.get("password") or "")
+            start = _time.time()
+            env_lines = [
+                f"export PLATFORM_BACKUP_TYPE={backup_type.value}",
+                f"export PLATFORM_TASK_ID={task_id}",
+                f"export PLATFORM_TASK_NAME={shlex_quote(str(self.task.get('name') or ''))}",
+                f"export PLATFORM_DB_HOST={self.task.get('host') or ''}",
+                f"export PLATFORM_DB_PORT={self.task.get('port') or ''}",
+                f"export PLATFORM_DB_USER={self.task.get('username') or ''}",
+                f"export PLATFORM_DB_NAME={self.task.get('db_name') or ''}",
+                f"export PLATFORM_BACKUP_DIR={artifact_dir}",
+            ]
+            if pw:
+                env_lines.append(f"export PLATFORM_DB_PASSWORD={shlex_quote(pw)}")
+            inner = ("mkdir -p " + artifact_dir + " && "
+                     + " && ".join(env_lines)
+                     + f" && bash {remote_script}")
+            shell = remote_dump._wrap_login(inner)
+            out, err, rc = _ssh_exec_pipe(client, shell, timeout=timeout_sec)
+            duration = round(_time.time() - start, 3)
+            out_text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+            err_text = err or ""
+            self.logger.info("[%s] 自定义脚本返回 rc=%s", self.task_name, rc)
+
+            if rc != 0:
+                snippet = (out_text or err_text)[-1500:]
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    duration_sec=duration, stdout=out_text, stderr=err_text,
+                    message=f"自定义备份脚本执行失败(rc={rc}): {snippet}")
+
+            # 扫描产物目录（仅拉取本次运行期间产生/修改的常规文件）
+            start_floor = start - 5
+            artifacts = []
+            try:
+                for attr in sftp.listdir_attr(artifact_dir):
+                    if attr.st_size <= 0:
+                        continue
+                    if getattr(attr, "st_mtime", 0) and attr.st_mtime < start_floor:
+                        continue  # 跳过旧文件（用户指定目录可能已有历史产物）
+                    artifacts.append((attr.filename, attr.st_size))
+            except IOError as e:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    duration_sec=duration, stdout=out_text, stderr=err_text,
+                    message=f"自定义脚本产物目录不存在或不可读: {artifact_dir} ({e})")
+
+            if not artifacts:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    duration_sec=duration, stdout=out_text, stderr=err_text,
+                    message=("自定义脚本执行成功但未产出备份文件："
+                             f"请让脚本把产物写入 $PLATFORM_BACKUP_DIR（本次为 {artifact_dir}）"))
+
+            out_dir = self._output_dir()
+            os.makedirs(out_dir, exist_ok=True)
+            local_files = []
+            total = 0
+            for fname, fsize in artifacts:
+                local_path = os.path.join(out_dir, fname)
+                sftp.get(f"{artifact_dir}/{fname}", local_path)
+                local_files.append((local_path, os.path.getsize(local_path)))
+                total += os.path.getsize(local_path)
+            local_files.sort(key=lambda x: -x[1])
+            primary = local_files[0][0]
+            checksum = db.sha256_file(primary)
+
+            manifest = os.path.join(out_dir, f"{ts}_custom_manifest.txt")
+            with open(manifest, "w", encoding="utf-8") as mf:
+                mf.write("Custom backup script via SSH\n")
+                mf.write(f"ssh_host: {ssh_host.get('host_key', '')}\n")
+                mf.write(f"task: {self.task_name}\n")
+                mf.write(f"backup_type: {backup_type.value}\n")
+                mf.write(f"artifact_dir: {artifact_dir}\n")
+                for p, sz in local_files:
+                    mf.write(f"{os.path.basename(p)}\t{sz}\t{db.sha256_file(p)}\n")
+
+            hk = ssh_host.get("host_key", "remote")
+            msg = (f"自定义备份脚本在 {hk} 执行成功，拉回 {len(local_files)} 个产物"
+                   f"共 {db.human_size(total)}（主文件: {os.path.basename(primary)}）")
+            self.logger.info("[%s] %s", self.task_name, msg)
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=primary, size_bytes=total,
+                duration_sec=duration, stdout=out_text, stderr=err_text,
+                simulated=False, checksum=checksum, message=msg)
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def run_restore(self, backup_path: str, **kwargs) -> BackupResult:
+        """统一恢复入口：配置了自定义恢复脚本（extra_options.custom_restore_script）
+        时执行用户恢复脚本（备份文件先 SFTP 推到目标 SSH 主机），否则走引擎原生恢复。
+        """
+        extra = self._parse_task_extra()
+        script = extra.get("custom_restore_script")
+        if not script:
+            return self.restore(backup_path, **kwargs)
+
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+        import time as _time
+
+        ssh_host = kwargs.get("target_host_info") or remote_dump.resolve_ssh_host(self.task)
+        if not ssh_host:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message="自定义恢复脚本需要 SSH 主机（恢复表单选择目标主机）")
+
+        if not backup_path or not os.path.exists(backup_path):
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message=f"本地备份文件不存在: {backup_path}")
+
+        ts = self._timestamp()
+        timeout_sec = int(extra.get("custom_timeout") or 7200)
+        client = remote_dump._connect(ssh_host)
+        sftp = client.open_sftp()
+        try:
+            remote_file = f"/tmp/platform_restore_{ts}_{os.path.basename(backup_path)}"
+            sftp.put(backup_path, remote_file)
+            remote_script = f"/tmp/platform_custom_restore_{ts}.sh"
+            with sftp.open(remote_script, "w") as f:
+                f.write(script if script.endswith("\n") else script + "\n")
+            try:
+                sftp.chmod(remote_script, 0o700)
+            except Exception:
+                pass
+
+            start = _time.time()
+            pw2 = db.decrypt_secret(self.task.get("password") or "")
+            env_lines = [
+                f"export PLATFORM_BACKUP_FILE={shlex_quote(remote_file)}",
+                f"export PLATFORM_RESTORE_DB={shlex_quote(str(kwargs.get('target_db') or self.task.get('db_name') or ''))}",
+                f"export PLATFORM_TASK_ID={self.task.get('id') or ''}",
+                f"export PLATFORM_DB_HOST={self.task.get('host') or ''}",
+                f"export PLATFORM_DB_PORT={self.task.get('port') or ''}",
+                f"export PLATFORM_DB_USER={self.task.get('username') or ''}",
+                f"export PLATFORM_DB_NAME={self.task.get('db_name') or ''}",
+            ]
+            if pw2:
+                env_lines.append(f"export PLATFORM_DB_PASSWORD={shlex_quote(pw2)}")
+            inner = " && ".join(env_lines) + f" && bash {remote_script}"
+            shell = remote_dump._wrap_login(inner)
+            out, err, rc = _ssh_exec_pipe(client, shell, timeout=timeout_sec)
+            duration = round(_time.time() - start, 3)
+            out_text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+
+            if rc != 0:
+                detail = (out_text or err_text or "")[-1200:]
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    duration_sec=duration, stdout=out_text, stderr=err_text,
+                    message=f"自定义恢复脚本执行失败(rc={rc}): {detail}")
+            msg = (f"自定义恢复脚本在 {ssh_host.get('host_key', '')} 执行成功"
+                   f"（耗时 {duration}s，备份文件: {os.path.basename(backup_path)}）")
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=backup_path, duration_sec=duration,
+                stdout=out_text, simulated=False, message=msg)
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass
+
     def backup(self, backup_type: BackupType) -> BackupResult:
         raise NotImplementedError
 

@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">数据对比</div>
+    <div class="page-sub">验证恢复后的备份数据与原生产库的一致性：表清单 → 行数 → 校验和（可选）→ 抽样行</div>
+  </div>
+  <div>
+    <button class="btn btn-outline-secondary btn-sm" onclick="dcRefresh()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+    <button class="btn btn-primary btn-sm" onclick="dcCreate()" title="新建对比任务"><i class="bi bi-plus-lg"></i> 新建对比任务</button>
+  </div>
+</div>
+
+<!-- Preact 渲染根节点（KPI/任务/报告/模态框均由 data_compare_preact.js 组件化渲染） -->
+<div id="dc-root"></div>
+{% endblock %}
+
+{% block scripts %}
+<script type="importmap">
+{"imports": {
+  "preact": "/static/vendor/preact/preact.module.js",
+  "preact/hooks": "/static/vendor/preact/hooks.module.js",
+  "htm": "/static/vendor/preact/htm.module.js"
+}}
+</script>
+<script type="module" src="/static/js/data_compare_preact.js?v=2026083002"></script>
+{% endblock %}

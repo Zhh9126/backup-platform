@@ -68,18 +68,24 @@ def resolve_ssh_host(task: dict):
     return None
 
 
-def remote_has_tool(ssh_host: dict, tool: str) -> bool:
-    """检查远程 SSH 主机上是否存在指定命令。"""
+def remote_has_tool(ssh_host: dict, tool: str, check_user: str = None) -> bool:
+    """检查远程 SSH 主机上是否存在指定命令（独立连接，不污染连接池）。
+
+    check_user：以指定用户身份探测（su - <user> -c），用于工具仅在某个
+    服务运行用户的 profile PATH 中可见的场景（如 Oracle 的 expdp/rman
+    只在 oracle 用户环境变量中）。默认以 SSH 登录用户探测。
+    """
     client = None
     try:
-        client = _connect(ssh_host)
-        shell = _wrap_login(
-            f"command -v {shlex.quote(tool)} >/dev/null 2>&1 || "
-            f"which {shlex.quote(tool)} >/dev/null 2>&1"
-        )
-        from core.engines.file import _ssh_exec_pipe
-        _out, _err, rc = _ssh_exec_pipe(client, shell, timeout=30)
-        return rc == 0
+        client = _connect_isolated(ssh_host)
+        if check_user:
+            probe = (f"su - {shlex.quote(check_user)} -c "
+                     f"{shlex.quote('command -v ' + shlex.quote(tool) + ' >/dev/null 2>&1')}")
+            shell = _wrap_login(probe)
+            from core.engines.file import _ssh_exec_pipe
+            _out, _err, rc = _ssh_exec_pipe(client, shell, timeout=30)
+            return rc == 0
+        return _resolve_remote_bin(client, tool) is not None
     except Exception:
         return False
     finally:
@@ -230,20 +236,32 @@ def _resolve_remote_bin(client, tool: str) -> str | None:
             pass
 
     common_dirs = (
-        "/usr/bin /usr/sbin /usr/local/bin /usr/local/sbin /opt "
-        "/usr/local/mysql/bin /usr/local/mariadb/bin "
+        "/usr/bin /usr/sbin /usr/local/bin /usr/local/sbin /bin /sbin /opt "
+        "/usr/local/mysql/bin /usr/local/mariadb/bin /opt/mysql*/bin /opt/database/bin "
         "/usr/pgsql-*/bin /usr/lib/postgresql/*/bin "
         "/usr/local/pgsql/bin /var/lib/pgsql/*/bin /opt/PostgreSQL/*/bin /opt/pg/*/bin "
-        "/pgdb/pgsql/bin /pgdb/*/bin"
+        "/pgdb/pgsql/bin /pgdb/*/bin "
+        # Oracle：静默安装常见目录（ORACLE_HOME 可能为 product/版本/dbhome_n 结构）
+        "/u01/app/oracle/product/*/*/bin /u01/app/oracle/*/bin /home/oracle/product/*/*/bin "
+        # DM 达梦
+        "/dm8/bin /opt/dmdbms/bin /home/dmdba/dmdbms/bin /opt/dm*/bin "
+        # 人大金仓
+        "/opt/Kingbase/ES/V*/bin /opt/kingbase/*/bin /KingbaseES/V*/bin "
+        # Redis / MongoDB
+        "/usr/local/redis*/bin /usr/local/redis/bin /opt/redis*/bin "
+        "/usr/local/mongodb*/bin /opt/mongodb*/bin /usr/local/mongodb/bin "
+        # 通用自部署目录
+        "/usr/local/*/bin /data/*/bin /data/*/*/bin /app/*/bin"
     )
-    # 单条命令：先 command -v，再用 find 兜底
+    # 单条命令：先 command -v，再用 find 兜底（find 只在声明过的候选目录中找，
+    # 绝不硬编码任何单一安装路径 —— 全部以 glob/枚举动态发现）
     cmd = (
         f"command -v {shlex.quote(tool)} 2>/dev/null || "
-        f"find {common_dirs} -maxdepth 4 -name {shlex.quote(tool)} -type f 2>/dev/null | head -1"
+        f"find {common_dirs} -maxdepth 4 -name {shlex.quote(tool)} -type f -perm -u+x 2>/dev/null | head -1"
     )
     shell = _wrap_login(cmd)
     try:
-        out, err, rc = _ssh_exec_pipe(client, shell, timeout=30)
+        out, err, rc = _ssh_exec_pipe(client, shell, timeout=45)
     except Exception:
         return None
     if rc != 0:
@@ -260,6 +278,53 @@ def _resolve_remote_bin(client, tool: str) -> str | None:
             return c
 
     return None
+
+
+_remote_bin_cache: dict = {}
+
+
+def resolve_remote_tool(ssh_host: dict, tool: str, check_user: str = None) -> str:
+    """解析远端数据库自带工具的绝对路径（带缓存），找不到返回 ""。
+
+    解析顺序（绝不硬编码单一路径，全部动态发现）：
+    1) 以 check_user（如 oracle）身份 `command -v`（该用户的 profile PATH）；
+    2) 以 SSH 登录用户 bash -lc `command -v`（/etc/profile）；
+    3) 常见安装目录 glob 枚举 + find（覆盖 Oracle/DM/金仓/MySQL/PG/Redis/Mongo）。
+    结果按 (host_key, tool, check_user) 缓存，避免同一任务内反复探测。
+    """
+    key = (ssh_host.get("host_key") or ssh_host.get("hostname") or "", tool, check_user or "")
+    if key in _remote_bin_cache:
+        return _remote_bin_cache[key]
+
+    path = ""
+    client = None
+    try:
+        client = _connect_isolated(ssh_host)
+        if check_user:
+            from core.engines.file import _ssh_exec_pipe
+            probe = (f"su - {shlex.quote(check_user)} -c "
+                     f"{shlex.quote('command -v ' + shlex.quote(tool) + ' 2>/dev/null')}")
+            out, _err, rc = _ssh_exec_pipe(client, _wrap_login(probe), timeout=30)
+            text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+            for line in text.splitlines():
+                line = line.strip()
+                if line.startswith("/"):
+                    path = line
+                    break
+        if not path:
+            path = _resolve_remote_bin(client, tool) or ""
+    except Exception:
+        path = ""
+    finally:
+        if client:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    if path:
+        _remote_bin_cache[key] = path
+    return path
 
 
 def _connect_isolated(ssh_host: dict):
@@ -311,22 +376,6 @@ def _connect_isolated(ssh_host: dict):
     except Exception:
         pass
     return client
-
-
-def remote_has_tool(ssh_host: dict, tool: str) -> bool:
-    """检查远端 SSH 主机上 tool 命令是否存在且可执行（使用独立连接，不污染连接池）。"""
-    client = None
-    try:
-        client = _connect_isolated(ssh_host)
-        return _resolve_remote_bin(client, tool) is not None
-    except Exception:
-        return False
-    finally:
-        if client:
-            try:
-                client.close()
-            except Exception:
-                pass
 
 
 # ----------------------------- 远程 DUMP -----------------------------

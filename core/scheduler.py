@@ -300,7 +300,7 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
         else:
             if pre_detail and pre_detail != "ok":
                 _logger.info("备份前置提示 task=%s: %s", task["id"], pre_detail)
-            result = engine.backup(bt)
+            result = engine.run_backup(bt)
     except Exception as e:
         result = BackupResult(success=False, status=BackupStatus.FAILED, message=f"执行异常: {e}")
         _logger.exception("备份异常 task=%s", task["id"])
@@ -468,7 +468,7 @@ def run_restore_now(record_id: int, target_host: str = None,
     try:
         from core.engines import get_engine
         engine = get_engine(task["db_type"], task, config.BACKUP_ROOT, _logger)
-        result = engine.restore(rec["backup_path"], target_host=target_host,
+        result = engine.run_restore(rec["backup_path"], target_host=target_host,
                                 target_host_info=target_host_info,
                                 target_db=target_db,
                                 target_port=target_port)
@@ -907,6 +907,50 @@ def _register_restore_verify(sched):
         _logger.info("[restore_verify] 策略 %s 已注册调度(%s)", p.get("id"), st)
 
 
+# ------------------------- 数据对比调度 -------------------------
+def _data_compare_job_wrapper(task_id: int):
+    """调度触发的数据对比：调用 data_compare.run_data_compare_task。"""
+    try:
+        from core import data_compare as dc
+        result = dc.run_data_compare_task(task_id)
+        _logger.info("[data_compare] 任务 %s 执行完成: success=%s",
+                     task_id, result.get("success"))
+    except Exception:
+        _logger.exception("[data_compare] 任务 %s 调度执行异常", task_id)
+
+
+def _register_data_compare(sched):
+    """注册所有启用的数据对比任务为独立的周期 job（模式同恢复校验）。"""
+    try:
+        tasks = models.list_data_compare_tasks(enabled_only=True)
+    except Exception as e:
+        _logger.warning("[data_compare] 读取任务失败: %s", e)
+        return
+    for t in tasks or []:
+        st = t.get("schedule_type")
+        trig = None
+        if st == "cron" and t.get("cron_expr"):
+            from apscheduler.triggers.cron import CronTrigger
+            try:
+                trig = CronTrigger.from_crontab(t["cron_expr"])
+            except Exception as e:
+                _logger.warning("[data_compare] 任务 %s cron 非法: %s", t.get("id"), e)
+        elif st == "interval" and t.get("interval_minutes"):
+            from apscheduler.triggers.interval import IntervalTrigger
+            trig = IntervalTrigger(minutes=int(t["interval_minutes"]))
+        if not trig:
+            continue
+        job_id = "dc_task_" + str(t["id"])
+        try:
+            sched.remove_job(job_id)
+        except Exception:
+            pass
+        sched.add_job(_data_compare_job_wrapper, trig, id=job_id,
+                      replace_existing=True, args=[t["id"]],
+                      misfire_grace_time=3600)
+        _logger.info("[data_compare] 任务 %s 已注册调度(%s)", t.get("id"), st)
+
+
 def _register(sched, task: dict, prefix: str = "task"):
     wrapper = _job_wrapper if prefix == "task" else _job_wrapper_sync
     if prefix != "task":
@@ -1089,6 +1133,7 @@ def start_scheduler():
     _register_ai_alert(_scheduler)
     _register_drill_schedule(_scheduler)
     _register_restore_verify(_scheduler)
+    _register_data_compare(_scheduler)
     _register_synthesize(_scheduler)
     _register_rt_backup(_scheduler)
     _scheduler.start()
@@ -1118,6 +1163,7 @@ def reload_scheduler():
     _register_ai_alert(_scheduler)
     _register_drill_schedule(_scheduler)
     _register_restore_verify(_scheduler)
+    _register_data_compare(_scheduler)
     _register_synthesize(_scheduler)
     # RT 周期任务幂等重注册；Supervisor 主循环 tick 已保留，不重启守护
     if config.RT_BACKUP_ENABLED:

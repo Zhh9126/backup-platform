@@ -48,7 +48,8 @@ def run_restore_verify_policy(policy_id: int) -> dict:
     if not policy:
         raise ValueError(f"恢复校验策略不存在: {policy_id}")
     task_id = policy["task_id"]
-    task = models.get_task(task_id)
+    # include_secret=True：恢复校验（如 Oracle impdp SQLFILE）需要真实连接串
+    task = models.get_task(task_id, include_secret=True)
     if not task:
         raise ValueError(f"策略关联的任务不存在: {task_id}")
 

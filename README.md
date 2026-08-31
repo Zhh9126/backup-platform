@@ -319,11 +319,18 @@ python run.py
 
 ### 从 GitHub 拉取镜像
 
-镜像由 GitHub Actions 自动构建并发布到 GHCR（push 标签 `v*` 或手动触发）：
+镜像由 GitHub Actions 自动构建并发布到 GHCR（push 标签 `v*` 或手动触发）。每个版本发布（如 `v1.1.2`）会同时产出以下 tag，**推荐用「版本-日期」tag 固定可追溯的镜像**：
+
+| Tag | 示例 | 说明 |
+|---|---|---|
+| `latest` | `…:latest` | 默认分支最新构建（跟随更新） |
+| `community` | `…:community` | 社区版固定别名（跟随更新） |
+| `1.1.2` | `…:1.1.2` | 纯版本号 |
+| `1.1.2-20260831` | `…:1.1.2-20260831` | 版本 + 构建日期（**推荐**，同版本多次构建可区分） |
 
 ```bash
-# 公开镜像，直接拉取（离线环境可先在有网机器 docker pull / docker save 后拷贝）
-docker pull ghcr.io/<OWNER>/backup-platform:latest
+# 按版本+日期拉取（离线环境可先在有网机器 docker pull / docker save 后拷贝）
+docker pull ghcr.io/<OWNER>/backup-platform:1.1.2-20260831
 
 # 离线环境导入
 docker load -i backup-platform-image.tar.gz

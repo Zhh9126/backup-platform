@@ -315,7 +315,7 @@ python run.py
 
 ## Docker 部署（含离线运行）
 
-镜像已包含全部 Python 依赖与原生直连驱动（pymysql/psycopg2/oracledb），**运行时无需联网、无需外部安装任何依赖、无需 Java/JRE**。
+镜像已包含全部 Python 依赖与原生直连驱动（pymysql/psycopg2/oracledb），并附带 JRE + JDBC 驱动 jar 作为可选兜底（如 Oracle 11g），**运行时无需联网、无需外部安装任何依赖**。
 
 ### 从 GitHub 拉取镜像
 

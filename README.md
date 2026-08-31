@@ -78,11 +78,12 @@
 ### 主机与连接纳管
 - **SSH 主机纳管**（`ssh_hosts` 表）：用于文件备份的远程源/目标，密码 XOR + base64 加密，支持连接测试
 
-### JDBC 直连能力
-- **JDBC 连接方式**（`core/jdbc.py`）：通过 JPype/jaydebeapi 桥接 Java JDBC 驱动，实现**不依赖 SSH / 本机客户端**的数据库直连——连接测试、拉取库列表、能力状态。入口：任务表单与「备份插件」页，接口：`/api/jdbc/*`。
-- **支持 6 类数据库**：MySQL / MariaDB / PostgreSQL / Kingbase / Oracle / DM（`drivers/` 目录内置各驱动 jar，支持页面上传 / 下载 / 删除）。
-- **「原有连接方式优先」**：JDBC 仅作为连接测试 / 拉库列表的兜底通道与显式入口，备份执行仍走原有（SSH / 本机客户端）方式。
-- **JVM 全局单例**：classpath 在首次启动时一次性加载 `drivers/` 全部 jar；自动探测 JDK（`JAVA_HOME` / 常见安装路径 / `.jdks` / PATH 推导）。
+### 数据库直连能力（原生驱动，无需 Java）
+- **原生直连**（`core/native_conn.py`）：通过纯 Python 驱动直连数据库——连接测试、拉取库列表、数据对比，**不依赖 SSH、本机客户端与 Java/JVM**，离线环境开箱即用。入口：任务表单与「备份插件」页，接口：`/api/jdbc/*`。
+- **驱动与覆盖**：MySQL/MariaDB（pymysql，纯 Python）、PostgreSQL（psycopg2）、Kingbase（协议兼容 PG，复用 psycopg2）、Oracle（oracledb 瘦客户端，纯 Python，免装 Instant Client，12.1+；11g 请走 JDBC 兜底）、DM 达梦（dmPython，随达梦客户端提供）。
+- **JDBC 可选兜底**（`core/jdbc.py`）：仅当原生驱动缺失或服务端不支持瘦模式直连（如 Oracle 11g）时启用，需本机 JDK/JRE 与 `drivers/` 下驱动 jar（均可选，不装不影响直连功能）。
+- **「原有连接方式优先」**：直连仅作为连接测试 / 拉库列表的兜底通道与显式入口，备份执行仍走原有（SSH / 本机客户端）方式。
+- **JVM 全局单例**（仅 JDBC 兜底时）：classpath 在首次启动时一次性加载 `drivers/` 全部 jar；自动探测 JDK（`JAVA_HOME` / 常见安装路径 / `.jdks` / PATH 推导）。
 
 ### 一键恢复
 - 选择历史备份记录恢复到目标实例（数据库）或目标目录（文件）
@@ -193,7 +194,8 @@
 │   ├── lifecycle.py       # 生命周期：L1→L2 按龄/按容量下沉 + 到期清理
 │   ├── notifier.py        # 通知（webhook/钉钉/企微/飞书/邮件）
 │   ├── ssh_hosts.py       # SSH 主机纳管（文件备份远程源/目标）
-│   ├── jdbc.py            # JDBC 直连（JPype 桥接，连接测试 / 拉库列表）
+│   ├── jdbc.py            # 直连统一入口（原生驱动优先，JDBC 可选兜底）
+│   ├── native_conn.py     # 原生 Python 直连驱动（pymysql/psycopg2/oracledb/dmPython，无 Java）
 │   ├── sync/              # 数据同步引擎（Reader/Writer/Plugin 架构）
 │   │   ├── engine.py      # 同步执行器（task → SyncEngine）
 │   │   ├── realtime_runners.py  # 实时同步（Binlog CDC）后台线程管理
@@ -230,7 +232,7 @@
 ├── api/                   # REST API 蓝图
 │   ├── storage.py         # 存储目标 CRUD / 测试连接 / 复制 / 复制策略
 │   ├── hosts.py           # SSH 主机 CRUD + 连接测试
-│   ├── jdbc.py            # JDBC 连接测试 / 拉库列表 / 驱动管理
+│   ├── jdbc.py            # 直连连接测试 / 拉库列表 / JDBC 驱动管理
 │   ├── sync.py            # 同步任务 / 记录
 │   ├── inspection.py      # 巡检执行 / 记录 / 排程
 │   ├── system.py          # 系统设置 / 通知配置（UI）/ 备份质量阈值
@@ -247,7 +249,7 @@
 ├── templates/             # 前端页面（Bootstrap）
 ├── static/                # CSS / JS
 ├── skills/                # 9 份备份 Skill 操作指南（Markdown）
-├── drivers/               # JDBC 驱动 jar（mysql/pg/oracle 等，供 core/jdbc.py 加载）
+├── drivers/               # JDBC 驱动 jar（可选兜底通道，供 core/jdbc.py 加载；直连无需）
 ├── docs/                  # 设计文档（mermaid 架构图、备份质量监控等）
 ├── backups/               # 备份文件落盘目录（运行时生成）
 └── instance/              # SQLite 元数据库（运行时生成）
@@ -261,12 +263,12 @@
 pip install -r requirements.txt
 ```
 
-- 必选：`Flask`、`APScheduler`
+- 必选：`Flask`、`APScheduler`、`paramiko`、`pymysql`、`psycopg2-binary`、`oracledb`（原生直连驱动，无 Java 依赖）
 - 可选（按需）：
-  - `paramiko`（SFTP 远程存储、文件备份远程 SSH 源/目标）
   - `minio`（三级存储 MinIO / S3 驱动，需 `boto3`）
   - `PyYAML`（config.yaml 支持）
-  - `jpype1`、`jaydebeapi`（JDBC 直连能力，另需本机 JDK/JRE 与 `drivers/` 下的驱动 jar）
+  - `jpype1`、`jaydebeapi`（JDBC 可选兜底通道，另需本机 JDK/JRE 与 `drivers/` 下的驱动 jar；离线环境无 Java 时无需安装）
+  - `dmPython`（达梦直连，非 PyPI，随达梦客户端 `drivers/python` 目录提供）
 
 > 启用三级对象存储时，请安装 `minio` 与 `boto3`：`pip install minio boto3`
 
@@ -303,7 +305,7 @@ python init_db.py
 python run.py
 ```
 
-> 也可使用 `start.sh` 一键启动（自动注入 JDK 环境与 `BACKUP_ROOT` 后运行 `run.py`）。
+> 也可使用 `start.sh` 一键启动（自动注入 `BACKUP_ROOT`，检测到 JDK 时附带注入，运行 `run.py`）。
 
 浏览器访问 `http://<服务器IP>:8080`，使用默认账号 `admin / admin123` 登录。
 
@@ -313,7 +315,7 @@ python run.py
 
 ## Docker 部署（含离线运行）
 
-镜像已包含全部 Python 依赖与 JRE（JDBC 桥接用），**运行时无需联网、无需外部安装任何依赖**。
+镜像已包含全部 Python 依赖与原生直连驱动（pymysql/psycopg2/oracledb），**运行时无需联网、无需外部安装任何依赖、无需 Java/JRE**。
 
 ### 从 GitHub 拉取镜像
 

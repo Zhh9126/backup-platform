@@ -24,9 +24,14 @@ DEFAULT_PORTS = {
 @api_bp.route("/jdbc/status", methods=["GET"])
 @login_required
 def jdbc_status():
-    """JDBC 能力状态：JVM 探测结果 + 各类型驱动 jar 就绪状态。"""
+    """直连能力状态：原生驱动就绪状态 + JVM（JDBC 兜底）探测结果。"""
+    from core import native_conn
     return jsonify({
         "success": True,
+        "native": {
+            "drivers": native_conn.driver_status(),
+            "db_types": list(native_conn.NATIVE_DB_TYPES),
+        },
         "jvm": jdbc.jvm_info(),
         "drivers": jdbc.available_drivers(),
         "db_types": list(jdbc.JDBC_DB_TYPES),

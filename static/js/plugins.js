@@ -538,18 +538,29 @@
   async function loadJdbc() {
     try {
       const st = await api("GET", "/api/jdbc/status");
-      if (st && st.jvm) {
-        const j = st.jvm;
-        let ver = "";
-        const m = /java-1[0-9]-openjdk-([0-9.]+)/.exec(j.path || "");
-        if (m) ver = "Java " + m[1];
-        const label = (j.found && j.started)
-          ? ("JVM 就绪" + (ver ? " · " + ver : ""))
-          : "JVM 不可用";
-        const el = $("jvmStatus");
-        if (el) {
-          el.className = "text-muted small align-self-center";
-          el.textContent = label;
+      const el = $("jvmStatus");
+      if (el) {
+        // 原生直连驱动状态优先展示（无 Java 依赖）
+        const nat = st && st.native && st.native.drivers;
+        if (nat) {
+          const okCnt = Object.values(nat).filter(d => d.available).length;
+          const total = Object.keys(nat).length;
+          el.className = "small align-self-center " + (okCnt ? "text-success" : "text-warning");
+          el.textContent = okCnt
+            ? ("原生直连就绪 " + okCnt + "/" + total + " 类驱动")
+            : "原生直连驱动缺失";
+        }
+        // JVM 状态（JDBC 可选兜底通道）
+        if (st && st.jvm) {
+          const j = st.jvm;
+          let ver = "";
+          const m = /java-1[0-9]-openjdk-([0-9.]+)/.exec(j.path || "");
+          if (m) ver = "Java " + m[1];
+          if (j.found && j.started) {
+            el.title = "JDBC 兜底通道就绪" + (ver ? " · " + ver : "");
+          } else {
+            el.title = "JVM 未检测到（不影响使用：直连走原生 Python 驱动，无需 Java）";
+          }
         }
       }
     } catch (e) { /* 不影响驱动列表 */ }

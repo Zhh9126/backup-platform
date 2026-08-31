@@ -835,13 +835,18 @@ class TestT06PositionAndSafety(unittest.TestCase):
             self.assertNotIn("s3cr3t", " ".join(cmd))
 
     def test_requirements_keeps_xc_drivers_commented(self):
-        """依赖兜底：信创驱动必须全部是注释行，否则 pip install -r 会整体失败。"""
+        """依赖兜底：非 PyPI 公开分发的信创驱动必须是注释行，否则 pip install -r 会整体失败。
+
+        例外：oracledb 已成为原生直连必选依赖（纯 Python、PyPI 公开分发，
+        免装 Instant Client，见 core/native_conn.py），允许非注释出现；
+        cx_Oracle / dmPython / ksycopg2 仍需保持注释。
+        """
         path = os.path.join(PROJECT_ROOT, "requirements.txt")
         with open(path, "r", encoding="utf-8") as fh:
             lines = fh.read().split("\n")
         active = [ln.strip() for ln in lines
                   if ln.strip() and not ln.strip().startswith("#")]
-        for token in ("oracledb", "cx_Oracle", "dmPython", "ksycopg2"):
+        for token in ("cx_Oracle", "dmPython", "ksycopg2"):
             for line in active:
                 self.assertNotIn(token, line,
                                  f"{token} 不得作为非注释依赖出现: {line}")

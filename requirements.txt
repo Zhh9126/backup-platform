@@ -3,16 +3,24 @@
 
 Flask>=3.0
 APScheduler>=3.10          # 后台定时调度（必选）
-jpype1>=1.5                # JDBC 连接方式：JPype 桥接 Java JDBC 驱动（必选）
-jaydebeapi>=1.2.3          # JDBC 连接方式：Python JDBC 桥接层（必选）
-
-# 以下为可选依赖：
-paramiko>=3.0              # SFTP 远程存储上传（如不使用 SFTP 可注释掉）
+paramiko>=3.0              # SSH/SFTP 远程通道（所有数据库备份/恢复/远程操作，必选）
 PyYAML>=6.0                # 支持 config.yaml 配置（当前以 config.json/环境变量为主，可注释）
+
+# ---------- 直连驱动（连接测试 / 拉库列表 / 数据对比 / 数据同步，无需 Java）----------
+pymysql>=1.1               # MySQL / MariaDB 直连（纯 Python）
+psycopg2-binary>=2.9       # PostgreSQL 直连；KingbaseES 协议兼容，同一驱动可用
+oracledb>=2.0              # Oracle 瘦客户端直连（纯 Python，免装 Instant Client；12.1+）
 
 # ---------- 准 CDP 实时备份（可选加速依赖）----------
 watchdog>=4.0              # 文件事件驱动加速：Linux=inotify / Windows=ReadDirectoryChangesW
                            # 【可选】未安装时自动降级为高频轮询，功能不缺失，仅 RPO 变差
+
+# ---------- JDBC 兜底通道（可选，默认不安装）----------
+# 仅当原生驱动缺失或服务端不支持直连（如 Oracle 11g 瘦模式）时作为兜底：
+# 需要 jpype1 + jaydebeapi + 本机 JDK/JRE（8+）+ drivers/ 下的驱动 jar。
+# 离线环境无 Java 时无需安装——连接测试/拉库列表/数据对比均走上面的原生直连。
+# jpype1>=1.5
+# jaydebeapi>=1.2.3
 
 # 说明（不 pip 安装，仅记录）：
 # pyinotify      —— 仅 Linux，功能被 watchdog 覆盖，不引入
@@ -30,16 +38,14 @@ watchdog>=4.0              # 文件事件驱动加速：Linux=inotify / Windows=
 # 平台已对每个驱动做 try/except ImportError 探测，缺失时自动降级为仿真模式，
 # 只在「实时备份 → 自检」面板给出安装指引，功能不会中断。
 #
-# Oracle（LogMiner 轨道，二选一即可，推荐 oracledb 瘦客户端免装 Instant Client）：
-# oracledb>=2.0            —— pip install oracledb
+# Oracle（LogMiner 轨道，直连已内置 oracledb 瘦客户端，此处为 CDC 深度功能）：
 # cx_Oracle>=8.3           —— pip install cx_Oracle（需 Oracle Instant Client）
 #
 # Kingbase 人大金仓（WAL 流复制轨道）：
 # ksycopg2                 —— 非 PyPI，随 KingbaseES 客户端安装包提供
-#                             （亦可直接复用 psycopg2-binary，协议兼容）
-# psycopg2-binary>=2.9     —— pip install psycopg2-binary（Kingbase/PG 通用回退）
+#                             （直连通道已可直接复用 psycopg2-binary，协议兼容）
 #
-# Dameng 达梦（DM_LOGMNR 轨道）：
+# Dameng 达梦（LOGMNR 轨道 + 直连通道）：
 # dmPython                 —— 非 PyPI，随达梦客户端 drivers/python 目录提供
 #                             安装：cd <DM_HOME>/drivers/python/dmPython && python setup.py install
 #

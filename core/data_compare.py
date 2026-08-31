@@ -9,8 +9,8 @@
 4. 抽样行比对：按第一列排序取前 N 行，逐行逐列比对。
 
 连接方式（与平台约束一致）：
-- 优先 DB-API 直连（pymysql / psycopg2，恢复端实例平台网络可达时）；
-- 直连驱动缺失时回退 JDBC 桥接（core/jdbc.py，需本机 JRE 与 drivers/ 驱动）；
+- 优先原生直连（core/native_conn.py：pymysql/psycopg2/oracledb/dmPython，无 Java 依赖）；
+- 原生驱动缺失时回退 JDBC 桥接（core/jdbc.py，可选：需本机 JRE 与 drivers/ 驱动）；
 - 均不可用时任务失败并在报告中给出原因。
 
 设计约束：
@@ -40,7 +40,7 @@ _NULL_MARK = "~N"
 def _open_conn(cfg: dict):
     """按端配置打开数据库连接（DB-API），调用方负责 close。
 
-    顺序：类型专用驱动 → JDBC 兜底。
+    顺序：原生直连（core/native_conn.py，无 Java 依赖）→ JDBC 兜底。
     """
     db_type = (cfg.get("db_type") or "").lower()
     host = cfg.get("host") or ""
@@ -50,45 +50,17 @@ def _open_conn(cfg: dict):
     database = cfg.get("database") or ""
     last_err = None
 
-    if db_type in ("mysql", "mariadb"):
-        try:
-            import pymysql
-            return pymysql.connect(
-                host=host, port=port or 3306, user=user, password=pwd,
-                database=database, charset="utf8mb4",
-                connect_timeout=10, read_timeout=120, write_timeout=120)
-        except ImportError as e:
-            last_err = e
-        except Exception as e:
-            last_err = e
+    # 原生直连优先（pymysql / psycopg2 / oracledb / dmPython）
+    from core import native_conn
+    try:
+        return native_conn.connect(db_type, host, port, database, user, pwd)
+    except native_conn.DriverUnavailable as e:
+        last_err = e
+    except Exception as e:
+        raise ConnectionError(
+            f"无法建立 {db_type} 连接 {host}:{port}/{database}: {e}") from e
 
-    elif db_type in ("postgresql", "kingbase"):
-        try:
-            import psycopg2
-            conn = psycopg2.connect(
-                host=host, port=port or 5432, user=user, password=pwd,
-                dbname=database or "postgres", connect_timeout=10)
-            conn.autocommit = True
-            return conn
-        except ImportError as e:
-            last_err = e
-        except Exception as e:
-            last_err = e
-
-    elif db_type == "oracle":
-        # 优先 oracledb 瘦客户端（免装 Instant Client），回退 cx_Oracle
-        for mod in ("oracledb", "cx_Oracle"):
-            try:
-                m = __import__(mod)
-                dsn = m.makedsn(host, port or 1521,
-                                service_name=database or cfg.get("schema") or "ORCL")
-                return m.connect(user=user, password=pwd, dsn=dsn)
-            except ImportError:
-                continue
-            except Exception as e:
-                last_err = e
-
-    # JDBC 兜底（mysql/pg/oracle/kingbase/dameng）
+    # JDBC 兜底（mysql/pg/oracle/kingbase/dameng，需本机 JRE + drivers/ jar）
     try:
         from core import jdbc
         return jdbc.connect(db_type, host, port, database, user, pwd)

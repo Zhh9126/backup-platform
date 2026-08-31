@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-JDBC 连接方式模块
+直连通道模块（原 JDBC 连接方式模块）
 
-通过 JPype/jaydebeapi 桥接 Java JDBC 驱动，实现不依赖 SSH/本机客户端的
-数据库直连能力（连接测试、拉取库列表）。
+连接测试 / 拉库列表的统一入口，**原生 Python 驱动直连优先，JDBC 为可选兜底**：
+
+1. 原生直连（core/native_conn.py）：pymysql / psycopg2 / oracledb / dmPython，
+   纯 Python 或 wheel 分发，**不依赖 Java/JVM** —— Docker 与离线镜像默认即用；
+2. JDBC 兜底（本模块 JPype 桥接）：仅当原生驱动缺失或服务端不支持
+   （如 Oracle 11g 瘦模式）且本机恰有 JRE + drivers/ 驱动 jar 时启用。
 
 设计原则：
 - 「原有连接方式优先」：本模块仅作为连接测试 / 拉库列表的兜底通道与显式入口，
@@ -12,7 +16,8 @@ JDBC 连接方式模块
   一次性包含 drivers/ 下全部 jar，之后任何 db_type 均可复用。
 - 自动探测 JDK：支持 JAVA_HOME / 常见安装路径 / .jdks / PATH 推导。
 
-依赖：jpype1、jaydebeapi、本机 JDK（JRE 亦可）、drivers/ 下的驱动 jar。
+依赖：原生通道只需 requirements.txt 必选依赖；JDBC 兜底另需
+jpype1、jaydebeapi、本机 JDK（JRE 亦可）、drivers/ 下的驱动 jar（均可选）。
 """
 
 from __future__ import annotations
@@ -354,18 +359,20 @@ def _to_py(value):
 
 
 def test_connection(db_type, host, port, db, user, password, timeout=15):
-    """测试 JDBC 连接，返回 (ok, message, info)。"""
-    t0 = time.monotonic()
-    # 端口预检：TCP 不通时给出明确提示，避免误导性的
-    # "Communications link failure"（常见原因是端口填错/防火墙）
+    """测试直连：原生驱动优先，JDBC 兜底，返回 (ok, message, info)。"""
+    # 1) 原生直连优先（无 Java 依赖）；驱动缺失抛 DriverUnavailable
+    from core import native_conn
     try:
-        import socket
-        with socket.create_connection((host, int(port)), timeout=4):
-            pass
-    except Exception as e:
-        return False, (
-            f"目标 {host}:{port} 端口不可达（{type(e).__name__}）——"
-            "请确认数据库实例已启动、监听端口填写正确，且防火墙已放行该端口"), None
+        ok, msg, info = native_conn.test_connection(
+            db_type, host, port, db, user, password, timeout=timeout)
+    except native_conn.DriverUnavailable as e:
+        ok, msg, info = False, str(e), None
+    if ok:
+        return ok, msg, info
+    native_err = msg
+
+    # 2) JDBC 兜底（原生驱动缺失 / Oracle 11g 瘦模式不支持 / 达梦无 dmPython 等）
+    t0 = time.monotonic()
     try:
         conn = connect(db_type, host, port, db, user, password, timeout=timeout)
         cfg = DRIVER_CONFIG.get(db_type, {})
@@ -382,6 +389,7 @@ def test_connection(db_type, host, port, db, user, password, timeout=15):
             "port": port,
             "db": db,
             "user": user,
+            "mode": "jdbc",
             "driver_class": DRIVER_CONFIG.get(db_type, {}).get("class"),
             "latency_ms": ms,
             "probe_result": str(_to_py(row[0])) if row else "",
@@ -389,11 +397,19 @@ def test_connection(db_type, host, port, db, user, password, timeout=15):
         return True, f"JDBC 连接成功（{ms} ms），驱动: {info['driver_class']}", info
     except Exception as e:
         ms = int((time.monotonic() - t0) * 1000)
-        return False, f"JDBC 连接失败（{ms} ms）: {e}", None
+        # 两者都失败时优先返回原生通道的错误（更贴近真实原因）
+        return False, f"连接失败（{ms} ms）: {native_err or e}", None
 
 
 def list_databases(db_type, host, port, db, user, password, timeout=30):
-    """通过 JDBC 拉取数据库/schema 列表。"""
+    """拉取数据库/schema 列表：原生驱动优先，JDBC 兜底。"""
+    # 原生驱动缺失时走 JDBC 兜底；原生连接失败则错误信息更真实，直接抛出
+    from core import native_conn
+    try:
+        return native_conn.list_databases(
+            db_type, host, port, db, user, password, timeout=timeout)
+    except native_conn.DriverUnavailable:
+        pass
     _, _, _, _, list_sql, filters = _resolve_config(db_type)
     conn = connect(db_type, host, port, db, user, password, timeout=timeout)
     try:

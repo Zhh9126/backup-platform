@@ -2,9 +2,10 @@
 """离线部署依赖导出脚本。
 
 用途：在**有网**的构建机上，一次性导出离线部署所需的三类资产：
-1. Python 依赖离线包（wheel/sdist）→ wheelhouse/
+1. Python 依赖离线包（wheel/sdist）→ wheelhouse/（含原生直连驱动，
+   连接测试/拉库列表/数据对比均无需 Java）
 2. 平台可执行包（PyInstaller one-file）→ dist/backup_platform(.exe)
-3. JDBC 驱动 jar 清单与状态检查
+3. JDBC 驱动 jar 清单与状态检查（可选兜底通道）
 
 用法：
     python scripts/export_offline_deps.py            # 全部导出
@@ -14,9 +15,9 @@
 说明：
 - 目标平台 Python 版本/操作系统不同，pip 离线包**不能混用**。
   建议在目标机相同系统（Windows / Linux x64）与相近 Python 版本（3.10-3.14）下构建。
-- JDBC 驱动 jar 已随 PyInstaller 打进可执行文件，无需单独分发；
-  若目标机还要跑源码方式（python run.py），则需连同 drivers/ 目录一起拷贝。
-- 离线部署机需准备 Java 运行时：可执行文件同目录放 jdk/ 或 jre/（见 drivers/README.md）。
+- 离线部署机**无需安装 Java**：直连通道使用纯 Python 驱动（pymysql/psycopg2/oracledb）。
+  仅当需要 JDBC 兜底（如 Oracle 11g）时，才安装 JDK/JRE 8+，
+  或拷贝到可执行文件同目录的 jdk/、jre/（见 drivers/README.md）。
 """
 from __future__ import annotations
 
@@ -81,8 +82,8 @@ def main() -> None:
     print("\n========== 离线交付清单 ==========")
     print(f"1. Python 离线包 : {WHEELHOUSE}  (需与目标机系统/Python 版本一致)")
     print(f"2. 可执行程序    : {ROOT / 'dist' / ('backup_platform.exe' if sys.platform.startswith('win') else 'backup_platform')}")
-    print(f"3. JDBC 驱动 jar : 已内置（drivers/ 目录）")
-    print("4. Java 运行时   : 目标机安装 JDK/JRE 8+，或拷贝到可执行文件同目录的 jdk/、jre/")
+    print(f"3. JDBC 驱动 jar : 已内置（drivers/ 目录，可选兜底用）")
+    print("4. Java 运行时   : 无需安装（直连走纯 Python 驱动）；仅 JDBC 兜底时才需 JDK/JRE 8+")
     print("目标机安装：pip install --no-index --find-links=<wheelhouse> -r requirements.txt")
 
 

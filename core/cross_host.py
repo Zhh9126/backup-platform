@@ -150,6 +150,13 @@ def cross_host_restore(db_type: str, backup_path: str, target_host_info: dict,
             extra = dict(extra)
             extra["_pg_psql_bin"] = _resolve_remote_bin(client, "psql") or "psql"
             extra["_pg_restore_bin"] = _resolve_remote_bin(client, "pg_restore") or "pg_restore"
+        if db_type == "kingbase":
+            # 金仓客户端工具通常不在 root PATH（Server/ClientTools 专用目录），
+            # 必须动态解析绝对路径，否则 rc=127 command not found
+            from core.remote_dump import _resolve_remote_bin
+            extra = dict(extra)
+            extra["_kb_restore_bin"] = _resolve_remote_bin(client, "sys_restore") or "sys_restore"
+            extra["_kb_ksql_bin"] = _resolve_remote_bin(client, "ksql") or "ksql"
         cmd = _build_restore_cmd(db_type, remote, target_db, extra, target_host_info)
         log(f"远程执行: {cmd[:200]}")
         out, err, rc = _remote_exec_logged(client, cmd, timeout=7200, log=log)
@@ -276,6 +283,11 @@ exit $RC
         port = extra.get("source_port") or 54321
         user = extra.get("source_username") or "SYSTEM"
         pw = extra.get("source_password") or ""
+        pw_esc = pw.replace("'", "'\\''")
+        # V8 兼容 PGPASSWORD；V9 起读 KINGBASE_PASSWORD，两个都导出
+        env = f"export PGPASSWORD='{pw_esc}'; export KINGBASE_PASSWORD='{pw_esc}';"
+        restore_bin = extra.get("_kb_restore_bin") or "sys_restore"
+        ksql_bin = extra.get("_kb_ksql_bin") or "ksql"
         actual = remote_pkg
         if remote_pkg.endswith(".gz"):
             actual = remote_pkg[:-3]
@@ -283,9 +295,9 @@ exit $RC
         else:
             pre = ""
         if remote_pkg.endswith(".dump"):
-            return f"export PGPASSWORD='{pw}'; {pre}sys_restore -h {host} -p {port} -U {user} -d '{target_db or 'kingbase'}' '{actual}'"
+            return f"{env} {pre}{restore_bin} -h {host} -p {port} -U {user} -d '{target_db or 'kingbase'}' '{actual}'"
         target = f"-d '{target_db}'" if target_db else ""
-        return f"export PGPASSWORD='{pw}'; {pre}ksql -h {host} -p {port} -U {user} {target} -f '{actual}'"
+        return f"{env} {pre}{ksql_bin} -h {host} -p {port} -U {user} {target} -f '{actual}'"
 
     elif db_type == "redis":
         # 上传 .rdb / .tar.gz
@@ -304,20 +316,27 @@ exit $RC
     elif db_type == "dameng":
         # DM 真实 dimp 恢复：动态解析 dimp（dmdba 用户 profile → 常见安装目录），
         # 找不到时如实报错（不伪造成功）。
-        dm_pwd = extra.get("dm_sysdba", "Dameng123")
+        # SYSDBA 密码：优先 extra_options.dm_sysdba，其次复用任务连接密码
+        dm_pwd = (extra.get("dm_sysdba") or extra.get("source_password")
+                  or "Dameng123")
+        # 密码含特殊字符（@ 等）时需双引号包裹，否则达梦连接串被截断
+        if dm_pwd and not dm_pwd.isalnum():
+            dm_pwd = '"{0}"'.format(dm_pwd)
         dm_port = extra.get("source_port") or 5236
         script = f"""#!/bin/bash
 set -u
 DIMP=$(su - dmdba -c 'command -v dimp' 2>/dev/null | head -1)
 if [ -z "$DIMP" ]; then
-  DIMP=$(find /dm8/bin /opt/dmdbms/bin /home/dmdba/dmdbms/bin /opt/dm*/bin -maxdepth 1 -name dimp -type f 2>/dev/null | head -1)
+  DIMP=$(find /dm8/bin /opt/dmdbms/bin /home/dmdba/dmdbms/bin /opt/dm*/bin /dm*/bin -maxdepth 2 -name dimp -type f 2>/dev/null | head -1)
 fi
 if [ -z "$DIMP" ]; then
   echo "[ERROR] 目标主机未找到 dimp（dmdba 用户 PATH 与常见安装目录均无）"
   exit 127
 fi
 echo "DIMP=$DIMP"
-"$DIMP" SYSDBA/'{dm_pwd}'@localhost:{dm_port} FILE='{remote_pkg}' LOG=/tmp/dm_restore_{int(time.time())}.log
+DM_FDIR=$(dirname '{remote_pkg}')
+DM_FBASE=$(basename '{remote_pkg}')
+"$DIMP" SYSDBA/'{dm_pwd}'@localhost:{dm_port} FILE="$DM_FBASE" DIRECTORY="$DM_FDIR" LOG=/tmp/dm_restore_{int(time.time())}.log
 exit $?
 """
         import base64

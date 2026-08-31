@@ -206,16 +206,26 @@ def _resolve_remote_bin(client, tool: str) -> str | None:
     """
     from core.engines.file import _ssh_exec_pipe
 
-    # 0) PostgreSQL 家族工具：从运行中的 postgres 主进程定位 bin 目录。
-    #    不少环境把 PG 二进制放在自定义目录（如 /pgdb/pgsql/bin），且未加入
-    #    PATH；主进程路径必然真实存在且版本与实例严格匹配，据此可推断
-    #    pg_dump/psql/pg_basebackup/pg_restore 位置，避免 PATH 中旧版工具
-    #    导致 "invalid option" 类失败。
-    if tool.startswith("pg_") or tool == "psql":
+    # 0) PostgreSQL / Kingbase 家族工具：从运行中的数据库主进程定位 bin 目录。
+    #    不少环境把 PG/金仓 二进制放在自定义目录（如 /pgdb/pgsql/bin、
+    #    /opt/Kingbase/ES/V9/KESRealPro/*/Server/bin），且未加入 PATH；
+    #    主进程路径必然真实存在且版本与实例严格匹配，据此可推断
+    #    pg_dump/psql/ksql/sys_dump 等工具位置，避免 PATH 中旧版工具
+    #    导致 "invalid option" 或 rc=127 类失败。
+    _pg_like = ("ksql", "sys_dump", "sys_restore", "sys_basebackup",
+                "sys_receivewal", "sys_dumpall")
+    if (tool.startswith("pg_") or tool == "psql"
+            or tool in _pg_like):
         try:
-            proc_cmd = (
-                r"ps -eo cmd= | awk '/\/postgres(\s|$)/ && !/awk/ && !/grep/ {print $1; exit}'"
-            )
+            if tool in _pg_like:
+                # 金仓：主进程名为 kingbase，工具在其 bin 目录
+                proc_cmd = (
+                    r"ps -eo cmd= | awk '/\/kingbase(\s|$)/ && !/awk/ && !/grep/ {print $1; exit}'"
+                )
+            else:
+                proc_cmd = (
+                    r"ps -eo cmd= | awk '/\/postgres(\s|$)/ && !/awk/ && !/grep/ {print $1; exit}'"
+                )
             out2, _, rc2 = _ssh_exec_pipe(
                 client, _wrap_login(proc_cmd), timeout=20
             )
@@ -245,8 +255,10 @@ def _resolve_remote_bin(client, tool: str) -> str | None:
         "/u01/app/oracle/product/*/*/bin /u01/app/oracle/*/bin /home/oracle/product/*/*/bin "
         # DM 达梦
         "/dm8/bin /opt/dmdbms/bin /home/dmdba/dmdbms/bin /opt/dm*/bin "
-        # 人大金仓
+        # 人大金仓（V9 为 KESRealPro/<版本>/Server|ClientTools/bin 布局）
         "/opt/Kingbase/ES/V*/bin /opt/kingbase/*/bin /KingbaseES/V*/bin "
+        "/opt/Kingbase/ES/V*/KESRealPro/*/Server/bin "
+        "/opt/Kingbase/ES/V*/KESRealPro/*/ClientTools/bin "
         # Redis / MongoDB
         "/usr/local/redis*/bin /usr/local/redis/bin /opt/redis*/bin "
         "/usr/local/mongodb*/bin /opt/mongodb*/bin /usr/local/mongodb/bin "
@@ -639,12 +651,16 @@ def _remote_pg_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
 
 
 def _remote_kingbase_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
-    """在远端数据库服务器以 sys_dump 导出，返回原始字节（可选 gzip 压缩）。"""
+    """在远端数据库服务器以 sys_dump 导出，返回原始字节（可选 gzip 压缩）。
+
+    工具解析使用 resolve_remote_tool（kingbase 用户 profile 优先），兼容
+    V8/V9 客户端工具不在 root PATH 的现场（如 ClientTools/Server 自定义目录）。
+    """
     client = _connect(ssh_host)
-    dump_bin = _resolve_remote_bin(client, "sys_dump")
+    dump_bin = resolve_remote_tool(ssh_host, "sys_dump", check_user="kingbase")
     if not dump_bin:
         raise RuntimeError(
-            "远端主机未找到 sys_dump（PATH 与 /opt/Kingbase/ES/V*/Server/bin、/usr/bin 均无）。"
+            "远端主机未找到 sys_dump（root/kingbase 用户 PATH 与常见安装目录均无）。"
             "请在远端安装 KingbaseES 客户端后重试。"
         )
     user = task.get("username") or "system"
@@ -665,8 +681,10 @@ def _remote_kingbase_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
     schemas = [str(s).strip() for s in (extra.get("schemas") or []) if str(s).strip()]
     tables = [str(t).strip() for t in (extra.get("tables") or []) if str(t).strip()]
 
+    # 密码环境变量：V8 兼容 PGPASSWORD；V9 起使用 KINGBASE_PASSWORD，两个都注入
     base = (
         f"set -o pipefail; export PGPASSWORD={shlex.quote(pw)}; "
+        f"export KINGBASE_PASSWORD={shlex.quote(pw)}; "
         f"{dump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt}"
     )
 
@@ -839,7 +857,7 @@ def remote_db_dump(task: dict, ssh_host: dict, db_type: str, compress: int = 0,
 def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
                            default_port: int, default_user: str,
                            extra_args_key: str = "pg_basebackup_extra_args",
-                           tool_label: str = None) -> dict:
+                           tool_label: str = None, check_user: str = None) -> dict:
     """在远端数据库服务器执行流式物理备份（pg_basebackup / sys_basebackup 等）。
 
     参数
@@ -851,6 +869,8 @@ def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
     default_user: 该库默认用户名（任务未配置时回退）
     extra_args_key: extra_options 中透传额外参数的 key
     tool_label  : 报错展示用中文名（默认取 tool）
+    check_user  : 工具探测用户（如 kingbase/postgres：该服务端 OS 用户的
+                  profile PATH 通常才含有对应客户端工具）
 
     返回
     ----
@@ -871,7 +891,7 @@ def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
     pw = db.decrypt_secret(task.get("password") or "")
 
     client = _connect(ssh_host)
-    resolved = _resolve_remote_bin(client, tool)
+    resolved = resolve_remote_tool(ssh_host, tool, check_user=check_user)
     if not resolved:
         return {
             "ok": False, "rc": 127, "stdout": "", "stderr": "", "remote_dir": "",
@@ -906,8 +926,11 @@ def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
     except Exception:
         extra = []
 
+    # 密码环境变量：PG 兼容库 V8 用 PGPASSWORD，KingbaseES V9 用 KINGBASE_PASSWORD，
+    # 两个都注入避免版本差异导致鉴权失败
     inner = (
         f"export PGPASSWORD={shlex.quote(pw)}; "
+        f"export KINGBASE_PASSWORD={shlex.quote(pw)}; "
         f"{resolved} -h {shlex.quote(db_host)} -p {port} -U {shlex.quote(user)} "
         f"-D {remote_tmp} -Ft -z --checkpoint=fast --no-password"
     )

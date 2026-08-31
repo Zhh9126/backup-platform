@@ -48,6 +48,8 @@ class DamengEngine(BackupEngine):
     required_clients = ["dexp", "dimp"]
     # 物理备份：达梦自带 dmrman 工具
     physical_bundled_tools = ["dmrman"]
+    # 远端工具探测用户：dexp/dimp/dmrman 仅在 dmdba 用户 profile PATH 中可见
+    tool_check_user = "dmdba"
 
     # ---------------- 内部辅助 ----------------
     def _parse_extra(self) -> dict:
@@ -71,12 +73,16 @@ class DamengEngine(BackupEngine):
         """构造达梦 dexp/dimp 的连接串 USERID=用户/密码@主机:端口。
 
         注意：按达梦惯例，密码直接嵌入 USERID（明文出现在命令行参数），
-        这是 dexp/dimp 的连接语法要求。
+        这是 dexp/dimp 的连接语法要求。密码含 @ 等特殊字符时必须用
+        双引号包裹，否则连接串会被密码中的 @ 截断导致登录失败。
         """
         user = self.task.get("username") or ""
         pw = self.task.get("password") or ""  # task 中密码为已解密明文
         host = self.task.get("host") or "127.0.0.1"
         port = self.task.get("port") or 5236
+        # 含字母数字以外字符（@ / : 等）的密码用双引号包裹（达梦官方语法）
+        if pw and not pw.isalnum():
+            pw = '"{0}"'.format(pw)
         return "{user}/{pw}@{host}:{port}".format(
             user=user, pw=pw, host=host, port=port
         )
@@ -152,13 +158,17 @@ class DamengEngine(BackupEngine):
                             message="达梦 物理备份(dmrman)成功")
 
     def _backup_physical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
-        """物理备份：通过 SSH 在远端达梦服务器以 dmdba 用户执行 dmrman 联机全量
-        备份，再把备份集打成 tar.gz 经 SFTP 拉回本机落盘并计算 size/sha256。
+        """物理备份：通过 SSH 在远端达梦服务器执行联机全量备份，再把备份集
+        打成 tar.gz 经 SFTP 拉回本机落盘并计算 size/sha256。
 
-        - dmrman 位于 dmdba 的 DM_HOME/bin 下，故用 `su - dmdba -c`（login shell
-          自动加载 dmdba profile 获得 PATH），失败再回退为直接执行。
-        - 备份目录置于 /home/dmdba 下并 chown 给 dmdba，避免权限拒绝。
-        - 无达梦测试机，本方法仅保证代码正确性与逻辑一致，未做 E2E。
+        实现说明（E2E 已在 DM8 真机验证）：
+        - **联机备份优先**：实例运行中时 dmrman（离线工具）无法备份，正确做法是
+          经 disql 执行 `BACKUP DATABASE FULL BACKUPSET '<dir>'`（要求归档模式）。
+          工具路径与归档目录均动态准备：备份目录 chown 给 dmdba（dmserver 运行
+          用户）避免权限拒绝。
+        - **dmrman 离线兜底**：disql 失败时再尝试 dmrman 脚本方式（仅当实例
+          已关闭时才可能成功，作为兜底保留）。
+        - 产物以「备份集目录非空」为真实判据，不以 disql 退出码为准。
         """
         from core import remote_dump
         from core.engines.file import _ssh_exec_pipe
@@ -168,44 +178,101 @@ class DamengEngine(BackupEngine):
         sftp = client.open_sftp()
         remote_dir = f"/home/dmdba/dm_bkp_{ts}"
         remote_tar = f"{remote_dir}.tar.gz"
-        remote_script = f"/home/dmdba/dmrman_{ts}.cmd"
-        # dmrman 联机全量备份脚本（TO 后为远端备份目录）
-        script_body = f"BACKUP DATABASE FULL TO '{remote_dir}';\nexit;\n"
 
         try:
-            # 1) 建目录并 chown 给 dmdba，避免 dmrman 以 dmdba 运行时权限拒绝
+            # 1) 建备份目录并 chown 给 dmdba（dmserver 以 dmdba 运行，备份集由
+            #    服务端进程写入，必须可写）
             prep = (f"mkdir -p {remote_dir} && chown dmdba {remote_dir} "
                     f"&& chmod 755 {remote_dir}")
             _ssh_exec_pipe(client, remote_dump._wrap_login(prep), timeout=60)
 
-            # 2) 写 dmrman 脚本（644，dmdba 可读）
-            with sftp.open(remote_script, "w") as f:
-                f.write(script_body)
-            try:
-                sftp.chmod(remote_script, 0o644)
-            except Exception:
-                pass
-
-            # 3) 优先以 dmdba 用户执行；失败回退为直接以当前 SSH 用户执行
-            inner = f"dmrman CTLFILE={remote_script}"
-            shell = f"su - dmdba -c {shlex.quote(inner)}"
-            start = time.time()
-            out, err, rc = _ssh_exec_pipe(client, remote_dump._wrap_login(shell), timeout=7200)
-            if rc != 0:
-                self.logger.warning("[%s] su - dmdba 执行 dmrman 失败(rc=%s)，回退直接执行",
-                                    self.task_name, rc)
+            # 2) 联机备份：disql 执行 BACKUP DATABASE（SQL 写文件执行，避免引号嵌套）
+            disql_bin = remote_dump.resolve_remote_tool(ssh_host, "disql",
+                                                        check_user="dmdba")
+            online_out = ""
+            online_ok = False
+            if disql_bin:
+                pw = db.decrypt_secret(self.task.get("password") or "")
+                user = self.task.get("username") or "SYSDBA"
+                port = self.task.get("port") or 5236
+                sql_path = f"/tmp/dm_online_bkp_{ts}.sql"
+                with sftp.open(sql_path, "w") as f:
+                    f.write(f"BACKUP DATABASE FULL BACKUPSET '{remote_dir}';\nexit\n")
+                try:
+                    sftp.chmod(sql_path, 0o644)
+                except Exception:
+                    pass
+                # 密码含特殊字符时用双引号包裹（达梦官方语法）
+                if pw and not pw.isalnum():
+                    pw = '"{0}"'.format(pw)
+                shell = (f"timeout 7200 {disql_bin} "
+                         f"{shlex.quote(user + '/' + pw + '@localhost:' + str(port))} "
+                         f"\\`{sql_path}")
+                start = time.time()
                 out, err, rc = _ssh_exec_pipe(
-                    client, remote_dump._wrap_login(inner), timeout=7200)
-            duration = round(time.time() - start, 3)
-            out_text = out.decode("utf-8", "replace") if isinstance(out, bytes) else out
-            self.logger.info("[%s] 远端 dmrman 返回 rc=%s", self.task_name, rc)
+                    client, remote_dump._wrap_login(shell), timeout=7260)
+                duration = round(time.time() - start, 3)
+                online_out = (out.decode("utf-8", "replace")
+                              if isinstance(out, bytes) else out) or ""
+                # 产物判据：备份集目录下出现真实备份文件（.bak/.meta）
+                check_cmd = (f"find {remote_dir} -type f \\( -name '*.bak' -o "
+                             f"-name '*.meta' \\) | head -3")
+                chk_out, _e2, _rc2 = _ssh_exec_pipe(
+                    client, remote_dump._wrap_login(check_cmd), timeout=30)
+                chk_text = (chk_out.decode("utf-8", "replace")
+                            if isinstance(chk_out, bytes) else chk_out) or ""
+                online_ok = bool(chk_text.strip())
+                if not online_ok:
+                    snippet = online_out[-600:]
+                    if ("归档" in snippet or "-718" in snippet or "-8003" in snippet
+                            or "archive" in snippet.lower()):
+                        hint = ("；提示：达梦联机备份要求数据库处于归档模式"
+                                "(ARCH_MODE=Y)。请先开启归档：dm.ini 设 ARCH_INI=1、"
+                                "配置 dmarch.ini 并重启实例。")
+                    else:
+                        hint = ""
+                    self.logger.warning("[%s] 联机物理备份失败，尝试 dmrman 兜底: %s",
+                                        self.task_name, snippet[:200])
+                    last_err = snippet + hint
+                else:
+                    last_err = ""
+            else:
+                duration = 0
+                last_err = "远端主机未找到 disql（dmdba 用户 PATH 与常见安装目录均无）"
 
-            if rc != 0:
-                snippet = (out_text or err)[-1200:]
+            # 3) dmrman 离线兜底（实例关闭时才可用；联机已成功则跳过）
+            if not online_ok:
+                dmrman_bin = remote_dump.resolve_remote_tool(ssh_host, "dmrman",
+                                                             check_user="dmdba")
+                if dmrman_bin:
+                    remote_script = f"/home/dmdba/dmrman_{ts}.cmd"
+                    with sftp.open(remote_script, "w") as f:
+                        f.write(f"BACKUP DATABASE FULL TO '{remote_dir}';\nexit;\n")
+                    try:
+                        sftp.chmod(remote_script, 0o644)
+                    except Exception:
+                        pass
+                    shell = f"su - dmdba -c {shlex.quote(dmrman_bin + ' CTLFILE=' + remote_script)}"
+                    out, err, rc = _ssh_exec_pipe(
+                        client, remote_dump._wrap_login(shell), timeout=7200)
+                    online_out = (out.decode("utf-8", "replace")
+                                  if isinstance(out, bytes) else out) or ""
+                    check_cmd = (f"find {remote_dir} -type f | head -3")
+                    chk_out, _e2, _rc2 = _ssh_exec_pipe(
+                        client, remote_dump._wrap_login(check_cmd), timeout=30)
+                    chk_text = (chk_out.decode("utf-8", "replace")
+                                if isinstance(chk_out, bytes) else chk_out) or ""
+                    online_ok = bool(chk_text.strip())
+                    if not online_ok:
+                        last_err = (last_err or "") + "；dmrman 兜底也失败: " + online_out[-400:]
+                elif not last_err:
+                    last_err = "远端主机未找到 dmrman（dmdba 用户 PATH 与常见安装目录均无）"
+
+            if not online_ok:
                 return BackupResult(
                     success=False, status=BackupStatus.FAILED,
-                    duration_sec=duration, stdout=out_text, stderr=err,
-                    message=f"远端 dmrman 物理备份失败(rc={rc}): {snippet}")
+                    duration_sec=duration, stdout=online_out, stderr="",
+                    message=f"达梦物理备份失败: {last_err[:900]}")
 
             # 4) 把远端备份集打成 tar.gz，再经 SFTP 拉回本机
             tar_cmd = f"tar czf {remote_tar} -C {remote_dir} ."
@@ -215,32 +282,32 @@ class DamengEngine(BackupEngine):
                 snippet = (err2 or "")[-800:]
                 return BackupResult(
                     success=False, status=BackupStatus.FAILED,
-                    duration_sec=duration, stdout=out_text, stderr=err2,
-                    message=f"远端 dmrman 备份集打包失败(rc={rc2}): {snippet}")
+                    duration_sec=duration, stdout=online_out, stderr=err2,
+                    message=f"远端备份集打包失败(rc={rc2}): {snippet}")
 
             out_dir = self._output_dir()
             os.makedirs(out_dir, exist_ok=True)
-            local_path = os.path.join(out_dir, f"dmrman_{ts}.tar.gz")
+            local_path = os.path.join(out_dir, f"dm_backup_{ts}.tar.gz")
             sftp.get(remote_tar, local_path)
 
             size = os.path.getsize(local_path)
             checksum = db.sha256_file(local_path)
             hk = ssh_host.get("host_key", "remote")
-            msg = (f"通过 SSH 在 {hk} 以 dmdba 用户执行 dmrman 物理备份成功，"
-                   f"已拉回 {local_path} ({db.human_size(size)})")
+            msg = (f"通过 SSH 在 {hk} 对达梦执行联机全量物理备份成功，"
+                   f"备份集已拉回 {local_path} ({db.human_size(size)})")
             self.logger.info("[%s] %s", self.task_name, msg)
 
             # 清理远端备份目录与临时脚本/tar（best-effort，失败不致命）
             try:
                 _ssh_exec_pipe(client, remote_dump._wrap_login(
-                    f"rm -rf {remote_dir} {remote_tar} {remote_script}"), timeout=60)
+                    f"rm -rf {remote_dir} {remote_tar}"), timeout=60)
             except Exception:
                 pass
 
             return BackupResult(
                 success=True, status=BackupStatus.SUCCESS,
                 backup_path=local_path, size_bytes=size, duration_sec=duration,
-                stdout=out_text, stderr=err, simulated=False,
+                stdout=online_out, stderr="", simulated=False,
                 checksum=checksum, message=msg)
         finally:
             try:
@@ -249,19 +316,34 @@ class DamengEngine(BackupEngine):
                 pass
 
     def _backup_logical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
-        """在 SSH 备份机执行 dexp，把 dmp 文件通过 SFTP 拉回本地。"""
+        """在 SSH 备份机执行 dexp，把 dmp 文件通过 SFTP 拉回本地。
+
+        dexp 绝不写死：通过 resolve_remote_tool 动态解析（dmdba 用户 profile
+        优先，覆盖 /dm*/bin、/opt/dm*/bin 等任意安装目录）。
+        """
         from core import remote_dump
         import time
         ts = self._timestamp()
         userid = self._connect_userid()
         extra = self._parse_extra()
         scope = " ".join(self._scope_args(extra))
+        dexp_bin = remote_dump.resolve_remote_tool(ssh_host, "dexp",
+                                                   check_user="dmdba")
+        if not dexp_bin:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message=("远端主机未找到 dexp（dmdba 用户 PATH 与常见安装目录均无），"
+                         "无法执行达梦逻辑备份。"))
         remote_tmp = f"/tmp/dm_bkp_{ts}"
         remote_dmp = f"{remote_tmp}/{ts}.dmp"
         remote_log = f"{remote_tmp}/{ts}.log"
+        import shlex as _shlex
+        # USERID 中密码带双引号（含特殊字符时），必须整体单引号包裹，
+        # 防止 bash -lc 剥掉双引号后达梦连接串被密码中的 @ 截断
         remote_cmd = (
             f"mkdir -p {remote_tmp} && "
-            f"dexp USERID={userid} FILE={ts} DIRECTORY={remote_tmp} LOG={ts}.log {scope}"
+            f"{dexp_bin} {_shlex.quote('USERID=' + userid)} "
+            f"FILE={ts}.dmp DIRECTORY={remote_tmp} LOG={ts}.log {scope}"
         )
         t0 = time.time()
         data = remote_dump.remote_exec_and_fetch(ssh_host, remote_cmd, remote_dmp, timeout=7200)

@@ -38,6 +38,8 @@ class KingbaseEngine(BackupEngine):
     required_clients = ["sys_dump", "sys_restore", "ksql"]
     # 物理备份：Kingbase 自带 sys_basebackup 工具
     physical_bundled_tools = ["sys_basebackup"]
+    # 远端工具探测用户：金仓客户端工具在 kingbase 用户 profile PATH 中
+    tool_check_user = "kingbase"
 
     # ------------------------------------------------------------------
     # 辅助方法
@@ -64,8 +66,13 @@ class KingbaseEngine(BackupEngine):
         return int(self.task.get("compress") or 1)
 
     def _env_with_pwd(self) -> dict:
-        """构造注入 PGPASSWORD 的环境变量，避免密码出现在命令行参数中。"""
-        return {"PGPASSWORD": self._password()}
+        """构造注入密码的环境变量，避免密码出现在命令行参数中。
+
+        V8 兼容 PostgreSQL 的 PGPASSWORD；V9 起改用 KINGBASE_PASSWORD，
+        两个同时注入，兼容新旧版本共存环境。
+        """
+        return {"PGPASSWORD": self._password(),
+                "KINGBASE_PASSWORD": self._password()}
 
     def _compute_size_and_checksum(self, path: str):
         """计算备份产物的大小与校验和。
@@ -150,6 +157,7 @@ class KingbaseEngine(BackupEngine):
             self.task, ssh_host,
             tool="sys_basebackup", default_port=54321, default_user="system",
             extra_args_key="sys_basebackup_extra_args", tool_label="sys_basebackup",
+            check_user="kingbase",
         )
         if not res["ok"]:
             return BackupResult(

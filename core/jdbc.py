@@ -84,10 +84,15 @@ DRIVER_CONFIG = {
     "dameng": {
         "jar": "DmJdbcDriver18-8.1.3.62.jar",
         "class": "dm.jdbc.driver.DmDriver",
-        "url": "jdbc:dm://{host}:{port}/{db}?connectTimeout=8000&socketTimeout=15000",
+        # DM 为单库实例架构，URL 中的 db 段实为 schema：留空或填登录用户
+        # 的 schema 均可（默认表空间下直接连实例），填其他库名会报
+        # "Invalid schema name"
+        "url": "jdbc:dm://{host}:{port}?connectTimeout=8000&socketTimeout=15000",
         "probe": "SELECT 1",
-        "list_sql": "SELECT username FROM all_users ORDER BY 1",
-        "filter": ("SYS", "SYSDBA", "SYSAUDITOR", "SYSSSO", "SYSTEM", "CTISYS", "CJISYS"),
+        "list_sql": ("SELECT username FROM all_users "
+                     "ORDER BY 1"),
+        # 注意：达梦的 SYSDBA 既是管理员又常被用作业务 schema，不能排除
+        "filter": ("SYS", "SYSAUDITOR", "SYSSSO", "SYSDBAOPER", "CTISYS", "CJISYS"),
     },
 }
 

@@ -44,8 +44,9 @@ _RT_CONFIG_TO_TASK_COLUMN = {
     "rt_log_retention_days": "db_log_retention_days",
 }
 
-# 按数据库类型推断默认捕获模式：关系型走 CDC（binlog/WAL），其余走文件轮询
-_DB_CDC_TYPES = ("mysql", "mariadb", "postgresql")
+# 按数据库类型推断默认捕获模式：有日志流实现的关系型走 CDC
+# （binlog/WAL/LogMiner/DM_LOGMNR，见 core.cdc.ENGINE_DAEMON_MAP），其余走文件轮询
+_DB_CDC_TYPES = ("mysql", "mariadb", "postgresql", "kingbase", "dameng", "oracle")
 
 
 def _default_rt_mode(task: dict) -> str:

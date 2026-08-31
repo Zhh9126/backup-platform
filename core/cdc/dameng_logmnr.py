@@ -132,10 +132,14 @@ class DamengLogMnrDaemon(PollingLogMinerDaemon):
         "SELECT PATH FROM V$ARCH_FILE ORDER BY CLSN",
         "SELECT NAME FROM V$ARCHIVED_LOG ORDER BY FIRST_CHANGE#",
     )
+    # 注意：DM8 的 PL/SQL 块内不解析 DBMS_LOGMNR.NEW/ADDFILE 包常量
+    # （报 [-2007] Syntax error nearby [NEW]），必须使用字面量。
+    # DM8 常量与 Oracle 不同（E2E 真机验证）：NEW=1, REMOVE=2, ADDFILE=3
+    # （用 2 会报 [-2849] cannot remove unlisted logfile）。
     SQL_ADD_LOGFILE_NEW = (
-        "BEGIN DBMS_LOGMNR.ADD_LOGFILE(?, DBMS_LOGMNR.NEW); END;")
+        "BEGIN DBMS_LOGMNR.ADD_LOGFILE(?, 1); END;")
     SQL_ADD_LOGFILE_MORE = (
-        "BEGIN DBMS_LOGMNR.ADD_LOGFILE(?, DBMS_LOGMNR.ADDFILE); END;")
+        "BEGIN DBMS_LOGMNR.ADD_LOGFILE(?, 3); END;")
     SQL_START_LOGMNR = (
         "BEGIN DBMS_LOGMNR.START_LOGMNR("
         "STARTSCN => ?, ENDSCN => ?, "
@@ -323,11 +327,15 @@ class DamengLogMnrDaemon(PollingLogMinerDaemon):
                               self.task_id, exc)
 
     def _contents_sql(self) -> str:
-        """构造 ``V$LOGMNR_CONTENTS`` 查询（排除系统 Schema，拍板 Q5）。"""
+        """构造 ``V$LOGMNR_CONTENTS`` 查询（排除系统 Schema，拍板 Q5）。
+
+        注意：DM8 没有Oracle 的 ``START_TIME`` 列，对应列为 ``START_TIMESTAMP``
+        （E2E 真机验证：用 START_TIME 会报 [-2111] Invalid column name）。
+        """
         ops = ", ".join(f"'{op}'" for op in self.CAPTURED_OPERATIONS)
         owners = ", ".join(f"'{name}'" for name in self.EXCLUDED_SCHEMAS)
         return (
-            "SELECT SCN, START_TIME, SEG_OWNER, TABLE_NAME, OPERATION, "
+            "SELECT SCN, START_TIMESTAMP, SEG_OWNER, TABLE_NAME, OPERATION, "
             "SQL_REDO, SQL_UNDO FROM V$LOGMNR_CONTENTS "
             f"WHERE OPERATION IN ({ops}) "
             f"AND (SEG_OWNER IS NULL OR SEG_OWNER NOT IN ({owners})) "

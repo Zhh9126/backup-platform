@@ -7,6 +7,16 @@
 # 直连（连接测试/拉库列表/数据对比）默认走原生 Python 驱动，无需 Java；
 # JRE + drivers/ JDBC jar 仅作为可选兜底通道（如 Oracle 11g 瘦模式不支持时）。
 # 元数据/备份/日志持久化到 /data 挂载卷。
+#
+# 【物理备份零安装（平台推送二进制）】
+# 物理 xtrabackup/mariabackup 二进制体积大且与远端主机 OS 相关，默认不烘焙
+# 进镜像，部署时从宿主机只读挂载（数据库服务器零安装，平台按服务器版本
+# 自动选择并推送到远端 /tmp 执行）：
+#   docker run ... \
+#     -v /opt/xtrabackup24:/opt/xtrabackup24:ro \   # xtrabackup 2.4（MySQL 5.5-5.7）
+#     -v /opt/mariabackup:/opt/mariabackup:ro \     # mariabackup（MariaDB 10.x）
+#     -v /opt/xtrabackup8:/opt/xtrabackup8:ro       # xtrabackup 8.0（MySQL 8.0+，可选，覆盖内置路径）
+# 路径可用环境变量 XTRABACKUP_8_PATH / XTRABACKUP_24_PATH / MARIABACKUP_PATH 覆盖。
 
 FROM python:3.10-slim
 

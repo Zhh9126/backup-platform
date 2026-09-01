@@ -519,6 +519,7 @@
     if ($("t_pick_mode")) $("t_pick_mode").value = "single";
     if ($("t_schema_only")) $("t_schema_only").checked = false;
     if ($("t_data_only")) $("t_data_only").checked = false;
+    if ($("t_include_sys")) $("t_include_sys").checked = false;
     if ($("t_db_picker_status")) $("t_db_picker_status").textContent = "点击按钮连接数据库并拉取";
   }
 
@@ -539,6 +540,7 @@
     }
     $("t_schema_only").checked = !!eo.schema_only;
     $("t_data_only").checked = !!eo.data_only;
+    if ($("t_include_sys")) $("t_include_sys").checked = !!eo.include_system_dbs;
   }
 
   // 拉取数据库列表
@@ -632,6 +634,8 @@
     delete eo.schemas; delete eo.tables; delete eo.use_all_db; delete eo.all_databases;
     if ($("t_schema_only").checked) eo.schema_only = true; else delete eo.schema_only;
     if ($("t_data_only").checked) eo.data_only = true; else delete eo.data_only;
+    if ($("t_include_sys") && $("t_include_sys").checked) eo.include_system_dbs = true;
+    else delete eo.include_system_dbs;
     if (mode === "schemas" && selected.length) eo.schemas = selected;
     else if (mode === "tables" && selected.length) eo.tables = selected;
     else if (mode === "all") eo.use_all_db = true;

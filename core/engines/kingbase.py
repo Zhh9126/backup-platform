@@ -221,11 +221,11 @@ class KingbaseEngine(BackupEngine):
                 message="客户端检查失败: " + detail,
             )
 
-        # 2.5) 全实例（db_name 为空）：sys_dump 是单库工具，不存在
+        # 2.5) 全实例（勾选全部库或库名为空）：sys_dump 是单库工具，不存在
         #      --all-databases 参数，改为逐库 tar.gz + globals + manifest
         extra = self._parse_task_extra()
-        if (not self._db_name() and not extra.get("schemas")
-                and not extra.get("tables")):
+        if ((extra.get("use_all_db") or not self._db_name())
+                and not extra.get("schemas") and not extra.get("tables")):
             return self._backup_full_instance_local(backup_type)
 
         # 3) Kingbase 仅支持逻辑全量（custom/纯文本）。
@@ -436,7 +436,8 @@ class KingbaseEngine(BackupEngine):
                 host=self._host(), port=self._port(), user=self._user(),
                 password=db.decrypt_secret(self.task.get("password") or ""),
                 dump_tool=dump_tool, out_path=out_path,
-                query_tool=query_tool, dumpall_tool=dumpall_tool)
+                query_tool=query_tool, dumpall_tool=dumpall_tool,
+                include_system_dbs=bool(extra.get("include_system_dbs")))
         except Exception as e:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,

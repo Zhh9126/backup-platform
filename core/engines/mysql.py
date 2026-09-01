@@ -403,6 +403,84 @@ class MySQLEngine(BackupEngine):
             except Exception:
                 pass
 
+    # ------------------------------------------------------------------
+    # 全实例（逐库 tar）备份/恢复 —— 勾选全部库或库名为空时的路径
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_full_instance_tar(path: str) -> bool:
+        """识别 multi-db-tar 产物（gzip tar + manifest.json）。
+
+        注意 .tar.gz 也被 XtraBackup 物理备份使用，故以 manifest.json 区分，
+        且物理产物在 restore() 中先于本判定处理。
+        """
+        import tarfile as _tarfile
+        try:
+            with _tarfile.open(path, "r:gz") as tf:
+                return "manifest.json" in tf.getnames()
+        except Exception:
+            return False
+
+    def _backup_full_instance_local(self, backup_type: BackupType) -> BackupResult:
+        """全实例逻辑备份：枚举库（默认排除系统库）→ 逐库 mysqldump → tar.gz。"""
+        from core import logical_full
+        extra = self._parse_extra_options()
+        out_dir = self._output_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"{self._timestamp()}.tar.gz")
+        dump_tool = shutil.which("mysqldump") or "mysqldump"
+        query_tool = shutil.which("mysql") or "mysql"
+        try:
+            manifest = logical_full.backup_full_instance(
+                self.db_type,
+                host=self.task.get("host") or "127.0.0.1",
+                port=self.task.get("port") or 3306,
+                user=self.task.get("username") or "",
+                password=db.decrypt_secret(self.task.get("password") or ""),
+                dump_tool=dump_tool, out_path=out_path,
+                query_tool=query_tool,
+                include_system_dbs=bool(extra.get("include_system_dbs")))
+        except Exception as e:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=None, simulated=False,
+                message=f"{self.display_name} 全实例备份失败: {e}")
+        size = os.path.getsize(out_path)
+        checksum = db.sha256_file(out_path)
+        dbs_txt = ", ".join(manifest.get("databases") or [])
+        msg = (f"{self.display_name} 全实例备份成功: {len(manifest['databases'])} 个库"
+               f"（{dbs_txt}）{'，已排除系统库' if not manifest.get('include_system_dbs') else ''}，"
+               f"产物 {out_path}")
+        return BackupResult(
+            success=True, status=BackupStatus.SUCCESS,
+            backup_path=out_path, size_bytes=size, duration_sec=0,
+            simulated=False, checksum=checksum, message=msg)
+
+    def _restore_full_instance_local(self, backup_path: str) -> BackupResult:
+        """全实例恢复：解包 → 逐库灌入（dump 内含 CREATE DATABASE/USE）。"""
+        from core import logical_full
+        restore_tool = shutil.which("mysql") or "mysql"
+        query_tool = restore_tool
+        try:
+            result = logical_full.restore_full_instance(
+                self.db_type,
+                host=self.task.get("host") or "127.0.0.1",
+                port=self.task.get("port") or 3306,
+                user=self.task.get("username") or "",
+                password=db.decrypt_secret(self.task.get("password") or ""),
+                backup_path=backup_path,
+                restore_tool=restore_tool, query_tool=query_tool)
+        except Exception as e:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path, simulated=False,
+                message=f"{self.display_name} 全实例恢复失败: {e}")
+        dbs_txt = ", ".join(result.get("restored") or [])
+        msg = (f"{self.display_name} 全实例恢复成功: {len(result['restored'])} 个库（{dbs_txt}）")
+        return BackupResult(
+            success=True, status=BackupStatus.SUCCESS,
+            backup_path=backup_path, duration_sec=0,
+            simulated=False, checksum="", message=msg)
+
     # ------------------ 逻辑备份 (mysqldump) ------------------
     def _backup_logical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
         """在 SSH 备份机/数据库服务器上执行 mysqldump，把流拉回到本地落盘。"""
@@ -413,7 +491,12 @@ class MySQLEngine(BackupEngine):
         extra = self._parse_extra_options()
         # 默认禁用 GTID_PURGED；用户可通过 gtid_purged=true 显式保留。
         extra_args = "--set-gtid-purged=OFF" if not extra.get("gtid_purged") else ""
-        data, compressed, _fmt = remote_dump.remote_db_dump(self.task, ssh_host, "mysql", comp, extra_args)
+        data, compressed, fmt = remote_dump.remote_db_dump(self.task, ssh_host, "mysql", comp, extra_args)
+        if fmt == "multi-db-tar":
+            # 全实例：逐库 .sql → tar.gz（远端已 gzip，manifest.json 标注库清单）
+            res = self._write_dump_file(data, backup_type, ssh_host, ".tar.gz", "mysqldump")
+            res.compress_algo = "gzip"
+            return res
         # compressed 反映远端实际是否压缩（缺 zstd 时 remote_dump 会降级为不压缩）
         suffix = ".sql.zst" if compressed else ".sql"
         res = self._write_dump_file(data, backup_type, ssh_host, suffix, "mysqldump")
@@ -424,6 +507,12 @@ class MySQLEngine(BackupEngine):
 
     def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:
         """逻辑备份：mysqldump。支持分库/分表/仅结构/仅数据。"""
+        extra0 = self._parse_extra_options()
+        # 全实例（勾选全部库或库名为空）：逐库 .sql → tar.gz（默认排除系统库）
+        if ((extra0.get("use_all_db") or not self.task.get("db_name"))
+                and not extra0.get("tables") and not extra0.get("schemas")):
+            return self._backup_full_instance_local(backup_type)
+
         host = self.task.get("host") or "127.0.0.1"
         port = self.task.get("port") or 3306
         user = self.task.get("username") or ""
@@ -564,7 +653,14 @@ class MySQLEngine(BackupEngine):
                 backup_path=backup_path, message=reason,
                 detail_log="\n".join(logs))
 
-        # 2) 逻辑备份 -> 本机直接执行 mysql 恢复
+        # 2) 全实例 tar 产物（multi-db-tar）→ 逐库恢复
+        if backup_path.endswith((".tar.gz", ".tgz")) and self._is_full_instance_tar(backup_path):
+            logs.append("[全实例恢复] 检测到逐库 tar 产物（manifest.json），执行全实例恢复")
+            result = self._restore_full_instance_local(backup_path)
+            result.detail_log = "\n".join(logs) + "\n" + (result.detail_log or "")
+            return result
+
+        # 3) 逻辑备份 -> 本机直接执行 mysql 恢复
         logs.append("[本机恢复] 尝试本地执行 mysql 恢复...")
         result = self._restore_local(backup_path, **kwargs)
         logs.append(f"[本机恢复] success={result.success}, message={result.message}")

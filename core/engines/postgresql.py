@@ -157,11 +157,11 @@ class PostgreSQLEngine(BackupEngine):
         db_name = self.task.get("db_name")
         compress = int(self.task.get("compress") or 0)
 
-        # 3.5) 全实例（db_name 为空）：pg_dump 是单库工具，不存在
+        # 3.5) 全实例（勾选全部库或库名为空）：pg_dump 是单库工具，不存在
         #      --all-databases 参数，改为逐库 tar.gz + globals + manifest
         extra_eo = self._parse_extra_options()
-        if (not db_name and not extra_eo.get("schemas")
-                and not extra_eo.get("tables")):
+        if ((extra_eo.get("use_all_db") or not db_name)
+                and not extra_eo.get("schemas") and not extra_eo.get("tables")):
             return self._backup_full_instance_local(backup_type)
 
         # 4) 增量/差异回退为全量（逻辑备份无真正增量），并在 message 注明
@@ -261,7 +261,8 @@ class PostgreSQLEngine(BackupEngine):
                 user=self.task.get("username"),
                 password=db.decrypt_secret(self.task.get("password") or ""),
                 dump_tool=dump_tool, out_path=out_path,
-                query_tool=query_tool, dumpall_tool=dumpall_tool)
+                query_tool=query_tool, dumpall_tool=dumpall_tool,
+                include_system_dbs=bool(extra_eo.get("include_system_dbs")))
         except Exception as e:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,

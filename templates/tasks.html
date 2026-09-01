@@ -268,6 +268,10 @@
                   <input class="form-check-input" type="checkbox" id="t_data_only">
                   <label class="form-check-label">仅数据（不要建表语句）</label>
                 </div>
+                <div class="form-check form-check-inline">
+                  <input class="form-check-input" type="checkbox" id="t_include_sys">
+                  <label class="form-check-label">全实例时包含系统库（默认仅业务库）</label>
+                </div>
                 <div class="mt-1 small text-muted">
                   提示：MySQL/MariaDB 单库 = <code>mysqldump &lt;db&gt;</code>，全实例 = <code>--all-databases</code>；
                   PostgreSQL/Kingbase 单库 = <code>pg_dump/sys_dump -d &lt;db&gt;</code>，

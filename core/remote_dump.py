@@ -23,6 +23,7 @@ import logging
 import config
 import core.db as db
 from core import ssh_hosts
+from core.logical_full import SYSTEM_DBS
 
 
 def resolve_ssh_host(task: dict):
@@ -418,14 +419,15 @@ def _connect_isolated(ssh_host: dict):
 
 # ----------------------------- 远程 DUMP -----------------------------
 
-def _remote_mysql_dump(task: dict, ssh_host: dict, compress: int, extra_args: str = "") -> bytes:
-    """在远端数据库服务器以 mysqldump 导出，返回原始字节（可选 gzip 压缩）。
+def _remote_mysql_dump(task: dict, ssh_host: dict, compress: int, extra_args: str = "") -> tuple:
+    """在远端数据库服务器以 mysqldump 导出，返回 (原始字节, 产物格式, 是否压缩)。
 
     支持四种备份范围（按 extra_options / task.db_name 自动判定）：
     1) extra.schemas 非空  → --databases schema1 schema2 ...
     2) extra.tables 非空   → --databases <db_name> table1 table2 ...
     3) task.db_name 非空   → --databases <db_name>
-    4) 上述都为空          → --all-databases（全实例）
+    4) 上述都为空          → 全实例（逐库 .sql → tar.gz + manifest，
+                              默认排除系统库；extra.include_system_dbs=true 包含）
 
     关键修复（paramiko PATH 问题）：
     1) 先用 _resolve_remote_bin 探测 mysqldump 真实路径（绕开非交互 shell 的 PATH 缺失）
@@ -506,8 +508,10 @@ def _remote_mysql_dump(task: dict, ssh_host: dict, compress: int, extra_args: st
         args.append("--databases")
         args.append(db_name)
     else:
-        # 全实例：--all-databases
-        args.append("--all-databases")
+        # 全实例：逐库 .sql → tar.gz（默认排除系统库）
+        data = _remote_mysql_full_instance_tar(
+            client, mysqldump_bin, remote_cnf, int(port), extra)
+        return data, "multi-db-tar", True
 
     if schema_only:
         args.append("--no-data")
@@ -583,7 +587,7 @@ def _remote_mysql_dump(task: dict, ssh_host: dict, compress: int, extra_args: st
             raise RuntimeError(
                 f"远程 mysqldump 疑似失败：zstd 压缩后仅 {len(out)} 字节（stderr: {err[:200]}）"
             )
-        return out, enable
+        return out, "single", enable
     finally:
         try:
             sftp.remove(remote_cnf)
@@ -690,11 +694,13 @@ def _pg_family_resolve_dumpall_bin(client, cfg) -> str:
 
 
 def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
-                                 user: str, pw: str, port: int) -> bytes:
+                                 user: str, pw: str, port: int,
+                                 include_sys: bool = False) -> bytes:
     """全实例备份：一次 SSH 会话内逐库 dump + globals + manifest → tar.gz 流。
 
     每库 -Fc（独立一致性快照，支持并行恢复）；单库失败即整体失败（rc=32）；
     dumpall 缺失/失败仅降级跳过 globals（在 manifest 中标记），不阻塞备份。
+    默认排除系统库（SYSTEM_DBS），include_sys=True 时包含。
     """
     from core.engines.file import _ssh_exec_pipe
 
@@ -711,6 +717,15 @@ def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
     ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     db_type = "kingbase" if cfg["dump_tool"].startswith("sys_") else "postgresql"
 
+    # 系统库排除：SQL 层 NOT IN 过滤（include_sys 时不过滤）
+    sys_dbs = SYSTEM_DBS.get(db_type) or ()
+    if include_sys or not sys_dbs:
+        filter_sql = f"SELECT datname FROM {catalog} WHERE NOT datistemplate ORDER BY 1"
+    else:
+        excl = ",".join(f"'{d}'" for d in sys_dbs)
+        filter_sql = (f"SELECT datname FROM {catalog} WHERE NOT datistemplate "
+                      f"AND datname NOT IN ({excl}) ORDER BY 1")
+
     lines = [
         "set -eu",
         env,
@@ -726,10 +741,11 @@ def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
         'DBS=""',
         "for MDB in $MAINTS; do",
         '  if DBS=$("$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -d "$MDB" -t -A '
-        f'-c "SELECT datname FROM {catalog} WHERE NOT datistemplate ORDER BY 1" 2>/dev/null) '
+        f'-c "{filter_sql}" 2>/dev/null) '
         '&& [ -n "$DBS" ]; then MAINT="$MDB"; break; fi',
         "done",
-        '[ -n "${DBS:-}" ] || { echo "cannot enumerate databases (tried: $MAINTS)" >&2; exit 31; }',
+        '[ -n "${DBS:-}" ] || { echo "no backupable databases after filtering'
+        ' (system dbs excluded; set include_system_dbs=true to include)" >&2; exit 31; }',
         'for d in $DBS; do',
         '  "$DUMP_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -Fc -f "$WORK/dbs/$d.dump" "$d"'
         ' || { echo "dump failed for db $d" >&2; exit 32; }',
@@ -743,7 +759,8 @@ def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
         'DBJSON=$(printf \'%s\\n\' "$DBS" | awk \'BEGIN{ORS="";first=1} '
         '{if(!first)print ","; printf "\\"%s\\"",$0; first=0}\')',
         f'printf \'{{"format":"multi-db-tar","db_type":"{db_type}",'
-        '"generated_at":"' + ts + '","globals":"%s","databases":[%s]}\' '
+        '"generated_at":"' + ts + '","globals":"%s","include_system_dbs":'
+        + ("true" if include_sys else "false") + ',"databases":[%s]}\' '
         '"$GLOBALS" "$DBJSON" > "$WORK/manifest.json"',
         'if [ -s "$WORK/globals.sql" ]; then',
         '  tar -czf - -C "$WORK" manifest.json dbs globals.sql',
@@ -814,12 +831,15 @@ def _pg_family_dump(task: dict, ssh_host: dict, db_type: str, compress: int) -> 
     schemas = [str(s).strip() for s in (extra.get("schemas") or []) if str(s).strip()]
     tables = [str(t).strip() for t in (extra.get("tables") or []) if str(t).strip()]
 
-    # ---- 全实例：逐库 tar / dumpall（db_name 为空且未指定 schemas/tables）----
-    if not db_name and not schemas and not tables:
+    # ---- 全实例：逐库 tar / dumpall（勾选全部库或库名为空，且未指定表/schema）----
+    if ((extra.get("use_all_db") or not db_name)
+            and not schemas and not tables):
+        # 默认仅备份业务库（排除系统库），extra.include_system_dbs=true 时包含
+        include_sys = bool(extra.get("include_system_dbs"))
         if (extra.get("all_db_mode") or "").strip().lower() == "dumpall":
             return _pg_family_dumpall_stream(client, cfg, user, pw, port), "dumpall"
         return _pg_family_full_instance_tar(
-            client, cfg, dump_bin, user, pw, port), "multi-db-tar"
+            client, cfg, dump_bin, user, pw, port, include_sys), "multi-db-tar"
 
     # ---- 单库/多表/多 schema（原有行为）----
     # 注意：不使用 "-f -"（显式指定 stdout）。某些环境下 pg_dump 的 "-f -"
@@ -980,7 +1000,8 @@ def remote_db_dump(task: dict, ssh_host: dict, db_type: str, compress: int = 0,
     - extra_args: 透传给 dump 命令的额外参数（目前 MySQL 用）。
     """
     if db_type == "mysql":
-        return _remote_mysql_dump(task, ssh_host, compress, extra_args) + ("single",)
+        data, fmt, compressed = _remote_mysql_dump(task, ssh_host, compress, extra_args)
+        return data, compressed, fmt
     if db_type == "postgresql":
         data, fmt = _remote_pg_dump(task, ssh_host, compress)
         return data, bool(compress) and fmt == "single", fmt
@@ -1297,6 +1318,138 @@ def _remote_mysql_restore(task: dict, ssh_host: dict, dump_bytes: bytes) -> None
         sftp.close()
 
 
+def _remote_mysql_full_instance_tar(client, mysqldump_bin: str, remote_cnf: str,
+                                    port: int, extra: dict) -> bytes:
+    """MySQL/MariaDB 全实例：逐库 .sql（--databases 保证含 CREATE DATABASE/USE）
+    → tar.gz + manifest。默认排除系统库（SYSTEM_DBS），可含 schema_only/data_only。
+    """
+    from core.engines.file import _ssh_exec_pipe
+
+    mysql_bin = os.path.join(os.path.dirname(mysqldump_bin), "mysql")
+    include_sys = bool(extra.get("include_system_dbs"))
+    sys_dbs = SYSTEM_DBS.get("mysql") or ()
+    # 枚举过滤：include_sys 时不过滤
+    if include_sys:
+        enum_filter = ""
+    else:
+        excl = "|".join(sys_dbs)
+        enum_filter = f" | grep -vE '^({excl})$'"
+
+    dump_flags = ""
+    if extra.get("schema_only"):
+        dump_flags += " --no-data"
+    if extra.get("data_only"):
+        dump_flags += " --no-create-info"
+
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    lines = [
+        "set -eu",
+        f"MYSQL_BIN={shlex.quote(mysql_bin)}",
+        f"DUMP_BIN={shlex.quote(mysqldump_bin)}",
+        f"CNF={shlex.quote(remote_cnf)}",
+        f"PORT={int(port)}",
+        'WORK=$(mktemp -d /tmp/bp_mysql_fi.XXXXXX)',
+        "trap 'rm -rf \"$WORK\"' EXIT",
+        'mkdir -p "$WORK/dbs"',
+        f'DBS=$("$MYSQL_BIN" --defaults-file="$CNF" -h 127.0.0.1 -P $PORT '
+        f'-N -B -e "SHOW DATABASES"{enum_filter})',
+        '[ -n "${DBS:-}" ] || { echo "no backupable databases after filtering'
+        ' (system dbs excluded; set include_system_dbs=true to include)" >&2; exit 31; }',
+        'for d in $DBS; do',
+        '  "$DUMP_BIN" --defaults-file="$CNF" -h 127.0.0.1 -P $PORT '
+        '--single-transaction --routines --triggers --events '
+        '--default-character-set=utf8mb4' + dump_flags + ' '
+        '--databases "$d" > "$WORK/dbs/$d.sql" '
+        '|| { echo "dump failed for db $d" >&2; exit 32; }',
+        "done",
+        'DBJSON=$(printf \'%s\\n\' "$DBS" | awk \'BEGIN{ORS="";first=1} '
+        '{if(!first)print ","; printf "\\"%s\\"",$0; first=0}\')',
+        f'printf \'{{"format":"multi-db-tar","db_type":"mysql",'
+        '"generated_at":"' + ts + '","globals":"na","include_system_dbs":'
+        + ("true" if include_sys else "false") + ',"databases":[%s]}\' '
+        '"$DBJSON" > "$WORK/manifest.json"',
+        'tar -czf - -C "$WORK" manifest.json dbs',
+    ]
+    script = "\n".join(lines)
+    wrapped = _wrap_login(script)
+    out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=7200)
+    if rc != 0:
+        raise RuntimeError(f"远程 MySQL 全实例备份失败(rc={rc}): {err[:800]}")
+    if len(out) <= 100:
+        raise RuntimeError(
+            f"远程 MySQL 全实例备份疑似失败：tar 流仅 {len(out)} 字节"
+            f"（stderr: {err[:200]}）")
+    return out
+
+
+def _remote_mysql_restore_tar(task: dict, ssh_host: dict, dump_bytes: bytes) -> None:
+    """MySQL 全实例 tar 恢复：SFTP 上传后逐库灌入（dump 内含 CREATE DATABASE/USE）。"""
+    import tempfile
+    from core.engines.file import _ssh_exec_pipe
+
+    client = _connect(ssh_host)
+    mysql_bin = _resolve_remote_bin(client, "mysql")
+    if not mysql_bin:
+        raise RuntimeError("远端主机未找到 mysql 客户端，无法执行全实例恢复。")
+    user = task.get("username") or "root"
+    pw = db.decrypt_secret(task.get("password") or "")
+    port = int(task.get("port") or 3306)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
+    try:
+        tmp.write(dump_bytes)
+        tmp.close()
+        pkg_path = f"/tmp/bp_mysql_restore_{os.getpid()}_{int(time.time())}.tar.gz"
+        sftp = client.open_sftp()
+        try:
+            sftp.put(tmp.name, pkg_path)
+        finally:
+            sftp.close()
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+    # 密码走临时 cnf，不进 argv/环境
+    cnf_local = tempfile.mktemp(suffix=".cnf")
+    with open(cnf_local, "wb") as f:
+        f.write(f"[client]\nuser={user}\npassword={pw}\n".encode("utf-8"))
+    remote_cnf = "/tmp/bp_mysql_restore.cnf"
+    sftp = client.open_sftp()
+    try:
+        sftp.put(cnf_local, remote_cnf)
+        try:
+            sftp.chmod(remote_cnf, 0o600)
+        except Exception:
+            pass
+    finally:
+        os.remove(cnf_local)
+        sftp.close()
+
+    script = "\n".join([
+        "set -eu",
+        f"MYSQL_BIN={shlex.quote(mysql_bin)}",
+        f"CNF={shlex.quote(remote_cnf)}",
+        f"PKG={shlex.quote(pkg_path)}",
+        f"PORT={int(port)}",
+        'WORK=$(mktemp -d /tmp/bp_mysql_restore.XXXXXX)',
+        'trap \'rm -rf "$WORK" "$PKG" "$CNF"\' EXIT',
+        'tar -xzf "$PKG" -C "$WORK"',
+        'RESTORED=""',
+        'for f in "$WORK"/dbs/*.sql; do',
+        '  [ -e "$f" ] || continue',
+        '  "$MYSQL_BIN" --defaults-file="$CNF" -h 127.0.0.1 -P $PORT < "$f"'
+        ' || { echo "restore failed for $(basename $f)" >&2; exit 52; }',
+        '  RESTORED="$RESTORED $(basename $f .sql)"',
+        "done",
+        'echo "restored:$RESTORED"',
+    ])
+    _out, err, rc = _ssh_exec_pipe(client, _wrap_login(script), timeout=7200)
+    if rc != 0:
+        raise RuntimeError(f"远程 MySQL 全实例恢复失败(rc={rc}): {err[:800]}")
+
+
 def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
                        is_custom: bool, db_type: str = "postgresql") -> None:
     """单库 dump 恢复（PG 系通用：postgresql=psql/pg_restore，kingbase=ksql/sys_restore）。"""
@@ -1469,6 +1622,9 @@ def remote_db_restore(task: dict, ssh_host: dict, db_type: str,
     """
     if db_type in ("postgresql", "kingbase") and _looks_like_full_instance_tar(dump_bytes):
         _remote_pg_family_restore_tar(task, ssh_host, db_type, dump_bytes)
+        return
+    if db_type in ("mysql", "mariadb") and _looks_like_full_instance_tar(dump_bytes):
+        _remote_mysql_restore_tar(task, ssh_host, dump_bytes)
         return
     if db_type == "mysql":
         _remote_mysql_restore(task, ssh_host, dump_bytes)

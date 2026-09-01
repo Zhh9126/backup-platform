@@ -1042,6 +1042,14 @@ class BackupEngine:
         """
         from core import cross_host
         from core import ssh_hosts as _ssh
+        # 全实例 tar 产物（multi-db-tar）暂不支持跨主机恢复：需在目标实例
+        # 重建原库清单，请使用「恢复到本任务实例」（引擎会自动建缺失的库）
+        if (backup_path or "").lower().endswith((".tar.gz", ".tgz")):
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path,
+                message="全实例备份产物（.tar.gz）暂不支持跨主机恢复，"
+                        "请使用恢复到本任务实例（缺失的库会自动创建）")
         # 需要解密密码
         target = dict(target_host_info)
         target["password"] = db.decrypt_secret(target.get("password") or "")

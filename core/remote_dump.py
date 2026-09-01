@@ -29,9 +29,11 @@ def resolve_ssh_host(task: dict):
     """解析任务的 SSH 主机（用于远程执行 dump）。
 
     解析优先级：
+    0) 任务自带 SSH 凭据（extra_options.ssh_cred，API 层已加密保存密码）——
+       **无需纳管主机**，适合"数据库与 SSH 同机"的快速接入场景；
     1) extra_options.ssh_host_id 显式指定（数据库任务表单下拉框写入）
     2) 按任务 host（数据库地址）匹配 ssh_hosts 的 hostname 或 host_key
-    3) 无匹配则返回 None（调用方将退化为仿真占位）
+    3) 无匹配则返回 None（调用方将回退本机执行）
     """
     extra = {}
     raw = task.get("extra_options")
@@ -42,6 +44,27 @@ def resolve_ssh_host(task: dict):
             extra = json.loads(raw)
         except Exception:
             extra = {}
+
+    # 0) 任务自带凭据（免纳管）：{host, port, username, password(密文)}
+    cred = extra.get("ssh_cred") or {}
+    if isinstance(cred, dict) and (cred.get("host") or cred.get("hostname")):
+        ch = (cred.get("host") or cred.get("hostname") or "").strip()
+        cp = int(cred.get("port") or 22)
+        cu = (cred.get("username") or "root").strip()
+        enc_pw = cred.get("password") or ""
+        pw = db.decrypt_secret(enc_pw) if enc_pw else ""
+        return {
+            "name": "task-direct",
+            "host_key": f"{cu}@{ch}:{cp}",
+            "hostname": ch,
+            "port": cp,
+            "username": cu,
+            "password": pw,
+            "auth_type": "password",
+            "has_password": bool(pw),
+            "os_type": cred.get("os_type") or "linux",
+            "remark": "任务自带 SSH 凭据（未纳管）",
+        }
 
     # 1) 显式指定
     hid = extra.get("ssh_host_id") or task.get("ssh_host_id")
@@ -98,7 +121,10 @@ def remote_has_tool(ssh_host: dict, tool: str, check_user: str = None) -> bool:
 
 def _connect(ssh_host: dict):
     from core.engines.file import _get_ssh_client
-    return _get_ssh_client(ssh_host["host_key"])
+    # 任务级 SSH 凭据（resolve_ssh_host 构造的临时主机）直接带密码；
+    # 已纳管主机 dict 也含解密后密码，传入可省一次 DB 查询。
+    pw = ssh_host.get("password") or None
+    return _get_ssh_client(ssh_host["host_key"], password=pw)
 
 
 def remote_exec_capture(ssh_host: dict, shell: str, timeout: int = 1800) -> dict:
@@ -566,138 +592,253 @@ def _remote_mysql_dump(task: dict, ssh_host: dict, compress: int, extra_args: st
         sftp.close()
 
 
-def _remote_pg_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
-    """在远端数据库服务器以 pg_dump 导出，返回原始字节（可选 gzip 压缩）。
+def _remote_pg_dump(task: dict, ssh_host: dict, compress: int) -> tuple:
+    """在远端数据库服务器以 pg_dump 导出，返回 (原始字节, 产物格式)。
 
     支持多模式：
     1) extra.schemas 非空  → -n s1 -n s2 ...（多 schema）
     2) extra.tables 非空   → -t tbl1 -t tbl2 ...（限定表）
     3) task.db_name 非空   → -d <db>
-    4) 上述都为空          → --all-databases
+    4) 上述都为空          → 全实例（逐库 tar + manifest；extra.all_db_mode
+                              == "dumpall" 时改为 sys_dumpall 整实例 SQL 流）
     """
-    client = _connect(ssh_host)
-    # 探测 pg_dump 真实路径
-    pgdump_bin = _resolve_remote_bin(client, "pg_dump")
-    if not pgdump_bin:
-        raise RuntimeError(
-            "远端主机未找到 pg_dump（PATH 与 /usr/pgsql-*/bin、/usr/lib/postgresql/*/bin 均无）。"
-            "请在远端安装 postgresql-client 后重试。"
-        )
-    user = task.get("username") or "postgres"
-    pw = db.decrypt_secret(task.get("password") or "")
-    db_name = task.get("db_name") or ""
-    port = task.get("port") or 5432
-    fmt = "-Fc" if compress else "-Fp"
-
-    # 解析 extra_options
-    extra = {}
-    raw_eo = task.get("extra_options")
-    if isinstance(raw_eo, dict):
-        extra = raw_eo
-    elif isinstance(raw_eo, str) and raw_eo.strip():
-        try:
-            extra = json.loads(raw_eo)
-        except Exception:
-            extra = {}
-    schemas = [str(s).strip() for s in (extra.get("schemas") or []) if str(s).strip()]
-    tables = [str(t).strip() for t in (extra.get("tables") or []) if str(t).strip()]
-
-    # 基础 args
-    # 注意：不使用 "-f -"（显式指定 stdout）。某些环境（如 PG 14.24 / CentOS7）
-    # 下 pg_dump 的 "-f -" 参数异常导致输出 0 字节；不带 -f 时 pg_dump 默认输出到
-    # stdout，行为一致且兼容性更好。
-    base = (
-        f"set -o pipefail; export PGPASSWORD={shlex.quote(pw)}; "
-        f"{pgdump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt}"
-    )
-
-    if tables:
-        # 单 db + 多表
-        if not db_name:
-            raise RuntimeError("指定表（tables）时必须同时填写 task.db_name 库名")
-        target_args = f"-d {shlex.quote(db_name)} " + " ".join(f"-t {shlex.quote(t)}" for t in tables)
-    elif schemas:
-        # 多 schema
-        target_args = " ".join(f"-n {shlex.quote(s)}" for s in schemas)
-    elif db_name:
-        target_args = f"-d {shlex.quote(db_name)}"
-    else:
-        # 全实例
-        target_args = "--all-databases"
-
-    # 额外原样透传
-    extra_args = ""
-    if extra.get("extra_args"):
-        try:
-            shlex.split(str(extra["extra_args"]))
-            extra_args = " " + str(extra["extra_args"])
-        except Exception:
-            pass
-
-    shell = f"{base} {target_args}{extra_args}"
-    # 压缩策略：远程 pg_dump 已通过 -Fc 自带 zlib 压缩，无需再外挂 gzip/zstd，
-    # 外挂会造成双重压缩（更慢且压缩率反而略差）。故 compress 时直接输出 -Fc，
-    # 落盘后缀保持 .dump，恢复端用 pg_restore，不破坏已有恢复流程。
-    wrapped = _wrap_login(shell)
-    from core.engines.file import _ssh_exec_pipe
-    out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=3600)
-    if rc != 0:
-        raise RuntimeError(f"远程 pg_dump 失败(rc={rc}, bin={pgdump_bin}): {err[:600]}")
-    if compress and len(out) <= 20:
-        raise RuntimeError(
-            f"远程 pg_dump 疑似失败：-Fc 压缩后仅 {len(out)} 字节（stderr: {err[:200]}）"
-        )
-    return out
+    return _pg_family_dump(task, ssh_host, "postgresql", compress)
 
 
-def _remote_kingbase_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
-    """在远端数据库服务器以 sys_dump 导出，返回原始字节（可选 gzip 压缩）。
+def _remote_kingbase_dump(task: dict, ssh_host: dict, compress: int) -> tuple:
+    """在远端数据库服务器以 sys_dump 导出，返回 (原始字节, 产物格式)。
 
     工具解析使用 resolve_remote_tool（kingbase 用户 profile 优先），兼容
     V8/V9 客户端工具不在 root PATH 的现场（如 ClientTools/Server 自定义目录）。
+    全实例语义见 _pg_family_dump（PG 系不存在 --all-databases 参数）。
     """
-    client = _connect(ssh_host)
-    dump_bin = resolve_remote_tool(ssh_host, "sys_dump", check_user="kingbase")
-    if not dump_bin:
-        raise RuntimeError(
-            "远端主机未找到 sys_dump（root/kingbase 用户 PATH 与常见安装目录均无）。"
-            "请在远端安装 KingbaseES 客户端后重试。"
-        )
-    user = task.get("username") or "system"
-    pw = db.decrypt_secret(task.get("password") or "")
-    db_name = task.get("db_name") or ""
-    port = task.get("port") or 54321
-    fmt = "-Fc" if compress else "-Fp"
+    return _pg_family_dump(task, ssh_host, "kingbase", compress)
 
-    extra = {}
+
+# 旧实现占位（由下方 PG 系共用实现整体接管）：
+# ---------------------------------------------------------------------------
+# PG 系（PostgreSQL / KingbaseES）共用 dump 实现
+# ---------------------------------------------------------------------------
+# 关键修正：pg_dump/sys_dump 是单库工具，不存在 mysqldump 的 --all-databases
+# 参数。全实例备份 = 枚举库 → 逐库 dump（-Fc，各自一致性快照）+
+# dumpall --globals-only（角色/表空间等全局对象）→ 打包 tar.gz + manifest.json。
+
+# 各库类型差异点（工具名候选 / 系统目录 / 维护库候选 / 密码环境变量）
+_PG_FAMILY_TOOLING = {
+    "postgresql": {
+        "label": "PostgreSQL",
+        "dump_tool": "pg_dump",
+        "query_candidates": ("psql",),
+        "dumpall_candidates": ("pg_dumpall",),
+        "catalog_table": "pg_database",
+        "maint_candidates": ("postgres", "template1"),
+        "default_port": 5432,
+        "default_user": "postgres",
+        "check_user": None,
+        "env_exports": ("PGPASSWORD",),
+    },
+    "kingbase": {
+        "label": "KingbaseES",
+        "dump_tool": "sys_dump",
+        "query_candidates": ("ksql", "sys_psql", "psql"),
+        "dumpall_candidates": ("sys_dumpall", "kb_dumpall", "ksy_dumpall", "pg_dumpall"),
+        "catalog_table": "sys_database",
+        "maint_candidates": ("test", "postgres", "security", "template1"),
+        "default_port": 54321,
+        "default_user": "system",
+        "check_user": "kingbase",
+        # V8 兼容 PGPASSWORD；V9 起用 KINGBASE_PASSWORD，两个都注入最稳
+        "env_exports": ("KINGBASE_PASSWORD", "PGPASSWORD"),
+    },
+}
+
+
+def _pg_family_parse_extra(task: dict) -> dict:
+    """解析 extra_options（dict 或 JSON 字符串），容忍脏数据。"""
     raw_eo = task.get("extra_options")
     if isinstance(raw_eo, dict):
-        extra = raw_eo
-    elif isinstance(raw_eo, str) and raw_eo.strip():
+        return raw_eo
+    if isinstance(raw_eo, str) and raw_eo.strip():
         try:
-            extra = json.loads(raw_eo)
+            return json.loads(raw_eo)
         except Exception:
-            extra = {}
+            return {}
+    return {}
+
+
+def _pg_family_env_exports(cfg: dict, pw: str) -> str:
+    """密码只走环境变量，不进 argv（各类型注入自己认的环境变量集）。"""
+    return " ".join(f"export {e}={shlex.quote(pw)};" for e in cfg["env_exports"])
+
+
+def _pg_family_resolve_query_bin(client, cfg) -> str:
+    """定位交互式 SQL 客户端（ksql/sys_psql/psql），用于枚举库与建库。"""
+    for name in cfg["query_candidates"]:
+        p = _resolve_remote_bin(client, name)
+        if p:
+            return p
+    return ""
+
+
+def _pg_family_resolve_dumpall_bin(client, cfg) -> str:
+    """定位 dumpall 工具（sys_dumpall/kb_dumpall/pg_dumpall，版本间命名不一）。"""
+    for name in cfg["dumpall_candidates"]:
+        p = _resolve_remote_bin(client, name)
+        if p:
+            return p
+    return ""
+
+
+def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
+                                 user: str, pw: str, port: int) -> bytes:
+    """全实例备份：一次 SSH 会话内逐库 dump + globals + manifest → tar.gz 流。
+
+    每库 -Fc（独立一致性快照，支持并行恢复）；单库失败即整体失败（rc=32）；
+    dumpall 缺失/失败仅降级跳过 globals（在 manifest 中标记），不阻塞备份。
+    """
+    from core.engines.file import _ssh_exec_pipe
+
+    query_bin = _pg_family_resolve_query_bin(client, cfg)
+    if not query_bin:
+        raise RuntimeError(
+            f"远端主机未找到 SQL 客户端（{'/'.join(cfg['query_candidates'])}），"
+            "无法枚举数据库清单以执行全实例备份。")
+    dumpall_bin = _pg_family_resolve_dumpall_bin(client, cfg)
+
+    env = _pg_family_env_exports(cfg, pw)
+    catalog = cfg["catalog_table"]
+    maints = " ".join(cfg["maint_candidates"])
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    db_type = "kingbase" if cfg["dump_tool"].startswith("sys_") else "postgresql"
+
+    lines = [
+        "set -eu",
+        env,
+        f"DUMP_BIN={shlex.quote(dump_bin)}",
+        f"QUERY_BIN={shlex.quote(query_bin)}",
+        f"DUMPALL_BIN={shlex.quote(dumpall_bin or '')}",
+        f"PORT={int(port)}",
+        f"USERQ={shlex.quote(user)}",
+        'WORK=$(mktemp -d /tmp/bp_fullinst.XXXXXX)',
+        "trap 'rm -rf \"$WORK\"' EXIT",
+        'mkdir -p "$WORK/dbs"',
+        f'MAINTS="{maints}"',
+        'DBS=""',
+        "for MDB in $MAINTS; do",
+        '  if DBS=$("$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -d "$MDB" -t -A '
+        f'-c "SELECT datname FROM {catalog} WHERE NOT datistemplate ORDER BY 1" 2>/dev/null) '
+        '&& [ -n "$DBS" ]; then MAINT="$MDB"; break; fi',
+        "done",
+        '[ -n "${DBS:-}" ] || { echo "cannot enumerate databases (tried: $MAINTS)" >&2; exit 31; }',
+        'for d in $DBS; do',
+        '  "$DUMP_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -Fc -f "$WORK/dbs/$d.dump" "$d"'
+        ' || { echo "dump failed for db $d" >&2; exit 32; }',
+        "done",
+        'GLOBALS="no"',
+        'if [ -n "$DUMPALL_BIN" ]; then',
+        '  if "$DUMPALL_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -g > "$WORK/globals.sql" '
+        '2>"$WORK/globals.err" && [ -s "$WORK/globals.sql" ]; then GLOBALS="yes"; '
+        'else GLOBALS="failed"; fi',
+        "fi",
+        'DBJSON=$(printf \'%s\\n\' "$DBS" | awk \'BEGIN{ORS="";first=1} '
+        '{if(!first)print ","; printf "\\"%s\\"",$0; first=0}\')',
+        f'printf \'{{"format":"multi-db-tar","db_type":"{db_type}",'
+        '"generated_at":"' + ts + '","globals":"%s","databases":[%s]}\' '
+        '"$GLOBALS" "$DBJSON" > "$WORK/manifest.json"',
+        'if [ -s "$WORK/globals.sql" ]; then',
+        '  tar -czf - -C "$WORK" manifest.json dbs globals.sql',
+        "else",
+        '  tar -czf - -C "$WORK" manifest.json dbs',
+        "fi",
+    ]
+    script = "\n".join(lines)
+    wrapped = _wrap_login(script)
+    out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=7200)
+    if rc != 0:
+        raise RuntimeError(
+            f"远程全实例备份失败(rc={rc}, bin={dump_bin}): {err[:800]}")
+    if len(out) <= 100:
+        raise RuntimeError(
+            f"远程全实例备份疑似失败：tar 流仅 {len(out)} 字节（stderr: {err[:200]}）")
+    return out
+
+
+def _pg_family_dumpall_stream(client, cfg: dict,
+                              user: str, pw: str, port: int) -> bytes:
+    """整实例 SQL 流模式（extra.all_db_mode="dumpall"）：dumpall 直接输出。
+
+    纯 SQL 文本、单文件；大库恢复较慢，但最贴近原生全实例语义。
+    dumpall 工具缺失时报错并给出说明。
+    """
+    from core.engines.file import _ssh_exec_pipe
+    dumpall_bin = _pg_family_resolve_dumpall_bin(client, cfg)
+    if not dumpall_bin:
+        raise RuntimeError(
+            f"远端主机未找到 dumpall 工具（{'/'.join(cfg['dumpall_candidates'])}）。"
+            "可在 extra_options 中去掉 all_db_mode 使用默认逐库 tar 模式。")
+    env = _pg_family_env_exports(cfg, pw)
+    shell = (
+        f"set -o pipefail; {env} "
+        f"{dumpall_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}"
+    )
+    out, err, rc = _ssh_exec_pipe(client, _wrap_login(shell), timeout=7200)
+    if rc != 0:
+        raise RuntimeError(
+            f"远程 dumpall 失败(rc={rc}, bin={dumpall_bin}): {err[:600]}")
+    return out
+
+
+def _pg_family_dump(task: dict, ssh_host: dict, db_type: str, compress: int) -> tuple:
+    """PG 系统一 dump 入口。返回 (data, fmt)：
+
+    - fmt="single"       单库/多表/多 schema dump（-Fc 自带压缩或 -Fp 纯文本）
+    - fmt="multi-db-tar" 全实例逐库 tar.gz（含 manifest.json + globals.sql）
+    - fmt="dumpall"      整实例 SQL 流（extra.all_db_mode="dumpall" 时）
+    """
+    cfg = _PG_FAMILY_TOOLING[db_type]
+    client = _connect(ssh_host)
+    dump_bin = resolve_remote_tool(
+        ssh_host, cfg["dump_tool"], check_user=cfg["check_user"])
+    if not dump_bin:
+        raise RuntimeError(
+            f"远端主机未找到 {cfg['dump_tool']}"
+            "（root/数据库用户 PATH 与常见安装目录均无）。"
+            "请确认数据库服务端/客户端工具已安装后重试。")
+
+    user = task.get("username") or cfg["default_user"]
+    pw = db.decrypt_secret(task.get("password") or "")
+    db_name = task.get("db_name") or ""
+    port = int(task.get("port") or cfg["default_port"])
+    fmt_flag = "-Fc" if compress else "-Fp"
+    extra = _pg_family_parse_extra(task)
     schemas = [str(s).strip() for s in (extra.get("schemas") or []) if str(s).strip()]
     tables = [str(t).strip() for t in (extra.get("tables") or []) if str(t).strip()]
 
-    # 密码环境变量：V8 兼容 PGPASSWORD；V9 起使用 KINGBASE_PASSWORD，两个都注入
+    # ---- 全实例：逐库 tar / dumpall（db_name 为空且未指定 schemas/tables）----
+    if not db_name and not schemas and not tables:
+        if (extra.get("all_db_mode") or "").strip().lower() == "dumpall":
+            return _pg_family_dumpall_stream(client, cfg, user, pw, port), "dumpall"
+        return _pg_family_full_instance_tar(
+            client, cfg, dump_bin, user, pw, port), "multi-db-tar"
+
+    # ---- 单库/多表/多 schema（原有行为）----
+    # 注意：不使用 "-f -"（显式指定 stdout）。某些环境下 pg_dump 的 "-f -"
+    # 参数异常导致输出 0 字节；不带 -f 时默认输出 stdout，行为一致且兼容性更好。
+    env = _pg_family_env_exports(cfg, pw)
     base = (
-        f"set -o pipefail; export PGPASSWORD={shlex.quote(pw)}; "
-        f"export KINGBASE_PASSWORD={shlex.quote(pw)}; "
-        f"{dump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt}"
+        f"set -o pipefail; {env} "
+        f"{dump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt_flag}"
     )
 
     if tables:
         if not db_name:
-            raise RuntimeError("指定表（tables）时必须同时填写 task.db_name 库名")
-        target_args = f"-d {shlex.quote(db_name)} " + " ".join(f"-t {shlex.quote(t)}" for t in tables)
+            raise RuntimeError("指定表（tables）时必须同时填写库名（db_name）")
+        target_args = f"-d {shlex.quote(db_name)} " + " ".join(
+            f"-t {shlex.quote(t)}" for t in tables)
     elif schemas:
         target_args = " ".join(f"-n {shlex.quote(s)}" for s in schemas)
-    elif db_name:
-        target_args = f"-d {shlex.quote(db_name)}"
     else:
-        target_args = "--all-databases"
+        target_args = f"-d {shlex.quote(db_name)}"
 
     extra_args = ""
     if extra.get("extra_args"):
@@ -708,19 +849,20 @@ def _remote_kingbase_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
             pass
 
     shell = f"{base} {target_args}{extra_args}"
-    # 压缩策略：远程 sys_dump 已通过 -Fc 自带 zlib 压缩，无需再外挂 gzip/zstd，
-    # 否则双重压缩（更慢且压缩率略差）。compress 时直接输出 -Fc，落盘 .dump，
-    # 恢复端用 sys_restore，保持与本地一致、不破坏恢复流程。
+    # 压缩策略：-Fc 自带 zlib 压缩，不外挂 gzip/zstd 以免双重压缩；
+    # compress 时落盘 .dump，恢复端用 pg_restore/sys_restore。
     wrapped = _wrap_login(shell)
     from core.engines.file import _ssh_exec_pipe
     out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=3600)
     if rc != 0:
-        raise RuntimeError(f"远程 sys_dump 失败(rc={rc}, bin={dump_bin}): {err[:600]}")
+        raise RuntimeError(
+            f"远程 {cfg['dump_tool']} 失败(rc={rc}, bin={dump_bin}): {err[:600]}")
     if compress and len(out) <= 20:
         raise RuntimeError(
-            f"远程 sys_dump 疑似失败：-Fc 压缩后仅 {len(out)} 字节（stderr: {err[:200]}）"
-        )
-    return out
+            f"远程 {cfg['dump_tool']} 疑似失败：-Fc 压缩后仅 {len(out)} 字节"
+            f"（stderr: {err[:200]}）")
+    return out, "single"
+
 
 
 def _remote_redis_dump(task: dict, ssh_host: dict) -> bytes:
@@ -828,23 +970,27 @@ def remote_exec_and_fetch(ssh_host: dict, remote_cmd: str, remote_path: str,
 
 def remote_db_dump(task: dict, ssh_host: dict, db_type: str, compress: int = 0,
                    extra_args: str = "") -> tuple:
-    """统一入口：在数据库服务器本地执行 dump 并返回 (原始字节, 是否压缩)。
+    """统一入口：在数据库服务器本地执行 dump 并返回 (原始字节, 是否压缩, 产物格式)。
 
-    - 返回元组 (data: bytes, compressed: bool)，供调用方决定落盘后缀与
-      compress_algo；当远端缺少压缩工具而降级为不压缩时，compressed=False，
+    - 返回元组 (data: bytes, compressed: bool, fmt: str)，供调用方决定落盘
+      后缀与 compress_algo；当远端缺少压缩工具而降级为不压缩时，compressed=False，
       调用方应以 .sql 落盘而非 .sql.zst，保证恢复可逆。
+    - fmt: "single"（单库 dump）/"multi-db-tar"（PG 系全实例逐库 tar.gz）/
+      "dumpall"（PG 系整实例 SQL 流）。MySQL/Redis/MongoDB 恒为 "single"。
     - extra_args: 透传给 dump 命令的额外参数（目前 MySQL 用）。
     """
     if db_type == "mysql":
-        return _remote_mysql_dump(task, ssh_host, compress, extra_args)
+        return _remote_mysql_dump(task, ssh_host, compress, extra_args) + ("single",)
     if db_type == "postgresql":
-        return _remote_pg_dump(task, ssh_host, compress), bool(compress)
+        data, fmt = _remote_pg_dump(task, ssh_host, compress)
+        return data, bool(compress) and fmt == "single", fmt
     if db_type == "kingbase":
-        return _remote_kingbase_dump(task, ssh_host, compress), bool(compress)
+        data, fmt = _remote_kingbase_dump(task, ssh_host, compress)
+        return data, bool(compress) and fmt == "single", fmt
     if db_type == "redis":
-        return _remote_redis_dump(task, ssh_host), False
+        return _remote_redis_dump(task, ssh_host), False, "single"
     if db_type == "mongodb":
-        return _remote_mongodb_dump(task, ssh_host, compress), bool(compress)
+        return _remote_mongodb_dump(task, ssh_host, compress), bool(compress), "single"
     raise RuntimeError(f"不支持的远程 dump 类型: {db_type}")
 
 
@@ -1152,11 +1298,15 @@ def _remote_mysql_restore(task: dict, ssh_host: dict, dump_bytes: bytes) -> None
 
 
 def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
-                       is_custom: bool) -> None:
-    user = task.get("username") or "postgres"
+                       is_custom: bool, db_type: str = "postgresql") -> None:
+    """单库 dump 恢复（PG 系通用：postgresql=psql/pg_restore，kingbase=ksql/sys_restore）。"""
+    cfg = _PG_FAMILY_TOOLING[db_type]
+    restore_tool = "sys_restore" if db_type == "kingbase" else "pg_restore"
+    user = task.get("username") or cfg["default_user"]
     pw = db.decrypt_secret(task.get("password") or "")
     db_name = task.get("db_name") or ""
-    port = task.get("port") or 5432
+    port = int(task.get("port") or cfg["default_port"])
+    env = _pg_family_env_exports(cfg, pw)
     # 探测工具路径
     client = _connect(ssh_host)
     from core.engines.file import _ssh_exec_pipe
@@ -1165,10 +1315,13 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
     #    pg_restore 的 "-C" 在目标库同名已存在时会因 "cannot drop the
     #    currently open database" 失败，导致旧对象残留，这里改为两步建库。
     if db_name:
-        psql_tool = _resolve_remote_bin(client, "psql") or "psql"
+        psql_tool = _pg_family_resolve_query_bin(client, cfg)
+        if not psql_tool:
+            raise RuntimeError(
+                f"远端主机未找到 SQL 客户端（{'/'.join(cfg['query_candidates'])}），无法恢复。")
         safe_db = db_name.replace('"', '""')
         prep = (
-            f"set -o pipefail; export PGPASSWORD={shlex.quote(pw)}; "
+            f"set -o pipefail; {env} "
             f"{psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d postgres "
             f"-c 'DROP DATABASE IF EXISTS \"{safe_db}\" WITH (FORCE);' "
             f"&& {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d postgres "
@@ -1180,19 +1333,17 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
             raise RuntimeError(f"远程重建目标库 {db_name} 失败(rc={prc}): {perr[:600]}")
 
     if is_custom:
-        tool = _resolve_remote_bin(client, "pg_restore") or "pg_restore"
-        shell = (
-            f"set -o pipefail; export PGPASSWORD={shlex.quote(pw)}; "
-            f"{tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} "
-            f"-d {shlex.quote(db_name)}"
-        )
+        tool = _resolve_remote_bin(client, restore_tool) or restore_tool
     else:
-        tool = _resolve_remote_bin(client, "psql") or "psql"
-        shell = (
-            f"set -o pipefail; export PGPASSWORD={shlex.quote(pw)}; "
-            f"{tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} "
-            f"-d {shlex.quote(db_name)}"
-        )
+        tool = _pg_family_resolve_query_bin(client, cfg)
+        if not tool:
+            raise RuntimeError(
+                f"远端主机未找到 SQL 客户端（{'/'.join(cfg['query_candidates'])}），无法恢复。")
+    shell = (
+        f"set -o pipefail; {env} "
+        f"{tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} "
+        f"-d {shlex.quote(db_name)}"
+    )
     wrapped = _wrap_login(shell)
     _out, err, rc = _ssh_exec_pipe(
         client, wrapped, input_data=dump_bytes, timeout=3600)
@@ -1200,12 +1351,130 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
         raise RuntimeError(f"远程恢复失败(rc={rc}): {err[:600]}")
 
 
+def _pg_family_tar_restore_script(cfg: dict, restore_bin: str, query_bin: str,
+                                  pkg_path: str, user: str, pw: str, port: int) -> str:
+    """构造全实例 tar 包恢复脚本：globals + 逐库（缺失自动建库，-c 清理覆盖）。"""
+    env = _pg_family_env_exports(cfg, pw)
+    catalog = cfg["catalog_table"]
+    maints = " ".join(cfg["maint_candidates"])
+    return "\n".join([
+        "set -eu",
+        env,
+        f"RESTORE_BIN={shlex.quote(restore_bin)}",
+        f"QUERY_BIN={shlex.quote(query_bin)}",
+        f"PKG={shlex.quote(pkg_path)}",
+        f"PORT={int(port)}",
+        f"USERQ={shlex.quote(user)}",
+        'WORK=$(mktemp -d /tmp/bp_restore.XXXXXX)',
+        "trap 'rm -rf \"$WORK\" \"$PKG\"' EXIT",
+        'tar -xzf "$PKG" -C "$WORK"',
+        # pg_restore/sys_restore 低版本可能无 --if-exists，探测后再用
+        'IFEX=""',
+        'if "$RESTORE_BIN" --help 2>&1 | grep -q -- "--if-exists"; then IFEX="--if-exists"; fi',
+        'MAINT=""',
+        'DBS_EXIST=""',
+        "for MDB in " + maints + "; do",
+        '  if DBS_EXIST=$("$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -d "$MDB" -t -A '
+        f'-c "SELECT datname FROM {catalog} WHERE NOT datistemplate" 2>/dev/null) '
+        '&& [ -n "$DBS_EXIST" ]; then MAINT="$MDB"; break; fi',
+        "done",
+        '[ -n "${MAINT:-}" ] || { echo "cannot connect instance to restore" >&2; exit 51; }',
+        # 全局对象（角色/表空间）：失败不阻塞（可能已存在）
+        'if [ -s "$WORK/globals.sql" ]; then',
+        '  "$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -d "$MAINT" '
+        '-f "$WORK/globals.sql" >/dev/null 2>&1 \\',
+        '    || echo "WARN: globals restore failed (may already exist)" >&2',
+        "fi",
+        'RESTORED=""',
+        'for f in "$WORK"/dbs/*.dump; do',
+        '  [ -e "$f" ] || continue',
+        '  d=$(basename "$f" .dump)',
+        '  if ! printf \'%s\\n\' "$DBS_EXIST" | grep -qxF "$d"; then',
+        '    "$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -d "$MAINT" '
+        '-c "CREATE DATABASE \\"$d\\"" >/dev/null 2>&1 || true',
+        "  fi",
+        '  "$RESTORE_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" --dbname "$d" '
+        '--clean $IFEX "$f" || { echo "restore failed for db $d" >&2; exit 52; }',
+        '  RESTORED="$RESTORED $d"',
+        "done",
+        'echo "restored:$RESTORED"',
+    ])
+
+
+def _remote_pg_family_restore_tar(task: dict, ssh_host: dict, db_type: str,
+                                  dump_bytes: bytes) -> None:
+    """全实例 tar 包恢复：SFTP 上传后在远端解包，逐库 restore（含建库/globals）。"""
+    import tempfile
+    from core.engines.file import _ssh_exec_pipe
+
+    cfg = _PG_FAMILY_TOOLING[db_type]
+    client = _connect(ssh_host)
+    restore_tool = "sys_restore" if db_type == "kingbase" else "pg_restore"
+    restore_bin = _resolve_remote_bin(client, restore_tool)
+    if not restore_bin:
+        raise RuntimeError(f"远端主机未找到 {restore_tool}，无法执行全实例恢复。")
+    query_bin = _pg_family_resolve_query_bin(client, cfg)
+    if not query_bin:
+        raise RuntimeError(
+            f"远端主机未找到 SQL 客户端（{'/'.join(cfg['query_candidates'])}），"
+            "无法执行全实例恢复。")
+
+    user = task.get("username") or cfg["default_user"]
+    pw = db.decrypt_secret(task.get("password") or "")
+    port = int(task.get("port") or cfg["default_port"])
+
+    # dump 字节流先落本地临时文件，再 SFTP 推送（tar 需远端随机访问，不能走 stdin）
+    tmp = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)
+    try:
+        tmp.write(dump_bytes)
+        tmp.close()
+        pkg_path = f"/tmp/bp_restore_{os.getpid()}_{int(time.time())}.tar.gz"
+        sftp = client.open_sftp()
+        try:
+            sftp.put(tmp.name, pkg_path)
+        finally:
+            sftp.close()
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+    script = _pg_family_tar_restore_script(
+        cfg, restore_bin, query_bin, pkg_path, user, pw, port)
+    out, err, rc = _ssh_exec_pipe(client, _wrap_login(script), timeout=7200)
+    if rc != 0:
+        raise RuntimeError(f"远程全实例恢复失败(rc={rc}): {err[:800]}")
+
+
+def _looks_like_full_instance_tar(dump_bytes: bytes) -> bool:
+    """识别 multi-db-tar 产物：gzip 魔数 + tar 内含 manifest.json。"""
+    if dump_bytes[:2] != b"\x1f\x8b":
+        return False
+    try:
+        import io as _io
+        import tarfile
+        with tarfile.open(fileobj=_io.BytesIO(dump_bytes), mode="r:gz") as tf:
+            names = tf.getnames()
+        return "manifest.json" in names
+    except Exception:
+        return False
+
+
 def remote_db_restore(task: dict, ssh_host: dict, db_type: str,
                       dump_bytes: bytes, is_custom: bool = False) -> None:
-    """统一入口：将本地 dump 字节流经 SSH 灌入数据库服务器。"""
+    """统一入口：将本地 dump 字节流经 SSH 灌入数据库服务器。
+
+    自动识别 multi-db-tar（全实例逐库 tar.gz）产物并走整实例恢复分支。
+    """
+    if db_type in ("postgresql", "kingbase") and _looks_like_full_instance_tar(dump_bytes):
+        _remote_pg_family_restore_tar(task, ssh_host, db_type, dump_bytes)
+        return
     if db_type == "mysql":
         _remote_mysql_restore(task, ssh_host, dump_bytes)
     elif db_type == "postgresql":
-        _remote_pg_restore(task, ssh_host, dump_bytes, is_custom)
+        _remote_pg_restore(task, ssh_host, dump_bytes, is_custom, db_type="postgresql")
+    elif db_type == "kingbase":
+        _remote_pg_restore(task, ssh_host, dump_bytes, is_custom, db_type="kingbase")
     else:
         raise RuntimeError(f"不支持的远程恢复类型: {db_type}")

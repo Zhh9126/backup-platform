@@ -18,6 +18,33 @@ _LIST_DB_SKIP = {
 }
 
 
+def _secure_ssh_cred(extra_options):
+    """extra_options.ssh_cred.password 加密保存（免纳管 SSH 执行通道）。
+
+    - 前端传明文密码（无 _enc 标记）→ 加密后落库；
+    - 前端未改密码（带 _enc=1，密文原样传回）→ 原样保留；
+    - 解析失败时不修改原值（不影响任务其它字段保存）。
+    """
+    if not extra_options:
+        return extra_options
+    try:
+        import json as _json
+        eo = (_json.loads(extra_options) if isinstance(extra_options, str)
+              else dict(extra_options))
+        if not isinstance(eo, dict):
+            return extra_options
+        cred = eo.get("ssh_cred")
+        if isinstance(cred, dict) and cred.get("password"):
+            if not cred.get("_enc"):
+                cred["password"] = db.encrypt_secret(str(cred["password"]))
+                cred["_enc"] = 1
+            eo["ssh_cred"] = cred
+            return _json.dumps(eo, ensure_ascii=False)
+    except Exception:
+        pass
+    return extra_options
+
+
 def _fetch_db_list(db_type: str, task: dict):
     """拉取库列表：优先原有连接方式（SSH/本机客户端），失败或为空时回退 JDBC 通道。
 
@@ -120,6 +147,8 @@ def create_task():
     err = _validate_biz_system(data.get("biz_system"), required=True)
     if err:
         return jsonify({"error": err}), 400
+    if data.get("extra_options"):
+        data["extra_options"] = _secure_ssh_cred(data["extra_options"])
     tid = models.create_task(data)
     scheduler.reload_scheduler()
     return jsonify({"id": tid, "ok": True}), 201
@@ -149,6 +178,8 @@ def update_task(task_id):
         err = _validate_biz_system(s, required=True)
         if err:
             return jsonify({"error": err}), 400
+    if data.get("extra_options"):
+        data["extra_options"] = _secure_ssh_cred(data["extra_options"])
     models.update_task(task_id, data)
     scheduler.reload_scheduler()
     return jsonify({"ok": True})

@@ -72,7 +72,7 @@ class MongoEngine(BackupEngine):
         enable = getattr(config, "COMPRESS_BY_DEFAULT", True)
         compress = 1 if enable else 0
         t0 = time.time()
-        data, compressed = remote_dump.remote_db_dump(self.task, ssh_host, "mongodb", compress)
+        data, compressed, _fmt = remote_dump.remote_db_dump(self.task, ssh_host, "mongodb", compress)
 
         duration = round(time.time() - t0, 3)
         out_dir = self._output_dir()

@@ -64,7 +64,7 @@ class RedisEngine(BackupEngine):
         from core import remote_dump
         import time
         t0 = time.time()
-        data, _ = remote_dump.remote_db_dump(self.task, ssh_host, "redis")
+        data, _, _fmt = remote_dump.remote_db_dump(self.task, ssh_host, "redis")
         duration = round(time.time() - t0, 3)
         out_dir = self._output_dir()
         ts = self._timestamp()

@@ -413,7 +413,7 @@ class MySQLEngine(BackupEngine):
         extra = self._parse_extra_options()
         # 默认禁用 GTID_PURGED；用户可通过 gtid_purged=true 显式保留。
         extra_args = "--set-gtid-purged=OFF" if not extra.get("gtid_purged") else ""
-        data, compressed = remote_dump.remote_db_dump(self.task, ssh_host, "mysql", comp, extra_args)
+        data, compressed, _fmt = remote_dump.remote_db_dump(self.task, ssh_host, "mysql", comp, extra_args)
         # compressed 反映远端实际是否压缩（缺 zstd 时 remote_dump 会降级为不压缩）
         suffix = ".sql.zst" if compressed else ".sql"
         res = self._write_dump_file(data, backup_type, ssh_host, suffix, "mysqldump")

@@ -147,6 +147,37 @@
               </div>
             </div>
             <div class="tab-pane fade" id="tab_advanced" role="tabpanel">
+              <div class="col-12 border rounded p-3 bg-light mb-1">
+                <div class="form-check form-switch mb-1">
+                  <input class="form-check-input" type="checkbox" id="t_ssh_same">
+                  <label class="form-check-label fw-bold" for="t_ssh_same">
+                    数据库服务器 SSH 执行通道（可选，推荐开启）
+                  </label>
+                </div>
+                <div class="small text-muted mb-2">
+                  开启后优先通过 SSH 在数据库服务器上执行备份/恢复——<b>无需纳管主机、无需安装 agent</b>。
+                  SSH 地址留空 = 与上方数据库主机同机；凭据加密存储。
+                </div>
+                <div class="row g-2" id="t_ssh_fields" style="display:none">
+                  <div class="col-md-3">
+                    <label class="form-label">SSH 地址</label>
+                    <input class="form-control form-control-sm" id="t_ssh_addr" placeholder="留空 = 与数据库同机">
+                  </div>
+                  <div class="col-md-2">
+                    <label class="form-label">SSH 端口</label>
+                    <input type="number" class="form-control form-control-sm" id="t_ssh_port" value="22">
+                  </div>
+                  <div class="col-md-3">
+                    <label class="form-label">SSH 用户名</label>
+                    <input class="form-control form-control-sm" id="t_ssh_user" placeholder="root">
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label">SSH 密码</label>
+                    <input type="password" class="form-control form-control-sm" id="t_ssh_pwd" placeholder="留空表示不修改">
+                    <div class="small text-muted" id="t_ssh_state"></div>
+                  </div>
+                </div>
+              </div>
               <div class="row g-3">
                 <div class="col-md-4">
                   <label class="form-label">保留天数</label>
@@ -238,8 +269,9 @@
                   <label class="form-check-label">仅数据（不要建表语句）</label>
                 </div>
                 <div class="mt-1 small text-muted">
-                  提示：单库（不带 schemas/tables）= <code>--databases &lt;db&gt;</code>；多库 = <code>--databases s1 s2 ...</code>；
-                  单库指定表 = <code>mysqldump &lt;db&gt; t1 t2 ...</code>；全实例 = <code>--all-databases</code>。
+                  提示：MySQL/MariaDB 单库 = <code>mysqldump &lt;db&gt;</code>，全实例 = <code>--all-databases</code>；
+                  PostgreSQL/Kingbase 单库 = <code>pg_dump/sys_dump -d &lt;db&gt;</code>，
+                  <b>库名留空 = 全实例</b>（逐库导出 + 全局对象打包为 .tar.gz，恢复时自动建缺失的库）。
                 </div>
               </div>
 

@@ -446,6 +446,8 @@
         const eo = JSON.parse(task.extra_options || "{}");
         if ($("t_ssh_host")) $("t_ssh_host").value = eo.ssh_host_id || "";
         if ($("t_encrypt_pool")) $("t_encrypt_pool").checked = !!eo.encrypt_pool;
+        // 任务级 SSH 凭据回填（免纳管执行通道）
+        fillSshCred(eo.ssh_cred, task);
         // 自定义脚本回填
         if ($("t_custom_script")) $("t_custom_script").value = eo.custom_script || "";
         if ($("t_custom_restore")) $("t_custom_restore").value = eo.custom_restore_script || "";
@@ -467,6 +469,7 @@
       if ($("t_custom_restore")) $("t_custom_restore").value = "";
       if ($("t_custom_artifact_dir")) $("t_custom_artifact_dir").value = "";
       if ($("t_custom_timeout")) $("t_custom_timeout").value = "";
+      resetSshCred();
     }
     toggleCustomBox();
     // 数据库选择器（schema/table 多选）：mysql/mariadb/postgresql/kingbase/oracle/dameng 显示
@@ -694,8 +697,67 @@
     const box = $("t_custom_box");
     const sel = $("t_backup_mode");
     if (box && sel) box.style.display = sel.value === "custom" ? "" : "none";
+    // SSH 通道开关绑定（一次性）
+    const sc = $("t_ssh_same");
+    if (sc && !sc._bound) { sc._bound = true; sc.onchange = toggleSshFields; }
   }
   window.toggleCustomBox = toggleCustomBox;
+
+  // ===================================================================
+  // 任务级 SSH 执行通道（免纳管）：凭据写入 extra_options.ssh_cred
+  // ===================================================================
+  function toggleSshFields() {
+    const chkEl = $("t_ssh_same");
+    const box = $("t_ssh_fields");
+    if (chkEl && box) box.style.display = chkEl.checked ? "" : "none";
+  }
+  window.toggleSshFields = toggleSshFields;
+
+  function resetSshCred() {
+    if ($("t_ssh_same")) $("t_ssh_same").checked = false;
+    if ($("t_ssh_addr")) $("t_ssh_addr").value = "";
+    if ($("t_ssh_port")) $("t_ssh_port").value = 22;
+    if ($("t_ssh_user")) $("t_ssh_user").value = "";
+    if ($("t_ssh_pwd")) $("t_ssh_pwd").value = "";
+    if ($("t_ssh_state")) $("t_ssh_state").textContent = "";
+    toggleSshFields();
+  }
+
+  function fillSshCred(sc, task) {
+    resetSshCred();
+    if (!sc) return;
+    if ($("t_ssh_same")) $("t_ssh_same").checked = true;
+    // 地址与数据库同机时留空（保存时自动带出任务 host）
+    const sameHost = !sc.host || sc.host === (task && task.host || "");
+    if ($("t_ssh_addr") && !sameHost) $("t_ssh_addr").value = sc.host;
+    if ($("t_ssh_port")) $("t_ssh_port").value = sc.port || 22;
+    if ($("t_ssh_user")) $("t_ssh_user").value = sc.username || "";
+    if ($("t_ssh_state")) {
+      $("t_ssh_state").textContent = sc._enc
+        ? "已保存加密凭据（密码留空 = 不修改）" : "";
+    }
+    toggleSshFields();
+  }
+
+  function collectSshCred(eo) {
+    if (!$("t_ssh_same")) return;
+    if ($("t_ssh_same").checked) {
+      const prev = eo.ssh_cred || {};
+      const pwd = ($("t_ssh_pwd") && $("t_ssh_pwd").value) || "";
+      const addr = ($("t_ssh_addr") && $("t_ssh_addr").value.trim())
+        || val("t_host") || "";
+      eo.ssh_cred = {
+        host: addr,
+        port: num($("t_ssh_port") ? $("t_ssh_port").value : 22) || 22,
+        username: ($("t_ssh_user") && $("t_ssh_user").value.trim()) || "root",
+        // 密码留空且之前已加密保存 → 原样保留密文（API 层按 _enc 识别）
+        password: pwd || (prev._enc ? prev.password : ""),
+      };
+      if (!pwd && prev._enc) eo.ssh_cred._enc = 1;
+    } else if (eo.ssh_cred) {
+      delete eo.ssh_cred;
+    }
+  }
 
   async function saveTask() {
     // 全面防御：编辑/新建时，模态框的某些字段可能不在当前 tab/不存在，
@@ -728,6 +790,7 @@
       }
       let eo = {};
       try { eo = JSON.parse(val("t_extra_options", "{}")); } catch (_) { eo = {}; }
+      collectSshCred(eo);
       const sshId = val("t_ssh_host");
       if (sshId) eo.ssh_host_id = Number(sshId); else delete eo.ssh_host_id;
       if (chk("t_encrypt_pool")) eo.encrypt_pool = true; else delete eo.encrypt_pool;

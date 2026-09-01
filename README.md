@@ -77,6 +77,12 @@
 
 ### 主机与连接纳管
 - **SSH 主机纳管**（`ssh_hosts` 表）：用于文件备份的远程源/目标，密码 XOR + base64 加密，支持连接测试
+- **任务级 SSH 凭据（免纳管）**：任务表单「高级」页可勾选「数据库服务器 SSH 执行通道」，直接填 SSH 账号（默认与数据库同机），密码加密存入任务——**无需预先纳管主机即可远程备份/恢复**；已纳管主机仍按 IP 自动匹配
+
+### PG / Kingbase 全实例备份（库名留空）
+- `pg_dump`/`sys_dump` 是单库工具、不支持 `--all-databases`：任务库名留空时自动切换**全实例模式**——枚举用户库 → 逐库 `-Fc` 导出（各自一致性快照）+ `sys_dumpall/pg_dumpall -g` 全局对象 → 打包为单个 `.tar.gz`（内含 `manifest.json` 库清单）
+- 恢复端自动识别 tar 产物：恢复全局对象 → 缺失的库自动 CREATE → 逐库 `restore --clean`（本机与 SSH 远端通道均支持）
+- 可选整实例 SQL 模式：`extra_options` 传 `{"all_db_mode": "dumpall"}` 时直接 `dumpall` 输出纯 SQL（大库恢复较慢）
 
 ### 数据库直连能力（原生驱动，无需 Java）
 - **原生直连**（`core/native_conn.py`）：通过纯 Python 驱动直连数据库——连接测试、拉取库列表、数据对比，**不依赖 SSH、本机客户端与 Java/JVM**，离线环境开箱即用。入口：任务表单与「备份插件」页，接口：`/api/jdbc/*`。

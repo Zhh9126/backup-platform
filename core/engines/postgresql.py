@@ -16,6 +16,7 @@ PostgreSQL 备份引擎。
 import os
 import time
 import shlex
+import shutil
 import subprocess
 import json
 
@@ -128,11 +129,20 @@ class PostgreSQLEngine(BackupEngine):
         """在 SSH 备份机/数据库服务器上执行 pg_dump，把流拉回到本地落盘。"""
         from core import remote_dump
         comp = int(self.task.get("compress") or 0)
-        data, _ = remote_dump.remote_db_dump(self.task, ssh_host, "postgresql", comp)
-        # 远程 pg_dump 用 -Fc 自带压缩，落盘为 .dump（不再外挂 gzip）
-        ext = ".dump" if comp else ".sql"
+        data, compressed, fmt = remote_dump.remote_db_dump(self.task, ssh_host, "postgresql", comp)
+        if fmt == "multi-db-tar":
+            # 全实例：逐库 tar.gz（远端已 gzip，manifest.json 标注库清单）
+            res = self._write_dump_file(data, backup_type, ssh_host, ".tar.gz", "pg_dump")
+            res.compress_algo = "gzip"
+            return res
+        if fmt == "dumpall":
+            res = self._write_dump_file(data, backup_type, ssh_host, ".sql", "pg_dumpall")
+            res.compress_algo = "none"
+            return res
+        # 单库：远程 pg_dump 用 -Fc 自带压缩，落盘为 .dump（不再外挂 gzip）
+        ext = ".dump" if compressed else ".sql"
         res = self._write_dump_file(data, backup_type, ssh_host, ext, "pg_dump")
-        res.compress_algo = "zlib" if comp else "none"
+        res.compress_algo = "zlib" if compressed else "none"
         return res
 
     def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:
@@ -146,6 +156,13 @@ class PostgreSQLEngine(BackupEngine):
         pw = db.decrypt_secret(self.task.get("password") or "")
         db_name = self.task.get("db_name")
         compress = int(self.task.get("compress") or 0)
+
+        # 3.5) 全实例（db_name 为空）：pg_dump 是单库工具，不存在
+        #      --all-databases 参数，改为逐库 tar.gz + globals + manifest
+        extra_eo = self._parse_extra_options()
+        if (not db_name and not extra_eo.get("schemas")
+                and not extra_eo.get("tables")):
+            return self._backup_full_instance_local(backup_type)
 
         # 4) 增量/差异回退为全量（逻辑备份无真正增量），并在 message 注明
         real_type = backup_type
@@ -222,6 +239,70 @@ class PostgreSQLEngine(BackupEngine):
             message=message,
         )
 
+    # ------------------------------------------------------------------
+    # 全实例（逐库 tar）备份/恢复 —— db_name 为空时的路径
+    # ------------------------------------------------------------------
+    def _backup_full_instance_local(self, backup_type: BackupType) -> BackupResult:
+        """全实例逻辑备份：枚举库 → 逐库 pg_dump + pg_dumpall 全局对象 → tar.gz。
+
+        PG 系没有 --all-databases；逐库快照各自一致，globals 单独导出。
+        """
+        from core import logical_full
+        out_dir = self._output_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, f"{self._timestamp()}.tar.gz")
+        dump_tool = shutil.which("pg_dump") or "pg_dump"
+        query_tool = shutil.which("psql") or "psql"
+        dumpall_tool = shutil.which("pg_dumpall") or ""
+        try:
+            manifest = logical_full.backup_full_instance(
+                "postgresql",
+                host=self.task.get("host"), port=self.task.get("port"),
+                user=self.task.get("username"),
+                password=db.decrypt_secret(self.task.get("password") or ""),
+                dump_tool=dump_tool, out_path=out_path,
+                query_tool=query_tool, dumpall_tool=dumpall_tool)
+        except Exception as e:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=None, simulated=False,
+                message=f"PostgreSQL 全实例备份失败: {e}")
+        size, checksum = self._compute_size_checksum(out_path)
+        dbs_txt = ", ".join(manifest.get("databases") or [])
+        msg = (f"PostgreSQL 全实例备份成功: {len(manifest['databases'])} 个库"
+               f"（{dbs_txt}）+ 全局对象({manifest.get('globals')})，"
+               f"产物 {out_path}")
+        return BackupResult(
+            success=True, status=BackupStatus.SUCCESS,
+            backup_path=out_path, size_bytes=size, duration_sec=0,
+            simulated=False, checksum=checksum, message=msg)
+
+    def _restore_full_instance_local(self, backup_path: str) -> BackupResult:
+        """全实例恢复：解包 → globals → 缺失库自动建库 → 逐库 pg_restore。"""
+        from core import logical_full
+        restore_tool = shutil.which("pg_restore") or "pg_restore"
+        query_tool = shutil.which("psql") or "psql"
+        try:
+            result = logical_full.restore_full_instance(
+                "postgresql",
+                host=self.task.get("host"), port=self.task.get("port"),
+                user=self.task.get("username"),
+                password=db.decrypt_secret(self.task.get("password") or ""),
+                backup_path=backup_path,
+                restore_tool=restore_tool, query_tool=query_tool)
+        except Exception as e:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path, simulated=False,
+                message=f"PostgreSQL 全实例恢复失败: {e}")
+        dbs_txt = ", ".join(result.get("restored") or [])
+        msg = (f"PostgreSQL 全实例恢复成功: {len(result['restored'])} 个库"
+               f"（{dbs_txt}），全局对象{'已恢复' if result.get('globals') else '跳过/已存在'}")
+        return BackupResult(
+            success=True, status=BackupStatus.SUCCESS,
+            backup_path=backup_path, duration_sec=0,
+            simulated=False, checksum="", message=msg)
+
     # ------------------------- 恢复 -------------------------
     def restore(self, backup_path: str, **kwargs) -> BackupResult:
         """执行 PostgreSQL 逻辑恢复。"""
@@ -294,6 +375,10 @@ class PostgreSQLEngine(BackupEngine):
         target_db = kwargs.get("target_db") or self.task.get("db_name")
 
         env_extra = {"PGPASSWORD": pw} if pw else None
+
+        # 2.5) 全实例 tar 包（multi-db-tar）：逐库恢复，不适用单库流程
+        if backup_path.endswith((".tar.gz", ".tgz")):
+            return self._restore_full_instance_local(backup_path)
 
         # 3) 确保目标库存在（PostgreSQL 必须连接一个已存在的库再恢复）。
         #    先 DROP 再 CREATE：保证恢复是干净、可重复的（与 -C 相比更可靠，

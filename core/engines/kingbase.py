@@ -331,16 +331,6 @@ class KingbaseEngine(BackupEngine):
             return self._try_cross_host_restore(backup_path, target_host_info,
                                                  kwargs.get("target_db") or "")
 
-        # 客户端探测
-        ok, detail = self.check_client()
-        if not ok:
-            return BackupResult(
-                success=False,
-                status=BackupStatus.FAILED,
-                simulated=False,
-                message="客户端检查失败: " + detail,
-            )
-
         if not backup_path or not os.path.exists(backup_path):
             return BackupResult(
                 success=False,
@@ -348,6 +338,39 @@ class KingbaseEngine(BackupEngine):
                 backup_path=backup_path,
                 simulated=False,
                 message="恢复失败：备份文件不存在: %s" % backup_path,
+            )
+
+        # 远程优先：经 SSH 在数据库服务器恢复（与备份对称，工具自动发现）
+        from core import remote_dump
+        ssh_host = remote_dump.resolve_ssh_host(self.task)
+        if ssh_host:
+            try:
+                with open(backup_path, "rb") as f:
+                    dump_bytes = f.read()
+                is_custom = backup_path.endswith(".dump")
+                remote_dump.remote_db_restore(
+                    self.task, ssh_host, "kingbase", dump_bytes,
+                    is_custom=is_custom)
+                hk = ssh_host.get("host_key", "remote")
+                target_db = kwargs.get("target_db") or self._db_name()
+                return BackupResult(
+                    success=True, status=BackupStatus.SUCCESS,
+                    backup_path=backup_path,
+                    message=f"通过 SSH 在数据库服务器({hk})恢复成功"
+                            f"{f'，目标库: {target_db}' if target_db else ''}")
+            except Exception as e:
+                # 远程失败回退本机执行（本机有客户端时）
+                self.logger.warning(
+                    "[%s] 远程恢复失败，回退本机: %s", self.task_name, e)
+
+        # 本机回退：客户端探测
+        ok, detail = self.check_client()
+        if not ok:
+            return BackupResult(
+                success=False,
+                status=BackupStatus.FAILED,
+                simulated=False,
+                message="客户端检查失败: " + detail,
             )
 
         # 目标库：优先 kwargs 指定的 target_db，否则使用任务原库名

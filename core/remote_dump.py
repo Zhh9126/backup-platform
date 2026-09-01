@@ -702,7 +702,8 @@ _PG_FAMILY_TOOLING = {
         "dump_tool": "sys_dump",
         "query_candidates": ("ksql", "sys_psql", "psql"),
         "dumpall_candidates": ("sys_dumpall", "kb_dumpall", "ksy_dumpall", "pg_dumpall"),
-        "catalog_table": "sys_database",
+        # V8/V009R003 系统目录为 sys_database；V9R1 为 pg_database——运行时探测
+        "catalog_candidates": ("sys_database", "pg_database"),
         "maint_candidates": ("test", "postgres", "security", "template1"),
         "default_port": 54321,
         "default_user": "system",
@@ -769,7 +770,8 @@ def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
     dumpall_bin = _pg_family_resolve_dumpall_bin(client, cfg)
 
     env = _pg_family_env_exports(cfg, pw)
-    catalog = cfg["catalog_table"]
+    # 系统目录表：V8/V009R003=sys_database、V9R1=pg_database —— 候选探测
+    catalogs = cfg.get("catalog_candidates") or (cfg["catalog_table"],)
     maints = " ".join(cfg["maint_candidates"])
     ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     db_type = "kingbase" if cfg["dump_tool"].startswith("sys_") else "postgresql"
@@ -777,11 +779,10 @@ def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
     # 系统库排除：SQL 层 NOT IN 过滤（include_sys 时不过滤）
     sys_dbs = SYSTEM_DBS.get(db_type) or ()
     if include_sys or not sys_dbs:
-        filter_sql = f"SELECT datname FROM {catalog} WHERE NOT datistemplate ORDER BY 1"
+        cond = "NOT datistemplate"
     else:
         excl = ",".join(f"'{d}'" for d in sys_dbs)
-        filter_sql = (f"SELECT datname FROM {catalog} WHERE NOT datistemplate "
-                      f"AND datname NOT IN ({excl}) ORDER BY 1")
+        cond = f"NOT datistemplate AND datname NOT IN ({excl})"
 
     lines = [
         "set -eu",
@@ -796,11 +797,14 @@ def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
         "trap 'rm -rf \"$WORK\"' EXIT",
         'mkdir -p "$WORK/dbs"',
         f'MAINTS="{maints}"',
+        f'CATALOGS="{(" ".join(catalogs))}"',
         'DBS=""',
         "for MDB in $MAINTS; do",
-        '  if DBS=$("$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -d "$MDB" -t -A '
-        f'-c "{filter_sql}" 2>/dev/null) '
-        '&& [ -n "$DBS" ]; then MAINT="$MDB"; break; fi',
+        '  for CAT in $CATALOGS; do',
+        f'    if DBS=$("$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -d "$MDB" -t -A '
+        f'-c "SELECT datname FROM $CAT WHERE {cond} ORDER BY 1" 2>/dev/null) '
+        '&& [ -n "$DBS" ]; then MAINT="$MDB"; break 2; fi',
+        "  done",
         "done",
         '[ -n "${DBS:-}" ] || { echo "no backupable databases after filtering'
         ' (system dbs excluded; set include_system_dbs=true to include)" >&2; exit 31; }',
@@ -1511,6 +1515,29 @@ def _remote_mysql_restore_tar(task: dict, ssh_host: dict, dump_bytes: bytes) -> 
         raise RuntimeError(f"远程 MySQL 全实例恢复失败(rc={rc}): {err[:800]}")
 
 
+def _pg_family_detect_maint_db(client, cfg: dict, query_bin: str,
+                               user: str, pw: str, port: int) -> str:
+    """探测可连接的维护库（金仓 V9R1 无 postgres 库，需候选尝试）。
+
+    返回第一个可连通的维护库名；全部失败抛 RuntimeError。
+    """
+    from core.engines.file import _ssh_exec_pipe
+    env = _pg_family_env_exports(cfg, pw)
+    catalogs = cfg.get("catalog_candidates") or (cfg["catalog_table"],)
+    for mdb in cfg["maint_candidates"]:
+        probe = (
+            f"{env} {query_bin} -h 127.0.0.1 -p {int(port)} "
+            f"-U {shlex.quote(user)} -d {shlex.quote(mdb)} -t -A "
+            f"-c 'SELECT 1' 2>/dev/null"
+        )
+        _out, _err, rc = _ssh_exec_pipe(client, _wrap_login(probe), timeout=30)
+        if rc == 0:
+            return mdb
+    raise RuntimeError(
+        f"无法连接实例（尝试维护库: {', '.join(cfg['maint_candidates'])}），"
+        "请检查连接信息")
+
+
 def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
                        is_custom: bool, db_type: str = "postgresql") -> None:
     """单库 dump 恢复（PG 系通用：postgresql=psql/pg_restore，kingbase=ksql/sys_restore）。"""
@@ -1528,17 +1555,26 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
     # 0) 远程先 DROP+CREATE 目标库，保证干净恢复。
     #    pg_restore 的 "-C" 在目标库同名已存在时会因 "cannot drop the
     #    currently open database" 失败，导致旧对象残留，这里改为两步建库。
+    #    维护库不写死 postgres（金仓 V9R1 无 postgres 库）——候选探测。
     if db_name:
         psql_tool = _pg_family_resolve_query_bin(client, cfg)
         if not psql_tool:
             raise RuntimeError(
                 f"远端主机未找到 SQL 客户端（{'/'.join(cfg['query_candidates'])}），无法恢复。")
+        maint = _pg_family_detect_maint_db(client, cfg, psql_tool, user, pw, port)
         safe_db = db_name.replace('"', '""')
+        # DROP ... WITH (FORCE) 需 PG13+/金仓较新版本；老版本先杀连接再 DROP
         prep = (
             f"set -o pipefail; {env} "
-            f"{psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d postgres "
+            f"{psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d {shlex.quote(maint)} "
             f"-c 'DROP DATABASE IF EXISTS \"{safe_db}\" WITH (FORCE);' "
-            f"&& {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d postgres "
+            f"|| {{ {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d {shlex.quote(maint)} "
+            f"-c \"SELECT sys_terminate_backend(pid) FROM sys_stat_activity WHERE datname = '{db_name}';\" "
+            f"|| {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d {shlex.quote(maint)} "
+            f"-c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db_name}';\" ; "
+            f"{psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d {shlex.quote(maint)} "
+            f"-c 'DROP DATABASE IF EXISTS \"{safe_db}\";' ; }} "
+            f"&& {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d {shlex.quote(maint)} "
             f"-c 'CREATE DATABASE \"{safe_db}\";'"
         )
         _out, perr, prc = _ssh_exec_pipe(
@@ -1569,7 +1605,8 @@ def _pg_family_tar_restore_script(cfg: dict, restore_bin: str, query_bin: str,
                                   pkg_path: str, user: str, pw: str, port: int) -> str:
     """构造全实例 tar 包恢复脚本：globals + 逐库（缺失自动建库，-c 清理覆盖）。"""
     env = _pg_family_env_exports(cfg, pw)
-    catalog = cfg["catalog_table"]
+    # 系统目录表候选探测（V8=sys_database / V9R1=pg_database）
+    catalogs = cfg.get("catalog_candidates") or (cfg["catalog_table"],)
     maints = " ".join(cfg["maint_candidates"])
     return "\n".join([
         "set -eu",
@@ -1585,12 +1622,15 @@ def _pg_family_tar_restore_script(cfg: dict, restore_bin: str, query_bin: str,
         # pg_restore/sys_restore 低版本可能无 --if-exists，探测后再用
         'IFEX=""',
         'if "$RESTORE_BIN" --help 2>&1 | grep -q -- "--if-exists"; then IFEX="--if-exists"; fi',
+        f'CATALOGS="{(" ".join(catalogs))}"',
         'MAINT=""',
         'DBS_EXIST=""',
         "for MDB in " + maints + "; do",
-        '  if DBS_EXIST=$("$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -d "$MDB" -t -A '
-        f'-c "SELECT datname FROM {catalog} WHERE NOT datistemplate" 2>/dev/null) '
-        '&& [ -n "$DBS_EXIST" ]; then MAINT="$MDB"; break; fi',
+        '  for CAT in $CATALOGS; do',
+        '    if DBS_EXIST=$("$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -d "$MDB" -t -A '
+        '        -c "SELECT datname FROM $CAT WHERE NOT datistemplate" 2>/dev/null) '
+        '&& [ -n "$DBS_EXIST" ]; then MAINT="$MDB"; break 2; fi',
+        "  done",
         "done",
         '[ -n "${MAINT:-}" ] || { echo "cannot connect instance to restore" >&2; exit 51; }',
         # 全局对象（角色/表空间）：失败不阻塞（可能已存在）

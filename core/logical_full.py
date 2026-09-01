@@ -36,27 +36,33 @@ SYSTEM_DBS = {
 # 各库类型差异点
 TOOLING = {
     "postgresql": {
-        "catalog_sql": "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY 1",
+        "catalog_sqls": (
+            "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY 1",
+        ),
         "maint_candidates": ("postgres", "template1"),
         "env_exports": ("PGPASSWORD",),
         "default_query": "psql",
         "default_dumpall": "pg_dumpall",
     },
     "kingbase": {
-        "catalog_sql": "SELECT datname FROM sys_database WHERE NOT datistemplate ORDER BY 1",
+        # V8/V009R003=sys_database、V9R1=pg_database —— 运行时候选探测
+        "catalog_sqls": (
+            "SELECT datname FROM sys_database WHERE NOT datistemplate ORDER BY 1",
+            "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY 1",
+        ),
         "maint_candidates": ("test", "postgres", "security", "template1"),
         "env_exports": ("KINGBASE_PASSWORD", "PGPASSWORD"),
         "default_query": "ksql",
         "default_dumpall": "sys_dumpall",
     },
     "mysql": {
-        "catalog_sql": "SHOW DATABASES",
+        "catalog_sqls": ("SHOW DATABASES",),
         "maint_candidates": ("mysql",),
         "env_exports": ("MYSQL_PWD",),
         "default_query": "mysql",
     },
     "mariadb": {
-        "catalog_sql": "SHOW DATABASES",
+        "catalog_sqls": ("SHOW DATABASES",),
         "maint_candidates": ("mysql",),
         "env_exports": ("MYSQL_PWD",),
         "default_query": "mysql",
@@ -101,18 +107,19 @@ def enumerate_databases(db_type: str, query_tool: str, host: str, port,
     is_pg = db_type in ("postgresql", "kingbase")
     sys_set = set() if include_system_dbs else set(SYSTEM_DBS.get(db_type) or ())
     for mdb in cfg["maint_candidates"]:
-        if is_pg:
-            cmd = [query_tool, "-h", str(host), "-p", str(port), "-U", user,
-                   "-d", mdb, "-t", "-A", "-c", cfg["catalog_sql"]]
-        else:
-            # 注意 MySQL 客户端 -P(大写)=端口、-p(小写)=密码
-            cmd = [query_tool, "-h", str(host), "-P", str(port), "-u", user,
-                   "-N", "-B", "-e", cfg["catalog_sql"]]
-        rc, out, _err = _run(cmd, env)
-        if rc == 0 and out.strip():
-            dbs = [ln.strip().split("\t")[0] for ln in out.splitlines() if ln.strip()]
-            dbs = [d for d in dbs if d and d not in sys_set]
-            return mdb, dbs
+        for catalog_sql in cfg["catalog_sqls"]:
+            if is_pg:
+                cmd = [query_tool, "-h", str(host), "-p", str(port), "-U", user,
+                       "-d", mdb, "-t", "-A", "-c", catalog_sql]
+            else:
+                # 注意 MySQL 客户端 -P(大写)=端口、-p(小写)=密码
+                cmd = [query_tool, "-h", str(host), "-P", str(port), "-u", user,
+                       "-N", "-B", "-e", catalog_sql]
+            rc, out, _err = _run(cmd, env)
+            if rc == 0 and out.strip():
+                dbs = [ln.strip().split("\t")[0] for ln in out.splitlines() if ln.strip()]
+                dbs = [d for d in dbs if d and d not in sys_set]
+                return mdb, dbs
     return "", []
 
 

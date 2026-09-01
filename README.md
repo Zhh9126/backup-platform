@@ -167,7 +167,7 @@
 | MySQL / MariaDB | `mysqldump`、`mysql` | `mysql` | 密码通过临时选项文件注入，不出现于命令行 |
 | PostgreSQL | `pg_dump`、`psql` | `pg_restore` / `psql` | 通过 `PGPASSWORD` 环境变量传密码 |
 | Oracle | `expdp` / `impdp`（服务端目录）或 `exp` / `imp`（传统增量） | 同左 | 数据泵导出到数据库服务端 `DIRECTORY` |
-| Kingbase 人大金仓 | `sys_dump`、`ksql` | `sys_restore` / `ksql` | 兼容 PostgreSQL 协议，端口默认 54321 |
+| Kingbase 电科金仓 | `sys_dump`、`ksql` | `sys_restore` / `ksql` | 兼容 PostgreSQL 协议，端口默认 54321 |
 | DM 达梦 | `dexp` | `dimp` | 逻辑导出，端口默认 5236 |
 | Redis | `redis-cli` | （复制 rdb + 重启） | 通过 `REDISCLI_AUTH` 传密码 |
 | MongoDB | `mongodump` | `mongorestore` | 通过 `--password` 传密码 |
@@ -335,23 +335,56 @@ python run.py
 
 镜像已包含全部 Python 依赖与原生直连驱动（pymysql/psycopg2/oracledb），并附带 JRE + JDBC 驱动 jar 作为可选兜底（如 Oracle 11g），**运行时无需联网、无需外部安装任何依赖**。
 
-### 从 GitHub 拉取镜像
+### 镜像地址（GHCR，国内可加速拉取）
 
-镜像由 GitHub Actions 自动构建并发布到 GHCR（push 标签 `v*` 或手动触发）。每个版本发布（如 `v1.1.2`）会同时产出以下 tag，**推荐用「版本-日期」tag 固定可追溯的镜像**：
+镜像仓库：**`ghcr.io/zhh9126/backup-platform`**（由 GitHub Actions 在 push `v*` 标签时自动构建发布）。
 
-| Tag | 示例 | 说明 |
-|---|---|---|
-| `latest` | `…:latest` | 默认分支最新构建（跟随更新） |
-| `community` | `…:community` | 社区版固定别名（跟随更新） |
-| `1.1.2` | `…:1.1.2` | 纯版本号 |
-| `1.1.2-20260831` | `…:1.1.2-20260831` | 版本 + 构建日期（**推荐**，同版本多次构建可区分） |
+当前版本 tag（**生产环境推荐固定「版本-日期」tag，勿用 latest**）：
 
 ```bash
-# 按版本+日期拉取（离线环境可先在有网机器 docker pull / docker save 后拷贝）
-docker pull ghcr.io/<OWNER>/backup-platform:1.1.2-20260831
+# 最新版（跟随更新）
+ghcr.io/zhh9126/backup-platform:latest
+# 社区版固定别名（跟随更新）
+ghcr.io/zhh9126/backup-platform:community
+# 纯版本号
+ghcr.io/zhh9126/backup-platform:1.2.1
+# 版本+构建日期（推荐：同版本多次构建可区分、可回滚）
+ghcr.io/zhh9126/backup-platform:1.2.1-20260901
+```
 
-# 离线环境导入
-docker load -i backup-platform-image.tar.gz
+历史版本 tag 规律：`vX.Y.Z` 发版同时产出 `X.Y.Z` 与 `X.Y.Z-<构建日期YYYYMMDD>`，例如 `1.1.1-20260901`。历次更新明细见 `readme_20260901.md` 等按日期归档的更新说明。
+
+### 国内网络加速（拉取 ghcr.io 必看）
+
+国内服务器直连 ghcr.io 易超时，配置镜像加速器（网页打不开属正常，不影响 Docker 后台加速）：
+
+```bash
+# /etc/docker/daemon.json
+{
+  "registry-mirrors": [
+    "https://docker.1ms.run",
+    "https://docker.m.daocloud.io"
+  ],
+  "log-driver": "json-file",
+  "log-opts": {"max-size": "10m", "max-file": "3"}
+}
+```
+
+```bash
+systemctl daemon-reload && systemctl restart docker
+docker info   # 底部出现两个加速地址即生效
+```
+
+### 拉取与离线导入
+
+```bash
+# 推荐：按版本-日期拉取（可追溯、可回滚）
+docker pull ghcr.io/zhh9126/backup-platform:1.2.1-20260901
+
+# 离线环境：先在有网机器导出，拷贝到内网后导入
+docker save -o backup-platform-1.2.1.tar.gz ghcr.io/zhh9126/backup-platform:1.2.1-20260901
+# （内网机器上）
+docker load -i backup-platform-1.2.1.tar.gz
 ```
 
 ### 运行
@@ -361,12 +394,53 @@ docker run -d --name backup-platform \
   -p 8080:8080 \
   -v /data/backup-platform:/data \
   -e WEB_PASSWORD=your_password \
-  ghcr.io/<OWNER>/backup-platform:latest
+  --restart unless-stopped \
+  ghcr.io/zhh9126/backup-platform:1.2.1-20260901
 ```
 
 - `/data` 挂载卷持久化：元数据库（`instance/`）、备份文件（`backups/`）、日志（`logs/`）
 - 配置全部走环境变量（`WEB_PORT`、`SECRET_KEY`、`WEB_USERNAME` 等，见上文「配置」）
 - 访问 `http://<主机IP>:8080`，默认账号 `admin / admin123`（**请立即修改**）
+
+### Docker Compose 部署（推荐生产）
+
+`docker-compose.yml`：
+
+```yaml
+version: '3.8'
+services:
+  backup-platform:
+    image: ghcr.io/zhh9126/backup-platform:1.2.1-20260901
+    container_name: backup-platform
+    ports:
+      - "8080:8080"
+    environment:
+      - WEB_PASSWORD=your_password
+      - SECRET_KEY=change-me-to-random
+      - TZ=Asia/Shanghai
+    volumes:
+      - /data/backup-platform:/data
+    restart: unless-stopped
+```
+
+```bash
+docker compose up -d
+```
+
+### 容器内调试
+
+```bash
+docker exec -it backup-platform /bin/bash
+```
+
+### 常见问题
+
+| 现象 | 处理 |
+|---|---|
+| 拉取 ghcr.io 超时 | 配置上文国内加速器并重启 Docker（网页打不开不影响加速） |
+| `denied` 拉取失败 | 确认 tag 存在；GHCR 包需在 GitHub Packages 设置为 Public |
+| 容器起不来 | 检查 `/data` 挂载目录权限（容器内 root 运行，一般无需干预） |
+| pip 安装超时 | 镜像内已烘焙依赖，运行时不需要 pip；勿使用清华源 |
 
 ### 手动构建镜像
 

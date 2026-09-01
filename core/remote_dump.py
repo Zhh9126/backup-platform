@@ -1405,6 +1405,11 @@ def _remote_mysql_full_instance_tar(client, mysqldump_bin: str, remote_cnf: str,
         dump_flags += " --no-data"
     if extra.get("data_only"):
         dump_flags += " --no-create-info"
+    # 默认禁用 GTID_PURGED（与单库逻辑备份对齐），避免恢复到已开 GTID 的
+    # 实例时逐库 dump 的 SET @@GLOBAL.GTID_PURGED 触发 1840。
+    # 用户可通过 extra_options.gtid_purged=true 显式保留 GTID 信息。
+    if not extra.get("gtid_purged"):
+        dump_flags += " --set-gtid-purged=OFF"
 
     ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     lines = [

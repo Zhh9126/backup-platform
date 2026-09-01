@@ -458,6 +458,10 @@ class MySQLEngine(BackupEngine):
     def _restore_full_instance_local(self, backup_path: str) -> BackupResult:
         """全实例恢复：解包 → 逐库灌入（dump 内含 CREATE DATABASE/USE）。"""
         from core import logical_full
+        # 恢复前清空 GTID_PURGED，避免导入含 GTID 的 dump 时报 1840
+        # （与单库恢复 _restore_local 的 _reset_gtid_before_restore 对齐）
+        self._reset_gtid_before_restore(
+            host=self.task.get("host"), port=self.task.get("port"))
         restore_tool = self._resolve_local_tool("mysql")
         query_tool = restore_tool
         try:
@@ -747,12 +751,21 @@ class MySQLEngine(BackupEngine):
     # ------------------------------------------------------------------ #
     @staticmethod
     def _is_physical_backup(backup_path: str) -> bool:
-        """判断备份产物是否为 XtraBackup 物理备份。"""
+        """判断备份产物是否为 XtraBackup 物理备份。
+
+        注意：全实例逻辑备份产物也是 .tar.gz（multi-db-tar，含 manifest.json），
+        必须优先排除——否则会误触发 xtrabackup --prepare 报错。
+        """
         if not backup_path:
             return False
         if os.path.isdir(backup_path):
             return os.path.isfile(os.path.join(backup_path, "xtrabackup_checkpoints"))
-        return backup_path.endswith((".tar.gz", ".tgz", ".tar", ".xbstream"))
+        if not backup_path.endswith((".tar.gz", ".tgz", ".tar", ".xbstream")):
+            return False
+        # 全实例逻辑备份产物（multi-db-tar）按逻辑路径处理，不判为物理
+        if backup_path.endswith((".tar.gz", ".tgz")) and MySQLEngine._is_full_instance_tar(backup_path):
+            return False
+        return True
 
     @staticmethod
     def _decompress_xtrabackup_dir(work_dir: str) -> int:

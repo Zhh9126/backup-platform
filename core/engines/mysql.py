@@ -199,6 +199,93 @@ class MySQLEngine(BackupEngine):
         return f"set -o pipefail; {quoted}{pv_str} | {comp_str} > {shlex.quote(out_path)}"
 
     # ------------------------------------------------------------------ #
+    # 物理备份工具：多版本选择 + 远端零安装推送
+    # ------------------------------------------------------------------ #
+    def _server_version_str(self) -> str:
+        """直连任务目标库执行 SELECT VERSION()，返回完整版本字符串（失败空串）。
+
+        与 _server_version()（返回 (major, minor) 元组）不同：本方法保留
+        完整版本串（含 -MariaDB 后缀），用于选择与服务器版本匹配的
+        xtrabackup/mariabackup 二进制。
+        """
+        try:
+            import pymysql
+            conn = pymysql.connect(
+                host=self.task.get("host") or "127.0.0.1",
+                port=int(self.task.get("port") or 3306),
+                user=self.task.get("username") or "root",
+                password=db.decrypt_secret(self.task.get("password") or ""),
+                connect_timeout=8)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT VERSION()")
+                    row = cur.fetchone()
+                return str(row[0]) if row and row[0] else ""
+            finally:
+                conn.close()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _pick_physical_bin(server_version: str) -> tuple:
+        """按服务器版本选择平台侧物理备份二进制，返回 (path, label)。
+
+        原则：xtrabackup/mariabackup 只装在备份管理平台侧，数据库服务器
+        零安装；远端没有工具时由平台把二进制推送到 /tmp 临时执行。
+        """
+        v = (server_version or "").lower()
+        if "mariadb" in v:
+            return (getattr(config, "MARIABACKUP_PATH",
+                            "/opt/mariabackup/usr/bin/mariabackup"),
+                    "mariabackup")
+        try:
+            major = int((server_version or "8").split(".", 1)[0])
+        except ValueError:
+            major = 8
+        if major >= 8:
+            return (getattr(config, "XTRABACKUP_8_PATH", "/usr/bin/xtrabackup"),
+                    "xtrabackup 8.0")
+        return (getattr(config, "XTRABACKUP_24_PATH",
+                        "/opt/xtrabackup24/usr/bin/xtrabackup"),
+                "xtrabackup 2.4")
+
+    @staticmethod
+    def _local_lib_map(local_bin: str) -> dict:
+        """解析平台侧二进制的 ldd 输出，返回 {库名: 本地绝对路径}。"""
+        try:
+            ret = subprocess.run(["ldd", local_bin], capture_output=True,
+                                 text=True, timeout=30)
+        except Exception:
+            return {}
+        mapping = {}
+        for line in (ret.stdout or "").splitlines():
+            m = re.match(r"\s*(\S+)\s+=>\s+(/\S+)", line)
+            if m:
+                mapping.setdefault(os.path.basename(m.group(1)), m.group(2))
+        return mapping
+
+    @staticmethod
+    def _remote_ldd_missing(client, remote_bin: str) -> list:
+        """在远端执行 ldd，返回缺失的动态库名列表（如 ['libev.so.4']）。"""
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+        try:
+            out, _err, _rc = _ssh_exec_pipe(
+                client,
+                remote_dump._wrap_login(f"ldd {shlex.quote(remote_bin)} 2>/dev/null"),
+                timeout=60)
+        except Exception:
+            return []
+        txt = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+        missing = []
+        for line in txt.splitlines():
+            if "not found" in line:
+                name = line.strip().split("=>")[0].strip().split(" ")[0]
+                if name and name not in missing:
+                    missing.append(name)
+        return missing
+
+    # ------------------------------------------------------------------ #
     # 备份
     # ------------------------------------------------------------------ #
     def backup(self, backup_type: BackupType) -> BackupResult:
@@ -223,12 +310,24 @@ class MySQLEngine(BackupEngine):
     # ------------------ 物理备份 (XtraBackup) ------------------
     def _backup_physical(self, backup_type: BackupType) -> BackupResult:
         """物理备份：xtrabackup 全量/增量。"""
-        xtrabackup = shutil.which("xtrabackup") or "/opt/xtrabackup/bin/xtrabackup"
+        xtrabackup, _xb_label = self._pick_physical_bin(self._server_version_str())
+        if not os.path.isfile(xtrabackup):
+            xtrabackup = shutil.which("xtrabackup") or "/opt/xtrabackup/bin/xtrabackup"
         if not os.path.isfile(xtrabackup):
             return BackupResult(success=False, status=BackupStatus.FAILED,
                                 message="xtrabackup 未安装或未找到(请设置 XTRABACKUP_PATH)")
 
         host = self.task.get("host") or "127.0.0.1"
+        # 安全护栏：xtrabackup 只能读取本机 datadir。若目标实例在远端，
+        # 在平台本机执行会静默备份平台本地 my.cnf 指向的实例（误备），
+        # 必须拒绝并提示走 SSH 远端通道。
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message=(f"物理备份不能在平台本机对远程实例 {host} 执行"
+                         f"（xtrabackup 仅能读取本机数据目录，否则会误备平台本地"
+                         f"实例）；请为任务配置 SSH 凭据（纳管主机或任务级 "
+                         f"ssh_cred），由远端执行物理备份。"))
         port = self.task.get("port") or 3306
         user = self.task.get("username") or ""
         pw = db.decrypt_secret(self.task.get("password") or "")
@@ -320,21 +419,59 @@ class MySQLEngine(BackupEngine):
         pw = db.decrypt_secret(self.task.get("password") or "")
 
         client = remote_dump._connect(ssh_host)
-        # 探测 xtrabackup，找不到回退 mariabackup
-        tool = remote_dump._resolve_remote_bin(client, "xtrabackup")
-        if not tool:
-            tool = remote_dump._resolve_remote_bin(client, "mariabackup")
-        if not tool:
-            return BackupResult(
-                success=False, status=BackupStatus.FAILED,
-                message="远端主机未找到 xtrabackup / mariabackup，无法执行远端物理备份；"
-                        "请在远端安装 Percona XtraBackup 或 MariaDB Backup。")
-
         remote_tmp = f"/tmp/mysql_xtra_{ts}"
         remote_tar = f"{remote_tmp}.tar.gz"
         remote_cnf = "/tmp/bk_xtrabackup.cnf"
+        pushed_bin = None
+        pushed_libs_dir = None
+        env_pre = ""
+        push_note = ""
         sftp = client.open_sftp()
         try:
+            # 远端零安装原则：优先使用数据库服务器自带的 xtrabackup/mariabackup；
+            # 找不到则从平台推送对应版本二进制到 /tmp 临时执行（结束即清理），
+            # 数据库服务器上不安装、不落地任何备份工具。
+            server_ver = self._server_version_str()
+            tool = remote_dump._resolve_remote_bin(client, "xtrabackup")
+            if not tool:
+                tool = remote_dump._resolve_remote_bin(client, "mariabackup")
+            if not tool:
+                local_bin, bin_label = self._pick_physical_bin(server_ver)
+                if not os.path.isfile(local_bin):
+                    return BackupResult(
+                        success=False, status=BackupStatus.FAILED,
+                        message=(f"数据库服务器零安装：远端无 xtrabackup/mariabackup，"
+                                 f"平台侧也未找到 {bin_label}（{local_bin}，"
+                                 f"服务器版本 {server_ver or '未知'}）。"
+                                 f"请先在平台侧部署对应版本二进制。"))
+                pushed_bin = f"/tmp/bk_pushed_xb_{int(time.time())}"
+                sftp.put(local_bin, pushed_bin)
+                try:
+                    sftp.chmod(pushed_bin, 0o755)
+                except Exception:
+                    pass
+                missing = self._remote_ldd_missing(client, pushed_bin)
+                if missing:
+                    lmap = self._local_lib_map(local_bin)
+                    pushed_libs_dir = "/tmp/bk_pushed_xb_libs"
+                    from core.engines.file import _ssh_exec_pipe as _sep
+                    _sep(client, remote_dump._wrap_login(
+                        f"mkdir -p {pushed_libs_dir}"), timeout=30)
+                    for name in missing:
+                        local_so = lmap.get(name)
+                        if not local_so or not os.path.isfile(local_so):
+                            return BackupResult(
+                                success=False, status=BackupStatus.FAILED,
+                                message=(f"远端缺失动态库 {name}，平台侧未找到对应库"
+                                         f"文件，无法推送 {bin_label} 执行。"))
+                        sftp.put(local_so, f"{pushed_libs_dir}/{name}")
+                    env_pre = (f"export LD_LIBRARY_PATH={pushed_libs_dir}"
+                               f":$LD_LIBRARY_PATH; ")
+                    push_note = f"（远端零安装：平台推送 {bin_label} + {len(missing)} 个动态库"
+                else:
+                    push_note = f"（远端零安装：平台推送 {bin_label}"
+                push_note += f"，服务器版本 {server_ver or '未知'}）"
+                tool = pushed_bin
             # 1) 写临时 my.cnf（承载明文密码，0600，避免 ps 泄露）
             with sftp.open(remote_cnf, "w") as f:
                 f.write(f"[client]\nuser={user}\npassword={pw}\n")
@@ -348,9 +485,10 @@ class MySQLEngine(BackupEngine):
             _ssh_exec_pipe(client, remote_dump._wrap_login(prep), timeout=60)
 
             # 3) 远端执行：xtrabackup --backup -> tar czf（密码不在命令行）
+            # 注意：--defaults-file 必须是第一个参数（xtrabackup 硬性要求）
             inner = (
-                f"{tool} --backup --target-dir={remote_tmp} "
-                f"--defaults-file={remote_cnf} "
+                f"{env_pre}{tool} --defaults-file={remote_cnf} "
+                f"--backup --target-dir={remote_tmp} "
                 f"--host={shlex.quote(host)} --port={port} --no-lock "
                 f"&& tar czf {remote_tar} -C {remote_tmp} ."
             )
@@ -378,7 +516,7 @@ class MySQLEngine(BackupEngine):
             checksum = db.sha256_file(local_path)
             hk = ssh_host.get("host_key", "remote")
             msg = (f"通过 SSH 在 {hk} 以 {os.path.basename(tool)} 执行 MySQL 物理备份成功，"
-                   f"已拉回 {local_path} ({db.human_size(size)})")
+                   f"已拉回 {local_path} ({db.human_size(size)}){push_note}")
             self.logger.info("[%s] %s", self.task_name, msg)
 
             # 清理远端临时目录与 tar 包（best-effort，失败不致命）
@@ -396,6 +534,14 @@ class MySQLEngine(BackupEngine):
         finally:
             try:
                 sftp.remove(remote_cnf)
+            except Exception:
+                pass
+            # 清理远端临时产物与推送到远端的二进制/动态库（成功/失败路径均覆盖）
+            try:
+                from core.engines.file import _ssh_exec_pipe as _sep
+                _sep(client, remote_dump._wrap_login(
+                    f"rm -rf {remote_tmp} {remote_tar} {pushed_bin or ''} "
+                    f"{pushed_libs_dir or ''}"), timeout=60)
             except Exception:
                 pass
             try:
@@ -494,7 +640,11 @@ class MySQLEngine(BackupEngine):
         comp = 1 if enable else 0
         extra = self._parse_extra_options()
         # 默认禁用 GTID_PURGED；用户可通过 gtid_purged=true 显式保留。
-        extra_args = "--set-gtid-purged=OFF" if not extra.get("gtid_purged") else ""
+        # MariaDB 的 mysqldump 无 --set-gtid-purged 选项，必须跳过。
+        if self.db_type == "mariadb":
+            extra_args = ""
+        else:
+            extra_args = "--set-gtid-purged=OFF" if not extra.get("gtid_purged") else ""
         data, compressed, fmt = remote_dump.remote_db_dump(self.task, ssh_host, "mysql", comp, extra_args)
         if fmt == "multi-db-tar":
             # 全实例：逐库 .sql → tar.gz（远端已 gzip，manifest.json 标注库清单）
@@ -545,7 +695,7 @@ class MySQLEngine(BackupEngine):
             # 用户可通过 extra_options.gtid_purged=true 显式保留 GTID 信息。
             # 版本兼容：GTID 自 5.6 引入，5.5 及更早版本无 GTID，
             # 此时 --set-gtid-purged 选项本身不存在，传了会直接报错，故跳过。
-            if not extra.get("gtid_purged"):
+            if not extra.get("gtid_purged") and self.db_type != "mariadb":
                 major, minor = self._server_version(host=str(host), port=int(port))
                 if (major, minor) >= (5, 6):
                     dump_args.append("--set-gtid-purged=OFF")
@@ -855,6 +1005,157 @@ class MySQLEngine(BackupEngine):
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
+    # ------------------ 物理恢复：临时实例校验（版本自适应） ------------------
+    @staticmethod
+    def _parse_major(version: str, default: int = 8) -> int:
+        try:
+            return int((version or "").split(".", 1)[0])
+        except (ValueError, AttributeError):
+            return default
+
+    @staticmethod
+    def _mysqld_major(mysqld_path: str) -> int:
+        """获取平台本机 mysqld 大版本（失败返回 0）。"""
+        try:
+            ret = subprocess.run([mysqld_path, "--version"],
+                                 capture_output=True, text=True, timeout=30)
+            m = re.search(r"Ver\s+(\d+)", ret.stdout or "")
+            return int(m.group(1)) if m else 0
+        except Exception:
+            return 0
+
+    def _verify_prepared_remote(self, ssh_host: dict, work_dir: str,
+                                target_db: str, logs: list) -> tuple:
+        """把 prepare 后的数据目录推到数据库服务器，用其**自带** mysqld 启动
+        临时实例（--skip-grant-tables + --skip-networking）做可恢复性校验。
+
+        适用场景：平台 mysqld 与源实例大版本不一致（如平台 8.0、源 5.7），
+        平台本机无法启动源版本 datadir。仅临时占用远端 /tmp，结束后关闭
+        实例并清理全部痕迹——数据库服务器不安装任何平台组件。
+        返回 (label, verify_out)。
+        """
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+        client = remote_dump._connect(ssh_host)
+        ts = self._timestamp()
+        rdir = f"/tmp/xb_verify_{ts}"
+        rtar = f"{rdir}.tar.gz"
+        ltar = f"/tmp/xb_verify_{ts}.tar.gz"
+        sock = f"{rdir}.sock"
+        os_user = (ssh_host.get("username") or "root").strip() or "root"
+        sftp = None
+        try:
+            subprocess.run(["tar", "czf", ltar, "-C", work_dir, "."],
+                           capture_output=True, timeout=3600)
+            if not os.path.isfile(ltar):
+                raise RuntimeError("打包 prepare 后数据目录失败")
+            logs.append(f"[物理恢复] 上传 prepare 后数据目录 "
+                        f"({db.human_size(os.path.getsize(ltar))}) 到远端临时校验 ...")
+            sftp = client.open_sftp()
+            sftp.put(ltar, rtar)
+            mysqld_r = remote_dump._resolve_remote_bin(client, "mysqld")
+            mysql_r = remote_dump._resolve_remote_bin(client, "mysql")
+            if not mysqld_r:
+                raise RuntimeError("远端未找到 mysqld（数据库自带二进制），无法做临时实例校验")
+            if not mysql_r:
+                raise RuntimeError("远端未找到 mysql 客户端，无法做临时实例校验")
+            # 不直接使用 backup-my.cnf：xtrabackup 写入的
+            # innodb_log_checksum_algorithm / innodb_fast_checksum /
+            # redo_log_version 等变量是 Percona/MariaDB 系专有参数，
+            # 社区版 MySQL mysqld 会报 unknown variable 直接 Aborting。
+            # 改为本地解析白名单内的数据目录关键参数，以 --no-defaults
+            # + 显式参数启动（白名单参数在 MySQL 5.7/8.0 均有效）。
+            safe_keys = ["innodb_page_size", "innodb_log_file_size",
+                         "innodb_log_files_in_group", "innodb_data_file_path",
+                         "innodb_undo_tablespaces", "innodb_undo_directory"]
+            xb_args = []
+            cnf_path = os.path.join(work_dir, "backup-my.cnf")
+            if os.path.isfile(cnf_path):
+                with open(cnf_path, encoding="utf-8", errors="replace") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line or line.startswith(("#", "[")):
+                            continue
+                        k, _, v = line.partition("=")
+                        k = k.strip()
+                        if k in safe_keys:
+                            xb_args.append(f"--{k.replace('_', '-')}={v.strip()}")
+            if target_db:
+                verify_sql = (f'SELECT CONCAT("tables=", COUNT(*)) FROM '
+                              f'information_schema.tables WHERE '
+                              f'table_schema="{target_db}"')
+                label = f"目标库 {target_db}"
+            else:
+                verify_sql = ('SELECT CONCAT("databases=", COUNT(*)) FROM '
+                              'information_schema.schemata')
+                label = "实例库"
+
+            def _attempt_script() -> str:
+                """构建远端校验脚本。
+
+                - setsid 完全脱离 SSH 会话，避免会话关闭带走临时实例；
+                - pkill 锚定 mysqld 二进制路径，避免误杀包含同字符串的
+                  bash -lc 自身进程；
+                - 启动失败 exit 42 并回传 err 日志中的 ERROR 行。
+                """
+                # verify_sql 内含双引号（SQL 字符串字面量），嵌入 bash 双引号
+                # 参数时必须转义，否则内层引号会被剥掉导致 SQL 语法错误
+                verify_sql_esc = verify_sql.replace('"', '\\"')
+                return (
+                    f"pkill -f \"^{mysqld_r} .*--datadir={rdir}\" 2>/dev/null; "
+                    f"rm -rf {rdir}; mkdir -p {rdir} && tar xzf {rtar} -C {rdir} || exit 41; "
+                    f"setsid nohup {mysqld_r} --no-defaults "
+                    f"{' '.join(xb_args)} "
+                    f"--datadir={rdir} --socket={sock} --skip-networking "
+                    f"--skip-grant-tables --user={os_user} "
+                    f"--pid-file={sock}.pid --log-error={sock}.err "
+                    f"</dev/null >/dev/null 2>&1 & "
+                    f"ok=0; i=0; "
+                    f"while [ $i -lt 90 ]; do "
+                    f"if {mysql_r} --no-defaults -uroot -S {sock} -N -e \"SELECT 1\" "
+                    f">/dev/null 2>&1; then ok=1; break; fi; "
+                    f"grep -q Aborting {sock}.err 2>/dev/null && break; "
+                    f"i=$((i+1)); sleep 1; done; "
+                    f"if [ $ok -ne 1 ]; then echo XB_START_FAIL; "
+                    f"grep -E \"\\[ERROR\\]\" {sock}.err 2>/dev/null "
+                    f"| head -5; exit 42; fi; "
+                    f"{mysql_r} --no-defaults -uroot -S {sock} -N -e \"{verify_sql_esc}\"; "
+                    f"rc=$?; "
+                    f"{mysql_r} --no-defaults -uroot -S {sock} -e \"SHUTDOWN\" "
+                    f">/dev/null 2>&1; "
+                    f"sleep 2; rm -rf {rdir} {rtar} {sock} {sock}.pid {sock}.err; "
+                    f"exit $rc"
+                )
+
+            out, v_err, rc = _ssh_exec_pipe(
+                client, remote_dump._wrap_login(_attempt_script()), timeout=1800)
+            txt = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+            v_err_txt = (v_err.decode("utf-8", "replace")
+                         if isinstance(v_err, bytes) else (v_err or ""))
+            if rc != 0:
+                detail = (txt.strip() or v_err_txt.strip())[-600:]
+                raise RuntimeError(f"远端临时实例校验失败(rc={rc}): {detail}")
+            return label, txt.strip()
+        finally:
+            # best-effort 清理（异常路径兜底强杀临时实例；锚定 mysqld 路径防自杀匹配）
+            try:
+                _ssh_exec_pipe(client, remote_dump._wrap_login(
+                    f"pkill -f \"^{mysqld_r} .*--datadir={rdir}\" 2>/dev/null; "
+                    f"rm -rf {rdir} {rtar} {sock} {sock}.pid {sock}.err; true"),
+                    timeout=60)
+            except Exception:
+                pass
+            if sftp:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+            if os.path.isfile(ltar):
+                try:
+                    os.remove(ltar)
+                except OSError:
+                    pass
+
     def _restore_physical(self, backup_path: str, **kwargs) -> BackupResult:
         """XtraBackup 物理备份恢复：
 
@@ -867,7 +1168,13 @@ class MySQLEngine(BackupEngine):
         5) 关闭临时实例并清理。
         """
         target_db = kwargs.get("target_db") or self.task.get("db_name")
-        xtrabackup = shutil.which("xtrabackup") or "/opt/xtrabackup/bin/xtrabackup"
+        # 恢复（prepare/临时实例校验）全部在平台侧执行，不触碰数据库服务器；
+        # 二进制需与备份产出工具版本匹配（MySQL 5.5-5.7 → 2.4，8.0+ → 8.0，
+        # MariaDB → mariabackup），各版本只装在平台侧。
+        xtrabackup, _xb_label = self._pick_physical_bin(self._server_version_str())
+        if not os.path.isfile(xtrabackup):
+            xtrabackup = shutil.which("xtrabackup") or shutil.which("mariabackup") \
+                or "/opt/xtrabackup/bin/xtrabackup"
         if not os.path.isfile(xtrabackup):
             return BackupResult(success=False, status=BackupStatus.FAILED,
                                 backup_path=backup_path,
@@ -939,49 +1246,66 @@ class MySQLEngine(BackupEngine):
             if ret.returncode != 0:
                 raise RuntimeError(f"xtrabackup --prepare 失败: {(ret.stderr or ret.stdout or '')[-500:]}")
 
-            # 4) 启动临时 mysqld 校验
-            logs.append("[物理恢复] 启动临时 mysqld 实例做可恢复性校验 ...")
-            proc = subprocess.Popen(
-                [mysqld, "--no-defaults",
-                 f"--datadir={work}", f"--socket={sock}",
-                 "--skip-networking", "--skip-grant-tables",
-                 "--user=root", f"--pid-file={pid_file}",
-                 f"--log-error={err_file}"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            ready = False
-            for _ in range(90):
-                if proc.poll() is not None:
-                    break
-                r = subprocess.run([mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}",
-                                    "-N", "-e", "SELECT 1"],
-                                   capture_output=True, text=True, timeout=15)
-                if r.returncode == 0 and r.stdout.strip() == "1":
-                    ready = True
-                    break
-                time.sleep(1)
-            if not ready:
-                tail = ""
-                if os.path.exists(err_file):
-                    with open(err_file, errors="replace") as f:
-                        tail = f.read()[-600:]
-                raise RuntimeError(f"临时实例启动超时/失败: {tail or '无错误日志'}")
-
-            # 5) 校验数据可读
-            if target_db:
-                verify_sql = (
-                    f"SELECT CONCAT('tables=', COUNT(*)) FROM information_schema.tables "
-                    f"WHERE table_schema='{target_db}';")
-                label = f"目标库 {target_db}"
+            # 4) 启动临时 mysqld 校验：优先平台本机实例；平台 mysqld 大版本
+            #    与源实例不一致（或 MariaDB）且可 SSH 时，改用数据库服务器
+            #    自带 mysqld 做远端临时实例校验（DBMS 自带二进制，零安装）。
+            sv = self._server_version_str()
+            lm_major = self._mysqld_major(mysqld)
+            sv_major = self._parse_major(sv)
+            mismatch = ("mariadb" in (sv or "").lower()) or (lm_major != sv_major)
+            remote_ssh = None
+            if mismatch:
+                from core import remote_dump as _rd
+                remote_ssh = _rd.resolve_ssh_host(self.task)
+            if mismatch and remote_ssh:
+                logs.append(
+                    f"[物理恢复] 平台 mysqld({lm_major}.x) 与源实例({sv or '未知'})"
+                    f" 大版本不一致，改用远端自带 mysqld 启动临时校验实例 ...")
+                label, verify_out = self._verify_prepared_remote(
+                    remote_ssh, work, target_db, logs)
             else:
-                verify_sql = ("SELECT CONCAT('databases=', COUNT(*)) "
-                              "FROM information_schema.schemata;")
-                label = "实例库"
-            r = subprocess.run([mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}",
-                                "-N", "-e", verify_sql],
-                               capture_output=True, text=True, timeout=60)
-            if r.returncode != 0:
-                raise RuntimeError(f"校验查询失败: {(r.stderr or '')[:300]}")
-            verify_out = r.stdout.strip()
+                logs.append("[物理恢复] 启动临时 mysqld 实例做可恢复性校验 ...")
+                proc = subprocess.Popen(
+                    [mysqld, "--no-defaults",
+                     f"--datadir={work}", f"--socket={sock}",
+                     "--skip-networking", "--skip-grant-tables",
+                     "--user=root", f"--pid-file={pid_file}",
+                     f"--log-error={err_file}"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                ready = False
+                for _ in range(90):
+                    if proc.poll() is not None:
+                        break
+                    r = subprocess.run([mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}",
+                                        "-N", "-e", "SELECT 1"],
+                                       capture_output=True, text=True, timeout=15)
+                    if r.returncode == 0 and r.stdout.strip() == "1":
+                        ready = True
+                        break
+                    time.sleep(1)
+                if not ready:
+                    tail = ""
+                    if os.path.exists(err_file):
+                        with open(err_file, errors="replace") as f:
+                            tail = f.read()[-600:]
+                    raise RuntimeError(f"临时实例启动超时/失败: {tail or '无错误日志'}")
+
+                # 5) 校验数据可读
+                if target_db:
+                    verify_sql = (
+                        f"SELECT CONCAT('tables=', COUNT(*)) FROM information_schema.tables "
+                        f"WHERE table_schema='{target_db}';")
+                    label = f"目标库 {target_db}"
+                else:
+                    verify_sql = ("SELECT CONCAT('databases=', COUNT(*)) "
+                                  "FROM information_schema.schemata;")
+                    label = "实例库"
+                r = subprocess.run([mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}",
+                                    "-N", "-e", verify_sql],
+                                   capture_output=True, text=True, timeout=60)
+                if r.returncode != 0:
+                    raise RuntimeError(f"校验查询失败: {(r.stderr or '')[:300]}")
+                verify_out = r.stdout.strip()
             logs.append(f"[物理恢复] 校验通过: {label} {verify_out}")
 
             duration = round(time.time() - start, 3)
@@ -1095,7 +1419,9 @@ class MySQLEngine(BackupEngine):
 
         # 物理备份：优先 xtrabackup --prepare --apply-log-only
         if mode == BackupMode.PHYSICAL:
-            xtrabackup = shutil.which("xtrabackup") or shutil.which("mariabackup")
+            xtrabackup, _vb_label = self._pick_physical_bin(self._server_version_str())
+            if not os.path.isfile(xtrabackup):
+                xtrabackup = shutil.which("xtrabackup") or shutil.which("mariabackup")
             if xtrabackup:
                 import tempfile
                 import shutil as _shutil

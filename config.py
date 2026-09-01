@@ -62,6 +62,16 @@ WEB_USERNAME = os.environ.get("WEB_USERNAME", "admin")
 WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "admin123")
 SESSION_TIMEOUT = int(os.environ.get("SESSION_TIMEOUT", "28800"))  # 秒
 
+# ---------- 物理备份工具路径（只装平台侧，数据库服务器零安装） ----------
+# 版本匹配原则：MySQL 5.5-5.7 → xtrabackup 2.4；MySQL 8.0+ → xtrabackup 8.0；
+# MariaDB 10.x → mariabackup。备份时按远端服务器版本选用，并可将二进制
+# 临时推送到远端 /tmp 执行（结束后清理），远端无需安装任何备份工具。
+XTRABACKUP_8_PATH = os.environ.get("XTRABACKUP_8_PATH", "/usr/bin/xtrabackup")
+XTRABACKUP_24_PATH = os.environ.get("XTRABACKUP_24_PATH",
+                                    "/opt/xtrabackup24/usr/bin/xtrabackup")
+MARIABACKUP_PATH = os.environ.get("MARIABACKUP_PATH",
+                                  "/opt/mariabackup/usr/bin/mariabackup")
+
 # ---------- 登录安全（暴力破解防护） ----------
 LOGIN_MAX_FAILS = int(os.environ.get("LOGIN_MAX_FAILS", "5"))        # 连续失败次数上限
 LOGIN_LOCK_MINUTES = int(os.environ.get("LOGIN_LOCK_MINUTES", "15"))  # 达到上限后锁定分钟数

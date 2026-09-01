@@ -605,7 +605,8 @@ def _remote_mysql_dump(task: dict, ssh_host: dict, compress: int, extra_args: st
             _maj, _min = (int(_m.group(1)), int(_m.group(2))) if _m else (8, 0)
         except Exception:
             _maj, _min = (8, 0)
-        if (_maj, _min) >= (5, 6):
+        if (_maj, _min) >= (5, 6) and "mariadb" not in _vres.lower():
+            # MariaDB 的 mysqldump 不支持 --set-gtid-purged（GTID 体系不同）
             args.append("--set-gtid-purged=OFF")
 
     # 4) 包装 shell：set -o pipefail + bash -lc
@@ -1408,7 +1409,8 @@ def _remote_mysql_full_instance_tar(client, mysqldump_bin: str, remote_cnf: str,
     # 默认禁用 GTID_PURGED（与单库逻辑备份对齐），避免恢复到已开 GTID 的
     # 实例时逐库 dump 的 SET @@GLOBAL.GTID_PURGED 触发 1840。
     # 用户可通过 extra_options.gtid_purged=true 显式保留 GTID 信息。
-    if not extra.get("gtid_purged"):
+    # MariaDB 的 mysqldump 无 --set-gtid-purged 选项，按 db_type 跳过。
+    if not extra.get("gtid_purged") and (task.get("db_type") != "mariadb"):
         dump_flags += " --set-gtid-purged=OFF"
 
     ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")

@@ -17,14 +17,15 @@
 ## 功能特性
 
 ### 备份能力
-- **9 种引擎**：Oracle / MySQL / MariaDB / PostgreSQL / Kingbase / DM / Redis / MongoDB / 文件（本地 + 远程 SSH 无 Agent），统一引擎接口（`connect` / `backup` / `restore` / `verify_record` / `synthesize_full`）。
-- **9 个备份 Skills**（项目 `skills/` 目录，覆盖各引擎最佳实践）：
+- **10 种引擎**：Oracle / MySQL / MariaDB / PostgreSQL / Kingbase / DM / SQL Server / Redis / MongoDB / 文件（本地 + 远程 SSH 无 Agent），统一引擎接口（`connect` / `backup` / `restore` / `verify_record` / `synthesize_full`）。
+- **10 个备份 Skills**（项目 `skills/` 目录，覆盖各引擎最佳实践）：
   - `mysql-backup`：mysqldump + xtrabackup + binlog PITR
   - `mariadb-backup`：继承 MySQL，mariabackup
   - `postgresql-backup`：pg_dump + pg_basebackup + WAL
   - `oracle-backup`：expdp/exp + RMAN + archivelog PITR
   - `kingbase-backup`：sys_dump + sys_basebackup
   - `dameng-backup`：dexp + dmrman
+  - `sqlserver-backup`：BACKUP DATABASE/LOG 官方 T-SQL + RESTORE WITH MOVE
   - `redis-backup`：RDB 快照
   - `mongodb-backup`：mongodump
   - `file-backup`：tar.gz 全量 + 快照增量 + 准 CDP + 恢复链
@@ -169,6 +170,7 @@
 | Oracle | `expdp` / `impdp`（服务端目录）或 `exp` / `imp`（传统增量） | 同左 | 数据泵导出到数据库服务端 `DIRECTORY` |
 | Kingbase 电科金仓 | `sys_dump`、`ksql` | `sys_restore` / `ksql` | 兼容 PostgreSQL 协议，端口默认 54321 |
 | DM 达梦 | `dexp` | `dimp` | 逻辑导出，端口默认 5236 |
+| SQL Server | `sqlcmd` | `sqlcmd` | 官方 T-SQL：BACKUP/RESTORE，密码经 `SQLCMDPASSWORD` 环境变量注入；Linux/Windows 均支持，端口默认 1433 |
 | Redis | `redis-cli` | （复制 rdb + 重启） | 通过 `REDISCLI_AUTH` 传密码 |
 | MongoDB | `mongodump` | `mongorestore` | 通过 `--password` 传密码 |
 
@@ -573,7 +575,7 @@ docker run --rm -p 8080:8080 backup-platform:local
 三种方式：(1)「数据恢复管理 → 恢复校验」配置策略，定期对最近成功备份做可恢复性校验（Oracle 逻辑备份走 impdp SQLFILE 真实解析 DDL、物理备份走 RMAN RESTORE VALIDATE + 真实抽取数据文件）；(2)「数据恢复管理 → 数据对比」将恢复库与生产库做行数/校验和/抽样比对；(3)「记录」页对任意备份一键恢复到目标实例。
 
 **Q：逻辑增量备份是否完全可用？**
-MySQL 增量依赖 binlog；PostgreSQL / Kingbase / MongoDB 的逻辑增量能力有限，建议配合 WAL 归档 / oplog / 时间点恢复或物理备份；达梦增量建议使用 `dmrman` 物理备份。本平台逻辑引擎对不支持真正增量的库会回退为全量并在备注中说明。
+MySQL 增量依赖 binlog；PostgreSQL / Kingbase / MongoDB 的逻辑增量能力有限，建议配合 WAL 归档 / oplog / 时间点恢复或物理备份；达梦增量建议使用 `dmrman` 物理备份；SQL Server 的增量即事务日志备份（`BACKUP LOG`，需恢复模式为 FULL/BULK_LOGGED），差异备份用 `WITH DIFFERENTIAL`。本平台逻辑引擎对不支持真正增量的库会回退为全量并在备注中说明。
 
 **Q：如何实现异地备份？**
 两种方式：(1) 任务“存储后端”设为 `SFTP`，填写远程主机/路径（需 `paramiko`）；(2) 在「存储管理」配置 MinIO(L1) + S3(L2)，备份完成后自动复制到对象存储实现异地容灾。
@@ -591,7 +593,7 @@ L1 = MinIO（热数据，第一落点）、L2 = S3（冷数据归档）、L3 = �
 
 ## 备份 Skills 文档
 
-`skills/` 目录提供 9 份面向运维人员的备份操作指南（Markdown）：
+`skills/` 目录提供 10 份面向运维人员的备份操作指南（Markdown）：
 
 | Skill | 关键能力 |
 |---|---|
@@ -601,6 +603,7 @@ L1 = MinIO（热数据，第一落点）、L2 = S3（冷数据归档）、L3 = �
 | `oracle-backup` | `expdp`/`exp` 逻辑 + RMAN 物理 + archivelog PITR |
 | `kingbase-backup` | `sys_dump` 逻辑 + `sys_basebackup` 物理 |
 | `dameng-backup` | `dexp` 逻辑 + `dmrman` 物理 |
+| `sqlserver-backup` | `BACKUP DATABASE/LOG` 官方 T-SQL + `RESTORE WITH MOVE, REPLACE, RECOVERY` + `VERIFYONLY` |
 | `redis-backup` | RDB 快照复制 |
 | `mongodb-backup` | `mongodump` |
 | `file-backup` | `tar.gz` 全量 + 快照增量 + 准 CDP + 恢复链 |

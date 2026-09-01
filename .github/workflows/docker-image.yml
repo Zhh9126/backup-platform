@@ -20,6 +20,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # GHCR 要求镜像仓库名全小写，而 GITHUB_REPOSITORY 可能含大写
+      # （如 Zhh9126/backup-platform），必须先转小写，否则 buildx 报
+      # "invalid tag: repository name must be lowercase"
+      - name: Compute lowercase image name
+        id: image
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+        env:
+          REGISTRY: ghcr.io
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -38,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           VER="${GITHUB_REF_NAME#v}"
-          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          IMAGE="${{ steps.image.outputs.name }}"
           echo "all_tags=${IMAGE}:${VER},${IMAGE}:${VER}-r${GITHUB_RUN_NUMBER},${IMAGE}:latest,${IMAGE}:community" >> "$GITHUB_OUTPUT"
           echo "version_tag=${IMAGE}:${VER}" >> "$GITHUB_OUTPUT"
           echo "dated_tag=${IMAGE}:${VER}-r${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
@@ -47,7 +56,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ steps.image.outputs.name }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -64,5 +73,5 @@ jobs:
           echo "Published:"
           echo "  ${{ steps.tags.outputs.version_tag }}"
           echo "  ${{ steps.tags.outputs.dated_tag }}"
-          echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
-          echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:community"
+          echo "  ${{ steps.image.outputs.name }}:latest"
+          echo "  ${{ steps.image.outputs.name }}:community"

@@ -448,6 +448,8 @@
         if ($("t_encrypt_pool")) $("t_encrypt_pool").checked = !!eo.encrypt_pool;
         // 任务级 SSH 凭据回填（免纳管执行通道）
         fillSshCred(eo.ssh_cred, task);
+        // 任务级工具路径回填（手动兜底）
+        fillToolPath(task.extra_options, task);
         // 自定义脚本回填
         if ($("t_custom_script")) $("t_custom_script").value = eo.custom_script || "";
         if ($("t_custom_restore")) $("t_custom_restore").value = eo.custom_restore_script || "";
@@ -724,6 +726,7 @@
     if ($("t_ssh_user")) $("t_ssh_user").value = "";
     if ($("t_ssh_pwd")) $("t_ssh_pwd").value = "";
     if ($("t_ssh_state")) $("t_ssh_state").textContent = "";
+    if ($("t_tool_path")) $("t_tool_path").value = "";
     toggleSshFields();
   }
 
@@ -795,6 +798,7 @@
       let eo = {};
       try { eo = JSON.parse(val("t_extra_options", "{}")); } catch (_) { eo = {}; }
       collectSshCred(eo);
+      collectToolPath(eo);
       const sshId = val("t_ssh_host");
       if (sshId) eo.ssh_host_id = Number(sshId); else delete eo.ssh_host_id;
       if (chk("t_encrypt_pool")) eo.encrypt_pool = true; else delete eo.encrypt_pool;

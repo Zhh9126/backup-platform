@@ -23,6 +23,7 @@ from core.engines.postgresql import PostgreSQLEngine
 from core.engines.oracle import OracleEngine
 from core.engines.kingbase import KingbaseEngine
 from core.engines.dameng import DamengEngine
+from core.engines.sqlserver import SQLServerEngine
 from core.engines.redis import RedisEngine
 from core.engines.mongodb import MongoEngine
 from core.engines.file import FileBackupEngine
@@ -34,6 +35,7 @@ ENGINE_REGISTRY = {
     "oracle": OracleEngine,
     "kingbase": KingbaseEngine,
     "dameng": DamengEngine,
+    "sqlserver": SQLServerEngine,
     "redis": RedisEngine,
     "mongodb": MongoEngine,
     "file": FileBackupEngine,
@@ -45,7 +47,8 @@ ENGINE_DISPLAY = {k: cls.display_name for k, cls in ENGINE_REGISTRY.items()}
 # core_self      : 核心库（信创）以自研适配器为主，强同步/准同步、物理备份能力完备
 # peripheral_api : 外围引擎以 API 集成封装为主（逻辑导出 + 远程调用）
 _CORE_SELF = ("oracle", "kingbase", "dameng")
-_PERIPHERAL_API = ("mysql", "mariadb", "postgresql", "redis", "mongodb", "file")
+_PERIPHERAL_API = ("mysql", "mariadb", "postgresql", "sqlserver",
+                   "redis", "mongodb", "file")
 for _name in _CORE_SELF:
     if _name in ENGINE_REGISTRY:
         ENGINE_REGISTRY[_name].adapter_tier = "core_self"

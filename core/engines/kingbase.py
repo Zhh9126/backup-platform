@@ -71,9 +71,14 @@ class KingbaseEngine(BackupEngine):
 
         V8 兼容 PostgreSQL 的 PGPASSWORD；V9 起改用 KINGBASE_PASSWORD，
         两个同时注入，兼容新旧版本共存环境。
+        另注入任务级 tool_path 到 PATH 前缀（自动探测失败时的手动兜底）。
         """
-        return {"PGPASSWORD": self._password(),
-                "KINGBASE_PASSWORD": self._password()}
+        env = {"PGPASSWORD": self._password(),
+               "KINGBASE_PASSWORD": self._password()}
+        tp = self._task_tool_path()
+        if tp:
+            env["PATH"] = tp + os.pathsep + os.environ.get("PATH", "")
+        return env
 
     def _compute_size_and_checksum(self, path: str):
         """计算备份产物的大小与校验和。
@@ -424,9 +429,8 @@ class KingbaseEngine(BackupEngine):
         out_dir = self._output_dir()
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"{self._timestamp()}.tar.gz")
-        dump_tool = shutil.which("sys_dump") or "sys_dump"
-        query_tool = (shutil.which("ksql") or shutil.which("sys_psql")
-                      or shutil.which("psql") or "ksql")
+        dump_tool = self._resolve_local_tool("sys_dump")
+        query_tool = self._resolve_local_tool("ksql", "sys_psql", "psql")
         dumpall_tool = (shutil.which("sys_dumpall") or shutil.which("kb_dumpall")
                         or shutil.which("ksy_dumpall")
                         or shutil.which("pg_dumpall") or "")
@@ -456,9 +460,8 @@ class KingbaseEngine(BackupEngine):
     def _restore_full_instance_local(self, backup_path: str) -> BackupResult:
         """全实例恢复：解包 → globals → 缺失库自动建库 → 逐库 sys_restore。"""
         from core import logical_full
-        restore_tool = shutil.which("sys_restore") or "sys_restore"
-        query_tool = (shutil.which("ksql") or shutil.which("sys_psql")
-                      or shutil.which("psql") or "ksql")
+        restore_tool = self._resolve_local_tool("sys_restore")
+        query_tool = self._resolve_local_tool("ksql", "sys_psql", "psql")
         try:
             result = logical_full.restore_full_instance(
                 "kingbase",

@@ -427,8 +427,8 @@ class MySQLEngine(BackupEngine):
         out_dir = self._output_dir()
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"{self._timestamp()}.tar.gz")
-        dump_tool = shutil.which("mysqldump") or "mysqldump"
-        query_tool = shutil.which("mysql") or "mysql"
+        dump_tool = self._resolve_local_tool("mysqldump")
+        query_tool = self._resolve_local_tool("mysql")
         try:
             manifest = logical_full.backup_full_instance(
                 self.db_type,
@@ -458,7 +458,7 @@ class MySQLEngine(BackupEngine):
     def _restore_full_instance_local(self, backup_path: str) -> BackupResult:
         """全实例恢复：解包 → 逐库灌入（dump 内含 CREATE DATABASE/USE）。"""
         from core import logical_full
-        restore_tool = shutil.which("mysql") or "mysql"
+        restore_tool = self._resolve_local_tool("mysql")
         query_tool = restore_tool
         try:
             result = logical_full.restore_full_instance(

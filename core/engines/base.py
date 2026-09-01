@@ -363,10 +363,18 @@ class BackupEngine:
         # 1. 自带工具（若引擎声明了服务运行用户如 oracle，先以该用户探测——
         #    工具往往只在其 profile PATH 中可见，root 探测会误报缺失）
         check_user = getattr(self, "tool_check_user", None)
+        tool_path = None
+        try:
+            from core import remote_dump as _rd
+            tool_path = _rd.task_tool_path(self.task) or None
+        except Exception:
+            pass
         if self.physical_bundled_tools and check_user:
             from core import remote_dump
             missing = [t for t in self.physical_bundled_tools
-                       if not remote_dump.remote_has_tool(ssh_host, t, check_user=check_user)]
+                       if not remote_dump.remote_has_tool(
+                           ssh_host, t, check_user=check_user,
+                           extra_paths=tool_path)]
             if missing:
                 return (False,
                         f"远端 {check_user} 用户环境缺少 {', '.join(missing)}，"
@@ -410,9 +418,15 @@ class BackupEngine:
         if not self.required_clients:
             return True, "ok"
         check_user = getattr(self, "tool_check_user", None)
+        tool_path = None
+        try:
+            tool_path = remote_dump.task_tool_path(self.task) or None
+        except Exception:
+            pass
         missing = []
         for tool in self.required_clients:
-            if not remote_dump.remote_has_tool(ssh_host, tool, check_user=check_user):
+            if not remote_dump.remote_has_tool(
+                    ssh_host, tool, check_user=check_user, extra_paths=tool_path):
                 missing.append(tool)
         primary = self.required_clients[0]
         if primary in missing:
@@ -766,6 +780,39 @@ class BackupEngine:
             except Exception:
                 return {}
         return {}
+
+    def _task_tool_path(self) -> str:
+        """任务级工具路径兜底（extra_options.tool_path，冒号分隔的 bin 目录）。"""
+        try:
+            from core import remote_dump
+            return remote_dump.task_tool_path(self.task)
+        except Exception:
+            return ""
+
+    def _resolve_local_tool(self, *names) -> str:
+        """本机工具解析：任务级 tool_path 目录优先，其次 PATH。"""
+        import shutil
+        tp = self._task_tool_path()
+        for d in filter(None, tp.split(":")):
+            for n in names:
+                p = os.path.join(d, n)
+                if os.path.isfile(p) and os.access(p, os.X_OK):
+                    return p
+        for n in names:
+            p = shutil.which(n)
+            if p:
+                return p
+        return names[0] if names else ""
+
+    def _env_with_tool_path(self, extra_env: dict = None) -> dict:
+        """构造本机执行环境：注入任务级 tool_path 到 PATH 前缀。"""
+        env = os.environ.copy()
+        tp = self._task_tool_path()
+        if tp:
+            env["PATH"] = tp + os.pathsep + env.get("PATH", "")
+        if extra_env:
+            env.update(extra_env)
+        return env
 
     def run_backup(self, backup_type: BackupType) -> BackupResult:
         """统一备份入口：配置了自定义脚本（extra_options.custom_script）时

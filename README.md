@@ -85,6 +85,17 @@
 - 恢复端自动识别 tar 产物：恢复全局对象（PG 系）→ 缺失的库自动 CREATE → 逐库恢复（本机与 SSH 远端通道均支持）
 - PG 系可选整实例 SQL 模式：`extra_options` 传 `{"all_db_mode": "dumpall"}` 时直接 `dumpall` 输出纯 SQL（大库恢复较慢）
 
+### SQL Server 备份/恢复（Linux + Windows）
+- **严格遵循微软官方 T-SQL**：完整备份 `BACKUP DATABASE [db] TO DISK=N'...' WITH COMPRESSION, CHECKSUM, INIT`；差异备份 `WITH DIFFERENTIAL`；日志备份 `BACKUP LOG`（需 FULL 恢复模式）；还原 `RESTORE FILELISTONLY` + `RESTORE DATABASE ... WITH MOVE, REPLACE, RECOVERY`；校验 `RESTORE VERIFYONLY WITH CHECKSUM`
+- **零依赖**：sqlcmd 在数据库服务器上（Linux `/opt/mssql-tools/bin` 自动发现），平台经 SSH 远程执行并拉回 `.bak/.diff/.trn`；密码走 sqlcmd 官方环境变量 `SQLCMDPASSWORD`，不进 argv
+- **Windows 目标**：`ssh_hosts` 的 os_type 设为 `windows` 即走 cmd 语法（备份目录默认 `C:\MSSQL\backup`，可用 `extra_options.backup_dir` 覆盖）
+- 备份目录解析：`extra_options.backup_dir` > 实例默认备份目录（`SERVERPROPERTY('InstanceDefaultBackupPath')`）> 平台默认
+
+### 工具路径手动兜底（可选）
+- 平台自动发现数据库服务器上的备份工具（运行进程 / 常见目录 / 包管理器 / `/proc` 等）；
+  极端场景探测不到时，任务表单「高级」页可填写**备份命令所在目录**（`extra_options.tool_path`，
+  冒号/分号分隔），作为 PATH 前缀注入**远程 SSH 命令与本机回退执行**，并最高优先参与工具探测
+
 ### 数据库直连能力（原生驱动，无需 Java）
 - **原生直连**（`core/native_conn.py`）：通过纯 Python 驱动直连数据库——连接测试、拉取库列表、数据对比，**不依赖 SSH、本机客户端与 Java/JVM**，离线环境开箱即用。入口：任务表单与「备份插件」页，接口：`/api/jdbc/*`。
 - **驱动与覆盖**：MySQL/MariaDB（pymysql，纯 Python）、PostgreSQL（psycopg2）、Kingbase（协议兼容 PG，复用 psycopg2）、Oracle（oracledb 瘦客户端，纯 Python，免装 Instant Client，12.1+；11g 请走 JDBC 兜底）、DM 达梦（dmPython，随达梦客户端提供）。

@@ -199,7 +199,7 @@ class PostgreSQLEngine(BackupEngine):
         if extra:
             cmd.extend(extra)
 
-        env_extra = {"PGPASSWORD": pw} if pw else None
+        env_extra = self._env_with_tool_path({"PGPASSWORD": pw} if pw else None)
 
         start = time.time()
         ret = self._run(cmd, env_extra=env_extra, timeout=3600)
@@ -251,8 +251,8 @@ class PostgreSQLEngine(BackupEngine):
         out_dir = self._output_dir()
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"{self._timestamp()}.tar.gz")
-        dump_tool = shutil.which("pg_dump") or "pg_dump"
-        query_tool = shutil.which("psql") or "psql"
+        dump_tool = self._resolve_local_tool("pg_dump")
+        query_tool = self._resolve_local_tool("psql")
         dumpall_tool = shutil.which("pg_dumpall") or ""
         try:
             manifest = logical_full.backup_full_instance(
@@ -281,8 +281,8 @@ class PostgreSQLEngine(BackupEngine):
     def _restore_full_instance_local(self, backup_path: str) -> BackupResult:
         """全实例恢复：解包 → globals → 缺失库自动建库 → 逐库 pg_restore。"""
         from core import logical_full
-        restore_tool = shutil.which("pg_restore") or "pg_restore"
-        query_tool = shutil.which("psql") or "psql"
+        restore_tool = self._resolve_local_tool("pg_restore")
+        query_tool = self._resolve_local_tool("psql")
         try:
             result = logical_full.restore_full_instance(
                 "postgresql",
@@ -375,7 +375,7 @@ class PostgreSQLEngine(BackupEngine):
         # 目标库：优先使用调用方指定，否则回退到任务原始库名
         target_db = kwargs.get("target_db") or self.task.get("db_name")
 
-        env_extra = {"PGPASSWORD": pw} if pw else None
+        env_extra = self._env_with_tool_path({"PGPASSWORD": pw} if pw else None)
 
         # 2.5) 全实例 tar 包（multi-db-tar）：逐库恢复，不适用单库流程
         if backup_path.endswith((".tar.gz", ".tgz")):
@@ -613,7 +613,7 @@ class PostgreSQLEngine(BackupEngine):
             "-c",
             "SELECT datname FROM pg_database WHERE NOT datistemplate",
         ]
-        env_extra = {"PGPASSWORD": pw} if pw else None
+        env_extra = self._env_with_tool_path({"PGPASSWORD": pw} if pw else None)
         ret = self._run(cmd, env_extra=env_extra, timeout=600)
         if ret["returncode"] != 0:
             self.logger.warning("[%s] 列举数据库失败: %s", self.task_name, ret["stderr"])

@@ -91,14 +91,15 @@ SUPPORTED_DB_TYPES = [
 # 各类型默认端口（供前端预填）
 DEFAULT_PORTS = {
     "mysql": 3306, "mariadb": 3306, "postgresql": 5432, "oracle": 1521, "kingbase": 54321,
-    "dameng": 5236, "redis": 6379, "mongodb": 27017,
+    "dameng": 5236, "sqlserver": 1433, "redis": 6379, "mongodb": 27017,
 }
 
 # 各类型显示名
 DB_DISPLAY_NAMES = {
     "mysql": "MySQL", "mariadb": "MariaDB", "postgresql": "PostgreSQL",
     "oracle": "Oracle", "kingbase": "KingBase",
-    "dameng": "DM 达梦", "redis": "Redis", "mongodb": "MongoDB", "file": "文件",
+    "dameng": "DM 达梦", "sqlserver": "SQL Server",
+    "redis": "Redis", "mongodb": "MongoDB", "file": "文件",
 }
 
 # 备份方式（backup_type）中文映射：full / incremental / differential

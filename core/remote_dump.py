@@ -92,20 +92,63 @@ def resolve_ssh_host(task: dict):
     return None
 
 
-def remote_has_tool(ssh_host: dict, tool: str, check_user: str = None) -> bool:
+def task_tool_path(task: dict) -> str:
+    """任务级工具路径覆盖（extra_options.tool_path）。
+
+    自动探测不到备份命令时的**手动兜底**：填写数据库服务器上备份命令所在的
+    bin 目录（冒号/分号分隔多个），会作为 PATH 前缀注入远端命令与本机回退执行，
+    并优先于常见目录 glob 参与探测。返回规范化的冒号分隔串（无则空串）。
+    """
+    extra = {}
+    raw = task.get("extra_options")
+    if isinstance(raw, dict):
+        extra = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            extra = json.loads(raw)
+        except Exception:
+            extra = {}
+    tp = str(extra.get("tool_path") or "").strip()
+    if not tp:
+        return ""
+    parts = []
+    for seg in tp.replace(";", ":").replace(",", ":").split(":"):
+        seg = seg.strip().rstrip("/\\")
+        if seg and seg not in parts:
+            parts.append(seg)
+    return ":".join(parts)
+
+
+def _tool_path_export(tool_path: str) -> str:
+    """生成注入 PATH 的 export 语句（远端脚本首行用），空则空串。"""
+    if not tool_path:
+        return ""
+    return f"export PATH={shlex.quote(tool_path)}:$PATH; "
+
+
+def remote_has_tool(ssh_host: dict, tool: str, check_user: str = None,
+                    extra_paths: str = None) -> bool:
     """检查远程 SSH 主机上是否存在指定命令（独立连接，不污染连接池）。
 
     check_user：以指定用户身份探测（su - <user> -c），用于工具仅在某个
     服务运行用户的 profile PATH 中可见的场景（如 Oracle 的 expdp/rman
     只在 oracle 用户环境变量中）。默认以 SSH 登录用户探测。
+    extra_paths：任务级工具路径（PATH 前缀），自动探测不到时的手动兜底。
     """
     client = None
     try:
         client = _connect_isolated(ssh_host)
+        tp_export = _tool_path_export(extra_paths)
         if check_user:
+            inner = tp_export + f"command -v {shlex.quote(tool)} >/dev/null 2>&1"
             probe = (f"su - {shlex.quote(check_user)} -c "
-                     f"{shlex.quote('command -v ' + shlex.quote(tool) + ' >/dev/null 2>&1')}")
+                     f"{shlex.quote(inner)}")
             shell = _wrap_login(probe)
+            from core.engines.file import _ssh_exec_pipe
+            _out, _err, rc = _ssh_exec_pipe(client, shell, timeout=30)
+            return rc == 0
+        if tp_export:
+            shell = _wrap_login(tp_export + f"command -v {shlex.quote(tool)} >/dev/null 2>&1")
             from core.engines.file import _ssh_exec_pipe
             _out, _err, rc = _ssh_exec_pipe(client, shell, timeout=30)
             return rc == 0
@@ -216,10 +259,14 @@ def _wrap_login(shell_cmd: str) -> str:
     return f"bash -lc '{escaped}'"
 
 
-def _resolve_remote_bin(client, tool: str) -> str | None:
+def _resolve_remote_bin(client, tool: str, extra_paths: str = None) -> str | None:
     """在远端 SSH 上检测指定工具的实际路径。
 
     返回绝对路径；若找不到返回 None。
+
+    extra_paths：任务级工具路径（PATH 前缀，冒号分隔），**最高优先级**——
+    注入 command -v 的 PATH 且加入 find 候选目录，用于数据库服务器
+    未配置环境变量时的手动兜底。
 
     探测顺序：
     0) PostgreSQL 家族工具：优先从运行中的 postgres 主进程推断 bin 目录。
@@ -294,8 +341,12 @@ def _resolve_remote_bin(client, tool: str) -> str | None:
     )
     # 单条命令：先 command -v，再用 find 兜底（find 只在声明过的候选目录中找，
     # 绝不硬编码任何单一安装路径 —— 全部以 glob/枚举动态发现）
+    tp = extra_paths or ""
+    tp_export = _tool_path_export(tp)
+    if tp:
+        common_dirs = tp + " " + common_dirs
     cmd = (
-        f"command -v {shlex.quote(tool)} 2>/dev/null || "
+        f"{tp_export}command -v {shlex.quote(tool)} 2>/dev/null || "
         f"find {common_dirs} -maxdepth 4 -name {shlex.quote(tool)} -type f -perm -u+x 2>/dev/null | head -1"
     )
     shell = _wrap_login(cmd)
@@ -322,16 +373,19 @@ def _resolve_remote_bin(client, tool: str) -> str | None:
 _remote_bin_cache: dict = {}
 
 
-def resolve_remote_tool(ssh_host: dict, tool: str, check_user: str = None) -> str:
+def resolve_remote_tool(ssh_host: dict, tool: str, check_user: str = None,
+                        extra_paths: str = None) -> str:
     """解析远端数据库自带工具的绝对路径（带缓存），找不到返回 ""。
 
     解析顺序（绝不硬编码单一路径，全部动态发现）：
+    0) extra_paths（任务级 tool_path，PATH 前缀）——手动兜底最高优先级；
     1) 以 check_user（如 oracle）身份 `command -v`（该用户的 profile PATH）；
     2) 以 SSH 登录用户 bash -lc `command -v`（/etc/profile）；
     3) 常见安装目录 glob 枚举 + find（覆盖 Oracle/DM/金仓/MySQL/PG/Redis/Mongo）。
-    结果按 (host_key, tool, check_user) 缓存，避免同一任务内反复探测。
+    结果按 (host_key, tool, check_user, extra_paths) 缓存，避免同一任务内反复探测。
     """
-    key = (ssh_host.get("host_key") or ssh_host.get("hostname") or "", tool, check_user or "")
+    key = (ssh_host.get("host_key") or ssh_host.get("hostname") or "", tool,
+           check_user or "", extra_paths or "")
     if key in _remote_bin_cache:
         return _remote_bin_cache[key]
 
@@ -339,10 +393,12 @@ def resolve_remote_tool(ssh_host: dict, tool: str, check_user: str = None) -> st
     client = None
     try:
         client = _connect_isolated(ssh_host)
+        tp_export = _tool_path_export(extra_paths)
         if check_user:
             from core.engines.file import _ssh_exec_pipe
+            inner = tp_export + f"command -v {shlex.quote(tool)} 2>/dev/null"
             probe = (f"su - {shlex.quote(check_user)} -c "
-                     f"{shlex.quote('command -v ' + shlex.quote(tool) + ' 2>/dev/null')}")
+                     f"{shlex.quote(inner)}")
             out, _err, rc = _ssh_exec_pipe(client, _wrap_login(probe), timeout=30)
             text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
             for line in text.splitlines():
@@ -351,7 +407,7 @@ def resolve_remote_tool(ssh_host: dict, tool: str, check_user: str = None) -> st
                     path = line
                     break
         if not path:
-            path = _resolve_remote_bin(client, tool) or ""
+            path = _resolve_remote_bin(client, tool, extra_paths=extra_paths) or ""
     except Exception:
         path = ""
     finally:
@@ -695,7 +751,8 @@ def _pg_family_resolve_dumpall_bin(client, cfg) -> str:
 
 def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
                                  user: str, pw: str, port: int,
-                                 include_sys: bool = False) -> bytes:
+                                 include_sys: bool = False,
+                                 tool_path: str = "") -> bytes:
     """全实例备份：一次 SSH 会话内逐库 dump + globals + manifest → tar.gz 流。
 
     每库 -Fc（独立一致性快照，支持并行恢复）；单库失败即整体失败（rc=32）；
@@ -729,6 +786,7 @@ def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
     lines = [
         "set -eu",
         env,
+        _tool_path_export(tool_path) or "true;",
         f"DUMP_BIN={shlex.quote(dump_bin)}",
         f"QUERY_BIN={shlex.quote(query_bin)}",
         f"DUMPALL_BIN={shlex.quote(dumpall_bin or '')}",
@@ -795,7 +853,7 @@ def _pg_family_dumpall_stream(client, cfg: dict,
             "可在 extra_options 中去掉 all_db_mode 使用默认逐库 tar 模式。")
     env = _pg_family_env_exports(cfg, pw)
     shell = (
-        f"set -o pipefail; {env} "
+        f"set -o pipefail; {_tool_path_export(tool_path)}{env} "
         f"{dumpall_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}"
     )
     out, err, rc = _ssh_exec_pipe(client, _wrap_login(shell), timeout=7200)
@@ -814,8 +872,9 @@ def _pg_family_dump(task: dict, ssh_host: dict, db_type: str, compress: int) -> 
     """
     cfg = _PG_FAMILY_TOOLING[db_type]
     client = _connect(ssh_host)
+    tp = task_tool_path(task)
     dump_bin = resolve_remote_tool(
-        ssh_host, cfg["dump_tool"], check_user=cfg["check_user"])
+        ssh_host, cfg["dump_tool"], check_user=cfg["check_user"], extra_paths=tp)
     if not dump_bin:
         raise RuntimeError(
             f"远端主机未找到 {cfg['dump_tool']}"
@@ -837,16 +896,18 @@ def _pg_family_dump(task: dict, ssh_host: dict, db_type: str, compress: int) -> 
         # 默认仅备份业务库（排除系统库），extra.include_system_dbs=true 时包含
         include_sys = bool(extra.get("include_system_dbs"))
         if (extra.get("all_db_mode") or "").strip().lower() == "dumpall":
-            return _pg_family_dumpall_stream(client, cfg, user, pw, port), "dumpall"
+            return _pg_family_dumpall_stream(
+                client, cfg, user, pw, port, tool_path=tp), "dumpall"
         return _pg_family_full_instance_tar(
-            client, cfg, dump_bin, user, pw, port, include_sys), "multi-db-tar"
+            client, cfg, dump_bin, user, pw, port, include_sys,
+            tool_path=tp), "multi-db-tar"
 
     # ---- 单库/多表/多 schema（原有行为）----
     # 注意：不使用 "-f -"（显式指定 stdout）。某些环境下 pg_dump 的 "-f -"
     # 参数异常导致输出 0 字节；不带 -f 时默认输出 stdout，行为一致且兼容性更好。
     env = _pg_family_env_exports(cfg, pw)
     base = (
-        f"set -o pipefail; {env} "
+        f"set -o pipefail; {_tool_path_export(tp)}{env} "
         f"{dump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt_flag}"
     )
 

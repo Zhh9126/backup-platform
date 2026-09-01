@@ -15,6 +15,7 @@ _LIST_DB_SKIP = {
     "mariadb": {"information_schema", "performance_schema", "mysql", "sys"},
     "postgresql": {"template0", "template1"},
     "kingbase": {"template0", "template1"},
+    "sqlserver": {"master", "tempdb", "model", "msdb"},
 }
 
 

@@ -30,20 +30,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 版本 tag：vX.Y.Z → X.Y.Z / X.Y.Z-YYYYMMDD / latest / community
-      # 日期与版本由本步骤显式计算（不用 metadata-action 的 date 表达式，
-      # 避免不同 runner 时区/语法兼容问题）
+      # 版本 tag：vX.Y.Z → X.Y.Z / X.Y.Z-<run_number> / latest / community
+      # 用 GITHUB_RUN_NUMBER 区分同版本多次构建（稳定、无语法兼容风险），
+      # 不再用 metadata-action 的 date 表达式。
       - name: Compute image tags
         id: tags
         run: |
           set -euo pipefail
           VER="${GITHUB_REF_NAME#v}"
-          DATE="$(date -u +%Y%m%d)"
           IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "all_tags=${IMAGE}:${VER},${IMAGE}:${VER}-r${GITHUB_RUN_NUMBER},${IMAGE}:latest,${IMAGE}:community" >> "$GITHUB_OUTPUT"
           echo "version_tag=${IMAGE}:${VER}" >> "$GITHUB_OUTPUT"
-          echo "dated_tag=${IMAGE}:${VER}-${DATE}" >> "$GITHUB_OUTPUT"
-          echo "rolling_tags=${IMAGE}:latest,${IMAGE}:community" >> "$GITHUB_OUTPUT"
-          echo "all_tags=${IMAGE}:${VER},${IMAGE}:${VER}-${DATE},${IMAGE}:latest,${IMAGE}:community" >> "$GITHUB_OUTPUT"
+          echo "dated_tag=${IMAGE}:${VER}-r${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (labels)
         id: meta

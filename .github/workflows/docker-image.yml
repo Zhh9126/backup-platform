@@ -30,26 +30,41 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels)
+      # 版本 tag：vX.Y.Z → X.Y.Z / X.Y.Z-YYYYMMDD / latest / community
+      # 日期与版本由本步骤显式计算（不用 metadata-action 的 date 表达式，
+      # 避免不同 runner 时区/语法兼容问题）
+      - name: Compute image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF_NAME#v}"
+          DATE="$(date -u +%Y%m%d)"
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "version_tag=${IMAGE}:${VER}" >> "$GITHUB_OUTPUT"
+          echo "dated_tag=${IMAGE}:${VER}-${DATE}" >> "$GITHUB_OUTPUT"
+          echo "rolling_tags=${IMAGE}:latest,${IMAGE}:community" >> "$GITHUB_OUTPUT"
+          echo "all_tags=${IMAGE}:${VER},${IMAGE}:${VER}-${DATE},${IMAGE}:latest,${IMAGE}:community" >> "$GITHUB_OUTPUT"
+
+      - name: Extract metadata (labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=community
-            type=semver,pattern={{version}}
-            type=semver,pattern={{version}}-{{date 'YYYYMMDD'}}
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.tags.outputs.all_tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Image digest
-        run: echo "Published ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} digest=${{ steps.meta.outputs.digest }}"
+        run: |
+          echo "Published:"
+          echo "  ${{ steps.tags.outputs.version_tag }}"
+          echo "  ${{ steps.tags.outputs.dated_tag }}"
+          echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:community"

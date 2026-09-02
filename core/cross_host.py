@@ -158,6 +158,9 @@ def cross_host_restore(db_type: str, backup_path: str, target_host_info: dict,
             extra["_kb_restore_bin"] = _resolve_remote_bin(client, "sys_restore") or "sys_restore"
             extra["_kb_ksql_bin"] = _resolve_remote_bin(client, "ksql") or "ksql"
         cmd = _build_restore_cmd(db_type, remote, target_db, extra, target_host_info)
+        # 任务级自定义环境变量前缀（contextvar，由 scheduler 设置）
+        from core.remote_dump import current_task_env_export
+        cmd = current_task_env_export() + cmd
         log(f"远程执行: {cmd[:200]}")
         out, err, rc = _remote_exec_logged(client, cmd, timeout=7200, log=log)
         out_s = out.decode("utf-8", "replace")

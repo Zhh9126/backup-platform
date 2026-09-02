@@ -15,10 +15,12 @@ dump（连接 127.0.0.1），再把数据流（字节）回传到备份服务器
 import os
 import io
 import json
+import re
 import shlex
 import tempfile
 import time
 import logging
+import contextvars
 
 import config
 import core.db as db
@@ -124,6 +126,83 @@ def _tool_path_export(tool_path: str) -> str:
     if not tool_path:
         return ""
     return f"export PATH={shlex.quote(tool_path)}:$PATH; "
+
+
+def parse_task_env_vars(task: dict) -> dict:
+    """解析任务级自定义环境变量（extra_options.env_vars）。
+
+    支持两种存储形态：
+    - dict：{"KEY": "VALUE", ...}
+    - str：每行一条 KEY=VALUE（兼容 ; 分隔）；# 开头视为注释
+    返回 {KEY: VALUE}；键名不符合 shell 变量规则的条目被忽略。
+    """
+    extra = {}
+    raw = task.get("extra_options")
+    if isinstance(raw, dict):
+        extra = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            extra = json.loads(raw)
+        except Exception:
+            extra = {}
+    raw_env = extra.get("env_vars") if isinstance(extra, dict) else None
+    result: dict = {}
+    if isinstance(raw_env, dict):
+        items = list(raw_env.items())
+    elif isinstance(raw_env, str) and raw_env.strip():
+        items = []
+        for line in raw_env.replace(";", "\n").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            items.append((k.strip(), v.strip()))
+    else:
+        items = []
+    for k, v in items:
+        k = str(k).strip()
+        if not k or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", k):
+            continue
+        result[k] = str(v)
+    return result
+
+
+def task_env_export(task: dict) -> str:
+    """生成任务级环境变量的 export 前缀（远端脚本用），无则空串。
+
+    PATH 特殊处理：用户配置的 PATH 以「前缀」方式合并（PATH=xxx:$PATH），
+    而非直接覆盖，避免清空系统查找路径导致命令全部找不到。
+    """
+    env_vars = parse_task_env_vars(task)
+    if not env_vars:
+        return ""
+    parts = []
+    user_path = env_vars.pop("PATH", None)
+    for k, v in env_vars.items():
+        parts.append(f"export {k}={shlex.quote(v)}; ")
+    if user_path:
+        parts.append(f"export PATH={shlex.quote(user_path)}:$PATH; ")
+    return "".join(parts)
+
+
+# 当前执行上下文的任务环境变量 export 前缀。
+# 由 scheduler 在调用 engine.run_backup()/run_restore() 前设置，
+# _wrap_login 读取并注入到所有远程 SSH 命令（覆盖全部引擎与自定义脚本）。
+_task_env_export_cv: contextvars.ContextVar = contextvars.ContextVar(
+    "bp_task_env_export", default="")
+
+
+def set_task_env_export(export_str: str):
+    """设置当前上下文的任务环境变量前缀，返回 token 供 reset。"""
+    return _task_env_export_cv.set(export_str or "")
+
+
+def reset_task_env_export(token) -> None:
+    _task_env_export_cv.reset(token)
+
+
+def current_task_env_export() -> str:
+    return _task_env_export_cv.get()
 
 
 def remote_has_tool(ssh_host: dict, tool: str, check_user: str = None,
@@ -254,8 +333,11 @@ def _wrap_login(shell_cmd: str) -> str:
     用 `bash -lc '...'` 强制作为 login shell 启动，加载 /etc/profile 后
     再执行命令。注意：必须把 shell_cmd 包成单引号字符串传入。
     """
+    # 任务级自定义环境变量（extra_options.env_vars）统一注入：
+    # 覆盖所有引擎的远程命令与自定义脚本，且不影响工具探测的 PATH 前缀逻辑
+    prefix = _task_env_export_cv.get() or ""
     # 用单引号包，并用 sed 把命令里的单引号转义（'\'' 方式）
-    escaped = shell_cmd.replace("'", "'\\''")
+    escaped = (prefix + shell_cmd).replace("'", "'\\''")
     return f"bash -lc '{escaped}'"
 
 

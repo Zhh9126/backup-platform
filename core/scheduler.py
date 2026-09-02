@@ -300,7 +300,13 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
         else:
             if pre_detail and pre_detail != "ok":
                 _logger.info("备份前置提示 task=%s: %s", task["id"], pre_detail)
-            result = engine.run_backup(bt)
+            # 任务级自定义环境变量：注入本机执行与所有远程 SSH 命令
+            from core import remote_dump as _rd
+            _env_token = _rd.set_task_env_export(_rd.task_env_export(task))
+            try:
+                result = engine.run_backup(bt)
+            finally:
+                _rd.reset_task_env_export(_env_token)
     except Exception as e:
         result = BackupResult(success=False, status=BackupStatus.FAILED, message=f"执行异常: {e}")
         _logger.exception("备份异常 task=%s", task["id"])
@@ -468,10 +474,16 @@ def run_restore_now(record_id: int, target_host: str = None,
     try:
         from core.engines import get_engine
         engine = get_engine(task["db_type"], task, config.BACKUP_ROOT, _logger)
-        result = engine.run_restore(rec["backup_path"], target_host=target_host,
-                                target_host_info=target_host_info,
-                                target_db=target_db,
-                                target_port=target_port)
+        # 任务级自定义环境变量：注入本机执行与所有远程 SSH 命令
+        from core import remote_dump as _rd
+        _env_token = _rd.set_task_env_export(_rd.task_env_export(task))
+        try:
+            result = engine.run_restore(rec["backup_path"], target_host=target_host,
+                                    target_host_info=target_host_info,
+                                    target_db=target_db,
+                                    target_port=target_port)
+        finally:
+            _rd.reset_task_env_export(_env_token)
         detail_log_lines.append(f"[引擎结果] success={result.success}, status={getattr(result, 'status', '-')}")
         detail_log_lines.append(f"[引擎结果] message={getattr(result, 'message', '')}")
         if getattr(result, "stdout", None):

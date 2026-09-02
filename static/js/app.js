@@ -455,6 +455,15 @@
         if ($("t_custom_restore")) $("t_custom_restore").value = eo.custom_restore_script || "";
         if ($("t_custom_artifact_dir")) $("t_custom_artifact_dir").value = eo.custom_artifact_dir || "";
         if ($("t_custom_timeout")) $("t_custom_timeout").value = eo.custom_timeout || "";
+        // 任务级环境变量回填（支持 dict 或字符串两种存储形态）
+        if ($("t_env_vars")) {
+          const ev = eo.env_vars;
+          if (ev && typeof ev === "object") {
+            $("t_env_vars").value = Object.entries(ev).map(([k, v]) => `${k}=${v}`).join("\n");
+          } else {
+            $("t_env_vars").value = ev || "";
+          }
+        }
         toggleCustomBox();
       } catch (e) {
         if ($("t_ssh_host")) $("t_ssh_host").value = "";
@@ -471,6 +480,7 @@
       if ($("t_custom_restore")) $("t_custom_restore").value = "";
       if ($("t_custom_artifact_dir")) $("t_custom_artifact_dir").value = "";
       if ($("t_custom_timeout")) $("t_custom_timeout").value = "";
+      if ($("t_env_vars")) $("t_env_vars").value = "";
       resetSshCred();
     }
     toggleCustomBox();
@@ -825,6 +835,12 @@
         delete eo.custom_artifact_dir;
         delete eo.custom_timeout;
       }
+      // 任务级环境变量（所有数据库类型通用；KEY=VALUE 每行一条）
+      const envRaw = ($("t_env_vars") && $("t_env_vars").value) || "";
+      const envLines = envRaw.split(/\n|;/).map(s => s.trim())
+        .filter(s => s && !s.startsWith("#") && s.includes("="));
+      if (envLines.length) eo.env_vars = envLines.join("\n");
+      else delete eo.env_vars;
       const data = {
         name: val("t_name"),
         biz_system: val("t_biz_system").trim(),

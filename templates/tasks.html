@@ -221,6 +221,15 @@
                   </div>
                   <div class="form-text">0 跟随引擎默认（zstd 10）；1~22 自定义压缩级别</div>
                 </div>
+                <div class="col-12">
+                  <label class="form-label">自定义环境变量（可选，所有数据库类型生效）</label>
+                  <textarea class="form-control form-control-sm font-monospace" id="t_env_vars" rows="3"
+                            placeholder="每行一条 KEY=VALUE，例如：&#10;NLS_LANG=AMERICAN_AMERICA.AL32UTF8&#10;PGOPTIONS=-c statement_timeout=0&#10;LD_LIBRARY_PATH=/opt/database/lib"></textarea>
+                  <div class="small text-muted">
+                    随任务注入备份/恢复执行环境：本机命令、远程 SSH 命令、自定义脚本均生效；
+                    <code>PATH</code> 会以「前缀」合并而非覆盖，不会破坏系统命令查找。
+                  </div>
+                </div>
               </div>
             </div>
             <div class="tab-pane fade" id="tab_extra" role="tabpanel">

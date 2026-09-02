@@ -615,6 +615,8 @@ class BackupEngine:
         pw = db.decrypt_secret(self.task.get("password") or "")
         if pw:
             env["DB_BACKUP_PASSWORD"] = pw
+        # 任务级自定义环境变量（extra_options.env_vars，所有数据库类型通用）
+        self._apply_task_env_vars(env)
         if env_extra:
             env.update(env_extra)
 
@@ -646,6 +648,8 @@ class BackupEngine:
         pw = db.decrypt_secret(self.task.get("password") or "")
         if pw:
             env["DB_BACKUP_PASSWORD"] = pw
+        # 任务级自定义环境变量（extra_options.env_vars，所有数据库类型通用）
+        self._apply_task_env_vars(env)
         if env_extra:
             env.update(env_extra)
         if len(cmd) == 3 and cmd[0] == "sh" and cmd[1] == "-c":
@@ -846,9 +850,30 @@ class BackupEngine:
                 return p
         return names[0] if names else ""
 
+    def _apply_task_env_vars(self, env: dict) -> None:
+        """把任务级自定义环境变量（extra_options.env_vars）注入执行环境。
+
+        所有数据库类型通用；本机命令（_run/_run_with_stdin/_env_with_tool_path）
+        与远程 SSH 命令（scheduler 设置的 _wrap_login 前缀）均会注入。
+        PATH 特殊处理：用户配置的 PATH 以「前缀」方式合并而非覆盖。
+        """
+        try:
+            from core.remote_dump import parse_task_env_vars
+            env_vars = parse_task_env_vars(self.task)
+        except Exception:
+            return
+        if not env_vars:
+            return
+        user_path = env_vars.pop("PATH", None)
+        env.update(env_vars)
+        if user_path:
+            env["PATH"] = user_path + os.pathsep + env.get("PATH", "")
+
     def _env_with_tool_path(self, extra_env: dict = None) -> dict:
         """构造本机执行环境：注入任务级 tool_path 到 PATH 前缀。"""
         env = os.environ.copy()
+        # 任务级自定义环境变量（所有数据库类型通用）
+        self._apply_task_env_vars(env)
         tp = self._task_tool_path()
         if tp:
             env["PATH"] = tp + os.pathsep + env.get("PATH", "")

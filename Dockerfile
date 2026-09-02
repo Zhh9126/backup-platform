@@ -18,7 +18,7 @@
 #     -v /opt/xtrabackup8:/opt/xtrabackup8:ro       # xtrabackup 8.0（MySQL 8.0+，可选，覆盖内置路径）
 # 路径可用环境变量 XTRABACKUP_8_PATH / XTRABACKUP_24_PATH / MARIABACKUP_PATH 覆盖。
 
-FROM python:3.10-slim
+FROM python:3.14-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

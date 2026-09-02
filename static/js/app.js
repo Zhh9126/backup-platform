@@ -748,6 +748,24 @@
     toggleSshFields();
   }
 
+  // 任务级工具路径：编辑回填（extra_options.tool_path）
+  function fillToolPath(extraOptionsStr) {
+    let eo = {};
+    try {
+      eo = (typeof extraOptionsStr === "string")
+        ? JSON.parse(extraOptionsStr || "{}")
+        : (extraOptionsStr || {});
+    } catch (e) { eo = {}; }
+    if ($("t_tool_path")) $("t_tool_path").value = eo.tool_path || "";
+  }
+
+  // 任务级工具路径：保存收集（填写则写入 extra_options.tool_path）
+  function collectToolPath(eo) {
+    const v = ($("t_tool_path") && $("t_tool_path").value.trim()) || "";
+    if (v) eo.tool_path = v;
+    else delete eo.tool_path;
+  }
+
   function fillSshCred(sc, task) {
     resetSshCred();
     if (!sc) return;

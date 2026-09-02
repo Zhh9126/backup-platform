@@ -38,3 +38,4 @@ startup*.log
 lib
 cookies.txt
 mysql-bin.*
+core/plugins/state/

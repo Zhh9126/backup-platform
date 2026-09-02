@@ -336,6 +336,9 @@ def api_fill_gap(link_id):
     if not models.get_disaster_link(link_id):
         return jsonify({"error": "链路不存在"}), 404
     result = dl_engine.DisasterLinkEngine().fill_log_gap(link_id)
+    # 真实检测不可执行（未绑定实时任务等）→ 400 明确反馈
+    if not result.get("ok") and result.get("simulated") is not True:
+        return jsonify(result), 400
     return jsonify(result)
 
 
@@ -345,4 +348,7 @@ def api_check_consistency(link_id):
     if not models.get_disaster_link(link_id):
         return jsonify({"error": "链路不存在"}), 404
     result = dl_engine.DisasterLinkEngine().run_consistency_check(link_id)
+    # 真实检查不可执行（未绑定源等）→ 400 明确反馈；仿真兜底 → 200 + simulated 标注
+    if not result.get("ok") and result.get("simulated") is not True:
+        return jsonify(result), 400
     return jsonify(result)

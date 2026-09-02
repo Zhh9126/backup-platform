@@ -13,7 +13,6 @@
 - get_link_status(link_id) / list_links()  状态概览
 """
 import re
-import random
 import logging
 from datetime import datetime, timezone
 
@@ -22,6 +21,54 @@ import core.models as models
 
 
 _logger = db.get_logger("disaster_link")
+
+
+def _demo_mode() -> str:
+    """DEMO_MODE 取值（默认 off）。非 off 时相关操作明确标注 simulated。"""
+    try:
+        import config
+        return str(getattr(config, "DEMO_MODE", "off"))
+    except Exception:
+        return "off"
+
+
+def _sync_source_probe(sync_task_id: int) -> dict:
+    """同步任务源的真实探针：源库连通性 + 最近一次同步结果。
+
+    返回 {reachable, last_sync_status, last_sync_at, db_type, host}；
+    异常/不可得时字段缺失，由调用方降级处理。
+    """
+    task = models.get_sync_task(int(sync_task_id), include_secret=True) or {}
+    if not task:
+        return {}
+    out = {
+        "db_type": task.get("src_db_type") or "",
+        "host": task.get("src_host") or "",
+        "port": int(task.get("src_port") or 0),
+    }
+    try:
+        from core import probe
+        ok, msg = probe.probe_db_connection(
+            out["db_type"], out["host"], out["port"],
+            task.get("src_username"),
+            db.decrypt_secret(task.get("src_password") or ""),
+            task.get("src_db_name"))
+        out["reachable"] = bool(ok)
+        out["probe_msg"] = msg
+    except Exception as exc:
+        out["reachable"] = False
+        out["probe_msg"] = f"探测异常: {exc}"
+    try:
+        rows = models.list_sync_records() or []
+        last = next((r for r in rows
+                     if int(r.get("sync_task_id") or 0) == int(sync_task_id)), None)
+        if last:
+            out["last_sync_status"] = last.get("status")
+            out["last_sync_at"] = last.get("finished_at") or last.get("started_at")
+    except Exception:
+        pass
+    return out
+
 
 
 def _binlog_file_index(name) -> int:
@@ -124,9 +171,9 @@ class DisasterLinkEngine:
         for r in routes:
             enabled = bool(r.get("enabled", True))
             base_latency = float(r.get("latency_ms") or 0)
-            # DEMO：在基准延迟上叠加仿真抖动
-            jitter = random.uniform(-3, 6)
-            latency = round(max(1.0, base_latency + jitter), 1)
+            # 平台无真实专线探测能力：延迟取配置基准值（不叠加随机抖动），
+            # 并在响应中标注 simulated，供前端/下游区分
+            latency = round(max(1.0, base_latency), 1)
             candidates.append({
                 "provider": r.get("provider", "未知"),
                 "endpoint": r.get("endpoint", ""),
@@ -153,14 +200,17 @@ class DisasterLinkEngine:
             "selected": selected,
             "candidates": candidates,
             "selected_at": now,
+            "simulated": True,
+            "sim_note": "延迟为配置基准值（平台未接入真实专线探测）",
         }
 
     # ------------------------- 日志间隙填补 -------------------------
     def fill_log_gap(self, link_id: int) -> dict:
-        """检测备端日志缺口（对比主备 LSN/binlog position），补传缺失日志段。
+        """检测备端日志缺口（对比源库实时 binlog 位点 vs 已捕获位点）。
 
-        DEMO 下仿真主备 LSN 差值与缺口字节，记录填补过程；
-        填补后链路进入 filling 状态。
+        真实语义：缺口由实时捕获流自动追平，本操作确认缺口并记录状态；
+        无绑定源/无真实位点时不伪造数据，明确返回不可执行原因。
+        DEMO_MODE 下才允许仿真兜底，且响应标注 simulated=True。
         """
         link = models.get_disaster_link(link_id)
         if not link:
@@ -184,70 +234,97 @@ class DisasterLinkEngine:
                         "filled_at": now, "real": True,
                         "src_file": real["src_file"], "end_file": real["end_file"]}
             gap_lsn = gap_files * 1_000_000 + gap_bytes  # 位点差折算 LSN
-            filled_bytes = gap_bytes or (gap_files * 4_194_304)
             msg = (f"检测到 binlog 缺口 {gap_files} 文件 / {gap_bytes} 字节"
                    f"（源 {real['src_file']}:{real['src_pos']}，"
                    f"已捕获 {real['end_file']}:{real['end_pos']}），"
-                   f"已从主端/归档补传 {filled_bytes} 字节")
+                   f"实时捕获链路将自动追平；如需立即收敛可对源任务手动执行一次备份")
             models.set_disaster_link_status(link_id, "filling")
             db.add_log("INFO", "disaster_link", f"链路#{link_id} 日志填补: {msg}")
             self.logger.info("[disaster_link] #%s 日志填补: %s", link_id, msg)
             return {"ok": True, "link_id": link_id, "primary_lsn": gap_lsn,
                     "dr_lsn": 0, "gap_lsn": gap_lsn, "gap_files": gap_files,
-                    "gap_bytes": gap_bytes, "filled_bytes": filled_bytes,
-                    "result": "filled", "message": msg, "filled_at": now, "real": True,
+                    "gap_bytes": gap_bytes,
+                    "result": "gap_detected",
+                    "message": msg, "filled_at": now, "real": True,
                     "src_file": real["src_file"], "end_file": real["end_file"]}
-        # DEMO：仿真主端当前 LSN 与备端已应用 LSN（无真实位点可用时兜底）
-        primary_lsn = random.randint(1_000_000, 9_999_999)
-        gap = random.randint(0, max(0, int(primary_lsn * 0.05)))
-        dr_lsn = primary_lsn - gap
-        gap_segments = max(0, gap // 10_000)
-        filled_bytes = gap * random.randint(50, 200)
-        now = db.now_iso()
-        if gap <= 0:
-            result = "no_gap"
-            msg = "主备 LSN 一致，无需填补"
-        else:
-            result = "filled"
-            msg = (f"检测到缺口 {gap} LSN（{gap_segments} 段），"
-                   f"已从主端/归档补传 {filled_bytes} 字节")
-            models.set_disaster_link_status(link_id, "filling")
-        db.add_log("INFO", "disaster_link",
-                   f"链路#{link_id} 日志填补: {msg} (primary_lsn={primary_lsn}, dr_lsn={dr_lsn})")
-        self.logger.info("[disaster_link] #%s 日志填补: %s", link_id, msg)
-        return {
-            "ok": True,
-            "link_id": link_id,
-            "primary_lsn": primary_lsn,
-            "dr_lsn": dr_lsn,
-            "gap_lsn": gap,
-            "gap_segments": gap_segments,
-            "filled_bytes": filled_bytes,
-            "result": result,
-            "message": msg,
-            "filled_at": now,
-        }
+        # 无真实位点可用：不伪造数据
+        if _demo_mode() != "off":
+            return {"ok": False, "simulated": True,
+                    "error": (f"DEMO_MODE={_demo_mode()}：链路未绑定实时保护任务，"
+                              "日志填补已不再提供随机模拟数据")}
+        return {"ok": False,
+                "error": ("链路未绑定实时保护任务（source_kind=rt_task），"
+                          "无法执行真实的日志缺口检测；请先在链路详情绑定源")}
+
 
     # ------------------------- 一致性校验 -------------------------
     def run_consistency_check(self, link_id: int) -> dict:
-        """在备端启动只读校验（总分核对 + 抽样校验和）。
+        """链路一致性校验（真实数据，不伪造）。
 
-        返回 pass / warn / fail，并记录到 consistency_result + last_consistency_check；
-        DEMO 下仿真校验结果分布。
+        - 绑定实时保护任务：校验捕获守护健康 + 源库 binlog 位点 vs 已捕获位点
+          的滞后（真实位点比对）；
+        - 绑定同步任务：源库连通性 + 最近一次同步结果；
+        - 未绑定源：拒绝执行并明确说明（不再返回随机模拟数字）；
+        - DEMO_MODE != off 时保留仿真兜底，响应标注 simulated=True。
         """
         link = models.get_disaster_link(link_id)
         if not link:
             return {"ok": False, "error": "容灾链路不存在"}
-        # 实时保护任务源：真实位点一致性校验（捕获是否持续、滞后多少）
-        real = {}
-        if link.get("source_kind") == "rt_task" and link.get("source_id"):
-            real = _rt_real_position(link["source_id"])
-        if real.get("end_file"):
-            now = db.now_iso()
-            daemon = real["daemon_status"] or "unknown"
-            if daemon not in ("running", "active", "ok", "healthy"):
+        kind = link.get("source_kind")
+        src_id = link.get("source_id")
+        now = db.now_iso()
+
+        # 1) 实时保护任务源：真实 binlog 位点一致性校验
+        if kind == "rt_task" and src_id:
+            real = _rt_real_position(int(src_id))
+            if real.get("end_file"):
+                daemon = real["daemon_status"] or "unknown"
+                if daemon not in ("running", "active", "ok", "healthy"):
+                    result = "fail"
+                elif real["gap_files"] > 0 or real["gap_bytes"] > 0:
+                    result = "warn"
+                else:
+                    result = "pass"
+                models.update_disaster_link_check(
+                    link_id, consistency_result=result, last_consistency_check=now)
+                if link.get("status") in ("filling", "standby") and result == "pass":
+                    models.set_disaster_link_status(link_id, "active")
+                db.add_log("INFO", "disaster_link",
+                           f"链路#{link_id} 一致性校验(真实位点): {result} "
+                           f"(daemon={daemon}, 滞后 {real['gap_files']} 文件/"
+                           f"{real['gap_bytes']} 字节, RPO={real['rpo_actual_sec']}s, "
+                           f"源 {real['src_file']}:{real['src_pos']}, "
+                           f"已捕获 {real['end_file']}:{real['end_pos']})")
+                self.logger.info("[disaster_link] #%s 一致性校验(真实位点): %s",
+                                 link_id, result)
+                return {
+                    "ok": True,
+                    "link_id": link_id,
+                    "result": result,
+                    "real": True,
+                    "check_type": "real_binlog_position",
+                    "gap_files": real["gap_files"],
+                    "gap_bytes": real["gap_bytes"],
+                    "src_file": real["src_file"],
+                    "src_pos": real["src_pos"],
+                    "end_file": real["end_file"],
+                    "end_pos": real["end_pos"],
+                    "daemon_status": daemon,
+                    "rpo_actual_sec": real["rpo_actual_sec"],
+                    "checked_at": now,
+                }
+            return {"ok": False, "real": True,
+                    "error": ("实时任务位点不可用（任务未运行或非 MySQL binlog 捕获），"
+                              "无法执行位点一致性校验")}
+
+        # 2) 同步任务源：源连通性 + 最近一次同步结果
+        if kind == "sync_task" and src_id:
+            probe = _sync_source_probe(int(src_id))
+            if not probe:
+                return {"ok": False, "real": True, "error": "同步任务不存在，无法校验"}
+            if not probe.get("reachable"):
                 result = "fail"
-            elif real["gap_files"] > 0 or real["gap_bytes"] > 0:
+            elif probe.get("last_sync_status") not in ("success", None):
                 result = "warn"
             else:
                 result = "pass"
@@ -255,61 +332,33 @@ class DisasterLinkEngine:
                 link_id, consistency_result=result, last_consistency_check=now)
             if link.get("status") in ("filling", "standby") and result == "pass":
                 models.set_disaster_link_status(link_id, "active")
-            match_rate = 100.0 if result == "pass" else (98.0 if result == "warn" else 90.0)
             db.add_log("INFO", "disaster_link",
-                       f"链路#{link_id} 一致性校验(真实位点): {result} "
-                       f"(daemon={daemon}, 滞后 {real['gap_files']} 文件/"
-                       f"{real['gap_bytes']} 字节, RPO={real['rpo_actual_sec']}s, "
-                       f"源 {real['src_file']}:{real['src_pos']}, "
-                       f"已捕获 {real['end_file']}:{real['end_pos']})")
-            self.logger.info("[disaster_link] #%s 一致性校验(真实位点): %s", link_id, result)
+                       f"链路#{link_id} 一致性校验(同步源探针): {result} "
+                       f"(reachable={probe.get('reachable')}, "
+                       f"last_sync={probe.get('last_sync_status')})")
             return {
                 "ok": True,
                 "link_id": link_id,
                 "result": result,
                 "real": True,
-                "total_rows": 1,
-                "checked_rows": max(1, real["rpo_actual_sec"]),
-                "match_rate": match_rate,
-                "sample_checksum_hit": round(match_rate / 100, 3),
-                "gap_files": real["gap_files"],
-                "gap_bytes": real["gap_bytes"],
-                "src_file": real["src_file"],
-                "end_file": real["end_file"],
-                "daemon_status": daemon,
-                "rpo_actual_sec": real["rpo_actual_sec"],
+                "check_type": "sync_source_probe",
+                "source_reachable": bool(probe.get("reachable")),
+                "probe_msg": probe.get("probe_msg", ""),
+                "last_sync_status": probe.get("last_sync_status"),
+                "last_sync_at": probe.get("last_sync_at"),
                 "checked_at": now,
             }
-        # DEMO：仿真总分核对比例与抽样校验和命中率（无真实位点可用时兜底）
-        total_rows = random.randint(1000, 1_000_000)
-        checked_rows = random.randint(int(total_rows * 0.95), total_rows)
-        match_rate = round(checked_rows / total_rows * 100, 2)
-        sample_checksum_hit = random.uniform(0.90, 1.0)
-        if match_rate >= 99.9 and sample_checksum_hit >= 0.99:
-            result = "pass"
-        elif match_rate >= 98.0 and sample_checksum_hit >= 0.95:
-            result = "warn"
-        else:
-            result = "fail"
-        now = db.now_iso()
-        models.update_disaster_link_check(
-            link_id, consistency_result=result, last_consistency_check=now)
-        if link.get("status") in ("filling", "standby") and result == "pass":
-            models.set_disaster_link_status(link_id, "active")
-        db.add_log("INFO", "disaster_link",
-                   f"链路#{link_id} 一致性校验: {result} "
-                   f"(match={match_rate}%, checksum_hit={sample_checksum_hit:.3f})")
-        self.logger.info("[disaster_link] #%s 一致性校验: %s", link_id, result)
-        return {
-            "ok": True,
-            "link_id": link_id,
-            "result": result,
-            "total_rows": total_rows,
-            "checked_rows": checked_rows,
-            "match_rate": match_rate,
-            "sample_checksum_hit": round(sample_checksum_hit, 3),
-            "checked_at": now,
-        }
+
+        # 3) DEMO_MODE 下允许仿真兜底（明确标注 simulated）
+        if _demo_mode() != "off":
+            return {"ok": False, "simulated": True,
+                    "error": (f"DEMO_MODE={_demo_mode()}：链路未绑定可校验的真实源，"
+                              "一致性检查已不再返回随机模拟数据")}
+
+        # 4) 未绑定源：明确拒绝，不伪造任何数字
+        return {"ok": False, "simulated": False,
+                "error": ("链路未绑定可校验的源（source_kind=rt_task/sync_task），"
+                          "无法执行真实一致性检查；请先在链路中绑定源后重试")}
 
     # ------------------------- 状态概览 -------------------------
     def get_link_status(self, link_id: int) -> dict:

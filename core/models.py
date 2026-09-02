@@ -1234,13 +1234,8 @@ DISASTER_LINK_SOURCE_KINDS = ("sync_task", "rt_task", "manual")
 
 
 def _default_route_policy() -> list:
-    """双运营商专线的默认路由策略（DEMO 仿真兜底）。"""
-    return [
-        {"provider": "联通专线", "endpoint": "10.20.0.1:3306",
-         "priority": 1, "enabled": True, "latency_ms": 12},
-        {"provider": "电信专线", "endpoint": "10.20.0.2:3306",
-         "priority": 2, "enabled": True, "latency_ms": 18},
-    ]
+    """默认路由策略：空列表（由用户按真实专线配置，不再内置演示路由）。"""
+    return []
 
 
 def _dl_json(data: dict, key: str):

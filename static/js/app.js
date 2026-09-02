@@ -2579,8 +2579,16 @@
     if (stype === "manual" && (!data.src_db_type || !data.src_host)) { toast("请填写源数据库类型与主机", "danger"); return; }
     if (!data.tgt_db_type || !data.tgt_host) { toast("请填写目标数据库类型与主机", "danger"); return; }
     try {
-      if (id) { await api("PUT", `/api/sync/tasks/${id}`, data); toast("同步任务已更新"); }
-      else { await api("POST", "/api/sync/tasks", data); toast("同步任务已创建"); }
+      let resp;
+      if (id) { resp = await api("PUT", `/api/sync/tasks/${id}`, data); toast("同步任务已更新"); }
+      else {
+        resp = await api("POST", "/api/sync/tasks", data);
+        toast("同步任务已创建");
+        // 后端对未识别字段的告警（字段名写错会被静默忽略，必须提示）
+        if (resp && resp.warnings && resp.warnings.length) {
+          toast(resp.warnings.join("；"), "warning");
+        }
+      }
       syncModal.hide();
       await loadSyncTasks(); await loadSyncRecords();
     } catch (e) { toast(e.message, "danger"); }

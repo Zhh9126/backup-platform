@@ -183,7 +183,18 @@ def update_task(task_id):
         data["extra_options"] = _secure_ssh_cred(data["extra_options"])
     models.update_task(task_id, data)
     scheduler.reload_scheduler()
-    return jsonify({"ok": True})
+    # 语义明确化：实时保护依赖任务启用。任务停用（enabled=0）时实时捕获
+    # 不会被守护接管（重启后也不会自动拉起），必须提示，避免保护盲区
+    warnings = []
+    try:
+        merged = models.get_task(task_id) or {}
+        if int(merged.get("rt_enabled") or 0) == 1 and not merged.get("enabled"):
+            warnings.append(
+                "任务已停用但开启了实时备份保护：停用状态下实时捕获不会被守护接管"
+                "（重启平台后也不会自动拉起），存在保护盲区；如需实时保护请同时启用任务")
+    except Exception:
+        pass
+    return jsonify({"ok": True, "warnings": warnings})
 
 
 @api_bp.route("/tasks/<int:task_id>", methods=["DELETE"])

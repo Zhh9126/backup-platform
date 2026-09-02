@@ -76,6 +76,29 @@ def create_app() -> Flask:
 
     app.register_blueprint(api_bp)
 
+    # ------------------------- 全局 API 异常处理 -------------------------
+    # 统一把未捕获异常转为 JSON（/api 路径），避免裸 HTML 500；
+    # 唯一约束冲突 → 409，其余 → 500 + 可读信息（含日志），页面路由不受影响。
+    @app.errorhandler(Exception)
+    def _global_error_handler(e):
+        from werkzeug.exceptions import HTTPException
+        if isinstance(e, HTTPException):
+            if request.path.startswith("/api/"):
+                return jsonify({"error": e.description or e.name}), e.code
+            return e
+        try:
+            app.logger.exception("未处理异常 [%s %s]: %s",
+                                 request.method, request.path, e)
+        except Exception:
+            pass
+        msg = str(e) or e.__class__.__name__
+        if e.__class__.__name__ == "IntegrityError" or "UNIQUE constraint" in msg \
+                or "Duplicate entry" in msg:
+            return jsonify({"error": f"数据冲突（记录已存在或唯一字段重复）：{msg[:200]}"}), 409
+        if request.path.startswith("/api/"):
+            return jsonify({"error": f"服务器内部错误: {msg[:300]}"}), 500
+        return jsonify({"error": f"服务器内部错误: {msg[:300]}"}), 500
+
     # ------------------------- 鉴权 -------------------------
     @app.route("/login", methods=["GET", "POST"])
     def login_page():

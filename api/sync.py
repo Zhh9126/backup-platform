@@ -33,6 +33,30 @@ def list_tasks():
 def create_task():
     data = request.get_json(silent=True) or {}
     now = datetime.now().isoformat(timespec="seconds")
+    # 必填校验：避免关键字段缺失时静默创建出不可用任务
+    missing = []
+    for f in ("name", "src_db_type", "src_host", "src_username",
+              "src_password", "src_db_name", "tgt_db_type", "tgt_host",
+              "tgt_username", "tgt_password", "tgt_db_name"):
+        v = data.get(f)
+        if v is None or (isinstance(v, str) and not v.strip()):
+            missing.append(f)
+    if missing:
+        return jsonify({"success": False,
+                        "message": f"缺少必填字段: {', '.join(missing)}"
+                                   "（注意字段名前缀为 src_/tgt_）"}), 400
+    # 未知字段告警：提示调用方字段名可能写错（静默丢弃是可用性陷阱）
+    known = {"name", "source_type", "source_task_id", "src_db_type", "src_host",
+             "src_port", "src_username", "src_password", "src_db_name",
+             "src_schema", "tgt_db_type", "tgt_host", "tgt_port", "tgt_username",
+             "tgt_password", "tgt_db_name", "tgt_schema", "source_table",
+             "target_table", "sync_mode", "save_mode", "field_ide",
+             "incremental_column", "incremental_value", "source_where",
+             "schedule_type", "cron_expr", "interval_minutes",
+             "column_mapping", "source_tables_list", "flink_config",
+             "batch_size", "error_threshold", "enabled", "realtime_enabled",
+             "full_db_migrate", "validate_before_run", "verify_after_run"}
+    unknown = [k for k in data.keys() if k not in known]
     payload = _prepare_payload(data)
     payload["status"] = "never"
     payload["last_status"] = "never"
@@ -41,7 +65,10 @@ def create_task():
     try:
         tid = models.create_sync_task(payload)
         scheduler.reload_scheduler()
-        return jsonify({"success": True, "data": {"id": tid}})
+        resp = {"success": True, "data": {"id": tid}}
+        if unknown:
+            resp["warnings"] = [f"未识别的字段（已忽略，请核对字段名）: {', '.join(unknown)}"]
+        return jsonify(resp)
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 

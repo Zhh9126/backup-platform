@@ -15,6 +15,11 @@ oracledb>=2.0              # Oracle 瘦客户端直连（纯 Python，免装 Ins
 watchdog>=4.0              # 文件事件驱动加速：Linux=inotify / Windows=ReadDirectoryChangesW
                            # 【可选】未安装时自动降级为高频轮询，功能不缺失，仅 RPO 变差
 
+# ---------- 报表导出（Word / PDF，可选）----------
+# 未安装时导出接口返回 400 与明确提示（CSV 不受影响），功能优雅降级
+python-docx>=1.1           # Word(.docx) 报告生成
+reportlab>=4.0             # PDF 报告生成
+
 # ---------- JDBC 兜底通道（可选，默认不安装）----------
 # 仅当原生驱动缺失或服务端不支持直连（如 Oracle 11g 瘦模式）时作为兜底：
 # 需要 jpype1 + jaydebeapi + 本机 JDK/JRE（8+）+ drivers/ 下的驱动 jar。

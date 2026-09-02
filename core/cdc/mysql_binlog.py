@@ -107,6 +107,10 @@ class MySQLBinlogDaemon(CDCDaemon):
 
         cmd = [
             "mysqlbinlog",
+            # --no-defaults 必须最前：屏蔽 /root/.my.cnf 等残留 [client]
+            # password——配置文件优先级高于 MYSQL_PWD 环境变量，会导致
+            # "Access denied"（与 restore_extras 同源问题）
+            "--no-defaults",
             "--read-from-remote-server",
             "--raw",
             "--stop-never",
@@ -146,7 +150,7 @@ class MySQLBinlogDaemon(CDCDaemon):
         if not shutil.which("mysql"):
             return {}
         env = self._auth_env()
-        cmd = ["mysql", "-h", str(self.host), "-P", str(self.port),
+        cmd = ["mysql", "--no-defaults", "-h", str(self.host), "-P", str(self.port),
                "-u", str(self.username), "-N", "-e", "SHOW MASTER STATUS"]
         try:
             out = subprocess.run(cmd, env=env, capture_output=True, text=True,

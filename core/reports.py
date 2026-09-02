@@ -24,6 +24,25 @@ def build_csv(title: str, headers: list, rows: list) -> bytes:
     return buf.getvalue().encode("utf-8-sig")
 
 
+# ----------------- 通用文本清洗 -----------------
+_CTRL_RE = None
+
+def _cell_text(val, max_len: int = 0) -> str:
+    """把任意值转为报告可安全渲染的文本。
+
+    - 剥离 XML/Word 不接受的控制字符（\\x00-\\x08、\\x0b、\\x0c、\\x0e-\\x1f）；
+    - 超长内容按 max_len 截断（报告不是全量日志，过长会撑爆版面）。
+    """
+    global _CTRL_RE
+    if _CTRL_RE is None:
+        import re as _re
+        _CTRL_RE = _re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+    text = _CTRL_RE.sub("", "" if val is None else str(val))
+    if max_len and len(text) > max_len:
+        text = text[:max_len] + "…(截断)"
+    return text
+
+
 # ----------------- Word (.docx) -----------------
 def build_docx(title: str, summary: dict, headers: list, rows: list) -> bytes:
     """生成 Word 报告（含标题/摘要/表格）。"""
@@ -70,7 +89,7 @@ def build_docx(title: str, summary: dict, headers: list, rows: list) -> bytes:
         for ri, row in enumerate(rows, start=1):
             for ci, val in enumerate(row):
                 cell = table.rows[ri].cells[ci]
-                cell.text = "" if val is None else str(val)
+                cell.text = _cell_text(val, max_len=1000)
                 for p in cell.paragraphs:
                     for r in p.runs:
                         r.font.size = Pt(9)
@@ -146,12 +165,14 @@ def build_pdf(title: str, summary: dict, headers: list, rows: list) -> bytes:
     if rows:
         cell_style = ParagraphStyle("td", parent=styles["Normal"], fontSize=8)
         th_style = ParagraphStyle("th", parent=styles["Normal"], fontSize=9, textColor=colors.white)
-        # 数据：首行是表头（teal 底），后续是数据
-        data = [[Paragraph(f"<b>{h}</b>", th_style) for h in headers]]
+        # 数据：首行是表头（teal 底），后续是数据（清洗控制字符 + 截断超长：
+        # PDF 表格单行不可跨页，列窄时长文本会把行高撑过页高导致 LayoutError）
+        data = [[Paragraph(_cell_text(h, 100), th_style) for h in headers]]
         for row in rows:
-            data.append([Paragraph("" if v is None else str(v), cell_style) for v in row])
-        # 自适应列宽：根据表头长度估算
-        col_w = max(2*cm, min(8*cm, 22*cm / len(headers)))
+            data.append([Paragraph(_cell_text(v, 150), cell_style) for v in row])
+        # 自适应列宽：按可用页宽均分（13 列以内可完整容纳，不溢出版面）
+        avail = landscape(A4)[0] - 3*cm  # 横向 A4 减左右页边距
+        col_w = max(1.6*cm, min(8*cm, avail / max(len(headers), 1)))
         t = Table(data, colWidths=[col_w]*len(headers), repeatRows=1)
         t.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0D9488")),
@@ -182,13 +203,28 @@ def build_pdf(title: str, summary: dict, headers: list, rows: list) -> bytes:
 
 # ----------------- 工厂 -----------------
 def build_report(fmt: str, title: str, summary: dict, headers: list, rows: list) -> tuple:
-    """根据 fmt 返回 (mime_type, file_ext, content_bytes)"""
+    """根据 fmt 返回 (mime_type, file_ext, content_bytes)。
+
+    可选依赖缺失时抛 ValueError（API 层转 400 明确提示），不产生 500。
+    """
     fmt = (fmt or "csv").lower()
     if fmt == "csv":
         return ("text/csv; charset=utf-8-sig", "csv", build_csv(title, headers, rows))
     if fmt in ("docx", "word"):
+        try:
+            content = build_docx(title, summary, headers, rows)
+        except ImportError:
+            raise ValueError(
+                "Word 导出依赖 python-docx 未安装：请在平台环境执行 "
+                "`pip install python-docx` 后重试（CSV 导出不受影响）")
         return ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                "docx", build_docx(title, summary, headers, rows))
+                "docx", content)
     if fmt == "pdf":
-        return ("application/pdf", "pdf", build_pdf(title, summary, headers, rows))
+        try:
+            content = build_pdf(title, summary, headers, rows)
+        except ImportError:
+            raise ValueError(
+                "PDF 导出依赖 reportlab 未安装：请在平台环境执行 "
+                "`pip install reportlab` 后重试（CSV 导出不受影响）")
+        return ("application/pdf", "pdf", content)
     raise ValueError(f"不支持的格式: {fmt}")

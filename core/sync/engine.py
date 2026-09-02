@@ -12,6 +12,7 @@
 """
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -758,10 +759,52 @@ def run_sync_task(task_id: int, progress_callback=None) -> Dict[str, Any]:
     return run_sync_task_with_task(task, progress_callback=progress_callback)
 
 
+def _ensure_target_database(cfg: SyncConfig) -> Dict[str, Any]:
+    """目标库预检/自动建库（MySQL/MariaDB 目标）。
+
+    目标库不存在时自动 CREATE DATABASE（utf8mb4），消除
+    "Unknown database" 同步失败；其他库类型仅预检提示（不自动建）。
+    """
+    db_type = (cfg.tgt_db_type or "").lower()
+    if db_type not in ("mysql", "mariadb"):
+        return {"created": False,
+                "message": f"目标类型 {db_type or '?'} 不自动建库，请确认目标库已存在"}
+    if not cfg.tgt_db_name:
+        return {"created": False, "message": "未配置目标库名"}
+    try:
+        import pymysql
+        conn = pymysql.connect(
+            host=cfg.tgt_host, port=int(cfg.tgt_port or 3306),
+            user=cfg.tgt_username, password=cfg.tgt_password or "",
+            connect_timeout=5, charset="utf8mb4")
+    except Exception as e:
+        return {"created": False, "message": f"目标实例连接失败: {e}"}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SHOW DATABASES LIKE %s", (cfg.tgt_db_name,))
+            if cur.fetchone():
+                return {"created": False, "message": "目标库已存在"}
+            if not re.match(r"^[A-Za-z0-9_$]+$", cfg.tgt_db_name):
+                return {"created": False, "message": "目标库名含特殊字符，请手工建库"}
+            cur.execute(f"CREATE DATABASE `{cfg.tgt_db_name}` CHARACTER SET utf8mb4")
+            conn.commit()
+            logger.info("[sync] 目标库 %s 不存在，已自动创建", cfg.tgt_db_name)
+            return {"created": True, "message": f"目标库 {cfg.tgt_db_name} 已自动创建"}
+    except Exception as e:
+        return {"created": False, "message": f"目标库预检/建库失败: {e}"}
+    finally:
+        conn.close()
+
+
 def run_sync_task_with_task(task: Dict[str, Any], progress_callback=None) -> Dict[str, Any]:
     """使用已获取 task dict 直接执行同步（含 pre-validate / post-verify）。"""
     cfg = _task_to_config(task)
     engine = SyncEngine(cfg)
+
+    # 目标库预检/自动建库（MySQL/MariaDB 目标）
+    ensure = _ensure_target_database(cfg)
+    if ensure.get("message"):
+        logger.info("[sync] task #%d 目标库预检: %s", cfg.task_id, ensure["message"])
 
     # pre-validate（可选）
     if cfg.validate_before_run:

@@ -3992,7 +3992,7 @@
       else if (page === "settings") await initSettings();
       else if (page === "storage") await initStorage();
       else if (page === "protection") await initProtection();
-      else if (page === "migration") await initMigration();
+      else if (page === "migration") { await initMigration(); await initDbMigrate(); }
       else if (page === "clone") await initClone();
       else if (page === "dr-link") await initDrLink();
       else if (page === "alert") await initAlert();
@@ -5241,6 +5241,194 @@
     $("migrationSaveBtn").addEventListener("click", window.saveMigration);
 
     await loadMigrations();
+  }
+
+  // ======================= 一站式数据迁移计划（DTS 对标） =======================
+  async function initDbMigrate() {
+    const dmModalEl = document.getElementById("dbMigrateModal");
+    const dmModalInst = dmModalEl ? new bootstrap.Modal(dmModalEl) : null;
+    const dmDetailEl = document.getElementById("dbMigrateDetailModal");
+    const dmDetailInst = dmDetailEl ? new bootstrap.Modal(dmDetailEl) : null;
+
+    function statusBadgeDbMigrate(s) {
+      const m = {
+        created: ["bg-secondary", "已创建"],
+        checking: ["badge-run", "预检查中"],
+        migrating: ["badge-run", "迁移中"],
+        verifying: ["badge-run", "校验中"],
+        completed: ["badge-ok", "已完成"],
+        failed: ["badge-fail", "失败"],
+      };
+      const pair = m[s] || ["bg-secondary", s || "-"];
+      return '<span class="badge ' + pair[0] + '">' + pair[1] + '</span>';
+    }
+
+    function phaseChips(phases, types) {
+      const order = ["precheck", "migrate", "verify"];
+      const names = { precheck: "预检查", migrate: "结构+全量", verify: "数据校验" };
+      return order.map(function (ph) {
+        if ((types || []).indexOf(ph === "migrate" ? (ph === "migrate" && types.indexOf("structure") >= 0 ? "structure" : "full") : ph) < 0
+            && !(ph === "migrate" && (types || []).indexOf("full") >= 0)
+            && !(ph === "migrate" && (types || []).indexOf("structure") >= 0)
+            && !(ph === "verify" && (types || []).indexOf("verify") >= 0)
+            && !(ph === "precheck")) return "";
+        const p = (phases || {})[ph];
+        const ok = p && p.ok;
+        const cls = !p ? "bg-secondary" : (ok ? "badge-ok" : "badge-fail");
+        return '<span class="badge ' + cls + '" style="margin-right:4px">' + names[ph] + '</span>';
+      }).join("");
+    }
+
+    window.loadDbMigrations = async function () {
+      const rows = await api("GET", "/api/db-migrate");
+      let running = false;
+      $("dbMigrateTable").innerHTML = (rows || []).map(function (p) {
+        if (["checking", "migrating", "verifying"].indexOf(p.status) >= 0) running = true;
+        const link = '<span class="badge bg-info">' + esc(p.src_db_type) + '</span> ' +
+          esc(p.src_host + ':' + (p.src_port || '-') + '/' + p.src_db_name) +
+          ' <i class="bi bi-arrow-right"></i> ' +
+          '<span class="badge bg-success">' + esc(p.tgt_db_type) + '</span> ' +
+          esc(p.tgt_host + ':' + (p.tgt_port || '-') + '/' + p.tgt_db_name);
+        const types = (p.migrate_types || []).map(function (t) {
+          return { structure: "结构", full: "全量", verify: "校验" }[t] || t;
+        }).join("+");
+        const detail = '<button class="btn btn-sm btn-outline-primary" onclick="showDbMigrateDetail(' + p.id + ')">' +
+          '<i class="bi bi-card-list"></i> 详情/报告</button> ';
+        const rerun = '<button class="btn btn-sm btn-outline-secondary" onclick="rerunDbMigrate(' + p.id + ')">' +
+          '<i class="bi bi-arrow-repeat"></i> 重新执行</button> ';
+        const del = '<button class="btn btn-sm btn-outline-danger" onclick="deleteDbMigrate(' + p.id + ')">' +
+          '<i class="bi bi-trash"></i> 删除</button>';
+        return '<tr>' +
+          '<td>' + p.id + '</td>' +
+          '<td>' + esc(p.name) + '</td>' +
+          '<td style="max-width:380px">' + link + '</td>' +
+          '<td>' + esc(types) + '</td>' +
+          '<td>' + statusBadgeDbMigrate(p.status) + '</td>' +
+          '<td>' + esc(p.current_phase || '-') + '</td>' +
+          '<td>' + phaseChips(p.phases_json, p.migrate_types) + '</td>' +
+          '<td class="text-end">' + detail + rerun + del + '</td>' +
+        '</tr>';
+      }).join("") || '<tr><td colspan="8" class="text-muted text-center">暂无迁移计划</td></tr>';
+      if (running) {
+        clearTimeout(loadDbMigrations._timer);
+        loadDbMigrations._timer = setTimeout(function () {
+          if (document.getElementById("dbMigrateTable")) loadDbMigrations();
+        }, 3000);
+      }
+    };
+
+    window.showDbMigrateDetail = async function (id) {
+      try {
+        const p = await api("GET", "/api/db-migrate/" + id);
+        const phases = p.phases_json || {};
+        let html = '<div class="mb-2"><span class="badge bg-info">' + esc(p.src_db_type) + '</span> ' +
+          esc(p.src_host + ':' + (p.src_port || '-') + '/' + p.src_db_name) +
+          ' <i class="bi bi-arrow-right"></i> ' +
+          '<span class="badge bg-success">' + esc(p.tgt_db_type) + '</span> ' +
+          esc(p.tgt_host + ':' + (p.tgt_port || '-') + '/' + p.tgt_db_name) +
+          '　' + statusBadgeDbMigrate(p.status) + '</div>';
+        if (p.error_msg) {
+          html += '<div class="alert alert-danger py-2 small">' + esc(p.error_msg) + '</div>';
+        }
+        const names = { precheck: "① 预检查", migrate: "② 结构迁移 + 全量迁移", verify: "③ 数据校验" };
+        ["precheck", "migrate", "verify"].forEach(function (ph) {
+          const d = phases[ph];
+          if (!d) return;
+          html += '<div class="border rounded p-2 mb-2 small">' +
+            '<div class="fw-bold mb-1">' + names[ph] + ' ' +
+            '<span class="badge ' + (d.ok ? 'badge-ok' : 'badge-fail') + '">' + (d.ok ? '通过' : '失败') + '</span></div>';
+          if (ph === "precheck") {
+            (d.checks || []).forEach(function (c) {
+              html += '<div>' + (c.ok ? '✅' : '❌') + ' ' + esc(c.item) + '：' + esc(c.message || '') + '</div>';
+            });
+            html += '<div>源对象统计：表 ' + (d.source_tables || 0) + ' 张 / 约 ' + (d.source_rows || 0) + ' 行</div>';
+          } else if (ph === "migrate") {
+            html += '<div>结构迁移：' + esc(d.structure || '-') + '</div>' +
+              '<div>读取 ' + (d.total_read || 0) + ' 行 / 写入 ' + (d.total_write || 0) + ' 行，耗时 ' + (d.duration_sec || 0) + 's</div>' +
+              '<div class="text-muted">' + esc(d.message || '') + '</div>';
+          } else if (ph === "verify") {
+            html += '<div>' + esc(d.message || '') + '（一致 ' + (d.tables_matched || 0) + '/' + (d.tables_total || 0) + ' 张）</div>';
+            (d.tables || []).forEach(function (t) {
+              html += '<div>' + (t.match ? '✅' : '❌') + ' ' + esc(t.table) + '：源 ' + t.source_rows + ' 行 / 目标 ' + t.target_rows + ' 行</div>';
+            });
+          } else if (ph === "report") {
+            html += '<div>迁移耗时 ' + (d.duration_sec || 0) + 's，完成于 ' + esc(d.generated_at || '') + '</div>';
+          }
+          html += '</div>';
+        });
+        if (!Object.keys(phases).length) html += '<div class="text-muted">尚未执行</div>';
+        $("dbMigrateDetailBody").innerHTML = html;
+        if (dmDetailInst) dmDetailInst.show();
+      } catch (e) { toast(e.message, "danger"); }
+    };
+
+    window.rerunDbMigrate = async function (id) {
+      try {
+        await api("POST", "/api/db-migrate/" + id + "/run");
+        toast("迁移计划已重新执行", "success");
+        await loadDbMigrations();
+      } catch (e) { toast(e.message, "danger"); }
+    };
+
+    window.deleteDbMigrate = async function (id) {
+      const ok = await confirmDialog({ title: "删除迁移计划", message: "确认删除该迁移计划？", confirmText: "删除", danger: true });
+      if (!ok) return;
+      try {
+        await api("DELETE", "/api/db-migrate/" + id);
+        toast("已删除", "success");
+        await loadDbMigrations();
+      } catch (e) { toast(e.message, "danger"); }
+    };
+
+    window.openDbMigrateModal = function () {
+      $("dm_name").value = "";
+      $("dm_src_host").value = ""; $("dm_src_port").value = 3306;
+      $("dm_src_username").value = "root"; $("dm_src_password").value = "";
+      $("dm_src_db_name").value = "";
+      $("dm_tgt_host").value = ""; $("dm_tgt_port").value = 3306;
+      $("dm_tgt_username").value = "root"; $("dm_tgt_password").value = "";
+      $("dm_tgt_db_name").value = "";
+      $("dm_note").value = "";
+      ["dm_t_structure", "dm_t_full", "dm_t_verify"].forEach(function (id) { $("#" + id).checked = true; });
+      if (dmModalInst) dmModalInst.show();
+    };
+
+    window.saveDbMigrate = async function () {
+      const payload = {
+        name: $("dm_name").value.trim(),
+        src_db_type: $("dm_src_db_type").value,
+        src_host: $("dm_src_host").value.trim(),
+        src_port: Number($("dm_src_port").value) || 0,
+        src_username: $("dm_src_username").value.trim(),
+        src_password: $("dm_src_password").value,
+        src_db_name: $("dm_src_db_name").value.trim(),
+        tgt_db_type: $("dm_tgt_db_type").value,
+        tgt_host: $("dm_tgt_host").value.trim(),
+        tgt_port: Number($("dm_tgt_port").value) || 0,
+        tgt_username: $("dm_tgt_username").value.trim(),
+        tgt_password: $("dm_tgt_password").value,
+        tgt_db_name: $("dm_tgt_db_name").value.trim(),
+        migrate_types: [],
+        note: $("dm_note").value.trim(),
+      };
+      if ($("dm_t_structure").checked) payload.migrate_types.push("structure");
+      if ($("dm_t_full").checked) payload.migrate_types.push("full");
+      if ($("dm_t_verify").checked) payload.migrate_types.push("verify");
+      if (!payload.name) { toast("请填写计划名称", "warning"); return; }
+      if (!payload.src_host || !payload.src_db_name) { toast("请填写源端主机与数据库", "warning"); return; }
+      if (!payload.tgt_host || !payload.tgt_db_name) { toast("请填写目标端主机与数据库", "warning"); return; }
+      try {
+        await api("POST", "/api/db-migrate", payload);
+        toast("迁移计划已创建并开始执行", "success");
+        if (dmModalInst) dmModalInst.hide();
+        await loadDbMigrations();
+      } catch (e) { toast(e.message, "danger"); }
+    };
+
+    $("newDbMigrateBtn").addEventListener("click", window.openDbMigrateModal);
+    $("dbMigrateSaveBtn").addEventListener("click", window.saveDbMigrate);
+
+    await loadDbMigrations();
   }
 
   // ======================= 克隆服务（Phase 2） =======================

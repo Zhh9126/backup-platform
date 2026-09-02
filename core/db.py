@@ -483,6 +483,34 @@ CREATE TABLE IF NOT EXISTS migration_plans (
     updated_at               TEXT
 );
 
+-- 一站式数据迁移计划（DTS 对标：预检查 → 结构迁移 → 全量迁移 → 数据校验 → 报告）
+CREATE TABLE IF NOT EXISTS db_migration_plans (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL,
+    src_db_type    TEXT NOT NULL,
+    src_host       TEXT NOT NULL,
+    src_port       INTEGER,
+    src_username   TEXT,
+    src_password   TEXT,                     -- 加密存储
+    src_db_name    TEXT NOT NULL,
+    tgt_db_type    TEXT NOT NULL,
+    tgt_host       TEXT NOT NULL,
+    tgt_port       INTEGER,
+    tgt_username   TEXT,
+    tgt_password   TEXT,                     -- 加密存储
+    tgt_db_name    TEXT NOT NULL,
+    -- 迁移内容开关：structure(结构) / full(全量) / verify(校验)，JSON 数组
+    migrate_types  TEXT DEFAULT '["structure","full","verify"]',
+    status         TEXT DEFAULT 'created',   -- created|checking|migrating|verifying|completed|failed
+    current_phase  TEXT,                     -- 当前阶段名
+    phases_json    TEXT,                     -- 各阶段结果明细（JSON）
+    error_msg      TEXT,                     -- 失败原因
+    note           TEXT,
+    created_at     TEXT,
+    updated_at     TEXT,
+    finished_at    TEXT
+);
+
 CREATE TABLE IF NOT EXISTS clone_requests (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     source_record_id INTEGER,                         -- 克隆源备份记录

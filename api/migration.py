@@ -74,3 +74,61 @@ def api_verify_migration(plan_id):
         return jsonify({"error": "迁移计划不存在"}), 404
     result = _engine.verify_golden(plan_id)
     return jsonify(result)
+
+
+# ======================================================================
+# 一站式数据迁移计划（DTS 对标：预检查 → 结构/全量迁移 → 校验 → 报告）
+# ======================================================================
+from core import db_migrate as _db_migrate_mod
+
+_migrate_engine = _db_migrate_mod.engine
+
+
+@api_bp.route("/db-migrate", methods=["GET"])
+@login_required
+def api_list_db_migrate():
+    return jsonify(_migrate_engine.list_plans())
+
+
+@api_bp.route("/db-migrate", methods=["POST"])
+@login_required
+def api_create_db_migrate():
+    data = request.get_json(silent=True) or {}
+    try:
+        pid = _migrate_engine.create_plan(data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"创建失败: {e}"}), 500
+    # 创建即执行（业界 DTS 习惯：任务建好后立刻进入预检查）
+    run_info = _migrate_engine.run_plan(pid)
+    return jsonify({"id": pid, "ok": True, "run": run_info}), 201
+
+
+@api_bp.route("/db-migrate/<int:plan_id>", methods=["GET"])
+@login_required
+def api_get_db_migrate(plan_id):
+    plan = _migrate_engine.get_plan(plan_id)
+    if not plan:
+        return jsonify({"error": "迁移计划不存在"}), 404
+    return jsonify(plan)
+
+
+@api_bp.route("/db-migrate/<int:plan_id>", methods=["DELETE"])
+@login_required
+def api_delete_db_migrate(plan_id):
+    try:
+        ok = _migrate_engine.delete_plan(plan_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "deleted": ok})
+
+
+@api_bp.route("/db-migrate/<int:plan_id>/run", methods=["POST"])
+@login_required
+def api_run_db_migrate(plan_id):
+    try:
+        result = _migrate_engine.run_plan(plan_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    return jsonify(result)

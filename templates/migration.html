@@ -3,10 +3,138 @@
 <div class="toolbar">
   <div>
     <div class="page-title">数据迁移</div>
-    <div class="page-sub">数据迁移全流程保护：黄金回退点 + 恢复验证 / 高频增量 / 重心切换与旧库保留</div>
+    <div class="page-sub">一站式迁移链路：预检查 → 结构迁移 → 全量迁移 → 数据校验 → 迁移报告（增量/不停机由「数据同步」承接）</div>
   </div>
-  <button class="btn btn-primary" id="newMigrationBtn"><i class="bi bi-plus-lg"></i> 新建迁移计划</button>
-  <button class="btn btn-outline-secondary btn-sm" onclick="loadMigrations()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+  <button class="btn btn-primary" id="newDbMigrateBtn"><i class="bi bi-plus-lg"></i> 新建迁移计划</button>
+  <button class="btn btn-outline-secondary btn-sm" onclick="loadDbMigrations(); loadMigrations()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+</div>
+
+<div class="page-card">
+  <div class="px-3 pt-3 d-flex align-items-center">
+    <i class="bi bi-arrow-left-right text-primary me-2"></i>
+    <span class="fw-bold">迁移计划（对标 DTS：结构 + 全量 + 校验 一站式）</span>
+  </div>
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>名称</th><th>链路</th><th>迁移内容</th>
+        <th>状态</th><th>阶段</th><th>明细</th>
+        <th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="dbMigrateTable"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 新建迁移计划 模态框 -->
+<div class="modal fade" id="dbMigrateModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">新建迁移计划（预检查 → 结构 → 全量 → 校验）</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label class="form-label">计划名称 *</label>
+          <input class="form-control" id="dm_name" placeholder="如：OA 系统 MySQL 133 → 140 迁移">
+        </div>
+        <div class="row g-2">
+          <div class="col-md-6 border-end">
+            <div class="fw-bold mb-2 text-primary">源端（生产库）</div>
+            <div class="mb-2">
+              <label class="form-label small">类型</label>
+              <select class="form-select form-select-sm" id="dm_src_db_type">
+                <option value="mysql">MySQL / MariaDB</option>
+                <option value="postgresql">PostgreSQL</option>
+              </select>
+            </div>
+            <div class="row g-2">
+              <div class="col-7"><label class="form-label small">主机 *</label>
+                <input class="form-control form-control-sm" id="dm_src_host" placeholder="IP"></div>
+              <div class="col-5"><label class="form-label small">端口</label>
+                <input type="number" class="form-control form-control-sm" id="dm_src_port" placeholder="3306"></div>
+            </div>
+            <div class="row g-2 mt-1">
+              <div class="col-4"><label class="form-label small">用户名</label>
+                <input class="form-control form-control-sm" id="dm_src_username" value="root"></div>
+              <div class="col-8"><label class="form-label small">密码</label>
+                <input type="password" class="form-control form-control-sm" id="dm_src_password"></div>
+            </div>
+            <div class="mt-2"><label class="form-label small">数据库 *</label>
+              <input class="form-control form-control-sm" id="dm_src_db_name" placeholder="如 bpm1"></div>
+          </div>
+          <div class="col-md-6">
+            <div class="fw-bold mb-2 text-success">目标端（新库）</div>
+            <div class="mb-2">
+              <label class="form-label small">类型</label>
+              <select class="form-select form-select-sm" id="dm_tgt_db_type">
+                <option value="mysql">MySQL / MariaDB</option>
+                <option value="postgresql">PostgreSQL</option>
+              </select>
+            </div>
+            <div class="row g-2">
+              <div class="col-7"><label class="form-label small">主机 *</label>
+                <input class="form-control form-control-sm" id="dm_tgt_host" placeholder="IP"></div>
+              <div class="col-5"><label class="form-label small">端口</label>
+                <input type="number" class="form-control form-control-sm" id="dm_tgt_port" placeholder="3306"></div>
+            </div>
+            <div class="row g-2 mt-1">
+              <div class="col-4"><label class="form-label small">用户名</label>
+                <input class="form-control form-control-sm" id="dm_tgt_username" value="root"></div>
+              <div class="col-8"><label class="form-label small">密码</label>
+                <input type="password" class="form-control form-control-sm" id="dm_tgt_password"></div>
+            </div>
+            <div class="mt-2"><label class="form-label small">数据库 *（MySQL 不存在将自动创建）</label>
+              <input class="form-control form-control-sm" id="dm_tgt_db_name" placeholder="如 bpm1_new"></div>
+          </div>
+        </div>
+        <div class="mt-3">
+          <label class="form-label">迁移内容</label>
+          <div class="d-flex gap-3">
+            <div class="form-check"><input class="form-check-input" type="checkbox" id="dm_t_structure" checked>
+              <label class="form-check-label" for="dm_t_structure">结构迁移（按源端 schema 重建表）</label></div>
+            <div class="form-check"><input class="form-check-input" type="checkbox" id="dm_t_full" checked>
+              <label class="form-check-label" for="dm_t_full">全量数据迁移</label></div>
+            <div class="form-check"><input class="form-check-input" type="checkbox" id="dm_t_verify" checked>
+              <label class="form-check-label" for="dm_t_verify">数据校验（逐表行数比对）</label></div>
+          </div>
+          <div class="form-text">提交后立即执行：预检查 → 所选阶段顺序编排，进度与报告实时展示；增量/不停机由「数据同步」realtime 模式承接。</div>
+        </div>
+        <div class="mt-2"><label class="form-label">备注</label>
+          <input class="form-control" id="dm_note" placeholder="迁移原因 / 时间窗口等"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="dbMigrateSaveBtn"><i class="bi bi-play-fill"></i> 创建并执行</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 迁移报告/详情 模态框 -->
+<div class="modal fade" id="dbMigrateDetailModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">迁移计划详情与报告</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body" id="dbMigrateDetailBody"></div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<hr class="mt-4">
+<div class="toolbar">
+  <div>
+    <div class="page-title" style="font-size:1.05rem">迁移全流程保护（迁移期间备份接管）</div>
+    <div class="page-sub">黄金回退点 + 恢复验证 / 高频增量 / 重心切换与旧库保留</div>
+  </div>
+  <button class="btn btn-outline-primary btn-sm" id="newMigrationBtn"><i class="bi bi-plus-lg"></i> 新建迁移保护计划</button>
 </div>
 
 <div class="page-card">
@@ -22,12 +150,12 @@
   </div>
 </div>
 
-<!-- 新建迁移计划 模态框 -->
+<!-- 新建迁移保护计划 模态框 -->
 <div class="modal fade" id="migrationModal" tabindex="-1">
   <div class="modal-dialog">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title">新建迁移计划</h5>
+        <h5 class="modal-title">新建迁移保护计划</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
       </div>
       <div class="modal-body">

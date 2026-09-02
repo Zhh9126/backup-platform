@@ -99,9 +99,11 @@ def _probe_mysql(h, p, u, pw, db_name, t):
     env = os.environ.copy()
     if pw:
         env["MYSQL_PWD"] = pw
+    # --no-defaults 屏蔽 /root/.my.cnf 等残留 [client] password——
+    # 配置文件优先级高于 MYSQL_PWD，会导致用错密码连接（Access denied）
     rc, out, err = _run(
-        ["mysql", "-h", h, "-P", str(p), "-u", u, "--connect-timeout",
-         str(t), "-e", "SELECT 1"], env, t + 5)
+        ["mysql", "--no-defaults", "-h", h, "-P", str(p), "-u", u,
+         "--connect-timeout", str(t), "-e", "SELECT 1"], env, t + 5)
     return (rc == 0, "MySQL 连接正常" if rc == 0 else (err.strip() or "连接失败"))
 
 

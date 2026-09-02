@@ -1102,10 +1102,13 @@ def get_clone_request(request_id: int) -> Optional[dict]:
 def list_clone_requests() -> list:
     rows = db.query(
         "SELECT cr.*, br.db_type AS source_db_type, br.task_id AS source_task_id, "
-        "t.name AS task_name "
+        "t.name AS task_name, "
+        "v.host AS vdb_host, v.port AS vdb_port, v.database_name AS vdb_dbname, "
+        "v.status AS vdb_status, v.username AS vdb_username "
         "FROM clone_requests cr "
         "LEFT JOIN backup_records br ON br.id = cr.source_record_id "
         "LEFT JOIN backup_tasks t ON t.id = br.task_id "
+        "LEFT JOIN vdb_instances v ON v.id = cr.vdb_instance_id "
         "ORDER BY cr.id DESC")
     return rows
 

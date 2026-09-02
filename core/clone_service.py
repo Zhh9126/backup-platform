@@ -16,6 +16,7 @@
 VDB 实例，保证无真实数据库客户端也能跑通自测闭环。
 """
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -34,12 +35,14 @@ STATUS_APPROVED = "approved"
 STATUS_REJECTED = "rejected"
 STATUS_CREATING = "creating"
 STATUS_READY = "ready"
+STATUS_FAILED = "failed"
 STATUS_EXPIRED = "expired"
 STATUS_DELETED = "deleted"
 
-# 触发底层克隆引擎的 db_type 映射；其余类型在 DEMO 下统一仿真
+# 触发底层克隆引擎的 db_type 映射；其余类型明确不支持（不仿真）
 _CLONE_ENGINE = {
     "mysql": "mysql_clone_to_test",
+    "mariadb": "mysql_clone_to_test",
     "postgresql": "pg_clone_to_test",
 }
 
@@ -66,11 +69,14 @@ class CloneService:
     def request_clone(self, source_record_id: int, target_env: str,
                       requested_by: str, note: str = "",
                       itsm_system: str = None) -> dict:
-        """提交一次克隆申请。
+        """提交克隆申请。
 
+        免审批直通（默认，业界 VDB 标准打法，借鉴 Delphix/Neon）：
         1) 建 clone_request(pending)
-        2) 建 itsm_ticket（按 system 选择适配器，默认 internal）
-        3) 调用 ITSM 适配层发起审批
+        2) 立即后台异步拉起 VDB（creating → ready/failed），不阻塞 API
+        3) ITSM 工单仅在显式指定 itsm_system 时创建（可选审计留痕）
+
+        itsm 模式（CLONE_AUTO_APPROVE=false）：走原审批流。
         """
         rec = models.get_record(source_record_id)
         if not rec:
@@ -87,18 +93,58 @@ class CloneService:
             "requested_by": requested_by,
             "note": note,
         })
-        # 关联 ITSM 工单（默认 internal；可插拔 dingtalk/servicenow）
-        adapter = get_itsm_adapter(itsm_system)
-        ticket = adapter.create_ticket("clone", req_id, {
-            "source_record_id": source_record_id,
-            "target_env": target_env,
-            "requested_by": requested_by,
-            "note": note,
-        })
-        models.update_clone_request(req_id, {"itsm_ticket_id": ticket["id"]})
-        self.logger.info("[clone] 申请 #%s 已提交（env=%s, by=%s, itsm=%s/#%s）",
-                         req_id, target_env, requested_by, adapter.system, ticket["id"])
+        # ITSM 工单：仅显式指定适配器时创建（可选审计留痕，不阻塞克隆）
+        if itsm_system:
+            adapter = get_itsm_adapter(itsm_system)
+            ticket = adapter.create_ticket("clone", req_id, {
+                "source_record_id": source_record_id,
+                "target_env": target_env,
+                "requested_by": requested_by,
+                "note": note,
+            })
+            models.update_clone_request(req_id, {"itsm_ticket_id": ticket["id"]})
+
+        if config.CLONE_AUTO_APPROVE:
+            self.logger.info("[clone] 申请 #%s 已提交，免审批直通拉起（env=%s, by=%s）",
+                             req_id, target_env, requested_by)
+            self._provision_async(req_id)
+        else:
+            self.logger.info("[clone] 申请 #%s 已提交，等待审批（env=%s, by=%s）",
+                             req_id, target_env, requested_by)
         return self.get_clone(req_id)
+
+    def _provision_async(self, request_id: int) -> None:
+        """后台线程拉起 VDB：creating → ready / failed（失败原因写入 note）。"""
+        import threading
+
+        def _run() -> None:
+            try:
+                req = self.get_clone(request_id)
+                if not req:
+                    return
+                models.update_clone_request(request_id, {"status": STATUS_CREATING})
+                self.logger.info("[clone] 请求 #%s 开始拉起 VDB", request_id)
+                vdb_id = self._launch_vdb(req)
+                ttl = _default_ttl_days()
+                expires = _compute_expires(ttl)
+                models.update_clone_request(request_id, {
+                    "status": STATUS_READY,
+                    "vdb_instance_id": vdb_id,
+                    "expires_at": expires,
+                })
+                self.logger.info("[clone] 请求 #%s VDB #%s 已就绪，到期 %s",
+                                 request_id, vdb_id, expires)
+            except Exception as exc:
+                self.logger.error("[clone] 请求 #%s 拉起失败: %s", request_id, exc)
+                cur = self.get_clone(request_id) or {}
+                note = (cur.get("note") or "").strip()
+                models.update_clone_request(request_id, {
+                    "status": STATUS_FAILED,
+                    "note": (note + "\n" if note else "") + f"拉起失败: {exc}"[:480],
+                })
+
+        threading.Thread(target=_run, daemon=True,
+                         name=f"clone-provision-{request_id}").start()
 
     # ------------------------- 审批 -------------------------
     def approve_clone(self, request_id: int, approved_by: str = "admin") -> dict:
@@ -201,36 +247,44 @@ class CloneService:
 
     # ------------------------- 内部：拉起 / 释放 VDB -------------------------
     def _launch_vdb(self, req: dict) -> int:
-        """按源库类型调用底层克隆函数（或 DEMO 仿真），并登记 VDB 实例。"""
+        """按源库类型调用底层真实克隆引擎，并登记 VDB 实例。
+
+        真实引擎：mysql / mariadb（本机管理实例建库 + 流式导入）
+                 postgresql（本机管理实例建库 + 导入）
+        其余类型明确抛错（不降级仿真，避免"假克隆"）；
+        仅 DEMO_MODE != off 时才允许仿真兜底且在 VDB note 中明确标注。
+        """
         rec = models.get_record(req["source_record_id"]) or {}
         db_type = rec.get("db_type") or "mysql"
         instance_name = f"clone_{req['id']}"
         backup_path = rec.get("backup_path") or ""
+        if not backup_path or not os.path.isfile(backup_path):
+            raise RuntimeError(f"备份产物不存在: {backup_path or '-'}")
 
-        # DEMO 仿真：DEMO_MODE != off 时直接仿真成功，避免依赖真实客户端
         simulated = config.DEMO_MODE != "off"
         if not simulated:
-            # 源任务密码：注入克隆目标连接（克隆库通常在本机管理实例）
+            engine_name = _CLONE_ENGINE.get(db_type)
+            if not engine_name:
+                raise RuntimeError(
+                    f"db_type={db_type} 暂不支持真实克隆"
+                    "（当前支持 mysql/mariadb/postgresql；其余类型请先确认克隆目标方案）")
+            # 源任务密码：注入克隆目标连接（克隆库在本机管理实例）
             src_task = models.get_task(rec.get("task_id"), include_secret=True) or {}
             src_password = src_task.get("password") or ""
-            try:
-                if db_type == "mysql":
-                    res = restore_extras.mysql_clone_to_test(
-                        backup_path, instance_name, mysql_password=src_password)
-                elif db_type == "postgresql":
-                    res = restore_extras.pg_clone_to_test(
-                        backup_path, instance_name, pg_password=src_password)
-                else:
-                    res = {"ok": False, "message": f"db_type={db_type} 暂不支持真实克隆"}
-                if not res.get("ok"):
-                    self.logger.warning("[clone] 真实克隆失败，降级仿真: %s", res.get("message"))
-                    simulated = True
-            except Exception as e:
-                self.logger.warning("[clone] 真实克隆异常，降级仿真: %s", e)
-                simulated = True
+            fn = getattr(restore_extras, engine_name)
+            if engine_name == "pg_clone_to_test":
+                res = restore_extras.pg_clone_to_test(
+                    backup_path, instance_name, pg_password=src_password)
+            else:
+                res = restore_extras.mysql_clone_to_test(
+                    backup_path, instance_name, mysql_password=src_password)
+            if not res.get("ok"):
+                raise RuntimeError(f"真实克隆失败: {res.get('message')}")
 
-        port = 3306 if db_type == "mysql" else (5432 if db_type == "postgresql" else 0)
-        user = "root" if db_type == "mysql" else ("postgres" if db_type == "postgresql" else "")
+        port = 3306 if db_type in ("mysql", "mariadb") else (
+            5432 if db_type == "postgresql" else 0)
+        user = "root" if db_type in ("mysql", "mariadb") else (
+            "postgres" if db_type == "postgresql" else "")
         vdb_id = models.create_vdb({
             "name": instance_name,
             "source_record_id": req["source_record_id"],

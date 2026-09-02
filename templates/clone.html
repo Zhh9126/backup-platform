@@ -3,9 +3,9 @@
 <div class="toolbar">
   <div>
     <div class="page-title">克隆服务</div>
-    <div class="page-sub">标准化克隆：申请 → ITSM 审批 → 拉起 VDB → 生命周期 → 自动销毁</div>
+    <div class="page-sub">自助克隆：申请 → 自动拉起（免审批直通）→ 生命周期 → 自动销毁；ITSM 审批可插拔开启</div>
   </div>
-  <button class="btn btn-primary" id="newCloneBtn"><i class="bi bi-plus-lg"></i> 申请克隆</button>
+  <button class="btn btn-primary" id="newCloneBtn"><i class="bi bi-plus-lg"></i> 立即克隆</button>
   <button class="btn btn-outline-secondary btn-sm" onclick="loadClones()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
 </div>
 
@@ -27,14 +27,14 @@
   <div class="modal-dialog">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title">申请克隆</h5>
+        <h5 class="modal-title">立即克隆（免审批直通）</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
       </div>
       <div class="modal-body">
         <div class="mb-3">
           <label class="form-label">源备份记录 *</label>
           <select class="form-select" id="c_source_record_id"></select>
-          <div class="form-text">选择一个已生成的备份记录作为克隆源（将从中拉起隔离测试库）。</div>
+          <div class="form-text">选择一个已生成的备份记录作为克隆源。提交后平台<b>免审批异步拉起</b>隔离克隆库（真实导入），就绪后此处展示连接串。</div>
         </div>
         <div class="mb-3">
           <label class="form-label">目标环境 *</label>
@@ -51,7 +51,7 @@
       </div>
       <div class="modal-footer">
         <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-        <button class="btn btn-primary" id="cloneSaveBtn">提交申请</button>
+        <button class="btn btn-primary" id="cloneSaveBtn">立即克隆</button>
       </div>
     </div>
   </div>

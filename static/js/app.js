@@ -5248,18 +5248,20 @@
     const cloneModalEl = document.getElementById("cloneModal");
     const cloneModalInst = cloneModalEl ? new bootstrap.Modal(cloneModalEl) : null;
 
-    function statusBadgeClone(s) {
+    function statusBadgeClone(s, title) {
       const m = {
         pending: ["bg-warning text-dark", "待审批"],
         approved: ["badge-ok", "已批准"],
         rejected: ["badge-fail", "已驳回"],
         creating: ["badge-run", "拉起中"],
+        failed: ["badge-fail", "拉起失败"],
         ready: ["badge-ok", "就绪"],
         expired: ["bg-secondary", "已过期"],
         deleted: ["bg-secondary", "已销毁"],
       };
       const pair = m[s] || ["bg-secondary", s || "-"];
-      return '<span class="badge ' + pair[0] + '">' + pair[1] + '</span>';
+      return '<span class="badge ' + pair[0] + '"' +
+        (title ? ' title="' + esc(title) + '"' : '') + '>' + pair[1] + '</span>';
     }
 
     async function loadRecordsInto(sel) {
@@ -5275,9 +5277,17 @@
 
     window.loadClones = async function () {
       const rows = await api("GET", "/api/clone");
+      let provisioning = false;
       $("cloneTable").innerHTML = (rows || []).map(function (c) {
         const itsm = c.itsm_ticket_id ? c.itsm_ticket_id : '-';
-        const vdb = c.vdb_instance_id ? c.vdb_instance_id : '-';
+        // VDB 连接信息：就绪时展示可直接使用的连接串
+        let vdb = '-';
+        if (c.status === 'ready' && c.vdb_dbname) {
+          vdb = '<code>' + esc((c.vdb_host || '127.0.0.1') + ':' +
+            (c.vdb_port || '-') + '/' + c.vdb_dbname) + '</code>';
+        } else if (c.vdb_instance_id) {
+          vdb = '#' + c.vdb_instance_id;
+        }
         const actions = [];
         if (c.status === 'pending' || c.status === 'rejected') {
           actions.push('<button class="btn btn-sm btn-primary" onclick="approveClone(' + c.id + ')">' +
@@ -5287,16 +5297,25 @@
           actions.push('<button class="btn btn-sm btn-outline-secondary" onclick="rejectClone(' + c.id + ')">' +
             '<i class="bi bi-x-lg"></i> 驳回</button>');
         }
-        if (['ready', 'creating', 'expired'].indexOf(c.status) >= 0) {
+        if (c.status === 'failed') {
+          actions.push('<button class="btn btn-sm btn-outline-primary" onclick="approveClone(' + c.id + ')">' +
+            '<i class="bi bi-arrow-clockwise"></i> 重试拉起</button>');
+        }
+        if (['ready', 'creating', 'failed', 'expired'].indexOf(c.status) >= 0) {
           actions.push('<button class="btn btn-sm btn-outline-danger" onclick="destroyClone(' + c.id + ')">' +
             '<i class="bi bi-trash"></i> 销毁</button>');
         }
+        // 失败原因/备注透出到状态徽章 tooltip
+        const note = (c.note || '').trim();
+        const badge = statusBadgeClone(c.status,
+          c.status === 'failed' && note ? note.split('\n').pop() : (note || ''));
+        if (c.status === 'creating') provisioning = true;
         return '<tr>' +
           '<td>' + c.id + '</td>' +
           '<td>' + (c.source_record_id != null ? c.source_record_id : '-') + '</td>' +
           '<td>' + (c.source_db_type ? '<span class="badge bg-info">' + esc(c.source_db_type) + '</span>' : '-') + '</td>' +
           '<td>' + esc(c.target_env || '') + '</td>' +
-          '<td>' + statusBadgeClone(c.status) + '</td>' +
+          '<td>' + badge + '</td>' +
           '<td>' + itsm + '</td>' +
           '<td>' + esc(c.requested_by || '-') + '</td>' +
           '<td>' + esc(c.expires_at || '-') + '</td>' +
@@ -5304,6 +5323,13 @@
           '<td class="text-end">' + (actions.join(' ') || '-') + '</td>' +
         '</tr>';
       }).join("") || '<tr><td colspan="10" class="text-muted text-center">暂无克隆请求</td></tr>';
+      // 有克隆正在拉起时每 3 秒自动刷新，直到终态
+      if (provisioning) {
+        clearTimeout(loadClones._timer);
+        loadClones._timer = setTimeout(function () {
+          if (document.getElementById("cloneTable")) loadClones();
+        }, 3000);
+      }
     };
 
     window.approveClone = async function (id) {
@@ -5349,7 +5375,7 @@
       if (!payload.target_env) { toast("请填写目标环境", "warning"); return; }
       try {
         await api("POST", "/api/clone", payload);
-        toast("克隆申请已提交", "success");
+        toast("克隆已提交，正在后台拉起（列表自动刷新）", "success");
         if (cloneModalInst) cloneModalInst.hide();
         await loadClones();
       } catch (e) { toast(e.message, "danger"); }

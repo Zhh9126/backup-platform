@@ -84,6 +84,10 @@ BACKUP_RETRY_DELAY = int(os.environ.get("BACKUP_RETRY_DELAY", "5"))
 # 自 2026-08-14 起不再支持仿真/兜底占位备份；该配置保留为兼容但强制按 off 处理。
 DEMO_MODE = "off"
 
+# 克隆服务审批模式：auto = 申请即异步拉起（免审批直通，业界 VDB 标准打法）；
+# itsm = 保留 ITSM 审批流（可插拔钉钉 / ServiceNow）
+CLONE_AUTO_APPROVE = os.environ.get("CLONE_AUTO_APPROVE", "true").lower() != "false"
+
 # ---------- 调度 ----------
 SCHEDULER_ENABLED = os.environ.get("SCHEDULER_ENABLED", "true").lower() == "true"
 

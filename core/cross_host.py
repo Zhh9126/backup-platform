@@ -157,6 +157,29 @@ def cross_host_restore(db_type: str, backup_path: str, target_host_info: dict,
             extra = dict(extra)
             extra["_kb_restore_bin"] = _resolve_remote_bin(client, "sys_restore") or "sys_restore"
             extra["_kb_ksql_bin"] = _resolve_remote_bin(client, "ksql") or "ksql"
+        # 全实例 tar.gz：解包后逐库恢复（结构按源端、库名沿用 manifest）
+        if os.path.basename(remote).lower().endswith(
+                (".tar.gz", ".tgz")) and db_type in (
+                "mysql", "mariadb", "postgresql", "kingbase"):
+            cmd = _build_full_instance_restore_cmd(db_type, remote, extra)
+            # 任务级自定义环境变量前缀（contextvar，由 scheduler 设置）
+            from core.remote_dump import current_task_env_export
+            cmd = current_task_env_export() + cmd
+            log(f"全实例跨主机恢复: {cmd[:200]}")
+            out, err, rc = _remote_exec_logged(client, cmd, timeout=14400, log=log)
+            out_s = out.decode("utf-8", "replace")
+            err_s = err.decode("utf-8", "replace")
+            for line in (out_s + err_s).splitlines():
+                s = line.strip()
+                if s:
+                    log(f"REMOTE: {s}")
+            ok = rc == 0
+            msg = f"全实例跨主机恢复{'成功' if ok else '失败'}(rc={rc})"
+            return {"ok": ok, "message": msg, "rc": rc,
+                    "remote_path": remote, "stdout_tail": out_s[-2000:],
+                    "stderr_tail": err_s[-2000:],
+                    "full_instance": True}
+
         cmd = _build_restore_cmd(db_type, remote, target_db, extra, target_host_info)
         # 任务级自定义环境变量前缀（contextvar，由 scheduler 设置）
         from core.remote_dump import current_task_env_export
@@ -183,6 +206,95 @@ def cross_host_restore(db_type: str, backup_path: str, target_host_info: dict,
             client.close()
         except Exception:
             pass
+
+
+def _build_full_instance_restore_cmd(db_type: str, remote_pkg: str,
+                                     extra: dict) -> str:
+    """全实例 tar.gz 跨主机恢复命令：解包 → 逐库恢复（库名沿用源端）。
+
+    tar 结构（备份端生成）：manifest.json + dbs/<db>.sql|.dump [ + globals.sql ]
+    - mysql/mariadb：CREATE DATABASE IF NOT EXISTS → 逐库导入（含 RESET 主库 binlog/GTID）
+    - postgresql：CREATE DATABASE → pg_restore 逐库；globals.sql 存在则一并应用
+    - kingbase：同上，工具为 sys_restore / ksql
+    目标库名 target_db 参数对全实例产物不适用（多库沿用源端库名）。
+    """
+    host = "127.0.0.1"
+    if db_type in ("mysql", "mariadb"):
+        port = extra.get("source_port") or 3306
+        user = extra.get("source_username") or "root"
+        pw = extra.get("source_password") or ""
+        pw_esc = pw.replace("'", "'\\''")
+        reset_sql = extra.get("_mysql_reset_sql") or "RESET MASTER"
+        return f"""set -e
+WORK=$(mktemp -d /tmp/bp_fi_restore.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+tar -xzf '{remote_pkg}' -C "$WORK"
+# 用函数封装连接参数：避免带引号命令存入变量后引号不再解析（密码会带上引号）
+run_sql() {{ mysql --no-defaults -h {host} -P {port} -u {user} -p'{pw_esc}' "$@"; }}
+run_sql -e '{reset_sql}' || true
+OK=0; FAIL=0
+for f in "$WORK"/dbs/*.sql; do
+  [ -e "$f" ] || continue
+  db=$(basename "$f" .sql)
+  if run_sql -e "CREATE DATABASE IF NOT EXISTS \\`$db\\` CHARACTER SET utf8mb4" \\
+     && run_sql "$db" < "$f"; then
+    echo "[OK] $db"; OK=$((OK+1))
+  else
+    echo "[FAIL] $db"; FAIL=$((FAIL+1))
+  fi
+done
+echo "RESTORE_SUMMARY ok=$OK fail=$FAIL"
+[ "$FAIL" -eq 0 ]"""
+
+    # ---- PG 系 ----
+    if db_type == "postgresql":
+        port = extra.get("source_port") or 5432
+        user = extra.get("source_username") or "postgres"
+        pw = extra.get("source_password") or ""
+        psql_bin = extra.get("_pg_psql_bin") or "psql"
+        restore_bin = extra.get("_pg_restore_bin") or "pg_restore"
+        maint = "postgres"
+        env = f"export PGPASSWORD='{pw}';"
+        loop_restore = restore_bin
+        create_via = psql_bin
+        global_apply = f'[ -f "$WORK/globals.sql" ] && {psql_bin} -h {host} -p {port} -U {user} -d {maint} -f "$WORK/globals.sql" || echo "[SKIP] globals"'
+    elif db_type == "kingbase":
+        port = extra.get("source_port") or 54321
+        user = extra.get("source_username") or "SYSTEM"
+        pw = extra.get("source_password") or ""
+        psql_bin = extra.get("_kb_ksql_bin") or "ksql"
+        restore_bin = extra.get("_kb_restore_bin") or "sys_restore"
+        maint = "kingbase"
+        env = (f"export PGPASSWORD='{pw}';"
+               f"export KINGBASE_PASSWORD='{pw}';")
+        loop_restore = restore_bin
+        create_via = psql_bin
+        global_apply = f'[ -f "$WORK/globals.sql" ] && {psql_bin} -h {host} -p {port} -U {user} -d {maint} -f "$WORK/globals.sql" || echo "[SKIP] globals"'
+    else:
+        return f"echo '[ERROR] db_type {db_type} 不支持全实例跨主机恢复'; exit 1"
+
+    return f"""set -e
+WORK=$(mktemp -d /tmp/bp_fi_restore.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+tar -xzf '{remote_pkg}' -C "$WORK"
+{env}
+OK=0; FAIL=0
+for f in "$WORK"/dbs/*.dump; do
+  [ -e "$f" ] || continue
+  db=$(basename "$f" .dump)
+  EXISTS=$({create_via} -h {host} -p {port} -U {user} -d {maint} -tAc \\
+    "SELECT 1 FROM pg_database WHERE datname='{db}'" 2>/dev/null || true)
+  [ "$EXISTS" = "1" ] || {create_via} -h {host} -p {port} -U {user} -d {maint} \\
+    -c "CREATE DATABASE \\"{db}\\"" || {{ echo "[FAIL] $db (createdb)"; FAIL=$((FAIL+1)); continue; }}
+  if {loop_restore} -h {host} -p {port} -U {user} -d "{db}" --no-owner "$f"; then
+    echo "[OK] $db"; OK=$((OK+1))
+  else
+    echo "[FAIL] $db (restore)"; FAIL=$((FAIL+1))
+  fi
+done
+{global_apply} || true
+echo "RESTORE_SUMMARY ok=$OK fail=$FAIL"
+[ "$FAIL" -eq 0 ]"""
 
 
 def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,

@@ -13,6 +13,7 @@ import os
 import json
 import time
 import threading
+import socket
 
 import core.db as db
 from core import models
@@ -88,6 +89,29 @@ def _get_ssh_client(host_id: int):
     client.connect(hostname, port=port, username=user, password=pw, timeout=30,
                    allow_agent=False, look_for_keys=False)
     return client, h
+
+
+def _is_local_target(hostname: str) -> bool:
+    """判断部署目标主机是否为平台本机（用于防自毁：同路径跳过上传仅限本机）。"""
+    if not hostname:
+        return False
+    if hostname in ("127.0.0.1", "localhost", "::1"):
+        return True
+    try:
+        local_ips = {"127.0.0.1", "::1"}
+        for info in socket.getaddrinfo(socket.gethostname(), None):
+            local_ips.add(info[4][0])
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            local_ips.add(s.getsockname()[0])
+        except Exception:
+            pass
+        finally:
+            s.close()
+        return hostname in local_ips
+    except Exception:
+        return False
 
 
 def _get_ssh_client_from_dep(dep: dict):
@@ -244,16 +268,17 @@ else
     echo "[deploy] WARN: 安装包中未找到 support-files/mysql.server，将仅使用 mysqld_safe/mysqld 直接启动。"
 fi
 
-# ---------- 启动 MySQL（优先 mysqld_safe，已在 CentOS7/8/9 验证稳定）----------
+# ---------- 启动 MySQL（优先 mysqld --daemonize：干净后台化，不占 SSH 通道；
+#            mysqld_safe 后台方式在远程 SSH 会话下易随通道中断被误杀）----------
 echo "[deploy] 启动 MySQL..."
 start_rc=0
-if [ -x {base}/bin/mysqld_safe ]; then
-    echo "[deploy] 使用 mysqld_safe 启动 (最通用，兼容 5.x/8.0/9.x)"
-    nohup {base}/bin/mysqld_safe --user=mysql --datadir={data} >/var/log/mysqld_safe.log 2>&1 &
+if [ -x {base}/bin/mysqld ]; then
+    echo "[deploy] 使用 mysqld --daemonize 启动 (8.0+，干净后台化)"
+    nohup {base}/bin/mysqld --user=mysql --datadir={data} --daemonize </dev/null >/var/log/mysqld.log 2>&1 &
     start_rc=0
-elif [ -x {base}/bin/mysqld ]; then
-    echo "[deploy] mysqld_safe 不存在，使用 mysqld --daemonize 启动"
-    nohup {base}/bin/mysqld --user=mysql --datadir={data} --daemonize >/var/log/mysqld.log 2>&1 &
+elif [ -x {base}/bin/mysqld_safe ]; then
+    echo "[deploy] 使用 mysqld_safe 启动 (兼容 5.x)"
+    setsid nohup {base}/bin/mysqld_safe --user=mysql --datadir={data} </dev/null >/var/log/mysqld_safe.log 2>&1 &
     start_rc=0
 else
     # 兜底：尝试 mysql.server
@@ -940,9 +965,12 @@ def run_deployment(dep_id: int) -> None:
         if pkg_path:
             if os.path.isfile(pkg_path):
                 remote_pkg = "/tmp/" + os.path.basename(pkg_path)
-                # 本机部署防自毁：目标主机即平台本机时 remote_pkg 可能与
-                # 源路径相同，sftp.put 自己到自己会把包截断成 0 字节
-                if os.path.abspath(remote_pkg) == os.path.abspath(pkg_path):
+                # 本机部署防自毁：仅当目标主机确为平台本机且 remote_pkg 与
+                # 源路径相同时才跳过上传（sftp.put 自己到自己会把包截断成 0 字节）；
+                # 远程主机即使路径同名也必须真实上传
+                target_host = h.get("hostname") or h.get("host") or ""
+                if (os.path.abspath(remote_pkg) == os.path.abspath(pkg_path)
+                        and _is_local_target(target_host)):
                     log(f"安装包已在目标主机同路径（本机部署），跳过上传: {remote_pkg}")
                 else:
                     try:

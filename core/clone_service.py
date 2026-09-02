@@ -173,13 +173,23 @@ class CloneService:
             except Exception as e:
                 self.logger.warning("[clone] 同步 ITSM 工单失败（忽略）: %s", e)
 
-        # 2) 拉起 VDB 实例
+        # 2) 拉起 VDB 实例（异常必须落 failed，避免卡死 creating 无法重试）
         req = models.get_clone_request(request_id, include_secret=True)
         req["status"] = STATUS_CREATING
         models.update_clone_request(request_id, {"status": STATUS_CREATING,
                                                   "approved_by": approved_by})
         self.logger.info("[clone] 请求 #%s 审批通过，开始拉起 VDB", request_id)
-        vdb_id = self._launch_vdb(req)
+        try:
+            vdb_id = self._launch_vdb(req)
+        except Exception as exc:
+            self.logger.error("[clone] 请求 #%s 拉起失败: %s", request_id, exc)
+            cur = self.get_clone(request_id) or {}
+            note = (cur.get("note") or "").strip()
+            models.update_clone_request(request_id, {
+                "status": STATUS_FAILED,
+                "note": (note + "\n" if note else "") + f"拉起失败: {exc}"[:480],
+            })
+            raise
         ttl = _default_ttl_days()
         expires = _compute_expires(ttl)
         models.update_clone_request(request_id, {

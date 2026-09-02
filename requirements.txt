@@ -20,6 +20,10 @@ watchdog>=4.0              # 文件事件驱动加速：Linux=inotify / Windows=
 python-docx>=1.1           # Word(.docx) 报告生成
 reportlab>=4.0             # PDF 报告生成
 
+# ---------- 三级存储（MinIO / S3，必选启用三级存储时）----------
+# 未安装时存储页提示 SDK 未安装、MinIO/S3 功能不可用（本地导出不受影响）
+minio>=7.1                 # MinIO / S3 兼容对象存储 SDK（L1/L2 后端共用）
+
 # ---------- JDBC 兜底通道（可选，默认不安装）----------
 # 仅当原生驱动缺失或服务端不支持直连（如 Oracle 11g 瘦模式）时作为兜底：
 # 需要 jpype1 + jaydebeapi + 本机 JDK/JRE（8+）+ drivers/ 下的驱动 jar。

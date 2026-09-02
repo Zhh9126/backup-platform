@@ -526,6 +526,8 @@ CREATE TABLE IF NOT EXISTS clone_requests (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     source_record_id INTEGER,                         -- 克隆源备份记录
     target_env     TEXT NOT NULL,                    -- 目标环境（test / dev / staging ...）
+    target_host    TEXT DEFAULT '127.0.0.1',          -- 目标主机（克隆库拉起位置，可为远程机器 IP）
+    target_password TEXT,                            -- 目标实例 root/管理员密码（加密存储，可空=沿用源任务密码）
     status         TEXT DEFAULT 'pending',            -- pending|approved|rejected|creating|ready|expired|deleted
     itsm_ticket_id INTEGER,                          -- 关联的 ITSM 工单
     requested_by   TEXT,
@@ -762,6 +764,16 @@ def init_schema() -> None:
             ]:
                 try:
                     conn.execute(f"ALTER TABLE backup_sets ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass  # 列已存在，忽略
+
+            # 迁移：克隆请求目标主机 / 目标密码列（支持克隆到其他机器）
+            for col, typedef in [
+                ("target_host", "TEXT DEFAULT '127.0.0.1'"),
+                ("target_password", "TEXT"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE clone_requests ADD COLUMN {col} {typedef}")
                 except Exception:
                     pass  # 列已存在，忽略
 

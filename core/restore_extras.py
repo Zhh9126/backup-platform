@@ -390,21 +390,71 @@ def pg_clone_to_test(backup_path: str, instance_name: str,
 
 
 def drop_clone(db_type: str, instance_name: str,
+               host: str = "127.0.0.1", port: int = None,
                mysql_password: str = "", pg_password: str = "") -> Dict[str, Any]:
-    """清理 VDB 测试库/库（与 pg_clone_to_test 的库级克隆语义对齐）。"""
+    """清理 VDB 测试库/库（与 pg_clone_to_test 的库级克隆语义对齐）。
+
+    host/port：目标实例地址（支持远程主机，默认本机默认端口）。
+    """
     env = os.environ.copy()
     if mysql_password:
         env["MYSQL_PWD"] = mysql_password
     if pg_password:
         env["PGPASSWORD"] = pg_password
-    if db_type == "mysql":
-        cmd = ["mysql", "--no-defaults", "-h", "127.0.0.1", "-P", "3306", "-u", "root", "-N", "-e",
+    if db_type in ("mysql", "mariadb"):
+        cmd = ["mysql", "--no-defaults", "-h", host or "127.0.0.1",
+               "-P", str(port or 3306), "-u", "root", "-N", "-e",
                f"DROP DATABASE IF EXISTS `{instance_name}`"]
     elif db_type == "postgresql":
-        pg_port = os.environ.get("PGPORT") or 5432
-        cmd = ["psql", "-h", "127.0.0.1", "-p", str(pg_port), "-U", "postgres",
+        pg_port = port or os.environ.get("PGPORT") or 5432
+        cmd = ["psql", "-h", host or "127.0.0.1", "-p", str(pg_port), "-U", "postgres",
                "-d", "postgres", "-c", f'DROP DATABASE IF EXISTS "{instance_name}"']
     else:
         return {"ok": False, "message": f"不支持的类型 {db_type}"}
     r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
     return {"ok": r.returncode == 0, "message": (r.stderr or r.stdout or "OK")[:200]}
+
+
+def verify_clone_conn(db_type: str, host: str, port, database: str, user: str,
+                      password: str = "") -> Dict[str, Any]:
+    """克隆库就绪校验：远程连接探活 + 统计表数量。
+
+    返回 {ok, message, tables}。ok=False 时 message 带原因（连不上/库不存在等）。
+    """
+    env = os.environ.copy()
+    host = host or "127.0.0.1"
+    if db_type in ("mysql", "mariadb"):
+        if password:
+            env["MYSQL_PWD"] = password
+        cmd = ["mysql", "--no-defaults", "--connect-timeout=8", "-h", host,
+               "-P", str(port or 3306), "-u", user or "root", "-N", "-e",
+               f"SELECT COUNT(*) FROM information_schema.tables "
+               f"WHERE table_schema='{database}'"]
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            return {"ok": False, "message": f"连接失败: {r.stderr.strip()[:200]}", "tables": 0}
+        try:
+            tables = int(r.stdout.strip() or 0)
+        except ValueError:
+            tables = 0
+        return {"ok": True,
+                "message": f"连接正常，库 {database} 共 {tables} 张表",
+                "tables": tables}
+    if db_type == "postgresql":
+        if password:
+            env["PGPASSWORD"] = password
+        pg_port = port or os.environ.get("PGPORT") or 5432
+        cmd = ["psql", "-h", host, "-p", str(pg_port), "-U", user or "postgres",
+               "-d", database, "-t", "-A", "-c",
+               "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'"]
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=20)
+        if r.returncode != 0:
+            return {"ok": False, "message": f"连接失败: {r.stderr.strip()[:200]}", "tables": 0}
+        try:
+            tables = int(r.stdout.strip() or 0)
+        except ValueError:
+            tables = 0
+        return {"ok": True,
+                "message": f"连接正常，库 {database} 共 {tables} 张表",
+                "tables": tables}
+    return {"ok": False, "message": f"不支持的类型 {db_type}", "tables": 0}

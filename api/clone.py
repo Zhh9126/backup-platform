@@ -40,7 +40,9 @@ def api_request_clone():
     try:
         req = _service.request_clone(
             int(source_record_id), target_env, requested_by,
-            note=data.get("note", ""), itsm_system=data.get("itsm_system"))
+            note=data.get("note", ""), itsm_system=data.get("itsm_system"),
+            target_host=data.get("target_host") or "127.0.0.1",
+            target_password=data.get("target_password") or "")
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"ok": True, "id": req["id"], "request": req}), 201
@@ -85,6 +87,17 @@ def api_destroy_clone(request_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"ok": True, "request": req})
+
+
+@api_bp.route("/clone/<int:request_id>/verify", methods=["POST"])
+@login_required
+def api_verify_clone(request_id):
+    """就绪克隆连接校验：探活 + 统计表数量。"""
+    try:
+        res = _service.verify_clone(request_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(res)
 
 
 @api_bp.route("/clone/<int:request_id>/expire", methods=["POST"])

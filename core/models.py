@@ -1074,18 +1074,24 @@ def delete_migration_plan(plan_id: int) -> None:
 
 # ------------------------- 克隆请求（CloneRequest，Phase 2） -------------------------
 _CLONE_FIELDS = [
-    "source_record_id", "target_env", "status", "itsm_ticket_id",
+    "source_record_id", "target_env", "target_host", "target_password",
+    "status", "itsm_ticket_id",
     "requested_by", "approved_by", "expires_at", "vdb_instance_id", "note",
 ]
 
 
 def create_clone_request(data: dict) -> int:
-    """创建一条克隆请求。返回新请求 id。"""
+    """创建一条克隆请求。返回新请求 id。target_password 加密存储。"""
     data = {k: data.get(k) for k in _CLONE_FIELDS}
     now = db.now_iso()
     data["created_at"] = now
     data["updated_at"] = now
     data["status"] = data.get("status") or "pending"
+    data["target_host"] = (data.get("target_host") or "127.0.0.1").strip() or "127.0.0.1"
+    if data.get("target_password"):
+        data["target_password"] = db.encrypt_secret(data["target_password"])
+    else:
+        data["target_password"] = ""
     for n in ("source_record_id", "itsm_ticket_id", "vdb_instance_id"):
         if data.get(n) in (0, "", None):
             data[n] = None
@@ -1095,8 +1101,16 @@ def create_clone_request(data: dict) -> int:
     return db.execute(sql, tuple(data.values()))
 
 
-def get_clone_request(request_id: int) -> Optional[dict]:
-    return db.query_one("SELECT * FROM clone_requests WHERE id=?", (request_id,))
+def get_clone_request(request_id: int, include_secret: bool = False) -> Optional[dict]:
+    row = db.query_one("SELECT * FROM clone_requests WHERE id=?", (request_id,))
+    if not row:
+        return None
+    row = dict(row)
+    if include_secret:
+        row["target_password"] = db.decrypt_secret(row.get("target_password") or "")
+    else:
+        row["target_password"] = ""
+    return row
 
 
 def list_clone_requests() -> list:
@@ -1114,9 +1128,9 @@ def list_clone_requests() -> list:
 
 
 def update_clone_request(request_id: int, data: dict) -> None:
-    """更新克隆请求字段（白名单）。"""
+    """更新克隆请求字段（白名单）。target_password 自动加密。"""
     allow = {"status", "itsm_ticket_id", "approved_by", "expires_at",
-             "vdb_instance_id", "note"}
+             "vdb_instance_id", "note", "target_host", "target_password"}
     updates = {k: v for k, v in data.items() if k in allow}
     if not updates:
         return
@@ -1125,6 +1139,8 @@ def update_clone_request(request_id: int, data: dict) -> None:
     for k, v in updates.items():
         if k in ("itsm_ticket_id", "vdb_instance_id"):
             v = None if v in (0, "", None) else v
+        if k == "target_password":
+            v = db.encrypt_secret(v) if v else ""
         sets.append(f"{k}=?")
         params.append(v)
     params.append(request_id)

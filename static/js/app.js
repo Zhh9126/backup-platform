@@ -5453,12 +5453,14 @@
   async function initClone() {
     const cloneModalEl = document.getElementById("cloneModal");
     const cloneModalInst = cloneModalEl ? new bootstrap.Modal(cloneModalEl) : null;
+    // 校验结果内存缓存：{cloneId: {ok, message, ts}}，行刷新后仍可回显
+    const VERIFY_RESULTS = {};
 
     function statusBadgeClone(s, title) {
       const m = {
-        pending: ["bg-warning text-dark", "待审批"],
-        approved: ["badge-ok", "已批准"],
-        rejected: ["badge-fail", "已驳回"],
+        pending: ["bg-warning text-dark", "排队中"],
+        approved: ["badge-run", "拉起中"],
+        rejected: ["bg-secondary", "已取消"],
         creating: ["badge-run", "拉起中"],
         failed: ["badge-fail", "拉起失败"],
         ready: ["badge-ok", "就绪"],
@@ -5470,42 +5472,91 @@
         (title ? ' title="' + esc(title) + '"' : '') + '>' + pair[1] + '</span>';
     }
 
-    async function loadRecordsInto(sel) {
+    // ---- 源备份记录：可搜索下拉 ----
+    let CLONE_RECORDS = [];
+    async function loadRecordsInto() {
+      const input = $("c_source_search"), list = $("c_source_list"),
+        hidden = $("c_source_record_id");
       try {
         const recs = await api("GET", "/api/records");
-        sel.innerHTML = (recs || []).map(function (r) {
-          return '<option value="' + r.id + '">' + fmtRecordLabel(r) + '</option>';
-        }).join("");
-      } catch (e) {
-        sel.innerHTML = '<option value="">加载备份记录失败</option>';
-      }
+        CLONE_RECORDS = (recs || []).map(function (r) {
+          return { id: r.id, label: fmtRecordLabel(r), raw: (r.task_name || "") + " " + (r.db_type || "") + " " + r.id };
+        });
+      } catch (e) { CLONE_RECORDS = []; }
+      hidden.value = "";
+      input.value = "";
+      renderSourceList("");
+    }
+    function renderSourceList(kw) {
+      const list = $("c_source_list");
+      kw = (kw || "").trim().toLowerCase();
+      const items = CLONE_RECORDS.filter(function (r) {
+        return !kw || r.label.toLowerCase().indexOf(kw) >= 0 || r.raw.toLowerCase().indexOf(kw) >= 0;
+      }).slice(0, 80);
+      list.innerHTML = items.length ? items.map(function (r) {
+        return '<button type="button" class="list-group-item list-group-item-action py-1" ' +
+          'style="font-size:.86rem" data-id="' + r.id + '" data-label="' + esc(r.label) + '">' +
+          esc(r.label) + '</button>';
+      }).join("") : '<span class="list-group-item text-muted py-1" style="font-size:.86rem">无匹配记录</span>';
+      list.style.display = "block";
+    }
+    function bindSourceSearch() {
+      const input = $("c_source_search"), list = $("c_source_list"),
+        hidden = $("c_source_record_id");
+      input.addEventListener("input", function () {
+        hidden.value = "";
+        renderSourceList(input.value);
+      });
+      input.addEventListener("focus", function () { renderSourceList(input.value); });
+      input.addEventListener("blur", function () {
+        setTimeout(function () { list.style.display = "none"; }, 180);
+      });
+      list.addEventListener("mousedown", function (ev) {
+        const btn = ev.target.closest("button[data-id]");
+        if (!btn) return;
+        hidden.value = btn.dataset.id;
+        input.value = btn.dataset.label;
+        list.style.display = "none";
+      });
+    }
+
+    // ---- 目标主机候选：从任务实例 host 聚合 ----
+    async function loadHostOptions() {
+      const dl = $("c_target_host_options");
+      if (!dl) return;
+      let hosts = ["127.0.0.1"];
+      try {
+        const tasks = await api("GET", "/api/tasks");
+        (tasks || []).forEach(function (t) {
+          const h = (t.host || "").trim();
+          if (h && hosts.indexOf(h) < 0) hosts.push(h);
+        });
+      } catch (e) { /* 忽略，保留默认本机 */ }
+      dl.innerHTML = hosts.map(function (h) {
+        return '<option value="' + esc(h) + '">' + (h === "127.0.0.1" ? "本机 (127.0.0.1)" : esc(h)) + '</option>';
+      }).join("");
     }
 
     window.loadClones = async function () {
       const rows = await api("GET", "/api/clone");
       let provisioning = false;
       $("cloneTable").innerHTML = (rows || []).map(function (c) {
-        const itsm = c.itsm_ticket_id ? c.itsm_ticket_id : '-';
         // VDB 连接信息：就绪时展示可直接使用的连接串
         let vdb = '-';
         if (c.status === 'ready' && c.vdb_dbname) {
-          vdb = '<code>' + esc((c.vdb_host || '127.0.0.1') + ':' +
-            (c.vdb_port || '-') + '/' + c.vdb_dbname) + '</code>';
+          vdb = '<code title="' + esc((c.vdb_username || '') + '@' + (c.vdb_host || '127.0.0.1') + ':' + (c.vdb_port || '-') + '/' + c.vdb_dbname) + '">' +
+            esc((c.vdb_host || '127.0.0.1') + ':' + (c.vdb_port || '-') + '/' + c.vdb_dbname) + '</code>';
         } else if (c.vdb_instance_id) {
           vdb = '#' + c.vdb_instance_id;
         }
         const actions = [];
-        if (c.status === 'pending' || c.status === 'rejected') {
-          actions.push('<button class="btn btn-sm btn-primary" onclick="approveClone(' + c.id + ')">' +
-            '<i class="bi bi-check-lg"></i> 审批</button>');
-        }
-        if (c.status === 'pending') {
-          actions.push('<button class="btn btn-sm btn-outline-secondary" onclick="rejectClone(' + c.id + ')">' +
-            '<i class="bi bi-x-lg"></i> 驳回</button>');
-        }
         if (c.status === 'failed') {
-          actions.push('<button class="btn btn-sm btn-outline-primary" onclick="approveClone(' + c.id + ')">' +
+          actions.push('<button class="btn btn-sm btn-outline-primary" onclick="retryClone(' + c.id + ')">' +
             '<i class="bi bi-arrow-clockwise"></i> 重试拉起</button>');
+        }
+        if (c.status === 'ready') {
+          actions.push('<button class="btn btn-sm btn-outline-success" onclick="verifyClone(' + c.id + ')">' +
+            '<i class="bi bi-shield-check"></i> 校验</button>');
         }
         if (['ready', 'creating', 'failed', 'expired'].indexOf(c.status) >= 0) {
           actions.push('<button class="btn btn-sm btn-outline-danger" onclick="destroyClone(' + c.id + ')">' +
@@ -5515,14 +5566,20 @@
         const note = (c.note || '').trim();
         const badge = statusBadgeClone(c.status,
           c.status === 'failed' && note ? note.split('\n').pop() : (note || ''));
+        // 校验结果小字（内存缓存回显）
+        const vr = VERIFY_RESULTS[c.id];
+        const verifyHtml = vr
+          ? '<div style="font-size:.72rem" class="' + (vr.ok ? 'text-success' : 'text-danger') + '">' +
+            (vr.ok ? '✓ ' : '✗ ') + esc(vr.message) + '</div>'
+          : '';
         if (c.status === 'creating') provisioning = true;
         return '<tr>' +
           '<td>' + c.id + '</td>' +
-          '<td>' + (c.source_record_id != null ? c.source_record_id : '-') + '</td>' +
+          '<td>' + (c.task_name ? esc(c.task_name) + ' <span class="text-muted">(记录 ' + c.source_record_id + ')</span>' : (c.source_record_id != null ? c.source_record_id : '-')) + '</td>' +
           '<td>' + (c.source_db_type ? '<span class="badge bg-info">' + esc(c.source_db_type) + '</span>' : '-') + '</td>' +
           '<td>' + esc(c.target_env || '') + '</td>' +
-          '<td>' + badge + '</td>' +
-          '<td>' + itsm + '</td>' +
+          '<td>' + esc(c.target_host || '127.0.0.1') + '</td>' +
+          '<td>' + badge + verifyHtml + '</td>' +
           '<td>' + esc(c.requested_by || '-') + '</td>' +
           '<td>' + esc(c.expires_at || '-') + '</td>' +
           '<td>' + vdb + '</td>' +
@@ -5538,17 +5595,22 @@
       }
     };
 
-    window.approveClone = async function (id) {
+    window.verifyClone = async function (id) {
+      try {
+        const res = await api("POST", "/api/clone/" + id + "/verify");
+        VERIFY_RESULTS[id] = { ok: !!res.ok, message: res.message || (res.ok ? "连接正常" : "校验失败"), ts: Date.now() };
+        toast((res.ok ? "校验通过：" : "校验失败：") + (res.message || ""), res.ok ? "success" : "danger");
+      } catch (e) {
+        VERIFY_RESULTS[id] = { ok: false, message: e.message, ts: Date.now() };
+        toast(e.message, "danger");
+      }
+      await loadClones();
+    };
+    // failed 重试拉起（复用后端幂等的 approve 直通通道）
+    window.retryClone = async function (id) {
       try {
         await api("POST", "/api/clone/" + id + "/approve");
-        toast("审批通过，VDB 拉起中", "success");
-        await loadClones();
-      } catch (e) { toast(e.message, "danger"); }
-    };
-    window.rejectClone = async function (id) {
-      try {
-        await api("POST", "/api/clone/" + id + "/reject");
-        toast("已驳回", "warning");
+        toast("重新拉起中（列表自动刷新）", "success");
         await loadClones();
       } catch (e) { toast(e.message, "danger"); }
     };
@@ -5563,8 +5625,10 @@
     };
 
     window.openCloneModal = async function () {
-      await loadRecordsInto($("c_source_record_id"));
+      await Promise.all([loadRecordsInto(), loadHostOptions()]);
       $("c_target_env").value = "";
+      $("c_target_host").value = "127.0.0.1";
+      $("c_target_password").value = "";
       $("c_requested_by").value = "";
       $("c_note").value = "";
       if (cloneModalInst) cloneModalInst.show();
@@ -5575,6 +5639,8 @@
       const payload = {
         source_record_id: source_record_id,
         target_env: $("c_target_env").value.trim(),
+        target_host: $("c_target_host").value.trim() || "127.0.0.1",
+        target_password: $("c_target_password").value,
         requested_by: $("c_requested_by").value.trim(),
         note: $("c_note").value,
       };
@@ -5587,6 +5653,7 @@
       } catch (e) { toast(e.message, "danger"); }
     };
 
+    bindSourceSearch();
     $("newCloneBtn").addEventListener("click", window.openCloneModal);
     $("cloneSaveBtn").addEventListener("click", window.saveClone);
 

@@ -68,13 +68,19 @@ class CloneService:
     # ------------------------- 申请 -------------------------
     def request_clone(self, source_record_id: int, target_env: str,
                       requested_by: str, note: str = "",
-                      itsm_system: str = None) -> dict:
+                      itsm_system: str = None,
+                      target_host: str = "127.0.0.1",
+                      target_password: str = "") -> dict:
         """提交克隆申请。
 
         免审批直通（默认，业界 VDB 标准打法，借鉴 Delphix/Neon）：
         1) 建 clone_request(pending)
-        2) 立即后台异步拉起 VDB（creating → ready/failed），不阻塞 API
+        2) 立即后台异步拉起克隆库（creating → ready/failed），不阻塞 API
         3) ITSM 工单仅在显式指定 itsm_system 时创建（可选审计留痕）
+
+        target_host：克隆库拉起的目标主机（默认本机 127.0.0.1，可指定其他机器 IP，
+        要求该机器上的 MySQL/PG 实例允许从本平台远程连接）。
+        target_password：目标实例管理员密码（可空=沿用源任务密码）。
 
         itsm 模式（CLONE_AUTO_APPROVE=false）：走原审批流。
         """
@@ -85,10 +91,13 @@ class CloneService:
         if not target_env:
             raise ValueError("目标环境 target_env 必填")
         requested_by = (requested_by or "anonymous").strip() or "anonymous"
+        target_host = (target_host or "127.0.0.1").strip() or "127.0.0.1"
 
         req_id = models.create_clone_request({
             "source_record_id": source_record_id,
             "target_env": target_env,
+            "target_host": target_host,
+            "target_password": target_password or "",
             "status": STATUS_PENDING,
             "requested_by": requested_by,
             "note": note,
@@ -165,6 +174,7 @@ class CloneService:
                 self.logger.warning("[clone] 同步 ITSM 工单失败（忽略）: %s", e)
 
         # 2) 拉起 VDB 实例
+        req = models.get_clone_request(request_id, include_secret=True)
         req["status"] = STATUS_CREATING
         models.update_clone_request(request_id, {"status": STATUS_CREATING,
                                                   "approved_by": approved_by})
@@ -249,8 +259,10 @@ class CloneService:
     def _launch_vdb(self, req: dict) -> int:
         """按源库类型调用底层真实克隆引擎，并登记 VDB 实例。
 
-        真实引擎：mysql / mariadb（本机管理实例建库 + 流式导入）
-                 postgresql（本机管理实例建库 + 导入）
+        真实引擎：mysql / mariadb（目标主机实例建库 + 流式导入）
+                 postgresql（目标主机实例建库 + 导入）
+        目标主机：req.target_host（默认本机 127.0.0.1，可指定其他机器 IP）；
+        连接密码：req.target_password 优先，未填时沿用源任务密码。
         其余类型明确抛错（不降级仿真，避免"假克隆"）；
         仅 DEMO_MODE != off 时才允许仿真兜底且在 VDB note 中明确标注。
         """
@@ -261,6 +273,17 @@ class CloneService:
         if not backup_path or not os.path.isfile(backup_path):
             raise RuntimeError(f"备份产物不存在: {backup_path or '-'}")
 
+        target_host = (req.get("target_host") or "127.0.0.1").strip() or "127.0.0.1"
+        port = 3306 if db_type in ("mysql", "mariadb") else (
+            5432 if db_type == "postgresql" else 0)
+        user = "root" if db_type in ("mysql", "mariadb") else (
+            "postgres" if db_type == "postgresql" else "")
+        # 连接密码：目标实例密码优先，未填则沿用源任务密码
+        password = req.get("target_password") or ""
+        if not password:
+            src_task = models.get_task(rec.get("task_id"), include_secret=True) or {}
+            password = src_task.get("password") or ""
+
         simulated = config.DEMO_MODE != "off"
         if not simulated:
             engine_name = _CLONE_ENGINE.get(db_type)
@@ -268,39 +291,58 @@ class CloneService:
                 raise RuntimeError(
                     f"db_type={db_type} 暂不支持真实克隆"
                     "（当前支持 mysql/mariadb/postgresql；其余类型请先确认克隆目标方案）")
-            # 源任务密码：注入克隆目标连接（克隆库在本机管理实例）
-            src_task = models.get_task(rec.get("task_id"), include_secret=True) or {}
-            src_password = src_task.get("password") or ""
-            fn = getattr(restore_extras, engine_name)
             if engine_name == "pg_clone_to_test":
                 res = restore_extras.pg_clone_to_test(
-                    backup_path, instance_name, pg_password=src_password)
+                    backup_path, instance_name,
+                    pg_host=target_host, pg_port=port or None,
+                    pg_user=user, pg_password=password)
             else:
                 res = restore_extras.mysql_clone_to_test(
-                    backup_path, instance_name, mysql_password=src_password)
+                    backup_path, instance_name,
+                    mysql_host=target_host, mysql_port=port or 3306,
+                    mysql_user=user, mysql_password=password)
             if not res.get("ok"):
                 raise RuntimeError(f"真实克隆失败: {res.get('message')}")
 
-        port = 3306 if db_type in ("mysql", "mariadb") else (
-            5432 if db_type == "postgresql" else 0)
-        user = "root" if db_type in ("mysql", "mariadb") else (
-            "postgres" if db_type == "postgresql" else "")
         vdb_id = models.create_vdb({
             "name": instance_name,
             "source_record_id": req["source_record_id"],
             "task_id": rec.get("task_id"),
             "db_type": db_type,
             "port": port,
-            "host": "127.0.0.1",
+            "host": target_host,
             "database_name": instance_name,
             "username": user,
             "status": "ready",
             "created_at": db.now_iso(),
             "expires_at": _compute_expires(_default_ttl_days()),
             "note": ("DEMO 仿真实例" if simulated else "真实克隆实例")
+                    + (f" | 目标主机 {target_host}" if target_host != "127.0.0.1" else "")
                     + (f" | {req.get('note') or ''}"),
         })
         return vdb_id
+
+    def verify_clone(self, request_id: int) -> dict:
+        """就绪校验：连接克隆库执行探活 + 统计表数量。"""
+        req = models.get_clone_request(request_id, include_secret=True)
+        if not req:
+            raise ValueError(f"克隆请求不存在: {request_id}")
+        if req.get("status") != STATUS_READY or not req.get("vdb_instance_id"):
+            raise ValueError("克隆未就绪，无法校验")
+        vdb = models.get_vdb(req["vdb_instance_id"])
+        if not vdb:
+            raise ValueError("VDB 实例元数据缺失")
+        # 连接密码：与拉起逻辑一致——目标实例密码优先，未填则沿用源任务密码
+        password = req.get("target_password") or ""
+        if not password:
+            src_task = models.get_task(vdb.get("task_id"), include_secret=True) or {}
+            password = src_task.get("password") or ""
+        res = restore_extras.verify_clone_conn(
+            vdb.get("db_type"), vdb.get("host") or "127.0.0.1",
+            vdb.get("port"), vdb.get("database_name"), vdb.get("username"),
+            password=password)
+        self.logger.info("[clone] 请求 #%s 校验: %s", request_id, res.get("message"))
+        return res
 
     def _release_vdb(self, req: dict) -> None:
         """释放 VDB 实例：调用底层 drop_clone 销毁真实库，并清理元数据。DEMO 下仅置状态。"""
@@ -310,13 +352,18 @@ class CloneService:
         vdb = models.get_vdb(vdb_id)
         if vdb:
             if config.DEMO_MODE == "off":
-                # 源任务密码：注入销毁连接（克隆库在本机管理实例）
-                src_task = models.get_task(vdb.get("task_id"), include_secret=True) or {}
-                src_password = src_task.get("password") or ""
+                # 连接密码：目标实例密码优先，未填则沿用源任务密码
+                creq = models.get_clone_request(req["id"], include_secret=True) or {}
+                password = creq.get("target_password") or ""
+                if not password:
+                    src_task = models.get_task(vdb.get("task_id"), include_secret=True) or {}
+                    password = src_task.get("password") or ""
                 try:
                     res = restore_extras.drop_clone(
                         vdb.get("db_type"), vdb.get("name"),
-                        mysql_password=src_password, pg_password=src_password)
+                        host=vdb.get("host") or "127.0.0.1",
+                        port=vdb.get("port"),
+                        mysql_password=password, pg_password=password)
                     if not res.get("ok"):
                         self.logger.warning("[clone] 释放 VDB #%s 失败: %s",
                                             vdb_id, res.get("message"))

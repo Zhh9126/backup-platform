@@ -515,6 +515,48 @@ def _remote_mysql_dump(task: dict, ssh_host: dict, compress: int, extra_args: st
             "请在远端安装 mysql-client 或 xtrabackup 后重试。"
         )
 
+    # 1.5) MySQL/MariaDB 风味匹配：同一台服务器可能共存两套客户端
+    # （如装了 MariaDB 后 /usr/bin/mysqldump 被 MariaDB 版抢占，而目标是
+    # MySQL）——两者参数集不同（--set-gtid-purged 仅 MySQL 有），风味
+    # 不匹配会报 unknown variable。用 mysqldump --version 的 -MariaDB
+    # 后缀与 SELECT VERSION() 比对，不匹配则在常见目录自动找匹配版本。
+    try:
+        from core.engines.file import _ssh_exec_pipe as _sep
+        _mysql_cli = os.path.dirname(mysqldump_bin) + "/mysql"
+        _vo, _ve, _vrc = _sep(
+            client,
+            _wrap_login(f"{shlex.quote(_mysql_cli)} --defaults-file={shlex.quote(remote_cnf)} "
+                        f"-h 127.0.0.1 -P {int(task.get('port') or 3306)} -N -e \"SELECT VERSION();\" 2>/dev/null"),
+            timeout=30)
+        _server_ver = (_vo.decode("utf-8", "replace")
+                       if isinstance(_vo, bytes) else str(_vo or "")).strip().splitlines()
+        _server_ver = _server_ver[-1].strip() if _server_ver else ""
+    except Exception:
+        _server_ver = ""
+
+    if _server_ver:
+        def _dump_flavor(p: str) -> str:
+            try:
+                o, _e, _rc = _sep(client, _wrap_login(
+                    f"{shlex.quote(p)} --version 2>/dev/null"), timeout=30)
+                t = o.decode("utf-8", "replace") if isinstance(o, bytes) else str(o or "")
+                return "mariadb" if "mariadb" in t.lower() else "mysql"
+            except Exception:
+                return ""
+        want = "mariadb" if "mariadb" in _server_ver.lower() else "mysql"
+        if _dump_flavor(mysqldump_bin) != want:
+            try:
+                fo, _fe, _frc = _sep(client, _wrap_login(
+                    "find /usr/local /opt -maxdepth 4 -type f -name mysqldump "
+                    "2>/dev/null | head -20"), timeout=30)
+                ftxt = fo.decode("utf-8", "replace") if isinstance(fo, bytes) else str(fo or "")
+                for cand in [c.strip() for c in ftxt.splitlines() if c.strip()]:
+                    if cand != mysqldump_bin and _dump_flavor(cand) == want:
+                        mysqldump_bin = cand
+                        break
+            except Exception:
+                pass
+
     # 2) 解析备份范围
     db_name = task.get("db_name") or ""
     port = task.get("port") or 3306

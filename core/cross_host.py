@@ -202,10 +202,21 @@ def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
         else:
             pre = ""
         target = f"'{target_db}'" if target_db else ""
+        # 目标库不存在时自动创建：单库 dump 不含 CREATE DATABASE，
+        # 否则导入报 ERROR 1049 Unknown database（全实例路径已有自动建库，
+        # 单库跨主机路径此前缺失）。
+        create_part = ""
+        if target_db:
+            safe_db = str(target_db).replace("`", "")
+            create_part = (
+                f"mysql -h {host} -P {port} -u {user} -p'{pw_esc}' "
+                f"-e 'CREATE DATABASE IF NOT EXISTS `{safe_db}`' && "
+            )
         # 恢复前清空 GTID，避免含 GTID_PURGED 的备份导入时报 1840
         reset_sql = extra.get("_mysql_reset_sql") or "RESET MASTER"
         return (
-            f"{pre}mysql -h {host} -P {port} -u {user} -p'{pw_esc}' -e '{reset_sql}' && "
+            f"{pre}{create_part}"
+            f"mysql -h {host} -P {port} -u {user} -p'{pw_esc}' -e '{reset_sql}' && "
             f"mysql -h {host} -P {port} -u {user} -p'{pw_esc}' {target} < '{actual}'"
         )
 

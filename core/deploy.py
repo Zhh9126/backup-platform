@@ -182,7 +182,9 @@ MYSQL_INSTALL_DB={base}/bin/mysql_install_db
 init_rc=0
 if [ -x "$MYSQLD" ] && [ "$MAJOR" -ge 5 ] && ([ "$MINOR" -ge 7 ] || [ "$MAJOR" -ge 8 ]); then
     echo "[deploy] 使用 mysqld --initialize-insecure (MySQL 5.7+ / 8.0+ / 9.x)"
-    $MYSQLD --initialize-insecure --user=mysql --datadir={data} --basedir={base} 2>&1 | head -30
+    # --no-defaults 必须是第一个参数：屏蔽 /etc/my.cnf 等外部配置中残留的
+    # datadir/log-bin 等设置，避免初始化读到旧实例配置而失败
+    $MYSQLD --no-defaults --initialize-insecure --user=mysql --datadir={data} --basedir={base} 2>&1 | head -30
     init_rc=${{PIPESTATUS[0]}}
     if [ $init_rc -ne 0 ]; then
         # 常见原因：datadir 有残留 / libaio 缺失
@@ -938,18 +940,23 @@ def run_deployment(dep_id: int) -> None:
         if pkg_path:
             if os.path.isfile(pkg_path):
                 remote_pkg = "/tmp/" + os.path.basename(pkg_path)
-                try:
-                    log(f"上传安装包: {pkg_path} -> {remote_pkg}")
-                    sftp = client.open_sftp()
-                    sftp.put(pkg_path, remote_pkg)
-                    sftp.close()
-                    log(f"安装包上传完成")
-                    # 更新 remote package path
-                    models.update_deployment(dep_id, {"package_path": remote_pkg})
-                    pkg_path = remote_pkg
-                except Exception as e:
-                    log(f"安装包上传失败: {e}")
-                    raise
+                # 本机部署防自毁：目标主机即平台本机时 remote_pkg 可能与
+                # 源路径相同，sftp.put 自己到自己会把包截断成 0 字节
+                if os.path.abspath(remote_pkg) == os.path.abspath(pkg_path):
+                    log(f"安装包已在目标主机同路径（本机部署），跳过上传: {remote_pkg}")
+                else:
+                    try:
+                        log(f"上传安装包: {pkg_path} -> {remote_pkg}")
+                        sftp = client.open_sftp()
+                        sftp.put(pkg_path, remote_pkg)
+                        sftp.close()
+                        log(f"安装包上传完成")
+                        # 更新 remote package path
+                        models.update_deployment(dep_id, {"package_path": remote_pkg})
+                        pkg_path = remote_pkg
+                    except Exception as e:
+                        log(f"安装包上传失败: {e}")
+                        raise
             elif pkg_path.startswith(("/", "~")):
                 # 用户填的是远程路径，检查目标主机是否存在
                 log(f"检查远程包是否存在: {pkg_path}")

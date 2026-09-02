@@ -34,7 +34,7 @@ logger = logging.getLogger("restore_extras")
 def capture_mysql_cdc(task: dict, password: str) -> Dict[str, Any]:
     """调用 mysql -e 'SHOW MASTER STATUS' 拿 binlog 位点。"""
     try:
-        cmd = ["mysql", "-h", str(task.get("host") or "127.0.0.1"),
+        cmd = ["mysql", "--no-defaults", "-h", str(task.get("host") or "127.0.0.1"),
                "-P", str(task.get("port") or 3306),
                "-u", str(task.get("username") or "root"),
                f"--password={password}"]
@@ -75,6 +75,25 @@ def capture_pg_cdc(task: dict, password: str) -> Dict[str, Any]:
 # ============================================================
 # 2. PITR：MySQL binlog replay / PG recovery_target_time
 # ============================================================
+def _norm_stop_datetime(ts: str) -> str:
+    """把 ISO8601 时间归一化为 mysqlbinlog --stop-datetime 认可的格式。
+
+    ``2026-09-02T08:51:00+08:00`` → ``2026-09-02 08:51:00``（本地时区）。
+    解析失败时退化为简单的 T/时区剥离，保证不向 mysqlbinlog 传非法值。
+    """
+    s = (ts or "").strip()
+    if not s:
+        return s
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone()
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return s.replace("T", " ").split("+")[0].split(".")[0].strip()
+
+
 def mysql_pitr_restore(backup_path: str, target_time: str, target: dict) -> Dict[str, Any]:
     """MySQL PITR：先做全量恢复，再调用 mysqlbinlog replay 到 target_time。
     target: {host, port, user, password, db}
@@ -93,7 +112,7 @@ def mysql_pitr_restore(backup_path: str, target_time: str, target: dict) -> Dict
     if target.get("password"):
         env["MYSQL_PWD"] = target["password"]
     db_arg = f" {db_name}" if db_name else ""
-    cmd_full = ["mysql", "-h", str(target.get("host") or "127.0.0.1"),
+    cmd_full = ["mysql", "--no-defaults", "-h", str(target.get("host") or "127.0.0.1"),
                 "-P", str(target.get("port") or 3306),
                 "-u", str(target.get("user") or "root")] + db_arg.split()
     logger.info("[pitr] mysql full restore: %s", " ".join(cmd_full))
@@ -113,20 +132,24 @@ def mysql_pitr_restore(backup_path: str, target_time: str, target: dict) -> Dict
     if not os.path.exists(binlog_path):
         return {"ok": True, "message": f"全量恢复成功（找不到 binlog {binlog_path}，未执行增量）",
                 "skipped_replay": True}
-    cmd_binlog = ["mysqlbinlog", f"--start-position={binlog_pos}",
-                  f"--stop-datetime={target_time}", binlog_path]
+    stop_dt = _norm_stop_datetime(target_time)
+    # --skip-gtids：源库 GTID_MODE=ON 而目标可能为 OFF，回放 SQL 中的
+    # SET @@SESSION.GTID_NEXT 会导致 ERROR 1781，统一剥离 GTID 语句
+    cmd_binlog = ["mysqlbinlog", "--skip-gtids=true",
+                  f"--start-position={binlog_pos}",
+                  f"--stop-datetime={stop_dt}", binlog_path]
     logger.info("[pitr] mysqlbinlog replay: %s", " ".join(cmd_binlog))
     r2 = subprocess.run(cmd_binlog, capture_output=True, text=True, timeout=1800)
     if r2.returncode != 0:
         return {"ok": False, "message": f"binlog replay 失败: {r2.stderr[:200]}"}
     # 5) 把 replay 出的 SQL 灌入目标
-    cmd_apply = ["mysql", "-h", str(target.get("host") or "127.0.0.1"),
+    cmd_apply = ["mysql", "--no-defaults", "-h", str(target.get("host") or "127.0.0.1"),
                  "-P", str(target.get("port") or 3306),
                  "-u", str(target.get("user") or "root")] + db_arg.split()
     r3 = subprocess.run(cmd_apply, env=env, input=r2.stdout, capture_output=True, text=True)
     if r3.returncode != 0:
         return {"ok": False, "message": f"apply binlog SQL 失败: {r3.stderr[:200]}"}
-    return {"ok": True, "message": f"PITR 成功，已 replay 至 {target_time}",
+    return {"ok": True, "message": f"PITR 成功，已 replay 至 {stop_dt}",
             "binlog_replayed": True, "target_time": target_time}
 
 
@@ -207,7 +230,7 @@ def mysql_restore_object(backup_path: str, object_name: str, target: dict) -> Di
     env = os.environ.copy()
     if target.get("password"):
         env["MYSQL_PWD"] = target["password"]
-    cmd = ["mysql", "-h", str(target.get("host") or "127.0.0.1"),
+    cmd = ["mysql", "--no-defaults", "-h", str(target.get("host") or "127.0.0.1"),
            "-P", str(target.get("port") or 3306),
            "-u", str(target.get("user") or "root"),
            str(target.get("db") or "")]
@@ -256,7 +279,7 @@ def mysql_clone_to_test(backup_path: str, instance_name: str, base_port: int = 3
     env = os.environ.copy()
     if mysql_password:
         env["MYSQL_PWD"] = mysql_password
-    base = ["mysql", "-h", mysql_host, "-P", str(mysql_port), "-u", mysql_user]
+    base = ["mysql", "--no-defaults", "-h", mysql_host, "-P", str(mysql_port), "-u", mysql_user]
     # 1) 创建克隆库
     cmd_create = base + ["-N", "-e",
                          f"CREATE DATABASE IF NOT EXISTS `{instance_name}` CHARACTER SET utf8mb4"]
@@ -375,7 +398,7 @@ def drop_clone(db_type: str, instance_name: str,
     if pg_password:
         env["PGPASSWORD"] = pg_password
     if db_type == "mysql":
-        cmd = ["mysql", "-h", "127.0.0.1", "-P", "3306", "-u", "root", "-N", "-e",
+        cmd = ["mysql", "--no-defaults", "-h", "127.0.0.1", "-P", "3306", "-u", "root", "-N", "-e",
                f"DROP DATABASE IF EXISTS `{instance_name}`"]
     elif db_type == "postgresql":
         pg_port = os.environ.get("PGPORT") or 5432

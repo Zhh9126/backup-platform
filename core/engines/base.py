@@ -341,10 +341,52 @@ class BackupEngine:
         return total
 
     # ---------------- 通用工具 ----------------
+    # 本机常见客户端安装目录（平台侧兜底；命中后自动注入 PATH）
+    _LOCAL_TOOL_FALLBACK_GLOBS = (
+        "/opt/*/bin", "/opt/*/*/bin", "/usr/local/*/bin",
+        "/data/*/bin", "/opt/database/bin",
+    )
+
+    def _ensure_local_clients_on_path(self, tools: list) -> tuple:
+        """PATH 找不到的客户端工具：任务级 tool_path → 常见安装目录 逐级兜底。
+
+        命中后把目录注入 os.environ["PATH"]（进程级，后续 _run 子进程继承），
+        避免因平台服务启动方式不同、PATH 未包含客户端目录而误报
+        "缺少客户端工具"。返回 (仍缺失列表, 兜底命中说明列表)。
+        """
+        import glob as _glob
+        still = []
+        hit_notes = []
+        cand_dirs = [d for d in (self._task_tool_path() or "").split(":") if d]
+        cand_dirs.append("/opt/database/bin")
+        for pat in self._LOCAL_TOOL_FALLBACK_GLOBS:
+            cand_dirs.extend(_glob.glob(pat))
+        seen = set()
+        cand_dirs = [d for d in cand_dirs if not (d in seen or seen.add(d))]
+        for c in tools:
+            if shutil.which(c):
+                continue
+            for d in cand_dirs:
+                p = os.path.join(d, c)
+                if os.path.isfile(p) and os.access(p, os.X_OK):
+                    cur = os.environ.get("PATH", "")
+                    if d not in cur.split(os.pathsep):
+                        os.environ["PATH"] = d + os.pathsep + cur
+                    hit_notes.append(f"{c}@{d}")
+                    break
+            else:
+                still.append(c)
+        return still, hit_notes
+
     def check_client(self) -> (bool, str):
-        missing = [c for c in self.required_clients if not shutil.which(c)]
+        missing, hits = self._ensure_local_clients_on_path(
+            list(self.required_clients))
         if missing:
-            return False, "缺少客户端工具: " + ", ".join(missing) + "（请安装并在 PATH 中）"
+            return False, ("缺少客户端工具: " + ", ".join(missing)
+                           + "（已尝试 PATH 与常见安装目录自动探测；"
+                             "请安装客户端，或在任务高级选项配置 tool_path 指向 bin 目录）")
+        if hits:
+            return True, "ok（客户端工具已自动注入 PATH: " + ", ".join(hits) + "）"
         return True, "ok"
 
     def _preflight_remote_physical(self, ssh_host: dict) -> (bool, str):
@@ -481,11 +523,11 @@ class BackupEngine:
                 self.logger.warning(
                     "[%s] 远端物理备份工具缺失（%s），转检查本机",
                     self.task_name, msg2)
-            # 查本机自带工具
+            # 查本机自带工具（同样走兜底探测，避免 PATH 问题误报）
             if self.physical_bundled_tools:
-                missing = [t for t in self.physical_bundled_tools
-                           if not shutil.which(t)]
-                if not missing:
+                miss_phys, _ = self._ensure_local_clients_on_path(
+                    list(self.physical_bundled_tools))
+                if not miss_phys:
                     if ssh_host:
                         return True, ("远端未安装物理备份工具，本机具备，"
                                       "将回退本机执行")

@@ -178,6 +178,25 @@ class RecoveryJournal:
             if base and point.pit_at == base.pit_at and point.pit_seq < base.pit_seq:
                 continue
             chain.append(point)
+        # DB 日志段补纳：段封存时间(pit_at)常晚于目标时间点，但其内容
+        # 覆盖到封存前一刻的事件；若严格按 pit_at<=target 过滤会把覆盖
+        # 目标窗口的最后一个段排除掉，导致回放缺段。这里补纳首个
+        # pit_at > target_ts 的日志段，精确截断由回放侧
+        # --stop-datetime / --stop-position 保证（文件/增量段不适用）。
+        if inc_kind == RP_DB_LOG:
+            try:
+                nxt_rows = models.list_recovery_points(
+                    task_id=task_id, start=target_ts, kind=inc_kind,
+                    limit=1, order="asc")
+            except Exception:
+                nxt_rows = []
+            for row in nxt_rows:
+                point = RecoveryPoint.from_row(row)
+                if point.pit_at <= target_ts:
+                    continue  # 已在链中（end<=target 已纳入）
+                if any(p.id == point.id for p in chain):
+                    continue
+                chain.append(point)
         return chain
 
     def validate_chain(self, chain: List[RecoveryPoint]) -> Tuple[bool, str]:

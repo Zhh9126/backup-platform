@@ -214,14 +214,14 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
                     <input type="password" class="form-control form-control-sm" id="t_ssh_pwd" placeholder="留空表示不修改">
                     <div class="small text-muted" id="t_ssh_state"></div>
                   </div>
-                  <div class="col-12">
-                    <label class="form-label">备份命令所在目录（可选，手动兜底）</label>
-                    <input class="form-control form-control-sm font-monospace" id="t_tool_path"
-                           placeholder="如 /kes/app/KESRealPro/V9/Server/bin:/opt/mssql-tools/bin（自动探测不到时填写，冒号分隔）">
-                    <div class="small text-muted">
-                      平台会自动发现数据库服务器上的备份工具（运行进程 / 常见目录 / 包管理器）；
-                      仅当探测不到时在此填写 bin 目录，将作为 PATH 前缀注入远程与本机执行。
-                    </div>
+                </div>
+                <div class="col-12 mt-2">
+                  <label class="form-label">备份命令所在目录（可选，手动兜底，全数据库类型生效）</label>
+                  <input class="form-control form-control-sm font-monospace" id="t_tool_path"
+                         placeholder="如 /kes/app/KESRealPro/V9/Server/bin:/opt/mssql-tools/bin（自动探测不到时填写，冒号分隔）">
+                  <div class="small text-muted">
+                    平台会自动发现数据库服务器上的备份工具（运行进程 / 常见目录 / 包管理器）；
+                    仅当探测不到时在此填写 bin 目录，将作为 PATH 前缀注入远程与本机执行。
                   </div>
                 </div>
               </div>

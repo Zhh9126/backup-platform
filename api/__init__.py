@@ -15,14 +15,25 @@ PUBLIC_API_PATHS = {"/api/meta", "/api/health"}
 def _api_security_gate():
     """API 全局安全钩子（必须在嵌套蓝图注册前声明）。
 
-    1) 鉴权兜底：任何 API 都要求已登录（白名单除外）。
+    1) 鉴权兜底：任何 API 都要求已登录或持有有效外部调用令牌（白名单除外）。
        即使个别路由遗漏 @login_required，也不会匿名可访问。
+       外部系统调用：Authorization: Bearer <token> / X-API-Token（api_tokens 表）。
     2) CSRF 防护：写操作校验 Origin/Referer 同源。
-       无 Origin/Referer 头（如本机 curl/脚本）且已登录时放行。
+       无 Origin/Referer 头（如本机 curl/脚本）且已登录时放行；
+       令牌认证的请求（非浏览器）不适用 CSRF，直接放行写操作。
     """
-    if request.path not in PUBLIC_API_PATHS and "user" not in session:
-        return jsonify({"success": False, "error": "未登录或会话已过期"}), 401
-    if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+    from auth import _extract_bearer_token, _valid_api_token
+
+    token_auth = False
+    if "user" not in session:
+        token = _extract_bearer_token()
+        if request.path not in PUBLIC_API_PATHS:
+            if not token or not _valid_api_token(token):
+                return jsonify({"success": False,
+                                "error": "未登录或会话已过期（外部调用请携带 "
+                                         "Authorization: Bearer <token>）"}), 401
+            token_auth = True
+    if request.method in ("POST", "PUT", "DELETE", "PATCH") and not token_auth:
         origin = (request.headers.get("Origin") or request.headers.get("Referer") or "").strip()
         if origin:
             o = urlparse(origin)

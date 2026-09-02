@@ -241,6 +241,17 @@ def save_notify_config():
         except (json.JSONDecodeError, TypeError):
             cfg = {}
     else:
+        # 防静默丢字段：识别到平铺 SMTP 字段（契约要求 channels 数组结构）时
+        # 直接 400 提示，而不是忽略后返回"保存成功"造成配置丢失假象
+        flat_smtp = {"smtp_host", "smtp_port", "smtp_user", "smtp_password",
+                     "username", "password", "from_addr", "to_addrs", "to"}
+        suspect = sorted(flat_smtp & set(data.keys()))
+        if suspect and "channels" not in data:
+            return jsonify({"error": (
+                "通知配置格式不正确：请使用 {enabled, on_success, on_failure, "
+                "channels: [{type:'email', smtp_host, smtp_port, smtp_user, "
+                "smtp_password, from_addr, to, use_tls}]} 结构"
+                f"（检测到疑似误传的字段: {', '.join(suspect)}）")}), 400
         cfg = {
             "enabled": bool(data.get("enabled", False)),
             "on_success": bool(data.get("on_success", False)),
@@ -508,3 +519,33 @@ def test_pool_crypto():
         "ok": False,
         "error": "KMS 不可达或凭证无效（请确认 endpoint/key_id/access_key/secret，或网络是否可达）",
     }), 400
+
+
+# ======================================================================
+# 外部 API 调用令牌管理（页面会话鉴权；供外部系统调用的 Bearer Token）
+# ======================================================================
+@api_bp.route("/tokens", methods=["GET"])
+@login_required
+def api_list_tokens():
+    return jsonify({"success": True, "data": models.list_api_tokens()})
+
+
+@api_bp.route("/tokens", methods=["POST"])
+@login_required
+def api_create_token():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "令牌名称必填"}), 400
+    plain = models.create_api_token(name, created_by=session.get("user") or "system")
+    return jsonify({"success": True, "token": plain,
+                    "warning": "令牌明文仅此一次展示，请立即保存；平台仅存哈希"}), 201
+
+
+@api_bp.route("/tokens/<int:token_id>", methods=["DELETE"])
+@login_required
+def api_revoke_token(token_id):
+    ok = models.revoke_api_token(token_id)
+    if not ok:
+        return jsonify({"error": "令牌不存在"}), 404
+    return jsonify({"success": True, "message": "令牌已吊销"})

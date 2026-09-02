@@ -2435,3 +2435,54 @@ def get_data_compare_stats() -> dict:
         "failed_count": int(failed["c"] if failed else 0),
         "last_compare_at": last["created_at"] if last else None,
     }
+
+
+# ======================================================================
+# 外部 API 调用令牌（Bearer Token，仅哈希落库，明文只在创建时展示一次）
+# ======================================================================
+def create_api_token(name: str, created_by: str = "system") -> str:
+    """创建外部调用令牌，返回明文（仅此一次，落库为 sha256 哈希）。"""
+    import hashlib
+    import secrets
+    name = (name or "").strip() or "unnamed"
+    plain = "bk_" + secrets.token_hex(24)
+    token_hash = hashlib.sha256(plain.encode()).hexdigest()
+    db.execute(
+        "INSERT INTO api_tokens (name, token_hash, created_by, created_at, revoked)"
+        " VALUES (?,?,?,?,0)",
+        (name, token_hash, created_by, db.now_iso()))
+    return plain
+
+
+def list_api_tokens() -> list:
+    """列出令牌（脱敏：不含哈希）。"""
+    rows = db.query(
+        "SELECT id, name, created_by, created_at, last_used_at, revoked"
+        " FROM api_tokens ORDER BY id DESC")
+    return rows
+
+
+def revoke_api_token(token_id: int) -> bool:
+    cur = db.query_one("SELECT id FROM api_tokens WHERE id=?", (int(token_id),))
+    if not cur:
+        return False
+    db.execute("UPDATE api_tokens SET revoked=1 WHERE id=?", (int(token_id),))
+    return True
+
+
+def verify_api_token(token: str) -> Optional[dict]:
+    """校验外部令牌；有效返回令牌行并刷新 last_used_at，无效返回 None。"""
+    if not token:
+        return None
+    import hashlib
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    row = db.query_one(
+        "SELECT * FROM api_tokens WHERE token_hash=? AND revoked=0", (token_hash,))
+    if not row:
+        return None
+    try:
+        db.execute("UPDATE api_tokens SET last_used_at=? WHERE id=?",
+                   (db.now_iso(), row["id"]))
+    except Exception:
+        pass
+    return row

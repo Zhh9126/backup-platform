@@ -36,3 +36,5 @@ startup*.log
 # 本地测试环境依赖（金仓客户端 / 达梦驱动构建产物，随机器安装不随库分发）
 .tools/
 lib
+cookies.txt
+mysql-bin.*

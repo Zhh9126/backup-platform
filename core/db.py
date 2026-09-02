@@ -511,6 +511,17 @@ CREATE TABLE IF NOT EXISTS db_migration_plans (
     finished_at    TEXT
 );
 
+-- 外部 API 调用令牌（Bearer Token，哈希存储，支持吊销）
+CREATE TABLE IF NOT EXISTS api_tokens (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    name          TEXT NOT NULL,
+    token_hash    TEXT NOT NULL UNIQUE,      -- sha256(明文令牌)，明文只在创建时展示一次
+    created_by    TEXT,
+    created_at    TEXT,
+    last_used_at  TEXT,
+    revoked       INTEGER DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS clone_requests (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     source_record_id INTEGER,                         -- 克隆源备份记录

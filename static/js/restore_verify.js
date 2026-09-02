@@ -120,7 +120,7 @@
       const sel = $("vp_task_id");
       sel.innerHTML = '<option value="">请选择备份任务</option>' +
         tasksCache.map((t) =>
-          '<option value="' + t.id + '">' + esc((t.instance_name || t.name || "任务") + " #" + t.id +
+          '<option value="' + t.id + '">' + esc((t.instance_name || t.name || "任务") +
           (t.db_type ? " (" + t.db_type + ")" : "")) + '</option>'
         ).join("");
     });

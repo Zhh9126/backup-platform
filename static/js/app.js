@@ -472,6 +472,7 @@
     } else {
       $("taskModalTitle").textContent = "新建备份任务";
       $("t_id").value = "";
+      $("t_backup_mode").value = "logical";
       const p = META.default_ports[$("t_db_type").value];
       if (p) $("t_port").value = p;
       if ($("t_encrypt_pool")) $("t_encrypt_pool").checked = false;
@@ -712,7 +713,14 @@
   function toggleCustomBox() {
     const box = $("t_custom_box");
     const sel = $("t_backup_mode");
-    if (box && sel) box.style.display = sel.value === "custom" ? "" : "none";
+    if (box && sel) {
+      const isCustom = sel.value === "custom";
+      box.style.display = isCustom ? "" : "none";
+      // 选中「自定义脚本」时定位到脚本编辑区，避免用户找不到输入框
+      if (isCustom && box.offsetParent !== null) {
+        box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+    }
     // SSH 通道开关绑定（一次性）
     const sc = $("t_ssh_same");
     if (sc && !sc._bound) { sc._bound = true; sc.onchange = toggleSshFields; }

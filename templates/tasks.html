@@ -146,6 +146,43 @@
                   </div>
                 </div>
               </div>
+
+              <!-- 自定义脚本备份（选择「自定义脚本」时展开，全数据库类型通用） -->
+              <div class="mb-3 border rounded p-3 bg-light" id="t_custom_box" style="display:none">
+                <div class="fw-bold mb-2"><i class="bi bi-terminal me-1"></i>自定义备份脚本（在数据库服务器上以 bash 执行）</div>
+                <div class="mb-2 small text-muted">
+                  平台注入环境变量：<code>PLATFORM_DB_HOST / PLATFORM_DB_PORT / PLATFORM_DB_USER /
+                  PLATFORM_DB_PASSWORD / PLATFORM_DB_NAME / PLATFORM_BACKUP_TYPE / PLATFORM_BACKUP_DIR</code>。
+                  脚本退出码 0 = 成功；<b>必须把备份产物写入 <code>$PLATFORM_BACKUP_DIR</code></b>，平台自动 SFTP 拉回并计算大小与 sha256，
+                  支持定时调度与三级存储复制。执行通道 = 数据库服务器 SSH（见「高级选项」的任务级 SSH 凭据或纳管主机）。
+                </div>
+                <label class="form-label">备份脚本 (bash)</label>
+                <textarea class="form-control font-monospace" id="t_custom_script" rows="8"
+                  placeholder='#!/bin/bash
+# 例：MySQL 自定义备份（平台已注入环境变量）
+mysqldump -h $PLATFORM_DB_HOST -P $PLATFORM_DB_PORT -u $PLATFORM_DB_USER -p"$PLATFORM_DB_PASSWORD" \
+  $PLATFORM_DB_NAME | gzip > $PLATFORM_BACKUP_DIR/mybackup.sql.gz
+echo "done"'></textarea>
+                <div class="row g-2 mt-1">
+                  <div class="col-md-6">
+                    <label class="form-label">产物目录（可选，默认平台自动分配）</label>
+                    <input class="form-control font-monospace" id="t_custom_artifact_dir" placeholder="/var/tmp/platform_backup/...">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label">超时秒数（可选，默认 7200）</label>
+                    <input class="form-control" id="t_custom_timeout" type="number" min="60" placeholder="7200">
+                  </div>
+                </div>
+                <label class="form-label mt-2">恢复脚本 (bash，可选)</label>
+                <div class="small text-muted mb-1">
+                  配置后恢复页可直接使用：平台自动把备份文件推送到目标主机并注入
+                  <code>PLATFORM_BACKUP_FILE</code>（备份文件路径）、<code>PLATFORM_RESTORE_DB</code>（目标库名）。
+                </div>
+                <textarea class="form-control font-monospace" id="t_custom_restore" rows="4"
+                  placeholder='#!/bin/bash
+# 例：MySQL 自定义恢复
+gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USER -p"$PLATFORM_DB_PASSWORD" $PLATFORM_RESTORE_DB'></textarea>
+              </div>
             </div>
             <div class="tab-pane fade" id="tab_advanced" role="tabpanel">
               <div class="col-12 border rounded p-3 bg-light mb-1">
@@ -301,38 +338,7 @@
               <div class="mb-3">
                 <label class="form-label">类型参数 (JSON)</label>
                 <textarea class="form-control font-monospace" id="t_extra_options" rows="8" placeholder='{"key": "value"}'></textarea>
-                <div class="form-text">高级 / 透传参数，例如 <code>--set-gtid-purged=OFF</code> 填 <code>{"extra_args": "--set-gtid-purged=OFF"}</code></div>
-              </div>
-
-              <div class="mb-3 border rounded p-3" id="t_custom_box" style="display:none">
-                <div class="fw-bold mb-2"><i class="bi bi-terminal me-1"></i>自定义备份脚本（在数据库服务器上以 bash 执行）</div>
-                <div class="mb-2 small text-muted">
-                  平台会注入环境变量：<code>PLATFORM_DB_HOST / PLATFORM_DB_PORT / PLATFORM_DB_USER /
-                  PLATFORM_DB_PASSWORD / PLATFORM_DB_NAME / PLATFORM_BACKUP_TYPE / PLATFORM_BACKUP_DIR</code>。
-                  脚本退出码 0 = 成功；<b>必须把备份产物写入 <code>$PLATFORM_BACKUP_DIR</code></b>，平台会拉回并计算校验值。
-                </div>
-                <label class="form-label">备份脚本 (bash)</label>
-                <textarea class="form-control font-monospace" id="t_custom_script" rows="8"
-                  placeholder='#!/bin/bash
-# 例：MySQL 自定义备份（平台已注入环境变量）
-mysqldump -h $PLATFORM_DB_HOST -P $PLATFORM_DB_PORT -u $PLATFORM_DB_USER -p"$PLATFORM_DB_PASSWORD" \
-  $PLATFORM_DB_NAME | gzip > $PLATFORM_BACKUP_DIR/mybackup.sql.gz
-echo "done"'></textarea>
-                <div class="row g-2 mt-1">
-                  <div class="col-md-6">
-                    <label class="form-label">产物目录（可选，默认平台自动分配）</label>
-                    <input class="form-control font-monospace" id="t_custom_artifact_dir" placeholder="/var/tmp/platform_backup/...">
-                  </div>
-                  <div class="col-md-6">
-                    <label class="form-label">超时秒数（可选，默认 7200）</label>
-                    <input class="form-control" id="t_custom_timeout" type="number" min="60" placeholder="7200">
-                  </div>
-                </div>
-                <label class="form-label mt-2">恢复脚本 (bash，可选)</label>
-                <textarea class="form-control font-monospace" id="t_custom_restore" rows="4"
-                  placeholder='#!/bin/bash
-# 平台注入：PLATFORM_BACKUP_FILE=推送到该主机的备份文件路径，PLATFORM_RESTORE_DB=目标库名
-gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USER -p"$PLATFORM_DB_PASSWORD" $PLATFORM_RESTORE_DB'></textarea>
+                <div class="form-text">高级 / 透传参数，例如 <code>--set-gtid-purged=OFF</code> 填 <code>{"extra_args": "--set-gtid-purged=OFF"}</code>；自定义脚本的环境变量在「基本配置」页填写</div>
               </div>
             </div>
           </div>

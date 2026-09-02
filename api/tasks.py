@@ -180,6 +180,22 @@ def update_task(task_id):
         if err:
             return jsonify({"error": err}), 400
     if data.get("extra_options"):
+        # ssh_cred 保护：局部更新（如只改 enabled/备注/环境变量）时若请求未携带
+        # ssh_cred，自动保留任务原有凭据——防止整列覆盖导致远程执行通道静默丢失
+        try:
+            import json as _json
+            new_eo = (_json.loads(data["extra_options"])
+                      if isinstance(data["extra_options"], str)
+                      else dict(data["extra_options"]))
+            if isinstance(new_eo, dict) and "ssh_cred" not in new_eo:
+                old = models.get_task(task_id, include_secret=True) or {}
+                old_eo = old.get("extra_options")
+                old_eo = (_json.loads(old_eo) if isinstance(old_eo, str) else old_eo) or {}
+                if isinstance(old_eo, dict) and old_eo.get("ssh_cred"):
+                    new_eo["ssh_cred"] = old_eo["ssh_cred"]
+                    data["extra_options"] = _json.dumps(new_eo, ensure_ascii=False)
+        except Exception:
+            pass
         data["extra_options"] = _secure_ssh_cred(data["extra_options"])
     models.update_task(task_id, data)
     scheduler.reload_scheduler()

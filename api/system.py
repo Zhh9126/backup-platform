@@ -2,7 +2,7 @@
 """系统/仪表盘/调度/日志/元信息 API。"""
 import os
 import logging
-from flask import jsonify, request
+from flask import jsonify, request, session
 import json
 
 logger = logging.getLogger("api.system")

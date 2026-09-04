@@ -18,7 +18,10 @@
 #     -v /opt/xtrabackup8:/opt/xtrabackup8:ro       # xtrabackup 8.0（MySQL 8.0+，可选，覆盖内置路径）
 # 路径可用环境变量 XTRABACKUP_8_PATH / XTRABACKUP_24_PATH / MARIABACKUP_PATH 覆盖。
 
-FROM python:3.14-slim-bookworm
+# 3.12 而非 3.14：oracledb 等 C 扩展依赖尚无 cp314 预编译 wheel，
+# 3.14 基础镜像下 pip 报 "Could not find a version ... (from versions: none)"
+# 导致镜像构建失败（本地与 GitHub Actions 同样复现）
+FROM python:3.12-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

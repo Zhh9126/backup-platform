@@ -312,6 +312,12 @@ class PostgreSQLEngine(BackupEngine):
         if config.DEMO_MODE == "on":
             return self._simulate_restore(backup_path, "DEMO_MODE=on 强制仿真")
 
+        # 调用方指定的恢复目标主机/端口优先于任务原配置（同库型异机恢复）
+        if kwargs.get("target_host"):
+            self.task["host"] = kwargs["target_host"]
+        if kwargs.get("target_port"):
+            self.task["port"] = kwargs["target_port"]
+
         # 0) 跨主机恢复
         target_host_info = kwargs.get("target_host_info")
         if target_host_info:
@@ -335,11 +341,13 @@ class PostgreSQLEngine(BackupEngine):
                 is_custom = backup_path.endswith(".dump")
                 remote_dump.remote_db_restore(
                     self.task, ssh_host, "postgresql", dump_bytes, is_custom=is_custom)
-                target_db = kwargs.get("target_db") or self.task.get("db_name")
+                # SSH 兜底通道恢复到任务原库（暂不支持指定新目标库名），如实提示
+                actual_db = self.task.get("db_name")
                 return BackupResult(
                     success=True, status=BackupStatus.SUCCESS,
                     backup_path=backup_path,
-                    message="通过 SSH 在数据库服务器恢复成功 -> " + str(target_db or ""))
+                    message="通过 SSH 在数据库服务器恢复成功（恢复到任务原库 "
+                            + str(actual_db or "") + "）")
             except Exception as e:
                 self.logger.error("[%s] 远程恢复也失败: %s", self.task_name, e)
                 reason = f"本机与远程恢复均失败: {e}"
@@ -639,8 +647,19 @@ class PostgreSQLEngine(BackupEngine):
             self.logger.warning("[%s] extra_options 解析失败: %s", self.task_name, e)
             return []
         if isinstance(data, dict):
+            # 仅白名单字段允许作为 CLI 扩展参数追加；ssh_cred/tool_path/
+            # env_vars 等内部字段绝不能混入命令行（曾导致 pg_restore 报
+            # "too many command-line arguments"）
+            reserved = {
+                "ssh_cred", "ssh_host_id", "ssh_host", "tool_path",
+                "env_vars", "custom_script", "custom_restore_script",
+                "custom_artifact_dir", "encrypt_pool", "demo_only",
+                "all_db_mode", "include_system_dbs", "pg_basebackup_extra_args",
+            }
             args = []
             for k, v in data.items():
+                if str(k) in reserved:
+                    continue
                 # 支持 {"key": "value"} 与 {"--flag": None} 形式
                 if v is None or v == "":
                     args.append(str(k))

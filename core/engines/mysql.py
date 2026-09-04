@@ -776,6 +776,12 @@ class MySQLEngine(BackupEngine):
         logs = [f"[MySQL 恢复] 备份文件: {backup_path}",
                 f"[MySQL 恢复] 任务: {self.task_name} ({self.task.get('host')}:{self.task.get('port')})"]
 
+        # 调用方指定的恢复目标主机/端口优先于任务原配置（同库型异机恢复）
+        if kwargs.get("target_host"):
+            self.task["host"] = kwargs["target_host"]
+        if kwargs.get("target_port"):
+            self.task["port"] = kwargs["target_port"]
+
         # demo_only / DEMO_MODE 不再触发仿真；客户端或连接缺失直接失败。
 
         # 0) 跨主机恢复：SFTP 推送到目标主机 → SSH 远程执行 mysql
@@ -1361,6 +1367,22 @@ class MySQLEngine(BackupEngine):
             # 恢复前先清空 GTID，避免 1840 错误
             self._reset_gtid_before_restore(host=host, port=port)
 
+            # 指定目标库时自动建库（幂等）：否则 mysqldump --databases 产物
+            # 虽含 CREATE DATABASE，但按目标库导入时 mysql 会先报 1049
+            if target_db:
+                pre = self._run([
+                    "mysql", f"--defaults-file={cnf}",
+                    "--host", str(host), "--port", str(port), "-N", "-e",
+                    f"CREATE DATABASE IF NOT EXISTS `{target_db}` "
+                    "CHARACTER SET utf8mb4",
+                ])
+                if pre["returncode"] != 0:
+                    return BackupResult(
+                        success=False, status=BackupStatus.FAILED,
+                        backup_path=backup_path, duration_sec=round(time.time() - start, 3),
+                        stdout=pre["stdout"], stderr=pre["stderr"],
+                        message="MySQL 恢复失败（自动建库）: " + (pre["stderr"] or "未知错误"))
+
             # mysql 客户端基础参数
             mysql_args = [
                 "mysql",
@@ -1376,13 +1398,25 @@ class MySQLEngine(BackupEngine):
             # `cmd /c` 报 "文件名、目录名或卷标语法不正确"，也避免 POSIX 下
             # 依赖 `sh` 造成命令不存在。压缩文件在基类 _read_decompressed
             # 中统一解压，保证 zstd / gzip 均可正确恢复。
-            parallel = self._restore_parallel()
-            if parallel > 1:
-                # 表级并行导入：先按 CREATE TABLE 边界拆分 dump，再并发执行
-                res = self._restore_local_parallel(mysql_args, backup_path, parallel)
-                if res is not None:
-                    return res
-            res = self._run(mysql_args, input_file=backup_path)
+            # 恢复执行：
+            # - 指定 target_db 时，剥离 dump 中的 CREATE DATABASE / USE 语句，
+            #   否则 --databases 产物会把数据写回原库，目标库只是空壳（假成功）
+            # - 未指定 target_db 时沿用备份中的库名，可走表级并行导入
+            if target_db:
+                raw = self._read_decompressed(backup_path)
+                filtered = "\n".join(
+                    ln for ln in raw.decode("utf-8", "ignore").split("\n")
+                    if not re.match(r"(?i)^\s*(CREATE\s+DATABASE|USE\s)", ln)
+                )
+                res = self._run_with_stdin(mysql_args, filtered)
+            else:
+                parallel = self._restore_parallel()
+                if parallel > 1:
+                    # 表级并行导入：先按 CREATE TABLE 边界拆分 dump，再并发执行
+                    res = self._restore_local_parallel(mysql_args, backup_path, parallel)
+                    if res is not None:
+                        return res
+                res = self._run(mysql_args, input_file=backup_path)
             duration = round(time.time() - start, 3)
             if res["returncode"] != 0:
                 return BackupResult(

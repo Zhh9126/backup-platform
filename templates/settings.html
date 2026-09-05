@@ -282,4 +282,56 @@
   </div>
   <div class="alert alert-danger d-none mt-3" id="pcError"></div>
 </div>
+
+<!-- ===== Webhooks 事件中心 ===== -->
+<div class="page-card">
+  <h6 style="font-size:var(--font-size-base);font-weight:600;color:var(--text-primary);margin-bottom:var(--space-md)">
+    <i class="bi bi-broadcast"></i> Webhooks 事件中心</h6>
+  <div class="row g-3">
+    <div class="col-md-8">
+      <label class="form-label">推送地址（多个用逗号分隔）</label>
+      <input class="form-control" id="wh_urls" placeholder="http://ops.example.com/hook,http://127.0.0.1:9000/hook">
+      <div class="form-text">事件：备份成功/失败、恢复、合成完成、克隆销毁、摆渡导入。POST JSON，含 X-BP-Signature（HMAC-SHA256）。</div>
+    </div>
+    <div class="col-md-4">
+      <label class="form-label">签名密钥（可选）</label>
+      <input class="form-control" id="wh_secret" type="password" placeholder="留空=不签名">
+    </div>
+  </div>
+  <div class="mt-3 d-flex gap-2">
+    <button class="btn btn-sm btn-primary" id="whSaveBtn"><i class="bi bi-save"></i> 保存</button>
+    <button class="btn btn-sm btn-outline-secondary" id="whTestBtn"><i class="bi bi-send"></i> 发送测试事件</button>
+    <span class="form-text ms-2 text-muted" id="wh_result"></span>
+  </div>
+</div>
+<script>
+document.addEventListener("DOMContentLoaded", async function () {
+  if (!document.getElementById("wh_urls")) return;
+  try {
+    const cfg = await (await fetch("/api/webhooks", { credentials: "include" })).json();
+    document.getElementById("wh_urls").value = cfg.urls || "";
+    document.getElementById("wh_secret").value = cfg.secret || "";
+  } catch (e) { /* 忽略 */ }
+  const save = async (test) => {
+    const body = {
+      urls: document.getElementById("wh_urls").value.trim(),
+      secret: document.getElementById("wh_secret").value.trim(),
+      test: !!test,
+    };
+    try {
+      const r = await (await fetch("/api/webhooks", {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })).json();
+      document.getElementById("wh_result").textContent =
+        test ? ("测试事件送达端点数: " + (r.delivered ?? 0)) : "已保存";
+    } catch (e) {
+      document.getElementById("wh_result").textContent = "失败: " + e;
+    }
+  };
+  document.getElementById("whSaveBtn")?.addEventListener("click", () => save(false));
+  document.getElementById("whTestBtn")?.addEventListener("click", () => save(true));
+});
+</script>
 {% endblock %}

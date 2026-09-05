@@ -13,9 +13,18 @@ gfs_default_policy），清理备份记录与产物：
 物理删除（delete_files=true）或保留由存储层回收。物理全量/合成全量若
 仍被后续增量链引用则跳过（保守不删）。
 
+【安全护栏（真机事故教训）】
+1. 最新 KEEP_MIN=3 份备份永远保留，不受任何策略影响；
+2. delete_files 默认 False——仅标记状态不删文件，物理删除必须显式开启；
+3. 策略仅对显式配置 gfs_policy 的任务生效（全局默认策略只做标记，
+   不允许 delete_files）。
+
 入口：apply_gfs(task_id=None)（None=全部启用 GFS 的任务）；由 scheduler
 每日周期调用。
 """
+
+# 最新 N 份无条件保留（任何策略都不能删掉最近的备份）
+KEEP_MIN = 3
 import os
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -72,6 +81,32 @@ def _bucket_key(finished: str, kind: str) -> str:
     return ""
 
 
+def _recent_buckets(kind: str, n: int) -> set:
+    """以当前时间为基准，生成最近 n 个日/周/月/年桶键（保留窗口）。
+
+    语义：只有落在保留窗口内的备份才被 GFS 保留；窗口外的按桶内最新
+    语义已由窗口判定覆盖（窗口外一律清理）。
+    """
+    today = datetime.now()
+    keys = set()
+    for i in range(n):
+        if kind == "daily":
+            keys.add((today - timedelta(days=i)).strftime("%Y-%m-%d"))
+        elif kind == "weekly":
+            dt = today - timedelta(weeks=i)
+            keys.add(f"{dt.isocalendar().year}-W{dt.isocalendar().week:02d}")
+        elif kind == "monthly":
+            # 按月回退
+            y, m = today.year, today.month - i
+            while m <= 0:
+                m += 12
+                y -= 1
+            keys.add(f"{y:04d}-{m:02d}")
+        elif kind == "yearly":
+            keys.add(str(today.year - i))
+    return keys
+
+
 def apply_gfs(task_id: int = None, dry_run: bool = False) -> dict:
     """执行 GFS 清理。返回统计 {task_id: {kept, marked}}。"""
     tasks = ([models.get_task(task_id)] if task_id
@@ -88,7 +123,8 @@ def apply_gfs(task_id: int = None, dry_run: bool = False) -> dict:
             "ORDER BY finished_at DESC, id DESC", (tid,))
         if not rows:
             continue
-        # 分桶：每个桶内最新一份保留
+        # 保留判定：以当前时间为基准生成保留窗口（GFS 语义），
+        # 记录所在桶在任一窗口内即保留；窗口外的全部标记清理
         keep_ids, mark_ids = set(), set()
         for kind, n in (("daily", int(pol.get("daily", 0) or 0)),
                         ("weekly", int(pol.get("weekly", 0) or 0)),
@@ -96,32 +132,35 @@ def apply_gfs(task_id: int = None, dry_run: bool = False) -> dict:
                         ("yearly", int(pol.get("yearly", 0) or 0))):
             if n <= 0:
                 continue
-            buckets = defaultdict(list)
+            window = _recent_buckets(kind, n)
             for r in rows:
                 k = _bucket_key(r["finished_at"] or "", kind)
-                if k:
-                    buckets[k].append(r)
-            recent = sorted(buckets.keys(), reverse=True)[:n]
-            for k in recent:
-                if buckets[k]:
-                    keep_ids.add(buckets[k][0]["id"])
+                if k and k in window:
+                    keep_ids.add(r["id"])
         # 未被任何桶保留的 → 标记清理；被保留的跳过
         for r in rows:
             if r["id"] not in keep_ids:
                 mark_ids.add(r["id"])
-        # 保守规则：物理备份/合成备份若仍是链基备（有增量引用）不删
+        # 护栏1：最新 KEEP_MIN 份无条件保留
+        for r in rows[:KEEP_MIN]:
+            mark_ids.discard(r["id"])
+            keep_ids.add(r["id"])
+        # 护栏2：物理备份/合成备份若仍是链基备（有增量引用）不删
         for rid in list(mark_ids):
             refs = db.query(
                 "SELECT COUNT(*) AS c FROM backup_sets WHERE parent_set_id=?",
                 (rid,))
             if refs and refs[0]["c"] > 0:
                 mark_ids.discard(rid)
+        # 护栏3：物理删除默认关闭，须策略显式 delete_files=true；
+        #        全局默认策略（非任务级）永不物理删除
+        allow_del = bool(pol.get("delete_files")) and task_id is not None
         deleted_files = 0
         if mark_ids and not dry_run:
             for rid in mark_ids:
                 rec = db.query_one(
                     "SELECT backup_path FROM backup_records WHERE id=?", (rid,))
-                if rec and pol.get("delete_files") and rec.get("backup_path"):
+                if rec and allow_del and rec.get("backup_path"):
                     try:
                         if os.path.isfile(rec["backup_path"]):
                             os.remove(rec["backup_path"])

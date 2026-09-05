@@ -51,11 +51,15 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
+def _manifest_path(pkg_path: str) -> str:
+    return pkg_path[: -len(".inc.tar.gz")] + ".manifest.json"
+
+
 def ingest_one(pkg_path: str) -> dict:
     """处理单个摆渡增量包。返回 {ok, message, record_id}。"""
     d = inbox_dir()
     base = os.path.basename(pkg_path)
-    mpath = pkg_path[:-9] + ".manifest.json"
+    mpath = _manifest_path(pkg_path)
     if not os.path.exists(mpath):
         return {"ok": False, "message": "缺少 manifest（" + base + "）"}
     try:

@@ -150,9 +150,9 @@ def _scan_dameng_dmp(path: str) -> list:
         with open(path, "rb") as f:
             data = f.read(256 * 1024 * 1024)  # 上限 256MB
         text = data.decode("utf-8", "ignore")
-        for m in re.finditer(r'CREATE TABLE\s+"?(\w+)"?\s*\.\s*"?(\w+)"?',
-                             text):
-            schema, tbl = m.group(1), m.group(2)
+        for m in re.finditer(
+                r'CREATE TABLE\s+(?:"?(\w+)"?\s*\.\s*)?"?(\w+)"?\s*\(', text):
+            schema, tbl = m.group(1) or "SYSDBA", m.group(2)
             key = (schema, tbl)
             if key not in seen:
                 seen.add(key)

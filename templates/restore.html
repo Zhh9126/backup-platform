@@ -114,6 +114,11 @@
         <input class="form-control" id="r_target_db_same" placeholder="默认沿用备份中的库名">
         <div class="form-text">恢复到源实例时，可指定新库名（部分数据库支持）</div>
       </div>
+      <div class="col-md-6">
+        <label class="form-label">时点恢复 PITR（达梦物理备份）</label>
+        <input class="form-control" id="r_target_time" placeholder="YYYY-MM-DD HH:MM:SS，留空=恢复到最新">
+        <div class="form-text">达梦物理备份集 + 归档日志：恢复到指定时间点（默认还原到独立目录，不覆盖源库）</div>
+      </div>
     </div>
 
     <!-- ===== 数据库恢复：跨主机目标 ===== -->

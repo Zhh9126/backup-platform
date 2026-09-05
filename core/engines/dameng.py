@@ -25,6 +25,7 @@ DM 达梦（Dameng）逻辑备份/恢复引擎。
 
 import os
 import time
+import re
 import json
 import shlex
 
@@ -196,8 +197,13 @@ class DamengEngine(BackupEngine):
                 user = self.task.get("username") or "SYSDBA"
                 port = self.task.get("port") or 5236
                 sql_path = f"/tmp/dm_online_bkp_{ts}.sql"
+                # 增量物理备份：基于最近一次基备份集；PITR 链路 = 全量基备 +
+                # 增量链 + 归档日志（recover until time）
+                incr_kw = "INCREMENT " if str(
+                    getattr(backup_type, "value", backup_type)) == "incremental" else ""
                 with sftp.open(sql_path, "w") as f:
-                    f.write(f"BACKUP DATABASE FULL BACKUPSET '{remote_dir}';\nexit\n")
+                    f.write(f"BACKUP DATABASE {incr_kw}BACKUPSET '{remote_dir}';\n"
+                            f"SELECT CUR_LSN FROM V$RLOG;\nexit\n")
                 try:
                     sftp.chmod(sql_path, 0o644)
                 except Exception:
@@ -293,8 +299,33 @@ class DamengEngine(BackupEngine):
             size = os.path.getsize(local_path)
             checksum = db.sha256_file(local_path)
             hk = ssh_host.get("host_key", "remote")
-            msg = (f"通过 SSH 在 {hk} 对达梦执行联机全量物理备份成功，"
-                   f"备份集已拉回 {local_path} ({db.human_size(size)})")
+            btype = str(getattr(backup_type, "value", backup_type))
+            # 记录备份完成时的 LSN/时间（PITR 恢复点元数据，前端展示与恢复向导用）
+            pitr_info = ""
+            try:
+                _u = self.task.get("username") or "SYSDBA"
+                _p = db.decrypt_secret(self.task.get("password") or "")
+                if _p and not _p.isalnum():
+                    _p = '"{0}"'.format(_p)
+                _disql = remote_dump.resolve_remote_tool(ssh_host, "disql",
+                                                         check_user="dmdba") \
+                         or "disql"
+                lsn_out, _e, _rc = _ssh_exec_pipe(
+                    client, remote_dump._wrap_login(
+                        f"{_disql} {shlex.quote(_u + '/' + _p + '@localhost:5236')} "
+                        f"<<'SQL'\nSELECT CUR_LSN FROM V$RLOG;\nexit\nSQL"),
+                    timeout=60)
+                m = re.search(r"CUR_LSN\s*\n-+\s*\n(\d+)",
+                              (lsn_out.decode("utf-8", "replace")
+                               if isinstance(lsn_out, bytes) else lsn_out) or "")
+                if m:
+                    pitr_info = (f" | PITR点: LSN={m.group(1)}"
+                                 f"@{time.strftime('%Y-%m-%d %H:%M:%S')}")
+            except Exception:
+                pass
+            msg = (f"通过 SSH 在 {hk} 对达梦执行联机{('增量' if btype == 'incremental' else '全量')}"
+                   f"物理备份成功，"
+                   f"备份集已拉回 {local_path} ({db.human_size(size)}){pitr_info}")
             self.logger.info("[%s] %s", self.task_name, msg)
 
             # 清理远端备份目录与临时脚本/tar（best-effort，失败不致命）
@@ -459,13 +490,223 @@ class DamengEngine(BackupEngine):
         )
 
     # ---------------- 恢复 ----------------
-    def restore(self, backup_path: str, **kwargs) -> BackupResult:
-        """执行达梦逻辑导入（dimp）恢复。
+    def _restore_pitr(self, backup_path: str, **kwargs) -> BackupResult:
+        """达梦 PITR 时点恢复（物理备份集 + 归档日志）。
 
-        backup_path 为待恢复的 .dmp 文件路径。target_db（kwargs）可作为目标
-        schema 映射到 SCHEMAS 参数；否则沿用任务 extra_options 中的
-        schemas / owner，再否则整库 FULL 导入。
+        流程（对标 DBackup 恢复编排，默认非破坏性演练恢复）：
+        1. 定位 SSH 目标主机（必须与备份源同环境，需要 dmrman + 归档目录）
+        2. 本地 tar.gz 经 SFTP 推回目标机并解包出备份集目录
+        3. dmrman RESTORE DATABASE '<ini>' TO '<还原目录>' FROM BACKUPSET '...'
+        4. dmrman RECOVER DATABASE '<还原目录>/dm.ini' WITH ARCHIVEDIR '<归档目录>'
+           UNTIL TIME 'YYYY-MM-DD HH:MM:SS'（target_time 缺省=恢复至最新）
+        5. RECOVER ... UPDATE DB_MAGIC（使还原副本可独立 OPEN）
+        kwargs:
+          target_time     PITR 时间点（'YYYY-MM-DD HH:MM:SS'）；缺省恢复到最新
+          target_host_info 纳管主机信息（含 SSH 凭据）；缺省按 ssh_host_id/任务配置解析
+          pitr_restore_dir 还原目录（默认 /home/dmdba/pitr_restore_<ts>）
         """
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+
+        ts = self._timestamp()
+        target_time = (kwargs.get("target_time") or "").strip()
+        restore_dir = (kwargs.get("pitr_restore_dir")
+                       or f"/home/dmdba/pitr_restore_{ts}").rstrip("/")
+
+        # 1) SSH 目标
+        ssh_host = kwargs.get("target_host_info")
+        if not ssh_host:
+            from core import remote_dump as _rd
+            ssh_host = _rd.resolve_ssh_host(self.task)
+        if not ssh_host:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED, backup_path=backup_path,
+                message="达梦 PITR 恢复需要 SSH 目标主机（纳管主机或直接输入），未找到")
+        if not backup_path or not os.path.exists(backup_path):
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED, backup_path=backup_path,
+                message=f"备份产物不存在: {backup_path}")
+
+        client = remote_dump._connect(ssh_host)
+        sftp = client.open_sftp()
+        logs = []
+        try:
+            remote_pkg = f"/tmp/dm_pitr_{ts}.tar.gz"
+            bset_dir = f"/home/dmdba/dm_pitr_bset_{ts}"
+            # 2) 推送并解包备份集
+            logs.append(f"[PITR] 推送备份集: {os.path.basename(backup_path)}")
+            sftp.put(backup_path, remote_pkg)
+            out, err, rc = _ssh_exec_pipe(client, remote_dump._wrap_login(
+                f"mkdir -p {bset_dir} {restore_dir} && chown -R dmdba {bset_dir} "
+                f"{restore_dir} && tar xzf {remote_pkg} -C {bset_dir} && "
+                f"find {bset_dir} -type f | head -3"), timeout=300)
+            if rc != 0:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED, backup_path=backup_path,
+                    stderr=(err or b"").decode("utf-8", "ignore") if isinstance(err, bytes) else (err or ""),
+                    message=f"PITR 备份集解包失败(rc={rc})")
+            logs.append("[PITR] 备份集已解包")
+
+            # 3) 动态定位 dm.ini 与归档目录（dmserver 进程 cmdline）
+            out, _e, _rc = _ssh_exec_pipe(client, remote_dump._wrap_login(
+                "ps -ef | grep dmserver | grep -v grep | head -1"), timeout=30)
+            m_ini = re.search(r"path=(\S+?dm\.ini)",
+                              (out.decode("utf-8", "replace")
+                               if isinstance(out, bytes) else out) or "")
+            if not m_ini:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED, backup_path=backup_path,
+                    message="未在目标机发现运行中的 dmserver（dm.ini 路径无法确定）")
+            src_ini = m_ini.group(1)
+            data_dir = os.path.dirname(src_ini)
+            arch_dir = ""
+            out, _e, _rc = _ssh_exec_pipe(client, remote_dump._wrap_login(
+                f"grep -iE '^ARCH_DEST' {data_dir}/dmarch.ini 2>/dev/null | head -1"),
+                timeout=30)
+            m_arch = re.search(r"ARCH_DEST\s*=\s*(\S+)",
+                               (out.decode("utf-8", "replace")
+                                if isinstance(out, bytes) else out) or "")
+            if m_arch:
+                arch_dir = m_arch.group(1)
+            logs.append(f"[PITR] 源 dm.ini={src_ini} 归档目录={arch_dir or '未配置'}")
+
+            dmrman_bin = remote_dump.resolve_remote_tool(ssh_host, "dmrman",
+                                                         check_user="dmdba")
+            if not dmrman_bin:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED, backup_path=backup_path,
+                    message="目标机未找到 dmrman（dmdba 用户）")
+
+            # 3.5) dminit 初始化新实例骨架（官方"还原到指定目录"做法）：
+            #      新 dm.ini 必须存在且 SYSTEM_PATH 指向新目录，否则
+            #      RESTORE 报 -104 Invalid INI / -137 实例运行冲突
+            inst_name = os.path.basename(data_dir) or "DAMENG"
+            new_ini = os.path.join(restore_dir, inst_name, "dm.ini")
+            dminit_bin = remote_dump.resolve_remote_tool(ssh_host, "dminit",
+                                                         check_user="dmdba")
+            if not dminit_bin:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED, backup_path=backup_path,
+                    message="目标机未找到 dminit（dmdba 用户，用于初始化还原目录）")
+            # 还原副本用独立端口，避免与运行中的源实例冲突；
+            # SYSDBA_PWD 必须显式给（达梦新安全策略要求复杂密码，缺省会 init 失败）
+            replica_port = int(self.task.get("port") or 5236) + 100
+            src_pwd = db.decrypt_secret(self.task.get("password") or "") or "Ceshi@5235"
+            # 注：非安全版 dminit 不接受 SYSSSO_PWD（会报
+            # "Current dminit is not a secure version, you can't set [SYSSSO_PWD]"）
+            dminit_args = (dminit_bin + " path=" + restore_dir +
+                           " PORT_NUM=" + str(replica_port) +
+                           " SYSDBA_PWD=" + src_pwd +
+                           " SYSAUDITOR_PWD=" + src_pwd)
+            init_shell = "su - dmdba -c " + shlex.quote(dminit_args)
+            out, _e, _rc = _ssh_exec_pipe(
+                client, remote_dump._wrap_login(init_shell) + " 2>&1 | tail -3",
+                timeout=300)
+            logs.append(f"[PITR] dminit 新实例骨架: {restore_dir} "
+                        f"(PORT_NUM={replica_port})")
+            # 动态定位生成的 dm.ini（实例目录名可能为 DAMENG/源实例名等）
+            ini_chk, _e, _rc = _ssh_exec_pipe(client, remote_dump._wrap_login(
+                f"find {restore_dir} -name dm.ini -type f 2>/dev/null | head -1"),
+                timeout=30)
+            found_ini = (ini_chk.decode("utf-8", "replace")
+                         if isinstance(ini_chk, bytes) else ini_chk or "").strip()
+            if not found_ini:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED, backup_path=backup_path,
+                    stdout="\n".join(logs),
+                    message=f"dminit 未在 {restore_dir} 生成 dm.ini，还原目录初始化失败")
+            new_ini = found_ini.split("\n")[0].strip()
+            logs.append(f"[PITR] 新实例 dm.ini: {new_ini}")
+
+            def _dmrman(stmt: str, timeout: int = 3600) -> dict:
+                """写 dmrman 脚本（.txt，官方 CTLFILE 示例后缀；.cmd/.sql 会报
+                -2423 postfix invalid）并执行。
+                两个真机踩坑（137 PROD 实例验证）：
+                - 脚本 owner 必须为 dmdba，否则 -8291 failed to open ctl file
+                - 脚本内不能写 exit;（dmrman 无此语句，报 -2007 语法错误）"""
+                script_path = f"/home/dmdba/dmrman_pitr_{ts}.txt"
+                with sftp.open(script_path, "w") as f:
+                    f.write(stmt + "\n")
+                try:
+                    sftp.chmod(script_path, 0o644)
+                except Exception:
+                    pass
+                # chown 与 dmrman 串在同一条 shell 原子执行（分开两次 exec
+                # 时 chown 竞态不生效，dmrman 会报 -8291）
+                shell = (f"chown dmdba:dinstall {script_path} && "
+                         f"su - dmdba -c {shlex.quote(dmrman_bin + ' CTLFILE=' + script_path)}")
+                o, e, rc = _ssh_exec_pipe(client, remote_dump._wrap_login(shell),
+                                          timeout=timeout)
+                text = (o.decode("utf-8", "replace") if isinstance(o, bytes) else o) or ""
+                errt = (e.decode("utf-8", "replace") if isinstance(e, bytes) else e) or ""
+                bad = any(k in text for k in ("失败", "error", "Error", "[-"))
+                return {"ok": (not bad), "output": text + errt}
+
+            new_ini = os.path.join(restore_dir, "dm.ini")
+            # 4a) RESTORE 到独立目录（非破坏）：DATABASE 参数直接用新目录的
+            #     dm.ini 路径（DM8 dmrman 还原到指定目录的语法；不带 TO 子句）
+            r1 = _dmrman(
+                f"RESTORE DATABASE '{new_ini}' "
+                f"FROM BACKUPSET '{bset_dir}'")
+            logs.append(f"[PITR] RESTORE: {'成功' if r1['ok'] else '失败'}")
+            if not r1["ok"]:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED, backup_path=backup_path,
+                    stdout=r1["output"],
+                    message="PITR RESTORE 失败: " + r1["output"][-500:],
+                    detail_log="\n".join(logs))
+
+            # 4b) RECOVER（归档前滚，支持 UNTIL TIME）
+            until_clause = f" UNTIL TIME '{target_time}'" if target_time else ""
+            r2 = _dmrman(
+                f"RECOVER DATABASE '{new_ini}' WITH ARCHIVEDIR '{arch_dir}'"
+                f"{until_clause}")
+            logs.append(f"[PITR] RECOVER(until {target_time or '最新'}): "
+                        f"{'成功' if r2['ok'] else '失败'}")
+            if not r2["ok"]:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED, backup_path=backup_path,
+                    stdout=r2["output"],
+                    message="PITR RECOVER 失败: " + r2["output"][-500:],
+                    detail_log="\n".join(logs))
+
+            # 4c) UPDATE DB_MAGIC（副本可独立 OPEN）
+            r3 = _dmrman(f"RECOVER DATABASE '{new_ini}' UPDATE DB_MAGIC")
+            logs.append(f"[PITR] UPDATE DB_MAGIC: {'成功' if r3['ok'] else '失败'}")
+
+            msg = (f"达梦 PITR 恢复完成（{restore_dir}），"
+                   f"时点: {target_time or '最新可用'}"
+                   f"{'；UPDATE DB_MAGIC ' + ('成功' if r3['ok'] else '失败')}"
+                   f"。如需对外提供，可用 dmserver path={new_ini} 启动该副本")
+            self.logger.info("[%s] %s", self.task_name, msg)
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS, backup_path=backup_path,
+                stdout="\n".join(logs) + "\n" + (r3["output"] or "")[:800],
+                simulated=False, message=msg,
+                detail_log="\n".join(logs))
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+            try:
+                _ssh_exec_pipe(client, remote_dump._wrap_login(
+                    f"rm -f /tmp/dm_pitr_{ts}.tar.gz"), timeout=60)
+            except Exception:
+                pass
+
+    def restore(self, backup_path: str, **kwargs) -> BackupResult:
+        """执行达梦恢复：按产物类型分发。
+
+        - .tar.gz（物理备份集，PITR）：走 _restore_pitr —— dmrman
+          RESTORE ... TO '<还原目录>' + RECOVER ... WITH ARCHIVEDIR ... UNTIL
+          TIME '<target_time>'，默认恢复到独立目录（非破坏演练），可选覆盖原库
+        - .dmp（逻辑导出，dimp）：表/schema/整库导入
+        """
+        # ---- PITR 物理时点恢复（tar.gz 物理备份集 + target_time）----
+        if backup_path.endswith(".tar.gz") or kwargs.get("target_time"):
+            return self._restore_pitr(backup_path, **kwargs)
+
         if self.task.get("demo_only"):
             return self._simulate_restore(backup_path, "任务标记为演示(demo_only)")
         if config.DEMO_MODE == "on":

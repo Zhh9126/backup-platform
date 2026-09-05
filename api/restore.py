@@ -64,6 +64,8 @@ def create_restore():
         operator=data.get("operator"),
         target_host_user=data.get("target_host_user"),
         target_host_password=data.get("target_host_password"),
+        target_time=data.get("target_time"),
+        pitr_restore_dir=data.get("pitr_restore_dir"),
     )
     if not result:
         return jsonify({"error": "备份记录不存在"}), 404

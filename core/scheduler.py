@@ -481,7 +481,9 @@ def run_restore_now(record_id: int, target_host: str = None,
             result = engine.run_restore(rec["backup_path"], target_host=target_host,
                                     target_host_info=target_host_info,
                                     target_db=target_db,
-                                    target_port=target_port)
+                                    target_port=target_port,
+                                    target_time=target_time,
+                                    pitr_restore_dir=pitr_restore_dir)
         finally:
             _rd.reset_task_env_export(_env_token)
         detail_log_lines.append(f"[引擎结果] success={result.success}, status={getattr(result, 'status', '-')}")

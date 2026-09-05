@@ -1414,6 +1414,9 @@
       if (mode === "same") {
         // 恢复到源任务，目标库可选
         body.target_db = ($("r_target_db_same")?.value || "").trim();
+        // 达梦 PITR：物理备份集 + 时点（留空=恢复到最新）
+        const tt = ($("r_target_time")?.value || "").trim();
+        if (tt) body.target_time = tt;
       } else {
         // 跨主机恢复
         const dbName = ($("r_target_db_remote")?.value || "").trim();

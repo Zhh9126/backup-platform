@@ -334,6 +334,131 @@ class SyncEngine:
     # ------------------------------------------------------------------ #
     def _run_realtime(self, progress_callback=None) -> Dict[str, Any]:
         cfg = self.config
+        # 实时引擎选择：离线环境默认 polling（纯 Python 轮询 CDC，无外部
+        # 组件依赖）；MySQL 源且显式配置 flink_config.engine="flink" 时才走
+        # Flink CDC 轨道（在线环境）。
+        engine_kind = (cfg.flink_config or {}).get("engine") or "polling"
+        if engine_kind == "flink" and cfg.src_db_type == "mysql":
+            return self._run_realtime_binlog(progress_callback)
+        return self._run_realtime_polling(progress_callback)
+
+    def _run_realtime_polling(self, progress_callback=None) -> Dict[str, Any]:
+        """轮询式实时同步（离线环境主力方案，纯 Python 零外部依赖）。
+
+        原理：先全量快照（upsert 幂等），然后按增量列（时间戳/自增列）周期
+        轮询 `> watermark` 的新增/变更行，upsert 到目标端。
+        - 适用所有已注册插件库型（MySQL/PG/Oracle/达梦/SQLServer/金仓）
+        - 时延 = poll_interval 秒级；要求表有可比较的增量列
+        - 位点（watermark）持久化到 sync 任务 message，重启续传
+        """
+        cfg = self.config
+        if not cfg.incremental_column:
+            return {"success": False,
+                    "message": "轮询实时同步需要在任务中配置增量列"
+                               "（时间戳列如 updated_at 或自增列 id）"}
+        from .realtime_runners import get_stop_event
+
+        poll_interval = int((cfg.flink_config or {}).get("poll_interval", 5))
+        # 1) 全量快照（upsert 幂等，不重不漏）
+        logger.info("[sync#%s] 轮询实时同步：先执行全量快照（增量列 %s）",
+                    cfg.task_id, cfg.incremental_column)
+        models.update_sync_task(cfg.task_id, {
+            "message": f"轮询实时同步启动：全量快照（增量列 {cfg.incremental_column}）...",
+        })
+        snap = self._run_full_migration(progress_callback)
+        if not snap.get("success"):
+            return snap
+
+        # 2) 轮询增量：watermark 从当前最大值开始（快照已含）
+        stop = get_stop_event(cfg.task_id)
+        watermark = cfg.incremental_value or ""
+        src_plugin = registry.get_plugin(cfg.src_db_type)
+        tgt_plugin = registry.get_plugin(cfg.tgt_db_type)
+        poll_count = 0
+        logger.info("[sync#%s] 轮询实时同步进入增量循环（间隔 %ss）",
+                    cfg.task_id, poll_interval)
+        while not stop.is_set():
+            stop.wait(poll_interval)
+            if stop.is_set():
+                break
+            reader = None
+            try:
+                reader = registry.create_reader(cfg.src_db_type, cfg)
+                conn = reader.connect()
+                cur = conn.cursor()
+                table = (cfg.source_tables_list or [cfg.source_table])[0] \
+                    if (cfg.source_tables_list or cfg.source_table) else ""
+                schema = cfg.src_schema or ""
+                table_ref = (f"{schema}.{table}" if schema else table)
+                col = cfg.incremental_column
+                params = []
+                where = ""
+                if watermark:
+                    where = f" WHERE {col} > %s" if "%s" in "1" else \
+                        f" WHERE {col} > :1"
+                    # 统一用 ? 由插件方言差异处理：这里按驱动自适应
+                    where = f" WHERE {col} > :wm" \
+                        if cfg.src_db_type in ("oracle", "dameng") \
+                        else f" WHERE {col} > %s"
+                    params = [watermark]
+                sql = (f"SELECT * FROM {table_ref}{where} "
+                       f"ORDER BY {col}")
+                cur.execute(sql, tuple(params) or None)
+                columns = [d[0] for d in cur.description]
+                rows = cur.fetchmany(cfg.batch_size)
+                total = 0
+                writer = registry.create_writer(cfg.tgt_db_type, cfg)
+                wconn = writer.connect()
+                try:
+                    while rows:
+                        records = [[tgt_plugin.type_to_java(
+                            "VARCHAR", v) for v in row] for row in rows]
+                        total += writer.write_batch(wconn, records, columns)
+                        rows = cur.fetchmany(cfg.batch_size)
+                finally:
+                    writer.close(conn=wconn)
+                if total:
+                    watermark = self._max_incremental_value(
+                        cfg, table_ref, col)
+                    poll_count += total
+                    models.update_sync_task(cfg.task_id, {
+                        "message": f"轮询实时同步中：已同步 {poll_count} 行"
+                                   f"（watermark={watermark}）",
+                    })
+                    logger.info("[sync#%s] 轮询同步 %d 行，watermark=%s",
+                                cfg.task_id, total, watermark)
+                reader.close(cur, conn)
+            except Exception as e:
+                logger.warning("[sync#%s] 轮询异常（将继续重试）: %s",
+                               cfg.task_id, e)
+                if reader:
+                    try:
+                        reader.close()
+                    except Exception:
+                        pass
+        models.update_sync_task(cfg.task_id, {
+            "message": f"轮询实时同步已停止（累计 {poll_count} 行）",
+        })
+        return {"success": True,
+                "message": f"轮询实时同步已停止（累计同步 {poll_count} 行）"}
+
+    def _max_incremental_value(self, cfg, table_ref: str, col: str) -> str:
+        """查询当前增量列最大值（推进 watermark）。"""
+        reader = registry.create_reader(cfg.src_db_type, cfg)
+        conn = reader.connect()
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SELECT MAX({col}) FROM {table_ref}")
+            row = cur.fetchone()
+            v = row[0] if row else None
+            return str(v) if v is not None else ""
+        except Exception:
+            return ""
+        finally:
+            reader.close(conn=conn)
+
+    def _run_realtime_binlog(self, progress_callback=None) -> Dict[str, Any]:
+        cfg = self.config
         if cfg.src_db_type != "mysql":
             return {"success": False, "message": "实时同步当前仅支持 MySQL 源（Binlog CDC）"}
         try:

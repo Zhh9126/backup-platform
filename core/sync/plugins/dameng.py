@@ -1,0 +1,249 @@
+# -*- coding: utf-8 -*-
+"""达梦 DM8 同步插件（dmPython 驱动）。
+
+离线环境说明：dmPython 不在 PyPI，随达梦安装介质提供
+（<DM_HOME>/drivers/python/dmPython，pip install 或拷贝 .egg 到离线包）。
+导入失败时给出明确指引，插件注册不受影响（运行时才报错）。
+"""
+import logging
+from typing import Any, List
+
+from .base import BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader, SyncConfig
+from ..type_mapper import db_type_to_java_type, to_java
+
+logger = logging.getLogger(__name__)
+
+
+def _upper(name: str) -> str:
+    return (name or "").upper()
+
+
+def _import_dmpython():
+    try:
+        import dmPython  # noqa
+        return dmPython
+    except ImportError as e:
+        raise RuntimeError(
+            "达梦同步需要 dmPython 驱动（离线环境随 DM 客户端提供）："
+            "从数据库服务器 <DM_HOME>/drivers/python/dmPython 安装，"
+            "或将其加入 PYTHONPATH") from e
+
+
+class DamengSourceReader(SourceReader):
+    def connect(self) -> Any:
+        dm = _import_dmpython()
+        cfg = self.config
+        port = cfg.src_port or 5236
+        return dm.connect(host=cfg.src_host, port=port,
+                          user=cfg.src_username, password=cfg.src_password,
+                          database=cfg.src_db_name or cfg.src_schema or "",
+                          loginTimeout=15)
+
+    def list_tables(self) -> List[str]:
+        conn = self.connect()
+        try:
+            cur = conn.cursor()
+            schema = _upper(self.config.src_schema or self.config.src_username
+                            or "SYSDBA")
+            cur.execute(
+                "SELECT table_name FROM dba_tables WHERE owner=? "
+                "ORDER BY table_name", (schema,))
+            return [r[0] for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def list_columns(self, table: str) -> List[ColumnMeta]:
+        conn = self.connect()
+        try:
+            cur = conn.cursor()
+            schema = _upper(self.config.src_schema or self.config.src_username
+                            or "SYSDBA")
+            cur.execute(
+                "SELECT column_name, data_type, nullable, data_default "
+                "FROM dba_tab_columns WHERE owner=? AND table_name=? "
+                "ORDER BY column_id", (schema, _upper(table)))
+            rows = cur.fetchall()
+            cur.execute(
+                "SELECT cols.column_name FROM dba_constraints c "
+                "JOIN dba_cons_columns cols ON c.owner=cols.owner "
+                "AND c.constraint_name=cols.constraint_name "
+                "WHERE c.owner=? AND c.table_name=? AND c.constraint_type='P'",
+                (schema, _upper(table)))
+            pk_set = {r[0] for r in cur.fetchall()}
+            cols = []
+            for row in rows:
+                c = ColumnMeta(name=row[0], type=(row[1] or "").upper(),
+                               nullable=(row[2] == "Y" or row[2] == 1 or
+                                         str(row[2]).upper() == "Y"),
+                               default=row[3])
+                c.is_primary = c.name in pk_set
+                cols.append(c)
+            return cols
+        finally:
+            conn.close()
+
+    def _build_select_sql(self, table: str, columns: List[str]) -> tuple:
+        schema = _upper(self.config.src_schema or self.config.src_username
+                        or "SYSDBA")
+        table_ref = f'{schema}.{_upper(table)}'
+        col_str = ", ".join(f'"{c}"' for c in columns) if columns else "*"
+        sql = f"SELECT {col_str} FROM {table_ref}"
+        cfg = self.config
+        binds = {}
+        if cfg.sync_mode == "incremental" and cfg.incremental_column \
+                and cfg.incremental_value:
+            sql += (f" WHERE {cfg.incremental_column} > ?")
+            binds["1"] = cfg.incremental_value
+        sql += f" ORDER BY {cfg.incremental_column}" \
+            if cfg.incremental_column else sql
+        return sql, binds
+
+    def read_batch(self, cursor: Any) -> ReadResult:
+        cfg = self.config
+        table = (cfg.source_tables_list or [cfg.source_table])[0] \
+            if (cfg.source_tables_list or cfg.source_table) else ""
+        sql, binds = self._build_select_sql(table, [])
+        cursor.execute(sql, binds or {})
+        columns = [d[0] for d in cursor.description]
+        rows = cursor.fetchmany(cfg.batch_size)
+        records = [[self.plugin.type_to_java(
+            (cursor.description[i][1] or str), v)
+            for i, v in enumerate(row)] for row in rows]
+        return ReadResult(records=records, columns=columns,
+                          has_more=len(rows) >= cfg.batch_size)
+
+
+class DamengSinkWriter(SinkWriter):
+    def connect(self) -> Any:
+        dm = _import_dmpython()
+        cfg = self.config
+        port = cfg.tgt_port or 5236
+        return dm.connect(host=cfg.tgt_host, port=port,
+                          user=cfg.tgt_username, password=cfg.tgt_password,
+                          database=cfg.tgt_db_name or cfg.tgt_schema or "",
+                          loginTimeout=15)
+
+    def _table_ref(self, table: str = None) -> str:
+        cfg = self.config
+        schema = _upper(cfg.tgt_schema or cfg.tgt_username or "SYSDBA")
+        tbl = _upper(table or cfg.target_table or "")
+        return f'{schema}.{tbl}'
+
+    def _get_target_columns(self, conn: Any, table: str) -> List[str]:
+        cur = conn.cursor()
+        schema = _upper(self.config.tgt_schema or self.config.tgt_username
+                        or "SYSDBA")
+        cur.execute("SELECT column_name FROM dba_tab_columns "
+                    "WHERE owner=? AND table_name=? ORDER BY column_id",
+                    (schema, _upper(table)))
+        return [r[0] for r in cur.fetchall()]
+
+    def _get_primary_keys(self, conn: Any, table: str) -> List[str]:
+        cur = conn.cursor()
+        schema = _upper(self.config.tgt_schema or self.config.tgt_username
+                        or "SYSDBA")
+        cur.execute(
+            "SELECT cols.column_name FROM dba_constraints c "
+            "JOIN dba_cons_columns cols ON c.owner=cols.owner "
+            "AND c.constraint_name=cols.constraint_name "
+            "WHERE c.owner=? AND c.table_name=? AND c.constraint_type='P'",
+            (schema, _upper(table)))
+        return [r[0] for r in cur.fetchall()]
+
+    def _create_table_sql(self, table: str, columns: List[ColumnMeta]) -> str:
+        cfg = self.config
+        schema = _upper(cfg.tgt_schema or cfg.tgt_username or "SYSDBA")
+        tbl = _upper(table)
+        defs = []
+        for c in columns:
+            name, t = _upper(c.name), c.type.upper()
+            dm_t = "VARCHAR(4000)"
+            if t in ("INT", "INTEGER", "BIGINT", "SMALLINT"):
+                dm_t = "BIGINT"
+            elif t in ("FLOAT", "DOUBLE", "DECIMAL", "NUMERIC"):
+                dm_t = "DOUBLE"
+            elif t.startswith("DATETIME") or t in ("TIMESTAMP", "DATE"):
+                dm_t = "TIMESTAMP" if t != "DATE" else "DATE"
+            elif "TEXT" in t:
+                dm_t = "TEXT"
+            elif "BLOB" in t or "BYTEA" in t:
+                dm_t = "BLOB"
+            defs.append(f'"{name}" {dm_t}' + ("" if c.nullable else " NOT NULL"))
+        pk = [c.name for c in columns if getattr(c, "is_primary", False)]
+        if pk:
+            defs.append("PRIMARY KEY (" + ", ".join(f'"{_upper(p)}"' for p in pk) + ")")
+        return f'CREATE TABLE {schema}.{tbl} ({", ".join(defs)})'
+
+    def prepare_table(self, conn: Any, columns: List[ColumnMeta]) -> None:
+        cfg = self.config
+        table = cfg.target_table
+        cur = conn.cursor()
+        schema = _upper(cfg.tgt_schema or cfg.tgt_username or "SYSDBA")
+        cur.execute("SELECT COUNT(*) FROM dba_tables WHERE owner=? "
+                    "AND table_name=?", (schema, _upper(table)))
+        exists = cur.fetchone()[0] > 0
+        mode = cfg.save_mode
+        if mode == "overwrite" and exists:
+            cur.execute(f"DROP TABLE {self._table_ref(table)}")
+            exists = False
+        if not exists:
+            cur.execute(self._create_table_sql(table, columns))
+        conn.commit()
+
+    def write_batch(self, conn: Any, records: List[List[Any]],
+                    columns: List[str]) -> int:
+        cfg = self.config
+        table = cfg.target_table
+        cur = conn.cursor()
+        pks = self._get_primary_keys(conn, table)
+        ncols = [self.plugin.normalize_identifier(
+            c, cfg.field_ide) for c in columns]
+        if cfg.save_mode == "upsert" and pks:
+            # 达梦 MERGE INTO（UPSERT）
+            upd = [c for c in ncols if _upper(c) not in
+                   {_upper(p) for p in pks}]
+            set_sql = ", ".join(f'"{_upper(c)}" = :{i + len(pks) + 1}'
+                                for i, c in enumerate(upd))
+            on_sql = " AND ".join(f'T."{_upper(p)}" = :{i + 1}'
+                                  for i, p in enumerate(pks))
+            ins_cols = ", ".join(f'"{_upper(c)}"' for c in ncols)
+            ins_vals = ", ".join(f":{i + 1}" for i in range(len(ncols)))
+            sql = (f"MERGE INTO {self._table_ref(table)} T USING "
+                   f"(SELECT 1 AS ONE) S ON ({on_sql}) "
+                   f"WHEN MATCHED THEN UPDATE SET {set_sql} "
+                   f"WHEN NOT MATCHED THEN INSERT ({ins_cols}) "
+                   f"VALUES ({ins_vals})")
+            rows_data = []
+            for rec in records:
+                d = dict(zip(ncols, rec))
+                rows_data.append([d.get(_upper(p)) for p in pks]
+                                 + [d.get(_upper(c)) for c in upd])
+            cur.executemany(sql, rows_data)
+        else:
+            cols_sql = ", ".join(f'"{_upper(c)}"' for c in ncols)
+            binds = ", ".join("?" for _ in ncols)
+            sql = (f"INSERT INTO {self._table_ref(table)} "
+                   f"({cols_sql}) VALUES ({binds})")
+            cur.executemany(sql, records)
+        conn.commit()
+        return len(records)
+
+
+class DamengPlugin(BasePlugin):
+    db_type = "dameng"
+    default_ports = {"sync": 5236}
+
+    def create_reader(self, config: SyncConfig) -> SourceReader:
+        return DamengSourceReader(config, self)
+
+    def create_writer(self, config: SyncConfig) -> SinkWriter:
+        return DamengSinkWriter(config, self)
+
+    def type_to_java(self, db_type: str, value: Any) -> Any:
+        return to_java(db_type_to_java_type((db_type or "").upper()), value)
+
+    def java_to_db(self, java_value: Any, target_type: str) -> Any:
+        return java_value
+
+    def quote_identifier(self, name: str) -> str:
+        return f'"{_upper(name)}"'

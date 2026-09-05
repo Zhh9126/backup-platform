@@ -551,6 +551,16 @@ CREATE TABLE IF NOT EXISTS hetero_jobs (
     updated_at     TEXT
 );
 
+CREATE TABLE IF NOT EXISTS backup_objects (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    record_id   INTEGER NOT NULL,                 -- 所属备份记录
+    obj_type    TEXT DEFAULT 'TABLE',             -- TABLE | VIEW | DATABASE
+    obj_name    TEXT NOT NULL,                    -- 对象名
+    schema      TEXT,                             -- 所属 schema/database
+    created_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_backup_objects_rec ON backup_objects(record_id);
+
 CREATE TABLE IF NOT EXISTS itsm_tickets (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     system      TEXT NOT NULL DEFAULT 'internal',    -- internal | dingtalk | servicenow

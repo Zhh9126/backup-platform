@@ -2,6 +2,7 @@
 """数据恢复 API。"""
 from flask import request, jsonify
 
+import core.db as db
 from auth import login_required
 from core import models, scheduler
 from . import api_bp
@@ -66,7 +67,34 @@ def create_restore():
         target_host_password=data.get("target_host_password"),
         target_time=data.get("target_time"),
         pitr_restore_dir=data.get("pitr_restore_dir"),
+        tables=data.get("tables"),
     )
     if not result:
         return jsonify({"error": "备份记录不存在"}), 404
     return jsonify(result), 201
+
+
+@api_bp.route("/records/<int:record_id>/objects", methods=["GET"])
+@login_required
+def api_record_objects(record_id):
+    """备份产物对象清单（表级恢复向导数据源）。"""
+    from core import object_catalog
+    return jsonify(object_catalog.list_objects(record_id))
+
+
+@api_bp.route("/webhooks", methods=["GET", "POST"])
+@login_required
+def api_webhooks():
+    """Webhooks 事件中心配置：urls（逗号/换行分隔）+ secret（HMAC 签名）。"""
+    from core import webhooks as wh
+    if request.method == "GET":
+        urls, secret = wh._urls_and_secret()
+        return jsonify({"urls": ",".join(urls), "secret": secret})
+    data = request.get_json(silent=True) or {}
+    db.set_system_config("webhook_urls", data.get("urls", ""))
+    db.set_system_config("webhook_secret", data.get("secret", ""))
+    test = data.get("test")
+    if test:
+        sent = wh.emit("webhook.test", {"message": "hello from backup-platform"})
+        return jsonify({"ok": True, "delivered": sent})
+    return jsonify({"ok": True})

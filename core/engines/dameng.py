@@ -771,6 +771,12 @@ class DamengEngine(BackupEngine):
         ]
         cmd.extend(self._scope_args(extra, target_db=target_db))
 
+        # 表级恢复：tables 参数 → dimpr TABLES=表1,表2
+        sel_tables = kwargs.get("tables") or []
+        if sel_tables:
+            names = ",".join(str(t).strip().strip('"') for t in sel_tables)
+            cmd.append("TABLES=" + names)
+
         conn_note = "（达梦 dimp 将密码写入 USERID 参数，属官方语法惯例）"
         target_note = " 目标库/模式={0}".format(target_db) if target_db else ""
 

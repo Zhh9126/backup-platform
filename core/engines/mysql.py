@@ -1351,6 +1351,35 @@ class MySQLEngine(BackupEngine):
                 except Exception:
                     pass
 
+    @staticmethod
+    def _filter_dump_tables(text: str, tables: list) -> str:
+        """从 mysqldump 产物中抽取指定表的完整段落（结构+数据）。
+
+        dump 结构：文件头（至第一个 '-- Table structure' 标记）+
+        每张表两个标记段：'-- Table structure for table `t`' 与
+        '-- Dumping data for table `t`'。遇标记切换：表被勾选则开始收集，
+        未勾选则切断收集（cur=None）。
+        """
+        wanted = {t.strip().strip("`\"") for t in tables if t.strip()}
+        header, out = [], []
+        cur = None
+        for ln in text.split("\n"):
+            m = re.match(
+                r"^-- (?:Table structure|Dumping data) for table [`\"]?(\w+)",
+                ln)
+            if m:
+                cur = m.group(1) if m.group(1) in wanted else None
+                if cur:
+                    out.append(ln)
+                continue
+            if cur:
+                out.append(ln)
+            elif not out:
+                header.append(ln)
+        if not out:
+            return text  # 未匹配到任何表标记：原样返回（可能非 mysqldump 格式）
+        return "\n".join(header + out)
+
     def _restore_local(self, backup_path: str, **kwargs) -> BackupResult:
         # 连接参数
         host = self.task.get("host") or "127.0.0.1"
@@ -1401,6 +1430,7 @@ class MySQLEngine(BackupEngine):
             # 恢复执行：
             # - 指定 target_db 时，剥离 dump 中的 CREATE DATABASE / USE 语句，
             #   否则 --databases 产物会把数据写回原库，目标库只是空壳（假成功）
+            # - tables 参数指定表级恢复：只保留勾选表的完整段落（结构+数据）
             # - 未指定 target_db 时沿用备份中的库名，可走表级并行导入
             if target_db:
                 raw = self._read_decompressed(backup_path)
@@ -1408,6 +1438,9 @@ class MySQLEngine(BackupEngine):
                     ln for ln in raw.decode("utf-8", "ignore").split("\n")
                     if not re.match(r"(?i)^\s*(CREATE\s+DATABASE|USE\s)", ln)
                 )
+                sel_tables = kwargs.get("tables") or []
+                if sel_tables:
+                    filtered = self._filter_dump_tables(filtered, sel_tables)
                 res = self._run_with_stdin(mysql_args, filtered)
             else:
                 parallel = self._restore_parallel()

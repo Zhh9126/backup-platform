@@ -420,6 +420,25 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
         "success" if result.success else "failure", title, text=text, html=html)
     db.add_log("INFO" if result.success else "ERROR", "scheduler",
                f"task={task['id']} {task['name']} -> {status} ({db.human_size(size)})")
+
+    # M2 对象目录：备份成功后异步扫描产物内对象清单（表级恢复的数据基础）
+    if result.success:
+        try:
+            from core import object_catalog
+            object_catalog.scan_async(rec_id, path, task.get("db_type"), _logger)
+        except Exception as e:
+            _logger.warning("[catalog] 对象清单扫描启动失败: %s", e)
+
+    # M5 Webhooks 事件中心：备份结果事件推送（异步，失败不影响备份结果）
+    try:
+        from core import webhooks
+        webhooks.emit_async("backup." + ("success" if result.success else "failure"), {
+            "task_id": task["id"], "task_name": task.get("name"),
+            "db_type": task.get("db_type"), "record_id": rec_id,
+            "status": status, "size_bytes": size, "backup_path": path,
+        })
+    except Exception as e:
+        _logger.warning("[webhooks] 事件推送失败: %s", e)
     return models.get_record(rec_id)
 
 
@@ -428,7 +447,10 @@ def run_restore_now(record_id: int, target_host: str = None,
                     target_port: int = None,
                     operator: str = None,
                     target_host_user: str = None,
-                    target_host_password: str = None) -> Optional[dict]:
+                    target_host_password: str = None,
+                    target_time: str = None,
+                    pitr_restore_dir: str = None,
+                    tables: list = None) -> Optional[dict]:
     rec = models.get_record(record_id)
     if not rec:
         return None
@@ -483,7 +505,8 @@ def run_restore_now(record_id: int, target_host: str = None,
                                     target_db=target_db,
                                     target_port=target_port,
                                     target_time=target_time,
-                                    pitr_restore_dir=pitr_restore_dir)
+                                    pitr_restore_dir=pitr_restore_dir,
+                                    tables=tables)
         finally:
             _rd.reset_task_env_export(_env_token)
         detail_log_lines.append(f"[引擎结果] success={result.success}, status={getattr(result, 'status', '-')}")
@@ -510,6 +533,13 @@ def run_restore_now(record_id: int, target_host: str = None,
         (finished, status, getattr(result, "message", ""), detail_log, rid))
     db.add_log("INFO" if result.success else "ERROR", "scheduler",
                f"restore record={record_id} -> {status}")
+    # M5 Webhooks：恢复结果事件
+    try:
+        from core import webhooks
+        webhooks.emit_restore(record_id, task["name"], task.get("db_type"),
+                              target_db or "", result.success)
+    except Exception as e:
+        _logger.warning("[webhooks] 恢复事件推送失败: %s", e)
     return models.list_restores(limit=1)[0]
 
 
@@ -840,6 +870,59 @@ def _register_synthesize(sched):
     _logger.info("[synthesize] 已注册自动合成全量任务，cron=%s", cron)
 
 
+def _gfs_job_wrapper():
+    """调度触发的 GFS 保留清理：运行 core.retention_gfs.apply_gfs()。"""
+    try:
+        from core import retention_gfs
+        report = retention_gfs.apply_gfs()
+        if report:
+            _logger.info("[gfs] 调度完成: %s", report)
+    except Exception:
+        _logger.exception("[gfs] GFS 清理调度异常")
+
+
+def _register_gfs(sched):
+    """注册 GFS 保留清理周期任务（默认每日 02:30）。"""
+    from apscheduler.triggers.cron import CronTrigger
+    cron = db.get_system_config("gfs_cron") or "30 2 * * *"
+    try:
+        trig = CronTrigger.from_crontab(cron)
+    except Exception as e:
+        _logger.warning("[gfs] cron 非法(%s)，回退默认", e)
+        trig = CronTrigger.from_crontab("30 2 * * *")
+    try:
+        sched.remove_job("gfs_cleanup")
+    except Exception:
+        pass
+    sched.add_job(_gfs_job_wrapper, trig, id="gfs_cleanup",
+                  replace_existing=True, misfire_grace_time=86400)
+    _logger.info("[gfs] 已注册 GFS 保留清理任务，cron=%s", cron)
+
+
+def _ferry_job_wrapper():
+    """调度触发的摆渡收件箱扫描：运行 core.ferry_inbox.ingest_all()。"""
+    try:
+        from core import ferry_inbox
+        stat = ferry_inbox.ingest_all()
+        if stat.get("ingested") or stat.get("failed"):
+            _logger.info("[ferry] 调度完成: %s", stat)
+    except Exception:
+        _logger.exception("[ferry] 摆渡收件箱扫描异常")
+
+
+def _register_ferry(sched):
+    """注册摆渡收件箱周期扫描（默认每 10 分钟）。"""
+    from apscheduler.triggers.interval import IntervalTrigger
+    try:
+        sched.remove_job("ferry_inbox")
+    except Exception:
+        pass
+    sched.add_job(_ferry_job_wrapper, IntervalTrigger(minutes=10),
+                  id="ferry_inbox", replace_existing=True,
+                  misfire_grace_time=3600)
+    _logger.info("[ferry] 已注册摆渡收件箱扫描任务（10 分钟）")
+
+
 # ------------------------- Phase 4：季度演练排程 -------------------------
 def _drill_schedule_job_wrapper():
     """调度触发的季度演练：运行 DrillEngine.run_scheduled_drill()。
@@ -1149,6 +1232,8 @@ def start_scheduler():
     _register_restore_verify(_scheduler)
     _register_data_compare(_scheduler)
     _register_synthesize(_scheduler)
+    _register_gfs(_scheduler)
+    _register_ferry(_scheduler)
     _register_rt_backup(_scheduler)
     _scheduler.start()
     _logger.info("调度器已启动，已注册 %d 个任务", len(_scheduler.get_jobs()))

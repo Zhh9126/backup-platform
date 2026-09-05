@@ -440,8 +440,12 @@ class PostgreSQLEngine(BackupEngine):
                 "--port", str(port),
                 "--username", str(user),
                 "--dbname", str(target_db),
-                backup_path,
             ]
+            # 表级恢复：pg_restore --table 可重复指定
+            sel_tables = kwargs.get("tables") or []
+            for tb in sel_tables:
+                cmd += ["--table", str(tb).strip().strip('"')]
+            cmd.append(backup_path)
         elif backup_path.endswith(".sql"):
             # 纯文本格式用 psql 执行 SQL 脚本
             cmd = [

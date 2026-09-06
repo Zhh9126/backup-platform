@@ -104,11 +104,24 @@ def replicate_to_tiers(backup_path: str, task: dict, record_id: int,
         else:
             log.info("[TierReplicate] 未配置本地导出目标，跳过 L3")
 
-    tiers_achieved = [k for k in ("minio", "s3", "local") if result.get(k)]
+    # D2T 磁带归档（P2 落地）：启用中的 tape 目标自动参与每次备份复制。
+    # 磁带作为离线长期保存层，独立于 L1/L2/L3 互斥策略之外。
+    tape_targets = [x for x in targets if x.get("type") == "tape"]
+    for tt in tape_targets:
+        ok = _replicate_with_retry(backup_path, tt, object_key_base, log,
+                                   tier_label=f"D2T-{tt.get('name')}",
+                                   max_retries=max_retries,
+                                   retry_interval=retry_interval)
+        result["tape"] = ok
+        if not ok:
+            log.warning("[TierReplicate] D2T 磁带归档失败: %s", tt.get("name"))
+
+    tiers_achieved = [k for k in ("minio", "s3", "local", "tape") if result.get(k)]
     final_tier = "+".join(tiers_achieved) if tiers_achieved else "local"
     _update_record_tier(record_id, final_tier)
-    log.info("[TierReplicate] 完成: minio=%s s3=%s local=%s → %s",
-             result["minio"], result["s3"], result["local"], final_tier)
+    log.info("[TierReplicate] 完成: minio=%s s3=%s local=%s tape=%s → %s",
+             result.get("minio"), result.get("s3"), result.get("local"),
+             result.get("tape"), final_tier)
     return result
 
 
@@ -116,7 +129,8 @@ def _get_enabled_targets(logger: logging.Logger = None) -> list:
     """获取所有启用的非本地存储目标。"""
     try:
         rows = db.query(
-            "SELECT * FROM storage_targets WHERE enabled=1 AND type IN ('minio','s3','local') ORDER BY tier"
+            "SELECT * FROM storage_targets WHERE enabled=1 "
+            "AND type IN ('minio','s3','local','tape') ORDER BY tier"
         )
         targets = []
         for r in rows:

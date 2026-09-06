@@ -4679,6 +4679,12 @@
       // 按类型填充字段
       onStorageTypeChange();
       if (d.type === "local") $("st_endpoint_local").value = d.endpoint || "./backups";
+      else if (d.type === "tape") {
+        $("st_endpoint_tape").value = d.endpoint || "";
+        if (d.extra_options && typeof d.extra_options === "object") {
+          $("st_tape_max_gb").value = d.extra_options.max_tape_gb || 0;
+        }
+      }
       else {
         $("st_endpoint_s3").value = d.endpoint || "";
         $("st_region").value = d.region || "";
@@ -4699,6 +4705,7 @@
     const type = $("st_type").value;
     document.querySelectorAll(".storage-type-fields").forEach(el => el.classList.add("d-none"));
     if (type === "local") $("st_fields_local").classList.remove("d-none");
+    else if (type === "tape") $("st_fields_tape").classList.remove("d-none");
     else if (type === "minio" || type === "s3") {
       $("st_fields_s3_compat").classList.remove("d-none");
       if (type === "s3") $("st_fields_s3_extra").classList.remove("d-none");
@@ -4732,6 +4739,9 @@
         extraOpts.storage_class = $("st_storage_class").value;
         extraOpts.insecure = $("st_insecure").checked;
       }
+      if (type === "tape") {
+        extraOpts.max_tape_gb = Number($("st_tape_max_gb").value) || 0;
+      }
       data.extra_options = extraOpts;
     }
 
@@ -4740,8 +4750,8 @@
         await api("PUT", "/api/storage/targets/" + editingStorageId, data);
         toast("已更新: " + name);
       } else {
-        // 新建时 secret_key 必填（非本地类型）
-        if (type !== "local" && !data.secret_key) {
+        // 新建时 secret_key 必填（MinIO/S3 类型）；磁带/本地无需
+        if (type !== "local" && type !== "tape" && !data.secret_key) {
           toast("新建 MinIO/S3 存储需填写 Secret Key", "warning");
           return;
         }

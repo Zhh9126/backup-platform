@@ -183,6 +183,7 @@
                 <option value="minio">MinIO 热存储 (L1)</option>
                 <option value="s3">S3 冷存储 (L2)</option>
                 <option value="local">本地存储 (L3)</option>
+                <option value="tape">磁带库 (D2T 归档)</option>
               </select>
             </div>
           </div>
@@ -196,6 +197,26 @@
                        placeholder="/data/backups 或 C:\backups"
                        value="./backups">
                 <div class="form-text">备份文件的本地根目录，需确保进程有读写权限。</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 磁带库专用字段 -->
+          <div id="st_fields_tape" class="storage-type-fields d-none">
+            <div class="row g-3">
+              <div class="col-12">
+                <label class="form-label">磁带设备 / 模拟带库目录 *</label>
+                <input type="text" class="form-control font-code" id="st_endpoint_tape"
+                       placeholder="/dev/nst0（真实磁带）或 /data/tapelibrary（目录模拟）">
+                <div class="form-text">
+                  真实磁带：填 Linux 非回流设备（/dev/nst0），需安装 mt-st（mt+tar 顺序写入）。
+                  目录模拟：填一个目录路径，每盘带为 tape_NNN.tar（容量满自动开新带）。
+                </div>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">单盘容量上限 (GB)</label>
+                <input type="number" class="form-control" id="st_tape_max_gb" value="0" min="0">
+                <div class="form-text">仅目录模拟模式生效；0=不限。真实磁带由介质容量决定。</div>
               </div>
             </div>
           </div>

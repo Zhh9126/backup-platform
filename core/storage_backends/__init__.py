@@ -9,12 +9,14 @@ from .base import StorageBackend
 from .local import LocalStorageBackend
 from .minio import MinIOStorageBackend
 from .s3 import S3StorageBackend
+from .tape import TapeStorageBackend
 
 # 类型 → 类 映射
 BACKEND_REGISTRY: dict[type[StorageBackend]] = {
     "local": LocalStorageBackend,
     "minio": MinIOStorageBackend,
     "s3": S3StorageBackend,
+    "tape": TapeStorageBackend,
 }
 
 # Tier 显示名
@@ -29,6 +31,7 @@ TYPE_META = {
     "local": {"name": "源端本地路径", "icon": "bi-hdd", "tier": 3, "desc": "服务端本地文件系统导出（可离线转移）"},
     "minio": {"name": "MinIO", "icon": "bi-cloud-arrow-up", "tier": 1, "desc": "热数据对象存储（S3 兼容），备份第一落点"},
     "s3": {"name": "S3", "icon": "bi-cloud-check", "tier": 2, "desc": "冷数据归档存储（AWS S3 / 兼容服务）"},
+    "tape": {"name": "磁带库 (D2T)", "icon": "bi-layers", "tier": 3, "desc": "磁带归档：真实设备 /dev/nst*（mt+tar）或目录模拟带库；顺序写入，适合离线长期保存"},
 }
 
 
@@ -65,6 +68,7 @@ def check_dependencies() -> dict[str, bool]:
         "local": True,  # 无额外依赖
         "minio": False,
         "s3": False,
+        "tape": True,   # mt/tar（设备模式）；目录模式无依赖
     }
     try:
         import minio

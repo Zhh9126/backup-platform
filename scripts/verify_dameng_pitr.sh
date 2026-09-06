@@ -50,7 +50,7 @@ import paramiko
 c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 c.connect('192.168.220.137', 22, 'root', 'Zhh@190226', timeout=15, allow_agent=False, look_for_keys=False)
 cmd = r'''
-NEW_INI=$(find /home/dmdba/pitr_verify -name dm.ini -type f | head -1)
+NEW_INI=$(find /home/dmdba/pitr_verify -name dm.ini -type f -path "*DAMENG*" | head -1)
 echo "新实例 ini: $NEW_INI"
 [ -z "$NEW_INI" ] && exit 0
 echo "RECOVER DATABASE '$NEW_INI' WITH ARCHIVEDIR '/dm/data/PROD/arch'" > /home/dmdba/rec_v.txt
@@ -71,7 +71,7 @@ import paramiko
 c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 c.connect('192.168.220.137', 22, 'root', 'Zhh@190226', timeout=15, allow_agent=False, look_for_keys=False)
 cmd = r'''
-NEW_INI=$(find /home/dmdba/pitr_verify -name dm.ini -type f | head -1)
+NEW_INI=$(find /home/dmdba/pitr_verify -name dm.ini -type f -path "*DAMENG*" | head -1)
 PORT=$(grep -iE "^PORT_NUM" $NEW_INI | head -1 | tr -dc 0-9); PORT=${PORT:-5336}
 ps -ef | grep pitr_verify | grep -v grep | head -1 || { nohup su - dmdba -c "/dm/dbms/bin/dmserver path=$NEW_INI -noconsole" >/tmp/dms_pitr.log 2>&1 & sleep 12; }
 /dm/dbms/bin/disql "SYSDBA/\"Ceshi@5235\""@localhost:$PORT <<'SQL' 2>&1 | tail -8

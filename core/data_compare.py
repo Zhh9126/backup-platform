@@ -152,7 +152,7 @@ def _user_of(conn) -> str:
     cur = conn.cursor()
     try:
         cur.execute("SELECT USER FROM DUAL")
-        return cur.fetchone()[0]
+        return str(cur.fetchone()[0])   # JDBC 通道 java.lang.String 归一
     except Exception:
         return ""
     finally:

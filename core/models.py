@@ -2227,6 +2227,7 @@ _DATA_COMPARE_TASK_FIELDS = [
     "target_db_type", "target_host", "target_port", "target_username",
     "target_password", "target_database", "target_schema",
     "tables", "enable_checksum", "sample_rows",
+    "force_pk_compare", "chunk_rows", "chunk_threshold",
     "schedule_type", "cron_expr", "interval_minutes", "enabled",
 ]
 
@@ -2433,6 +2434,12 @@ def list_data_compare_reports(task_id: int = None, limit: int = 200) -> list:
     for r in db.query(sql, tuple(params)):
         d = dict(r)
         d["duration_sec"] = float(d.get("duration_sec") or 0)
+        # 解析 JSON 字段（前端直接渲染 tables[].diffs 差异定位）
+        for f in ("summary_json", "tables_json"):
+            try:
+                d[f] = _json.loads(d.get(f)) if d.get(f) else None
+            except Exception:
+                pass
         rows.append(d)
     return rows
 

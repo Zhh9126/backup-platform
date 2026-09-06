@@ -621,11 +621,19 @@ def run_data_compare_task(task_id: int) -> dict:
             "tables_failed": failed,
             "duration_sec": duration,
         }
-        ok = (mismatched == 0 and failed == 0)
-        status = "success" if ok else "failed"
-        message = ("全部 {n} 张表比对一致".format(n=len(results)) if ok else
-                   "差异表 {m} / 失败表 {f}（共 {n} 张）".format(
-                       m=mismatched, f=failed, n=len(results)))
+        # 状态语义：failed 仅表示对比执行异常；发现差异是正常业务结果
+        # （status=mismatch），不应与执行失败混为一谈
+        if failed:
+            status = "failed"
+            message = ("差异表 {m} / 失败表 {f}（共 {n} 张）".format(
+                m=mismatched, f=failed, n=len(results)))
+        elif mismatched:
+            status = "mismatch"
+            message = "发现差异表 {m}（共 {n} 张，一致 {ok} 张）".format(
+                m=mismatched, n=len(results), ok=matched)
+        else:
+            status = "success"
+            message = "全部 {n} 张表比对一致".format(n=len(results))
 
         models.update_data_compare_report(report_id, {
             "status": status,
@@ -636,7 +644,8 @@ def run_data_compare_task(task_id: int) -> dict:
             "finished_at": db.now_iso(),
         })
         models.set_data_compare_status(task_id, db.now_iso(), status, report_id)
-        return {"report_id": report_id, "success": ok, "message": message,
+        return {"report_id": report_id, "success": not failed,
+                "message": message,
                 "summary": summary}
     except Exception as e:
         duration = round(time.monotonic() - started, 3)

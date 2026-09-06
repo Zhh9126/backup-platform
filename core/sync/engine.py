@@ -185,6 +185,27 @@ class SyncEngine:
     def run(self, progress_callback=None) -> Dict[str, Any]:
         """执行同步。支持单表 / 多表 / 全库迁移。"""
         cfg = self.config
+        # ---- 迁移前预校验（对标 DTS 预检查）：字段/结构不合适直接拒绝 ----
+        if not cfg.skip_precheck:
+            from .precheck import run_precheck
+            report = run_precheck(cfg)
+            if not report.get("passed"):
+                msg = (f"预校验未通过（{report.get('fail')} 项失败），"
+                       f"已阻止迁移。请修正后重试。")
+                logging.getLogger("sync").warning("[precheck] %s", msg)
+                return {
+                    "success": False,
+                    "precheck_failed": True,
+                    "precheck": report,
+                    "message": msg,
+                    "total_read": 0,
+                    "total_write": 0,
+                    "errors": 0,
+                    "duration": 0.0,
+                }
+            if report.get("warn"):
+                logging.getLogger("sync").info(
+                    "[precheck] 通过，%s 项警告", report.get("warn"))
         if cfg.sync_mode == "realtime":
             return self._run_realtime(progress_callback)
         if cfg.full_db_migrate:

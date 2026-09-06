@@ -91,6 +91,7 @@
         <td>
           <button class="btn btn-sm btn-primary" onclick="SYNC.editTask(${t.id})">编辑</button>
           <button class="btn btn-sm btn-success" onclick="SYNC.runTask(${t.id})">运行</button>
+          <button class="btn btn-sm btn-outline-secondary" onclick="SYNC.precheckTask(${t.id})">预检</button>
           <button class="btn btn-sm btn-outline-info" onclick="SYNC.validateTask(${t.id})">校验</button>
           <button class="btn btn-sm btn-danger" onclick="SYNC.deleteTask(${t.id})">删除</button>
         </td>
@@ -451,11 +452,36 @@
     },
     runTask: async function (id) {
       try {
+        // 迁移前预校验：字段/结构不合适直接拒绝启动
+        const pc = await api("POST", "/api/sync-tasks/" + id + "/precheck", {});
+        if (pc.success && pc.passed === false) {
+          let lines = (pc.items || []).filter(i => i.status !== "pass")
+            .map(i => "【" + (i.status === "fail" ? "不通过" : "警告") + "】"
+              + i.message + (i.detail || []).map(d =>
+                "    - " + (d.table ? d.table + "." : "") + (d.column || "") + ": " + (d.message || "")).join(""));
+          alert("迁移前预校验未通过，已阻止启动：\n\n" + lines.join("\n"));
+          refreshTasks();
+          return;
+        }
         const res = await api("POST", "/api/sync-tasks/" + id + "/run", {});
         toast(res.message, res.success ? "success" : "danger");
         setTimeout(refreshTasks, 500);
       } catch (e) {
         toast("启动失败：" + e.message, "danger");
+      }
+    },
+    precheckTask: async function (id) {
+      try {
+        const pc = await api("POST", "/api/sync-tasks/" + id + "/precheck", {});
+        if (!pc.success) throw new Error(pc.message || "预校验执行失败");
+        const icon = {pass: "✔", warn: "⚠", fail: "✘"};
+        let lines = (pc.items || []).map(i =>
+          icon[i.status] + " [" + i.check + "] " + i.message
+          + (i.detail || []).map(d =>
+            "\n     - " + (d.table ? d.table + "." : "") + (d.column || "") + ": " + (d.message || "")).join(""));
+        alert("迁移前预校验结果：\n\n" + lines.join("\n"));
+      } catch (e) {
+        toast("预校验失败：" + e.message, "danger");
       }
     },
     deleteTask: async function (id) {

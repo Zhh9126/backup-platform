@@ -51,6 +51,7 @@ class SyncConfig:
     incremental_value: str = ""
     batch_size: int = 1000
     error_threshold: int = 0
+    skip_precheck: bool = False         # 跳过迁移前预校验（默认强制执行）
 
     # 实时同步（Flink CDC 预留）
     realtime_enabled: bool = False

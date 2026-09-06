@@ -135,6 +135,23 @@ def run_task(task_id):
             return jsonify({"success": False, "message": "实时同步线程启动失败"}), 500
         return jsonify({"success": True, "message": "实时同步已启动（Binlog CDC 监听中）"})
 
+    # ---- 迁移前预校验（字段/结构不合适直接拒绝启动）----
+    from core.sync.precheck import run_precheck
+    from core.sync.engine import _task_to_config
+    pre = run_precheck(_task_to_config(task))
+    if not pre.get("passed"):
+        msg = (f"预校验未通过（{pre.get('fail')} 项失败），已阻止迁移："
+               + "；".join(i["message"] for i in pre["items"]
+                           if i["status"] == "fail")[:300])
+        models.update_sync_task(task_id, {
+            "status": "failed",
+            "last_status": "failed",
+            "message": msg,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        return jsonify({"success": False, "precheck": pre,
+                        "message": msg}), 400
+
     models.update_sync_task(task_id, {
         "status": "running",
         "last_status": "running",
@@ -220,6 +237,23 @@ def list_records(task_id):
 @login_required
 def flink_config(task_id):
     return jsonify(generate_flink_config(task_id))
+
+
+@sync_bp.route("/sync-tasks/<int:task_id>/precheck", methods=["POST"])
+@login_required
+def precheck_task(task_id):
+    """迁移前预校验（连通性/表存在/列兼容/主键/增量列），只查不跑。"""
+    task = models.get_sync_task(task_id, include_secret=True)
+    if not task:
+        return jsonify({"success": False, "message": "同步任务不存在"}), 404
+    from core.sync.precheck import run_precheck
+    from core.sync.engine import _task_to_config
+    try:
+        report = run_precheck(_task_to_config(task))
+    except Exception as e:
+        return jsonify({"success": False, "passed": False,
+                        "message": f"预校验执行失败: {e}"}), 500
+    return jsonify({"success": True, **report})
 
 
 @sync_bp.route("/sync-tasks/<int:task_id>/validate", methods=["POST"])

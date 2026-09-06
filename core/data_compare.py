@@ -90,7 +90,8 @@ def _side_cfg(task: dict, side: str) -> dict:
 def _qident(db_type: str, *parts: str) -> str:
     """生成带引用的限定表名。输入均来自库内元数据或白名单校验。"""
     db_type = (db_type or "").lower()
-    parts = [p for p in parts if p]
+    # JDBC 通道标识符可能为 java.lang.String，统一归一为 python str
+    parts = [str(p) for p in parts if p]
     if db_type in ("mysql", "mariadb"):
         return ".".join("`" + p.replace("`", "``") + "`" for p in parts)
     return ".".join('"' + p.replace('"', '""') + '"' for p in parts)
@@ -137,7 +138,7 @@ def _list_tables(conn, db_type: str, database: str, schema: str) -> list:
                 "ORDER BY table_name")
         else:
             raise ValueError(f"暂不支持列出 {db_type} 的表清单")
-        names = [r[0] for r in cur.fetchall()]
+        names = [str(r[0]) for r in cur.fetchall()]
     finally:
         try:
             cur.close()
@@ -198,7 +199,7 @@ def _get_columns(conn, db_type: str, database: str, schema: str, table: str) -> 
                 "ORDER BY column_id")
         else:
             raise ValueError(f"暂不支持 {db_type} 取列")
-        return [r[0] for r in cur.fetchall()]
+        return [str(r[0]) for r in cur.fetchall()]   # JDBC java String 归一
     finally:
         try:
             cur.close()
@@ -318,7 +319,7 @@ def _get_pk_column(conn, db_type: str, database: str, schema: str,
                 "AND c.constraint_type='P' ORDER BY cols.position")
         else:
             return None
-        pks = [r[0] for r in cur.fetchall()]
+        pks = [str(r[0]) for r in cur.fetchall()]
         return pks[0] if len(pks) == 1 else None
     except Exception:
         return None
@@ -353,6 +354,7 @@ def _page_sql(db_type: str, ref: str, pk: str, last, chunk: int) -> str:
 def _pk_chunk_compare(src, dst, src_type: str, dst_type: str, task: dict,
                       table: str, ref_s: str, ref_d: str,
                       pk: str, pk_idx: int, pk_idx_d: int, out: dict,
+                      dst_table: str = None,
                       max_diffs: int = 20) -> dict:
     """主键 keyset 双指针归并对比（对标 pt-table-checksum 差异定位）。
 
@@ -428,12 +430,15 @@ def _pk_chunk_compare(src, dst, src_type: str, dst_type: str, task: dict,
 # 逐表比对
 # ---------------------------------------------------------------------------
 def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
-                   table: str) -> dict:
+                   table: str, target_table: str = None) -> dict:
     """对比单张表，返回结果 dict（永抛不异常，失败记 status=failed）。"""
     src_db = task.get("source_database") or ""
     src_schema = task.get("source_schema") or ""
     dst_db = task.get("target_database") or ""
     dst_schema = task.get("target_schema") or ""
+    # 跨名对比：目标侧独立表名（src_table 仍用于源端，不能覆盖共享变量
+    # ——此前 table=target_table 导致源侧也查目标表，永远"一致"）
+    dst_table = target_table or table
     sample_n = int(task.get("sample_rows") or 100)
     enable_checksum = bool(task.get("enable_checksum"))
 
@@ -455,7 +460,7 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
     try:
         # 行数
         ref_s = _table_ref(src_type, src_db, src_schema, table)
-        ref_d = _table_ref(dst_type, dst_db, dst_schema, table)
+        ref_d = _table_ref(dst_type, dst_db, dst_schema, dst_table)
         cur_s.execute(_row_count_sql(src_type, ref_s))
         out["source_rows"] = int(cur_s.fetchone()[0])
         cur_d.execute(_row_count_sql(dst_type, ref_d))
@@ -475,7 +480,7 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
         if pk and (out["source_rows"] > threshold
                    or str(task.get("force_pk_compare") or "") == "1"):
             cols_s = _get_columns(src, src_type, src_db, src_schema, table)
-            cols_d = _get_columns(dst, dst_type, dst_db, dst_schema, table)
+            cols_d = _get_columns(dst, dst_type, dst_db, dst_schema, dst_table)
             pk_idx = next((i for i, c in enumerate(cols_s)
                            if c.lower() == pk.lower()), 0)
             pk_idx_d = next((i for i, c in enumerate(cols_d)
@@ -484,7 +489,8 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
             out["mode"] = "pk_chunk"
             out["pk"] = pk
             _pk_chunk_compare(src, dst, src_type, dst_type, task, table,
-                              ref_s, ref_d, pk, pk_idx, pk_idx_d, out)
+                              ref_s, ref_d, pk, pk_idx, pk_idx_d, out,
+                              dst_table=dst_table)
             if out.get("diff_count"):
                 out["status"] = "mismatch"
                 out["message"] = (f"主键归并发现 {out['diff_count']} 处差异"
@@ -504,7 +510,7 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
                 return out
             cur_s.execute(_checksum_sql(src_type, ref_s, cols_s))
             row_s = cur_s.fetchone()
-            cols_d = _get_columns(dst, dst_type, dst_db, dst_schema, table)
+            cols_d = _get_columns(dst, dst_type, dst_db, dst_schema, dst_table)
             cur_d.execute(_checksum_sql(dst_type, ref_d, cols_d))
             row_d = cur_d.fetchone()
             out["source_checksum"] = str(row_s[1])
@@ -544,8 +550,9 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
         out["message"] = "一致"
         return out
     except Exception as e:
+        import traceback as _tb
+        out["message"] = f"{type(e).__name__}: {e}\n{_tb.format_exc()[-600:]}"
         out["status"] = "failed"
-        out["message"] = f"{type(e).__name__}: {e}"
         return out
     finally:
         try:
@@ -590,25 +597,33 @@ def run_data_compare_task(task_id: int) -> dict:
 
         # 表清单：任务指定 → 否则两端交集（大小写不敏感）
         wanted = task.get("tables") or []
-        if wanted:
-            tables = [t for t in wanted if t]
-        else:
+        table_pairs = []   # (源表名, 目标表名)：元素可为 "T1" 或
+                           # {"source": "T1", "target": "T1_CMP"}（跨名对比）
+        for t in wanted:
+            if isinstance(t, dict) and t.get("source"):
+                table_pairs.append((str(t["source"]),
+                                    str(t.get("target") or t["source"])))
+            elif isinstance(t, str) and t:
+                table_pairs.append((t, t))
+        if not table_pairs:
+            # 未指定表清单：两端交集（同名表对比）
             src_tables = _list_tables(src, src_type, src_cfg.get("database"),
                                       src_cfg.get("schema"))
             dst_tables = _list_tables(dst, dst_type, dst_cfg.get("database"),
                                       dst_cfg.get("schema"))
             lower = {t.lower(): t for t in src_tables}
-            tables = [lower[t.lower()] for t in dst_tables
-                      if t.lower() in lower]
-        if not tables:
+            table_pairs = [(lower[t.lower()], t) for t in dst_tables
+                           if t.lower() in lower]
+        if not table_pairs:
             raise ValueError("没有可对比的表（任务未指定且两端无共有表）")
 
         results = []
-        for t in tables:
-            r = _compare_table(src, dst, src_type, dst_type, task, t)
+        for src_t, dst_t in table_pairs:
+            r = _compare_table(src, dst, src_type, dst_type, task, src_t,
+                               target_table=dst_t)
             results.append(r)
             logger.info("[data_compare] task=%s table=%s -> %s",
-                        task_id, t, r["status"])
+                        task_id, src_t, r["status"])
 
         duration = round(time.monotonic() - started, 3)
         matched = sum(1 for r in results if r["status"] == "match")

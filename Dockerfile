@@ -55,6 +55,7 @@ COPY static/ ./static/
 COPY templates/ ./templates/
 COPY drivers/ ./drivers/
 COPY skills/ ./skills/
+COPY tools/ ./tools/
 
 RUN chmod +x start.sh \
     # 运行时持久化目录（挂载卷）

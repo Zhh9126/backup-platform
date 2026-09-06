@@ -149,10 +149,12 @@ def _get_ssh_client_from_dep(dep: dict):
 
 def _build_install_script(db_type: str, params: dict) -> str:
     """根据 db_type 和完整参数生成安装脚本。所有参数均从 config_json 读取。"""
-    base = params.get("base_dir", "/opt/database")
-    data = params.get("data_dir", "/data/db")
-    port = params.get("port", 3306)
-    pw = params.get("password", "Admin123!")
+    base = params.get("base_dir") or "/opt/database"
+    data = params.get("data_dir") or "/data/db"
+    port = params.get("port") or 3306
+    pw = params.get("password") or "Admin123!"
+    if not params.get("version"):
+        params["version"] = ""
     pkg = params.get("package_path", "")
     version = params.get("version", "")
 
@@ -705,7 +707,7 @@ tcp-keepalive 60
 timeout 300
 {cluster_cfg}
 EOF
-{base}/bin/redis-server {base}/redis.conf 2>&1 | head -5
+{base}/bin/redis-server {base}/redis.conf --daemonize yes 2>&1 | head -5
 sleep 2
 if REDISCLI_AUTH={pw} {base}/bin/redis-cli PING 2>/dev/null | grep -q PONG; then
     echo "[deploy] Redis 启动成功 (PONG)"
@@ -714,7 +716,7 @@ else
 fi
 cat > /usr/local/bin/redis-start.sh << 'STARTEOF'
 #!/bin/bash
-{base}/bin/redis-server {base}/redis.conf
+{base}/bin/redis-server {base}/redis.conf --daemonize yes
 STARTEOF
 chmod +x /usr/local/bin/redis-start.sh
 echo "[deploy] 写入 /etc/profile.d/redis.sh ..."

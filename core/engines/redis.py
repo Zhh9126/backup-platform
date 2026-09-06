@@ -163,26 +163,78 @@ class RedisEngine(BackupEngine):
                 success=False,
                 message="请提供目标主机与 rdb 目录(target_host, target_db)")
 
-        # 3. 通过 scp 将 rdb 复制到目标主机的目标目录（重命名为 dump.rdb）
-        remote_path = target_dir.rstrip("/") + "/dump.rdb"
-        cmd = ["sh", "-c", "scp %s %s:%s" % (backup_path, target_host, remote_path)]
+        # 3. SFTP 推送 rdb → 停库 → 替换数据文件 → 重启加载 → PING 验证
+        #    （零安装：全平台侧 paramiko 完成，不依赖本机 scp/人工干预）
         t0 = __import__("time").time()
-        res = self._run(cmd, timeout=3600)
-        duration = __import__("time").time() - t0
-
-        if res["returncode"] != 0:
-            return BackupResult(
-                success=False, status=BackupStatus.FAILED,
-                backup_path=backup_path, duration_sec=duration,
-                stdout=res["stdout"], stderr=res["stderr"],
-                message="恢复失败: scp 返回非零码 %s" % res["returncode"])
-
-        self.logger.info("[%s] Redis rdb 已复制到 %s:%s", self.task_name, target_host, remote_path)
-        return BackupResult(
-            success=True, status=BackupStatus.SUCCESS,
-            backup_path=backup_path, duration_sec=duration,
-            stdout=res["stdout"], stderr=res["stderr"],
-            message="恢复文件已推送至 %s:%s，请在目标端重启 Redis 以加载该 rdb" % (target_host, remote_path))
+        import re as _re
+        from core import remote_dump as _rd
+        ssh_host = _rd.resolve_ssh_host(self.task)
+        if ssh_host is None:
+            ssh_host = {"hostname": target_host.split("@")[-1], "port": 22,
+                        "username": "root", "password": ""}
+        try:
+            client = _rd._connect(ssh_host)
+        except Exception as e:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                backup_path=backup_path,
+                                message=f"SSH 连接目标失败: {e}")
+        sftp = client.open_sftp()
+        host = self.task.get("host") or "127.0.0.1"
+        port = int(self.task.get("port") or 6379)
+        pw = db.decrypt_secret(self.task.get("password") or "")
+        auth = f" -a '{pw}'" if pw else ""
+        cli_bin = "/opt/redis/bin/redis-cli"
+        cli_cmd = f"{cli_bin} -h 127.0.0.1 -p {port}{auth}"
+        from core.engines.file import _ssh_exec_pipe
+        logs = []
+        try:
+            def _run(shell, timeout=120):
+                o, e, rc = _ssh_exec_pipe(client, _rd._wrap_login(shell),
+                                          timeout=timeout)
+                return rc, (o.decode("utf-8", "replace") if isinstance(o, bytes) else o or ""), e
+            # 1) 定位数据目录（dir 配置）
+            rc, out, _ = _run(f"grep -E '^dir ' /opt/redis/redis.conf /etc/redis.conf 2>/dev/null | head -1")
+            m = _re.search(r"dir\s+(\S+)", out)
+            data_dir = m.group(1) if m else "/data/redis"
+            # 2) 推送 rdb
+            tmp_rdb = "/tmp/dump_restore.rdb"
+            sftp.put(backup_path, tmp_rdb)
+            logs.append(f"rdb 已推送 {tmp_rdb}")
+            # 3) 停库（数据安全：SHUTDOWN 前确认）
+            _run(f"{cli_cmd} SHUTDOWN NOSAVE || true")
+            import time as _t; _t.sleep(2)
+            # 4) 替换 dump.rdb
+            rc, out, _ = _run(
+                f"cp {tmp_rdb} {data_dir}/dump.rdb && echo COPY_OK")
+            if "COPY_OK" not in out:
+                raise RuntimeError(f"替换 dump.rdb 失败: {out[:200]}")
+            logs.append(f"dump.rdb 已替换至 {data_dir}")
+            # 5) 重启（优先部署脚本）
+            _run("/usr/local/bin/redis-start.sh || "
+                 "(redis-server --daemonize yes) || true")
+            _t.sleep(3)
+            # 6) PING 验证
+            rc, out, _ = _run(f"{cli_cmd} PING")
+            ping_ok = "PONG" in out
+            duration = __import__("time").time() - t0
+            if ping_ok:
+                self.logger.info("[%s] Redis 恢复完成: %s", self.task_name, "; ".join(logs))
+                return BackupResult(success=True, status=BackupStatus.SUCCESS,
+                                    backup_path=backup_path, duration_sec=duration,
+                                    message="Redis 恢复成功（rdb 推送+重启加载，PING=PONG）")
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                backup_path=backup_path, duration_sec=duration,
+                                message="Redis 重启后 PING 失败；" + "; ".join(logs))
+        except Exception as e:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                backup_path=backup_path,
+                                duration_sec=__import__("time").time() - t0,
+                                message=f"Redis 恢复失败: {e}; " + "; ".join(logs))
+        finally:
+            try:
+                sftp.close(); client.close()
+            except Exception:
+                pass
 
     def list_databases(self) -> list:
         """列出可备份的 Redis 库。

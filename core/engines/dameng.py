@@ -605,14 +605,14 @@ class DamengEngine(BackupEngine):
                              db.decrypt_secret(self.task.get("password") or ""))
                 _cur = _c.cursor()
                 _cur.execute("SELECT SF_GET_PAGE_SIZE()")
-                # dminit PAGE_SIZE 单位=字节（默认 8192），SF_GET_PAGE_SIZE
-                # 返回的也是字节，直接透传
-                page_size = int(_cur.fetchone()[0]) or 8192
+                # dminit PAGE_SIZE 单位=K（合法值 4/8/16/32），
+                # SF_GET_PAGE_SIZE 返回字节 → 换算为 K
+                page_size = max(int(_cur.fetchone()[0]) // 1024, 4) or 8
                 try:
                     _cur.execute("SELECT SF_GET_EXTENT_SIZE()")
-                    extent_size = int(_cur.fetchone()[0]) or 16   # 单位=K
+                    extent_size = max(int(_cur.fetchone()[0]) // 1024, 16)
                 except Exception:
-                    pass
+                    extent_size = 16
                 _cur.close()
                 _c.close()
                 logs.append(f"[PITR] 源实例页大小={page_size}K 簇大小={extent_size}K")

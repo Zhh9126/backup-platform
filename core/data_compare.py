@@ -351,6 +351,23 @@ def _page_sql(db_type: str, ref: str, pk: str, last, chunk: int) -> str:
     return sql
 
 
+def _sql_lit(v) -> str:
+    """值 → SQL 字面量（修复 SQL 生成用）。"""
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        return "TRUE" if v else "FALSE"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    s = str(v)
+    # ISO 时间戳/数值串可作裸值处理由目标库隐式转换，其余加引号转义
+    if re.fullmatch(r"-?\d+(\.\d+)?", s):
+        return s
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?.*", s):
+        return "'" + s.replace("T", " ") + "'"
+    return "'" + s.replace("'", "''") + "'"
+
+
 def _pk_chunk_compare(src, dst, src_type: str, dst_type: str, task: dict,
                       table: str, ref_s: str, ref_d: str,
                       pk: str, pk_idx: int, pk_idx_d: int, out: dict,
@@ -362,9 +379,18 @@ def _pk_chunk_compare(src, dst, src_type: str, dst_type: str, task: dict,
     - 仅源有   → missing_in_target（目标缺行，修复=INSERT）
     - 仅目标有 → extra_in_target（目标多行，修复=DELETE）
     - 双侧都有但值不同 → changed（修复=UPDATE）
-    内存占用 O(单页)，可对比千万级行；差异行携带行级明细与修复 SQL 模板。
+    内存占用 O(单页)，可对比千万级行；差异行携带行级明细与修复 SQL。
     """
     chunk = int(task.get("chunk_rows") or 5000)
+    # 修复 SQL 需要 列名 → 两侧取列清单（失败则退化为注释提示）
+    try:
+        cols_s = (_get_columns(src, src_type, task.get("source_database") or "",
+                               task.get("source_schema") or "", table) or [])
+        cols_d = (_get_columns(dst, dst_type, task.get("target_database") or "",
+                               task.get("target_schema") or "",
+                               dst_table or table) or cols_s)
+    except Exception:
+        cols_s, cols_d = [], []
 
     def _iter_side(cur, db_type, ref, idx):
         """按主键 keyset 流式产出原始行（pk 取第 idx 列）。"""
@@ -390,10 +416,15 @@ def _pk_chunk_compare(src, dst, src_type: str, dst_type: str, task: dict,
             kd = _norm_val(rd[0]) if rd else None
             if rd is None or (rs is not None and ks < kd):
                 if len(diffs) < max_diffs:
+                    nr = _norm_row(rs)
+                    ins = ("INSERT INTO {t} ({cols}) VALUES ({vals});".format(
+                        t=ref_d, cols=", ".join(cols_d),
+                        vals=", ".join(_sql_lit(v) for v in nr))
+                        if cols_d and nr else
+                        f"-- 目标缺行：请从源库补插该行（pk={ks}）")
                     diffs.append({
                         "op": "missing_in_target", "pk": ks,
-                        "source": _norm_row(rs),
-                        "repair": f"-- 目标缺行：请从源库补插该行（pk={ks}）"})
+                        "source": nr, "repair": ins})
                 rs = next(it_s, None)
             elif rs is None or kd < ks:
                 if len(diffs) < max_diffs:
@@ -405,10 +436,17 @@ def _pk_chunk_compare(src, dst, src_type: str, dst_type: str, task: dict,
             else:
                 ns, nd = _norm_row(rs), _norm_row(rd)
                 if ns != nd and len(diffs) < max_diffs:
+                    if cols_d and cols_s and len(ns) == len(cols_s):
+                        sets = ", ".join(
+                            f"{c} = {_sql_lit(v)}" for c, v in zip(cols_d, ns)
+                            if c.lower() != pk.lower())
+                        upd = (f"UPDATE {ref_d} SET {sets} WHERE {pk} = "
+                               f"{_sql_lit(ks)};")
+                    else:
+                        upd = (f"-- 请按源库该行内容更新目标行（pk={ks}）")
                     diffs.append({"op": "changed", "pk": ks,
                                   "source": ns, "target": nd,
-                                  "repair": f"UPDATE {ref_d} SET ... WHERE {pk} = "
-                                            f"{ks if str(ks).lstrip('-').isdigit() else chr(39)+str(ks)+chr(39)};"})
+                                  "repair": upd})
                 rs = next(it_s, None)
                 rd = next(it_d, None)
         out["compared_rows"] = compared
@@ -467,10 +505,11 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
         out["target_rows"] = int(cur_d.fetchone()[0])
         out["rows_match"] = out["source_rows"] == out["target_rows"]
 
-        if not out["rows_match"]:
-            out["status"] = "mismatch"
-            out["message"] = "行数不一致"
-            return out
+        # 行数不一致不短路——继续主键归并/抽样定位具体差异行
+        # （对标 DTS：行数差异只是表象，用户需要知道缺了哪些行、
+        #   哪些行被改过，才能直接生成修复清单）
+        row_pre = (f"行数不一致({out['source_rows']}≠{out['target_rows']})；"
+                   if not out["rows_match"] else "")
 
         # ---- 分块对比（对标 pt-table-checksum）：大表或有主键时走
         #      keyset 归并，精确输出差异行（missing/extra/changed）；
@@ -478,7 +517,8 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
         pk = _get_pk_column(src, src_type, src_db, src_schema, table)
         threshold = int(task.get("chunk_threshold") or 20000)
         if pk and (out["source_rows"] > threshold
-                   or str(task.get("force_pk_compare") or "") == "1"):
+                   or str(task.get("force_pk_compare") or "") == "1"
+                   or not out["rows_match"]):
             cols_s = _get_columns(src, src_type, src_db, src_schema, table)
             cols_d = _get_columns(dst, dst_type, dst_db, dst_schema, dst_table)
             pk_idx = next((i for i, c in enumerate(cols_s)
@@ -493,11 +533,13 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
                               dst_table=dst_table)
             if out.get("diff_count"):
                 out["status"] = "mismatch"
-                out["message"] = (f"主键归并发现 {out['diff_count']} 处差异"
+                out["message"] = (row_pre + f"主键归并发现 {out['diff_count']} 处差异"
                                   f"（共比对 {out.get('compared_rows')} 行）")
             else:
-                out["status"] = "match"
-                out["message"] = (f"主键归并比对 {out.get('compared_rows')} 行一致")
+                out["status"] = "match" if out["rows_match"] else "mismatch"
+                out["message"] = (row_pre + f"主键归并比对 {out.get('compared_rows')} 行一致"
+                                  if not out["rows_match"]
+                                  else f"主键归并比对 {out.get('compared_rows')} 行一致")
             return out
         out["mode"] = "checksum_sample"
 
@@ -518,7 +560,7 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
             out["checksum_match"] = str(row_s[1]) == str(row_d[1])
             if not out["checksum_match"]:
                 out["status"] = "mismatch"
-                out["message"] = "全表校验和不一致"
+                out["message"] = row_pre + "全表校验和不一致"
                 return out
 
         # 抽样比对
@@ -543,11 +585,11 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
             out["sample_diffs"] = diffs
             if diffs:
                 out["status"] = "mismatch"
-                out["message"] = f"抽样比对发现 {len(diffs)}+ 处差异"
+                out["message"] = row_pre + f"抽样比对发现 {len(diffs)}+ 处差异"
                 return out
 
-        out["status"] = "match"
-        out["message"] = "一致"
+        out["status"] = "match" if out["rows_match"] else "mismatch"
+        out["message"] = row_pre + "一致" if not out["rows_match"] else "一致"
         return out
     except Exception as e:
         import traceback as _tb

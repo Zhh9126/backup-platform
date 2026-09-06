@@ -65,7 +65,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 | 能力 | 说明 |
 |---|---|
-| 支持链路 | MySQL / MariaDB / PostgreSQL / DM（达梦）互为源目标（含异构跨库：MySQL→达梦、PG→达梦、MySQL→PG、达梦→PG 等）|
+| 支持链路 | MySQL / MariaDB / PostgreSQL / DM（达梦）/ Oracle 互为源目标（含异构跨库：MySQL→达梦、PG→达梦、MySQL→PG、达梦→PG、MySQL→Oracle、Oracle→MySQL 等）|
 | 全库迁移模式 | 源库所有表一次性迁移到目标库 |
 | 数据校验 | 逐表行数比对（源 vs 目标），逐表明细 |
 | 迁移报告 | 各阶段结果/行数/耗时汇总 |
@@ -75,13 +75,18 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 | 能力 | 说明 |
 |---|---|
-| 支持链路 | 与数据迁移一致（MySQL / MariaDB / PostgreSQL / DM 互为源目标，原生驱动 + JDBC 双通道）|
+| 支持链路 | 与数据迁移一致（MySQL / MariaDB / PostgreSQL / DM / Oracle 互为源目标，原生驱动 + JDBC 双通道）|
 | 同步模式 | full（数据迁移·一次性）/ incremental（周期增量）/ realtime（实时轮询）|
 | 写入模式 | append / overwrite（仅迁移可用）/ upsert / create_if_not_exists |
 | 增量同步 | 指定增量列 + 起始值，watermark 断点记录 |
 | 字段映射 | 同名映射 / 手动映射 / 可视化连线；列名归一 origin/upper/lower/camel/underscore |
 | 统一类型系统 | 源端类型 → 平台中间类型 → 目标端类型，读写两侧一致转换 |
 | 概念区分 | 迁移=一次性任务（支持覆盖写入）；同步=持续性任务（禁用覆盖写入），引擎/预校验/前端四层强制执行 |
+
+**Oracle 异构链路真机验证（129 / Oracle 19c）**：mysql→oracle 17/17 行 PASS、oracle→mysql 25/25 行 PASS。
+深度测试命中并修复 Oracle 异构迁移典型坑：oracledb 占位符方言、`_` 开头标识符非法（ORA-00911）、
+试写临时表 schema 前缀、datetime 字符串 NLS 转换（ORA-01843，会话级对齐 + 原生绑定）、
+`varchar2(n)` 精度解析、空 ORDER BY（ORA-00936）、连接自动重试（跨虚拟机 1521 偶发重置）。
 
 ### 5. 迁移前预校验
 
@@ -239,7 +244,15 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v1.3.3   # 固定版本（可回滚）
+docker pull ghcr.io/zhh9126/backup-platform:v1.4.0   # 固定版本（可回滚）
+```
+
+### 服务端环境自检（部署后先跑一遍）
+
+```bash
+python tools/check_env.py
+# 一键核对：Python 直连驱动（8 项）/ JDBC 驱动包 / JRE，输出缺失项与离线安装指引
+# 按"服务端集中安装、客户端零安装"设计，所有数据库驱动都在镜像内预装
 ```
 
 ### 国内加速
@@ -317,7 +330,7 @@ docker build -t backup-platform:local .
 | Redis | redis-cli --rdb | （替换 rdb + 自动重启） | REDISCLI_AUTH 传密码 |
 | MongoDB | mongodump | mongorestore | --archive 流式拉回 |
 
-**数据迁移/同步连接通道**：原生 Python 驱动优先（pymysql / psycopg2 / oracledb thin），JDBC 兜底（驱动 jar 随包，达梦/金仓/Oracle 全覆盖）。
+**数据迁移/同步连接通道**：原生 Python 驱动优先（pymysql / psycopg2 / oracledb thin），JDBC 兜底（驱动 jar 随包，达梦/金仓/Oracle 全覆盖）。部署后运行 `python tools/check_env.py` 一键自检（服务端集中安装、客户端零安装）。
 
 ---
 

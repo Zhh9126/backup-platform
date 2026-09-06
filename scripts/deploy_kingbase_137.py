@@ -51,6 +51,17 @@ def main():
         cli.close()
         return
 
+    # 0) kingbase 家目录迁移到大分区（安装器要求家目录有 6GB 空闲，
+    #    /home 为独立小分区时用根分区路径替代）
+    o = run(cli, "df --output=avail -k /home/kingbase | tail -1", quiet=True)
+    try:
+        avail_kb = int(o.strip().splitlines()[-1])
+    except Exception:
+        avail_kb = 0
+    if avail_kb < 6_000_000:
+        run(cli, "usermod -d /opt/kbhome kingbase && mkdir -p /opt/kbhome && "
+                 "chown -R kingbase:kingbase /opt/kbhome && echo home-migrated")
+
     # 1) 挂载 ISO + 清理残留
     run(cli, f"umount /mnt/kbiso2 2>/dev/null; mkdir -p /mnt/kbiso2 && "
              f"mount -o loop,ro '{ISO}' /mnt/kbiso2 && ls /mnt/kbiso2 | head -8")

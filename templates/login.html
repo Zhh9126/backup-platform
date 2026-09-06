@@ -6,28 +6,286 @@
   <title>登录 - 数据备份管理平台</title>
   <link href="/static/css/bootstrap.min.css?v=2026080210" rel="stylesheet">
   <link href="/static/vendor/bootstrap-icons/bootstrap-icons.css?v=2026081401" rel="stylesheet">
-  <link href="/static/css/app.css" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+      background: #0a1628;
+      display: flex;
+    }
+    /* ===== 左侧品牌区 ===== */
+    .brand-pane {
+      flex: 1.15;
+      position: relative;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 64px 72px;
+      color: #fff;
+      background: linear-gradient(135deg, #0a1628 0%, #0d2137 45%, #0b3a4a 100%);
+      overflow: hidden;
+      min-height: 100vh;
+    }
+    .brand-pane::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(ellipse 600px 400px at 85% 15%, rgba(13,148,136,.22), transparent 65%),
+        radial-gradient(ellipse 500px 380px at 10% 90%, rgba(30,90,180,.18), transparent 60%);
+      pointer-events: none;
+    }
+    .brand-pane::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(255,255,255,.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.03) 1px, transparent 1px);
+      background-size: 44px 44px;
+      pointer-events: none;
+      mask-image: linear-gradient(160deg, rgba(0,0,0,.8), transparent 70%);
+      -webkit-mask-image: linear-gradient(160deg, rgba(0,0,0,.8), transparent 70%);
+    }
+    .brand-inner { position: relative; z-index: 2; max-width: 520px; }
+    .brand-logo-row { display: flex; align-items: center; gap: 14px; margin-bottom: 10px; }
+    .brand-logo {
+      width: 52px; height: 52px; border-radius: 14px;
+      background: linear-gradient(135deg, #0D9488, #14b8a6);
+      display: flex; align-items: center; justify-content: center;
+      box-shadow: 0 8px 24px rgba(13,148,136,.35);
+      font-size: 26px; color: #fff;
+    }
+    .brand-name { font-size: 21px; font-weight: 600; letter-spacing: .5px; }
+    .brand-name small { display: block; font-size: 11.5px; font-weight: 400; color: rgba(255,255,255,.45); letter-spacing: 2px; }
+    .brand-slogan {
+      font-size: 30px; font-weight: 700; line-height: 1.35;
+      margin: 34px 0 12px;
+    }
+    .brand-slogan em { font-style: normal; color: #2dd4bf; }
+    .brand-desc { color: rgba(255,255,255,.55); font-size: 14.5px; line-height: 1.8; margin-bottom: 40px; }
+    .feat-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 18px; }
+    .feat-list li { display: flex; gap: 14px; align-items: flex-start; }
+    .feat-ico {
+      flex: 0 0 40px; width: 40px; height: 40px; border-radius: 10px;
+      background: rgba(255,255,255,.07);
+      border: 1px solid rgba(255,255,255,.1);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px; color: #2dd4bf;
+    }
+    .feat-list b { display: block; font-size: 14.5px; font-weight: 600; margin-bottom: 2px; }
+    .feat-list span { font-size: 12.5px; color: rgba(255,255,255,.5); line-height: 1.6; }
+    .brand-footer {
+      position: absolute; z-index: 2; bottom: 28px; left: 72px; right: 72px;
+      display: flex; justify-content: space-between;
+      font-size: 12px; color: rgba(255,255,255,.32);
+    }
+    /* ===== 右侧表单区 ===== */
+    .form-pane {
+      flex: 1;
+      min-width: 400px;
+      background: #f4f7fa;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 48px;
+      position: relative;
+    }
+    .login-box { width: 100%; max-width: 384px; }
+    .login-box h1 { font-size: 24px; font-weight: 700; color: #16283c; margin: 0 0 6px; }
+    .login-box .sub { color: #7b8a9c; font-size: 13.5px; margin-bottom: 30px; }
+    .field { margin-bottom: 18px; }
+    .field label {
+      display: block; font-size: 13px; font-weight: 600;
+      color: #3b4c5f; margin-bottom: 7px;
+    }
+    .input-wrap { position: relative; }
+    .input-wrap .bi {
+      position: absolute; left: 13px; top: 50%; transform: translateY(-50%);
+      color: #9db0c3; font-size: 15px; pointer-events: none;
+    }
+    .input-wrap input {
+      width: 100%; height: 46px;
+      border: 1.5px solid #dde6ee; border-radius: 10px;
+      padding: 0 42px 0 40px;
+      font-size: 14.5px; color: #16283c;
+      background: #fff; outline: none;
+      transition: border-color .18s, box-shadow .18s;
+    }
+    .input-wrap input:focus {
+      border-color: #0D9488;
+      box-shadow: 0 0 0 3.5px rgba(13,148,136,.13);
+    }
+    .input-wrap input::placeholder { color: #b3c2d1; }
+    .eye-btn {
+      position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+      border: none; background: none; color: #9db0c3;
+      width: 34px; height: 34px; border-radius: 8px; cursor: pointer;
+      display: flex; align-items: center; justify-content: center; font-size: 15px;
+    }
+    .eye-btn:hover { background: #eef3f8; color: #0D9488; }
+    .opts-row {
+      display: flex; justify-content: space-between; align-items: center;
+      margin: -4px 0 22px; font-size: 13px;
+    }
+    .opts-row label { display: flex; align-items: center; gap: 7px; color: #5a6c80; cursor: pointer; }
+    .opts-row input { accent-color: #0D9488; width: 15px; height: 15px; cursor: pointer; }
+    .opts-row a { color: #0D9488; text-decoration: none; font-weight: 500; }
+    .btn-login {
+      width: 100%; height: 47px; border: none; border-radius: 10px;
+      background: linear-gradient(135deg, #0D9488, #0f766e);
+      color: #fff; font-size: 15.5px; font-weight: 600; letter-spacing: 4px;
+      cursor: pointer; position: relative;
+      box-shadow: 0 6px 18px rgba(13,148,136,.32);
+      transition: transform .15s, box-shadow .15s, opacity .15s;
+    }
+    .btn-login:hover { transform: translateY(-1px); box-shadow: 0 9px 24px rgba(13,148,136,.4); }
+    .btn-login:active { transform: translateY(0); }
+    .btn-login:disabled { opacity: .65; cursor: wait; transform: none; }
+    .btn-login .spinner {
+      display: none; width: 17px; height: 17px; margin-right: 9px;
+      border: 2px solid rgba(255,255,255,.35); border-top-color: #fff;
+      border-radius: 50%; animation: spin .7s linear infinite;
+      vertical-align: -3px;
+    }
+    .btn-login.loading .spinner { display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .alert-err {
+      display: flex; gap: 9px; align-items: flex-start;
+      background: #fdf0ef; border: 1px solid #f5c6c2; color: #b42318;
+      border-radius: 10px; padding: 11px 13px; font-size: 13px; line-height: 1.5;
+      margin-bottom: 20px;
+      animation: shake .4s;
+    }
+    .alert-err .bi { margin-top: 1px; }
+    @keyframes shake {
+      0%,100% { transform: translateX(0); }
+      25% { transform: translateX(-5px); } 75% { transform: translateX(5px); }
+    }
+    .sec-tip {
+      display: flex; gap: 8px; align-items: center;
+      margin-top: 26px; padding: 10px 13px;
+      background: #eef6f5; border-radius: 9px;
+      font-size: 12px; color: #4d7a75; line-height: 1.6;
+    }
+    .form-footer {
+      position: absolute; bottom: 22px; left: 0; right: 0;
+      text-align: center; font-size: 12px; color: #9db0c3;
+    }
+    /* ===== 响应式 ===== */
+    @media (max-width: 900px) {
+      .brand-pane { display: none; }
+      .form-pane { min-width: 0; width: 100%; background: #fff; }
+      body { background: #fff; }
+    }
+  </style>
 </head>
-<body class="login-body">
-  <div class="login-card card">
-    <div class="login-brand">
-      <i class="bi bi-hdd-network login-logo"></i>
-      <div class="login-title">数据备份管理平台</div>
-      <p class="login-sub">请登录以继续</p>
+<body>
+  <!-- 左侧品牌区 -->
+  <div class="brand-pane">
+    <div class="brand-inner">
+      <div class="brand-logo-row">
+        <div class="brand-logo"><i class="bi bi-hdd-network"></i></div>
+        <div class="brand-name">数据备份管理平台<small>DATA BACKUP &amp; RECOVERY PLATFORM</small></div>
+      </div>
+      <div class="brand-slogan">数据资产，<em>有备无患</em></div>
+      <div class="brand-desc">一站式集中备份与容灾管理，覆盖数据库、文件的全生命周期保护，让每一次恢复都有把握。</div>
+      <ul class="feat-list">
+        <li>
+          <div class="feat-ico"><i class="bi bi-database-fill-gear"></i></div>
+          <div><b>多库集中备份</b><span>Oracle / MySQL / PostgreSQL / 达梦 / 金仓 / SQL Server / Redis / MongoDB，逻辑 + 物理全量增量</span></div>
+        </li>
+        <li>
+          <div class="feat-ico"><i class="bi bi-arrow-repeat"></i></div>
+          <div><b>异构迁移与实时同步</b><span>预校验把关、类型自动映射、迁移前数据级试写，差异行级定位</span></div>
+        </li>
+        <li>
+          <div class="feat-ico"><i class="bi bi-shield-check"></i></div>
+          <div><b>容灾演练与巡检</b><span>RTO/RPO 演练评估、三维巡检体检、智能告警，恢复能力持续在线</span></div>
+        </li>
+      </ul>
     </div>
-    {% if error %}<div class="alert" style="background:var(--error-light);color:var(--error);border:none;border-radius:var(--radius-sm);padding:8px 12px;font-size:var(--font-size-sm);">登录失败：{{ error }}</div>{% endif %}
-    <form method="post" action="/login">
-      <div class="mb-3">
-        <label class="form-label">用户名</label>
-        <input class="form-control" name="username" required autofocus>
-      </div>
-      <div class="mb-3">
-        <label class="form-label">密码</label>
-        <input class="form-control" name="password" type="password" required>
-      </div>
-      <button class="btn btn-primary w-100" type="submit">登录</button>
-      <p class="text-muted mt-3 mb-0" style="font-size:var(--font-size-xs);">请使用管理员分配的口令登录；生产环境请通过环境变量覆盖 WEB_USERNAME / WEB_PASSWORD。</p>
-    </form>
+    <div class="brand-footer">
+      <span>服务端插件化 · 客户端零安装 · 完全离线可用</span>
+      <span>Agentless</span>
+    </div>
   </div>
+
+  <!-- 右侧登录表单 -->
+  <div class="form-pane">
+    <div class="login-box">
+      <h1>欢迎登录</h1>
+      <div class="sub">请输入账号密码进入管理控制台</div>
+
+      {% if error %}
+      <div class="alert-err">
+        <i class="bi bi-exclamation-circle-fill"></i>
+        <div>登录失败：{{ error }}<br>请检查用户名与密码后重试。</div>
+      </div>
+      {% endif %}
+
+      <form method="post" action="/login" id="loginForm">
+        <div class="field">
+          <label for="username">用户名</label>
+          <div class="input-wrap">
+            <i class="bi bi-person"></i>
+            <input id="username" name="username" placeholder="请输入用户名" required autofocus autocomplete="username">
+          </div>
+        </div>
+        <div class="field">
+          <label for="password">密码</label>
+          <div class="input-wrap">
+            <i class="bi bi-shield-lock"></i>
+            <input id="password" name="password" type="password" placeholder="请输入密码" required autocomplete="current-password">
+            <button type="button" class="eye-btn" id="togglePwd" tabindex="-1" title="显示/隐藏密码">
+              <i class="bi bi-eye" id="eyeIcon"></i>
+            </button>
+          </div>
+        </div>
+        <div class="opts-row">
+          <label><input type="checkbox" name="remember" value="1"> 记住用户名</label>
+          <a href="#" onclick="return false;" title="请联系管理员重置密码">忘记密码？</a>
+        </div>
+        <button class="btn-login" type="submit" id="btnLogin">
+          <span class="spinner"></span><span class="txt">登 录</span>
+        </button>
+      </form>
+
+      <div class="sec-tip">
+        <i class="bi bi-info-circle" style="margin-top:2px;"></i>
+        <div>连续登录失败将被锁定；生产环境请通过环境变量 <code>WEB_USERNAME</code> / <code>WEB_PASSWORD</code> 覆盖默认口令。</div>
+      </div>
+    </div>
+    <div class="form-footer">v1.3.3 · 数据备份管理平台 © 2026</div>
+  </div>
+
+  <script>
+    // 密码显示切换
+    var pwd = document.getElementById("password");
+    document.getElementById("togglePwd").addEventListener("click", function () {
+      var show = pwd.type === "password";
+      pwd.type = show ? "text" : "password";
+      document.getElementById("eyeIcon").className = show ? "bi bi-eye-slash" : "bi bi-eye";
+    });
+    // 记住用户名
+    var u = document.getElementById("username");
+    try {
+      var saved = localStorage.getItem("login_username");
+      if (saved && !u.value) u.value = saved;
+    } catch (e) {}
+    // 提交：加载态 + 记住用户名
+    document.getElementById("loginForm").addEventListener("submit", function () {
+      try {
+        if (this.remember.checked) localStorage.setItem("login_username", u.value);
+        else localStorage.removeItem("login_username");
+      } catch (e) {}
+      var b = document.getElementById("btnLogin");
+      b.classList.add("loading"); b.disabled = true;
+      b.querySelector(".txt").textContent = "登录中...";
+    });
+    // 错误时聚焦用户名
+    {% if error %}setTimeout(function(){ u.focus(); u.select(); }, 300);{% endif %}
+  </script>
 </body>
 </html>

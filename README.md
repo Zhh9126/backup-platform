@@ -1,143 +1,141 @@
-# 数据备份管理平台
-
-<<<<<<< HEAD
-跨平台的**数据库 + 文件**集中备份管理平台，支持 **Oracle、MySQL、PostgreSQL、Kingbase（金仓）、DM（达梦）、Redis、MongoDB** 等多种数据库，以及**文件/目录（本地与远程 SSH，无 Agent）**的集中备份、定时调度、保留策略、三级对象存储、数据同步、巡检与健康检查、通知告警与一键恢复。
-=======
 <div align="center">
->>>>>>> docs(readme): README 据实重写 + Docker 基础镜像升级 Python 3.14
+
+# 数据备份管理平台
 
 **跨平台数据库 + 文件 集中备份管理平台**
 
 Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦） · SQL Server · Redis · MongoDB · 文件
 
-**备份 · 恢复 · 实时备份(PITR) · 数据迁移 · 数据同步 · 数据对比 · 克隆 · 演练 · 巡检 · 告警 · AI 助手**
+**备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 预校验 · 克隆 · 演练 · 巡检 · 告警**
 
-[![Version](https://img.shields.io/badge/Version-v1.3.0-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v1.3.3-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
-[![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows-lightgrey)](#支持的数据库与所需客户端)
 [![Framework](https://img.shields.io/badge/Framework-Flask-black)](https://flask.palletsprojects.com/)
-
-[![Docker Pulls](https://img.shields.io/badge/Docker%20Pulls-%E6%9F%A5%E7%9C%8B-2496ED)](https://github.com/Zhh9126/backup-platform/pkgs/container/backup-platform)
-[![GitHub Stars](https://img.shields.io/badge/Stars-%E6%AC%A2%E8%BF%8E%E7%82%B9%E6%98%9F-yellow)](https://github.com/Zhh9126/backup-platform/stargazers)
-[![GitHub Issues](https://img.shields.io/badge/Issues-%E5%8F%8D%E9%A6%88-red)](https://github.com/Zhh9126/backup-platform/issues)
-[![Docker Image](https://img.shields.io/badge/Image-ghcr.io%2Fzhh9126%2Fbackup--platform-2496ED)](https://github.com/Zhh9126/backup-platform/pkgs/container/backup-platform)
 
 </div>
 
 ---
 
-- **纯 Python + Flask**，元数据 SQLite（零外部中间件依赖，开箱即用）
-- **Agentless**：客户端工具装在**数据库服务器**上即可，平台经 SSH 远程执行并动态发现工具真实路径，不在数据库服务器安装任何备份组件
-- **真实执行**：所有备份/恢复均为真实操作，客户端缺失或连接失败时任务**如实失败**并给出明确原因，不做任何仿真兜底
-- **离线可用**：Docker 镜像内已烘焙全部依赖与原生驱动，运行时零联网
+## 平台特色
 
-> **当前版本**：`v1.3.0`（社区版）｜ Docker 镜像：`ghcr.io/zhh9126/backup-platform:latest`
-
-> **社区版说明**：免费供个人学习、内部部署与中小规模生产环境使用。企业级增强（大规模集群纳管、多租户、商业支持与定制开发）请联系作者。
-> **联系方式**：📧 `1547358466@qq.com`
+- **服务端插件化，客户端零安装**：所有驱动/插件/工具（JDBC 驱动、mysqldump、dexp、sqlcmd 等）只装在平台服务端；用户客户端机器与被管理的数据库服务器**什么都不安装**、无需任何 Agent。
+- **完全离线运行**：所有依赖随平台包自带（JDBC jar、JRE、预编译驱动、外部备份工具离线包），运行时零联网。部署后运行 `python scripts/check_offline.py` 自检。
+- **真实执行，如实失败**：所有备份/恢复/同步均为真实操作，连接失败或依赖缺失时任务**如实失败**并给出明确原因与修复指引，不做任何仿真兜底。
+- **迁移前预校验**：字段类型映射矩阵、数据级试写、字符集冲突、容量预估、主键/外键检查——结构或数据不合适在启动前拦截，杜绝迁移到一半才失败。
+- **真实差异定位**：数据对比采用主键归并（对标 pt-table-checksum），逐行精确定位 missing/extra/changed 差异并生成修复 SQL，零误报。
 
 ---
 
-## 功能总览（已实现）
+## 功能总览（真实实测状态）
 
-### 1. 备份能力
-| 能力 | 说明 |
-|---|---|
-| 9 个数据库备份引擎 + 文件备份 | MySQL / MariaDB / PostgreSQL / Kingbase / DM / SQL Server / Oracle / Redis / MongoDB + 文件（本地 + 远程 SSH 无 Agent）|
-| 备份类型 | 全量 / 增量 / 差异（SQL Server）/ 快照 / 合成全量 / 组合（全量+增量双调度）|
-| 调度 | cron 表达式 / 固定间隔（APScheduler）|
-| 保留策略 | 按天数 + 按份数双重清理 |
-| 自定义备份/恢复脚本 | 全数据库类型通用，平台注入 `PLATFORM_*` 环境变量，SFTP 拉回产物并计算 sha256 |
-| 三级存储 | L1 MinIO（热）/ L2 S3（冷）/ L3 本地导出，备份后自动并行复制 |
-| 生命周期 | L1→L2 按龄/按容量下沉、到期清理 |
-| 全局重删 | 内容 sha256 索引 + 引用计数，KPI 展示节省空间 |
-| 存储池加密 | AES-256-GCM 信封式，密钥来源：环境变量 / 系统设置托管 / 外部 KMS |
-| 备份插件 | 服务端插件市场（XtraBackup / MariaDB Backup / pgBackRest / MongoDB Tools 等）|
-| 远端工具动态发现 | 数据库服务用户 profile → 登录 shell → 常见目录枚举 → find，不写死路径；支持 `tool_path` 手动兜底 |
+> 状态说明：✅ 真机实测通过 ｜ ⚠️ 部分实现/待完善 ｜ ❌ 未实现（如实标注，不做虚假宣传）
 
-### 2. 恢复能力
-| 能力 | 说明 |
-|---|---|
-| 一键恢复 | 备份记录 → 目标实例（库级）或目标目录（文件级）|
-| 表级并行导入 | MySQL 逻辑备份恢复自动拆分 dump 并行导入（`RESTORE_PARALLEL` 可调）|
-| 物理恢复并行化 | XtraBackup `--prepare` 附带 `--parallel` |
-| 恢复校验 | 策略化对最近成功备份做可恢复性校验（Oracle 走 impdp SQLFILE / RMAN RESTORE VALIDATE），生成报告 |
-| 文件增量恢复 | 自动构建恢复链（最近全量 → 按时间应用增量）|
-| PITR 时间点恢复 | MySQL binlog / PostgreSQL WAL 持续捕获，支持按时间点恢复 |
+### 1. 数据备份
 
-### 3. 数据迁移（DTS 对标）
-| 阶段 | 状态 | 说明 |
-|---|---|---|
-| 预检查 | ✅ 已实现 | 源/目标连通性、目标库自动创建（MySQL）、源对象统计（表数/行数）|
-| 结构迁移 + 全量迁移 | ✅ 已实现 | 按源端 schema 重建目标表 + 全库存量导入（复用同步引擎 `create_if_not_exists` + `full_db_migrate`）|
-| 数据校验 | ✅ 已实现 | 逐表行数比对（源 vs 目标），逐表明细 |
-| 迁移报告 | ✅ 已实现 | 各阶段结果/行数/耗时汇总 |
-| **增量迁移 / 不停机切换** | ⚠️ 未实现 | 由「数据同步」realtime 模式（Binlog CDC）承接，迁移页面有明确指引；反向回切、断点续传、自动断流未实现 |
-
-> 当前迁移引擎支持的数据库：**MySQL / MariaDB → MySQL**、**PostgreSQL → PostgreSQL**（原生驱动直连）。
-> **未实现**：Kingbase / DM / Oracle / SQL Server / Redis / MongoDB 作为迁移源或目标；异构迁移（如 Oracle → MySQL）；表级/库级黑白名单过滤。
-
-### 4. 数据同步（实时/离线）
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| 表级同步 | ✅ | MySQL/MariaDB、PostgreSQL 已实现 Reader/Writer（插件注册制）|
-| 写入模式 | ✅ | append / overwrite / upsert / create_if_not_exists |
-| 增量同步 | ✅ | 指定增量列 + 起始值，断点记录 |
-| 实时同步 | ✅ | MySQL Binlog CDC（插件内置监听），PG 逻辑复制预留 |
-| 字段映射 | ✅ | 同名映射 / 手动映射 / 可视化连线 |
-| 全库迁移模式 | ✅ | 源库所有表一次性同步到目标库 |
-| Schema 校验 | ✅ | 列类型/长度兼容性预检 |
-| **其他数据库**（Oracle/DM/SQL Server/Redis/MongoDB） | ⚠️ 未实现 | 仅 mysql / mariadb / postgresql 有 Reader/Writer 插件 |
+| MySQL/MariaDB 逻辑备份 | ✅ | mysqldump，压缩/并行，累计 400+ 次真机执行 |
+| MySQL/MariaDB 物理备份 | ✅ | XtraBackup（含 zstd 压缩），远端工具缺失时平台推送临时副本执行后清理 |
+| **MySQL 增量物理备份 + 增量链恢复** | ✅ | FULL→INCREMENT→恢复 全链闭环实测，增量数据验证恢复 |
+| PostgreSQL 逻辑/物理备份 | ✅ | pg_dump / pg_basebackup，恢复实测通过 |
+| 达梦逻辑备份（dexp/dimp） | ✅ | 跨机 SSH + 平台 JDBC 双通道实测 |
+| 达梦物理备份 + 增量（INCREMENT） | ✅ | 联机 BACKUP [INCREMENT] BACKUPSET，增量体积 143KB vs 全量 2.1MB |
+| 达梦 PITR 时间点恢复 | ⚠️ | dmrman RESTORE/RECOVER 链路已通，页大小对齐后最终验证进行中 |
+| Oracle / 金仓 / SQL Server 备份恢复 | ✅ | 各有真机成功记录（expdp/RMAN、sys_dump、BACKUP/RESTORE DATABASE） |
+| Redis / MongoDB 备份 | ⚠️ | 引擎就绪（依赖已随包内置），待真机实测 |
+| 文件备份（本地 + 远程 SSH） | ✅ | 无 Agent，全量/增量（watchdog / polling） |
+| 实时备份（CDP） | ✅ | MySQL binlog 流式 / PG WAL / Oracle LogMiner / 达梦 LogMNR 轨道 |
+| 调度 / 保留策略（GFS）/ 合成全量 | ✅ | cron / 间隔调度；按天数+份数清理；增量链合并 |
+| 三级存储 + 生命周期 + 全局重删 + 加密 | ✅ | MinIO(L1)/S3(L2)/本地(L3)，自动下沉与清理 |
 
-### 5. 数据对比
-| 能力 | 状态 |
+### 2. 数据恢复
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| MySQL 逻辑/物理恢复 | ✅ | 恢复实测 13+3 次；物理恢复含 prepare + 临时实例校验 |
+| MySQL 增量链恢复 | ✅ | 基备 prepare(--apply-log-only) → 逐层 --incremental-dir 合并 → 临时实例校验 |
+| PostgreSQL 恢复 | ✅ | 逻辑恢复实测 11 次，数据完整一致 |
+| 达梦逻辑恢复（dimp） | ✅ | 跨机恢复实测 |
+| Oracle / 金仓 / SQL Server 恢复 | ✅ | 各有真机成功记录 |
+| 表级并行导入 / 恢复校验 / 文件增量恢复链 | ✅ | RESTORE_PARALLEL 可调；策略化可恢复性校验 |
+
+### 3. 数据迁移与数据同步
+
+> **概念区分（业界定义）**：数据迁移 = 一次性任务（存量搬迁，完成即止，支持覆盖写入）；数据同步 = 持续性任务（常驻运行保持两端一致，禁用覆盖写入）。平台在术语、引擎约束、预校验、前端四个层面严格执行该区分。
+
+| 链路 | 预校验 | 全量迁移 | 实时同步（轮询） |
+|---|---|---|---|
+| MySQL → 达梦 | ✅ | ✅ | ✅ |
+| PG → 达梦 | ✅ | ✅ | ✅ |
+| MySQL → PG | ✅ | ✅ | ✅ |
+| 达梦 → PG | ✅ | ✅ | ✅ |
+| MySQL→MySQL / PG→PG（同构） | ✅ | ✅ | ✅ |
+
+配套能力：
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| 异构类型映射引擎 | ✅ | 对标阿里 DTS《结构初始化数据类型映射》：UNSIGNED 升位、精度降级、ENUM/SET/JSON/BIT 特殊处理，逐列输出建表类型建议 |
+| 数据级试写预检 | ✅ | 源端采样 N 行 → 目标端按映射建议 DDL 建临时表试写 → 对账 → 清理，数据级问题提前拦截 |
+| 字符集冲突检测 | ✅ | utf8mb4(4字节) → GB18030/latin1 拦截；按库型区分 MySQL utf8(3字节) 与真 UTF-8 |
+| 大表容量预估 | ✅ | 行数/体积统计 + 按带宽估时 + 大表告警（≥1 亿行 / ≥10GB） |
+| 外键父表完整性 | ✅ | 子表依赖的父表不在同步列表 → 告警 |
+| 列名归一（field_ide） | ✅ | origin/upper/lower/camel/underscore，建表 DDL 与写入一致生效 |
+| Binlog CDC 实时同步 | ✅ | mysql-replication 库（随离线包内置） |
+
+### 4. 数据对比
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| 主键归并对比（pk_chunk） | ✅ | 对标 pt-table-checksum：keyset 分页双指针归并，O(单页)内存，千万级表可对比 |
+| 差异行级定位 | ✅ | missing_in_target / extra_in_target / changed 三类精确定位，零误报 |
+| 修复 SQL 生成 | ✅ | 逐条差异输出 INSERT/DELETE/UPDATE 修复指引 |
+| 跨名表映射 | ✅ | tables 支持 {"source": "T1", "target": "T1_CMP"} 跨名对比 |
+| 校验和（多库型） | ✅ | MySQL CRC32 / PG hashtext / Oracle·达梦 ORA_HASH / SQL Server CHECKSUM_AGG |
+| 实测矩阵 | ✅ | mysql-mysql（4 处差异精确定位）、MySQL↔达梦（跨库）、达梦-达梦（跨名） |
+
+### 5. 迁移前预校验体系（对标 DTS 预检查）
+
+| 检查项 | 状态 |
 |---|---|
-| 表清单比对 / 行数比对 / 全表校验和 / 抽样行逐列比对 | ✅ |
-| 支持 MySQL/MariaDB、PostgreSQL/Kingbase、Oracle | ✅ |
-| Redis / MongoDB / SQL Server | ⚠️ 未实现 |
+| 源/目标连通性、表存在性 | ✅ |
+| 列兼容性（类型映射矩阵 + 列缺失/多列） | ✅ |
+| 主键（upsert/实时必需）与增量列 | ✅ |
+| 数据级试写 / 大表容量 / 字符集冲突 / 外键完整性 | ✅ |
+| 任务性质校验（迁移 vs 同步，概念冲突拦截） | ✅ |
 
-### 6. 实时备份（RT / CDC）
-| 能力 | 状态 | 说明 |
+接入点：引擎层强制拦截（skip_precheck 可跳过）+ REST API（`POST /api/sync-tasks/<id>/precheck`）+ 前端结构化报告弹窗。
+
+### 6. 其他功能
+
+| 功能 | 状态 | 说明 |
 |---|---|---|
-| MySQL binlog 流式捕获 + PITR | ✅ | `mysqlbinlog --read-from-remote-server --raw --stop-never` |
-| PostgreSQL WAL 流式捕获 | ✅ | `pg_receivewal` |
-| Oracle LogMiner | ✅ | 日志解析轨道 |
-| 达梦 LogMNR | ✅ | 日志解析轨道 |
-| Kingbase WAL | ⚠️ 需装客户端 | 缺 sys_receivewal 时降级采样 |
-| Redis / MongoDB 实时捕获 | ⚠️ 未实现 | |
-| 文件实时捕获 | ✅ | watchdog / polling 双模式 |
+| 数据库部署 | ⚠️ | MySQL 8.0 / MongoDB 一键部署实测；PG 部署验证通过；其余库型待实测 |
+| 克隆服务（VDB） | ✅ | 免审批直通，MySQL/MariaDB/PG 逻辑克隆，TTL 到期自动销毁 |
+| 巡检 / 恢复演练（RTO/RPO） | ✅ | 三维体检、趋势/基线/季度排程 |
+| 通知告警 | ✅ | Webhook/钉钉/企微/飞书/邮件 |
+| AI 智能体 / AI 告警 | ✅ | 对话式运维助手，LLM 不可用时本地兜底 |
+| 容灾链路 / ITSM 对接 | ✅ | binlog 位点一致性校验；内置适配器可插拔 |
+| 多租户 / RBAC | ❌ | 单管理员账号 |
+| 集群化 / 高可用 | ❌ | 单机架构 |
 
-### 7. 数据库部署
-| 能力 | 状态 | 说明 |
-|---|---|---|
-| MySQL 8.0.x 一键部署到目标 Linux 主机 | ✅ | 上传安装包 → 生成脚本 → 执行 → 实时日志 |
-| MongoDB 部署（副本集 + 认证） | ✅ | keyFile + rs.initiate |
-| **PostgreSQL / Oracle / Kingbase / DM / Redis / SQL Server 部署** | ⚠️ 未实现 | 仅 MySQL / MongoDB |
+---
 
-### 8. 克隆服务（VDB）
-| 能力 | 状态 | 说明 |
-|---|---|---|
-| 免审批直通（申请即拉起） | ✅ | `CLONE_AUTO_APPROVE=true` 默认；可切回 ITSM 审批流 |
-| 真实克隆引擎 | ✅ | mysql / mariadb / postgresql（本机管理实例建库 + 流式导入）|
-| TTL 到期自动销毁 | ✅ | 默认 7 天，可配置 |
-| **其他数据库（Oracle/DM/SQL Server 等）** | ⚠️ 未实现 | 明确报错不降级仿真 |
-| **基于快照/CoW 的秒级克隆** | ⚠️ 未实现 | 当前为逻辑导入克隆，非存储级快照 |
+## 真机测试矩阵（截至 2026-09-06）
 
-### 9. 运维管理
-| 能力 | 状态 |
+所有 ✅ 均为真机实测（非纸面推断），测试环境：本机 MySQL 8.0 + 192.168.220.137（达梦/PG）+ 192.168.220.140（MySQL/PG）跨机链路。
+
+| 类别 | 实测项 |
 |---|---|
-| 巡检（连通性/调度/上次状态三维体检，fail 即告警） | ✅ |
-| 恢复演练（RTO/RPO 评估，趋势/基线/季度排程） | ✅ |
-| 通知告警（Webhook/钉钉/企微/飞书/邮件，成功失败分别开关） | ✅ |
-| AI 智能体（对话式运维助手，7 个工具调用，LLM 不可用时本地兜底） | ✅ |
-| AI 智能告警（规则分析 + 归因） | ✅ |
-| 备份质量监控（超长/超频判定，阈值可配） | ✅ |
-| 容灾链路（真实 binlog 位点一致性校验/日志缺口检测） | ✅ |
-| ITSM 工单对接（内置适配器，可插拔） | ✅ |
-| **多租户 / RBAC** | ⚠️ 未实现（单管理员账号） |
-| **集群化部署 / 高可用** | ⚠️ 未实现（单机架构） |
+| 备份 | MySQL 逻辑/物理/增量物理、PG 逻辑/物理、达梦 逻辑/物理/增量物理、Oracle、金仓、SQL Server、文件全量/增量 |
+| 恢复 | MySQL 逻辑/物理/增量链、PG 逻辑、达梦 逻辑、Oracle、金仓、SQL Server |
+| 迁移 | MySQL→达梦、PG→达梦、MySQL→PG、达梦→PG（全量+数据比对） |
+| 同步 | 上述四链路实时轮询（源插入→目标秒级可见） |
+| 对比 | mysql-mysql、MySQL↔达梦、达梦-达梦（跨名映射，差异精确定位零误报） |
+| 预校验 | 五大项 + 数据级试写 + 字符集冲突真实拦截（utf8mb4→GB18030 案例） |
+
+> 详细测试记录与修复清单见 [readme_20260901.md](readme_20260901.md)（22 章测试日志，含每个 Bug 的现象/根因/修法）。
 
 ---
 
@@ -157,13 +155,23 @@ python run.py
 
 ---
 
+## 离线环境部署
+
+平台面向**完全离线环境**设计：运行时不安装任何东西，一切依赖随离线包自带。
+
+1. **构建离线包**：PyInstaller 打包（Python 依赖全内置）+ `drivers/`（JDBC jar）+ `jdk/`（JRE，达梦/Oracle JDBC 通道必需）+ 外部备份工具离线包。
+2. **部署后自检**：`python scripts/check_offline.py` —— 五层检查（Python 依赖 / JDBC jar / JVM / dmPython / 外部工具），缺失项给出处置指引。
+3. **外部备份工具**：仅支持离线包上传安装（备份插件页 SFTP 上传），不依赖在线源。
+
+---
+
 ## 外部 API 调用（Bearer Token）
 
-平台提供 REST API 供外部系统（监控平台 / CMDB / 自动化脚本）调用。所有接口与页面 API 共用，认证方式为 **Bearer Token**（非浏览器会话）。
+平台提供 REST API 供外部系统（监控平台 / CMDB / 自动化脚本）调用，认证方式为 **Bearer Token**。
 
 ### 获取令牌
 
-1. 登录 Web 页面 → 打开浏览器开发者工具（F12）→ 在控制台执行：
+登录 Web 页面 → 浏览器控制台（F12）执行：
 
 ```javascript
 fetch("/api/tokens", {
@@ -173,132 +181,66 @@ fetch("/api/tokens", {
 }).then(r => r.json()).then(d => console.log(d.token));
 ```
 
-2. 返回的 `token`（`bk_` 前缀，明文仅此一次展示）妥善保存；平台仅存哈希，丢失只能吊销重建。
+返回的 `token`（`bk_` 前缀）明文仅此一次展示，平台仅存哈希。
 
 ### 调用示例
 
 ```bash
-TOKEN="bk_xxxxxxxxxxxxxxxx"
-BASE="http://<平台IP>:8080"
+TOKEN="bk_xxxxxxxx"
 
 # 列出备份任务
-curl -s -H "Authorization: Bearer $TOKEN" "$BASE/api/tasks"
+curl -s -H "Authorization: Bearer $TOKEN" http://<服务器IP>:8080/api/tasks
 
-# 立即执行一次全量备份（task_id=22 为例）
+# 立即执行一次全量备份
 curl -s -X POST -H "Authorization: Bearer $TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{"backup_type":"full"}' \
-     "$BASE/api/tasks/22/run"
+  -H "Content-Type: application/json" -d '{"backup_type":"full"}' \
+  http://<服务器IP>:8080/api/tasks/22/run
 
 # 查询最近备份记录
-curl -s -H "Authorization: Bearer $TOKEN" "$BASE/api/records?limit=10"
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "http://<服务器IP>:8080/api/records?limit=10"
 
 # 触发巡检
-curl -s -X POST -H "Authorization: Bearer $TOKEN" "$BASE/api/inspection/run"
-
-# 克隆：从备份记录 103 拉起一个隔离克隆库（免审批直通）
 curl -s -X POST -H "Authorization: Bearer $TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{"source_record_id":103,"target_env":"test","requested_by":"ops"}' \
-     "$BASE/api/clone"
+  http://<服务器IP>:8080/api/inspection/run
 
-# 一站式数据迁移（预检查 → 结构 → 全量 → 校验）
+# 数据迁移（预检查 → 结构 → 全量 → 校验 一站式）
 curl -s -X POST -H "Authorization: Bearer $TOKEN" \
-     -H "Content-Type: application/json" \
-     -d '{"name":"OA迁移","src_db_type":"mysql","src_host":"192.168.1.10","src_port":3306,
-          "src_username":"root","src_password":"***","src_db_name":"oa",
-          "tgt_db_type":"mysql","tgt_host":"192.168.1.20","tgt_port":3306,
-          "tgt_username":"root","tgt_password":"***","tgt_db_name":"oa_new"}' \
-     "$BASE/api/db-migrate"
+  -H "Content-Type: application/json" -d '{"plan_id":1}' \
+  http://<服务器IP>:8080/api/migration/run
+
+# 数据同步任务迁移前预校验（连通性/类型矩阵/数据级试写等）
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+  http://<服务器IP>:8080/api/sync-tasks/9/precheck
 ```
-
-### 主要可用端点
-
-| 方法 | 端点 | 说明 |
-|---|---|---|
-| GET | `/api/tasks` | 备份任务列表 |
-| POST | `/api/tasks/<id>/run` | 立即执行备份 |
-| GET | `/api/records` | 备份记录列表 |
-| POST | `/api/restores` | 发起恢复 |
-| GET | `/api/restores` | 恢复记录列表 |
-| POST | `/api/inspection/run` | 触发巡检 |
-| GET | `/api/inspection/records` | 巡检记录 |
-| GET/POST | `/api/db-migrate` | 一站式迁移计划（列表/创建并执行）|
-| GET | `/api/db-migrate/<id>` | 迁移计划详情与各阶段结果 |
-| GET/POST | `/api/clone` | 克隆申请/列表（免审批直通）|
-| POST | `/api/clone/<id>/destroy` | 销毁克隆 |
-| GET | `/api/rt/points?task_id=<id>` | 实时备份恢复点 |
-| GET/POST | `/api/storage/targets` | 存储目标 |
-| GET | `/api/dashboard` | 仪表盘统计 |
-
-### 令牌管理
-
-```javascript
-// 列出令牌（哈希脱敏，不含明文）
-fetch("/api/tokens").then(r => r.json()).then(console.log);
-// 吊销令牌
-fetch("/api/tokens/3", {method: "DELETE"}).then(r => r.json()).then(console.log);
-```
-
-> 令牌具备与登录账号等同的操作权限（包含危险操作如删除/恢复/部署），请妥善保管；泄露时立即吊销。
-> 令牌认证的请求不走 CSRF 校验（非浏览器场景）；所有调用在平台日志中留痕。
 
 ---
 
 ## Docker 部署（含离线运行）
 
-镜像已包含全部 Python 依赖与原生直连驱动（pymysql/psycopg2/oracledb），并附带 JRE + JDBC 驱动 jar 作为可选兜底（如 Oracle 11g），**运行时无需联网、无需外部安装任何依赖**。
-
 ### 镜像地址（GHCR，国内可加速拉取）
-
-镜像仓库：**`ghcr.io/zhh9126/backup-platform`**（由 GitHub Actions 在 push `v*` 标签时自动构建发布）。
-
-当前版本 tag（**生产环境推荐固定「版本-日期」tag，勿用 latest**）：
 
 ```bash
 # 最新版（跟随更新）
-ghcr.io/zhh9126/backup-platform:latest
-# 社区版固定别名（跟随更新）
-ghcr.io/zhh9126/backup-platform:community
-# 纯版本号
-ghcr.io/zhh9126/backup-platform:1.3.0
-# 版本+构建日期（推荐：同版本多次构建可区分、可回滚）
-ghcr.io/zhh9126/backup-platform:1.3.0-20260902
+docker pull ghcr.io/zhh9126/backup-platform:latest
+# 纯版本号 / 版本+构建日期（推荐：可追溯、可回滚）
+docker pull ghcr.io/zhh9126/backup-platform:v1.3.3
 ```
 
-历史版本 tag 规律：`vX.Y.Z` 发版同时产出 `X.Y.Z` 与 `X.Y.Z-<构建日期YYYYMMDD>`，例如 `1.3.0-20260902`。
+### 国内网络加速
 
-### 国内网络加速（拉取 ghcr.io 必看）
-
-国内服务器直连 ghcr.io 易超时，配置镜像加速器（网页打不开属正常，不影响 Docker 后台加速）：
-
-```bash
-# /etc/docker/daemon.json
-{
-  "registry-mirrors": [
-    "https://docker.1ms.run",
-    "https://docker.m.daocloud.io"
-  ],
-  "log-driver": "json-file",
-  "log-opts": {"max-size": "10m", "max-file": "3"}
-}
+```json
+// /etc/docker/daemon.json
+{"registry-mirrors": ["https://docker.m.daocloud.io", "https://dockerproxy.com"]}
 ```
 
-```bash
-systemctl daemon-reload && systemctl restart docker
-docker info   # 底部出现两个加速地址即生效
-```
-
-### 拉取与离线导入
+### 离线环境
 
 ```bash
-# 推荐：按版本-日期拉取（可追溯、可回滚）
-docker pull ghcr.io/zhh9126/backup-platform:1.3.0-20260902
-
-# 离线环境：先在有网机器导出，拷贝到内网后导入
-docker save -o backup-platform-1.3.0.tar.gz ghcr.io/zhh9126/backup-platform:1.3.0-20260902
-# （内网机器上）
-docker load -i backup-platform-1.3.0.tar.gz
+# 有网机器导出
+docker save ghcr.io/zhh9126/backup-platform:v1.3.3 -o backup-platform.tar
+# 内网机器导入
+docker load -i backup-platform.tar
 ```
 
 ### 运行
@@ -306,171 +248,85 @@ docker load -i backup-platform-1.3.0.tar.gz
 ```bash
 docker run -d --name backup-platform \
   -p 8080:8080 \
-  -v /data/backup-platform:/data \
-  -e WEB_PASSWORD=your_password \
+  -v backup-data:/app/instance \
+  -v backup-files:/app/backups \
   --restart unless-stopped \
-  ghcr.io/zhh9126/backup-platform:1.3.0-20260902
+  ghcr.io/zhh9126/backup-platform:latest
 ```
 
-- `/data` 挂载卷持久化：元数据库（`instance/`）、备份文件（`backups/`）、日志（`logs/`）
-- 配置全部走环境变量（`WEB_PORT`、`SECRET_KEY`、`WEB_USERNAME` 等）
-- 访问 `http://<主机IP>:8080`，默认账号 `admin / admin123`（**请立即修改**）
-
-### Docker Compose 部署（推荐生产）
-
-`docker-compose.yml`：
+### Docker Compose（推荐生产）
 
 ```yaml
-version: '3.8'
 services:
   backup-platform:
-    image: ghcr.io/zhh9126/backup-platform:1.3.0-20260902
-    container_name: backup-platform
-    ports:
-      - "8080:8080"
-    environment:
-      - WEB_PASSWORD=your_password
-      - SECRET_KEY=change-me-to-random
-      - TZ=Asia/Shanghai
+    image: ghcr.io/zhh9126/backup-platform:latest
+    ports: ["8080:8080"]
     volumes:
-      - /data/backup-platform:/data
+      - ./instance:/app/instance
+      - ./backups:/app/backups
     restart: unless-stopped
 ```
-
-```bash
-docker compose up -d
-```
-
-### 容器内调试
-
-```bash
-docker exec -it backup-platform /bin/bash
-```
-
-### 常见问题
-
-| 现象 | 处理 |
-|---|---|
-| 拉取 ghcr.io 超时 | 配置上文国内加速器并重启 Docker |
-| `denied` 拉取失败 | 确认 tag 存在；GHCR 包需在 GitHub Packages 设置为 Public |
-| 容器起不来 | 检查 `/data` 挂载目录权限 |
-| pip 安装超时 | 镜像内已烘焙依赖，运行时不需要 pip |
-
-### 手动构建镜像
-
-```bash
-docker build -t backup-platform:local .
-docker run --rm -p 8080:8080 backup-platform:local
-```
-
----
-
-## 配置
-
-配置优先级：**代码默认值 < 环境变量 < `config.json`（项目根目录，可选）**。
-
-常用配置项（环境变量）：
-
-| 变量 | 说明 | 默认 |
-|---|---|---|
-| `WEB_HOST` / `WEB_PORT` | Web 监听地址 / 端口 | `0.0.0.0` / `8080` |
-| `SECRET_KEY` | 会话签名密钥（**生产务必修改**） | 随机生成并持久化 |
-| `WEB_USERNAME` / `WEB_PASSWORD` | 登录账号密码 | `admin` / `admin123` |
-| `BACKUP_ROOT` | 备份文件根目录 | `./backups` |
-| `SCHEDULER_ENABLED` | 是否启用定时调度 | `true` |
-| `DEFAULT_RETENTION_DAYS` / `DEFAULT_RETENTION_COUNT` | 默认保留天数 / 份数 | `30` / `50` |
-| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | AI 智能体模型端点（不可达时自动本地兜底） | 见 `config.py` |
 
 ---
 
 ## 支持的数据库与所需客户端
 
-| 数据库 | 备份客户端 | 恢复客户端 | 说明 |
-|---|---|---|---|
-| MySQL / MariaDB | `mysqldump`、`mysql` | `mysql` | 密码通过临时选项文件注入，不出现于命令行 |
-| PostgreSQL | `pg_dump`、`psql` | `pg_restore` / `psql` | 通过 `PGPASSWORD` 环境变量传密码 |
-| Oracle | `expdp` / `impdp`（服务端目录）或 `exp` / `imp`（传统增量） | 同左 | 数据泵导出到数据库服务端 `DIRECTORY` |
-| Kingbase 金仓 | `sys_dump`、`ksql` | `sys_restore` / `ksql` | 兼容 PostgreSQL 协议，端口默认 54321 |
-| DM 达梦 | `dexp` | `dimp` | 逻辑导出，端口默认 5236 |
-| SQL Server | `sqlcmd` | `sqlcmd` | 官方 T-SQL：BACKUP/RESTORE，密码经 `SQLCMDPASSWORD` 环境变量注入；Linux/Windows 均支持 |
-| Redis | `redis-cli` | （复制 rdb + 重启） | 通过 `REDISCLI_AUTH` 传密码 |
-| MongoDB | `mongodump` | `mongorestore` | 通过 `--password` 传密码 |
+> 以下工具装在**数据库服务器**上即可（数据库自带），平台经 SSH 远程执行并动态发现工具路径；平台机自身装有客户端时也可本机执行（零安装回退）。
 
-> **客户端工具装在数据库服务器上即可**，无需安装到平台机：平台通过 SSH 在数据库服务器执行备份/恢复命令，并**动态发现工具真实路径**（服务运行用户 profile → 登录 shell → 常见安装目录枚举，兼容 Oracle 11g/19c、MySQL 自编译目录、DM、金仓等各种未配环境变量的场景）。平台机自身装有客户端时也可本机执行。
+| 数据库 | 备份 | 恢复 | 说明 |
+|---|---|---|---|
+| MySQL / MariaDB | mysqldump、xtrabackup | mysql、xtrabackup | 密码经临时选项文件注入；物理恢复在平台侧 prepare + 临时实例校验 |
+| PostgreSQL | pg_dump、pg_basebackup | pg_restore / psql | PGPASSWORD 环境变量传密码 |
+| Oracle | expdp / RMAN | impdp / RMAN | 数据泵 DIRECTORY；RMAN 支持增量 |
+| Kingbase 金仓 | sys_dump、sys_basebackup | sys_restore / ksql | 兼容 PG 协议，默认端口 54321 |
+| DM 达梦 | dexp、disql(联机 BACKUP) | dimp、dmrman(PITR) | 原生驱动缺失时自动降级 JDBC 通道（驱动随包） |
+| SQL Server | sqlcmd | sqlcmd | BACKUP/RESTORE DATABASE；SQLCMDPASSWORD 注入 |
+| Redis | redis-cli --rdb | （复制 rdb + 重启） | REDISCLI_AUTH 传密码 |
+| MongoDB | mongodump | mongorestore | --archive 流式拉回 |
+
+**数据迁移/同步连接通道**：原生 Python 驱动（pymysql / psycopg2 / oracledb thin）优先，JDBC 兜底（驱动 jar 随包，达梦/金仓/Oracle 全覆盖）。
 
 ---
 
 ## 使用说明（导航结构）
 
-- **概览**：仪表盘（数据库/文件备份任务数、累计备份体积、成功失败统计）
+- **概览**：仪表盘（任务数、累计体积、成功失败统计）
 - **备份管理**：数据库备份、文件备份、存储管理（三级存储 + 合成全量）、保护策略、备份插件
 - **记录**：备份记录、恢复记录、恢复校验
 - **数据恢复管理**：数据恢复、数据库部署
 - **灾备管理**：数据迁移、数据同步、容灾链路、克隆服务、恢复演练
-- **实时管控**：实时管控时间线（RT / CDP / PITR）
+- **数据对比**：同库/异库对比，主键归并差异定位与修复 SQL
+- **实时管控**：RT / CDP / PITR 时间线
 - **运维**：巡检、智能告警、数据价值挖掘、智能体、系统设置
 
-典型操作：
+---
 
-1. **数据库备份**：在「数据库备份」新建任务，填写连接、备份类型、调度、保留策略与存储目标。
-2. **文件备份**：在「文件备份」先到「系统设置 → SSH 主机」纳管远程主机，再建文件任务；全量生成 `*_full.tar.gz`，增量基于源快照仅打包变化文件（`*_inc.tar.gz`）。
-3. **三级存储**：在「存储管理」新增 MinIO（L1）/ S3（L2）/ 本地导出（L3）目标并"测试连接"；备份完成后自动并行复制。
-4. **数据同步**：新建同步任务（源/目标连接 + 表 + 字段映射 + 写入模式 + 同步模式 full/incremental/realtime）。
-5. **数据迁移**：在「数据迁移」新建迁移计划（源/目标连接 + 迁移内容勾选），提交后自动执行预检查 → 结构+全量迁移 → 数据校验，实时查看各阶段进度与报告。
-6. **克隆服务**：在「克隆服务」选择备份记录一键克隆（免审批直通），就绪后展示连接串，到期自动销毁。
-7. **恢复校验**：配置策略定期对最近成功备份做可恢复性校验，查看报告与成功率 KPI。
-8. **巡检**：点击"立即巡检"或配置定时巡检，查看 `pass/warn/fail` 明细。
-9. **AI 智能体**：对话式助手支持查询任务/记录/存储用量、执行备份/巡检（需确认）、知识库问答。
+## 配置
+
+| 环境变量 | 说明 | 默认 |
+|---|---|---|
+| `WEB_HOST` / `WEB_PORT` | 监听地址 / 端口 | `0.0.0.0` / `8080` |
+| `BACKUP_ROOT` | 备份产物根目录 | `./backups` |
+| `SCHEDULER_ENABLED` | 是否启用定时调度 | `true` |
+| `DEFAULT_RETENTION_DAYS` / `_COUNT` | 默认保留天数 / 份数 | `30` / `50` |
+| `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | AI 智能体端点（不可达时本地兜底） | 见 `config.py` |
 
 ---
 
 ## 生产部署建议
 
 - 使用 `gunicorn` 运行：`gunicorn -w 2 -b 0.0.0.0:8080 run:app`
-- 通过 Nginx 反代并启用 HTTPS
-- 修改 `SECRET_KEY` 与登录密码
-- 将 `BACKUP_ROOT` 指向大容量、有冗余的存储；启用三级对象存储实现异地容灾
-- 配置系统服务（systemd）实现开机自启与进程守护
-
----
+- 元数据 SQLite 建议定期备份（`instance/meta.db`）
+- 备份产物目录与数据库服务器网络隔离，配置三级存储异地容灾
+- 离线环境部署完成后**首先运行** `python scripts/check_offline.py` 自检
 
 ## 安全说明
 
-- 数据库连接 / SSH 主机密码以混淆方式存储于 SQLite，Web 接口默认不回显明文
-- MySQL 等使用临时选项文件（权限 `600`）承载密码，避免明文出现在进程参数中
-- 登录失败暴力破解限流；CSRF 同源校验；全局安全响应头与 CSP
-- 备份/恢复文件下载路径穿越防护、PITR 参数注入防护、file 引擎命令注入防护
-- **外部调用令牌**仅存 sha256 哈希，明文创建时一次性展示，支持随时吊销；调用在平台日志留痕
-
----
-
-## 常见问题
-
-**Q：平台机没有安装数据库客户端工具，能否备份？**
-可以。平台通过 SSH 到数据库服务器执行备份/恢复命令，并动态发现工具真实路径。仅当远端确实不存在对应工具时任务才会失败，此时可通过「备份插件」页或自定义备份脚本解决。
-
-**Q：如何验证备份真的可以恢复？**
-三种方式：(1)「恢复校验」配置策略定期校验；(2)「数据对比」将恢复库与生产库做行数/校验和/抽样比对；(3) 直接对任意备份一键恢复到目标实例。
-
-**Q：逻辑增量备份是否完全可用？**
-MySQL 增量依赖 binlog；PostgreSQL / Kingbase / MongoDB 的逻辑增量能力有限，建议配合 WAL 归档 / oplog / 时间点恢复或物理备份；SQL Server 的增量即事务日志备份（`BACKUP LOG`），差异备份用 `WITH DIFFERENTIAL`。本平台逻辑引擎对不支持真正增量的库会回退为全量并在备注中说明。
-
-**Q：如何实现异地备份？**
-在「存储管理」配置 MinIO(L1) + S2(L2)，备份完成后自动复制到对象存储实现异地容灾。
-
-**Q：文件备份需要被备份机器装 Agent 吗？**
-不需要。文件备份通过 `paramiko` SSH 在远程主机上执行 `find`/`tar`。
-
----
+- 密码 AES 加密存储（元数据库中不含明文）
+- 备份密码通过临时选项文件 / 环境变量注入，不出现在命令行（防 ps 泄露）
+- API Token 仅存哈希；会话 Cookie HttpOnly
+- 默认账号请立即修改；生产环境建议限制来源 IP
 
 ## 许可证
 
-本项目采用 [MIT License](LICENSE) 开源（社区版免费使用）；企业级增强与商业支持请联系作者。
-
----
-
-## 联系方式
-
-📧 `1547358466@qq.com`（问题反馈、功能建议、合作洽谈均可来信）
-
-GitHub 仓库：[Zhh9126/backup-platform](https://github.com/Zhh9126/backup-platform)
+MIT（社区版免费供个人学习、内部部署与中小规模生产环境使用。企业级增强请联系作者：📧 `1547358466@qq.com`）

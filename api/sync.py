@@ -338,7 +338,8 @@ def _prepare_payload(data: dict) -> dict:
             payload[k] = json.dumps(v, ensure_ascii=False) if v is not None else None
     # 整数/布尔字段
     for k in ["batch_size", "error_threshold", "enabled", "realtime_enabled",
-              "full_db_migrate", "validate_before_run", "verify_after_run"]:
+              "full_db_migrate", "validate_before_run", "verify_after_run",
+              "precheck_sample_rows"]:
         if k in data:
             payload[k] = int(data[k]) if data[k] is not None else None
     return payload

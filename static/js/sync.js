@@ -171,6 +171,7 @@
     $("errorThreshold").value = t.error_threshold || 0;
     if ($("fullDbMigrate")) $("fullDbMigrate").checked = !!t.full_db_migrate;
     if ($("validateBeforeRun")) $("validateBeforeRun").checked = !!t.validate_before_run;
+    if ($("precheckSampleRows")) $("precheckSampleRows").value = (t.precheck_sample_rows !== undefined && t.precheck_sample_rows !== null) ? t.precheck_sample_rows : 20;
     if ($("verifyAfterRun")) $("verifyAfterRun").checked = !!t.verify_after_run;
     $("scheduleType").value = t.schedule_type || "none";
     $("cronExpr").value = t.cron_expr || "";
@@ -406,6 +407,7 @@
       save_mode: $("saveMode").value,
       column_mapping: mapping,
       field_ide: $("fieldIde").value,
+      precheck_sample_rows: $("precheckSampleRows") ? (parseInt($("precheckSampleRows").value) || 0) : 20,
       batch_size: parseInt($("batchSize").value) || 1000,
       source_where: $("sourceWhere").value.trim(),
       incremental_column: $("incrementalColumn").value.trim(),
@@ -471,14 +473,11 @@
         // 迁移前预校验：字段/结构不合适直接拒绝启动
         const pc = await api("POST", "/api/sync-tasks/" + id + "/precheck", {});
         if (pc.success && pc.passed === false) {
-          let lines = (pc.items || []).filter(i => i.status !== "pass")
-            .map(i => "【" + (i.status === "fail" ? "不通过" : "警告") + "】"
-              + i.message + (i.detail || []).map(d =>
-                "    - " + (d.table ? d.table + "." : "") + (d.column || "") + ": " + (d.message || "")).join(""));
-          alert("迁移前预校验未通过，已阻止启动：\n\n" + lines.join("\n"));
+          SYNC.showPrecheckReport(pc, true);
           refreshTasks();
           return;
         }
+        if (pc.success && pc.warn > 0) SYNC.showPrecheckReport(pc, false);
         const res = await api("POST", "/api/sync-tasks/" + id + "/run", {});
         toast(res.message, res.success ? "success" : "danger");
         setTimeout(refreshTasks, 500);
@@ -490,15 +489,54 @@
       try {
         const pc = await api("POST", "/api/sync-tasks/" + id + "/precheck", {});
         if (!pc.success) throw new Error(pc.message || "预校验执行失败");
-        const icon = {pass: "✔", warn: "⚠", fail: "✘"};
-        let lines = (pc.items || []).map(i =>
-          icon[i.status] + " [" + i.check + "] " + i.message
-          + (i.detail || []).map(d =>
-            "\n     - " + (d.table ? d.table + "." : "") + (d.column || "") + ": " + (d.message || "")).join(""));
-        alert("迁移前预校验结果：\n\n" + lines.join("\n"));
+        SYNC.showPrecheckReport(pc, pc.passed === false);
       } catch (e) {
         toast("预校验失败：" + e.message, "danger");
       }
+    },
+    showPrecheckReport: function (pc, blocked) {
+      const esc = window.esc || function (s) { return s; };
+      const icon = {pass: ["✓", "success"], warn: ["⚠", "warning"], fail: ["✗", "danger"]};
+      const kind = function (c) {
+        if (c.startsWith("column_compat")) return "结构/类型兼容";
+        if (c.startsWith("data_sample")) return "数据级试写";
+        if (c === "capacity") return "容量预估";
+        if (c === "charset") return "字符集";
+        if (c === "fk_integrity") return "外键完整性";
+        if (c === "task_kind") return "任务性质";
+        if (c === "primary_key") return "主键";
+        if (c === "incremental_column") return "增量列";
+        return "基础检查";
+      };
+      let html = "";
+      const head = blocked
+        ? '<div class="alert alert-danger py-2">预校验未通过，迁移已被阻止</div>'
+        : '<div class="alert alert-' + (pc.warn > 0 ? "warning" : "success") + ' py-2">'
+          + '预校验通过' + (pc.warn > 0 ? "（含 " + pc.warn + " 项警告，请确认风险）" : "") + '</div>';
+      html += head + '<div class="table-responsive"><table class="table table-sm table-bordered mb-0">'
+        + '<thead><tr><th style="width:60px">结果</th><th style="width:150px">类别</th><th>说明</th></tr></thead><tbody>';
+      (pc.items || []).forEach(function (i) {
+        const ic = icon[i.status] || ["·", "secondary"];
+        html += '<tr><td class="text-' + ic[1] + '">' + ic[0] + "</td><td>" + esc(kind(i.check))
+          + "</td><td>" + esc(i.message || "");
+        if ((i.detail || []).length) {
+          html += '<div class="small text-muted mt-1">';
+          i.detail.forEach(function (d) {
+            if (d.big_tables !== undefined) {
+              (d.big_tables || []).forEach(function (b) {
+                html += "大表: " + esc(b.table) + "（" + (b.rows === null ? "未统计" : b.rows) + " 行 / "
+                  + (b.size_mb === null ? "?" : b.size_mb.toFixed(1)) + " MB）<br>"; });
+            } else {
+              html += "• " + esc((d.table ? d.table + "." : "") + (d.column || "") + " " + (d.message || "")) + "<br>";
+            }
+          });
+          html += "</div>";
+        }
+        html += "</td></tr>";
+      });
+      html += "</tbody></table></div>";
+      $("precheckBody").innerHTML = html;
+      new bootstrap.Modal($("precheckModal")).show();
     },
     deleteTask: async function (id) {
       if (!confirm("确定删除该同步任务？")) return;

@@ -182,6 +182,11 @@
                   <label class="form-label">批量大小</label>
                   <input type="number" class="form-control" id="batchSize" value="1000" min="1">
                 </div>
+                <div class="col-md-3">
+                  <label class="form-label">预检采样行数</label>
+                  <input type="number" class="form-control" id="precheckSampleRows" value="20" min="0">
+                  <div class="form-text">0=跳过数据级试写</div>
+                </div>
                 <div class="col-md-6" id="incrementalWrap" style="display:none">
                   <div class="row g-3">
                     <div class="col-6">
@@ -338,5 +343,20 @@
 .field-item .field-name { font-weight: 500; }
 .field-item .field-type { font-size: 0.75rem; color: #6c757d; }
 </style>
-<script src="/static/js/sync.js?v=2026081102"></script>
+<script src="/static/js/sync.js?v=2026090601"></script>
+<!-- 预检结果模态框 -->
+<div class="modal fade" id="precheckModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">迁移前预校验报告</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body" id="precheckBody"></div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
 {% endblock %}

@@ -623,6 +623,7 @@ SYNC_FIELDS = [
     "field_ide", "incremental_column", "incremental_value", "batch_size",
     "source_where", "error_threshold", "realtime_enabled", "flink_config",
     "full_db_migrate", "validate_before_run", "verify_after_run",
+    "precheck_sample_rows",
     "schedule_type", "cron_expr", "interval_minutes", "enabled", "status",
     "message",
 ]

@@ -94,6 +94,7 @@ def _task_to_config(task: Dict[str, Any]) -> SyncConfig:
         full_db_migrate=bool(task.get("full_db_migrate")),
         validate_before_run=bool(task.get("validate_before_run")),
         verify_after_run=bool(task.get("verify_after_run")),
+        precheck_sample_rows=int(task.get("precheck_sample_rows") or 20),
     )
     # managed 源：从 backup_tasks 读取连接信息
     if cfg.source_type == "managed" and cfg.source_task_id:

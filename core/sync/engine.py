@@ -448,7 +448,8 @@ class SyncEngine:
                 sql = (f"SELECT * FROM {table_ref}{where} "
                        f"ORDER BY {col}")
                 cur.execute(sql)
-                columns = [d[0] for d in cur.description]
+                # JDBC 通道列名为 java.lang.String，归一化后交给 writer
+                columns = [str(d[0]) for d in cur.description]
                 rows = cur.fetchmany(cfg.batch_size)
                 total = 0
                 writer = registry.create_writer(cfg.tgt_db_type, cfg)
@@ -473,6 +474,9 @@ class SyncEngine:
                                 cfg.task_id, total, watermark)
                 reader.close(cur, conn)
             except Exception as e:
+                if getattr(cfg, "debug", False) or os.environ.get("SYNC_DEBUG"):
+                    logger.warning("[sync#%s] 轮询异常:\n%s",
+                                   cfg.task_id, traceback.format_exc())
                 logger.warning("[sync#%s] 轮询异常（将继续重试）: %s",
                                cfg.task_id, e)
                 if reader:

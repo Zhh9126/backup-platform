@@ -149,12 +149,12 @@ class DamengSourceReader(SourceReader):
                 "AND c.constraint_name=cols.constraint_name "
                 "WHERE c.owner=? AND c.table_name=? AND c.constraint_type='P'",
                 (schema, _upper(table)))
-            pk_set = {r[0] for r in cur.fetchall()}
+            pk_set = {_s(r[0]) for r in cur.fetchall()}
             cols = []
             for row in rows:
-                c = ColumnMeta(name=row[0], type=(row[1] or "").upper(),
-                               nullable=(row[2] == "Y" or row[2] == 1 or
-                                         str(row[2]).upper() == "Y"),
+                c = ColumnMeta(name=_s(row[0]), type=_s(row[1] or "").upper(),
+                               nullable=(_s(row[2]) == "Y" or row[2] == 1 or
+                                         _s(row[2]).upper() == "Y"),
                                default=row[3])
                 c.is_primary = c.name in pk_set
                 cols.append(c)
@@ -174,8 +174,8 @@ class DamengSourceReader(SourceReader):
                 and cfg.incremental_value:
             sql += (f" WHERE {cfg.incremental_column} > ?")
             binds["1"] = cfg.incremental_value
-        sql += f" ORDER BY {cfg.incremental_column}" \
-            if cfg.incremental_column else sql
+        if cfg.incremental_column:
+            sql += f" ORDER BY {cfg.incremental_column}"
         return sql, binds
 
     def read_batch(self, cursor: Any) -> ReadResult:

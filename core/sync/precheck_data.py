@@ -43,6 +43,12 @@ def _to_bindable(v, src_type: str = ""):
         return str(v)
     if isinstance(v, Decimal):
         return str(v)
+    # JPype java 对象（java.lang.String 等）：JDBC 通道源端值归一
+    if not isinstance(v, (str, int, float)):
+        try:
+            return str(v)
+        except Exception:
+            return v
     return v
 
 
@@ -84,6 +90,8 @@ def check_data_sample(cfg, src_conn, tgt_conn, table: str,
     try:
         pk = _get_pk_column(src_conn, cfg.src_db_type, cfg.src_db_name,
                             cfg.src_schema, table)
+        if pk is not None and not isinstance(pk, str):
+            pk = str(pk)  # JDBC 通道返回 java.lang.String
         order = f" ORDER BY {pk}" if pk and cfg.src_db_type != "oracle" else ""
         top = f" WHERE ROWNUM <= {sample_rows}" if cfg.src_db_type == "oracle" \
             else f" LIMIT {sample_rows}"

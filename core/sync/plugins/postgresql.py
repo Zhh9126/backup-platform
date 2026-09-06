@@ -233,9 +233,13 @@ class PostgreSQLSinkWriter(SinkWriter):
             ctype = self._map_to_pg_type(c)
             null_str = "NULL" if c.nullable else "NOT NULL"
             default_str = self._pg_default(c.default, ctype)
-            lines.append(f'    "{c.name}" {ctype} {null_str}{default_str}')
+            # 列名按 field_ide 归一（与 write_batch 一致；否则建表用源库
+            # 大写列名而写入按 lower，列名错位导致 UndefinedColumn）
+            cname = self.plugin.normalize_identifier(
+                c.name, self.config.field_ide)
+            lines.append(f'    "{cname}" {ctype} {null_str}{default_str}')
             if getattr(c, "is_primary", False):
-                pks.append(c.name)
+                pks.append(cname)
         if pks:
             pk_cols = ", ".join('"' + k + '"' for k in pks)
             lines.append(f"    PRIMARY KEY ({pk_cols})")
@@ -246,15 +250,10 @@ class PostgreSQLSinkWriter(SinkWriter):
         table = cfg.target_table or cfg.source_table
         with conn.cursor() as cur:
             if cfg.save_mode == "overwrite":
-                # 表不存在时先建表（此前只 TRUNCATE，目标表不存在直接失败）；
-                # 存在则清空重写
-                cur.execute("SELECT to_regclass(%s) IS NOT NULL",
-                            (self._table_ref(table),))
-                exists = bool(cur.fetchone()[0])
-                if exists:
-                    cur.execute(f"TRUNCATE TABLE {self._table_ref(table)}")
-                else:
-                    cur.execute(self._create_table_sql(table, columns))
+                # overwrite = 按当前字段映射重建表（与达梦 writer 一致）：
+                # DROP + CREATE，保证列名归一/类型映射后结构仍与源对齐
+                cur.execute(f"DROP TABLE IF EXISTS {self._table_ref(table)}")
+                cur.execute(self._create_table_sql(table, columns))
                 conn.commit()
             elif cfg.save_mode in ("create_if_not_exists", "upsert"):
                 cur.execute(self._create_table_sql(table, columns))

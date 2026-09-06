@@ -124,14 +124,17 @@ def check_data_sample(cfg, src_conn, tgt_conn, table: str,
         col_names = [c[0] for c in src_cols]
         tgt_cols = ([_norm_name(n, "upper") if not is_mysql_tgt
                      else _norm_name(n, "origin") for n in col_names])
+        # 占位符按目标方言：psycopg2 用 %s（参数为 tuple），其它 qmark
+        ph = "%s" if tgt in ("postgresql", "kingbase") else "?"
         ins = (f"INSERT INTO {full} ("
                + ", ".join(f"{qt}{c}{qt}" for c in tgt_cols) + ") VALUES ("
-               + ", ".join("?" for _ in col_names) + ")")
+               + ", ".join(ph for _ in col_names) + ")")
         ok_rows, first_err = 0, None
         for r in rows:
             try:
-                cur.execute(ins, [_to_bindable(v, st)
-                                  for v, (_, st) in zip(r, src_cols)])
+                binds = [_to_bindable(v, st)
+                         for v, (_, st) in zip(r, src_cols)]
+                cur.execute(ins, tuple(binds) if ph == "%s" else binds)
                 ok_rows += 1
             except Exception as e:
                 if first_err is None:
@@ -324,6 +327,13 @@ def check_charset(cfg, src_conn, tgt_conn) -> Dict[str, Any]:
     """源/目标字符集家族判定（DTS 字符集检查项）。"""
     src_cs = probe_charset(src_conn, cfg.src_db_type, cfg.src_db_name)
     tgt_cs = probe_charset(tgt_conn, cfg.tgt_db_type, cfg.tgt_db_name)
+    # PG/金仓 的 UTF8 是真 4 字节 UTF-8（区别于 MySQL utf8=3字节）
+    if (cfg.tgt_db_type or "").lower() in ("postgresql", "kingbase") \
+            and tgt_cs.lower().startswith("utf"):
+        tgt_cs = "utf8mb4(PG)"
+    if (cfg.src_db_type or "").lower() in ("postgresql", "kingbase") \
+            and src_cs.lower().startswith("utf"):
+        src_cs = "utf8mb4(PG)"
     sf, tf = _charset_family(src_cs), _charset_family(tgt_cs)
     if "unknown" in (sf, tf):
         return {"status": "warn",

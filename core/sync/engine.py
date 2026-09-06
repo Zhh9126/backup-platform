@@ -400,7 +400,16 @@ class SyncEngine:
         models.update_sync_task(cfg.task_id, {
             "message": f"轮询实时同步启动：全量快照（增量列 {cfg.incremental_column}）...",
         })
-        snap = self._run_full_migration(progress_callback)
+        # 快照：单表任务尊重 cfg.target_table（此前走全库迁移路径，
+        # 快照写到了源表名对应的表，target_table 被忽略——真机实测发现）
+        if not cfg.full_db_migrate and (cfg.source_table or len(cfg.source_tables_list or []) == 1):
+            snap = self._run_single_table(
+                cfg.source_tables_list[0] if cfg.source_tables_list else cfg.source_table,
+                cfg.target_table or (cfg.source_tables_list[0] if cfg.source_tables_list
+                                     else cfg.source_table),
+                progress_callback)
+        else:
+            snap = self._run_full_migration(progress_callback)
         if not snap.get("success"):
             return snap
 

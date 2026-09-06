@@ -323,7 +323,9 @@ class DamengPlugin(BasePlugin):
         return DamengSinkWriter(config, self)
 
     def type_to_java(self, db_type: str, value: Any) -> Any:
-        return to_java(db_type_to_java_type((db_type or "").upper()), value)
+        # to_java(value) 单参（type_mapper 统一值归一）；
+        # 此前误传两参导致轮询实时同步 "takes 1 positional argument but 2" 异常
+        return to_java(value)
 
     def java_to_db(self, java_value: Any, target_type: str) -> Any:
         return java_value

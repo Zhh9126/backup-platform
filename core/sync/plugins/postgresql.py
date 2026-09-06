@@ -246,7 +246,15 @@ class PostgreSQLSinkWriter(SinkWriter):
         table = cfg.target_table or cfg.source_table
         with conn.cursor() as cur:
             if cfg.save_mode == "overwrite":
-                cur.execute(f"TRUNCATE TABLE {self._table_ref(table)}")
+                # 表不存在时先建表（此前只 TRUNCATE，目标表不存在直接失败）；
+                # 存在则清空重写
+                cur.execute("SELECT to_regclass(%s) IS NOT NULL",
+                            (self._table_ref(table),))
+                exists = bool(cur.fetchone()[0])
+                if exists:
+                    cur.execute(f"TRUNCATE TABLE {self._table_ref(table)}")
+                else:
+                    cur.execute(self._create_table_sql(table, columns))
                 conn.commit()
             elif cfg.save_mode in ("create_if_not_exists", "upsert"):
                 cur.execute(self._create_table_sql(table, columns))

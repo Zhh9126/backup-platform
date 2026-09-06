@@ -67,28 +67,50 @@ _SAFE_IDENT = None  # 延迟初始化（复用 data_compare 的白名单）
 
 def _get_cols_typed(conn, db_type: str, database: str, schema: str,
                     table: str) -> List[tuple]:
-    """取列 (名称, 数据类型) 列表（预校验专用，跨库型）。"""
-    from core.data_compare import _SAFE_IDENT, _user_of
+    """取列 (名称, 完整类型字符串) 列表（预校验专用，跨库型）。
+
+    类型含精度/unsigned 修饰（如 'bigint unsigned'、'decimal(20,4)'），
+    否则映射引擎无法判定升位/精度风险。
+    """
+    from core.data_compare import _user_of
     cur = conn.cursor()
     db_type = (db_type or "").lower()
     try:
         if db_type in ("mysql", "mariadb"):
+            # COLUMN_TYPE 含精度与 unsigned（'bigint unsigned'/'decimal(20,4)'）
             cur.execute(
-                "SELECT column_name, data_type FROM information_schema.columns "
+                "SELECT column_name, column_type FROM information_schema.columns "
                 "WHERE table_schema=%s AND table_name=%s "
                 "ORDER BY ordinal_position", (database, table))
         elif db_type in ("postgresql", "kingbase"):
             cur.execute(
-                "SELECT column_name, data_type FROM information_schema.columns "
+                "SELECT column_name, "
+                "CASE WHEN data_type IN ('character varying','char','character') "
+                "  AND character_maximum_length IS NOT NULL "
+                "  THEN data_type || '(' || character_maximum_length || ')' "
+                "WHEN data_type IN ('numeric','decimal') "
+                "  AND numeric_precision IS NOT NULL "
+                "  THEN data_type || '(' || numeric_precision || ',' "
+                "       || numeric_scale || ')' "
+                "ELSE data_type END "
+                "FROM information_schema.columns "
                 "WHERE table_schema=%s AND table_name=%s "
                 "ORDER BY ordinal_position", (schema or "public", table))
         elif db_type in ("oracle", "dameng"):
             owner = (schema or _user_of(conn) or "").upper()
             cur.execute(
-                "SELECT column_name, data_type FROM all_tab_columns "
-                f"WHERE owner = '{owner}' "
-                f"AND table_name = '{table}' "
-                "ORDER BY column_id")
+                "SELECT column_name, CASE "
+                "WHEN data_type IN ('VARCHAR2','NVARCHAR2','CHAR','NCHAR','RAW') "
+                "  AND char_length > 0 THEN data_type || '(' || char_length || ')' "
+                "WHEN data_type = 'NUMBER' AND data_precision IS NOT NULL "
+                "  THEN 'NUMBER(' || data_precision || "
+                "       CASE WHEN data_scale IS NOT NULL AND data_scale > 0 "
+                "            THEN ',' || data_scale ELSE '' END || ')' "
+                "WHEN data_type = 'TIMESTAMP' AND data_precision IS NOT NULL "
+                "  THEN 'TIMESTAMP(' || data_precision || ')' "
+                "ELSE data_type END "
+                f"FROM all_tab_columns WHERE owner = '{owner}' "
+                f"AND table_name = '{table}' ORDER BY column_id")
         else:
             raise ValueError(f"暂不支持 {db_type} 取列类型")
         return [(str(r[0]), str(r[1])) for r in cur.fetchall()]
@@ -224,16 +246,21 @@ def run_precheck(cfg) -> Dict[str, Any]:
         _add(items, "target_table_exists", "pass", "目标表均存在")
 
     # ---- 3) 列兼容性（核心）----
+    # overwrite（迁移自动建表）时同样输出映射建议——对标 DTS 结构初始化：
+    # 自动建表按映射引擎的建议类型建列，风险类型需人工确认。
     col_detail = []
     col_fail = col_warn = 0
-    if not overwrite:   # overwrite 重建表，列检查无意义
+    if True:
         for t in tables:
             tt = _tgt_table(t)
+            tgt_cols = []
             try:
                 src_cols = _get_cols_typed(src_conn, cfg.src_db_type,
                                            cfg.src_db_name, cfg.src_schema, t)
-                tgt_cols = _get_cols_typed(tgt_conn, cfg.tgt_db_type,
-                                           cfg.tgt_db_name, cfg.tgt_schema, tt)
+                # overwrite 自动建表时目标表可能不存在（tgt_cols 为空）
+                if not (overwrite and tt in tgt_missing):
+                    tgt_cols = _get_cols_typed(tgt_conn, cfg.tgt_db_type,
+                                               cfg.tgt_db_name, cfg.tgt_schema, tt)
             except Exception as e:
                 col_detail.append({"table": t, "status": "fail",
                                    "message": f"读取列元数据失败: {e}"})
@@ -242,35 +269,56 @@ def run_precheck(cfg) -> Dict[str, Any]:
             tgt_map = {_norm_name(c[0], cfg.field_ide).upper(): c
                        for c in tgt_cols}
             src_map = set()
+            from core.sync.type_matrix import map_type
             for c in src_cols:
                 name, stype = c
                 key = _norm_name(name, cfg.field_ide).upper()
                 src_map.add(key)
                 tc = tgt_map.get(key)
                 if tc is None:
+                    if overwrite:
+                        continue  # 自动建表场景无目标列可缺（建表建议见下）
                     col_detail.append({"table": t, "column": name,
                                        "status": "fail",
                                        "message": "目标表缺少该列"})
                     col_fail += 1
                     continue
-                lvl = _compat_level(stype, tc[1])
-                if lvl == "fail":
+                # 类型映射引擎（对标 DTS 映射手册）：unsigned 升位/精度降级/
+                # 特殊类型不支持等异构风险逐列判定
+                m = map_type(cfg.src_db_type, cfg.tgt_db_type, stype)
+                if m["level"] == "fail":
                     col_detail.append({
                         "table": t, "column": name, "status": "fail",
-                        "message": f"类型不兼容: 源 {stype} → 目标 {tc[1]}"})
+                        "message": f"类型不支持: 源 {stype} → 目标 {cfg.tgt_db_type}"
+                                   f"（{m['reason']}）"})
                     col_fail += 1
-                elif lvl == "warn":
+                elif m["level"] == "warn":
                     col_detail.append({
                         "table": t, "column": name, "status": "warn",
-                        "message": f"类型需隐式转换: 源 {stype} → 目标 {tc[1]}"})
+                        "message": f"源 {stype} → 建议 {m['target_type'] or '人工确认'}"
+                                   f"（实际目标 {tc[1]}）: {m['reason']}"})
                     col_warn += 1
             # 目标多列（源没有的）
             for c in tgt_cols:
                 if _norm_name(c[0], cfg.field_ide).upper() not in src_map:
                     col_detail.append({
-                        "table": t, "column": c, "status": "warn",
+                        "table": t, "column": str(c[0]), "status": "warn",
                         "message": "目标列源端不存在（取默认值/空）"})
                     col_warn += 1
+            # overwrite 自动建表：逐列输出建表类型建议（对标 DTS 结构初始化）
+            if overwrite and tt in tgt_missing:
+                from core.sync.type_matrix import map_type as _mt
+                for c in src_cols:
+                    m = _mt(cfg.src_db_type, cfg.tgt_db_type, c[1])
+                    if m["level"] == "ok" and not m["reason"]:
+                        continue          # 无风险类型不刷屏
+                    lvl = "warn"          # 建议仅提示，不拦截（建表已按建议类型规避）
+                    col_warn += 1
+                    col_detail.append({
+                        "table": t, "column": str(c[0]),
+                        "status": lvl,
+                        "message": (f"建表建议: {c[1]} → {m['target_type'] or '人工确认'}"
+                                    + (f"（{m['reason']}）" if m["reason"] else ""))})
     if col_fail:
         _add(items, "column_compat", "fail",
              f"{col_fail} 列不兼容（字段类型/缺失），请先修正表结构",

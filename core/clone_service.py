@@ -17,6 +17,7 @@ VDB 实例，保证无真实数据库客户端也能跑通自测闭环。
 """
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -24,6 +25,7 @@ import config
 import core.models as models
 import core.db as db
 from core import restore_extras
+from core import restore_extras_clone
 from core.itsm import get_itsm_adapter
 
 
@@ -70,8 +72,16 @@ class CloneService:
                       requested_by: str, note: str = "",
                       itsm_system: str = None,
                       target_host: str = "127.0.0.1",
-                      target_password: str = "") -> dict:
+                      target_password: str = "",
+                      clone_mode: str = "logical",
+                      live_source_db: str = "") -> dict:
         """提交克隆申请。
+
+        clone_mode：
+        - logical（默认）：从备份产物逻辑导入克隆（mysqldump/pg_restore 流式导入）
+        - template：PostgreSQL 模板库 COW 秒级克隆（live_source_db=同实例源库名）
+        - snapshot：MySQL LVM 快照秒级克隆（源 datadir 须在 LVM 卷上）
+        - schema：Oracle expdp/impdp REMAP schema 克隆（live_source_db=源 schema）
 
         免审批直通（默认，业界 VDB 标准打法，借鉴 Delphix/Neon）：
         1) 建 clone_request(pending)
@@ -92,6 +102,16 @@ class CloneService:
             raise ValueError("目标环境 target_env 必填")
         requested_by = (requested_by or "anonymous").strip() or "anonymous"
         target_host = (target_host or "127.0.0.1").strip() or "127.0.0.1"
+        clone_mode = (clone_mode or "logical").strip() or "logical"
+        live_source_db = (live_source_db or "").strip()
+        if clone_mode in ("template", "schema") and not live_source_db:
+            raise ValueError(f"克隆模式 {clone_mode} 需要提供源库名/schema（live_source_db）")
+
+        # 克隆模式编码进 note（免改表结构，_launch_vdb 解析）
+        mode_tag = f"[clone_mode={clone_mode}]"
+        if live_source_db:
+            mode_tag += f"[live_src={live_source_db}]"
+        note = (mode_tag + "\n" + note) if note else mode_tag
 
         req_id = models.create_clone_request({
             "source_record_id": source_record_id,
@@ -266,20 +286,94 @@ class CloneService:
         return models.get_clone_request(request_id)
 
     # ------------------------- 内部：拉起 / 释放 VDB -------------------------
-    def _launch_vdb(self, req: dict) -> int:
-        """按源库类型调用底层真实克隆引擎，并登记 VDB 实例。
+    @staticmethod
+    def _parse_mode(req: dict) -> tuple:
+        """从 note 前缀解析克隆模式与在线源库：([mode, live_src], 剩余note)。"""
+        note = req.get("note") or ""
+        mode, src_db = "logical", ""
+        m = re.search(r"\[clone_mode=(\w+)\]", note)
+        if m:
+            mode = m.group(1)
+        m2 = re.search(r"\[live_src=([^\]]+)\]", note)
+        if m2:
+            src_db = m2.group(1)
+        rest = re.sub(r"\[clone_mode=\w+\]|\[live_src=[^\]]+\]", "", note).strip()
+        return (mode, src_db), rest
 
-        真实引擎：mysql / mariadb（目标主机实例建库 + 流式导入）
-                 postgresql（目标主机实例建库 + 导入）
+    def _launch_vdb(self, req: dict) -> int:
+        """按源库类型/克隆模式调用底层真实克隆引擎，并登记 VDB 实例。
+
+        引擎矩阵：
+        - mysql/mariadb：logical=流式导入；snapshot=LVM 快照 COW（无 LVM 明确报错）
+        - postgresql：logical=pg_restore 导入；template=模板库 COW 秒级克隆
+        - oracle：schema=expdp/impdp REMAP 在线 schema 克隆（129 真机验证）
         目标主机：req.target_host（默认本机 127.0.0.1，可指定其他机器 IP）；
         连接密码：req.target_password 优先，未填时沿用源任务密码。
-        其余类型明确抛错（不降级仿真，避免"假克隆"）；
+        其余组合明确抛错（不降级仿真，避免"假克隆"）；
         仅 DEMO_MODE != off 时才允许仿真兜底且在 VDB note 中明确标注。
         """
         rec = models.get_record(req["source_record_id"]) or {}
         db_type = rec.get("db_type") or "mysql"
         instance_name = f"clone_{req['id']}"
+        (clone_mode, live_src), user_note = self._parse_mode(req)
+        req = dict(req)
+        req["note"] = user_note
         backup_path = rec.get("backup_path") or ""
+
+        # ---- template / snapshot / schema 模式不依赖备份产物 ----
+        if clone_mode in ("template", "snapshot", "schema"):
+            password = req.get("target_password") or ""
+            if not password:
+                src_task = models.get_task(rec.get("task_id"),
+                                           include_secret=True) or {}
+                password = src_task.get("password") or ""
+            if config.DEMO_MODE != "off":
+                return self._register_vdb(req, rec, db_type, instance_name,
+                                          None, None, None, None,
+                                          "DEMO 仿真（COW 模板/快照）")
+            res = None
+            if db_type == "postgresql" and clone_mode == "template":
+                res = restore_extras_clone.pg_template_clone(
+                    live_src, instance_name,
+                    pg_host=req.get("target_host") or "127.0.0.1",
+                    pg_user="postgres", pg_password=password)
+            elif db_type in ("mysql", "mariadb") and clone_mode == "snapshot":
+                res = restore_extras_clone.mysql_snapshot_clone(
+                    instance_name, src_port=int(rec.get("port") or 3306),
+                    mysql_host=req.get("target_host") or "127.0.0.1",
+                    mysql_password=password)
+            elif db_type == "oracle" and clone_mode == "schema":
+                src_task = models.get_task(rec.get("task_id"),
+                                           include_secret=True) or {}
+                host = src_task.get("host") or rec.get("host") or "127.0.0.1"
+                port = int(src_task.get("port") or rec.get("port") or 1521)
+                service = (src_task.get("db_name") or src_task.get("database")
+                           or rec.get("db_name") or "ORCL")
+                ssh_host = self._resolve_ssh(rec)
+                res = restore_extras_clone.oracle_schema_clone(
+                    live_src, instance_name,
+                    host=host, port=port, service=service,
+                    user="system", password=password,
+                    ssh_host=ssh_host)
+            else:
+                raise RuntimeError(
+                    f"db_type={db_type} 不支持克隆模式 {clone_mode}"
+                    "（template 仅 PostgreSQL；snapshot 仅 MySQL；schema 仅 Oracle）")
+            if not res or not res.get("ok"):
+                raise RuntimeError((res or {}).get("message") or "秒级克隆失败")
+            elapsed = (res.get("elapsed_sec") and
+                       f"（耗时 {res['elapsed_sec']}s）") or ""
+            default_port = 5432 if db_type == "postgresql" else (
+                1521 if db_type == "oracle" else 3306)
+            return self._register_vdb(
+                req, rec, db_type, instance_name,
+                res.get("port") or default_port,
+                "postgres" if db_type == "postgresql" else ("system" if db_type == "oracle" else "root"),
+                password,
+                f"{'COW 快照/模板' if res.get('cow') else 'Schema'}克隆实例"
+                f"{elapsed} | {user_note}")
+
+        # ---- logical（默认）：基于备份产物逻辑导入 ----
         if not backup_path or not os.path.isfile(backup_path):
             raise RuntimeError(f"备份产物不存在: {backup_path or '-'}")
 
@@ -300,7 +394,8 @@ class CloneService:
             if not engine_name:
                 raise RuntimeError(
                     f"db_type={db_type} 暂不支持真实克隆"
-                    "（当前支持 mysql/mariadb/postgresql；其余类型请先确认克隆目标方案）")
+                    "（当前支持 mysql/mariadb/postgresql 逻辑导入；"
+                    "Oracle 走 schema 模式；秒级克隆见 template/snapshot 模式）")
             if engine_name == "pg_clone_to_test":
                 res = restore_extras.pg_clone_to_test(
                     backup_path, instance_name,
@@ -314,23 +409,46 @@ class CloneService:
             if not res.get("ok"):
                 raise RuntimeError(f"真实克隆失败: {res.get('message')}")
 
+        return self._register_vdb(req, rec, db_type, instance_name, port, user,
+                                  password,
+                                  ("DEMO 仿真实例" if simulated else "真实克隆实例")
+                                  + (f" | 目标主机 {target_host}"
+                                     if target_host != "127.0.0.1" else ""))
+
+    def _register_vdb(self, req: dict, rec: dict, db_type: str, name: str,
+                      port, user: str, password: str, note: str) -> int:
+        """登记 VDB 实例元数据。"""
         vdb_id = models.create_vdb({
-            "name": instance_name,
+            "name": name,
             "source_record_id": req["source_record_id"],
             "task_id": rec.get("task_id"),
             "db_type": db_type,
             "port": port,
-            "host": target_host,
-            "database_name": instance_name,
+            "host": req.get("target_host") or "127.0.0.1",
+            "database_name": name,
             "username": user,
             "status": "ready",
             "created_at": db.now_iso(),
             "expires_at": _compute_expires(_default_ttl_days()),
-            "note": ("DEMO 仿真实例" if simulated else "真实克隆实例")
-                    + (f" | 目标主机 {target_host}" if target_host != "127.0.0.1" else "")
-                    + (f" | {req.get('note') or ''}"),
+            "note": note + (f" | {req.get('note') or ''}"
+                            if req.get("note") else ""),
         })
         return vdb_id
+
+    @staticmethod
+    def _resolve_ssh(rec: dict) -> dict:
+        """从备份记录关联任务解析 SSH 主机（远端 Oracle 克隆用）。"""
+        from core import remote_dump
+        task = dict(rec.get("task_row") or {})
+        if not task:
+            try:
+                task = models.get_task(rec.get("task_id"),
+                                       include_secret=True) or {}
+            except Exception:
+                task = {}
+        if not task:
+            return None
+        return remote_dump.resolve_ssh_host(task)
 
     def verify_clone(self, request_id: int) -> dict:
         """就绪校验：连接克隆库执行探活 + 统计表数量。"""
@@ -369,11 +487,19 @@ class CloneService:
                     src_task = models.get_task(vdb.get("task_id"), include_secret=True) or {}
                     password = src_task.get("password") or ""
                 try:
-                    res = restore_extras.drop_clone(
-                        vdb.get("db_type"), vdb.get("name"),
-                        host=vdb.get("host") or "127.0.0.1",
-                        port=vdb.get("port"),
-                        mysql_password=password, pg_password=password)
+                    if vdb.get("db_type") == "oracle":
+                        res = restore_extras_clone.drop_clone_extended(
+                            "oracle", vdb.get("name"),
+                            host=vdb.get("host") or "127.0.0.1",
+                            port=vdb.get("port") or 1521,
+                            user="system", password=password,
+                            service=vdb.get("service") or "ORCL")
+                    else:
+                        res = restore_extras.drop_clone(
+                            vdb.get("db_type"), vdb.get("name"),
+                            host=vdb.get("host") or "127.0.0.1",
+                            port=vdb.get("port"),
+                            mysql_password=password, pg_password=password)
                     if not res.get("ok"):
                         self.logger.warning("[clone] 释放 VDB #%s 失败: %s",
                                             vdb_id, res.get("message"))

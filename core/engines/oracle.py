@@ -60,10 +60,12 @@ class OracleEngine(BackupEngine):
     # 工具方法
     # ------------------------------------------------------------------ #
     def _parse_extra(self) -> dict:
-        """解析 task 中的 extra_options（JSON 字符串），返回 dict。"""
+        """解析 task 中的 extra_options（dict 或 JSON 字符串），返回 dict。"""
         raw = self.task.get("extra_options") or ""
         if not raw:
             return {}
+        if isinstance(raw, dict):
+            return raw
         try:
             return json.loads(raw)
         except (json.JSONDecodeError, TypeError):
@@ -789,7 +791,9 @@ class OracleEngine(BackupEngine):
         port = self.task.get("port") or 1521
         username = self.task.get("username") or "system"
         pw = db.decrypt_secret(self.task.get("password") or "")
-        conn_easy = f"{username}/{pw}@//{host}:{port}/{service}"
+        # 远端脚本在数据库服务器本机执行：listener 对外部 IP 的注册可能
+        # 不稳定（实测 129 出现 ORA-12514），本机回环最可靠 → 优先 127.0.0.1
+        conn_easy = f"{username}/{pw}@//127.0.0.1:{port}/{service}"
 
         client = remote_dump._connect(ssh_host)
 
@@ -830,7 +834,7 @@ class OracleEngine(BackupEngine):
             "RC=$?\n"
             "if [ $RC -ne 0 ]; then\n"
             f"  echo '[fallback] primary expdp failed (rc=$RC), retry with / as sysdba'\n"
-            f"  \"$EXPDP_BIN\" \"/ as sysdba\" {mode_args} DIRECTORY=DATA_PUMP_DIR "
+            f"  \"$EXPDP_BIN\" \"'/ as sysdba'\" {mode_args} DIRECTORY=DATA_PUMP_DIR "
             f"DUMPFILE={ts}.dmp LOGFILE={ts}.log\n"
             "  RC=$?\n"
             "fi\n"

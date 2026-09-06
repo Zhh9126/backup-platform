@@ -26,9 +26,14 @@ class OracleSourceReader(SourceReader):
         cfg = self.config
         port = cfg.src_port or 1521
         dsn = f"{cfg.src_host}:{port}/{cfg.src_db_name or 'ORCL'}"
-        return oracledb.connect(user=cfg.src_username,
-                                password=cfg.src_password, dsn=dsn,
-                                timeout=15)
+        # oracledb 瘦客户端不支持 timeout 关键字（老版本 cx_Oracle 同样不支持）
+        try:
+            return oracledb.connect(user=cfg.src_username,
+                                    password=cfg.src_password, dsn=dsn,
+                                    tcp_connect_timeout=15)
+        except TypeError:
+            return oracledb.connect(user=cfg.src_username,
+                                    password=cfg.src_password, dsn=dsn)
 
     def list_tables(self) -> List[str]:
         conn = self.connect()
@@ -115,9 +120,14 @@ class OracleSinkWriter(SinkWriter):
         cfg = self.config
         port = cfg.tgt_port or 1521
         dsn = f"{cfg.tgt_host}:{port}/{cfg.tgt_db_name or 'ORCL'}"
-        return oracledb.connect(user=cfg.tgt_username,
-                                password=cfg.tgt_password, dsn=dsn,
-                                timeout=15)
+        # oracledb 瘦客户端不支持 timeout 关键字（老版本 cx_Oracle 同样不支持）
+        try:
+            return oracledb.connect(user=cfg.tgt_username,
+                                    password=cfg.tgt_password, dsn=dsn,
+                                    tcp_connect_timeout=15)
+        except TypeError:
+            return oracledb.connect(user=cfg.tgt_username,
+                                    password=cfg.tgt_password, dsn=dsn)
 
     def _table_ref(self, table: str = None) -> str:
         cfg = self.config

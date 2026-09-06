@@ -133,10 +133,11 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 | 能力 | 说明 |
 |---|---|
 | 免审批直通 | `CLONE_AUTO_APPROVE=true` 默认；可切回 ITSM 审批流 |
-| 真实克隆引擎 | mysql / mariadb / postgresql（本机管理实例建库 + 流式导入）|
-| TTL 到期自动销毁 | 默认 7 天，可配置 |
-| 基于快照/CoW 的秒级克隆 | ❌ 未实现（当前为逻辑导入克隆）|
-| 其他数据库克隆 | ❌ 未实现（明确报错不降级仿真）|
+| 逻辑导入克隆 | mysql / mariadb / postgresql（备份产物流式导入到目标实例新库）|
+| **PostgreSQL 秒级克隆（COW）** | `clone_mode=template`：`CREATE DATABASE ... TEMPLATE` 写时复制，实测 0.28s 完成整库克隆 |
+| **MySQL 快照克隆（COW）** | `clone_mode=snapshot`：LVM 快照 + 独立端口实例；VG 空间预检，非 LVM 明确报错不降级 |
+| **Oracle schema 克隆** | `clone_mode=schema`：在线 expdp 源 schema → impdp REMAP_SCHEMA 到新 schema（129 真机验证 44s）|
+| TTL 到期自动销毁 | 默认 7 天，可配置；Oracle 克隆清理走 DROP USER CASCADE |
 
 ### 10. 运维管理
 

@@ -42,7 +42,9 @@ def api_request_clone():
             int(source_record_id), target_env, requested_by,
             note=data.get("note", ""), itsm_system=data.get("itsm_system"),
             target_host=data.get("target_host") or "127.0.0.1",
-            target_password=data.get("target_password") or "")
+            target_password=data.get("target_password") or "",
+            clone_mode=data.get("clone_mode") or "logical",
+            live_source_db=data.get("live_source_db") or "")
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"ok": True, "id": req["id"], "request": req}), 201

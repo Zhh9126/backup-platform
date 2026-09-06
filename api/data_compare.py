@@ -128,3 +128,83 @@ def dc_stats():
         data["running_count"] = sum(
             1 for t in _running.values() if t.is_alive())
     return jsonify({"success": True, "data": data})
+
+
+@api_bp.route("/data-compare-reports/<int:report_id>/repair", methods=["POST"])
+@login_required
+def dc_repair(report_id: int):
+    """差异修复（两步确认）。
+
+    第一步（confirm 缺省/false）：dry_run —— 只返回将执行的修复 SQL 清单，
+    供前端弹窗二次确认；
+    第二步（confirm=true）：在目标库逐条执行修复 SQL，返回每条结果。
+    修复只作用于目标库（恢复端），源端（生产端）只读。
+    """
+    from core.data_compare import _open_conn, _side_cfg
+    body = request.get_json(force=True, silent=True) or {}
+    confirm = bool(body.get("confirm"))
+    only_table = body.get("table")
+    only_pks = {str(p) for p in (body.get("pks") or [])}
+
+    report = models.get_data_compare_report(report_id)
+    if not report:
+        return jsonify({"success": False, "message": "报告不存在"}), 404
+    task = models.get_data_compare_task(report.get("task_id"),
+                                        include_secret=True)
+    if not task:
+        return jsonify({"success": False, "message": "关联任务不存在或已删除"}), 404
+
+    tables = report.get("tables_json") or []
+    stmts = []
+    for t in tables:
+        if only_table and t.get("table") != only_table:
+            continue
+        for d in (t.get("diffs") or []):
+            sql = (d.get("repair") or "").strip()
+            if not sql or sql.startswith("--"):
+                continue  # 无可执行修复 SQL（旧报告/列信息缺失）
+            if only_pks and str(d.get("pk")) not in only_pks:
+                continue
+            stmts.append({"table": t.get("table"), "pk": d.get("pk"),
+                          "op": d.get("op"), "sql": sql})
+    if not stmts:
+        return jsonify({"success": False,
+                        "message": "没有可自动修复的差异（请先重新对比生成最新报告）"}), 400
+
+    if not confirm:
+        return jsonify({"success": True, "data": {
+            "dry_run": True, "count": len(stmts), "statements": stmts,
+            "message": f"共 {len(stmts)} 条修复 SQL 将在目标库执行，请确认"}})
+
+    cfg = _side_cfg(task, "target")
+    try:
+        conn = _open_conn(cfg)
+    except Exception as e:
+        return jsonify({"success": False,
+                        "message": f"无法连接目标库: {e}"}), 400
+    results, ok_n, err_n = [], 0, 0
+    try:
+        cur = conn.cursor()
+        for s in stmts:
+            try:
+                cur.execute(s["sql"])
+                rc = getattr(cur, "rowcount", None)
+                results.append({**s, "ok": True, "rowcount": rc})
+                ok_n += 1
+            except Exception as e:
+                results.append({**s, "ok": False, "error": str(e)[:200]})
+                err_n += 1
+        try:
+            conn.commit()
+        except Exception:
+            pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return jsonify({"success": err_n == 0, "data": {
+        "executed": ok_n, "failed": err_n, "results": results,
+        "message": (f"修复完成：成功 {ok_n} 条，失败 {err_n} 条（已提交）；"
+                    "建议立即重新对比验证" if err_n == 0
+                    else f"修复完成：成功 {ok_n} 条，失败 {err_n} 条")}})

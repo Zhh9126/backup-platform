@@ -275,13 +275,153 @@ function TaskModal({ state, onSave, onClose }) {
     </div>`;
 }
 
-// ---------- 报告明细模态框 ----------
-function ReportModal({ report, onClose }) {
+// ---------- 差异类型徽标 ----------
+const OP_ZH = {
+  missing_in_target: ["目标缺行", "bg-danger"],
+  extra_in_target: ["目标多行", "bg-warning text-dark"],
+  changed: ["数据不同", "bg-primary"],
+};
+const DiffBadge = ({ op }) => {
+  const [txt, cls] = OP_ZH[op] || [op || "-", "bg-secondary"];
+  return html`<span class=${"badge " + cls}>${txt}</span>`;
+};
+
+// ---------- 修复二次确认模态框 ----------
+function RepairModal({ reportId, groups, busy, result, onConfirm, onClose }) {
   const ref = useRef(null);
+  useEffect(() => { if (ref.current) new bootstrap.Modal(ref.current).show(); }, []);
+  const stmts = (preview) => (preview || []).flatMap((g) => g.statements || []);
+  const list = result ? (result.data && result.data.results || []) : stmts(groups);
+  const total = result ? (result.data && result.data.executed || 0) + (result.data && result.data.failed || 0) : list.length;
+  return html`
+    <div class="modal fade" id="dcRepairModal" tabindex="-1" ref=${ref}
+         style=${result ? "" : "z-index:1075"}>
+      <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title">
+              <i class="bi bi-wrench-adjustable me-1"></i>
+              ${result ? "修复执行结果" : "修复确认（第二步）"}
+            </h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" onClick=${onClose}></button>
+          </div>
+          <div class="modal-body">
+            ${!result && html`
+              <div class="alert alert-warning py-2 small mb-2">
+                <i class="bi bi-exclamation-triangle me-1"></i>
+                即将在<b>目标库（恢复端）</b>执行 <b>${total}</b> 条修复 SQL，源端（生产端）只读不受影响。
+                请逐条核对后再确认。
+              </div>`}
+            ${result && html`
+              <div class=${"alert py-2 small mb-2 " + (result.success ? "alert-success" : "alert-danger")}>
+                ${result.message || (result.success ? "修复完成" : "修复存在失败项")}
+              </div>`}
+            <div class="table-responsive" style="max-height:50vh; overflow:auto">
+              <table class="table table-sm table-bordered align-middle mb-0">
+                <thead><tr>
+                  ${result && html`<th>结果</th>`}
+                  <th>表</th><th>主键</th><th>类型</th><th>修复 SQL</th>
+                </tr></thead>
+                <tbody>
+                  ${list.map((s, i) => html`
+                    <tr key=${i}>
+                      ${result && html`<td>${s.ok
+                        ? html`<span class="badge badge-ok">成功</span>`
+                        : html`<span class="badge bg-danger">失败</span><div class="small text-danger">${s.error || ""}</div>`}</td>`}
+                      <td class="small">${s.table}</td>
+                      <td>${s.pk}</td>
+                      <td><${DiffBadge} op=${s.op} /></td>
+                      <td><code class="small text-break">${s.sql}</code></td>
+                    </tr>`)}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div class="modal-footer">
+            ${!result && html`
+              <button class="btn btn-secondary" data-bs-dismiss="modal" onClick=${onClose}>取消</button>
+              <button class="btn btn-danger" disabled=${busy || !total} onClick=${onConfirm}>
+                <i class="bi bi-check2-circle me-1"></i>确认执行（${total} 条）
+              </button>`}
+            ${result && html`
+              <button class="btn btn-primary" data-bs-dismiss="modal" onClick=${onClose}>关闭</button>`}
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ---------- 报告明细模态框 ----------
+function ReportModal({ report, onClose, onRepaired }) {
+  const ref = useRef(null);
+  const [sel, setSel] = useState({});          // "table|pk" -> true
+  const [repairPreview, setRepairPreview] = useState(null); // [{table, statements}]
+  const [repairResult, setRepairResult] = useState(null);
+  const [busy, setBusy] = useState(false);
   useEffect(() => { if (ref.current) new bootstrap.Modal(ref.current).show(); }, []);
   if (!report) return null;
   const s = report.summary_json || {};
   const tables = report.tables_json || [];
+
+  const diffRows = [];   // [{table, diff}]
+  tables.forEach((t) => (t.diffs || []).forEach((d) => {
+    if (d.repair && !d.repair.trim().startsWith("--")) diffRows.push({ table: t.table, diff: d });
+  }));
+  const selKey = (tb, pk) => tb + "|" + pk;
+  const selCount = Object.values(sel).filter(Boolean).length;
+  const toggle = (k) => setSel((p) => ({ ...p, [k]: !p[k] }));
+  const selectAll = () => {
+    const all = diffRows.every(({ table, diff }) => sel[selKey(table, diff.pk)]);
+    const next = {};
+    if (!all) diffRows.forEach(({ table, diff }) => { next[selKey(table, diff.pk)] = true; });
+    setSel(next);
+  };
+
+  const collectGroups = () => {
+    const groups = {};
+    diffRows.forEach(({ table, diff }) => {
+      if (sel[selKey(table, diff.pk)]) {
+        (groups[table] = groups[table] || []).push(String(diff.pk));
+      }
+    });
+    return Object.entries(groups).map(([table, pks]) => ({ table, pks }));
+  };
+
+  const askRepair = async () => {
+    const groups = collectGroups();
+    if (!groups.length) { toast("请先勾选要修复的差异行", "warning"); return; }
+    setBusy(true);
+    try {
+      const out = [];
+      for (const g of groups) {
+        const res = await api("POST", `/api/data-compare-reports/${report.id}/repair`,
+          { table: g.table, pks: g.pks, confirm: false });
+        if (res.success) out.push({ table: g.table, statements: (res.data.statements || []) });
+        else { toast(res.message || "获取修复 SQL 失败", "danger"); return; }
+      }
+      setRepairPreview(out);
+    } catch (e) { toast("请求异常", "danger"); }
+    finally { setBusy(false); }
+  };
+
+  const doRepair = async () => {
+    setBusy(true);
+    try {
+      let executed = 0, failed = 0, ok = true, msg = "";
+      for (const g of (repairPreview || [])) {
+        const res = await api("POST", `/api/data-compare-reports/${report.id}/repair`,
+          { table: g.table, pks: g.pks, confirm: true });
+        if (res.data) { executed += res.data.executed || 0; failed += res.data.failed || 0; }
+        if (!res.success) ok = false;
+        msg = res.message || msg;
+      }
+      setRepairResult({ success: ok && failed === 0, message: msg,
+        data: { executed, failed, results: [] } });
+      if (onRepaired) onRepaired();
+    } catch (e) { toast("执行异常", "danger"); }
+    finally { setBusy(false); }
+  };
+
   return html`
     <div class="modal fade show" id="dcReportModal" tabindex="-1" ref=${ref}>
       <div class="modal-dialog modal-xl">
@@ -302,9 +442,21 @@ function ReportModal({ report, onClose }) {
               <div class="col"><div class="border rounded py-2 text-warning"><div class="fs-5 fw-bold">${s.tables_failed || 0}</div><div class="small text-muted">失败</div></div></div>
               <div class="col"><div class="border rounded py-2"><div class="fs-5 fw-bold">${fmtDuration(report.duration_sec)}</div><div class="small text-muted">耗时</div></div></div>
             </div>
-            <table class="table table-sm table-bordered align-middle mb-0">
+            ${diffRows.length > 0 && html`
+              <div class="d-flex justify-content-between align-items-center mb-1">
+                <div class="small text-muted">已定位 ${diffRows.length} 处差异，勾选需修复的行</div>
+                <div>
+                  <button class="btn btn-sm btn-outline-secondary me-1" onClick=${selectAll}>
+                    ${diffRows.every(({ table, diff }) => sel[selKey(table, diff.pk)]) ? "全不选" : "全选"}
+                  </button>
+                  <button class="btn btn-sm btn-warning" disabled=${selCount === 0 || busy} onClick=${askRepair}>
+                    <i class="bi bi-wrench-adjustable me-1"></i>修复选中差异（${selCount}）…
+                  </button>
+                </div>
+              </div>`}
+            <table class="table table-sm table-bordered align-middle mb-2">
               <thead><tr>
-                <th>表</th><th>源行数</th><th>目标行数</th><th>行数</th><th>校验和</th><th>抽样差异</th><th>说明</th>
+                <th>表</th><th>源行数</th><th>目标行数</th><th>行数</th><th>校验和</th><th>差异</th><th>说明</th>
               </tr></thead>
               <tbody>
                 ${tables.map((t) => html`
@@ -318,13 +470,35 @@ function ReportModal({ report, onClose }) {
                     <td>${t.checksum_match === null ? "—" : (t.checksum_match
                       ? html`<span class="text-success">一致</span>`
                       : html`<span class="text-danger">不一致</span>`)}</td>
-                    <td>${t.sample_diff_count || 0}</td>
+                    <td>${(t.diff_count || (t.diffs && t.diffs.length) || t.sample_diff_count || 0)}</td>
                     <td>
                       <${StatusBadge} s=${t.status} />
                       <div class="small text-muted text-break">${t.message || ""}
-                        ${t.sample_diffs && t.sample_diffs.length > 0 && html`
+                        ${t.diffs && t.diffs.length > 0 && html`
+                          <details open class="mt-1">
+                            <summary class="text-primary small fw-bold">差异行明细（${t.diffs.length} 条）</summary>
+                            <table class="table table-sm table-bordered mt-1 mb-0">
+                              <thead><tr><th style="width:2em"></th><th>类型</th><th>主键</th><th>源端行</th><th>目标端行</th><th>修复 SQL</th></tr></thead>
+                              <tbody>
+                                ${t.diffs.map((d) => {
+                                  const k = selKey(t.table, d.pk);
+                                  return html`
+                                    <tr key=${k}>
+                                      <td class="text-center">${d.repair && !d.repair.trim().startsWith("--") && html`
+                                        <input type="checkbox" checked=${!!sel[k]} onClick=${() => toggle(k)} />`}</td>
+                                      <td><${DiffBadge} op=${d.op} /></td>
+                                      <td>${d.pk}</td>
+                                      <td class="small text-break">${rowStr(d.source)}</td>
+                                      <td class="small text-break">${rowStr(d.target)}</td>
+                                      <td><code class="small text-break">${d.repair || "—"}</code></td>
+                                    </tr>`;
+                                })}
+                              </tbody>
+                            </table>
+                          </details>`}
+                        ${(!t.diffs || !t.diffs.length) && t.sample_diffs && t.sample_diffs.length > 0 && html`
                           <details class="mt-1">
-                            <summary class="text-primary small">差异明细（前 20）</summary>
+                            <summary class="text-primary small">抽样差异（前 ${t.sample_diffs.length}）</summary>
                             <div class="small">
                               ${t.sample_diffs.map((d, i) => html`
                                 <div class="text-break" key=${i}>#${i + 1} 源: ${rowStr(d.source)} / 目标: ${rowStr(d.target)}</div>`)}
@@ -335,9 +509,19 @@ function ReportModal({ report, onClose }) {
                   </tr>`)}
               </tbody>
             </table>
+            <div class="small text-muted">
+              <i class="bi bi-info-circle me-1"></i>修复仅作用于目标库（恢复端）；执行前会二次确认，修复后建议重新对比验证。
+            </div>
           </div>
         </div>
       </div>
+      ${repairPreview && !repairResult && html`
+        <${RepairModal} reportId=${report.id} groups=${repairPreview} busy=${busy}
+          onConfirm=${doRepair}
+          onClose=${() => setRepairPreview(null)} />`}
+      ${repairResult && html`
+        <${RepairModal} reportId=${report.id} groups=${repairPreview} busy=${false} result=${repairResult}
+          onClose=${() => { setRepairResult(null); setRepairPreview(null); }} />`}
     </div>`;
 }
 
@@ -478,7 +662,7 @@ function App() {
       </div>
 
       ${formState && html`<${TaskModal} state=${formState} onSave=${saveTask} onClose=${() => setFormState(null)} />`}
-      ${detail && html`<${ReportModal} report=${detail} onClose=${() => setDetail(null)} />`}
+      ${detail && html`<${ReportModal} report=${detail} onClose=${() => setDetail(null)} onRepaired=${refreshAll} />`}
     </div>`;
 }
 

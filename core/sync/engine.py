@@ -391,19 +391,19 @@ class SyncEngine:
                 schema = cfg.src_schema or ""
                 table_ref = (f"{schema}.{table}" if schema else table)
                 col = cfg.incremental_column
-                params = []
+                # watermark 内联（跨驱动参数类型不一致：PG int 列与字符串
+                # 参数比较会报 operator does not exist）。数字直接字面量，
+                # 其他（时间戳）转义单引号后加引号。
                 where = ""
                 if watermark:
-                    where = f" WHERE {col} > %s" if "%s" in "1" else \
-                        f" WHERE {col} > :1"
-                    # 统一用 ? 由插件方言差异处理：这里按驱动自适应
-                    where = f" WHERE {col} > :wm" \
-                        if cfg.src_db_type in ("oracle", "dameng") \
-                        else f" WHERE {col} > %s"
-                    params = [watermark]
+                    wm = str(watermark).replace("'", "''")
+                    if wm.isdigit():
+                        where = f" WHERE {col} > {wm}"
+                    else:
+                        where = f" WHERE {col} > '{wm}'"
                 sql = (f"SELECT * FROM {table_ref}{where} "
                        f"ORDER BY {col}")
-                cur.execute(sql, tuple(params) or None)
+                cur.execute(sql)
                 columns = [d[0] for d in cur.description]
                 rows = cur.fetchmany(cfg.batch_size)
                 total = 0

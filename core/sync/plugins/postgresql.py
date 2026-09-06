@@ -94,9 +94,8 @@ class PostgreSQLSourceReader(SourceReader):
         cfg = self.config
         table = cfg.source_table
         mapping = cfg.column_mapping or []
+        # 无 mapping 时不限定列（SELECT *）；空列表语义=全列
         source_cols = [m.get("source") for m in mapping if m.get("source")]
-        if not source_cols:
-            source_cols = ["*"]
 
         sql = self._build_select_sql(table, source_cols)
         params = []

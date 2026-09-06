@@ -21,11 +21,12 @@ logger = logging.getLogger("precheck")
 # ---------------------------------------------------------------------------
 # 1) 数据级试写
 # ---------------------------------------------------------------------------
-def _to_bindable(v, src_type: str = ""):
+def _to_bindable(v, src_type: str = "", keep_datetime: bool = False):
     """源行值 → 目标端可绑定值（按源类型语义归一）。
 
     - BIT 源（bytes）→ int（映射建议 NUMBER 承载，直接传 bytes 会转换失败）
-    - datetime/date/time → 字符串（跨驱动最稳）
+    - datetime/date/time → 字符串（跨驱动最稳）；keep_datetime=True 时保留
+      原生 datetime（oracledb 原生绑定 DATE，绕开 NLS 隐式转换 ORA-01843）
     - Decimal → 字符串（精度无损）
     """
     from datetime import date, datetime, time
@@ -40,6 +41,8 @@ def _to_bindable(v, src_type: str = ""):
     if isinstance(v, (bytes, bytearray)):
         return bytes(v)              # JDBC BINARY → setBytes
     if isinstance(v, (datetime, date, time)):
+        if keep_datetime:
+            return v
         return str(v)
     if isinstance(v, Decimal):
         return str(v)
@@ -54,11 +57,18 @@ def _to_bindable(v, src_type: str = ""):
 
 def build_sample_ddl(src_db: str, tgt_db: str, src_cols: list,
                      table: str, tmp_name: str,
-                     pk_col: Optional[str] = None) -> str:
-    """按映射引擎建议类型生成试写临时表 DDL（同时验证建表建议可执行）。"""
+                     pk_col: Optional[str] = None,
+                     schema: str = "") -> str:
+    """按映射引擎建议类型生成试写临时表 DDL（同时验证建表建议可执行）。
+
+    schema：目标 schema 前缀（与 INSERT 的 full 引用保持一致，否则
+    建表落在连接用户默认 schema、INSERT 找不到表、清理也删错位置）。
+    """
     from core.sync.type_matrix import map_type
     from core.sync.precheck import _norm_name
     qt = "`" if tgt_db in ("mysql", "mariadb") else '"'
+    prefix = f"{qt}{schema}{qt}." if (schema and not tgt_db in ("mysql", "mariadb")) \
+        else (f"{qt}{schema}{qt}." if schema else "")
     cols, pk_decl = [], ""
     for name, stype in src_cols:
         m = map_type(src_db, tgt_db, stype)
@@ -73,7 +83,7 @@ def build_sample_ddl(src_db: str, tgt_db: str, src_cols: list,
         else:
             nn = ""
         cols.append(f"{qt}{col}{qt} {tt} {nn}".strip())
-    return f"CREATE TABLE {qt}{tmp_name}{qt} ({', '.join(cols)}{pk_decl})"
+    return f"CREATE TABLE {prefix}{qt}{tmp_name}{qt} ({', '.join(cols)}{pk_decl})"
 
 
 def check_data_sample(cfg, src_conn, tgt_conn, table: str,
@@ -108,12 +118,21 @@ def check_data_sample(cfg, src_conn, tgt_conn, table: str,
         return {"status": "pass", "message": "源表无数据，跳过试写", "detail": []}
 
     # 目标端临时表（按映射建议 DDL，同时验证 DDL 可执行性）
-    tmp = ("_bkpc_" + table.lower())[:120]
+    # 注意：Oracle 未引号标识符不能以 '_' 开头（ORA-00911），前缀用字母开头
+    tmp = ("bkpc_" + table.lower())[:120]
     tmp_ident = tmp if is_mysql_tgt else tmp.upper()
     full = (f"{qt}{tmp_ident}{qt}" if not cfg.tgt_schema or is_mysql_tgt
             else f"{qt}{cfg.tgt_schema}{qt}.{qt}{tmp_ident}{qt}")
     cur = tgt_conn.cursor()
     try:
+        # Oracle：datetime 以字符串绑定（str(dt)="YYYY-MM-DD HH:MI:SS"），
+        # 默认 NLS_DATE_FORMAT 无法隐式转换（ORA-01843）→ 会话级对齐
+        if tgt == "oracle":
+            try:
+                cur.execute("ALTER SESSION SET NLS_DATE_FORMAT="
+                            "'YYYY-MM-DD HH24:MI:SS'")
+            except Exception:
+                pass
         try:
             cur.execute(f"DROP TABLE {full}")
             if is_mysql_tgt or tgt in ("postgresql", "kingbase", "oracle", "dameng"):
@@ -122,7 +141,9 @@ def check_data_sample(cfg, src_conn, tgt_conn, table: str,
             _rollback(tgt_conn)
         try:
             cur.execute(build_sample_ddl(cfg.src_db_type, tgt, src_cols,
-                                         table, tmp_ident, pk))
+                                         table, tmp_ident, pk,
+                                         schema=("" if is_mysql_tgt
+                                                 else cfg.tgt_schema or "")))
             _commit(tgt_conn)
         except Exception as e:
             return {"status": "fail",
@@ -132,17 +153,25 @@ def check_data_sample(cfg, src_conn, tgt_conn, table: str,
         col_names = [c[0] for c in src_cols]
         tgt_cols = ([_norm_name(n, "upper") if not is_mysql_tgt
                      else _norm_name(n, "origin") for n in col_names])
-        # 占位符按目标方言：psycopg2 用 %s（参数为 tuple），其它 qmark
-        ph = "%s" if tgt in ("postgresql", "kingbase") else "?"
+        # 占位符按目标方言：
+        # - postgresql/kingbase (psycopg2)、mysql/mariadb (pymysql) → %s
+        # - oracle (oracledb) → :1,:2 数字占位符（不支持 ?，否则 DPY-4009）
+        # - dameng (dmPython) → ? qmark
+        if tgt == "oracle":
+            binds_list = [f":{i + 1}" for i in range(len(col_names))]
+        elif tgt in ("postgresql", "kingbase", "mysql", "mariadb"):
+            binds_list = ["%s"] * len(col_names)
+        else:
+            binds_list = ["?"] * len(col_names)
         ins = (f"INSERT INTO {full} ("
                + ", ".join(f"{qt}{c}{qt}" for c in tgt_cols) + ") VALUES ("
-               + ", ".join(ph for _ in col_names) + ")")
+               + ", ".join(binds_list) + ")")
         ok_rows, first_err = 0, None
         for r in rows:
             try:
-                binds = [_to_bindable(v, st)
+                binds = [_to_bindable(v, st, keep_datetime=(tgt == "oracle"))
                          for v, (_, st) in zip(r, src_cols)]
-                cur.execute(ins, tuple(binds) if ph == "%s" else binds)
+                cur.execute(ins, tuple(binds))
                 ok_rows += 1
             except Exception as e:
                 if first_err is None:

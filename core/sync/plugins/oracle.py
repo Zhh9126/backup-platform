@@ -6,12 +6,13 @@
 - 增量同步：基于时间戳/数值增量列（incremental_column + incremental_value）。
 """
 import logging
+import time
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, List
 
 from .base import BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader, SyncConfig
-from ..type_mapper import db_type_to_java_type, to_java
+from ..type_mapper import db_type_to_java_type, to_java, JavaType
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +28,20 @@ class OracleSourceReader(SourceReader):
         port = cfg.src_port or 1521
         dsn = f"{cfg.src_host}:{port}/{cfg.src_db_name or 'ORCL'}"
         # oracledb 瘦客户端不支持 timeout 关键字（老版本 cx_Oracle 同样不支持）
-        try:
-            return oracledb.connect(user=cfg.src_username,
-                                    password=cfg.src_password, dsn=dsn,
-                                    tcp_connect_timeout=15)
-        except TypeError:
-            return oracledb.connect(user=cfg.src_username,
-                                    password=cfg.src_password, dsn=dsn)
+        # 跨虚拟机 1521 偶发被网络重置（DPY-6005/12514）→ 自动重试
+        last = None
+        for attempt in range(3):
+            try:
+                return oracledb.connect(user=cfg.src_username,
+                                        password=cfg.src_password, dsn=dsn,
+                                        tcp_connect_timeout=15)
+            except TypeError:
+                return oracledb.connect(user=cfg.src_username,
+                                        password=cfg.src_password, dsn=dsn)
+            except Exception as e:
+                last = e
+                time.sleep(2 * (attempt + 1))
+        raise last
 
     def list_tables(self) -> List[str]:
         conn = self.connect()
@@ -94,7 +102,11 @@ class OracleSourceReader(SourceReader):
                              f"'YYYY-MM-DD HH24:MI:SS.FF6')")
         if conds:
             sql += " WHERE " + " AND ".join(conds)
-        sql += " ORDER BY " + (cfg.incremental_column or columns[0] if columns else "")
+        # ORDER BY 仅增量模式需要（且必须有排序列）；full 模式/列未知时
+        # 不加（空 ORDER BY → ORA-00936 missing expression，实测踩坑）
+        order_col = cfg.incremental_column or (columns[0] if columns else "")
+        if cfg.sync_mode == "incremental" and order_col:
+            sql += " ORDER BY " + order_col
         return sql, ({"iv": cfg.incremental_value} if
                      (cfg.sync_mode == "incremental" and
                       cfg.incremental_column and cfg.incremental_value) else {})
@@ -107,9 +119,14 @@ class OracleSourceReader(SourceReader):
         cursor.execute(sql, binds or {})
         columns = [d[0] for d in cursor.description]
         rows = cursor.fetchmany(cfg.batch_size)
-        records = [[self.plugin.type_to_java(
-            (cursor.description[i][1] or str), v)
-            for i, v in enumerate(row)] for row in rows]
+        # oracledb 的 description[i][1] 是 DbType 枚举（非 str）→ 取 .name 归一
+        col_types = []
+        for d in cursor.description:
+            raw = d[1]
+            col_types.append(raw if isinstance(raw, str)
+                             else getattr(raw, "name", str(raw)))
+        records = [[self.plugin.type_to_java(col_types[i], v)
+                    for i, v in enumerate(row)] for row in rows]
         return ReadResult(records=records, columns=columns,
                           has_more=len(rows) >= cfg.batch_size)
 
@@ -121,13 +138,33 @@ class OracleSinkWriter(SinkWriter):
         port = cfg.tgt_port or 1521
         dsn = f"{cfg.tgt_host}:{port}/{cfg.tgt_db_name or 'ORCL'}"
         # oracledb 瘦客户端不支持 timeout 关键字（老版本 cx_Oracle 同样不支持）
+        # 跨虚拟机 1521 偶发被网络重置（DPY-6005/12514）→ 自动重试
+        conn = None
+        for attempt in range(3):
+            try:
+                conn = oracledb.connect(user=cfg.tgt_username,
+                                        password=cfg.tgt_password, dsn=dsn,
+                                        tcp_connect_timeout=15)
+                break
+            except TypeError:
+                conn = oracledb.connect(user=cfg.tgt_username,
+                                        password=cfg.tgt_password, dsn=dsn)
+                break
+            except Exception as e:
+                last = e
+                time.sleep(2 * (attempt + 1))
+        if conn is None:
+            raise last
+        # 源端 DATETIME 以字符串绑定（"YYYY-MM-DD HH:MI:SS"），Oracle 默认
+        # NLS_DATE_FORMAT 无法隐式转换（ORA-01843）→ 会话级对齐（业界标准做法）
         try:
-            return oracledb.connect(user=cfg.tgt_username,
-                                    password=cfg.tgt_password, dsn=dsn,
-                                    tcp_connect_timeout=15)
-        except TypeError:
-            return oracledb.connect(user=cfg.tgt_username,
-                                    password=cfg.tgt_password, dsn=dsn)
+            cur = conn.cursor()
+            cur.execute("ALTER SESSION SET NLS_DATE_FORMAT="
+                        "'YYYY-MM-DD HH24:MI:SS'")
+            cur.close()
+        except Exception:
+            pass
+        return conn
 
     def _table_ref(self, table: str = None) -> str:
         cfg = self.config
@@ -168,7 +205,10 @@ class OracleSinkWriter(SinkWriter):
             elif t in ("FLOAT", "DOUBLE", "DECIMAL", "NUMERIC"):
                 ora_t = "NUMBER"
             elif t.startswith("DATETIME") or t in ("TIMESTAMP", "DATE"):
-                ora_t = "DATE" if t == "DATE" else "TIMESTAMP"
+                # DATETIME/TIMESTAMP 统一 DATE（MySQL DATETIME 秒精度语义一致；
+                # 且字符串写入走 NLS_DATE_FORMAT 会话格式，避免 TIMESTAMP 的
+                # NLS_TIMESTAMP_FORMAT 小数秒缺失问题 ORA-01843）
+                ora_t = "DATE"
             elif t.startswith("VARCHAR"):
                 ora_t = "VARCHAR2(4000)"
             elif "TEXT" in t or "BLOB" in t or "BYTEA" in t:
@@ -250,7 +290,24 @@ class OraclePlugin(BasePlugin):
         return OracleSinkWriter(config, self)
 
     def type_to_java(self, db_type: str, value: Any) -> Any:
-        return to_java(db_type_to_java_type((db_type or "").upper()), value)
+        """按目标 Java 类型归一化（对齐 MySQL 插件实现；原实现误把
+        两个参数传给单参 to_java → TypeError）。"""
+        if value is None:
+            return None
+        jt = db_type_to_java_type((db_type or "").upper())
+        if jt == JavaType.BOOLEAN:
+            return bool(value)
+        if jt == JavaType.LONG:
+            return int(value)
+        if jt == JavaType.DOUBLE:
+            return float(value)
+        if jt == JavaType.DECIMAL:
+            return str(value)
+        if jt == JavaType.BYTES:
+            if isinstance(value, (bytes, bytearray)):
+                return bytes(value)
+            return str(value).encode("utf-8")
+        return to_java(value)
 
     def java_to_db(self, java_value: Any, target_type: str) -> Any:
         return java_value

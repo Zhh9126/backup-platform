@@ -65,3 +65,10 @@ minio>=7.1                 # MinIO / S3 兼容对象存储 SDK（L1/L2 后端共
 pymssql>=2.2  # SQL Server 同步驱动（离线包随附 wheel）
 pymongo>=4.6
 redis>=5.0
+
+# ---------- JDBC 兜底通道（驱动缺失/异构同步对比时经 Java 桥接，可选）----------
+# 使用条件：本机已装 JRE 11+；驱动 jar 位于 drivers/ 目录（随代码仓库分发）
+JayDeBeApi>=1.2.3          # JDBC 桥接
+JPype1>=1.5                # JVM 进程内嵌
+mysql-replication>=0.46    # MySQL binlog 解析（准 CDP 实时备份/增量同步）
+redis>=5.0                 # Redis 备份/巡检

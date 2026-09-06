@@ -193,18 +193,28 @@ def connect(db_type, host, port, db, user, password, timeout=10):
     elif db_type == "oracle":
         service = db or "ORCL"
         dsn = mod.makedsn(host, port or 1521, service_name=service)
-        try:
-            return mod.connect(user=user or "", password=password or "", dsn=dsn)
-        except Exception as e:
-            msg = str(e)
-            # oracledb 瘦模式仅支持 12.1+；11g 服务端给出明确指引
-            if "DPY-3019" in msg or "unsupported" in msg.lower() or "version" in msg.lower():
-                last_err = RuntimeError(
-                    f"Oracle {service}@{host}:{port} 连接失败：{msg}；"
-                    "oracledb 瘦客户端仅支持 Oracle 12.1+，11g 请改用 cx_Oracle+Instant Client "
-                    "或（已装 Java 时的）JDBC 兜底通道")
-            else:
-                last_err = e
+        # 跨虚拟机 1521 偶发被网络重置（DPY-6005/12514，实测 129 环境）：
+        # 服务器侧实例正常时重试即可恢复 → 自动重试 3 次
+        last_exc = None
+        for attempt in range(3):
+            try:
+                return mod.connect(user=user or "", password=password or "",
+                                   dsn=dsn)
+            except Exception as e:
+                last_exc = e
+                msg = str(e)
+                # oracledb 瘦模式仅支持 12.1+；11g 服务端给出明确指引
+                if ("DPY-3019" in msg or "unsupported" in msg.lower()
+                        or "version" in msg.lower()):
+                    raise RuntimeError(
+                        f"Oracle {service}@{host}:{port} 连接失败：{msg}；"
+                        "oracledb 瘦客户端仅支持 Oracle 12.1+，11g 请改用 "
+                        "cx_Oracle+Instant Client 或（已装 Java 时的）JDBC 兜底通道")
+                if not any(k in msg for k in ("DPY-6005", "DPY-4011",
+                                              "12514", "12518", "12170")):
+                    break
+                time.sleep(2 * (attempt + 1))
+        last_err = last_exc
 
     elif db_type == "dameng":
         try:

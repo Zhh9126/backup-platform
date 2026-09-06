@@ -38,7 +38,9 @@ def parse_type(type_str) -> Dict[str, Any]:
     unsigned = "unsigned" in s
     s = s.replace("unsigned", "").replace("signed", "").replace("zerofill", "").strip()
     # 基类型词（enum('a','b')/set('x') 的括号值列表随词干剥离）
-    m = re.match(r"^\s*([a-zA-Z_]+)\s*(?:\(([^)]*)\))?", s)
+    # 注意：词干含数字（varchar2/nvarchar2/raw...），字符类必须含 0-9，
+    # 否则 'varchar2(64)' 被截成 'varchar' 且精度丢失（实测踩坑）
+    m = re.match(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\(([^)]*)\))?", s)
     if not m:
         return {"base": s, "prec": None, "scale": None, "unsigned": unsigned}
     base = re.sub(r"\s+", " ", m.group(1).strip())
@@ -204,7 +206,10 @@ def _char_target(tgt: str, t: dict):
         if tgt in ("oracle", "dameng") and p is None:
             return ("CHAR(1)", "warn", "CHAR 长度缺失 → CHAR(1)（DTS 规则）")
         return ("CHAR" + (f"({p})" if p else ""), "ok", "")
-    if base == "varchar":
+    if base in ("varchar", "varchar2", "nvarchar", "nvarchar2"):
+        # MySQL 的 VARCHAR 必须带长度；源无长度/超长时退 TEXT
+        if tgt in ("mysql", "mariadb") and p is None:
+            return ("TEXT", "warn", "VARCHAR 无长度 → TEXT（MySQL VARCHAR 必须带长度）")
         return ("VARCHAR" + (f"({p})" if p else ""), "ok", "")
     # text 族
     if tgt in ("oracle", "dameng"):

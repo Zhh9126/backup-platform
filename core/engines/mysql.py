@@ -13,6 +13,7 @@ mysqldump 与 mysql 完成逻辑备份与恢复。
   缺失时任务直接失败。
 - 仅使用 Python 标准库 + 外部客户端，不引入任何第三方依赖。
 """
+import glob
 import os
 import re
 import time
@@ -1200,10 +1201,41 @@ class MySQLEngine(BackupEngine):
         pid_file = sock + ".pid"
         err_file = sock + ".err"
         proc = None
+        # 增量产物识别：xtrabackup_incr_* 目录 → 增量链恢复
+        # （先 prepare 最近全量基，再按时间序逐层 --incremental-dir 合并增量）
+        _bn = os.path.basename(backup_path.rstrip("/"))
+        is_incr = os.path.isdir(backup_path) and (
+            "xtrabackup_inc_" in _bn or "xtrabackup_incr_" in _bn)
+        base_dir = None
+        incr_chain = []
+        if is_incr:
+            out_dir = os.path.dirname(backup_path.rstrip("/"))
+            full_dirs = sorted(
+                (d for d in glob.glob(os.path.join(out_dir, "xtrabackup_full_*"))
+                 if os.path.isfile(os.path.join(d, ".success"))), reverse=True)
+            base_dir = full_dirs[0] if full_dirs else None
+            if not base_dir:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path,
+                    message="增量恢复失败：未找到可用全量基备（xtrabackup_full_*）")
+            # 同任务全部增量层（inc/incr 两种命名），按时间序（旧→新）应用
+            incr_all = sorted(
+                d for d in glob.glob(os.path.join(out_dir, "xtrabackup_inc*"))
+                if os.path.isdir(d))
+            incr_chain = [d for d in incr_all
+                          if d.rstrip("/") != backup_path.rstrip("/")
+                          and os.path.basename(d) <= _bn]
+            incr_chain.append(backup_path)   # 被恢复的增量最后应用
+            logs.append(f"[增量恢复] 基备: {base_dir}，增量链 {len(incr_chain)} 层")
+
         try:
             # 1) 准备工作目录
             work = os.path.join(tmp, "data")
-            if backup_path.endswith((".tar.gz", ".tgz")):
+            if is_incr:
+                logs.append("[增量恢复] 复制全量基备到临时工作区 ...")
+                shutil.copytree(base_dir, work)
+            elif backup_path.endswith((".tar.gz", ".tgz")):
                 os.makedirs(work)
                 ret = subprocess.run(["tar", "xzf", backup_path, "-C", work],
                                      capture_output=True, text=True, timeout=3600)
@@ -1242,15 +1274,67 @@ class MySQLEngine(BackupEngine):
                     raise RuntimeError(f"xtrabackup --decompress 失败: {(ret.stderr or '')[:300]}")
 
             # 3) prepare（并行 apply-log，加快恢复）
-            logs.append("[物理恢复] xtrabackup --prepare 应用 redo log ...")
-            prep_cmd = [xtrabackup, "--prepare"]
-            if self._restore_parallel() > 1:
-                prep_cmd.append(f"--parallel={self._restore_parallel()}")
-            prep_cmd.append(f"--target-dir={work}")
-            ret = subprocess.run(prep_cmd,
-                                 capture_output=True, text=True, timeout=7200)
-            if ret.returncode != 0:
-                raise RuntimeError(f"xtrabackup --prepare 失败: {(ret.stderr or ret.stdout or '')[-500:]}")
+            if is_incr:
+                # 关键：增量链的基备必须 --apply-log-only（只应用 redo 不推进
+                # LSN），否则增量应用报 "needs target prepared with
+                # --apply-log-only"；全部增量应用完后再做最终普通 prepare。
+                logs.append("[增量恢复] prepare 全量基备（--apply-log-only）...")
+                prep_cmd = [xtrabackup, "--prepare", "--apply-log-only"]
+                if self._restore_parallel() > 1:
+                    prep_cmd.append(f"--parallel={self._restore_parallel()}")
+                prep_cmd.append(f"--target-dir={work}")
+                ret = subprocess.run(prep_cmd, capture_output=True, text=True,
+                                     timeout=7200)
+                if ret.returncode != 0:
+                    raise RuntimeError(
+                        f"增量恢复: 基备 prepare 失败: {(ret.stderr or ret.stdout or '')[-400:]}")
+                for i, inc in enumerate(incr_chain):
+                    # 增量层可能是 zstd 压缩产物：解压到临时副本（不污染原备份）
+                    inc_work = os.path.join(tmp, f"inc_{i}")
+                    shutil.copytree(inc, inc_work)
+                    try:
+                        n = self._decompress_xtrabackup_dir(inc_work)
+                        if n:
+                            logs.append(f"[增量恢复] 解压增量层 {n} 个 .zst 文件")
+                    except RuntimeError:
+                        ret = subprocess.run(
+                            [xtrabackup, "--decompress", f"--target-dir={inc_work}"],
+                            capture_output=True, text=True, timeout=7200)
+                        if ret.returncode != 0:
+                            raise RuntimeError(
+                                f"增量恢复: 解压增量层失败: {(ret.stderr or '')[:300]}")
+                    logs.append(f"[增量恢复] 应用增量层: {os.path.basename(inc)}")
+                    cmd_i = [xtrabackup, "--prepare",
+                             f"--incremental-dir={inc_work}", f"--target-dir={work}"]
+                    if self._restore_parallel() > 1:
+                        cmd_i.append(f"--parallel={self._restore_parallel()}")
+                    ret = subprocess.run(cmd_i, capture_output=True, text=True,
+                                         timeout=7200)
+                    if ret.returncode != 0:
+                        raise RuntimeError(
+                            f"增量恢复: 应用增量失败 {os.path.basename(inc)}: "
+                            f"{(ret.stderr or ret.stdout or '')[-400:]}")
+                # 最终 prepare：把最后的 redo 完整应用（产生可启动实例）
+                fin = [xtrabackup, "--prepare"]
+                if self._restore_parallel() > 1:
+                    fin.append(f"--parallel={self._restore_parallel()}")
+                fin.append(f"--target-dir={work}")
+                ret = subprocess.run(fin, capture_output=True, text=True,
+                                     timeout=7200)
+                if ret.returncode != 0:
+                    raise RuntimeError(
+                        f"增量恢复: 最终 prepare 失败: {(ret.stderr or ret.stdout or '')[-400:]}")
+                logs.append("[增量恢复] 增量链合并完成（基备 + %d 层增量）" % len(incr_chain))
+            else:
+                logs.append("[物理恢复] xtrabackup --prepare 应用 redo log ...")
+                prep_cmd = [xtrabackup, "--prepare"]
+                if self._restore_parallel() > 1:
+                    prep_cmd.append(f"--parallel={self._restore_parallel()}")
+                prep_cmd.append(f"--target-dir={work}")
+                ret = subprocess.run(prep_cmd,
+                                     capture_output=True, text=True, timeout=7200)
+                if ret.returncode != 0:
+                    raise RuntimeError(f"xtrabackup --prepare 失败: {(ret.stderr or ret.stdout or '')[-500:]}")
 
             # 4) 启动临时 mysqld 校验：优先平台本机实例；平台 mysqld 大版本
             #    与源实例不一致（或 MariaDB）且可 SSH 时，改用数据库服务器

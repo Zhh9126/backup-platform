@@ -594,8 +594,34 @@ class DamengEngine(BackupEngine):
             src_pwd = db.decrypt_secret(self.task.get("password") or "") or "Ceshi@5235"
             # 注：非安全版 dminit 不接受 SYSSSO_PWD（会报
             # "Current dminit is not a secure version, you can't set [SYSSSO_PWD]"）
+            # 页大小/簇大小必须与源实例一致，否则 RESTORE 报
+            # DM[-105] Invalid control file（备份集与目标实例页大小不匹配）
+            page_size, extent_size = 8, 16
+            try:
+                from core.sync.plugins.dameng import _jdbc_connect as _dmconn
+                _c = _dmconn(self.task.get("host") or "127.0.0.1",
+                             int(self.task.get("port") or 5236),
+                             self.task.get("username") or "SYSDBA",
+                             db.decrypt_secret(self.task.get("password") or ""))
+                _cur = _c.cursor()
+                _cur.execute("SELECT SF_GET_PAGE_SIZE()")
+                # dminit PAGE_SIZE 单位=字节（默认 8192），SF_GET_PAGE_SIZE
+                # 返回的也是字节，直接透传
+                page_size = int(_cur.fetchone()[0]) or 8192
+                try:
+                    _cur.execute("SELECT SF_GET_EXTENT_SIZE()")
+                    extent_size = int(_cur.fetchone()[0]) or 16   # 单位=K
+                except Exception:
+                    pass
+                _cur.close()
+                _c.close()
+                logs.append(f"[PITR] 源实例页大小={page_size}K 簇大小={extent_size}K")
+            except Exception as _e:
+                logs.append(f"[PITR] 页大小探测失败（用默认 8K）: {_e}")
             dminit_args = (dminit_bin + " path=" + restore_dir +
                            " PORT_NUM=" + str(replica_port) +
+                           " PAGE_SIZE=" + str(page_size) +
+                           " EXTENT_SIZE=" + str(extent_size) +
                            " SYSDBA_PWD=" + src_pwd +
                            " SYSAUDITOR_PWD=" + src_pwd)
             init_shell = "su - dmdba -c " + shlex.quote(dminit_args)
@@ -642,8 +668,10 @@ class DamengEngine(BackupEngine):
                 bad = any(k in text for k in ("失败", "error", "Error", "[-"))
                 return {"ok": (not bad), "output": text + errt}
 
-            new_ini = os.path.join(restore_dir, "dm.ini")
             # 4a) RESTORE 到独立目录（非破坏）：DATABASE 参数直接用新目录的
+            #     dm.ini（保留 dminit 后动态定位的 found_ini——此前此处被
+            #     os.path.join(restore_dir, "dm.ini") 硬编码覆盖，导致
+            #     DM[-140] Can not access INI file）
             #     dm.ini 路径（DM8 dmrman 还原到指定目录的语法；不带 TO 子句）
             r1 = _dmrman(
                 f"RESTORE DATABASE '{new_ini}' "

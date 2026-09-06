@@ -357,7 +357,9 @@ class DbMigrationEngine:
             "tgt_password": plan["tgt_password"],
             "tgt_db_name": plan["tgt_db_name"],
             "sync_mode": "full",
-            "save_mode": "create_if_not_exists" if with_structure else "append",
+            # 迁移=一次性任务：结构+全量阶段按当前字段映射重建目标表
+            # （DTS 全量迁移语义），保证列名/类型与映射一致且可重复执行
+            "save_mode": "overwrite" if with_structure else "append",
             "full_db_migrate": True,
             "validate_before_run": False,
             "verify_after_run": False,
@@ -439,6 +441,28 @@ class DbMigrationEngine:
 
     @staticmethod
     def _count_rows(db_type, host, port, user, password, database, table) -> int:
+        db_type = (db_type or "").lower()
+        # 达梦 / Oracle / 金仓：JDBC 通道（驱动 jar 随离线包内置，零安装）
+        if db_type in ("dameng", "oracle", "kingbase"):
+            from core import jdbc as _jdbc
+            # 达梦/Oracle 未加引号标识符自动转大写，目标表由 writer
+            # 按 _upper 建表 → 查询表名必须大写
+            tbl = table.replace('"', "").upper()
+            q = f'"{tbl}"'
+            if database:
+                q = f'"{database.replace(chr(34), "")}".' + q
+            sql = f"SELECT COUNT(*) FROM {q}"
+            conn = _jdbc.connect(db_type, host, int(port or 0),
+                                 database or "", user, password or "")
+            try:
+                cur = conn.cursor()
+                cur.execute(sql)
+                return int(cur.fetchone()[0])
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
         if db_type in ("mysql", "mariadb"):
             import pymysql
             conn = pymysql.connect(host=host, port=int(port or 3306), user=user,

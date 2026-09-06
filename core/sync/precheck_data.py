@@ -348,10 +348,16 @@ def check_charset(cfg, src_conn, tgt_conn) -> Dict[str, Any]:
                 "message": f"字符集探测不完整（源 {src_cs} / 目标 {tgt_cs}），"
                            f"无法自动判定，建议人工确认",
                 "detail": [{"source": src_cs, "target": tgt_cs}]}
-    if sf == "utf8_4" and tf in ("gb", "latin"):
+    if sf == "utf8_4" and tf == "latin":
         return {"status": "fail",
-                "message": f"字符集冲突：源 {src_cs}（4 字节，含 emoji/生僻字）"
-                           f"→ 目标 {tgt_cs}（无法承载 4 字节字符），写入将失败或丢数据",
+                "message": f"字符集冲突：源 {src_cs}（4 字节）→ 目标 {tgt_cs}，"
+                           f"绝大多数非 ASCII 字符将无法写入",
+                "detail": [{"source": src_cs, "target": tgt_cs}]}
+    if sf == "utf8_4" and tf == "gb":
+        return {"status": "warn",
+                "message": f"字符集风险：源 {src_cs}（4 字节）→ 目标 {tgt_cs}："
+                           f"常规中文可存储，emoji 及部分生僻字（4 字节字符）将写入失败或被替换，"
+                           f"如含此类数据建议目标改用 UTF-8",
                 "detail": [{"source": src_cs, "target": tgt_cs}]}
     if sf == "utf8_4" and tf == "utf8_3":
         return {"status": "warn",

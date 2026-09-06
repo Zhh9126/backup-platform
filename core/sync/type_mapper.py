@@ -79,9 +79,48 @@ def to_db(value: Any, target_type: str = "STRING") -> Any:
     return str(value)
 
 
+# pymysql 数字类型码 → 平台中间类型（driver 返回 description 类型码为数字）
+_PYMYSQL_CODE_MAP = {
+    0: JavaType.DECIMAL,     # DECIMAL
+    1: JavaType.LONG,        # TINYINT
+    2: JavaType.LONG,        # SMALLINT
+    3: JavaType.LONG,        # INT
+    4: JavaType.DOUBLE,      # FLOAT
+    5: JavaType.DOUBLE,      # DOUBLE
+    7: JavaType.DATETIME,    # TIMESTAMP
+    8: JavaType.LONG,        # BIGINT
+    9: JavaType.LONG,        # INT24
+    10: JavaType.DATE,       # DATE
+    11: JavaType.TIME,       # TIME
+    12: JavaType.DATETIME,   # DATETIME
+    13: JavaType.LONG,       # YEAR
+    15: JavaType.STRING,     # VARCHAR
+    16: JavaType.BYTES,      # BIT（bytes 原样透传）
+    245: JavaType.STRING,    # JSON
+    246: JavaType.DECIMAL,   # NEWDECIMAL
+    247: JavaType.STRING,    # ENUM
+    248: JavaType.STRING,    # SET
+    249: JavaType.BYTES,     # TINY_BLOB
+    250: JavaType.BYTES,     # MEDIUM_BLOB
+    251: JavaType.BYTES,     # LONG_BLOB
+    252: JavaType.BYTES,     # BLOB
+    253: JavaType.STRING,    # VAR_STRING
+    254: JavaType.STRING,    # STRING（含 CHAR/ENUM 字符串形态）
+    255: JavaType.BYTES,     # GEOMETRY
+}
+
+
 def db_type_to_java_type(db_type: str) -> str:
-    """根据源库列类型名推断平台中间类型。"""
+    """根据源库列类型名（或 pymysql 数字类型码）推断平台中间类型。
+
+    幂等：入参已是平台中间类型（STRING/LONG/BYTES 等）时原样返回——
+    防御调用方把转换结果再次传入导致二次映射（BYTES→STRING 事故）。
+    """
     t = (db_type or "").upper()
+    if t in (JavaType.STRING, JavaType.LONG, JavaType.DOUBLE, JavaType.DECIMAL,
+             JavaType.BOOLEAN, JavaType.DATE, JavaType.TIME, JavaType.DATETIME,
+             JavaType.BYTES, JavaType.NULL):
+        return t
     if any(x in t for x in ["INT", "SERIAL", "BIGINT", "SMALLINT", "TINYINT", "MEDIUMINT"]):
         return JavaType.LONG
     if any(x in t for x in ["FLOAT", "DOUBLE", "REAL"]):
@@ -98,4 +137,7 @@ def db_type_to_java_type(db_type: str) -> str:
         return JavaType.TIME
     if any(x in t for x in ["BLOB", "BINARY", "BYTEA"]):
         return JavaType.BYTES
+    # pymysql 数字类型码（'252'/'16'/'246' 等）
+    if t.isdigit() and int(t) in _PYMYSQL_CODE_MAP:
+        return _PYMYSQL_CODE_MAP[int(t)]
     return JavaType.STRING

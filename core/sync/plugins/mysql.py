@@ -56,8 +56,10 @@ class MySQLSourceReader(SourceReader):
                 )
                 pk_set = {r[0] for r in cur.fetchall()}
                 # 列信息
+                # COLUMN_TYPE 含完整修饰（'int unsigned'/'decimal(20,4)'），
+                # 仅 DATA_TYPE 会丢 unsigned 导致升位映射失效
                 cur.execute(
-                    "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, "
+                    "SELECT COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, "
                     "CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE "
                     "FROM INFORMATION_SCHEMA.COLUMNS "
                     "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s ORDER BY ORDINAL_POSITION",
@@ -120,7 +122,7 @@ class MySQLSourceReader(SourceReader):
         if not desc:
             return ReadResult(has_more=False)
         columns = [d[0] for d in desc]
-        records = [[self.plugin.type_to_java(db_type_to_java_type(str(desc[i][1])), v)
+        records = [[self.plugin.type_to_java(str(desc[i][1]), v)
                     for i, v in enumerate(row)]
                    for row in rows]
 
@@ -394,7 +396,9 @@ class MySQLPlugin(BasePlugin):
         if jt == JavaType.DECIMAL:
             return str(value)
         if jt == JavaType.BYTES:
-            return bytes(value)
+            if isinstance(value, (bytes, bytearray)):
+                return bytes(value)
+            return str(value).encode("utf-8")
         if jt in (JavaType.DATE, JavaType.TIME, JavaType.DATETIME):
             return str(value)
         return str(value)

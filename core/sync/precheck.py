@@ -163,7 +163,8 @@ def run_precheck(cfg) -> Dict[str, Any]:
 
     tables = list(cfg.source_tables_list or []) or (
         [cfg.source_table] if cfg.source_table else [])
-    if not tables:
+    # 全库迁移模式：表清单在源连接建立后自动枚举（无单表清单是正常的）
+    if not tables and not cfg.full_db_migrate:
         _add(items, "table_list", "fail", "未指定要同步的表")
         return _summary(items)
 
@@ -194,6 +195,18 @@ def run_precheck(cfg) -> Dict[str, Any]:
     except Exception as e:
         _add(items, "source_connectivity", "fail", f"源库连接失败: {e}")
         return _summary(items)
+
+    # 全库迁移：枚举源库全部表
+    if not tables and cfg.full_db_migrate:
+        try:
+            from core.data_compare import _list_tables as _lt
+            tables = _lt(src_conn, cfg.src_db_type, cfg.src_db_name,
+                         cfg.src_schema)
+            _add(items, "table_list", "pass",
+                 f"全库迁移：源库共 {len(tables)} 张表")
+        except Exception as e:
+            _add(items, "table_list", "fail", f"枚举源库表失败: {e}")
+            return _summary(items)
     try:
         tgt_conn = writer.connect()
         _add(items, "target_connectivity", "pass",
@@ -246,8 +259,9 @@ def run_precheck(cfg) -> Dict[str, Any]:
         _add(items, "target_table_exists", "pass", "目标表均存在")
 
     # ---- 3) 列兼容性（核心）----
-    # overwrite（迁移自动建表）时同样输出映射建议——对标 DTS 结构初始化：
-    # 自动建表按映射引擎的建议类型建列，风险类型需人工确认。
+    # overwrite / create_if_not_exists（迁移自动建表）时输出映射建议——
+    # 对标 DTS 结构初始化：自动建表按映射引擎的建议类型建列，风险需人工确认。
+    auto_create = overwrite or create_if_ne
     col_detail = []
     col_fail = col_warn = 0
     if True:
@@ -257,8 +271,8 @@ def run_precheck(cfg) -> Dict[str, Any]:
             try:
                 src_cols = _get_cols_typed(src_conn, cfg.src_db_type,
                                            cfg.src_db_name, cfg.src_schema, t)
-                # overwrite 自动建表时目标表可能不存在（tgt_cols 为空）
-                if not (overwrite and tt in tgt_missing):
+                # 自动建表时目标表可能不存在（tgt_cols 为空 → 建表建议）
+                if not (auto_create and tt in tgt_missing):
                     tgt_cols = _get_cols_typed(tgt_conn, cfg.tgt_db_type,
                                                cfg.tgt_db_name, cfg.tgt_schema, tt)
             except Exception as e:
@@ -276,7 +290,7 @@ def run_precheck(cfg) -> Dict[str, Any]:
                 src_map.add(key)
                 tc = tgt_map.get(key)
                 if tc is None:
-                    if overwrite:
+                    if auto_create:
                         continue  # 自动建表场景无目标列可缺（建表建议见下）
                     col_detail.append({"table": t, "column": name,
                                        "status": "fail",
@@ -305,8 +319,8 @@ def run_precheck(cfg) -> Dict[str, Any]:
                         "table": t, "column": str(c[0]), "status": "warn",
                         "message": "目标列源端不存在（取默认值/空）"})
                     col_warn += 1
-            # overwrite 自动建表：逐列输出建表类型建议（对标 DTS 结构初始化）
-            if overwrite and tt in tgt_missing:
+            # 自动建表：逐列输出建表类型建议（对标 DTS 结构初始化）
+            if auto_create and tt in tgt_missing:
                 from core.sync.type_matrix import map_type as _mt
                 for c in src_cols:
                     m = _mt(cfg.src_db_type, cfg.tgt_db_type, c[1])

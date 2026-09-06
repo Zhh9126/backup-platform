@@ -279,6 +279,11 @@ class PostgreSQLSinkWriter(SinkWriter):
                 target_type = JavaType.STRING
                 if mapped and mapped.get("target_type"):
                     target_type = mapped.get("target_type")
+                # bytes 原样透传（bytea/bytea 兼容列），不做 STRING 字符串化
+                # （此前 bytes → "b'...'" 字符串导致 bytea 列写入失败）
+                if isinstance(row[i], (bytes, bytearray)):
+                    out.append(bytes(row[i]))
+                    continue
                 java_val = self.plugin.type_to_java(target_type, row[i])
                 out.append(to_db(java_val, target_type))
             return tuple(out)

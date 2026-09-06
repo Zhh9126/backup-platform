@@ -122,8 +122,12 @@ def _int_target(tgt: str, t: dict):
                 "BIGINT UNSIGNED → DECIMAL(20,0)（超出 BIGINT 上限 9223372036854775807，"
                 "映射为 BIGINT 会静默降级/溢出）")
     if uns and base == "int":
-        return ("BIGINT" if tgt in ("mysql", "mariadb") else "NUMBER(10,0)",
-                "warn", "INT UNSIGNED → BIGINT/NUMBER(10,0)（无符号 32 位超有符号范围）")
+        # INT UNSIGNED (0~4294967295)：有符号 32 位装不下 → 升位 64 位
+        up = ("BIGINT" if tgt in ("mysql", "mariadb", "postgresql",
+                                  "kingbase", "sqlserver")
+              else "NUMBER(10,0)")
+        return (up, "warn",
+                f"INT UNSIGNED → {up}（无符号 32 位超有符号范围，升位 64 位）")
     if uns:
         # TINYINT/SMALLINT UNSIGNED 升一级
         up = {"tinyint": ("SMALLINT", "MEDIUMINT"), "smallint": ("INT", "BIGINT"),
@@ -237,6 +241,9 @@ def _special_target(tgt: str, t: dict):
         if tgt in ("oracle", "dameng"):
             p = t["prec"] or 1
             return (f"NUMBER({max(p, 2)},0)", "warn", f"BIT({p}) → NUMBER（DTS 规则）")
+        if tgt in ("postgresql", "kingbase"):
+            return ("SMALLINT", "warn",
+                    "BIT → SMALLINT（整型 0/1 承载，规避位串类型绑定兼容问题）")
         return ("BIT", "ok", "")
     if fam == "bool":
         if tgt in ("oracle", "dameng"):

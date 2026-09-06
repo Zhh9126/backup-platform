@@ -189,7 +189,8 @@ def _probe_kingbase(h, p, u, pw, db_name, t):
 
     client = _first_client("ksql", "sys_psql", "psql")
     if not client:
-        return None, f"缺少 ksycopg2/psycopg2 驱动与 ksql 客户端（{reason}），无法验证连接"
+        # 零安装原则：平台自带 JDBC 驱动（金仓兜底 PG 驱动），缺 CLI 时兜底
+        return _probe_via_jdbc("kingbase", _h, _p, _u, _pw, _t)
     env = os.environ.copy()
     if pw:
         env["KINGBASE_PASSWORD"] = pw
@@ -220,7 +221,8 @@ def _probe_dameng(h, p, u, pw, db_name, t):
 
     client = _first_client("disql")
     if not client:
-        return None, f"缺少 dmPython 驱动与 disql 客户端（{reason}），无法验证连接"
+        # 零安装原则：平台自带 JDBC 驱动，缺原生驱动/CLI 时自动兜底
+        return _probe_via_jdbc("dameng", h, p, u, pw, t)
     # 密码经 stdin 传入，不进命令行
     script = f"conn {u}/\"{pw}\"@{h}:{port}\nselect 1;\nexit\n"
     rc, out, err = _run([client, "/nolog"], None, t + 10, script)
@@ -246,6 +248,29 @@ _PROBES = {
     "kingbase": ([], _probe_kingbase),
     "dameng": ([], _probe_dameng),
 }
+
+
+def _probe_via_jdbc(db_type: str, h, p, u, pw, t):
+    """JDBC 兜底探测：驱动 jar 随平台离线包内置（零安装原则），
+    dmPython/CLI 客户端缺失时的可靠通道。返回 (ok, msg)。"""
+    try:
+        from core import jdbc
+        conn = jdbc.connect(db_type, str(h), int(p or 0),
+                            "", str(u), str(pw or ""))
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT 1 FROM DUAL" if db_type in ("oracle", "dameng")
+                        else "SELECT 1")
+            cur.fetchone()
+            cur.close()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        return True, f"{db_type} 连接正常（JDBC）"
+    except Exception as e:
+        return False, f"JDBC 连接失败: {str(e)[:150]}"
 
 
 def probe_db_connection(db_type: str, host: str, port, username: str,

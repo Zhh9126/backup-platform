@@ -15,8 +15,22 @@ from ..type_mapper import db_type_to_java_type, to_java
 logger = logging.getLogger(__name__)
 
 
-def _upper(name: str) -> str:
-    return (name or "").upper()
+def _upper(name) -> str:
+    if name is None:
+        return ""
+    if not isinstance(name, str):
+        name = str(name)  # JDBC 通道返回 java.lang.String（JPype 包装）
+    return name.upper()
+
+
+def _s(v):
+    """JPype java.lang.String → python str（其余原样）。"""
+    if v is not None and not isinstance(v, str):
+        try:
+            return str(v)
+        except Exception:
+            return v
+    return v
 
 
 def _import_dmpython():
@@ -114,7 +128,7 @@ class DamengSourceReader(SourceReader):
             cur.execute(
                 "SELECT table_name FROM dba_tables WHERE owner=? "
                 "ORDER BY table_name", (schema,))
-            return [r[0] for r in cur.fetchall()]
+            return [_s(r[0]) for r in cur.fetchall()]
         finally:
             conn.close()
 
@@ -170,10 +184,10 @@ class DamengSourceReader(SourceReader):
             if (cfg.source_tables_list or cfg.source_table) else ""
         sql, binds = self._build_select_sql(table, [])
         cursor.execute(sql, binds or {})
-        columns = [d[0] for d in cursor.description]
+        columns = [_s(d[0]) for d in cursor.description]
         rows = cursor.fetchmany(cfg.batch_size)
         records = [[self.plugin.type_to_java(
-            (cursor.description[i][1] or str), v)
+            str(cursor.description[i][1] or ''), _s(v))
             for i, v in enumerate(row)] for row in rows]
         return ReadResult(records=records, columns=columns,
                           has_more=len(rows) >= cfg.batch_size)
@@ -199,7 +213,7 @@ class DamengSinkWriter(SinkWriter):
         cur.execute("SELECT column_name FROM dba_tab_columns "
                     "WHERE owner=? AND table_name=? ORDER BY column_id",
                     (schema, _upper(table)))
-        return [r[0] for r in cur.fetchall()]
+        return [_s(r[0]) for r in cur.fetchall()]
 
     def _get_primary_keys(self, conn: Any, table: str) -> List[str]:
         cur = conn.cursor()
@@ -211,7 +225,7 @@ class DamengSinkWriter(SinkWriter):
             "AND c.constraint_name=cols.constraint_name "
             "WHERE c.owner=? AND c.table_name=? AND c.constraint_type='P'",
             (schema, _upper(table)))
-        return [r[0] for r in cur.fetchall()]
+        return [_s(r[0]) for r in cur.fetchall()]
 
     def _create_table_sql(self, table: str, columns: List[ColumnMeta]) -> str:
         cfg = self.config
@@ -265,22 +279,28 @@ class DamengSinkWriter(SinkWriter):
             # 达梦 MERGE INTO（UPSERT）
             upd = [c for c in ncols if _upper(c) not in
                    {_upper(p) for p in pks}]
-            set_sql = ", ".join(f'"{_upper(c)}" = :{i + len(pks) + 1}'
-                                for i, c in enumerate(upd))
-            on_sql = " AND ".join(f'T."{_upper(p)}" = :{i + 1}'
-                                  for i, p in enumerate(pks))
+            # JDBC/dmPython 均为 qmark（?）参数风格；参数顺序 =
+            # USING 子句的 pk 列 → SET 的 upd 列（ 达梦 MERGE ... USING
+            # (SELECT ? AS pk ...) 逐行提供比对值）
+            set_sql = ", ".join(f'"{_upper(c)}" = ?' for c in upd)
+            on_sql = " AND ".join(f'T."{_upper(p)}" = S."{_upper(p)}"'
+                                  for p in pks)
             ins_cols = ", ".join(f'"{_upper(c)}"' for c in ncols)
-            ins_vals = ", ".join(f":{i + 1}" for i in range(len(ncols)))
+            ins_vals = ", ".join("?" for _ in ncols)
+            using_cols = ", ".join(f'? AS "{_upper(p)}"' for p in pks)
             sql = (f"MERGE INTO {self._table_ref(table)} T USING "
-                   f"(SELECT 1 AS ONE) S ON ({on_sql}) "
+                   f"(SELECT {using_cols} FROM DUAL) S ON ({on_sql}) "
                    f"WHEN MATCHED THEN UPDATE SET {set_sql} "
                    f"WHEN NOT MATCHED THEN INSERT ({ins_cols}) "
                    f"VALUES ({ins_vals})")
             rows_data = []
             for rec in records:
-                d = dict(zip(ncols, rec))
+                # 统一大写键（源列名与主键名大小写可能不一致）
+                d = {_upper(k): v for k, v in zip(ncols, rec)}
+                # 参数顺序：USING 的 pk → SET 的 upd → INSERT VALUES 的全列
                 rows_data.append([d.get(_upper(p)) for p in pks]
-                                 + [d.get(_upper(c)) for c in upd])
+                                 + [d.get(_upper(c)) for c in upd]
+                                 + [d.get(_upper(c)) for c in ncols])
             cur.executemany(sql, rows_data)
         else:
             cols_sql = ", ".join(f'"{_upper(c)}"' for c in ncols)

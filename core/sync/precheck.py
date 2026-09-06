@@ -375,6 +375,34 @@ def run_precheck(cfg) -> Dict[str, Any]:
                 _add(items, "incremental_column", "warn",
                      f"增量列检查失败: {e}")
 
+    # ---- 6) 数据级试写 / 容量预估 / 字符集 / 外键完整性 ----
+    from core.sync import precheck_data as _pd
+    sample_n = int(getattr(cfg, "precheck_sample_rows", 20) or 0)
+    if sample_n > 0:
+        for t in tables[:5]:                 # 最多试写 5 张表（控制预检耗时）
+            try:
+                r = _pd.check_data_sample(cfg, src_conn, tgt_conn, t, sample_n)
+            except Exception as e:
+                r = {"status": "warn", "message": f"数据级试写异常（跳过）: {e}",
+                     "detail": []}
+            if r:
+                _add(items, f"data_sample[{t}]", r["status"],
+                     r["message"], r.get("detail"))
+    try:
+        r = _pd.check_capacity(cfg, src_conn, tables)
+        _add(items, "capacity", r["status"], r["message"], r.get("detail"))
+    except Exception as e:
+        _add(items, "capacity", "warn", f"容量预估不可用: {e}")
+    try:
+        r = _pd.check_charset(cfg, src_conn, tgt_conn)
+        _add(items, "charset", r["status"], r["message"], r.get("detail"))
+    except Exception as e:
+        _add(items, "charset", "warn", f"字符集探测不可用: {e}")
+    if len(tables) >= 2:
+        r = _pd.check_fk_parents(cfg, src_conn, tables)
+        if r:
+            _add(items, "fk_integrity", r["status"], r["message"], r.get("detail"))
+
     return _summary(items)
 
 

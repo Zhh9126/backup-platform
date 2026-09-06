@@ -6,6 +6,7 @@
 导入失败时给出明确指引，插件注册不受影响（运行时才报错）。
 """
 import logging
+import os
 from typing import Any, List
 
 from .base import BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader, SyncConfig
@@ -29,15 +30,80 @@ def _import_dmpython():
             "或将其加入 PYTHONPATH") from e
 
 
+# ---------------------------------------------------------------- #
+# JDBC fallback（dmPython 不可用时）：JayDeBeApi + DmJdbcDriver8.jar
+# jar 位置：平台 drivers/jdbc/DmJdbcDriver8.jar（离线包随附）；
+# JVM 要求 JDK11+（jpype 1.5+ 不支持 JDK8），自动探测常见路径。
+_JVM_STARTED = False
+
+
+def _ensure_jvm():
+    """启动 JVM（全局一次）。优先 JDK11+。"""
+    global _JVM_STARTED
+    if _JVM_STARTED:
+        return
+    import jpype
+    import glob
+    candidates = (glob.glob("/usr/lib/jvm/java-11*/lib/server/libjvm.so")
+                  + glob.glob("/usr/lib/jvm/java-1[1-9]*/lib/server/libjvm.so")
+                  + glob.glob("/usr/lib/jvm/*/lib/server/libjvm.so")
+                  + glob.glob("/usr/java/*/lib/server/libjvm.so"))
+    # __file__ = core/sync/plugins/dameng.py → 项目根需向上 4 层
+    _root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))))
+    jar = os.path.join(_root, "drivers", "jdbc", "DmJdbcDriver8.jar")
+    if not os.path.exists(jar):
+        # 容器/安装环境：driver.jar 与 jar 环境变量兜底
+        jar = os.environ.get("DM_JDBC_JAR", "/opt/backup-platform/drivers/jdbc/DmJdbcDriver8.jar")
+    for jvm in candidates:
+        try:
+            jpype.startJVM(jvm, classpath=[jar])
+            _JVM_STARTED = True
+            return
+        except OSError:
+            continue
+    try:
+        if jpype.isJVMStarted():
+            _JVM_STARTED = True
+            return
+    except Exception:
+        pass
+    raise RuntimeError(
+        "无法启动 JVM（JDBC fallback 需要 JDK11+，未找到 libjvm.so）。"
+        "请安装 java-11-openjdk 或改用 dmPython 驱动")
+
+
+def _jdbc_connect(host: str, port: int, user: str, password: str,
+                  database: str = ""):
+    """JayDeBeApi 连接达梦（DmJdbcDriver8）。"""
+    _ensure_jvm()
+    import jaydebeapi
+    dsn = f"jdbc:dm://{host}:{port}"
+    if database:
+        dsn += f"?schema={database}"
+    return jaydebeapi.connect("dm.jdbc.driver.DmDriver", dsn,
+                              [user, password])
+
+
+def _connect_dameng(host: str, port: int, user: str, password: str,
+                    database: str = ""):
+    """统一连接入口：优先 dmPython，不可用自动降级 JDBC。"""
+    try:
+        dm = _import_dmpython()
+        return dm.connect(host=host, port=port, user=user,
+                          password=password, database=database,
+                          loginTimeout=15)
+    except RuntimeError:
+        logger.info("[dameng-plugin] dmPython 不可用，降级 JDBC 通道")
+        return _jdbc_connect(host, port, user, password, database)
+
+
 class DamengSourceReader(SourceReader):
     def connect(self) -> Any:
-        dm = _import_dmpython()
         cfg = self.config
-        port = cfg.src_port or 5236
-        return dm.connect(host=cfg.src_host, port=port,
-                          user=cfg.src_username, password=cfg.src_password,
-                          database=cfg.src_db_name or cfg.src_schema or "",
-                          loginTimeout=15)
+        return _connect_dameng(cfg.src_host, cfg.src_port or 5236,
+                               cfg.src_username, cfg.src_password,
+                               cfg.src_db_name or cfg.src_schema or "")
 
     def list_tables(self) -> List[str]:
         conn = self.connect()
@@ -115,13 +181,10 @@ class DamengSourceReader(SourceReader):
 
 class DamengSinkWriter(SinkWriter):
     def connect(self) -> Any:
-        dm = _import_dmpython()
         cfg = self.config
-        port = cfg.tgt_port or 5236
-        return dm.connect(host=cfg.tgt_host, port=port,
-                          user=cfg.tgt_username, password=cfg.tgt_password,
-                          database=cfg.tgt_db_name or cfg.tgt_schema or "",
-                          loginTimeout=15)
+        return _connect_dameng(cfg.tgt_host, cfg.tgt_port or 5236,
+                               cfg.tgt_username, cfg.tgt_password,
+                               cfg.tgt_db_name or cfg.tgt_schema or "")
 
     def _table_ref(self, table: str = None) -> str:
         cfg = self.config

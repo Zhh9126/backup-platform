@@ -124,17 +124,17 @@ def _list_tables(conn, db_type: str, database: str, schema: str) -> list:
                 "AND tablename NOT LIKE 'pg\\_%' "
                 "AND tablename NOT LIKE 'xx\\_%' "
                 "ORDER BY tablename")
-        elif db_type == "oracle":
+        elif db_type in ("oracle", "dameng"):
             owner = (schema or _user_of(conn) or "").upper()
             if not owner:
                 return []
-            if owner in ("SYS", "SYSTEM", "SYSMAN", "DBSNMP") and not schema:
-                # 未显式指定 schema 时避免误对比系统用户下的表
+            if owner in ("SYS", "SYSTEM", "SYSMAN", "DBSNMP", "SYSAUDITOR",
+                         "SYSSSO", "CTISYS") and not schema:
                 return []
             cur.execute(
                 "SELECT table_name FROM all_tables "
                 f"WHERE owner = '{_lit_ident(db_type, owner)}' "
-                "AND secondary='N' ORDER BY table_name")
+                "ORDER BY table_name")
         else:
             raise ValueError(f"暂不支持列出 {db_type} 的表清单")
         names = [r[0] for r in cur.fetchall()]
@@ -167,7 +167,7 @@ def _table_ref(db_type: str, database: str, schema: str, table: str) -> str:
         return _qident(db_type, database, table)
     if db_type in ("postgresql", "kingbase"):
         return _qident(db_type, schema or "public", table)
-    if db_type == "oracle":
+    if db_type in ("oracle", "dameng"):
         owner = (schema or "").upper()
         return (_lit_ident(db_type, owner) + "." + _lit_ident(db_type, table)
                 if owner else _lit_ident(db_type, table))
@@ -189,7 +189,7 @@ def _get_columns(conn, db_type: str, database: str, schema: str, table: str) -> 
                 "SELECT column_name FROM information_schema.columns "
                 "WHERE table_schema=%s AND table_name=%s ORDER BY ordinal_position",
                 (schema or "public", table))
-        elif db_type == "oracle":
+        elif db_type in ("oracle", "dameng"):
             owner = (schema or _user_of(conn) or "").upper()
             cur.execute(
                 "SELECT column_name FROM all_tab_columns "
@@ -237,6 +237,18 @@ def _checksum_sql(db_type: str, ref: str, cols: list):
         expr = " || '#' || ".join(nvl(c) for c in cols)
         sql = ("SELECT COUNT(*), COALESCE(SUM(ORA_HASH({e})), 0) "
                "FROM {r}").format(e=expr, r=ref)
+    elif db_type == "dameng":
+        # 达梦兼容 Oracle 语法（ORA_HASH 可用）
+        def nvl_dm(col: str) -> str:
+            return "NVL(TO_CHAR(\"{}\"), '{}')".format(
+                col.replace('"', '""'), _NULL_MARK)
+        expr = " || '#' || ".join(nvl_dm(c) for c in cols)
+        sql = ("SELECT COUNT(*), COALESCE(SUM(ORA_HASH({e})), 0) "
+               "FROM {r}").format(e=expr, r=ref)
+    elif db_type in ("sqlserver", "mssql"):
+        # SQL Server：CHECKSUM_AGG(BINARY_CHECKSUM(*)) 原生聚合
+        sql = ("SELECT COUNT(*), COALESCE(CHECKSUM_AGG(BINARY_CHECKSUM(*)), 0) "
+               "FROM {r}").format(r=ref)
     else:
         raise ValueError(f"暂不支持 {db_type} 校验和")
     return sql
@@ -271,6 +283,145 @@ def _norm_val(v) -> str:
 
 def _norm_row(row) -> list:
     return [_norm_val(v) for v in row]
+
+
+# ---------------------------------------------------------------------------
+# 主键查询（分块对比依赖）
+# ---------------------------------------------------------------------------
+def _get_pk_column(conn, db_type: str, database: str, schema: str,
+                   table: str) -> str:
+    """返回表的单列主键列名（无主键/复合主键返回 None，退回抽样对比）。"""
+    cur = conn.cursor()
+    db_type = (db_type or "").lower()
+    try:
+        if db_type in ("mysql", "mariadb"):
+            cur.execute(
+                "SELECT column_name FROM information_schema.key_column_usage "
+                "WHERE table_schema=%s AND table_name=%s "
+                "AND constraint_name='PRIMARY' ORDER BY ordinal_position",
+                (database, table))
+        elif db_type in ("postgresql", "kingbase"):
+            cur.execute(
+                "SELECT a.attname FROM pg_index i "
+                "JOIN pg_attribute a ON a.attrelid=i.indrelid "
+                "AND a.attnum=ANY(i.indkey) "
+                "WHERE i.indrelid=%s::regclass AND i.indisprimary",
+                (f"{schema or 'public'}.{table}",))
+        elif db_type in ("oracle", "dameng"):
+            owner = (schema or _user_of(conn) or "").upper()
+            cur.execute(
+                "SELECT cols.column_name FROM all_constraints c "
+                "JOIN all_cons_columns cols ON c.owner=cols.owner "
+                "AND c.constraint_name=cols.constraint_name "
+                f"WHERE c.owner = '{_lit_ident(db_type, owner)}' "
+                f"AND c.table_name = '{_lit_ident(db_type, table)}' "
+                "AND c.constraint_type='P' ORDER BY cols.position")
+        else:
+            return None
+        pks = [r[0] for r in cur.fetchall()]
+        return pks[0] if len(pks) == 1 else None
+    except Exception:
+        return None
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 分块对比（对标 pt-table-checksum：主键有序分块 + 归并差异定位）
+# ---------------------------------------------------------------------------
+def _pk_of(cols: list) -> list:
+    """取主键列名列表（按列序）。"""
+    return [c.name for c in cols if getattr(c, "is_primary", False)]
+
+
+def _page_sql(db_type: str, ref: str, pk: str, last, chunk: int) -> str:
+    """keyset 分页 SQL：WHERE pk > last ORDER BY pk LIMIT chunk。"""
+    where = f" WHERE {pk} > " + (
+        str(int(last)) if str(last).lstrip('-').isdigit()
+        else "'" + str(last).replace("'", "''") + "'") if last is not None else ""
+    if (db_type or "").lower() == "oracle":
+        sql = (f"SELECT * FROM (SELECT * FROM {ref}{where} ORDER BY {pk}) "
+               f"WHERE ROWNUM <= {chunk}")
+    else:
+        sql = f"SELECT * FROM {ref}{where} ORDER BY {pk} LIMIT {chunk}"
+    return sql
+
+
+def _pk_chunk_compare(src, dst, src_type: str, dst_type: str, task: dict,
+                      table: str, ref_s: str, ref_d: str,
+                      pk: str, pk_idx: int, pk_idx_d: int, out: dict,
+                      max_diffs: int = 20) -> dict:
+    """主键 keyset 双指针归并对比（对标 pt-table-checksum 差异定位）。
+
+    两侧按主键序流式拉取（keyset 分页，每页 chunk 行），逐行归并：
+    - 仅源有   → missing_in_target（目标缺行，修复=INSERT）
+    - 仅目标有 → extra_in_target（目标多行，修复=DELETE）
+    - 双侧都有但值不同 → changed（修复=UPDATE）
+    内存占用 O(单页)，可对比千万级行；差异行携带行级明细与修复 SQL 模板。
+    """
+    chunk = int(task.get("chunk_rows") or 5000)
+
+    def _iter_side(cur, db_type, ref, idx):
+        """按主键 keyset 流式产出原始行（pk 取第 idx 列）。"""
+        last = None
+        while True:
+            cur.execute(_page_sql(db_type, ref, pk, last, chunk))
+            rows = cur.fetchall()
+            if not rows:
+                return
+            for r in rows:
+                yield r
+            last = _norm_val(rows[-1][idx])
+
+    it_s = _iter_side(cur_s := src.cursor(), src_type, ref_s, pk_idx)
+    it_d = _iter_side(cur_d := dst.cursor(), dst_type, ref_d, pk_idx_d)
+    diffs = []
+    compared = 0
+    rs, rd = next(it_s, None), next(it_d, None)
+    try:
+        while rs is not None or rd is not None:
+            compared += 1
+            ks = _norm_val(rs[0]) if rs else None
+            kd = _norm_val(rd[0]) if rd else None
+            if rd is None or (rs is not None and ks < kd):
+                if len(diffs) < max_diffs:
+                    diffs.append({
+                        "op": "missing_in_target", "pk": ks,
+                        "source": _norm_row(rs),
+                        "repair": f"-- 目标缺行：请从源库补插该行（pk={ks}）"})
+                rs = next(it_s, None)
+            elif rs is None or kd < ks:
+                if len(diffs) < max_diffs:
+                    diffs.append({
+                        "op": "extra_in_target", "pk": kd,
+                        "target": _norm_row(rd),
+                        "repair": f"DELETE FROM {ref_d} WHERE {pk} = {kd if str(kd).lstrip('-').isdigit() else chr(39)+str(kd).replace(chr(39), chr(39)*2)+chr(39)};"})
+                rd = next(it_d, None)
+            else:
+                ns, nd = _norm_row(rs), _norm_row(rd)
+                if ns != nd and len(diffs) < max_diffs:
+                    diffs.append({"op": "changed", "pk": ks,
+                                  "source": ns, "target": nd,
+                                  "repair": f"UPDATE {ref_d} SET ... WHERE {pk} = "
+                                            f"{ks if str(ks).lstrip('-').isdigit() else chr(39)+str(ks)+chr(39)};"})
+                rs = next(it_s, None)
+                rd = next(it_d, None)
+        out["compared_rows"] = compared
+        out["diff_count"] = len(diffs)
+        out["diffs"] = diffs
+        return out
+    finally:
+        try:
+            cur_s.close()
+        except Exception:
+            pass
+        try:
+            cur_d.close()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +466,34 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
             out["status"] = "mismatch"
             out["message"] = "行数不一致"
             return out
+
+        # ---- 分块对比（对标 pt-table-checksum）：大表或有主键时走
+        #      keyset 归并，精确输出差异行（missing/extra/changed）；
+        #      行数少且无主键时退回抽样比对。
+        pk = _get_pk_column(src, src_type, src_db, src_schema, table)
+        threshold = int(task.get("chunk_threshold") or 20000)
+        if pk and (out["source_rows"] > threshold
+                   or str(task.get("force_pk_compare") or "") == "1"):
+            cols_s = _get_columns(src, src_type, src_db, src_schema, table)
+            cols_d = _get_columns(dst, dst_type, dst_db, dst_schema, table)
+            pk_idx = next((i for i, c in enumerate(cols_s)
+                           if c.lower() == pk.lower()), 0)
+            pk_idx_d = next((i for i, c in enumerate(cols_d)
+                             if c.lower() == pk.lower()), 0)
+            # 归一化列序：按源列序对齐（源/目标列数一致前提下）
+            out["mode"] = "pk_chunk"
+            out["pk"] = pk
+            _pk_chunk_compare(src, dst, src_type, dst_type, task, table,
+                              ref_s, ref_d, pk, pk_idx, pk_idx_d, out)
+            if out.get("diff_count"):
+                out["status"] = "mismatch"
+                out["message"] = (f"主键归并发现 {out['diff_count']} 处差异"
+                                  f"（共比对 {out.get('compared_rows')} 行）")
+            else:
+                out["status"] = "match"
+                out["message"] = (f"主键归并比对 {out.get('compared_rows')} 行一致")
+            return out
+        out["mode"] = "checksum_sample"
 
         # 校验和（可选）
         if enable_checksum:

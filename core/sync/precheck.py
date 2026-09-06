@@ -145,6 +145,21 @@ def run_precheck(cfg) -> Dict[str, Any]:
         _add(items, "table_list", "fail", "未指定要同步的表")
         return _summary(items)
 
+    # ---- 0) 概念区分（业界定义：迁移=一次性 / 同步=持续性）----
+    kind = "migration" if cfg.sync_mode == "full" else "sync"
+    if kind == "migration":
+        _add(items, "task_kind", "pass",
+             "任务性质：数据迁移（一次性任务，完成后即结束，支持覆盖写入）")
+    else:
+        if cfg.save_mode == "overwrite":
+            _add(items, "task_kind", "fail",
+                 "概念冲突：同步是持续性任务（保持两端一致），不支持覆盖写入"
+                 "（overwrite 仅适用于一次性数据迁移）。请改用 upsert/append，"
+                 "或将任务类型改为数据迁移（full）")
+        else:
+            _add(items, "task_kind", "pass",
+                 "任务性质：数据同步（持续性任务，常驻运行保持两端一致）")
+
     reader = registry.create_reader(cfg.src_db_type, cfg)
     writer = registry.create_writer(cfg.tgt_db_type, cfg)
 

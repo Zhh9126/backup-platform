@@ -206,6 +206,19 @@ class SyncEngine:
             if report.get("warn"):
                 logging.getLogger("sync").info(
                     "[precheck] 通过，%s 项警告", report.get("warn"))
+        # ---- 概念区分（业界定义）：迁移=一次性任务（full，跑完即止）；
+        #      同步=持续性任务（incremental/realtime，常驻保持一致）。
+        #      同步任务禁止 overwrite——覆盖写入只对一次性迁移有意义，
+        #      对持续同步会破坏两端一致性语义。
+        if cfg.sync_mode in ("incremental", "realtime") \
+                and cfg.save_mode == "overwrite":
+            return {
+                "success": False,
+                "message": ("同步任务不支持覆盖写入（overwrite）：同步是持续性任务"
+                            "（保持两端一致），覆盖写入仅适用于一次性数据迁移"
+                            "（full）。请改用 upsert/append，或将任务类型改为迁移。"),
+                "total_read": 0, "total_write": 0, "errors": 0, "duration": 0.0,
+            }
         if cfg.sync_mode == "realtime":
             return self._run_realtime(progress_callback)
         if cfg.full_db_migrate:

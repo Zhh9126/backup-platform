@@ -14,10 +14,12 @@
   let selectedSource = null;
   let selectedTarget = null;
 
+  // 概念区分（业界定义）：迁移=一次性任务（full，跑完即止，支持覆盖写入）；
+  // 同步=持续性任务（incremental/realtime，常驻运行保持两端一致）
   const MODES = [
-    { value: "full", label: "全量同步" },
-    { value: "incremental", label: "增量同步" },
-    { value: "realtime", label: "实时同步（Flink CDC）" },
+    { value: "full", label: "数据迁移（一次性全量）" },
+    { value: "incremental", label: "数据同步（周期增量）" },
+    { value: "realtime", label: "数据同步（实时 CDC）" },
   ];
   const SAVE_MODES = [
     { value: "append", label: "追加写入" },
@@ -84,7 +86,7 @@
         <td>${esc(t.name)}</td>
         <td>${esc(t.src_db_display || t.src_db_type || "-")} <i class="bi bi-arrow-right"></i> ${esc(t.tgt_db_display || t.tgt_db_type || "-")}</td>
         <td>${esc(t.source_table || "-")} <i class="bi bi-arrow-right"></i> ${esc(t.target_table || "-")}</td>
-        <td>${esc(t.sync_mode || "full")} / ${esc(t.save_mode || "append")}</td>
+        <td>${(t.sync_mode === "full") ? "迁移·一次性" : "同步·持续"} / ${esc(t.save_mode || "append")}</td>
         <td>${statusBadge(t.last_status)}</td>
         <td>${fmtTime(t.last_run_at)}</td>
         <td>${esc(t.message || "")}</td>
@@ -108,6 +110,20 @@
     // 填充同步模式/保存模式/ide 下拉
     fillSelect($("syncMode"), MODES, task ? task.sync_mode : "full");
     fillSelect($("saveMode"), SAVE_MODES, task ? task.save_mode : "append");
+    // 概念联动：覆盖写入仅适用于数据迁移（full）；同步类禁用
+    const syncModeSel = $("syncMode");
+    if (syncModeSel) {
+      const toggleOverwrite = function () {
+        const isMigration = syncModeSel.value === "full";
+        Array.from($("saveMode").options).forEach(function (o) {
+          if (o.value === "overwrite") o.disabled = !isMigration;
+        });
+        if (!isMigration && $("saveMode").value === "overwrite")
+          $("saveMode").value = "upsert";
+      };
+      syncModeSel.addEventListener("change", toggleOverwrite);
+      toggleOverwrite();
+    }
     fillSelect($("fieldIde"), IDE_OPTIONS, task ? task.field_ide : "origin");
     onSyncModeChange();
     bootstrap.Modal.getOrCreateInstance($("taskModal")).show();

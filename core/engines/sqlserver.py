@@ -87,6 +87,9 @@ class SQLServerEngine(BackupEngine):
                 return {}
         return {}
 
+    class _FallToLocal(Exception):
+        """远端缺工具（零安装原则）→ 跳转平台服务端本机执行。"""
+
     def _exec_tsql(self, tsql: str, ssh_host: dict = None, timeout: int = 7200):
         """执行 T-SQL，返回 (rc, stdout, stderr)。
 
@@ -121,10 +124,14 @@ class SQLServerEngine(BackupEngine):
                 sqlcmd = remote_dump.resolve_remote_tool(
                     ssh_host, "sqlcmd", extra_paths=tp)
                 if not sqlcmd:
-                    raise RuntimeError(
-                        "远端主机未找到 sqlcmd（/opt/mssql-tools/bin 与 PATH 均无）。"
-                        "请在远端安装 mssql-tools，或在任务 extra_options.tool_path "
-                        "填写其目录")
+                    # 零安装原则：数据库服务器不安装任何组件。远端未自带
+                    # sqlcmd 时不要求用户在远端安装，而是回退到平台服务端
+                    # 本机 sqlcmd 直连远程 1433 执行（服务端插件化）。
+                    import logging
+                    logging.getLogger("backup").warning(
+                        "[%s] 远端主机未自带 sqlcmd，回退平台服务端执行"
+                        "（数据库服务器零安装）", self.task_name)
+                    raise self._FallToLocal()
                 # -b：T-SQL 报错时 sqlcmd 返回非零退出码（官方参数），
                 # 否则 BACKUP/RESTORE 失败也会被 rc=0 掩盖
                 script = (
@@ -136,6 +143,8 @@ class SQLServerEngine(BackupEngine):
                 out, err, rc = _ssh_exec_pipe(
                     client, remote_dump._wrap_login(script), timeout=timeout)
                 return rc, _to_text(out), _to_text(err)
+            except self._FallToLocal:
+                pass  # 落到函数尾部本机回退段
             finally:
                 try:
                     client.close()

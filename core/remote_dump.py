@@ -1081,8 +1081,8 @@ def _remote_redis_dump(task: dict, ssh_host: dict) -> bytes:
     redis_cli = _resolve_remote_bin(client, "redis-cli")
     if not redis_cli:
         raise RuntimeError(
-            "远端主机未找到 redis-cli（PATH 与 /usr/bin、/usr/local/bin 均无）。"
-            "请在远端安装 Redis 客户端后重试。"
+            "远端主机未找到 redis-cli，按数据库服务器零安装原则，"
+            "将回退平台服务端 redis-cli 直连远程执行。"
         )
     host = task.get("host") or "127.0.0.1"
     port = task.get("port") or 6379
@@ -1109,8 +1109,8 @@ def _remote_mongodb_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
     mongodump = _resolve_remote_bin(client, "mongodump")
     if not mongodump:
         raise RuntimeError(
-            "远端主机未找到 mongodump（PATH 与 /usr/bin、/usr/local/bin 均无）。"
-            "请在远端安装 MongoDB Database Tools 后重试。"
+            "远端主机未找到 mongodump，按数据库服务器零安装原则，"
+            "将回退平台服务端 mongodump 直连远程执行。"
         )
     host = task.get("host") or "127.0.0.1"
     port = task.get("port") or 27017

@@ -428,7 +428,8 @@ class BackupEngine:
             if not chk["installed"]:
                 missing = ", ".join(chk["missing"])
                 return (False,
-                        f"远端未安装 {missing}，请到备份插件页为该主机安装"
+                        f"远端未自带 {missing}（数据库服务器零安装），"
+                        "备份时将由平台推送临时副本执行或回退平台服务端执行"
                         f"或确认数据库自带工具路径")
             return True, "ok"
 
@@ -535,8 +536,9 @@ class BackupEngine:
             # 无远端也无本机自带工具
             _, detail = self.check_client()
             return False, (
-                f"{detail}。物理备份需要远端或本机具备对应工具，"
-                f"请前往【备份插件】页为该主机安装，或纳管 SSH 主机。"
+                f"{detail}。按数据库服务器零安装原则：可在平台服务端【备份插件】"
+                f"页安装工具（备份时由平台临时推送执行，结束即清理），"
+                f"或纳管 SSH 主机使用数据库自带工具。"
             )
 
         # 逻辑备份：本机有客户端直接放行

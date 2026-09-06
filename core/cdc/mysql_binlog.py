@@ -264,4 +264,4 @@ class MySQLBinlogDaemon(CDCDaemon):
         """探测可选依赖 ``mysql-replication`` 是否可用（自检面板用）。"""
         reader, reason = _import_mysql_replication()
         return {"installed": reader is not None, "reason": reason,
-                "hint": "" if reader else "pip install mysql-replication 可启用位点精确探测"}
+                "hint": "" if reader else "mysql-replication 库应随平台离线包内置（部署完整安装包以启用位点精确探测）"}

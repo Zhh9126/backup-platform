@@ -929,7 +929,7 @@ class MySQLEngine(BackupEngine):
         try:
             import zstandard as _zstd
         except ImportError:
-            raise RuntimeError("缺少 zstandard 库，无法解压 .zst 备份（可用 pip install zstandard）")
+            raise RuntimeError("缺少 zstandard 库（应随平台离线包内置），请联系管理员重新部署完整安装包")
         dctx = _zstd.ZstdDecompressor()
         cnt = 0
         for root, _dirs, files in os.walk(work_dir):

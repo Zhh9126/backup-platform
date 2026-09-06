@@ -29,6 +29,11 @@ a = Analysis(
         (str(ROOT / 'core' / 'plugins'), 'core/plugins'),
         (str(ROOT / 'drivers'), 'drivers'),
         (str(ROOT / 'requirements.txt'), '.'),
+        # 离线自足：内嵌 JRE/JDK 目录（jlink 裁剪 JRE 或完整 JDK，
+        # 目录名 jdk/jre/java/runtime 任一）。离线目标机无 Java 时，
+        # 达梦/Oracle/金仓的 JDBC 通道依赖此目录。
+        *([(str(ROOT / d), d) for d in ('jdk', 'jre', 'java', 'runtime')
+           if (ROOT / d).is_dir()]),
     ],
     hiddenimports=[
         'oracledb', 'cx_Oracle', 'ksycopg2', 'psycopg2',

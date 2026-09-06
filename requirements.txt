@@ -63,3 +63,5 @@ minio>=7.1                 # MinIO / S3 兼容对象存储 SDK（L1/L2 后端共
 # ksql                     —— Kingbase 位点探测回退（可选）
 # disql                    —— Dameng 位点探测回退（可选）
 pymssql>=2.2  # SQL Server 同步驱动（离线包随附 wheel）
+pymongo>=4.6
+redis>=5.0

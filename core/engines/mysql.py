@@ -1487,6 +1487,53 @@ class MySQLEngine(BackupEngine):
             return text  # 未匹配到任何表标记：原样返回（可能非 mysqldump 格式）
         return "\n".join(header + out)
 
+    def _downlevel_collations(self, text: str, host: str, port: int,
+                              cnf: str) -> str:
+        """目标服务器为 MySQL<8.0 或 MariaDB 时，把 dump 中 8.0 特有排序规则降级为
+        通用排序规则，避免 ERROR 1273 (Unknown collation) 导致跨版本恢复失败。
+
+        仅当确需降级时才做字符串替换（8.0→8.0 等目标保持 dump 原样，保证保真）。
+        """
+        if not text:
+            return text
+        # 8.0 特有排序规则 -> 5.7/MariaDB 通用排序规则
+        mapping = {
+            "utf8mb4_0900_ai_ci": "utf8mb4_general_ci",
+            "utf8mb4_0900_as_cs": "utf8mb4_general_ci",
+            "utf8mb4_0900_as_ci": "utf8mb4_general_ci",
+            "utf8mb4_0900_bin": "utf8mb4_bin",
+            "utf16_0900_ai_ci": "utf16_general_ci",
+            "utf16le_0900_ai_ci": "utf16_general_ci",
+            "utf32_0900_ai_ci": "utf32_general_ci",
+        }
+        if not any(k in text for k in mapping):
+            return text
+        try:
+            vres = self._run([
+                "mysql", f"--defaults-file={cnf}", "--host", str(host),
+                "--port", str(port), "-N", "-e", "SELECT VERSION()",
+            ], timeout=20)
+            version = (vres.get("stdout") or "").strip()
+        except Exception:
+            version = ""
+        if not version:
+            return text
+        low = version.lower()
+        vm = re.match(r"^(\d+)\.(\d+)\.(\d+)", version)
+        if not vm:
+            return text
+        major = int(vm.group(1))
+        is_maria = "mariadb" in low
+        if not is_maria and major >= 8:
+            return text
+        for src, dst in mapping.items():
+            if src in text:
+                text = text.replace(src, dst)
+        self.logger.warning(
+            "mysql: 目标服务器 %s 版本过低，dump 中 8.0 特有排序规则已降级为通用规则",
+            version)
+        return text
+
     def _restore_local(self, backup_path: str, **kwargs) -> BackupResult:
         # 连接参数
         host = self.task.get("host") or "127.0.0.1"
@@ -1545,6 +1592,10 @@ class MySQLEngine(BackupEngine):
                     ln for ln in raw.decode("utf-8", "ignore").split("\n")
                     if not re.match(r"(?i)^\s*(CREATE\s+DATABASE|USE\s)", ln)
                 )
+                # 8.0→低版本/MariaDB 兼容：MySQL 8.0 dump 特有的 utf8mb4_0900_* 排序规则
+                # 在 5.7 及 MariaDB 上不存在（ERROR 1273 Unknown collation），导入前按目标
+                # 服务器版本做无损降级替换，保证跨版本（8.0→5.7/5.6/MariaDB）恢复可用。
+                filtered = self._downlevel_collations(filtered, host, port, cnf)
                 sel_tables = kwargs.get("tables") or []
                 if sel_tables:
                     filtered = self._filter_dump_tables(filtered, sel_tables)

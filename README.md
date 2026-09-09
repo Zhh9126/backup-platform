@@ -14,7 +14,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 预校验 · 克隆 · 演练 · 巡检 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v1.4.1-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v1.4.4-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -292,8 +292,10 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v1.4.2   # 固定版本（可回滚）
+docker pull ghcr.io/zhh9126/backup-platform:v1.4.4   # 固定版本（可回滚）
 ```
+
+> v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
 
 ### 服务端环境自检（部署后先跑一遍）
 
@@ -314,7 +316,7 @@ python tools/check_env.py
 
 ```bash
 # 有网机器导出
-docker save ghcr.io/zhh9126/backup-platform:v1.3.3 -o backup-platform.tar
+docker save ghcr.io/zhh9126/backup-platform:v1.4.4 -o backup-platform.tar
 # 内网机器导入
 docker load -i backup-platform.tar
 ```
@@ -419,6 +421,20 @@ docker build -t backup-platform:local .
 - 备份密码通过临时选项文件 / 环境变量注入，不出现在命令行（防 ps 泄露）
 - API Token 仅存哈希；会话 Cookie HttpOnly
 - 默认账号请立即修改；生产环境建议限制来源 IP
+
+## 更新日志
+
+### v1.4.4（2026-09-09）
+
+- **Docker 镜像自足**：备份工具（xtrabackup / mariabackup 等）烘焙进镜像，启动即用、零外部挂载
+- **fix(db)**：新建数据同步任务时 `sync_tasks` 缺 `precheck_sample_rows` 列，导致全新目标库预检失败
+
+### v1.4.3（2026-09-09）
+
+- **fix(probe)**：MySQL / PostgreSQL / Redis / MongoDB 连通性探测改为原生驱动优先
+- **fix(mysql)**：8.0 dump 跨版本恢复兼容——目标为 5.7 / MariaDB 时自动降级 `utf8mb4_0900_*` 排序规则
+
+> 更早版本（v1.0.0 ~ v1.4.2）发布历史见仓库 Git Tags。
 
 ## 许可证
 

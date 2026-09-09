@@ -2,6 +2,8 @@
 
 # AIDBM
 
+<p align="center"><img src="static/img/aidbm-logo.png" alt="AIDBM" width="260"></p>
+
 **AI 原生智能数据库灾备管理平台**（AI-Native Database Backup & Disaster Recovery Management）
 
 区别于传统备份工具，**AIDBM** 是国内少有的 AI 原生智能数据库灾备管理平台，以 AI 技术赋能传统数据备份、迁移、容灾场景，
@@ -290,7 +292,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v1.4.1   # 固定版本（可回滚）
+docker pull ghcr.io/zhh9126/backup-platform:v1.4.2   # 固定版本（可回滚）
 ```
 
 ### 服务端环境自检（部署后先跑一遍）

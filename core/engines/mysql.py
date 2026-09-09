@@ -653,7 +653,11 @@ class MySQLEngine(BackupEngine):
             res.compress_algo = "gzip"
             return res
         # compressed 反映远端实际是否压缩（缺 zstd 时 remote_dump 会降级为不压缩）
-        suffix = ".sql.zst" if compressed else ".sql"
+        # 产物后缀由任务「备份文件格式」决定（sql → .sql；xml → .xml）
+        from core import dump_format as _dfmt
+        _spec = _dfmt.resolve(self.db_type, extra, compress=bool(compressed))
+        _ext = _spec.get("ext") or ".sql"
+        suffix = f"{_ext}.zst" if compressed else _ext
         res = self._write_dump_file(data, backup_type, ssh_host, suffix, "mysqldump")
         res.compress_algo = "zstd" if compressed else "none"
         if not compressed and enable:
@@ -733,9 +737,18 @@ class MySQLEngine(BackupEngine):
                 dump_args.append("--flush-logs")
                 note += "（需 binlog 支撑增量恢复）"
 
+            # 备份文件格式（extra_options.dump_format）：
+            #   sql(默认，标准 SQL 文本) / xml(mysqldump --xml，仅导出)
+            from core import dump_format as _dfmt
+            fmt = _dfmt.resolve(self.db_type, extra, compress=(algo != "none"))
+            if fmt.get("flag") == "--xml":
+                dump_args.append("--xml")
+                note += "（XML 格式：仅用于导出/交换，平台不提供自动恢复）"
+            base_ext = fmt.get("ext") or ".sql"
+
             # 输出文件（按算法加后缀）
             suffix = "" if algo == "none" else (".zst" if algo == "zstd" else ".gz")
-            fname = f"{ts}__{self.task_name}__{bt}.sql{suffix}"
+            fname = f"{ts}__{self.task_name}__{bt}{base_ext}{suffix}"
             out_path = os.path.join(out_dir, fname)
 
             raw_path = None
@@ -820,6 +833,16 @@ class MySQLEngine(BackupEngine):
             result = self._restore_full_instance_local(backup_path)
             result.detail_log = "\n".join(logs) + "\n" + (result.detail_log or "")
             return result
+
+        # 2.5) XML 产物（dump_format=xml）：MySQL 客户端无法回放，明确拒绝而非"假成功"
+        if backup_path.endswith(".xml") or backup_path.endswith(".xml.zst") \
+                or backup_path.endswith(".xml.gz"):
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path,
+                message=("该备份为 XML 导出格式（mysqldump --xml），MySQL 客户端无法直接回放，"
+                         "平台不提供自动恢复；请改用 SQL 格式备份，或自行用外部工具转换后导入。"),
+                detail_log="\n".join(logs))
 
         # 3) 逻辑备份 -> 本机直接执行 mysql 恢复
         logs.append("[本机恢复] 尝试本地执行 mysql 恢复...")
@@ -1636,6 +1659,12 @@ class MySQLEngine(BackupEngine):
                 return BackupResult(success=False, status=BackupStatus.FAILED,
                                     message="mysql: dump header empty")
             text = header.decode("utf-8", "ignore")
+            # XML 导出格式（dump_format=xml）：文件结构完整，但不可自动回放
+            if text.lstrip().startswith("<?xml"):
+                return BackupResult(success=True, status=BackupStatus.SUCCESS,
+                                    message="mysql: xml 导出格式，文件头完整"
+                                            "（XML 不可自动恢复，仅供交换/审阅）",
+                                    verified=True, size_bytes=size)
             if any(text.startswith(p) for p in ("--", "/*!", "/*M!", "DROP TABLE", "CREATE TABLE")):
                 return BackupResult(success=True, status=BackupStatus.SUCCESS,
                                     message="mysql: logical dump header verified",

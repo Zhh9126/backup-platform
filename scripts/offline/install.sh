@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================
-# 数据备份管理平台 —— 离线一键安装器（air-gapped installer）
+# AIDBM（AI 原生智能数据库灾备管理平台）—— 离线一键安装器（air-gapped installer）
 # 用法：
 #   sudo ./install.sh --mode auto            # 自动探测（推荐）
 #   sudo ./install.sh --mode docker          # 容器化部署（compose）

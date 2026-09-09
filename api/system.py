@@ -325,7 +325,7 @@ def test_notify_config():
             "error": "SMTP 密码未填写。QQ/163/Gmail 等需要的是「授权码」，不是登录密码。",
         }), 400
     # 组装并发送（HTML 卡片样式）
-    title = "[数据备份管理平台] 通知测试邮件"
+    title = "[AIDBM] 通知测试邮件"
     text = (
         f"发送时间: {db.now_iso()}\n"
         f"发件人: {email_ch.get('from_addr') or email_ch.get('smtp_user')}\n"

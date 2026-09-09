@@ -270,7 +270,7 @@ def render_inspection_alert(summary: dict, failures: list, triggered_by: str = "
   <tr>
     <td style="background:#f9fafb;padding:14px 28px;text-align:center;
                font-size:12px;color:#9ca3af;border-top:1px solid #e5e7eb;">
-      数据备份管理平台 · 自动巡检告警
+      AIDBM · AI 原生智能数据库灾备管理平台 · 自动巡检告警
     </td>
   </tr>
 
@@ -347,7 +347,7 @@ def render_backup_result(task: dict, result: dict, trigger_label: str = "调度�
   <tr>
     <td style="background:#f9fafb;padding:14px 28px;text-align:center;
                font-size:12px;color:#9ca3af;border-top:1px solid #e5e7eb;">
-      数据备份管理平台 · 备份任务通知
+      AIDBM · AI 原生智能数据库灾备管理平台 · 备份任务通知
     </td>
   </tr>
 
@@ -401,7 +401,7 @@ def render_test_email(meta: dict) -> str:
   <tr>
     <td style="background:#f9fafb;padding:14px 28px;text-align:center;
                font-size:12px;color:#9ca3af;border-top:1px solid #e5e7eb;">
-      数据备份管理平台 · 通知配置测试
+      AIDBM · AI 原生智能数据库灾备管理平台 · 通知配置测试
     </td>
   </tr>
 

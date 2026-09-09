@@ -72,7 +72,7 @@ _pending_confirms: Dict[str, Dict] = {}
 
 # ---- ReAct System Prompt ----
 
-SYSTEM_PROMPT_TEMPLATE = """你是数据备份管理平台的 AI 智能助手。你可以回答运维知识问题，也可以通过工具查询备份/巡检/存储/告警信息，或执行备份/巡检操作。
+SYSTEM_PROMPT_TEMPLATE = """你是 AIDBM（AI 原生智能数据库灾备管理平台）的 AI 智能助手。你可以回答运维知识问题，也可以通过工具查询备份/巡检/存储/告警信息，或执行备份/巡检操作。
 
 ## 可用工具
 

@@ -1,14 +1,18 @@
 <div align="center">
 
-# 数据备份管理平台
+# AIDBM
 
-**跨平台数据库 + 文件 集中备份管理平台**
+**AI 原生智能数据库灾备管理平台**（AI-Native Database Backup & Disaster Recovery Management）
+
+区别于传统备份工具，**AIDBM** 是国内少有的 AI 原生智能数据库灾备管理平台，以 AI 技术赋能传统数据备份、迁移、容灾场景，
+解决**人工运维效率低、备份失效难发现、故障排查慢、异构数据适配难**等行业痛点，
+真正实现数据灾备的**智能化、自动化、安全化、全域化**。
 
 Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦） · SQL Server · Redis · MongoDB · 文件
 
-**备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 预校验 · 克隆 · 演练 · 巡检 · 告警**
+**备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 预校验 · 克隆 · 演练 · 巡检 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v1.3.3-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v1.4.1-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -20,6 +24,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 ## 平台特色
 
+- **AI 原生**：AI 助手可自然语言驱动备份/巡检/查询，自动做根因分析、修复建议与告警降噪；预校验与类型映射由 AI 辅助，把"备份失效"和"异构不兼容"挡在发生之前。
 - **服务端插件化，客户端零安装**：所有驱动/插件/工具只装在平台服务端；用户客户端机器与被管理的数据库服务器**什么都不安装**、无需任何 Agent。
 - **完全离线运行**：所有依赖随平台包自带（JDBC 驱动、JRE、原生驱动、备份工具离线包），运行时零联网。部署后运行 `python scripts/check_offline.py` 自检。
 - **真实执行，如实失败**：所有备份/恢复/同步均为真实操作，连接失败或依赖缺失时任务**如实失败**并给出明确原因与修复指引，不做任何仿真兜底。
@@ -60,6 +65,26 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 | 恢复校验 | 策略化对最近成功备份做可恢复性校验（Oracle 走 impdp SQLFILE / RMAN RESTORE VALIDATE），生成报告 |
 | 文件增量恢复 | 自动构建恢复链（最近全量 → 按时间应用增量）|
 | PITR 时间点恢复 | MySQL binlog / PostgreSQL WAL 持续捕获；达梦 dmrman RESTORE/RECOVER（还原到指定目录，自动对齐源实例页大小/簇大小）|
+
+### 2.1 备份后自动校验（记录列表的「校验✓」验的是什么）
+
+每次备份成功后平台自动执行**产物级**两级校验（无需人工触发），结果写入 `backup_records.verified` / `verify_msg`，
+在「备份记录」页以「校验✓」徽章展示，鼠标悬停可看本次结论原文：
+
+| 级别 | 验什么 | 说明 |
+|---|---|---|
+| **L1 完整性** | sha256 校验和 + 历史比对 | 计算产物 sha256 并落库（>2GB 跳过以免拖慢主流程）；与同任务上一条成功记录比对，一致则标注「与上次一致（疑似源未变更）」，用于发现"任务一直成功但数据没变"的假象 |
+| **L2 可用性** | 产物格式头探测 | 按库型读产物头部识别：gzip/zstd 魔数、MySQL `-- MySQL dump`/`CREATE`/`INSERT`、PG `PostgreSQL`/`pg_dump` 等；其他类型至少确认存在、非空、可读 |
+
+**注意**：这是"产物级"校验，证明备份文件已生成且格式可识别，**不等于真的恢复了一遍**。
+要验证"能不能真的恢复出来"，请用：
+
+- **恢复校验**页：按策略定期把备份真实恢复到临时库/临时实例并比对，产出恢复测试报告；
+- **克隆服务**：把备份拉起为虚拟数据库（VDB）供真实查询验证；
+- **数据恢复**页：直接恢复到指定目标库并核对行数。
+
+对应实现：`core/scheduler.py::_verify_backup`（L1+L2 判定）与各引擎 `verify_record()`（深度校验，
+如 Oracle `impdp SQLFILE`、`RMAN RESTORE VALIDATE`）。校验未通过不会删除备份，记录照常保留。
 
 ### 3. 数据迁移（一站式：预检查 → 结构迁移 → 全量迁移 → 数据校验）
 
@@ -265,7 +290,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v1.4.0   # 固定版本（可回滚）
+docker pull ghcr.io/zhh9126/backup-platform:v1.4.1   # 固定版本（可回滚）
 ```
 
 ### 服务端环境自检（部署后先跑一遍）

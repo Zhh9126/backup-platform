@@ -1,4 +1,4 @@
-# 数据库备份管理平台 - Python 依赖
+# AIDBM（AI 原生智能数据库灾备管理平台） - Python 依赖
 # 安装：pip install -r requirements.txt
 
 Flask>=3.0

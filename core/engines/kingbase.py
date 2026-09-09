@@ -15,6 +15,7 @@ sys_restore / ksql 三件套，用法分别与 pg_dump / pg_restore / psql 一�
   兼容 PostgreSQL 客户端鉴权，读取 PGPASSWORD）。
 """
 import os
+import json
 import time
 import shlex
 import shutil
@@ -65,6 +66,19 @@ class KingbaseEngine(BackupEngine):
     def _compress(self) -> int:
         """compress 取值 0/1，默认 1（开启压缩）。"""
         return int(self.task.get("compress") or 1)
+
+    def _extra_dict(self) -> dict:
+        """解析 task.extra_options 为字典（兼容 dict / JSON 字符串两种形态）。"""
+        raw = self.task.get("extra_options")
+        if isinstance(raw, dict):
+            return raw
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
 
     def _env_with_pwd(self) -> dict:
         """构造注入密码的环境变量，避免密码出现在命令行参数中。
@@ -208,8 +222,13 @@ class KingbaseEngine(BackupEngine):
             res = self._write_dump_file(data, backup_type, ssh_host, ".sql", "sys_dumpall")
             res.compress_algo = "none"
             return res
-        # 单库：远程 sys_dump 用 -Fc 自带压缩，落盘为 .dump（不再外挂 gzip）
-        ext = ".dump" if compressed else ".sql"
+        # 单库：落盘后缀由任务「备份文件格式」(extra_options.dump_format) 决定
+        # （远端 -Fc 自带压缩，不再外挂 gzip；directory 由远端直接打成 tar.gz 流）
+        from core import dump_format as _dfmt
+        _spec = _dfmt.resolve("kingbase", self._extra_dict(), compress=bool(comp))
+        ext = _spec.get("ext") or (".dump" if compressed else ".sql")
+        if _spec.get("dir"):
+            ext = ".dir.tar.gz"
         res = self._write_dump_file(data, backup_type, ssh_host, ext, "sys_dump")
         res.compress_algo = "zlib" if compressed else "none"
         return res
@@ -253,29 +272,34 @@ class KingbaseEngine(BackupEngine):
             self._host(), self._port(), self._user(), self._db_name()
         )
 
-        # 是否关闭压缩：compress==0 时使用 -Fp 纯文本，否则 -Fc custom 格式（自带压缩）
-        if self._compress() == 0:
-            out_path = os.path.join(out_dir, "%s.sql" % ts)
-            cmd = [
-                "sys_dump",
-                "--host", host,
-                "--port", str(port),
-                "--username", user,
-                "-d", dbname,
-                "-Fp",              # 纯文本格式（不压缩）
-                "-f", out_path,
-            ]
+        # 导出格式由任务「备份文件格式」(extra_options.dump_format) 决定：
+        #   auto（默认）→ 压缩开 -Fc / 压缩关 -Fp（保持历史行为）
+        #   custom / plain / tar → -Fc / -Fp / -Ft
+        #   directory → -Fd 目录归档，落盘前打包为 .dir.tar.gz
+        from core import dump_format as _dfmt
+        fmt = _dfmt.resolve("kingbase", self._extra_dict(), compress=bool(self._compress()))
+        fmt_flag = fmt.get("flag") or ("-Fc" if self._compress() else "-Fp")
+        work_dir = ""
+        if fmt.get("dir"):
+            out_path = os.path.join(out_dir, "%s.dir.tar.gz" % ts)
+            work_dir = os.path.join(out_dir, "%s.d" % ts)
+            if os.path.isdir(work_dir):
+                shutil.rmtree(work_dir, ignore_errors=True)
+            os.makedirs(work_dir, exist_ok=True)
+            dump_out = work_dir
         else:
-            out_path = os.path.join(out_dir, "%s.dump" % ts)
-            cmd = [
-                "sys_dump",
-                "--host", host,
-                "--port", str(port),
-                "--username", user,
-                "-d", dbname,
-                "-Fc",              # custom 格式（自带压缩）
-                "-f", out_path,
-            ]
+            out_path = os.path.join(
+                out_dir, "%s%s" % (ts, fmt.get("ext") or (".dump" if self._compress() else ".sql")))
+            dump_out = out_path
+        cmd = [
+            "sys_dump",
+            "--host", host,
+            "--port", str(port),
+            "--username", user,
+            "-d", dbname,
+            fmt_flag,
+            "-f", dump_out,
+        ]
 
         # 5) 执行
         start = time.time()
@@ -295,6 +319,18 @@ class KingbaseEngine(BackupEngine):
                 message="sys_dump 执行失败 (returncode=%s): %s"
                         % (res["returncode"], fallback_msg),
             )
+
+        # 6.5) 目录格式（-Fd）：打包为单文件 .dir.tar.gz 后清理临时目录
+        if work_dir:
+            try:
+                self._pack_dir_tar_gz(work_dir, out_path)
+            except Exception as e:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=None, duration_sec=duration, simulated=False,
+                    message="目录格式归档打包失败: %s" % e)
+            finally:
+                shutil.rmtree(work_dir, ignore_errors=True)
 
         # 7) 计算大小与校验和
         size, checksum = self._compute_size_and_checksum(out_path)
@@ -343,11 +379,17 @@ class KingbaseEngine(BackupEngine):
         # 远程优先：经 SSH 在数据库服务器恢复（与备份对称，工具自动发现）
         from core import remote_dump
         ssh_host = remote_dump.resolve_ssh_host(self.task)
+        # 目录格式(-Fd)归档只能本机解开后回放：SSH 通道会把 tar 流误当 SQL 灌入，
+        # 这里直接走本机流程，避免制造"假成功"。
+        if ssh_host and self._tar_has_member(backup_path, "toc.dat") and not self._tar_has_member(
+                backup_path, "manifest.json"):
+            ssh_host = None
         if ssh_host:
             try:
                 with open(backup_path, "rb") as f:
                     dump_bytes = f.read()
-                is_custom = backup_path.endswith(".dump")
+                # -Fc 自定义格式与 -Ft tar 归档都走 sys_restore；-Fp 纯文本走 ksql
+                is_custom = backup_path.endswith((".dump", ".tar"))
                 remote_dump.remote_db_restore(
                     self.task, ssh_host, "kingbase", dump_bytes,
                     is_custom=is_custom)
@@ -378,9 +420,14 @@ class KingbaseEngine(BackupEngine):
         host, port, user = self._host(), self._port(), self._user()
 
         # 3) 根据文件后缀选择恢复工具
+        #    .tar.gz 分两类：含 manifest.json = 全实例逐库包；含 toc.dat = 目录格式(-Fd)单库归档
         if backup_path.endswith((".tar.gz", ".tgz")):
+            if (not self._tar_has_member(backup_path, "manifest.json")
+                    and self._tar_has_member(backup_path, "toc.dat")):
+                return self._restore_dir_archive_local(
+                    backup_path, host, port, user, target_db, self._env_with_pwd())
             return self._restore_full_instance_local(backup_path)
-        if backup_path.endswith(".dump"):
+        if backup_path.endswith((".dump", ".tar")):
             # custom 格式 -> sys_restore（-c 清理已存在对象，-C 创建目标库）
             cmd = [
                 "sys_restore",
@@ -407,8 +454,8 @@ class KingbaseEngine(BackupEngine):
                 status=BackupStatus.FAILED,
                 backup_path=backup_path,
                 simulated=False,
-                message="恢复失败：无法识别的备份文件类型(需 .dump 或 .sql): %s"
-                        % backup_path,
+                message=("恢复失败：无法识别的备份文件类型"
+                         "(需 .dump / .tar / .sql / 目录格式 .tar.gz): %s" % backup_path),
             )
 
         # 4) 执行
@@ -440,6 +487,48 @@ class KingbaseEngine(BackupEngine):
             message="Kingbase 恢复成功: 目标库=%s, 来源=%s" % (target_db, backup_path),
         )
 
+    def _restore_dir_archive_local(self, backup_path: str, host, port, user,
+                                   target_db: str, env_extra: dict) -> BackupResult:
+        """目录格式（-Fd）单库归档恢复：解开 tar.gz → sys_restore -Fd <dir>。"""
+        import tempfile
+        tmp_root = tempfile.mkdtemp(prefix="kbdir_")
+        try:
+            self._untar_to_dir(backup_path, tmp_root)
+            arc_dir = tmp_root
+            for dirpath, _dirs, files in os.walk(tmp_root):
+                if "toc.dat" in files:
+                    arc_dir = dirpath
+                    break
+            else:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path, simulated=False,
+                    message="目录格式归档中未找到 toc.dat，可能不是有效的 -Fd 归档")
+            cmd = [
+                "sys_restore",
+                "--host", host,
+                "--port", str(port),
+                "--username", user,
+                "--dbname", target_db,
+                "-Fd", arc_dir,
+            ]
+            start = time.time()
+            res = self._run(cmd, env_extra=env_extra or self._env_with_pwd())
+            duration = round(time.time() - start, 3)
+            if res["returncode"] != 0:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path, duration_sec=duration,
+                    stdout=res["stdout"], stderr=res["stderr"], simulated=False,
+                    message="sys_restore(目录格式)失败(rc=%s): %s"
+                            % (res["returncode"], (res["stderr"] or "")[:500]))
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=backup_path, duration_sec=duration, simulated=False,
+                message="Kingbase 目录格式(-Fd)恢复成功: 目标库=%s" % target_db)
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+
     # ------------------------------------------------------------------
     # 全实例（逐库 tar）备份/恢复 —— db_name 为空时的路径
     # ------------------------------------------------------------------
@@ -464,7 +553,7 @@ class KingbaseEngine(BackupEngine):
                 password=db.decrypt_secret(self.task.get("password") or ""),
                 dump_tool=dump_tool, out_path=out_path,
                 query_tool=query_tool, dumpall_tool=dumpall_tool,
-                include_system_dbs=bool(extra.get("include_system_dbs")))
+                include_system_dbs=bool(self._extra_dict().get("include_system_dbs")))
         except Exception as e:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,

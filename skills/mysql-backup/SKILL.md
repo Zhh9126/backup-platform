@@ -10,7 +10,7 @@ description: >
 
 ## 概述
 
-此技能封装了 MySQL 数据库的完整备份与恢复能力，通过备份管理平台 API（`http://localhost:8080`）操作。
+此技能封装了 MySQL 数据库的完整备份与恢复能力，通过 AIDBM 平台 API（`http://localhost:8080`）操作。
 
 ### 备份引擎: `MySQLEngine` (adapter_tier: peripheral_api)
 

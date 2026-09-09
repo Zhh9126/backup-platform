@@ -1,4 +1,4 @@
-# 数据备份管理平台 —— 离线运行 Docker 镜像
+# AIDBM（AI 原生智能数据库灾备管理平台）—— 离线运行 Docker 镜像
 # 构建：docker build -t backup-platform:local .
 # 运行：docker run -d -p 8080:8080 -v /data/backup-platform:/data backup-platform:local
 #

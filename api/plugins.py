@@ -100,7 +100,7 @@ def list_plugin_hosts():
     hosts.append({
         "id": 0,
         "host_key": "local",
-        "name": "本机（备份平台所在服务器）",
+        "name": "本机（AIDBM 所在服务器）",
         "hostname": "",
         "os_type": "local",
     })

@@ -209,7 +209,7 @@ def _deep_update(base: dict, override: dict) -> dict:
 
 
 # ------------------------- 内部默认提示词模板 -------------------------
-DEFAULT_PROMPT_TEMPLATE = """你是一个备份管理平台的 AI 风险预测引擎。请根据以下数据对 {metric} 风险进行评估。
+DEFAULT_PROMPT_TEMPLATE = """你是 AIDBM（AI 原生智能数据库灾备管理平台）的 AI 风险预测引擎。请根据以下数据对 {metric} 风险进行评估。
 
 风险指标类型：{metric}
 当前分析器输出：

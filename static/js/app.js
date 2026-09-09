@@ -1,5 +1,5 @@
 // -*- coding: utf-8 -*-
-// 数据库备份管理平台 - 前端逻辑（原生 JS + Fetch + Bootstrap）
+// AIDBM（AI 原生智能数据库灾备管理平台）- 前端逻辑（原生 JS + Fetch + Bootstrap）
 // UI 遵循 UI_DESIGN_SPEC：Slate + Teal 专业克制体系
 // 依赖 bkp-core.js，核心工具函数通过全局 BKP 命名空间提供
 (function () {
@@ -450,6 +450,8 @@
         fillSshCred(eo.ssh_cred, task);
         // 任务级工具路径回填（手动兜底）
         fillToolPath(task.extra_options, task);
+        // 备份产物导出格式回填（extra_options.dump_format）
+        if ($("t_dump_format")) $("t_dump_format").value = eo.dump_format || "";
         // 自定义脚本回填
         if ($("t_custom_script")) $("t_custom_script").value = eo.custom_script || "";
         if ($("t_custom_restore")) $("t_custom_restore").value = eo.custom_restore_script || "";
@@ -706,8 +708,132 @@
       dbTypeEl._pickerBound = true;
       const orig = dbTypeEl.onchange;
       dbTypeEl.addEventListener("change", () => refreshDbPickerVisibility());
+      // 数据库类型变化 → 重新渲染「备份文件格式」候选（各库支持的格式不同）
+      dbTypeEl.addEventListener("change", () => refreshDumpFormatOptions());
+      // 备份方式（逻辑/物理/自定义）变化同样影响格式可选性
+      const bmEl = $("t_backup_mode");
+      if (bmEl && !bmEl._fmtBound) {
+        bmEl._fmtBound = true;
+        bmEl.addEventListener("change", () => refreshDumpFormatOptions());
+      }
+      const dfEl = $("t_dump_format");
+      if (dfEl && !dfEl._fmtBound) {
+        dfEl._fmtBound = true;
+        dfEl.addEventListener("change", () => updateDumpFormatTip());
+      }
     }
   }
+
+  // ===================================================================
+  // 备份产物导出格式（extra_options.dump_format）
+  // 与后端 core/dump_format.py 的 DUMP_FORMATS 一一对应，改动请两边同步
+  // ===================================================================
+  const DUMP_FORMATS = {
+    mysql: [
+      { v: "sql", label: "SQL 文本（.sql，默认）",
+        note: "mysqldump 标准输出：建表 + INSERT，可直接用 mysql 客户端回放，兼容性最好。" },
+      { v: "xml", label: "XML（.xml，仅导出/交换）",
+        note: "mysqldump --xml：用于数据交换、人工审阅；MySQL 客户端无法回放，平台不提供自动恢复。" },
+    ],
+    mariadb: [
+      { v: "sql", label: "SQL 文本（.sql，默认）",
+        note: "mariadb-dump 标准输出，可直接用 mysql 客户端回放。" },
+      { v: "xml", label: "XML（.xml，仅导出/交换）",
+        note: "XML 形态导出，用于交换/审阅；平台不提供自动恢复。" },
+    ],
+    postgresql: [
+      { v: "auto", label: "跟随压缩设置（默认）",
+        note: "开压缩 → -Fc 自定义格式 .dump（体积小、可选择性恢复）；未开压缩 → -Fp 纯文本 .sql。" },
+      { v: "custom", label: "自定义格式 -Fc（.dump）",
+        note: "二进制归档，自带压缩，体积最小；支持 pg_restore 按表选择性恢复与并行回放，推荐生产使用。" },
+      { v: "plain", label: "纯文本 SQL -Fp（.sql）",
+        note: "可读 SQL 脚本，可人工审阅/改造，用 psql 回放；体积较大、不支持选择性恢复。" },
+      { v: "tar", label: "tar 归档 -Ft（.tar）",
+        note: "tar 归档（每表一个成员），可用 pg_restore 选择性恢复；不支持压缩且单表有 8GB 限制。" },
+      { v: "directory", label: "目录格式 -Fd（打包 .tar.gz）",
+        note: "目录归档，天然支持并行导出与并行恢复，最适合超大库；平台打包 tar.gz 拉回，恢复自动解开。" },
+    ],
+    kingbase: [
+      { v: "auto", label: "跟随压缩设置（默认）",
+        note: "开压缩 → sys_dump -Fc（.dump）；未开压缩 → -Fp（.sql）。" },
+      { v: "custom", label: "自定义格式 -Fc（.dump）",
+        note: "自带压缩、体积最小，可用 sys_restore 选择性/并行恢复，推荐。" },
+      { v: "plain", label: "纯文本 SQL -Fp（.sql）",
+        note: "可读 SQL 脚本，用 ksql 回放；体积较大。" },
+      { v: "tar", label: "tar 归档 -Ft（.tar）",
+        note: "tar 归档，可用 sys_restore 选择性恢复。" },
+      { v: "directory", label: "目录格式 -Fd（打包 .tar.gz）",
+        note: "目录归档，支持并行；平台打包 tar.gz 拉回，恢复时解开后回放。" },
+    ],
+    mongodb: [
+      { v: "archive", label: "单文件归档 --archive（.archive，默认）",
+        note: "单文件归档流，便于落地存储与跨主机传输，恢复用 mongorestore --archive。" },
+      { v: "gzip", label: "压缩归档 --archive --gzip（.archive.gz）",
+        note: "mongodump 自带 gzip 压缩，体积最小；恢复需 mongorestore --gzip --archive。" },
+      { v: "directory", label: "目录导出 --out（.tar.gz）",
+        note: "每库每集合一个 BSON 文件，便于单集合恢复与人工检查；平台打包 tar.gz 保存。" },
+    ],
+    oracle: [
+      { v: "dmp", label: "Data Pump 转储文件（.dmp，原生唯一）", native: true,
+        note: "Oracle 逻辑备份走 expdp，产物固定为 .dmp，恢复用 impdp；如需别的形态请用物理备份或自定义脚本。" },
+    ],
+    dameng: [
+      { v: "dmp", label: "dexp 转储文件（.dmp，原生唯一）", native: true,
+        note: "达梦逻辑备份走 dexp，产物固定 .dmp，恢复用 dimp。" },
+    ],
+    sqlserver: [
+      { v: "bak", label: "SQL Server 备份集（.bak/.diff/.trn）", native: true,
+        note: "走 BACKUP DATABASE/LOG TO DISK，产物由备份类型决定：全量 .bak、差异 .diff、日志 .trn。" },
+    ],
+    redis: [
+      { v: "rdb", label: "RDB 快照（.rdb，原生唯一）", native: true,
+        note: "Redis 备份走 redis-cli --rdb（或复制线上 dump.rdb），产物固定为 RDB 快照。" },
+    ],
+  };
+
+  /** 按数据库类型 + 备份方式刷新「备份文件格式」下拉与说明。 */
+  function refreshDumpFormatOptions() {
+    const sel = $("t_dump_format");
+    if (!sel) return;
+    const tip = $("t_dump_format_tip");
+    const dbType = ($("t_db_type") && $("t_db_type").value) || "";
+    const mode = ($("t_backup_mode") && $("t_backup_mode").value) || "logical";
+    const items = DUMP_FORMATS[dbType] || [];
+    const prev = sel.value;
+
+    // 物理备份/自定义脚本不走数据库导出工具，格式选择无意义
+    if (mode !== "logical" || !items.length) {
+      sel.innerHTML = '<option value="">（当前备份方式由数据库原生工具决定）</option>';
+      sel.disabled = true;
+      if (tip) {
+        tip.innerHTML = mode === "physical"
+          ? "物理备份直接复制数据文件/备份集，不经过导出工具，故不可选格式。"
+          : (mode === "custom"
+            ? "自定义脚本模式：产物格式完全由你的脚本决定（请写入 $PLATFORM_BACKUP_DIR）。"
+            : "该数据库类型暂无可选格式。");
+      }
+      return;
+    }
+
+    sel.disabled = false;
+    sel.innerHTML = items.map(
+      (it) => `<option value="${it.v}">${esc(it.label)}</option>`).join("");
+    sel.value = items.some((i) => i.v === prev) ? prev : (items[0].v || "");
+    updateDumpFormatTip();
+  }
+
+  /** 展示当前所选格式的说明（原理/用途/恢复方式）。 */
+  function updateDumpFormatTip() {
+    const sel = $("t_dump_format");
+    const tip = $("t_dump_format_tip");
+    if (!sel || !tip || sel.disabled) return;
+    const dbType = ($("t_db_type") && $("t_db_type").value) || "";
+    const it = (DUMP_FORMATS[dbType] || []).find((x) => x.v === sel.value);
+    tip.innerHTML = it ? esc(it.note) : "";
+  }
+
+  window.refreshDumpFormatOptions = refreshDumpFormatOptions;
+  window.updateDumpFormatTip = updateDumpFormatTip;
 
   // 自定义脚本区块显隐（备份方式 = custom 时展示）
   function toggleCustomBox() {
@@ -724,6 +850,8 @@
     // SSH 通道开关绑定（一次性）
     const sc = $("t_ssh_same");
     if (sc && !sc._bound) { sc._bound = true; sc.onchange = toggleSshFields; }
+    // 备份方式变化会影响「备份文件格式」是否可选（物理/自定义不走导出工具）
+    refreshDumpFormatOptions();
   }
   window.toggleCustomBox = toggleCustomBox;
 
@@ -759,6 +887,15 @@
     if ($("t_tool_path")) $("t_tool_path").value = eo.tool_path || "";
   }
 
+  // 备份产物导出格式：保存收集（写入 extra_options.dump_format）
+  function collectDumpFormat(eo) {
+    const sel = $("t_dump_format");
+    if (!sel) return;
+    // 未选（下拉禁用 = 物理/自定义模式，或该类型无可选格式）→ 不写入，保持引擎默认
+    if (!sel.disabled && sel.value) eo.dump_format = sel.value;
+    else delete eo.dump_format;
+  }
+
   // 任务级工具路径：保存收集（填写则写入 extra_options.tool_path）
   function collectToolPath(eo) {
     const v = ($("t_tool_path") && $("t_tool_path").value.trim()) || "";
@@ -782,7 +919,17 @@
     toggleSshFields();
   }
 
-  function collectSshCred(eo) {
+  // 注意：val/num 此前是在 saveTask() 内部用 const 声明的，而本函数在其之前被
+  // 调用 → 命中 TDZ（暂时性死区），抛 "num is not defined"，表现为「保存失败」。
+  // 这里改为自带兜底 helper（调用方也可传入自己的实现），彻底切断该耦合。
+  function collectSshCred(eo, helpers) {
+    const val = (helpers && helpers.val) || function (id, fb) {
+      const e = $(id);
+      return (e && e.value != null) ? e.value : (fb === undefined ? "" : fb);
+    };
+    const num = (helpers && helpers.num) || function (v) {
+      return (v === "" || v == null) ? null : Number(v);
+    };
     if (!$("t_ssh_same")) return;
     if ($("t_ssh_same").checked) {
       const prev = eo.ssh_cred || {};
@@ -833,8 +980,9 @@
       }
       let eo = {};
       try { eo = JSON.parse(val("t_extra_options", "{}")); } catch (_) { eo = {}; }
-      collectSshCred(eo);
+      collectSshCred(eo, { val: val, num: num });
       collectToolPath(eo);
+      collectDumpFormat(eo);
       const sshId = val("t_ssh_host");
       if (sshId) eo.ssh_host_id = Number(sshId); else delete eo.ssh_host_id;
       if (chk("t_encrypt_pool")) eo.encrypt_pool = true; else delete eo.encrypt_pool;
@@ -1028,8 +1176,12 @@
       let cdc = '-';
       if (r.binlog_file && r.binlog_pos) cdc = `<code class="small">${esc(r.binlog_file)}:${r.binlog_pos}</code>`;
       else if (r.wal_lsn) cdc = `<code class="small">${esc(r.wal_lsn)}</code>`;
-      // 校验徽章
-      const verifyBadge = r.verified ? '<span class="badge bg-success" title="已自动校验">校验✓</span>' : '';
+      // 校验徽章：title 显示本次自动校验的结论原文（L1 校验和 + L2 产物格式探测）
+      const verifyBadge = r.verified
+        ? `<span class="badge bg-success" title="已自动校验（产物级：sha256 完整性 + 产物格式头探测；不等于真实恢复验证）。结论：${esc(r.verify_msg || '通过')}">校验✓</span>`
+        : (r.verify_msg
+          ? `<span class="badge bg-warning text-dark" title="自动校验未通过：${esc(r.verify_msg)}">未校验</span>`
+          : '');
       // 操作按钮（仅 success 状态可恢复）
       const canRestore = (r.status === "success" || r.status === "simulated");
       const dbType = r.db_type || '';

@@ -22,12 +22,52 @@
   <span><i class="bi bi-funnel-fill"></i> 当前按保护策略过滤：<strong id="policyFilterName">—</strong></span>
   <button class="btn btn-sm btn-outline-secondary" onclick="clearPolicyFilter()">清除过滤</button>
 </div>
+<!-- 「校验」列原理说明（可折叠，默认收起） -->
+<div class="alert alert-light border py-2 mb-3 small">
+  <a class="text-decoration-none" data-bs-toggle="collapse" href="#verifyHelp" role="button"
+     aria-expanded="false" aria-controls="verifyHelp" title="展开/收起">
+    <i class="bi bi-question-circle"></i> 「校验」列到底验了什么？——备份后自动校验原理（点开查看）
+  </a>
+  <div class="collapse mt-2" id="verifyHelp">
+    <div class="text-muted" style="line-height:1.9">
+      每次备份成功后，平台会自动对产物做两级校验（无需人工触发），结果写入该记录的
+      <code>verified</code> 与 <code>verify_msg</code>，鼠标悬停「校验✓」徽章即可看到本次结论原文。
+      <ol class="mb-2 mt-1">
+        <li>
+          <b>L1 完整性（校验和）</b>：计算产物 <code>sha256</code> 并落库（超过约 2GB 的大文件会跳过，
+          避免全量哈希拖慢备份主流程）；再与<b>同任务上一条成功记录</b>的校验和比对——
+          若完全一致，结论里会标注 <i>“与上次一致（疑似源未变更）”</i>，
+          用来发现“备份任务一直在跑成功、但源数据其实没变化”的假象。
+        </li>
+        <li>
+          <b>L2 可用性（产物头探测）</b>：按数据库类型读取产物头部若干字节做格式识别——
+          gzip / zstd 压缩魔数；MySQL 的 <code>-- MySQL dump</code>、<code>CREATE</code>、<code>INSERT</code> 关键字；
+          PostgreSQL 的 <code>PostgreSQL</code> / <code>pg_dump</code> 标记等；
+          其它类型则至少确认产物存在、非空、可读。识别失败不会把成功备份判成失败，但会如实写入结论。
+        </li>
+      </ol>
+      <b>它不做什么（重要）</b>：这是<b>产物级</b>校验，证明“备份文件生成且格式可识别”，
+      <b>不等于真的把数据恢复了一遍</b>。要验证“能不能真的恢复出来”，请用：
+      <ul class="mb-1">
+        <li><b>恢复校验</b>页：按策略定期把备份真实恢复到临时库/临时实例并比对，产出恢复测试报告；</li>
+        <li><b>克隆服务</b>：把备份拉起为虚拟数据库（VDB）供真实查询验证；</li>
+        <li><b>数据恢复</b>页：直接恢复到指定目标库并核对行数。</li>
+      </ul>
+      校验未通过时不会删除备份，记录照常保留，只是没有绿色「校验✓」，可点“日志”查看失败原因。
+    </div>
+  </div>
+</div>
+
 <div class="page-card">
   <div class="table-responsive" style="flex:1">
     <table class="table table-hover align-middle mb-0">
       <thead><tr>
         <th>ID</th><th>业务系统</th><th>备份 IP</th><th>备份类型</th><th>备份时间</th><th>耗时</th>
-        <th>状态</th><th>大小</th><th>校验</th><th>CDC 基线</th>
+        <th>状态</th><th>大小</th>
+        <th title="备份完成后自动执行的产物级校验：L1 校验和完整性与历史比对 + L2 产物格式头探测（详见表格上方说明）">
+          校验 <i class="bi bi-question-circle text-muted"></i>
+        </th>
+        <th>CDC 基线</th>
         <th class="text-end">操作</th>
       </tr></thead>
       <tbody id="recordTable"></tbody>

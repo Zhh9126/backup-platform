@@ -736,6 +736,41 @@ class BackupEngine:
             success=False, status=BackupStatus.FAILED,
             message=f"缺少必要客户端/连接，无法执行真实恢复: {reason}")
 
+    # ---------------- 产物格式辅助（core.dump_format） ----------------
+    @staticmethod
+    def _pack_dir_tar_gz(src_dir: str, out_tar: str) -> None:
+        """把目录型产物（pg_dump -Fd / mongodump --out 等）打包为单文件 tar.gz。
+
+        打包时以 src_dir 的**内容**为根（不含最外层目录名），恢复端解开即可
+        直接得到归档目录。
+        """
+        import tarfile
+        with tarfile.open(out_tar, "w:gz") as tar:
+            for name in sorted(os.listdir(src_dir)):
+                tar.add(os.path.join(src_dir, name), arcname=name)
+
+    @staticmethod
+    def _tar_has_member(tar_path: str, member_name: str) -> bool:
+        """判断 tar(.gz) 包中是否存在指定成员（按 basename 匹配）。"""
+        import tarfile
+        try:
+            with tarfile.open(tar_path, "r:*") as tar:
+                for m in tar.getmembers():
+                    if os.path.basename(m.name) == member_name:
+                        return True
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def _untar_to_dir(tar_path: str, dest_dir: str) -> str:
+        """解开 tar(.gz) 到 dest_dir，返回实际目录路径。"""
+        import tarfile
+        os.makedirs(dest_dir, exist_ok=True)
+        with tarfile.open(tar_path, "r:*") as tar:
+            tar.extractall(dest_dir)
+        return dest_dir
+
     def _write_dump_file(self, data: bytes, backup_type: BackupType,
                           ssh_host: dict, ext: str, label: str) -> BackupResult:
         """将远程 dump 返回的字节流落盘，并返回 SUCCESS 结果。"""

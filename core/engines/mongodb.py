@@ -14,6 +14,7 @@ MongoDB 备份引擎实现。
 """
 import os
 import json
+import shutil
 
 import config
 import core.db as db
@@ -77,7 +78,15 @@ class MongoEngine(BackupEngine):
         duration = round(time.time() - t0, 3)
         out_dir = self._output_dir()
         ts = self._timestamp()
-        ext = ".archive.zst" if compressed else ".archive"
+        # 落盘后缀由任务「备份文件格式」决定（archive / gzip / directory）
+        from core import dump_format as _dfmt
+        _spec = _dfmt.resolve("mongodb", self._parse_extra_options(), compress=bool(compress))
+        if _spec.get("dir"):
+            ext = ".tar.gz"
+        elif _spec.get("value") == "gzip":
+            ext = ".archive.gz"
+        else:
+            ext = ".archive.zst" if compressed else ".archive"
         archive_path = os.path.join(out_dir, "%s%s" % (ts, ext))
         with open(archive_path, "wb") as f:
             f.write(data)
@@ -120,10 +129,23 @@ class MongoEngine(BackupEngine):
         ]
         # Mongo 惯例：密码以 --password 参数明文传入命令行
         cmd = self._build_auth_args(cmd)
-        cmd += ["--out", target_dir]
-        if compress == 1:
-            # 目录模式下 --gzip 会对每个集合文件单独压缩
-            cmd += ["--gzip"]
+
+        # 导出格式（extra_options.dump_format）：
+        #   archive(默认) 单文件 --archive=<file>
+        #   gzip           --archive=<file> --gzip（mongodump 自带压缩）
+        #   directory      --out <dir>（每集合一个 BSON），结束后打包 .tar.gz
+        from core import dump_format as _dfmt
+        fmt = _dfmt.resolve("mongodb", self._parse_extra_options(), compress=bool(compress))
+        is_dir_fmt = bool(fmt.get("dir"))
+        archive_path = ""
+        if is_dir_fmt:
+            cmd += ["--out", target_dir]
+        else:
+            ext = ".archive.gz" if fmt.get("value") == "gzip" else ".archive"
+            archive_path = os.path.join(out_dir, "%s%s" % (ts, ext))
+            cmd += ["--archive=%s" % archive_path]
+            if fmt.get("value") == "gzip":
+                cmd += ["--gzip"]
 
         # 增量/差异备份在 mongodump 无原生支持，统一回退为全量
         note = ""
@@ -145,24 +167,28 @@ class MongoEngine(BackupEngine):
                 stdout=res["stdout"], stderr=res["stderr"],
                 message="mongodump 执行失败(返回码=%s)" % res["returncode"])
 
-        # 计算输出目录总大小（os.walk 求和）
-        size_bytes = 0
-        if os.path.isdir(target_dir):
-            for root, _dirs, files in os.walk(target_dir):
-                for f in files:
-                    fp = os.path.join(root, f)
-                    try:
-                        size_bytes += os.path.getsize(fp)
-                    except OSError:
-                        pass
+        # 6. 产物落盘形态
+        #    目录格式：--out 目录 → 打包为单文件 .tar.gz（与远端对称）
+        #    归档格式：直接使用 --archive 产出的单文件
+        if is_dir_fmt:
+            out_path = os.path.join(out_dir, "%s.tar.gz" % ts)
+            self._pack_dir_tar_gz(target_dir, out_path)
+            shutil.rmtree(target_dir, ignore_errors=True)
+            final_path = out_path
+            size_bytes = os.path.getsize(out_path)
+        else:
+            final_path = archive_path
+            size_bytes = (os.path.getsize(archive_path)
+                          if archive_path and os.path.isfile(archive_path) else 0)
 
-        msg = "mongodump 全量备份成功；密码以 --password 参数传入命令行(mongo 惯例)。"
+        msg = "mongodump 全量备份成功(%s)；密码以 --password 参数传入命令行(mongo 惯例)。" \
+              % (fmt.get("label") or "archive")
         if note:
             msg = note + " " + msg
 
         return BackupResult(
             success=True, status=BackupStatus.SUCCESS,
-            backup_path=target_dir, size_bytes=size_bytes,
+            backup_path=final_path, size_bytes=size_bytes,
             duration_sec=duration,
             stdout=res["stdout"], stderr=res["stderr"],
             simulated=False, checksum="",
@@ -205,8 +231,16 @@ class MongoEngine(BackupEngine):
             or str(backup_path).endswith(".archive.gz")
             or str(backup_path).endswith(".archive.zst")
         )
+        # 目录格式产物（mongodump --out 打包的 tar.gz）：解开后按目录恢复
+        tmp_dir = ""
+        if str(backup_path).endswith((".tar.gz", ".tgz")):
+            import tempfile
+            tmp_dir = tempfile.mkdtemp(prefix="mongodir_")
+            self._untar_to_dir(backup_path, tmp_dir)
+            is_archive = False
+            restore_archive = tmp_dir
         # 外部压缩的归档需先解压再喂给 mongorestore --archive
-        if str(backup_path).endswith(".archive.zst"):
+        elif str(backup_path).endswith(".archive.zst"):
             import tempfile
             tmp = tempfile.NamedTemporaryFile(suffix=".archive", delete=False)
             tmp_path = tmp.name
@@ -253,9 +287,13 @@ class MongoEngine(BackupEngine):
             cmd += [restore_archive]
         cmd = self._build_auth_args(cmd)
 
-        # 4. 执行命令
+        # 4. 执行命令（目录格式用完即清理临时解压目录）
         start = __import__("time").time()
-        res = self._run(cmd)
+        try:
+            res = self._run(cmd)
+        finally:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
         duration = __import__("time").time() - start
 
         # 5. 按 returncode 判定结果

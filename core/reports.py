@@ -193,7 +193,7 @@ def build_pdf(title: str, summary: dict, headers: list, rows: list) -> bytes:
         canvas.saveState()
         canvas.setFont("Helvetica", 8)
         canvas.setFillColor(colors.grey)
-        canvas.drawString(1.5*cm, 0.8*cm, f"数据备份管理平台 — 报告生成于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        canvas.drawString(1.5*cm, 0.8*cm, f"AIDBM · AI 原生智能数据库灾备管理平台 — 报告生成于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         canvas.drawRightString(landscape(A4)[0] - 1.5*cm, 0.8*cm, f"第 {doc.page} 页")
         canvas.restoreState()
 

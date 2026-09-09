@@ -673,6 +673,16 @@ def _remote_mysql_dump(task: dict, ssh_host: dict, compress: int, extra_args: st
     if use_events: args.append("--events")
     args.append("--default-character-set=utf8mb4")
 
+    # 备份文件格式（extra_options.dump_format）：sql(默认) / xml(mysqldump --xml)
+    # 说明：XML 产物用于数据交换与人工审阅，平台不提供自动恢复（恢复页会明确拒绝）。
+    try:
+        from core import dump_format as _dfmt
+        _spec = _dfmt.resolve(task.get("db_type") or "mysql", extra, compress=bool(compress))
+        if _spec.get("flag") == "--xml":
+            args.append("--xml")
+    except Exception:
+        pass
+
     if tables:
         # 指定表：mysqldump <db> t1 t2 ...
         if not db_name:
@@ -1014,8 +1024,14 @@ def _pg_family_dump(task: dict, ssh_host: dict, db_type: str, compress: int) -> 
     pw = db.decrypt_secret(task.get("password") or "")
     db_name = task.get("db_name") or ""
     port = int(task.get("port") or cfg["default_port"])
-    fmt_flag = "-Fc" if compress else "-Fp"
-    extra = _pg_family_parse_extra(task)
+    # 导出格式：由任务 extra_options.dump_format 决定（auto 时保持历史行为：
+    # 开压缩 -Fc / 未开压缩 -Fp）。目录格式 -Fd 需在远端打包成 tar 流再拉回。
+    from core import dump_format as _dfmt
+    extra0 = _pg_family_parse_extra(task)
+    spec = _dfmt.resolve(db_type, extra0, compress=bool(compress))
+    fmt_flag = spec.get("flag") or ("-Fc" if compress else "-Fp")
+    is_dir_fmt = bool(spec.get("dir"))
+    extra = extra0
     schemas = [str(s).strip() for s in (extra.get("schemas") or []) if str(s).strip()]
     tables = [str(t).strip() for t in (extra.get("tables") or []) if str(t).strip()]
 
@@ -1058,7 +1074,19 @@ def _pg_family_dump(task: dict, ssh_host: dict, db_type: str, compress: int) -> 
         except Exception:
             pass
 
-    shell = f"{base} {target_args}{extra_args}"
+    if is_dir_fmt:
+        # 目录格式（-Fd）：远端先 dump 到临时目录，再打成 tar.gz 流拉回；
+        # 落盘后缀由调用方按 dump_format 决定（.dir.tar.gz）。
+        work = f"/tmp/.bk_pgdir_{os.getpid()}_{int(time.time())}"
+        shell = (
+            f"set -o pipefail; {_tool_path_export(tp)}{env} "
+            f"rm -rf {work} && mkdir -p {work}/db && "
+            f"{dump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt_flag} "
+            f"-f {work}/db {target_args}{extra_args} && "
+            f"tar -C {work} -czf - db; RC=$?; rm -rf {work}; exit $RC"
+        )
+    else:
+        shell = f"{base} {target_args}{extra_args}"
     # 压缩策略：-Fc 自带 zlib 压缩，不外挂 gzip/zstd 以免双重压缩；
     # compress 时落盘 .dump，恢复端用 pg_restore/sys_restore。
     wrapped = _wrap_login(shell)
@@ -1126,7 +1154,38 @@ def _remote_mongodb_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
 
     db_args = f" --db {shlex.quote(db_name)}" if db_name else ""
 
-    shell = f"{mongodump} --host {shlex.quote(host)} --port {port}{auth_args}{db_args} --archive"
+    # 导出格式（extra_options.dump_format）：archive(默认单文件归档) /
+    # gzip(mongodump 自带 --gzip 压缩归档) / directory(--out 目录，远端打 tar.gz 流)
+    from core import dump_format as _dfmt
+    spec = _dfmt.resolve("mongodb", _pg_family_parse_extra(task), compress=bool(compress))
+    base_shell = f"{mongodump} --host {shlex.quote(host)} --port {port}{auth_args}{db_args}"
+    if spec.get("dir"):
+        work = f"/tmp/.bk_mongo_{os.getpid()}_{int(time.time())}"
+        shell = (f"set -o pipefail; rm -rf {work} && mkdir -p {work} && "
+                 f"{base_shell} --out {work} && tar -C {work} -czf - .; RC=$?; "
+                 f"rm -rf {work}; exit $RC")
+        wrapped = _wrap_login(shell)
+        from core.engines.file import _ssh_exec_pipe
+        out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=3600)
+        if rc != 0:
+            raise RuntimeError(f"远程 mongodump(目录格式)失败(rc={rc}, bin={mongodump}): {err[:600]}")
+        if len(out) <= 100:
+            raise RuntimeError(f"远程 mongodump(目录格式)疑似失败：仅 {len(out)} 字节"
+                               f"（stderr: {err[:200]}）")
+        return out, False, "single"
+    if spec.get("value") == "gzip":
+        # mongodump 自带 gzip：不再外挂 zstd，避免双重压缩
+        shell = base_shell + " --archive --gzip"
+        wrapped = _wrap_login(shell)
+        from core.engines.file import _ssh_exec_pipe
+        out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=3600)
+        if rc != 0:
+            raise RuntimeError(f"远程 mongodump 失败(rc={rc}, bin={mongodump}): {err[:600]}")
+        if len(out) <= 20:
+            raise RuntimeError(f"远程 mongodump 疑似失败：仅 {len(out)} 字节（stderr: {err[:200]}）")
+        return out, False, "single"
+
+    shell = base_shell + " --archive"
     # 统一压缩：--archive 输出到 stdout，外挂 zstd（与本地 mongodump 对齐），
     # 节省磁盘；恢复端按落盘后缀 .archive.zst 用 zstd 解压后 --archive 导入。
     # 远端缺 zstd 时降级为不压缩，避免整条管道 rc=127 导致备份失败。
@@ -1145,7 +1204,7 @@ def _remote_mongodb_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
         raise RuntimeError(f"远程 mongodump 失败(rc={rc}, bin={mongodump}): {err[:600]}")
     if compress and len(out) <= 20:
         raise RuntimeError(f"远程 mongodump 疑似失败：zstd 压缩后仅 {len(out)} 字节（stderr: {err[:200]}）")
-    return out, bool(compress)
+    return out, bool(compress), "single"
 
 
 def remote_exec_and_fetch(ssh_host: dict, remote_cmd: str, remote_path: str,
@@ -1201,7 +1260,8 @@ def remote_db_dump(task: dict, ssh_host: dict, db_type: str, compress: int = 0,
     if db_type == "redis":
         return _remote_redis_dump(task, ssh_host), False, "single"
     if db_type == "mongodb":
-        return _remote_mongodb_dump(task, ssh_host, compress), bool(compress), "single"
+        data, compressed, fmt = _remote_mongodb_dump(task, ssh_host, compress)
+        return data, compressed, fmt
     raise RuntimeError(f"不支持的远程 dump 类型: {db_type}")
 
 

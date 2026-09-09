@@ -139,8 +139,13 @@ class PostgreSQLEngine(BackupEngine):
             res = self._write_dump_file(data, backup_type, ssh_host, ".sql", "pg_dumpall")
             res.compress_algo = "none"
             return res
-        # 单库：远程 pg_dump 用 -Fc 自带压缩，落盘为 .dump（不再外挂 gzip）
-        ext = ".dump" if compressed else ".sql"
+        # 单库：落盘后缀由任务「备份文件格式」(extra_options.dump_format) 决定
+        # （远端 -Fc 自带压缩，不再外挂 gzip；directory 由远端直接打成 tar.gz 流）
+        from core import dump_format as _dfmt
+        spec = _dfmt.resolve("postgresql", self._extra_dict(), compress=bool(comp))
+        ext = spec.get("ext") or (".dump" if compressed else ".sql")
+        if spec.get("dir"):
+            ext = ".dir.tar.gz"
         res = self._write_dump_file(data, backup_type, ssh_host, ext, "pg_dump")
         res.compress_algo = "zlib" if compressed else "none"
         return res
@@ -159,7 +164,10 @@ class PostgreSQLEngine(BackupEngine):
 
         # 3.5) 全实例（勾选全部库或库名为空）：pg_dump 是单库工具，不存在
         #      --all-databases 参数，改为逐库 tar.gz + globals + manifest
-        extra_eo = self._parse_extra_options()
+        # 注意：extra_options 需解析为**字典**形态供内部键读取（use_all_db /
+        # schemas / tables / dump_format / include_system_dbs）；追加进命令行的
+        # 用户扩展参数在下方另用 _parse_extra_options() 的列表形态。
+        extra_eo = self._extra_dict()
         if ((extra_eo.get("use_all_db") or not db_name)
                 and not extra_eo.get("schemas") and not extra_eo.get("tables")):
             return self._backup_full_instance_local(backup_type)
@@ -174,17 +182,28 @@ class PostgreSQLEngine(BackupEngine):
                 "建议改用 WAL 归档 + 流式物理备份 pg_basebackup 实现增量）"
             )
 
-        # 5) 根据 compress 决定格式与文件名后缀
-        if compress == 0:
-            # 纯文本格式（-Fp），不压缩
-            out_path = os.path.join(out_dir, f"{ts}.sql")
-            fmt_flag = "-Fp"
+        # 5) 按任务「备份文件格式」(extra_options.dump_format) 决定导出格式与后缀：
+        #    - auto（默认）：跟随压缩开关（-Fc .dump / -Fp .sql，保持历史行为）
+        #    - custom/plain/tar：对应 -Fc / -Fp / -Ft
+        #    - directory：-Fd 目录归档，落盘前打包为 .dir.tar.gz
+        from core import dump_format as _dfmt
+        fmt = _dfmt.resolve("postgresql", extra_eo, compress=bool(compress))
+        fmt_flag = fmt.get("flag") or ("-Fc" if compress else "-Fp")
+        if fmt.get("dir"):
+            out_path = os.path.join(out_dir, f"{ts}.dir.tar.gz")
         else:
-            # 自定义格式（-Fc），自带压缩
-            out_path = os.path.join(out_dir, f"{ts}.dump")
-            fmt_flag = "-Fc"
+            out_path = os.path.join(out_dir, f"{ts}{fmt.get('ext') or ('.dump' if compress else '.sql')}")
 
         # 6) 组装 pg_dump 命令（密码经 PGPASSWORD 环境变量注入）
+        dump_out = out_path
+        work_dir = ""
+        if fmt.get("dir"):
+            # 目录格式必须先输出到目录，再打成单文件归档落盘
+            work_dir = os.path.join(out_dir, f"{ts}.d")
+            if os.path.isdir(work_dir):
+                shutil.rmtree(work_dir, ignore_errors=True)
+            os.makedirs(work_dir, exist_ok=True)
+            dump_out = work_dir
         cmd = [
             "pg_dump",
             "--host", str(host),
@@ -192,7 +211,7 @@ class PostgreSQLEngine(BackupEngine):
             "--username", str(user),
             "-d", str(db_name),
             fmt_flag,
-            "-f", out_path,
+            "-f", dump_out,
         ]
         # 追加用户自定义扩展选项（extra_options 为 JSON 字符串）
         extra = self._parse_extra_options()
@@ -218,6 +237,18 @@ class PostgreSQLEngine(BackupEngine):
                 checksum="",
                 message=f"pg_dump 执行失败(rc={ret['returncode']}): {ret['stderr']}",
             )
+
+        # 6.5) 目录格式（-Fd）：把目录归档打包为单文件 .dir.tar.gz 后清理临时目录
+        if work_dir:
+            try:
+                self._pack_dir_tar_gz(work_dir, out_path)
+            except Exception as e:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=None, duration_sec=duration,
+                    message=f"目录格式归档打包失败: {e}", simulated=False)
+            finally:
+                shutil.rmtree(work_dir, ignore_errors=True)
 
         # 7) 计算大小与校验和（文件用 sha256；目录则仅算总大小，checksum 留空）
         size, checksum = self._compute_size_checksum(out_path)
@@ -262,7 +293,7 @@ class PostgreSQLEngine(BackupEngine):
                 password=db.decrypt_secret(self.task.get("password") or ""),
                 dump_tool=dump_tool, out_path=out_path,
                 query_tool=query_tool, dumpall_tool=dumpall_tool,
-                include_system_dbs=bool(extra_eo.get("include_system_dbs")))
+                include_system_dbs=bool(self._extra_dict().get("include_system_dbs")))
         except Exception as e:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,
@@ -277,6 +308,52 @@ class PostgreSQLEngine(BackupEngine):
             success=True, status=BackupStatus.SUCCESS,
             backup_path=out_path, size_bytes=size, duration_sec=0,
             simulated=False, checksum=checksum, message=msg)
+
+    def _restore_dir_archive_local(self, backup_path: str, host, port, user,
+                                   target_db: str, env_extra: dict) -> BackupResult:
+        """目录格式（-Fd）单库归档恢复：解开 tar.gz → pg_restore -Fd <dir>。
+
+        目标库的创建/清理由调用方（_restore_local）在分派前完成，这里只负责
+        解开归档并调用 pg_restore 回放，临时目录用完即删。
+        """
+        import tempfile
+        tmp_root = tempfile.mkdtemp(prefix="pgdir_")
+        try:
+            self._untar_to_dir(backup_path, tmp_root)
+            # 定位含 toc.dat 的目录（打包时以归档目录内容为根，通常就是 tmp_root）
+            arc_dir = tmp_root
+            for dirpath, _dirs, files in os.walk(tmp_root):
+                if "toc.dat" in files:
+                    arc_dir = dirpath
+                    break
+            else:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path, simulated=False,
+                    message="目录格式归档中未找到 toc.dat，可能不是有效的 -Fd 归档")
+            cmd = [
+                "pg_restore",
+                "--host", str(host),
+                "--port", str(port),
+                "--username", str(user),
+                "--dbname", str(target_db),
+                "-Fd", arc_dir,
+            ]
+            start = time.time()
+            ret = self._run(cmd, env_extra=env_extra, timeout=3600)
+            duration = time.time() - start
+            if ret["returncode"] != 0:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path, duration_sec=duration,
+                    stdout=ret["stdout"], stderr=ret["stderr"], simulated=False,
+                    message=f"pg_restore(目录格式)失败(rc={ret['returncode']}): {ret['stderr'][:500]}")
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=backup_path, duration_sec=duration,
+                simulated=False, message=f"PostgreSQL 目录格式(-Fd)恢复成功 → {target_db}")
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
 
     def _restore_full_instance_local(self, backup_path: str) -> BackupResult:
         """全实例恢复：解包 → globals → 缺失库自动建库 → 逐库 pg_restore。"""
@@ -333,12 +410,21 @@ class PostgreSQLEngine(BackupEngine):
         # 2) 本机失败 -> 尝试通过 SSH 在数据库服务器执行恢复
         reason = (result.message or "未知错误")
         from core import remote_dump
+        # 目录格式(-Fd)归档需在本地解开后回放，SSH 兜底通道会把 tar 流误当 SQL 灌入，
+        # 这里显式跳过兜底并如实返回本机失败原因（不制造"假成功"）。
+        if self._tar_has_member(backup_path, "toc.dat") and not self._tar_has_member(
+                backup_path, "manifest.json"):
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path,
+                message="目录格式(-Fd)归档仅支持本机 pg_restore 回放：" + reason)
         ssh_host = remote_dump.resolve_ssh_host(self.task)
         if ssh_host and os.path.exists(backup_path):
             try:
                 with open(backup_path, "rb") as f:
                     dump_bytes = f.read()
-                is_custom = backup_path.endswith(".dump")
+                # -Fc 自定义格式与 -Ft tar 归档都走 pg_restore；-Fp 纯文本走 psql
+                is_custom = backup_path.endswith((".dump", ".tar"))
                 remote_dump.remote_db_restore(
                     self.task, ssh_host, "postgresql", dump_bytes, is_custom=is_custom)
                 # SSH 兜底通道恢复到任务原库（暂不支持指定新目标库名），如实提示
@@ -385,8 +471,15 @@ class PostgreSQLEngine(BackupEngine):
 
         env_extra = self._env_with_tool_path({"PGPASSWORD": pw} if pw else None)
 
-        # 2.5) 全实例 tar 包（multi-db-tar）：逐库恢复，不适用单库流程
+        # 2.5) tar 包分两类：
+        #   - 含 manifest.json → 全实例逐库包（multi-db-tar），走逐库恢复流程
+        #   - 含 toc.dat（无 manifest）→ 目录格式 -Fd 的单库归档，解开后 pg_restore
+        #   - 其余/旧产物（两者皆无）→ 仍按全实例流程处理，保持历史兼容
         if backup_path.endswith((".tar.gz", ".tgz")):
+            if (not self._tar_has_member(backup_path, "manifest.json")
+                    and self._tar_has_member(backup_path, "toc.dat")):
+                return self._restore_dir_archive_local(
+                    backup_path, host, port, user, target_db, env_extra)
             return self._restore_full_instance_local(backup_path)
 
         # 3) 确保目标库存在（PostgreSQL 必须连接一个已存在的库再恢复）。
@@ -431,9 +524,10 @@ class PostgreSQLEngine(BackupEngine):
                     message=f"重建目标库 {target_db} 失败: {chk['stderr']}",
                     stderr=chk["stderr"], simulated=False)
 
-        # 4) 按文件后缀选择恢复方式
-        if backup_path.endswith(".dump"):
-            # 自定义格式用 pg_restore（目标库已创建，无需 -C；库已全新无需 -c）
+        # 4) 按文件后缀选择恢复方式（.dump=-Fc 自定义格式 / .tar=-Ft 归档 /
+        #    .sql=-Fp 纯文本；三者与任务「备份文件格式」一一对应）
+        if backup_path.endswith((".dump", ".tar")):
+            # 自定义格式/tar 归档用 pg_restore（目标库已创建，无需 -C；库已全新无需 -c）
             cmd = [
                 "pg_restore",
                 "--host", str(host),
@@ -461,7 +555,8 @@ class PostgreSQLEngine(BackupEngine):
                 success=False,
                 status=BackupStatus.FAILED,
                 backup_path=backup_path,
-                message=f"无法识别的备份文件类型(需 .dump 或 .sql): {backup_path}",
+                message=(f"无法识别的备份文件类型(需 .dump / .tar / .sql / 目录格式 .tar.gz): "
+                         f"{backup_path}"),
             )
 
         # 追加用户自定义扩展选项
@@ -640,6 +735,20 @@ class PostgreSQLEngine(BackupEngine):
         return dbs
 
     # ------------------------- 内部辅助 -------------------------
+    def _extra_dict(self) -> dict:
+        """解析 task.extra_options 为**字典**（与 _parse_extra_options 的
+        CLI 参数列表形态区分开），供 dump_format 等内部键读取。"""
+        raw = self.task.get("extra_options")
+        if isinstance(raw, dict):
+            return raw
+        if not raw:
+            return {}
+        try:
+            data = __import__("json").loads(raw)
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def _parse_extra_options(self):
         """解析 task 的 extra_options(JSON 字符串) 为命令参数列表。"""
         raw = self.task.get("extra_options")
@@ -659,6 +768,8 @@ class PostgreSQLEngine(BackupEngine):
                 "env_vars", "custom_script", "custom_restore_script",
                 "custom_artifact_dir", "encrypt_pool", "demo_only",
                 "all_db_mode", "include_system_dbs", "pg_basebackup_extra_args",
+                # 备份文件格式（由引擎内部消费，绝不能当 CLI 参数拼进命令行）
+                "dump_format",
             }
             args = []
             for k, v in data.items():

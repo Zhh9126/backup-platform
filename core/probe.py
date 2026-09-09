@@ -2,10 +2,11 @@
 """
 数据库连通性探测：在巡检 / 数据同步前，对源/目标库做一次轻量级连通性检查。
 
-零额外依赖，使用各数据库自带命令行客户端（与备份引擎一致）。
+零额外依赖：优先用各库 Python 驱动探测（与迁移/同步引擎同源，Docker 镜像
+零安装原则下无需命令行客户端），CLI 仅作回退。
 - 返回 (True, msg)  表示连接正常
 - 返回 (False, msg) 表示连接失败（应触发告警）
-- 返回 (None, msg)  表示无法判定（客户端缺失 / 类型未实现探测），视为“未知/警告”
+- 返回 (None, msg)  表示无法判定（驱动/客户端均缺失 / 类型未实现探测），视为“未知/警告”
 """
 import importlib
 import os
@@ -96,23 +97,53 @@ def _probe_via_driver(module, connect, probe_sql: str, ok_msg: str):
 
 
 def _probe_mysql(h, p, u, pw, db_name, t):
+    """MySQL/MariaDB 连通性：pymysql 驱动优先，回退 mysql CLI。
+
+    Docker 镜像按零安装原则只烘焙 Python 驱动、不含 mysql 客户端，
+    故驱动优先（与 T06 oracle/kingbase/达梦 一致），CLI 仅作回退。
+    """
+    module, reason = _try_import("pymysql")
+    if module is not None:
+        def _connect():
+            return module.connect(host=h, port=int(p or 3306), user=u,
+                                  password=pw, database=db_name or None,
+                                  connect_timeout=max(3, int(t)),
+                                  charset="utf8mb4")
+        ok, msg = _probe_via_driver(module, _connect, "SELECT 1",
+                                    "MySQL 连接正常（pymysql）")
+        if ok is not None:
+            return ok, msg
     env = os.environ.copy()
     if pw:
         env["MYSQL_PWD"] = pw
     # --no-defaults 屏蔽 /root/.my.cnf 等残留 [client] password——
     # 配置文件优先级高于 MYSQL_PWD，会导致用错密码连接（Access denied）
     rc, out, err = _run(
-        ["mysql", "--no-defaults", "-h", h, "-P", str(p), "-u", u,
+        ["mysql", "--no-defaults", "-h", h, "-P", str(p or 3306), "-u", u,
          "--connect-timeout", str(t), "-e", "SELECT 1"], env, t + 5)
     return (rc == 0, "MySQL 连接正常" if rc == 0 else (err.strip() or "连接失败"))
 
 
 def _probe_postgresql(h, p, u, pw, db_name, t):
+    """PostgreSQL 连通性：psycopg2 驱动优先，回退 psql/pg_isready。
+
+    Docker 镜像无 psql/pg_isready 客户端，驱动优先保证容器内可探测。
+    """
+    module, reason = _try_import("psycopg2")
+    if module is not None:
+        ok, msg = _probe_via_driver(
+            module,
+            lambda: module.connect(host=h, port=int(p or 5432), user=u,
+                                   password=pw, dbname=db_name or "postgres",
+                                   connect_timeout=max(3, int(t))),
+            "SELECT 1", "PostgreSQL 连接正常（psycopg2）")
+        if ok is not None:
+            return ok, msg
     env = os.environ.copy()
     if pw:
         env["PGPASSWORD"] = pw
     rc, out, err = _run(
-        ["pg_isready", "-h", h, "-p", str(p), "-U", u, "-t", str(t)],
+        ["pg_isready", "-h", h, "-p", str(p or 5432), "-U", u, "-t", str(t)],
         env, t + 5)
     # 0=接受连接 1=拒绝 2=无响应 3=未尝试
     if rc == 0:
@@ -121,7 +152,26 @@ def _probe_postgresql(h, p, u, pw, db_name, t):
 
 
 def _probe_redis(h, p, u, pw, db_name, t):
-    cmd = ["redis-cli", "-h", h, "-p", str(p)]
+    """Redis 连通性：redis 模块驱动优先，回退 redis-cli（零安装原则）。"""
+    module, reason = _try_import("redis")
+    if module is not None:
+        try:
+            client = module.Redis(
+                host=h, port=int(p or 6379), password=(pw or None),
+                db=int(db_name or 0), socket_connect_timeout=max(3, int(t)),
+                socket_timeout=max(3, int(t)))
+            try:
+                ok = bool(client.ping())
+                return ok, ("Redis 连接正常（redis 驱动）" if ok
+                            else "Redis PING 无响应")
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            return False, f"连接失败: {str(e).strip()[:160]}"
+    cmd = ["redis-cli", "-h", h, "-p", str(p or 6379)]
     if pw:
         cmd += ["-a", pw]
     cmd += ["PING"]
@@ -131,6 +181,26 @@ def _probe_redis(h, p, u, pw, db_name, t):
 
 
 def _probe_mongodb(h, p, u, pw, db_name, t):
+    """MongoDB 连通性：pymongo 驱动优先，回退 mongosh/mongo CLI。"""
+    module, reason = _try_import("pymongo")
+    if module is not None:
+        try:
+            from urllib.parse import quote_plus
+            cred = f"{quote_plus(u)}:{quote_plus(pw or '')}@" if u else ""
+            uri = f"mongodb://{cred}{h}:{p or 27017}/{db_name or ''}"
+            client = module.MongoClient(
+                uri, serverSelectionTimeoutMS=max(3000, int(t) * 1000),
+                connectTimeoutMS=max(3000, int(t) * 1000))
+            try:
+                client.admin.command("ping")
+                return True, "MongoDB 连接正常（pymongo）"
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            return False, f"连接失败: {str(e).strip()[:160]}"
     uri = (f"mongodb://{u}:{pw}@{h}:{p}/{db_name or ''}" if pw
            else f"mongodb://{h}:{p}/{db_name or ''}")
     rc, out, err = _run(
@@ -239,11 +309,13 @@ def _probe_unimplemented(_h, _p, _u, _pw, _db, _t):
 
 # 值为 (必需客户端列表, 探测函数)。
 # 客户端列表为空表示该探测函数自带「驱动优先 + CLI 回退 + 缺失即未知」逻辑（T06）。
+# mysql/postgresql/redis/mongodb 的 CLI 为空列表：容器镜像零安装原则只含
+# Python 驱动（pymysql/psycopg2/redis/pymongo），由探测函数内部驱动优先。
 _PROBES = {
-    "mysql": (["mysql"], _probe_mysql),
-    "postgresql": (["psql", "pg_isready"], _probe_postgresql),
-    "redis": (["redis-cli"], _probe_redis),
-    "mongodb": (["mongosh", "mongo"], _probe_mongodb),
+    "mysql": ([], _probe_mysql),
+    "postgresql": ([], _probe_postgresql),
+    "redis": ([], _probe_redis),
+    "mongodb": ([], _probe_mongodb),
     "oracle": ([], _probe_oracle),
     "kingbase": ([], _probe_kingbase),
     "dameng": ([], _probe_dameng),

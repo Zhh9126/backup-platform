@@ -29,6 +29,11 @@ startup*.log
 # 本地临时文件（仅根目录，_ 前缀）
 /_*
 
+# 镜像烘焙工具布局（由 scripts/docker_prep_tools.sh 从平台机收集，
+# 体积大不入库；.keep 除外用于保证 CI 下 COPY 不失败）
+/.docker-bake/*
+!/.docker-bake/.keep
+
 # 工具会话记忆（含服务器凭据，勿提交）
 .codebuddy/memory/
 .workbuddy/

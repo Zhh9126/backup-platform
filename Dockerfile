@@ -2,21 +2,26 @@
 # 构建：docker build -t backup-platform:local .
 # 运行：docker run -d -p 8080:8080 -v /data/backup-platform:/data backup-platform:local
 #
-# 镜像内已烘焙全部 Python 依赖（含 pymysql/psycopg2/oracledb 原生直连驱动），
-# 运行时零联网、零外部安装；
+# 镜像内已烘焙全部 Python 依赖（含 pymysql/psycopg2/oracledb 原生直连驱动）+
+# JRE + drivers/ JDBC jar，运行时零联网、零外部安装；
 # 直连（连接测试/拉库列表/数据对比）默认走原生 Python 驱动，无需 Java；
-# JRE + drivers/ JDBC jar 仅作为可选兜底通道（如 Oracle 11g 瘦模式不支持时）。
+# JRE + JDBC 作为可选兜底通道（如 Oracle 11g 瘦模式不支持时）。
 # 元数据/备份/日志持久化到 /data 挂载卷。
 #
-# 【物理备份零安装（平台推送二进制）】
-# 物理 xtrabackup/mariabackup 二进制体积大且与远端主机 OS 相关，默认不烘焙
-# 进镜像，部署时从宿主机只读挂载（数据库服务器零安装，平台按服务器版本
-# 自动选择并推送到远端 /tmp 执行）：
-#   docker run ... \
-#     -v /opt/xtrabackup24:/opt/xtrabackup24:ro \   # xtrabackup 2.4（MySQL 5.5-5.7）
-#     -v /opt/mariabackup:/opt/mariabackup:ro \     # mariabackup（MariaDB 10.x）
-#     -v /opt/xtrabackup8:/opt/xtrabackup8:ro       # xtrabackup 8.0（MySQL 8.0+，可选，覆盖内置路径）
-# 路径可用环境变量 XTRABACKUP_8_PATH / XTRABACKUP_24_PATH / MARIABACKUP_PATH 覆盖。
+# 【镜像自足：备份/恢复工具随镜像烘焙，启动即用（无需宿主机挂载）】
+# 构建前在平台机执行 scripts/docker_prep_tools.sh 生成 .docker-bake/，
+# 把 MySQL/MariaDB 一族备份恢复所需工具拷进镜像：
+#   - MySQL 8.0.40 客户端 mysql/mysqldump/mysqlbinlog/... 与 mysqld（物理恢复
+#     临时实例校验）位于 /opt/mysql840b/（自带 private openssl，可直接运行）
+#   - Percona XtraBackup 8.0 → /usr/bin/xtrabackup（MySQL 8.0+）
+#   - Percona XtraBackup 2.4 → /opt/xtrabackup24/usr/bin/xtrabackup（MySQL 5.5-5.7）
+#   - MariaDB Backup      → /opt/mariabackup/usr/bin/mariabackup（MariaDB 10.x）
+#   - 上述 CentOS7 编译二进制依赖的旧版动态库 → /opt/toolpack-libs64/
+#     （libssl.so.10 等 Debian 镜像缺失，经 LD_LIBRARY_PATH 注入）
+# 其余数据库类型（PG/金仓/Oracle/达梦/MSSQL 等）经 SSH 通道使用 DBMS 自带
+# 工具执行备份（远端零安装），无需镜像内再打包对应客户端。
+# 未运行 docker_prep_tools.sh 时 .docker-bake 仅含 .keep，仍可构建
+# “纯应用”镜像（CI 场景），备份工具相关功能按既有提示走。
 
 # 3.12 而非 3.14：oracledb 等 C 扩展依赖尚无 cp314 预编译 wheel，
 # 3.14 基础镜像下 pip 报 "Could not find a version ... (from versions: none)"
@@ -32,11 +37,16 @@ ENV PYTHONUNBUFFERED=1 \
     INSTANCE_DIR=/data/instance \
     LOG_DIR=/data/logs
 
-# tzdata 供时区；default-jre-headless（OpenJDK 17）仅供 JDBC 可选兜底通道
+# tzdata 供时区；default-jre-headless（OpenJDK 17）仅供 JDBC 可选兜底通道；
+# gzip/zstd 供备份产物压缩 CLI；libaio1/libnuma1 供烘焙的 mysqld 临时校验实例
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        default-jre-headless \
        tzdata \
+       gzip \
+       zstd \
+       libaio1 \
+       libnuma1 \
     && ln -fs /usr/share/zoneinfo/$TZ /etc/localtime \
     && rm -rf /var/lib/apt/lists/*
 
@@ -60,6 +70,18 @@ COPY tools/ ./tools/
 RUN chmod +x start.sh \
     # 运行时持久化目录（挂载卷）
     && mkdir -p /data/backups /data/instance /data/logs
+
+# 烘焙 MySQL/MariaDB 备份恢复工具（布局与宿主机一致，config 默认路径即命中；
+# 未执行 docker_prep_tools.sh 时该层为空目录，不影响构建）
+COPY .docker-bake/ /
+
+# 工具注入 PATH；CentOS7 旧版动态库经 LD_LIBRARY_PATH 提供给烘焙二进制；
+# XTRABACKUP/MARIABACKUP 路径显式化（与 config.py 默认值一致）
+ENV PATH="/opt/mysql840b/bin:${PATH}" \
+    LD_LIBRARY_PATH="/opt/toolpack-libs64" \
+    XTRABACKUP_8_PATH=/usr/bin/xtrabackup \
+    XTRABACKUP_24_PATH=/opt/xtrabackup24/usr/bin/xtrabackup \
+    MARIABACKUP_PATH=/opt/mariabackup/usr/bin/mariabackup
 
 VOLUME ["/data"]
 EXPOSE 8080

@@ -674,7 +674,9 @@ class BackupEngine:
     def _translate_shell_script(self, script: str) -> List[str]:
         """把 `sh -c "<script>"` 形式的命令翻译为当前平台可执行的命令。
 
-        - POSIX（有 sh）：原样返回 ["sh", "-c", script]。
+        - POSIX：优先用 bash 执行（引擎脚本普遍含 `set -o pipefail` 等 bash
+          专有语法；部分发行版 /bin/sh 为 dash 不支持，如 Debian 系容器/宿主机，
+          曾导致 "sh: 1: set: Illegal option -o pipefail")。无 bash 时才退回 sh。
         - Windows（无 sh）：去掉 `set -o pipefail` 等 bash 专有语法，将单引号
           替换为双引号（Windows cmd 只认双引号），再交给 `cmd /c` 执行。
           这样既保留了管道 `|`、输入重定向 `< file`、以及 `mysql < file` 等
@@ -688,6 +690,8 @@ class BackupEngine:
             # 不存在双引号与单引号混用的冲突场景，备份引擎脚本满足此约束）
             s = s.replace("'", '"')
             return ["cmd", "/c", s.strip()]
+        if shutil.which("bash"):
+            return ["bash", "-c", script]
         return ["sh", "-c", script]
 
     def _read_decompressed(self, path: str) -> bytes:

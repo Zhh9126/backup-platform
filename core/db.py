@@ -1078,6 +1078,7 @@ def init_schema() -> None:
                 ("full_db_migrate", "INTEGER DEFAULT 0"),
                 ("validate_before_run", "INTEGER DEFAULT 0"),
                 ("verify_after_run", "INTEGER DEFAULT 0"),
+                ("precheck_sample_rows", "INTEGER DEFAULT 20"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE sync_tasks ADD COLUMN {col} {typedef}")

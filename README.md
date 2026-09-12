@@ -14,7 +14,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 预校验 · 克隆 · 演练 · 巡检 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v1.4.4-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v1.4.5-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -31,6 +31,8 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 - **完全离线运行**：所有依赖随平台包自带（JDBC 驱动、JRE、原生驱动、备份工具离线包），运行时零联网。部署后运行 `python scripts/check_offline.py` 自检。
 - **真实执行，如实失败**：所有备份/恢复/同步均为真实操作，连接失败或依赖缺失时任务**如实失败**并给出明确原因与修复指引，不做任何仿真兜底。
 - **迁移前预校验**：类型映射矩阵、数据级试写、字符集冲突、容量预估、主键/外键检查——结构或数据不合适在启动前拦截。
+- **可插拔数据库类型**：除内置 10 种引擎外，界面就能"新增一种数据库"——填脚本模板 + 能力声明，即刻获得与内置引擎同等的备份/恢复/调度/存储能力，无需改代码。
+- **多用户与权限管控**：24 个权限点 × 3 档内置角色（admin / operator / viewer），菜单按权限自动收敛，API 层二次校验，适配多人协作与运维审计要求。
 
 ---
 
@@ -52,6 +54,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 | 全局重删 | 内容 sha256 索引 + 引用计数 |
 | 存储池加密 | AES-256-GCM 信封式，密钥来源：环境变量 / 系统设置托管 / 外部 KMS |
 | 备份插件 | 服务端插件市场（XtraBackup / MariaDB Backup / pgBackRest / MongoDB Tools 等），支持离线包安装 |
+| 可插拔数据库类型 | 「数据库类型」页界面新增：填脚本模板（备份/增量/全实例/恢复/校验/列库/连通性）+ 能力声明，运行时渲染为 `CustomDBEngine` 注入引擎注册表，与内置引擎同一调度链路；`{{KEY}}` 占位渲染为 `${PLATFORM_KEY}`，脚本不落明文密码 |
 | 远端工具动态发现 | 数据库服务用户 profile → 登录 shell → 常见目录枚举 → find，不写死路径；支持 `tool_path` 手动兜底 |
 | 零安装执行 | SSH 远程优先（用数据库自带工具）→ 平台推送临时副本（/tmp 执行即清理）→ 回退平台服务端执行 |
 
@@ -207,6 +210,29 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 | 对象级恢复 | 从备份中精准提取指定表/对象，不必整库恢复 |
 | 存储目标管理 | 多存储后端 CRUD + 连接测试 + 三级复制（本地/二级/三级）|
 
+### 13. 可插拔数据库类型
+
+| 能力 | 说明 |
+|---|---|
+| 界面新增数据库类型 | 「数据库类型」页填写 `db_type` / 显示名 / 默认端口 / 分类 / 图标 / 支持模式，保存即生效（无需重启）|
+| 脚本模板 | 备份（全量 / 增量 / 全实例）、恢复、校验、列库、连通性测试共 7 个模板位；`{{KEY}}` 占位渲染为 `${PLATFORM_KEY}`，密码等敏感值经 `PLATFORM_PARAM_<KEY>` 环境变量注入，**脚本文件不落明文** |
+| 能力声明 | `backup_modes` / `supports_incremental` / `supports_full_instance` / `supports_sync` / `client_tools` / `skip_client_check`，驱动前端表单与调度行为 |
+| 同一调度链路 | 渲染为 `CustomDBEngine` 实例注入引擎注册表，cron 调度、保留策略、三级存储、全局重删、恢复校验、告警全部自动复用 |
+| 动态类型发现 | `/api/meta` 的 `db_types` / `db_type_meta` / `default_ports` 运行时合并自定义类型，任务表单下拉无需改代码 |
+| 安全与治理 | 删除被备份任务引用的适配器会被拒绝（提示引用任务数）；支持停用/启用、远端连通性测试、从内置模板复制 |
+
+### 14. 用户与角色管理（RBAC）
+
+| 能力 | 说明 |
+|---|---|
+| 多用户登录 | `users` 表 + PBKDF2-HMAC-SHA256（20 万次迭代，标准库实现，无第三方依赖，可离线打包）|
+| 权限点 | 24 个，覆盖概览 / 备份 / 恢复 / 数据对比 / 部署 / 灾备 / 运维 / 系统 |
+| 内置角色 | `admin`（全部）/ `operator`（备份·恢复·同步·克隆·对比·部署·巡检·告警·日志·运维分析，21 项）/ `viewer`（只读，4 项）|
+| 附加权限 | 单用户可在角色基础上叠加权限点（`permissions` 字段，逗号分隔）|
+| 菜单按权限显示 | 侧边栏 25 个菜单带 `data-perm`，登录后按 `hasPerm()` 自动隐藏；API 层 `permission_required()` 二次校验，前端绕过仍返回 403 |
+| 账号治理 | 管理员重置密码 / 停用 / 删除（拒绝删除内置 admin 与最后一个启用的 admin）；用户自助改密（校验旧密码）；`must_change_password` 首登改密 |
+| 兼容升级 | `users` 表为空时自动用 `config.WEB_USERNAME/WEB_PASSWORD` 种子首个 admin；旧会话与外部 API Token 调用方均不受影响 |
+
 ---
 
 ## 快速开始
@@ -220,6 +246,9 @@ python run.py
 ```
 
 浏览器访问 `http://<服务器IP>:8080`，默认账号 `admin / admin123`（**请立即修改**）。
+
+> 首次启动会用 `config.WEB_USERNAME/WEB_PASSWORD` 自动创建首个 `admin` 用户（标记 `must_change_password`，建议登录后立即在「用户管理」改密）。
+> 需要多人协作时，在「用户管理」新增账号并分配角色（admin / operator / viewer），菜单会按权限自动收敛。
 
 > 备份任务执行前，请先在「系统设置 → SSH 主机」纳管数据库服务器（或使用任务级 SSH 凭据）。
 
@@ -292,7 +321,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v1.4.4   # 固定版本（可回滚）
+docker pull ghcr.io/zhh9126/backup-platform:v1.4.5   # 固定版本（可回滚）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -316,7 +345,7 @@ python tools/check_env.py
 
 ```bash
 # 有网机器导出
-docker save ghcr.io/zhh9126/backup-platform:v1.4.4 -o backup-platform.tar
+docker save ghcr.io/zhh9126/backup-platform:v1.4.5 -o backup-platform.tar
 # 内网机器导入
 docker load -i backup-platform.tar
 ```
@@ -387,17 +416,21 @@ docker build -t backup-platform:local .
 
 **数据迁移/同步连接通道**：原生 Python 驱动优先（pymysql / psycopg2 / oracledb thin），JDBC 兜底（驱动 jar 随包，达梦/金仓/Oracle 全覆盖）。部署后运行 `python tools/check_env.py` 一键自检（服务端集中安装、客户端零安装）。
 
+**以上不是上限——数据库类型可插拔**：除内置引擎外，可在「数据库类型」页界面新增任意一种数据库（GaussDB / OceanBase / TiDB / 自研库等），只需提供备份/恢复脚本模板与能力声明，即可获得与内置引擎**完全相同的**调度、保留策略、三级存储、重删、告警与恢复校验能力；脚本经 SSH 在数据库服务器执行，**客户端零安装**约束不变。
+
 ---
 
 ## 使用说明（导航结构）
 
 - **概览**：仪表盘（任务数、累计备份体积、成功失败统计）
-- **备份管理**：数据库备份、文件备份、存储管理（三级存储 + 合成全量）、保护策略、备份插件
+- **备份管理**：数据库备份、文件备份、存储管理（三级存储 + 合成全量）、保护策略、备份插件、**数据库类型（可插拔）**
 - **记录**：备份记录、恢复记录、恢复校验
 - **数据恢复管理**：数据恢复、数据库部署
 - **灾备管理**：数据迁移、数据同步、数据对比、容灾链路、克隆服务、恢复演练
 - **实时管控**：实时管控时间线（RT / CDP / PITR）
-- **运维**：巡检、智能告警、数据价值挖掘、智能体、系统设置
+- **运维**：巡检、智能告警、数据价值挖掘、智能体、**系统设置、用户管理（RBAC）**
+
+> 菜单按当前账号权限自动收敛：`viewer` 仅见只读入口，`operator` 不见系统设置 / 用户管理 / 数据库类型，`admin` 全量可见。
 
 典型操作：
 
@@ -410,6 +443,8 @@ docker build -t backup-platform:local .
 7. **恢复校验**：配置策略定期对最近成功备份做可恢复性校验，查看报告与成功率 KPI。
 8. **巡检**：点击"立即巡检"或配置定时巡检，查看 pass/warn/fail 明细。
 9. **AI 智能体**：对话式助手支持查询任务/记录/存储用量、执行备份/巡检（需确认）、知识库问答。
+10. **新增数据库类型**：在「数据库类型」页点「新增」，填 `db_type` / 显示名 / 默认端口与 7 个脚本模板（可从内置模板复制改），保存后到「数据库备份」新建任务即可选到该类型；右上「测试」可先做远端连通性验证。
+11. **新增用户**：在「用户管理」页点「新增用户」，选角色（admin / operator / viewer）并勾选附加权限；保存后该用户登录即按权限看到对应菜单。
 
 ---
 
@@ -424,10 +459,25 @@ docker build -t backup-platform:local .
 
 - 密码 AES 加密存储（元数据库中不含明文）
 - 备份密码通过临时选项文件 / 环境变量注入，不出现在命令行（防 ps 泄露）
+- 平台登录密码 PBKDF2-HMAC-SHA256 加盐哈希（20 万次迭代），元数据库不存明文
+- 多用户权限双层校验：菜单按权限隐藏 + API 层 `permission_required()` 强制校验（前端绕过仍 403）
+- 可插拔适配器脚本模板不落明文密码：敏感参数经 `${PLATFORM_PARAM_*}` 环境变量注入
 - API Token 仅存哈希；会话 Cookie HttpOnly
-- 默认账号请立即修改；生产环境建议限制来源 IP
+- 默认账号请立即修改（首登会标记 `must_change_password`）；生产环境建议限制来源 IP
 
 ## 更新日志
+
+### v1.4.5（2026-09-12）
+
+- **可插拔数据库类型**：新增「数据库类型」页，界面即可新增/编辑/停用/删除一种数据库（填脚本模板 + 能力声明即可用于备份/恢复）。适配器 → `db_adapters` 表 → 运行时渲染为 `CustomDBEngine` 注入引擎注册表，与 10 个内置引擎走**完全相同的调度链路**（cron/保留策略/三级存储/重删/告警全部复用）；`/api/meta` 动态返回类型与端口，任务表单无需改代码即可选到新类型。
+  - 脚本模板 `{{KEY}}` 占位统一渲染为 `${PLATFORM_KEY}` shell 变量引用，**脚本文件不落明文密码**；`PLATFORM_*` 由任务参数注入
+  - 删除被备份任务引用的适配器会被拒绝并提示任务数；支持「从模板复制」与远端连通性测试
+- **用户与角色管理（RBAC）**：新增「用户管理」页，多用户登录 + 24 个权限点 + 3 档内置角色（`admin` / `operator` / `viewer`）。
+  - 密码 PBKDF2-HMAC-SHA256（20 万次迭代，标准库实现，无第三方依赖，离线可打包），格式 `pbkdf2_sha256$<iter>$<salt>$<hash>`
+  - 侧边栏 25 个菜单按权限自动隐藏；`permission_required()` 装饰器在 API 层二次校验（前端隐藏失败仍会 403 兜底）
+  - 用户可叠加附加权限（`permissions` 字段）；支持管理员重置密码、用户自助改密、`must_change_password` 首登改密提醒
+  - 兼容升级：`users` 表为空时自动用 `config.WEB_USERNAME/WEB_PASSWORD` 种子首个 admin；旧会话（字符串 user）自动兼容；外部 API Token 调用方不受影响
+- **fix(mariadb)**：MariaDB 10.x 适配与 `db_adapters` 表迁移（存量库幂等补齐）
 
 ### v1.4.4（2026-09-09）
 

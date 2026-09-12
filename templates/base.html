@@ -24,34 +24,35 @@
         <div class="nav-group-label">概览</div>
         <a class="nav-link {% if page=='dashboard' %}active{% endif %}" href="/" title="仪表盘"><i class="bi bi-speedometer2"></i> <span class="nav-label">仪表盘</span></a>
         <div class="nav-group-label">备份管理</div>
-        <a class="nav-link {% if page=='tasks' %}active{% endif %}" href="/tasks" title="数据库备份"><i class="bi bi-list-check"></i> <span class="nav-label">数据库备份</span></a>
-        <a class="nav-link {% if page=='file_backup' %}active{% endif %}" href="/file_backup" title="文件备份"><i class="bi bi-folder2-open"></i> <span class="nav-label">文件备份</span></a>
-        <a class="nav-link {% if page=='storage' %}active{% endif %}" href="/storage" title="存储管理"><i class="bi bi-hdd-rack"></i> <span class="nav-label">存储管理</span></a>
-        <a class="nav-link {% if page=='protection' %}active{% endif %}" href="/protection" title="备份策略"><i class="bi bi-shield-lock"></i> <span class="nav-label">备份策略</span></a>
-        <a class="nav-link {% if page=='plugins' %}active{% endif %}" href="/plugins" title="备份依赖插件（一键安装 xtrabackup / percona / mariabackup 等）"><i class="bi bi-plug"></i> <span class="nav-label">备份插件</span></a>
-        <a class="nav-link {% if page=='db-adapters' %}active{% endif %}" href="/db-adapters" title="可插拔数据库类型（界面新增一种数据库即可用于备份/恢复）"><i class="bi bi-stack"></i> <span class="nav-label">数据库类型</span></a>
-        <a class="nav-link {% if page=='rt_timeline' %}active{% endif %}" href="/rt-timeline" title="实时备份（准 CDP）"><i class="bi bi-broadcast-pin"></i> <span class="nav-label">实时备份</span></a>
+        <a class="nav-link {% if page=='tasks' %}active{% endif %}" href="/tasks" title="数据库备份" data-perm="backup.task.view"><i class="bi bi-list-check"></i> <span class="nav-label">数据库备份</span></a>
+        <a class="nav-link {% if page=='file_backup' %}active{% endif %}" href="/file_backup" title="文件备份" data-perm="backup.task.view"><i class="bi bi-folder2-open"></i> <span class="nav-label">文件备份</span></a>
+        <a class="nav-link {% if page=='storage' %}active{% endif %}" href="/storage" title="存储管理" data-perm="backup.storage.manage"><i class="bi bi-hdd-rack"></i> <span class="nav-label">存储管理</span></a>
+        <a class="nav-link {% if page=='protection' %}active{% endif %}" href="/protection" title="备份策略" data-perm="backup.policy.manage"><i class="bi bi-shield-lock"></i> <span class="nav-label">备份策略</span></a>
+        <a class="nav-link {% if page=='plugins' %}active{% endif %}" href="/plugins" title="备份依赖插件（一键安装 xtrabackup / percona / mariabackup 等）" data-perm="backup.plugins.manage"><i class="bi bi-plug"></i> <span class="nav-label">备份插件</span></a>
+        <a class="nav-link {% if page=='db-adapters' %}active{% endif %}" href="/db-adapters" title="可插拔数据库类型（界面新增一种数据库即可用于备份/恢复）" data-perm="backup.dbtypes.manage"><i class="bi bi-stack"></i> <span class="nav-label">数据库类型</span></a>
+        <a class="nav-link {% if page=='rt_timeline' %}active{% endif %}" href="/rt-timeline" title="实时备份（准 CDP）" data-perm="rt.manage"><i class="bi bi-broadcast-pin"></i> <span class="nav-label">实时备份</span></a>
         <div class="nav-group-label">数据恢复管理</div>
-        <a class="nav-link {% if page=='restore' %}active{% endif %}" href="/restore" title="数据恢复"><i class="bi bi-arrow-counterclockwise"></i> <span class="nav-label">数据恢复</span></a>
-        <a class="nav-link {% if page=='restore-verify' %}active{% endif %}" href="/restore-verify" title="恢复校验"><i class="bi bi-patch-check"></i> <span class="nav-label">恢复校验</span></a>
-        <a class="nav-link {% if page=='data-compare' %}active{% endif %}" href="/data-compare" title="数据对比（恢复数据 vs 生产库）"><i class="bi bi-clipboard-data"></i> <span class="nav-label">数据对比</span></a>
-        <a class="nav-link {% if page=='deploy' %}active{% endif %}" href="/deploy" title="数据库部署"><i class="bi bi-rocket-takeoff"></i> <span class="nav-label">数据库部署</span></a>
+        <a class="nav-link {% if page=='restore' %}active{% endif %}" href="/restore" title="数据恢复" data-perm="restore.run"><i class="bi bi-arrow-counterclockwise"></i> <span class="nav-label">数据恢复</span></a>
+        <a class="nav-link {% if page=='restore-verify' %}active{% endif %}" href="/restore-verify" title="恢复校验" data-perm="restore.verify.manage"><i class="bi bi-patch-check"></i> <span class="nav-label">恢复校验</span></a>
+        <a class="nav-link {% if page=='data-compare' %}active{% endif %}" href="/data-compare" title="数据对比（恢复数据 vs 生产库）" data-perm="data_compare.run"><i class="bi bi-clipboard-data"></i> <span class="nav-label">数据对比</span></a>
+        <a class="nav-link {% if page=='deploy' %}active{% endif %}" href="/deploy" title="数据库部署" data-perm="deploy.manage"><i class="bi bi-rocket-takeoff"></i> <span class="nav-label">数据库部署</span></a>
         <div class="nav-group-label">记录</div>
-        <a class="nav-link {% if page=='records' %}active{% endif %}" href="/records" title="备份记录"><i class="bi bi-archive"></i> <span class="nav-label">备份记录</span></a>
-        <a class="nav-link {% if page=='restore_records' %}active{% endif %}" href="/restore_records" title="恢复记录"><i class="bi bi-clock-history"></i> <span class="nav-label">恢复记录</span></a>
+        <a class="nav-link {% if page=='records' %}active{% endif %}" href="/records" title="备份记录" data-perm="backup.task.view"><i class="bi bi-archive"></i> <span class="nav-label">备份记录</span></a>
+        <a class="nav-link {% if page=='restore_records' %}active{% endif %}" href="/restore_records" title="恢复记录" data-perm="restore.run"><i class="bi bi-clock-history"></i> <span class="nav-label">恢复记录</span></a>
         <div class="nav-group-label">灾备管理</div>
-        <a class="nav-link {% if page=='migration' %}active{% endif %}" href="/migration" title="数据迁移"><i class="bi bi-arrow-repeat"></i> <span class="nav-label">数据迁移</span></a>
-        <a class="nav-link {% if page=='sync' %}active{% endif %}" href="/sync" title="数据同步"><i class="bi bi-arrow-left-right"></i> <span class="nav-label">数据同步</span></a>
-        <a class="nav-link {% if page=='dr-link' %}active{% endif %}" href="/dr-link" title="容灾链路"><i class="bi bi-diagram-3"></i> <span class="nav-label">容灾链路</span></a>
-        <a class="nav-link {% if page=='clone' %}active{% endif %}" href="/clone" title="克隆服务"><i class="bi bi-layers"></i> <span class="nav-label">克隆服务</span></a>
+        <a class="nav-link {% if page=='migration' %}active{% endif %}" href="/migration" title="数据迁移" data-perm="dr.migration.manage"><i class="bi bi-arrow-repeat"></i> <span class="nav-label">数据迁移</span></a>
+        <a class="nav-link {% if page=='sync' %}active{% endif %}" href="/sync" title="数据同步" data-perm="dr.sync.manage"><i class="bi bi-arrow-left-right"></i> <span class="nav-label">数据同步</span></a>
+        <a class="nav-link {% if page=='dr-link' %}active{% endif %}" href="/dr-link" title="容灾链路" data-perm="dr.link.manage"><i class="bi bi-diagram-3"></i> <span class="nav-label">容灾链路</span></a>
+        <a class="nav-link {% if page=='clone' %}active{% endif %}" href="/clone" title="克隆服务" data-perm="dr.clone.manage"><i class="bi bi-layers"></i> <span class="nav-label">克隆服务</span></a>
         <div class="nav-group-label">运维</div>
-        <a class="nav-link {% if page=='operations' %}active{% endif %}" href="/operations" title="运维运营分析（超长 / 超频备份统计与阈值配置）"><i class="bi bi-graph-up-arrow"></i> <span class="nav-label">运维运营分析</span></a>
-        <a class="nav-link {% if page=='inspection' %}active{% endif %}" href="/inspection" title="巡检"><i class="bi bi-shield-check"></i> <span class="nav-label">巡检</span></a>
-        <a class="nav-link {% if page=='agent' %}active{% endif %}" href="/agent" title="AI 智能助手"><i class="bi bi-robot"></i> <span class="nav-label">AI 智能助手</span></a>
-        <a class="nav-link {% if page=='alert' %}active{% endif %}" href="/alert" title="智能告警"><i class="bi bi-bell"></i> <span class="nav-label">智能告警</span></a>
-        <a class="nav-link {% if page=='datamining' %}active{% endif %}" href="/datamining" title="数据价值挖掘"><i class="bi bi-database-check"></i> <span class="nav-label">数据价值挖掘</span></a>
-        <a class="nav-link {% if page=='logs' %}active{% endif %}" href="/logs" title="系统日志"><i class="bi bi-journal-text"></i> <span class="nav-label">系统日志</span></a>
-        <a class="nav-link {% if page=='settings' %}active{% endif %}" href="/settings" title="系统设置"><i class="bi bi-gear"></i> <span class="nav-label">系统设置</span></a>
+        <a class="nav-link {% if page=='operations' %}active{% endif %}" href="/operations" title="运维运营分析（超长 / 超频备份统计与阈值配置）" data-perm="operations.view"><i class="bi bi-graph-up-arrow"></i> <span class="nav-label">运维运营分析</span></a>
+        <a class="nav-link {% if page=='inspection' %}active{% endif %}" href="/inspection" title="巡检" data-perm="inspection.manage"><i class="bi bi-shield-check"></i> <span class="nav-label">巡检</span></a>
+        <a class="nav-link {% if page=='agent' %}active{% endif %}" href="/agent" title="AI 智能助手" data-perm="agent.use"><i class="bi bi-robot"></i> <span class="nav-label">AI 智能助手</span></a>
+        <a class="nav-link {% if page=='alert' %}active{% endif %}" href="/alert" title="智能告警" data-perm="alert.manage"><i class="bi bi-bell"></i> <span class="nav-label">智能告警</span></a>
+        <a class="nav-link {% if page=='datamining' %}active{% endif %}" href="/datamining" title="数据价值挖掘" data-perm="alert.manage"><i class="bi bi-database-check"></i> <span class="nav-label">数据价值挖掘</span></a>
+        <a class="nav-link {% if page=='logs' %}active{% endif %}" href="/logs" title="系统日志" data-perm="logs.view"><i class="bi bi-journal-text"></i> <span class="nav-label">系统日志</span></a>
+        <a class="nav-link {% if page=='settings' %}active{% endif %}" href="/settings" title="系统设置" data-perm="system.settings"><i class="bi bi-gear"></i> <span class="nav-label">系统设置</span></a>
+        <a class="nav-link {% if page=='users' %}active{% endif %}" href="/users" title="用户与角色管理（RBAC）" data-perm="users.manage"><i class="bi bi-people"></i> <span class="nav-label">用户管理</span></a>
         <a class="nav-link logout" href="/logout" title="退出登录"><i class="bi bi-box-arrow-right"></i> <span class="nav-label">退出登录</span></a>
       </nav>
     </aside>
@@ -83,8 +84,14 @@
   </div>
 
   <script src="/static/js/bootstrap.bundle.min.js?v=2026080210"></script>
-  <script src="/static/js/bkp-core.js?v=2026080208"></script>
+  <script src="/static/js/bkp-core.js?v=2026091201"></script>
   <script src="/static/js/app.js?v=2026091201"></script>
+  <script>
+    // 按权限隐藏菜单（每个 <a class="nav-link" data-perm="..."> 命中则可见）
+    document.addEventListener("DOMContentLoaded", function () {
+      if (window.BKP && BKP.applyMenuPerms) BKP.applyMenuPerms();
+    });
+  </script>
   {% block scripts %}{% endblock %}
 </body>
 </html>

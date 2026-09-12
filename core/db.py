@@ -1211,6 +1211,27 @@ def init_schema() -> None:
             except Exception:
                 pass  # 表已存在，忽略
 
+            # 迁移：RBAC 用户表（多用户/角色/权限）—— 幂等建表
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS users ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "username TEXT NOT NULL UNIQUE, "
+                    "display_name TEXT DEFAULT '', "
+                    "email TEXT DEFAULT '', "
+                    "password_hash TEXT NOT NULL, "
+                    "password_algo TEXT DEFAULT 'pbkdf2_sha256', "
+                    "role TEXT NOT NULL DEFAULT 'viewer', "   # admin/operator/viewer
+                    "permissions TEXT DEFAULT '', "          # 逗号分隔，附加权限
+                    "enabled INTEGER DEFAULT 1, "
+                    "must_change_password INTEGER DEFAULT 0, "
+                    "last_login_at TEXT, last_login_ip TEXT, "
+                    "created_at TEXT, updated_at TEXT, "
+                    "created_by TEXT DEFAULT '')")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role, enabled)")
+            except Exception:
+                pass  # 表已存在，忽略
+
             conn.commit()
         finally:
             conn.close()

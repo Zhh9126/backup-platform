@@ -1,0 +1,208 @@
+{% extends "base.html" %}
+{% block title %}用户管理 · RBAC{% endblock %}
+{% block content %}
+<div class="container-fluid py-3">
+  <div class="d-flex align-items-center mb-3">
+    <h4 class="mb-0"><i class="bi bi-people me-2"></i>用户与角色管理</h4>
+    <span class="badge bg-secondary ms-2" id="badgeCount">0</span>
+    <div class="ms-auto">
+      <button class="btn btn-primary" id="btnNew"><i class="bi bi-plus-lg me-1"></i>新增用户</button>
+    </div>
+  </div>
+
+  <div class="alert alert-info py-2 small">
+    平台内置三档角色：<b>admin</b>（全部权限）/ <b>operator</b>（备份·恢复·同步·克隆·对比·部署，不含系统设置与用户管理）/
+    <b>viewer</b>（只读）。可勾选附加权限（permissions）。删除内置 admin 或最后一个启用的 admin 会被拒绝。
+    首次部署时 admin 用户来自 <code>config.WEB_USERNAME/WEB_PASSWORD</code>，登录后会强制改密（must_change_password=1）。
+  </div>
+
+  <div class="card">
+    <div class="table-responsive">
+      <table class="table table-sm table-hover mb-0 align-middle">
+        <thead class="table-light">
+          <tr>
+            <th style="width:60px">ID</th>
+            <th style="width:140px">用户名</th>
+            <th>显示名</th>
+            <th style="width:110px">角色</th>
+            <th>邮箱</th>
+            <th style="width:100px">状态</th>
+            <th style="width:140px">最近登录</th>
+            <th style="width:240px" class="text-end">操作</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- 编辑/新增 模态框 -->
+<div class="modal fade" id="editModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="editTitle">新增用户</h5>
+        <button class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="row g-3">
+          <div class="col-md-4"><label class="form-label">用户名 <span class="text-danger">*</span></label>
+            <input class="form-control" id="f_username"></div>
+          <div class="col-md-4"><label class="form-label">显示名</label>
+            <input class="form-control" id="f_display_name"></div>
+          <div class="col-md-4"><label class="form-label">邮箱</label>
+            <input class="form-control" id="f_email" type="email"></div>
+          <div class="col-md-4"><label class="form-label">密码 <span class="text-danger">*</span></label>
+            <input class="form-control" id="f_password" type="password" placeholder="≥6 位"></div>
+          <div class="col-md-4"><label class="form-label">角色</label>
+            <select class="form-select" id="f_role">
+              <option value="viewer">viewer（只读）</option>
+              <option value="operator">operator（备份/恢复/同步/克隆）</option>
+              <option value="admin">admin（全部权限）</option>
+            </select></div>
+          <div class="col-md-2"><label class="form-check-label mt-4">
+            <input type="checkbox" class="form-check-input" id="f_enabled" checked> 启用</label></div>
+          <div class="col-md-2"><label class="form-check-label mt-4">
+            <input type="checkbox" class="form-check-input" id="f_must_change"> 首次登录须改密</label></div>
+          <div class="col-12"><label class="form-label">附加权限（逗号分隔，可覆盖角色默认）</label>
+            <input class="form-control font-monospace small" id="f_permissions"
+                   placeholder="例如 backup.policy.manage, dr.clone.manage">
+            <div class="form-text small text-muted" id="permHints">可选权限点：</div></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="btnSave"><i class="bi bi-check2 me-1"></i>保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 重置密码 -->
+<div class="modal fade" id="pwdModal" tabindex="-1">
+  <div class="modal-dialog modal-sm">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">重置密码</h5>
+        <button class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <label class="form-label">新密码（≥6 位）</label>
+        <input class="form-control" id="np_password" type="password">
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="btnSavePwd"><i class="bi bi-check2 me-1"></i>保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+{% block scripts %}
+<script>
+(function(){
+  const $=BKP.$; let list=[]; let editing=null; let pwdId=null; let permCatalog="";
+  BKP.api("/api/rbac/permissions").then(d=>{
+    permCatalog = (d.permissions||[]).map(p=>p.key).join(" · ");
+    $("#permHints").textContent = "可选权限点：" + permCatalog;
+  });
+
+  function render(){
+    const tb=$("#tbody"); tb.innerHTML="";
+    list.forEach(u=>{
+      const tr=document.createElement("tr");
+      const status=u.enabled?'<span class="badge bg-success">启用</span>':'<span class="badge bg-warning text-dark">停用</span>';
+      const roleBadge={
+        admin:'<span class="badge bg-danger">admin</span>',
+        operator:'<span class="badge bg-warning text-dark">operator</span>',
+        viewer:'<span class="badge bg-info text-dark">viewer</span>',
+      }[u.role]||`<span class="badge bg-secondary">${u.role}</span>`;
+      const must=u.must_change_password?'<i class="bi bi-key text-warning ms-1" title="登录后须改密"></i>':"";
+      tr.innerHTML=`
+        <td>${u.id}</td>
+        <td><code>${u.username}</code>${must}</td>
+        <td>${u.display_name||""}</td>
+        <td>${roleBadge}</td>
+        <td>${u.email||""}</td>
+        <td>${status}</td>
+        <td><span class="text-muted small">${u.last_login_at||"—"}</span></td>
+        <td class="text-end">
+          <button class="btn btn-sm btn-outline-primary me-1" data-act="edit" data-id="${u.id}">编辑</button>
+          <button class="btn btn-sm btn-outline-secondary me-1" data-act="pwd" data-id="${u.id}">密码</button>
+          <button class="btn btn-sm btn-outline-danger" data-act="del" data-id="${u.id}">删除</button>
+        </td>`;
+      tb.appendChild(tr);
+    });
+    $("#badgeCount").textContent=list.length+" 个";
+  }
+  function reload(){ return BKP.api("/api/rbac/users").then(d=>{list=d.users||[];render();}); }
+
+  function openEditor(u){
+    editing=u||null;
+    $("#editTitle").textContent=u?`编辑用户：${u.username}`:"新增用户";
+    $("#f_username").value=(u&&u.username)||"";
+    $("#f_username").disabled=!!u;
+    $("#f_display_name").value=(u&&u.display_name)||"";
+    $("#f_email").value=(u&&u.email)||"";
+    $("#f_password").value="";
+    $("#f_password").attr?$("#f_password").attr("placeholder",u?"留空则不修改密码（可在「密码」弹窗修改）":"≥6 位"):null;
+    $("#f_password").placeholder=u?"留空则不修改密码（可在「密码」弹窗修改）":"≥6 位";
+    $("#f_role").value=(u&&u.role)||"viewer";
+    $("#f_enabled").checked=!u||!!u.enabled;
+    $("#f_must_change").checked=!!(u&&u.must_change_password);
+    $("#f_permissions").value=(u&&u.permissions)||"";
+    new bootstrap.Modal($("#editModal")).show();
+  }
+
+  function collect(){
+    return {
+      username:($("#f_username").value||"").trim(),
+      display_name:$("#f_display_name").value||"",
+      email:$("#f_email").value||"",
+      password:$("#f_password").value||"",
+      role:$("#f_role").value,
+      enabled:$("#f_enabled").checked?1:0,
+      must_change_password:$("#f_must_change").checked?1:0,
+      permissions:$("#f_permissions").value||"",
+    };
+  }
+  $("#btnNew").onclick=()=>openEditor(null);
+  $("#btnSave").onclick=()=>{
+    const data=collect();
+    if(!data.username){BKP.toast("用户名必填","warning");return;}
+    if(!editing && (!data.password||data.password.length<6)){BKP.toast("密码 ≥6 位","warning");return;}
+    if(editing && data.password && data.password.length<6){BKP.toast("密码 ≥6 位","warning");return;}
+    const act=editing?`/api/rbac/users/${editing.id}`:"/api/rbac/users";
+    const opt=editing?{method:"PUT"}:{method:"POST"};
+    BKP.api(act,{...opt,body:JSON.stringify(data)})
+      .then(()=>{BKP.toast("保存成功","success");bootstrap.Modal.getInstance($("#editModal")).hide();reload();})
+      .catch(e=>BKP.toast(e.message||"保存失败","danger"));
+  };
+  $("#tbody").addEventListener("click",(e)=>{
+    const btn=e.target.closest("button[data-act]"); if(!btn) return;
+    const id=+btn.dataset.id; const a=list.find(x=>x.id===id); if(!a) return;
+    const act=btn.dataset.act;
+    if(act==="edit") openEditor(a);
+    else if(act==="pwd"){
+      pwdId=id; $("#np_password").value="";
+      new bootstrap.Modal($("#pwdModal")).show();
+    }
+    else if(act==="del"){
+      if(!confirm(`删除用户 ${a.username}?`)) return;
+      BKP.api(`/api/rbac/users/${id}`,{method:"DELETE"}).then(()=>{BKP.toast("已删除","success");reload();}).catch(er=>BKP.toast(er.message||"删除失败","danger"));
+    }
+  });
+  $("#btnSavePwd").onclick=()=>{
+    const p=$("#np_password").value||"";
+    if(p.length<6){BKP.toast("密码 ≥6 位","warning");return;}
+    BKP.api(`/api/rbac/users/${pwdId}/password`,{method:"POST",body:JSON.stringify({password:p})})
+      .then(()=>{BKP.toast("密码已重置","success");bootstrap.Modal.getInstance($("#pwdModal")).hide();})
+      .catch(er=>BKP.toast(er.message||"保存失败","danger"));
+  };
+
+  reload().catch(e=>BKP.toast(e.message||"加载失败","danger"));
+})();
+</script>
+{% endblock %}

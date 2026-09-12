@@ -84,6 +84,37 @@ window.BKP = (function () {
     return s + "s";
   };
 
+  // ============== RBAC：权限缓存与可见性检查 ==============
+  // 调用 BKP.loadPerms() 后 BKP.hasPerm('xxx.yyy') 返回布尔值。
+  BKP._perms = null;
+  BKP._permsBy = function () {
+    if (BKP._perms) return Promise.resolve(BKP._perms);
+    return fetch("/api/rbac/me", { credentials: "same-origin" })
+      .then(function (r) { return r.ok ? r.json() : {}; })
+      .then(function (d) { BKP._perms = new Set(d.permissions || []); return BKP._perms; })
+      .catch(function () { BKP._perms = new Set(); return BKP._perms; });
+  };
+  BKP.hasPerm = function (perm) {
+    if (!BKP._perms) return false;
+    return BKP._perms.has(perm);
+  };
+  BKP.applyMenuPerms = function (selector) {
+    selector = selector || "[data-perm]";
+    return BKP._permsBy().then(function () {
+      var els = document.querySelectorAll(selector);
+      var any = false;
+      els.forEach(function (el) {
+        var p = el.getAttribute("data-perm");
+        if (p && !BKP.hasPerm(p)) {
+          el.style.display = "none";
+        } else if (p) {
+          any = true;
+        }
+      });
+      return any;
+    });
+  };
+
   // ---- 文件大小人类可读 ----
   BKP.humanSize = function (n) {
     if (n == null || n === 0) return "0 B";

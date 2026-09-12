@@ -65,6 +65,14 @@ def create_app() -> Flask:
     app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
     app.config["PERMANENT_SESSION_LIFETIME"] = _dt.timedelta(seconds=config.SESSION_TIMEOUT)
     db.init_schema()
+    # RBAC 启动种子：users 表为空时建首个 admin（兼容老部署）
+    try:
+        from core import rbac as _rbac
+        u = _rbac.seed_admin_if_empty()
+        if u:
+            print(f"[startup] rbac: 已就绪内置管理员 {u.get('username')} (role={u.get('role')})")
+    except Exception as e:
+        print(f"[startup] rbac 初始化失败（不影响主流程）: {e}")
     # 本地备份存储位置（L1 落点）：界面配置 > 环境变量/config.json > 默认（程序目录）
     config.load_backup_root_from_db()
     # 可插拔数据库适配器：把 db_adapters 表中所有 enabled=1 的项注入引擎注册表
@@ -128,7 +136,7 @@ def create_app() -> Flask:
     def login_page():
         if request.method == "POST":
             data = request.get_json(silent=True) or {}
-            u = request.form.get("username") or data.get("username") or ""
+            u = (request.form.get("username") or data.get("username") or "").strip()
             p = request.form.get("password") or data.get("password") or ""
             ip = request.remote_addr or "unknown"
             is_json = request.headers.get("Content-Type", "").startswith("application/json")
@@ -139,15 +147,47 @@ def create_app() -> Flask:
                     return jsonify({"error": f"登录失败次数过多，IP 已被锁定，请 {remain} 分钟后再试"}), 429
                 return render_template("login.html",
                                        error=f"登录失败次数过多，IP 已被锁定，请 {remain} 分钟后再试")
-            # 常量时间比较，避免时序侧信道
-            ok = (hmac.compare_digest(u, config.WEB_USERNAME)
-                  and hmac.compare_digest(p, config.WEB_PASSWORD))
-            if ok:
+            # RBAC：优先 users 表（PBKDF2），回退 config 内置账号
+            user_row = None
+            try:
+                import core.rbac as rbac
+                # 启动种子（首次部署 users 表为空时建超管）
+                rbac.seed_admin_if_empty()
+                user_row = rbac.get_by_username(u, include_disabled=False)
+                if user_row:
+                    if not rbac.verify_password(p, user_row.get("password_hash") or ""):
+                        user_row = None
+            except Exception:
+                user_row = None
+            # 回退：config 内置账号（仅当 users 表无同名用户）
+            if not user_row:
+                try:
+                    import core.rbac as rbac
+                    if rbac.verify_builtin(u, p):
+                        user_row = {"id": 0, "username": u,
+                                    "display_name": u or "内置管理员",
+                                    "role": "admin"}
+                except Exception:
+                    pass
+            if user_row:
                 _LOGIN_ATTEMPTS.pop(ip, None)
-                session["user"] = u
+                # 标准化 session：dict 结构便于权限校验
+                session["user"] = {
+                    "id": user_row.get("id", 0),
+                    "username": user_row.get("username") or u,
+                    "display_name": user_row.get("display_name") or u,
+                    "role": user_row.get("role") or "admin",
+                }
                 session.permanent = True
+                # 记录登录（仅 DB 用户；内置账号无 id）
+                try:
+                    if user_row.get("id"):
+                        import core.rbac as rbac
+                        rbac.record_login(user_row["id"], ip)
+                except Exception:
+                    pass
                 if is_json:
-                    return jsonify({"ok": True})
+                    return jsonify({"ok": True, "user": session["user"]})
                 return redirect(url_for("dashboard_page"))
             _register_login_fail(ip)
             if is_json:
@@ -283,6 +323,12 @@ def create_app() -> Flask:
     def db_adapters_page():
         """可插拔数据库类型：内置 + 用户脚本模板自定义。"""
         return render_template("db_adapters.html", page="db-adapters")
+
+    @app.route("/users")
+    @login_required
+    def users_page():
+        """用户与角色管理（RBAC）。"""
+        return render_template("users.html", page="users")
 
     @app.route("/operations")
     @login_required

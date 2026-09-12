@@ -155,11 +155,50 @@ def _add(items: List[dict], check: str, status: str,
                   "message": message, "detail": detail or []})
 
 
+def _target_db_missing_hint(cfg, err) -> str:
+    """目标库不存在的识别与整改提示（非 MySQL 目标不自动建库）。"""
+    text = str(err).lower()
+    db = cfg.tgt_db_name or "?"
+    if (cfg.tgt_db_type or "").lower() in ("mysql", "mariadb"):
+        if "1049" in text or "unknown database" in text:
+            return (f"目标库 {db} 不存在且自动建库未生效："
+                    "请确认目标账号具备 CREATE 权限")
+        return ""
+    if "does not exist" in text or "unknown database" in text:
+        return (f"目标库 {db} 不存在：{cfg.tgt_db_type} 目标不自动建库，"
+                "请先在目标实例创建该库后重跑预检")
+    return ""
+
+
+def _ensure_target_db(cfg, items: List[dict]) -> None:
+    """目标库预检/自动建库（必须早于连通性与表存在性检查）。
+
+    MySQL/MariaDB 目标库不存在时自动建库——否则下游 writer.connect() 会以
+    "目标库连接失败(1049 Unknown database)" 提前判失败，与「数据迁移」页
+    （自动建库）行为不一致。
+    """
+    from .engine import _ensure_target_database
+    try:
+        r = _ensure_target_database(cfg)
+    except Exception as e:  # noqa: BLE001
+        _add(items, "target_database", "warn", f"目标库预检异常: {e}")
+        return
+    msg = r.get("message") or ""
+    if r.get("created"):
+        _add(items, "target_database", "pass", msg)
+    elif (cfg.tgt_db_type or "").lower() in ("mysql", "mariadb") \
+            and msg and "已存在" not in msg:
+        _add(items, "target_database", "warn", msg)
+
+
 def run_precheck(cfg) -> Dict[str, Any]:
     """执行预校验。返回 {passed, fail, warn, items:[...]}。"""
     from core.data_compare import _get_columns, _get_pk_column, _table_ref
     from core.sync.plugins import registry
     items: List[dict] = []
+
+    # ---- -1) 目标库预检/自动建库（必须先于连通性检查）----
+    _ensure_target_db(cfg, items)
 
     tables = list(cfg.source_tables_list or []) or (
         [cfg.source_table] if cfg.source_table else [])
@@ -212,7 +251,9 @@ def run_precheck(cfg) -> Dict[str, Any]:
         _add(items, "target_connectivity", "pass",
              f"目标 {cfg.tgt_db_type} {cfg.tgt_host}:{cfg.tgt_port} 连接正常")
     except Exception as e:
-        _add(items, "target_connectivity", "fail", f"目标库连接失败: {e}")
+        hint = _target_db_missing_hint(cfg, e)
+        _add(items, "target_connectivity", "fail",
+             f"目标库连接失败: {e}" + (f"（{hint}）" if hint else ""))
         return _summary(items)
 
     overwrite = cfg.save_mode == "overwrite"

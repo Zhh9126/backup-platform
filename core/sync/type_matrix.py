@@ -294,7 +294,11 @@ def _datetime_target(tgt: str, t: dict):
         return ("INTEGER" if tgt not in ("mysql", "mariadb") else "YEAR",
                 "warn", "YEAR → INTEGER（目标无 YEAR 类型）")
     if base == "time" and tgt in ("oracle",):
-        return (None, "fail", "Oracle 无 TIME 类型（DTS 规则：MySQL TIME→Oracle 不支持）")
+        # Oracle 无纯 TIME 类型：按 'HH:MM:SS[.ffffff]' 字符串承载。落 DATE 会引入
+        # 无意义的日期部分，且无法表达 MySQL TIME 的超 24h / 负值语义，字符串最保真。
+        return ("VARCHAR2(16)", "warn",
+                "Oracle 无 TIME 类型：按字符串承载 'HH:MM:SS'（保留超 24h/负值语义，"
+                "需人工确认是否改按 DATE 处理）")
     if base == "datetime":
         if tgt in ("oracle", "dameng"):
             p = t["prec"]
@@ -326,8 +330,12 @@ def _datetime_target(tgt: str, t: dict):
             return ("DATETIMEOFFSET", "ok",
                     "TIMESTAMPTZ → DATETIMEOFFSET（精度按源端保留）")
         if tgt in ("mysql", "mariadb"):
-            return (None, "fail",
-                    "MySQL/MariaDB 无原生带时区时间戳类型（DTS 规则：需落字符串/TIMESTAMP 转 UTC）")
+            # DTS 规则：按 UTC 归一为 DATETIME(6)。选 DATETIME 而非 TIMESTAMP：
+            # TIMESTAMP 有 2038 上限且受会话时区影响；DATETIME(6) 保留微秒精度、
+            # 覆盖全时间范围。原始时区偏移丢失，跨时区业务需人工确认。
+            return ("DATETIME(6)", "warn",
+                    "MySQL/MariaDB 无带时区时间戳：按 UTC 归一为 DATETIME(6)"
+                    "（微秒精度保留、时区偏移丢失，跨时区业务需人工确认）")
         return ("VARCHAR(64)", "warn", "UNKNOWN 目标库：带时区时间戳按字符串承载")
     # SQL Server DATETIME2/DATETIMEOFFSET/SMALLDATETIME 跨库
     if base == "datetime2":
@@ -362,7 +370,11 @@ def _datetime_target(tgt: str, t: dict):
             return ("VARCHAR(64)", "warn",
                     "INTERVAL → VARCHAR(64)（SQL Server 无原生 INTERVAL 类型）")
         if tgt in ("mysql", "mariadb"):
-            return (None, "fail", "目标库无原生 INTERVAL 类型（建议转字符串或拆字段）")
+            # MySQL/MariaDB 无 INTERVAL：按文本承载（'1-2' / '3 04:05:06'）。
+            # 拆成 年/月/日/秒 多字段需业务侧决策，故默认字符串 + 人工确认。
+            return ("VARCHAR(64)", "warn",
+                    "MySQL/MariaDB 无原生 INTERVAL：按字符串承载"
+                    "（'1-2' / '3 04:05:06'，需人工确认是否拆字段）")
         return ("VARCHAR(64)", "warn", "UNKNOWN 目标库：INTERVAL 按字符串承载")
     # 其它库的时间类型别名：按目标方言归一为标准时间类型。
     # 绝不能原样输出源类型名（BIGDATETIME 等曾让目标库建表直接失败）
@@ -441,6 +453,21 @@ def _blob_target(tgt: str, t: dict):
     return ("BLOB" if tgt in ("mysql", "mariadb", "dameng") else "VARBINARY(MAX)", "ok", "")
 
 
+def _enum_value_max_len(raw_inner: str) -> int:
+    """从 ENUM/SET 括号内原文（如 "'a','bb','ccc'"）取最长取值长度。
+
+    跨库落 VARCHAR2(n)/VARCHAR(n) 时长度必须按最长枚举值，固定 4000/255 会
+    与源语义脱节（过短截断、过长浪费），故统一按值长计算。
+    """
+    raw = str(raw_inner or "").strip()
+    if not raw:
+        return 0
+    best = 0
+    for part in raw.split(","):
+        best = max(best, len(part.strip().strip("'\"")))
+    return best
+
+
 def _special_target(tgt: str, t: dict):
     """特殊类型：JSON / ENUM / SET / BIT / BOOL / UUID / geometry 以及各数据库偏门类型。"""
     # 数组修饰必须在最前面判定：'integer[]' 的 base 是 integer，直接查 _FAMILY 会得到
@@ -469,7 +496,12 @@ def _special_target(tgt: str, t: dict):
             return ("VARCHAR(128)", "warn",
                     "ENUM/SET 枚举值列表缺失，VARCHAR 兜底（建议人工补全）")
         if tgt == "oracle":
-            return (None, "fail", "Oracle 不支持 ENUM/SET（DTS 规则）→ 建议 VARCHAR/CLOB")
+            # Oracle 无 ENUM/SET：按最长枚举值长度落 VARCHAR2（取值约束由应用层
+            # 保证）。此前判 fail 会整条链路阻断，实际 VARCHAR2(n) 即可承载。
+            n = _enum_value_max_len(t.get("raw_inner") or "") or 255
+            return (f"VARCHAR2({n})", "warn",
+                    f"Oracle 无 ENUM/SET：按 VARCHAR2({n}) 承载（长度取最长枚举值，"
+                    "枚举约束与应用层校验需人工确认）")
         return ("VARCHAR(128)", "warn", "ENUM/SET → VARCHAR（枚举约束丢失，应用层校验）")
     if fam == "bit":
         p = t.get("prec") or 1
@@ -498,19 +530,31 @@ def _special_target(tgt: str, t: dict):
         return ("CHAR(36)" if tgt not in ("oracle",) else "VARCHAR2(36)",
                 "warn", "UUID → 字符串承载（目标无原生 UUID）")
     if fam == "geometry":
+        # 空间类型跨库：目标库需具备空间能力（PG 需 PostGIS、达梦需 DMGEO、
+        # Oracle 需 Spatial），且 SRID / 坐标系 / 几何存储结构并非直接兼容，
+        # 统一按"需人工确认"的 warn 处理（此前 fail 会整条链路阻断）。
         if tgt in ("mysql", "mariadb"):
-            return ("GEOMETRY", "ok", "")
+            return ("GEOMETRY", "warn",
+                    "MySQL 空间类型内置（无需扩展）；SRID 与几何结构（WKB）需人工确认")
         if tgt == "oracle":
-            return ("MDSYS.SDO_GEOMETRY", "warn", "空间类型需 SDO 结构转换，非直接迁移")
+            return ("MDSYS.SDO_GEOMETRY", "warn",
+                    "Oracle 需 Spatial 组件：WKT/WKB → MDSYS.SDO_GEOMETRY 结构转换"
+                    "与 SRID 需人工确认")
         if tgt in ("postgresql", "kingbase"):
-            return ("GEOMETRY", "warn", "PG 几何类型需 PostGIS 扩展（无扩展时降 TEXT）")
+            return ("GEOMETRY", "warn",
+                    "PG/金仓需 PostGIS 扩展（缺失时降 TEXT）："
+                    "请先执行 CREATE EXTENSION IF NOT EXISTS postgis;，SRID 需人工确认")
         if tgt == "sqlserver":
             # 只有 geography 是地理坐标系类型；geometry / st_geometry / sdo_geometry
             # 等均为平面几何 → GEOMETRY（否则达梦 ST_GEOMETRY 会被误判为 GEOGRAPHY）
-            return ("GEOGRAPHY" if t["base"] == "geography" else "GEOMETRY", "ok", "")
+            return ("GEOGRAPHY" if t["base"] == "geography" else "GEOMETRY", "warn",
+                    "SQL Server 空间类型内置（无需扩展）；"
+                    "SRID（geometry 默认 0）与几何结构需人工确认")
         if tgt == "dameng":
-            return ("ST_GEOMETRY", "warn", "达梦空间类型需 ST_GEOMETRY（DTS 规则）")
-        return (None, "fail", "目标库无对应空间类型（DTS：Oracle 目标空间类型不支持）")
+            return ("ST_GEOMETRY", "warn",
+                    "达梦需 DMGEO 包（ST_GEOMETRY）；SRID 与几何结构需人工确认")
+        return ("CLOB", "warn",
+                "目标库无对应空间类型：按 WKT 文本承载（应用层转几何，需人工确认）")
     # PG 数组家族：跨库一律转 JSON 字符串承载（数组语义跨库不通用）
     if fam == "array":
         if tgt in ("mysql", "mariadb"):

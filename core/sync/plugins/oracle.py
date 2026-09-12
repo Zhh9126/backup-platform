@@ -266,7 +266,9 @@ class OracleSinkWriter(SinkWriter):
         if base == "TIMESTAMPTZ" or base == "DATETIMEOFFSET":
             return "TIMESTAMP WITH TIME ZONE"
         if base == "TIME":
-            return "VARCHAR(20)"                   # Oracle 无原生 TIME
+            # Oracle 无原生 TIME：字符串承载 'HH:MM:SS'（落 DATE 会引入无意义日期
+            # 部分，且无法表达 MySQL TIME 的超 24h / 负值语义）
+            return "VARCHAR2(16)"
         if base == "YEAR":
             return "NUMBER(4)"
         if base == "INTERVAL" or base.startswith("INTERVAL"):
@@ -285,9 +287,15 @@ class OracleSinkWriter(SinkWriter):
         if base == "XML" or base == "XMLTYPE":
             return "XMLTYPE"
         if base in ("ENUM", "SET"):
-            # Oracle 不支持 ENUM/SET（DTS 规则）；建表时只能兜底为 VARCHAR，
-            # precheck/type_matrix 应在更早阶段拦截此组合，避免无效建表
-            return "VARCHAR2(4000)"
+            # Oracle 无 ENUM/SET：按最长枚举值长度落 VARCHAR2（取值约束由应用层
+            # 保证）。长度必须按源枚举值计算——固定 4000 与实际语义脱节
+            from core.sync.type_matrix import _enum_value_max_len
+            raw = ""
+            src_t = c.type or ""
+            if "(" in src_t and ")" in src_t:
+                raw = src_t.split("(", 1)[1].rsplit(")", 1)[0]
+            n = _enum_value_max_len(raw) or c.max_length or 255
+            return f"VARCHAR2({min(n, 4000)})"
         if base in ("UROWID", "ROWID"):
             return "UROWID" if base == "UROWID" else "ROWID"
         if base == "BFILE":

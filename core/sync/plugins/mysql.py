@@ -239,9 +239,11 @@ class MySQLSinkWriter(SinkWriter):
         if base in ("TEXT", "LONGTEXT", "MEDIUMTEXT", "TINYTEXT", "BLOB", "LONGBLOB",
                     "MEDIUMBLOB", "TINYBLOB", "DATE", "DATETIME", "TIMESTAMP", "TIME",
                     "FLOAT", "DOUBLE", "REAL", "BIT", "JSON", "BINARY", "VARBINARY"):
-            # MySQL 没有带时区的时间戳，'TIMESTAMP WITH TIME ZONE' 原样输出会建表报错
+            # MySQL 没有带时区的时间戳：'TIMESTAMP WITH TIME ZONE'/'TIMESTAMPTZ'
+            # 原样输出会建表报错。按 UTC 归一为 DATETIME(6)——保留微秒精度且
+            # 无 TIMESTAMP 的 2038 上限（与 type_matrix 的映射建议保持一致）
             if base == "TIMESTAMP" and "WITH" in t:
-                return "TIMESTAMP"
+                return "DATETIME(6)"
             return t
         # 跨源兜底：源端列类型来自别的库（JSONB/XMLTYPE/HIERARCHYID/INET/ROWID/
         # TSVECTOR...）时用统一类型矩阵翻译，避免无脑落 VARCHAR(255) 丢语义

@@ -13,6 +13,8 @@
 import json
 import logging
 import re
+import socket
+import threading
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -370,10 +372,10 @@ class SyncEngine:
     def _run_realtime(self, progress_callback=None) -> Dict[str, Any]:
         cfg = self.config
         # 实时引擎选择：离线环境默认 polling（纯 Python 轮询 CDC，无外部
-        # 组件依赖）；MySQL 源且显式配置 flink_config.engine="flink" 时才走
-        # Flink CDC 轨道（在线环境）。
+        # 组件依赖）；MySQL/MariaDB 源（binlog 协议族）且显式配置
+        # flink_config.engine="flink" 时才走 Binlog CDC 轨道（在线环境）。
         engine_kind = (cfg.flink_config or {}).get("engine") or "polling"
-        if engine_kind == "flink" and cfg.src_db_type == "mysql":
+        if engine_kind == "flink" and cfg.src_db_type in ("mysql", "mariadb"):
             return self._run_realtime_binlog(progress_callback)
         return self._run_realtime_polling(progress_callback)
 
@@ -505,10 +507,38 @@ class SyncEngine:
         finally:
             reader.close(conn=conn)
 
+    @staticmethod
+    def _interrupt_stream(stream: Any) -> None:
+        """打断 BinLogStreamReader 的阻塞读（停止实时同步时立即生效）。
+
+        pymysql 的 Connection.close() 只 close 不 shutdown，Linux 下无法唤醒已
+        阻塞在 socket.recv 的线程（实测 stream.close() 后仍卡 40s+）；必须先对
+        底层 socket 做 shutdown(SHUT_RDWR)，再 close。
+        """
+        for conn in (getattr(stream, "_stream_connection", None),
+                     getattr(stream, "_ctl_connection", None)):
+            sock = getattr(conn, "_sock", None)
+            raw = getattr(sock, "_sock", None)
+            for s in (sock, raw):
+                if s is None:
+                    continue
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except Exception:  # noqa: BLE001
+                    pass
+        try:
+            stream.close()
+        except Exception:  # noqa: BLE001
+            pass
+
     def _run_realtime_binlog(self, progress_callback=None) -> Dict[str, Any]:
         cfg = self.config
-        if cfg.src_db_type != "mysql":
-            return {"success": False, "message": "实时同步当前仅支持 MySQL 源（Binlog CDC）"}
+        if cfg.src_db_type not in ("mysql", "mariadb"):
+            # Binlog CDC 依赖 MySQL 协议族的 binlog（MariaDB 为同一协议族，
+            # SHOW MASTER STATUS / ROW 事件 / CRC32 校验均兼容）
+            return {"success": False,
+                    "message": "Binlog CDC 实时同步仅支持 MySQL/MariaDB 源；"
+                               "其他库型请使用轮询式实时同步（flink_config.engine=polling）"}
         try:
             from pymysqlreplication import BinLogStreamReader
             from pymysqlreplication.row_event import (
@@ -616,6 +646,18 @@ class SyncEngine:
                 resume_stream=True,
                 auto_position=None,
             )
+
+            # 停止响应看门狗：停止信号置位后主动关闭 binlog 流以打断阻塞读。
+            # 否则 for event in stream 会阻塞到源库产生下一个事件，停止动作
+            # 可能延迟数分钟（前端「停止」长时间无响应，实测复现）。
+            def _watch_stop() -> None:
+                while not stop_ev.wait(1.0):
+                    pass
+                self._interrupt_stream(stream)
+
+            threading.Thread(target=_watch_stop, name=f"stop-watch-{cfg.task_id}",
+                             daemon=True).start()
+
             while not stop_ev.is_set():
                 for event in stream:
                     if stop_ev.is_set():
@@ -652,7 +694,16 @@ class SyncEngine:
                                 f"binlog {log_file}")
                         })
         except RuntimeError as e:
-            return {"success": False, "message": str(e)}
+            if stop_ev.is_set():
+                logger.info("[sync#%s] 收到停止信号，实时同步退出（%s）", cfg.task_id, e)
+            else:
+                return {"success": False, "message": str(e)}
+        except Exception as e:  # noqa: BLE001
+            # 停止时看门狗关闭 stream 会打断阻塞读并抛出异常（连接已关闭等），
+            # 属正常停止路径，不应记为失败
+            if not stop_ev.is_set():
+                logger.exception("[sync#%s] binlog 监听异常终止", cfg.task_id)
+                return {"success": False, "message": f"binlog 监听异常: {e}"}
         finally:
             try:
                 if writer_conn is not None:

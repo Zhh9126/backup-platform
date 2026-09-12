@@ -637,8 +637,19 @@ def _decorate_sync(row: dict) -> dict:
         row.get("tgt_db_type"), row.get("tgt_db_type"))
     row["has_src_password"] = bool(row.get("src_password"))
     row["has_tgt_password"] = bool(row.get("tgt_password"))
-    # 统一 last_status：未执行时回退到 status="never"，确保前端一致显示
-    row["last_status"] = row.get("last_status") or row.get("status") or "never"
+    # 统一状态字段（status / last_status 双写但有先后差异）：终态优先，其次运行态，
+    # 最后回退 never。此前仅回退空值，运行路径只更新 status 时列表会长期显示 never。
+    _term = ("success", "failed", "partial", "error", "canceled", "cancelled")
+    _st = str(row.get("status") or "").strip().lower()
+    _ls = str(row.get("last_status") or "").strip().lower()
+    if _st in _term:
+        row["last_status"] = row.get("status")          # 手动运行路径以 status 为准
+    elif _ls in _term:
+        row["last_status"] = row.get("last_status")     # 调度器路径以 last_status 为准
+    elif _st and _st != "never":
+        row["last_status"] = row.get("status")          # running/queued 等运行态
+    else:
+        row["last_status"] = row.get("last_status") or "never"
     # 若源是托管数据库任务，附带任务名供前端友好展示（去掉 ID 编号）
     if row.get("source_type") == "managed" and row.get("source_task_id"):
         name = db.query_one(
@@ -754,9 +765,16 @@ def delete_sync_task(sync_id: int) -> bool:
 
 def set_sync_status(sync_id: int, last_run_at: str, last_status: str,
                     message: str = "") -> None:
+    """更新同步任务运行状态（status 与 last_status 双写）。
+
+    此前只写 last_status：调度器触发的同步结束后 status 会残留 running，
+    前端按 status 判断运行态时会长期显示"运行中"；反之手动运行路径若只写
+    status 则列表显示 never。双写后两个字段语义一致。
+    """
     db.execute(
-        "UPDATE sync_tasks SET last_run_at=?, last_status=?, message=? WHERE id=?",
-        (last_run_at, last_status, message, sync_id))
+        "UPDATE sync_tasks SET last_run_at=?, last_status=?, status=?, message=?, "
+        "updated_at=? WHERE id=?",
+        (last_run_at, last_status, last_status, message, db.now_iso(), sync_id))
 
 
 # ------------------------- 同步记录 -------------------------

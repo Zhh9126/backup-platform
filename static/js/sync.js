@@ -13,6 +13,7 @@
   let mapping = [];         // [{source, target, source_type, target_type}]
   let selectedSource = null;
   let selectedTarget = null;
+  let runningTimer = null;  // 运行态任务的列表自动轮询定时器
 
   // 概念区分（业界定义）：迁移=一次性任务（full，跑完即止，支持覆盖写入）；
   // 同步=持续性任务（incremental/realtime，常驻运行保持两端一致）
@@ -87,7 +88,7 @@
         <td>${esc(t.src_db_display || t.src_db_type || "-")} <i class="bi bi-arrow-right"></i> ${esc(t.tgt_db_display || t.tgt_db_type || "-")}</td>
         <td>${esc(t.source_table || "-")} <i class="bi bi-arrow-right"></i> ${esc(t.target_table || "-")}</td>
         <td>${(t.sync_mode === "full") ? "迁移·一次性" : "同步·持续"} / ${esc(t.save_mode || "append")}</td>
-        <td>${statusBadge(t.last_status)}</td>
+        <td>${statusBadge(t.status === "running" ? "running" : (t.last_status || t.status))}</td>
         <td>${fmtTime(t.last_run_at)}</td>
         <td>${esc(t.message || "")}</td>
         <td>
@@ -99,6 +100,13 @@
         </td>
       </tr>`;
     }).join("");
+    // 运行态任务自动轮询：实时/长任务的状态与进度需要及时反映（3s）
+    clearTimeout(runningTimer);
+    if (tasks.some(function (t) {
+      return (t.status || t.last_status) === "running";
+    })) {
+      runningTimer = setTimeout(refreshTasks, 3000);
+    }
   }
 
   // -------------- Modal / 表单 --------------

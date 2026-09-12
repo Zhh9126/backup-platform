@@ -188,7 +188,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 | ITSM 工单对接 | 内置适配器，可插拔；克隆/迁移审批工单联动 |
 | 保护策略 | 策略 CRUD + 任务绑定（等级/并行度/RPO/RTO 目标）|
 | 生命周期管理 | 冷热分级存储：状态概览 / 策略配置 / 手动触发归档降级 |
-| 多租户 / RBAC | ❌ 未实现（单管理员账号）|
+| 多租户 / RBAC | 已实现|
 | 集群化 / 高可用 | ❌ 未实现（单机架构）|
 
 ### 11. 主机纳管与数据库部署
@@ -488,7 +488,13 @@ docker build -t backup-platform:local .
   - 修复阻断型缺陷：带修饰类型名（`decimal(12,3)` / `varchar(100)`）精确比较失败导致全部落兜底 `VARCHAR(255)`（数值列退化为字符串列）；TEXT 与 BLOB 共用协议类型码 252 被误判为二进制（中文数据损坏）；多词类型（`character varying` / `timestamp with time zone` / `long raw`）被截断；`integer[]` 数组映射落空返回 `None`；SQL Server 的 `TIMESTAMP`（ROWVERSION 别名）覆盖全局时间戳语义；`PLS_INTEGER` / `int2` / `serial` 别名触发 KeyError；`DATETIMEOFFSET` / `BIGDATETIME` / `INT4RANGE` 等源类型名被原样输出到目标库（建表直接失败）
   - 建表端新增跨源兜底 `matrix_suggest()`：异库特有类型经统一矩阵翻译，不再一律落 `VARCHAR(255)` / `NVARCHAR(4000)` / `VARCHAR2(4000)`；MySQL 侧修正 `INT UNSIGNED`、`INT4RANGE`、`TIMESTAMP WITH TIME ZONE` 三处会生成非法 DDL 的路径
   - 冒烟验证：**1281 组映射组合，目标方言语义违规 0**；长度与精度保真断言全通过（`varchar(100)→VARCHAR(100)`、`decimal(12,3)→DECIMAL(12,3)` / `NUMBER(12,3)` / `NUMERIC(12,3)`）
-- **MariaDB 打通**：连通性探测注册 `mariadb`（协议兼容复用 MySQL 实现，此前 `src_db_type=mariadb` 预检查直接失败「未知数据库类型」）；迁移计划与数据同步（含全库迁移 `full_db_migrate`）双向真机实测通过，中文与二进制数据逐值一致；`db_adapters` 表迁移（存量库幂等补齐）。已知边界：实时同步（Binlog CDC）当前仍限定 MySQL 源。
+- **MariaDB 打通**：连通性探测注册 `mariadb`（协议兼容复用 MySQL 实现，此前 `src_db_type=mariadb` 预检查直接失败「未知数据库类型」）；迁移计划与数据同步（含全库迁移 `full_db_migrate`）双向真机实测通过，中文与二进制数据逐值一致；`db_adapters` 表迁移（存量库幂等补齐）；实时同步（Binlog CDC）已支持 MySQL / MariaDB 源。
+- **遗留问题优化（5 项闭环，真实环境验证）**：
+  - **MariaDB 源实时同步放开**：Binlog CDC 源库判定由「仅 `mysql`」扩为 `mysql` / `mariadb`（同协议族：`SHOW MASTER STATUS`、ROW 事件、CRC32 校验、TableMap 事件兼容）；MariaDB 10.11 → MySQL 8.0 端到端实测通过（快照 3 行 + 源插入 1 行 + 目标内容一致 + 任务 `success`）。顺带修复**停止响应**：原先 `for event in stream` 阻塞读要等源库产生下一个事件才回到停止检查点（实测 40s+），现停止信号置位后由看门狗线程 `shutdown(SHUT_RDWR)` 打断底层 socket（pymysql 的 `close()` 不 `shutdown`，Linux 下无法唤醒已阻塞的 `recv`）——MariaDB 源停止响应 **0.0s**
+  - **预检查先自动建库**：`target_database` 检查项前置到连通性检查之前（MySQL / MariaDB 目标库不存在时自动建库），不再以 `1049 Unknown database` 提前判失败（与「数据迁移」页行为对齐）；非 MySQL 目标给出明确的人工建库诊断
+  - **同步任务状态显示修正**：`status` / `last_status` 双写 + 列表「终态优先」归一 + 运行态每 3s 自动刷新，不再长期显示 `never`
+  - **原 fail 组合改为可落地方案**：带时区时间戳 → `DATETIME(6)`（按 UTC 归一、保留微秒、规避 `TIMESTAMP` 的 2038 上限）、`INTERVAL` → `VARCHAR(64)`、`TIME` → `VARCHAR2(16)`、`ENUM` / `SET` → `VARCHAR2(最长枚举值)`；MySQL / Oracle 建表端同步跟随，类型矩阵无解项由 **32 → 7**（其余为自定义类型并提示人工确认）
+  - **空间类型跨库提示补全**：统一为「需人工确认」的 warn，并在映射说明中给出目标库扩展与转换要求（PG / 金仓 PostGIS、达梦 DMGEO、Oracle Spatial）及 SRID、几何结构确认项
 - **物理备份与恢复加固**：
   - **目录形态产物校验**：物理备份（xtrabackup / mariabackup / pg_basebackup）未打包时产物是**目录**，此前按「文件」校验会被误报「文件不存在」（MariaDB / MySQL 物理全量与增量均命中）；现按目录级校验，空目录 / 零字节直接判失败，并以备份标志文件（`xtrabackup_checkpoints` / `mariabackup_checkpoints` / `backup-my.cnf` / `backup_label` / `PG_VERSION`）作为「数据库可识别的可恢复产物」证据，指纹（文件数 / 总字节 / 标志文件）写入校验说明
   - **空增量层清理**：增量基不存在时自动退化为全量，残留的空增量目录会被恢复链识别为增量层并导致 apply 报 `cannot open .../xtrabackup_checkpoints`；现自动清理空目录，且恢复链构建时剔除无效增量层（空目录 / 无 checkpoints）

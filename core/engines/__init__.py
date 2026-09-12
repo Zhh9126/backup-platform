@@ -60,7 +60,58 @@ for _name in _PERIPHERAL_API:
 def get_adapter_tier(db_type: str) -> str:
     """返回指定 db_type 的适配层分级；未知类型默认归为外围 API 集成。"""
     cls = ENGINE_REGISTRY.get(db_type)
-    return getattr(cls, "adapter_tier", "peripheral_api") if cls else "peripheral_api"
+    if cls:
+        return getattr(cls, "adapter_tier", "peripheral_api")
+    # 适配器动态注册（custom_api）—— 走 db_adapters 兼容查询
+    try:
+        from core import db_adapters
+        spec = db_adapters.get_by_dbtype(db_type, include_disabled=True)
+        if spec:
+            return "custom_api"
+    except Exception:
+        pass
+    return "peripheral_api"
+
+
+def supported_types() -> list:
+    """返回所有可用数据库类型键：内置 + 已启用的自定义适配器。"""
+    out = list(ENGINE_REGISTRY.keys())
+    try:
+        from core import db_adapters
+        for t in db_adapters.enabled_types():
+            if t not in out:
+                out.append(t)
+    except Exception:
+        pass
+    return out
+
+
+def engine_meta_map() -> dict:
+    """返回 db_type → 元信息，给前端下拉/分类展示用。"""
+    out = {}
+    for t, cls in ENGINE_REGISTRY.items():
+        out[t] = {
+            "db_type": t,
+            "display_name": getattr(cls, "display_name", t),
+            "category": "builtin",
+            "icon": "bi-hdd-stack",
+            "default_port": None,
+            "description": "",
+            "backup_modes": ["logical", "physical"],
+            "supports_incremental": True,
+            "supports_full_instance": True,
+            "supports_sync": True,
+            "adapter_tier": getattr(cls, "adapter_tier", "peripheral_api"),
+            "builtin": True,
+            "source": "builtin",
+        }
+    try:
+        from core import db_adapters
+        for spec in db_adapters.list_adapters(include_disabled=False):
+            out[spec["db_type"]] = db_adapters.engine_meta(spec)
+    except Exception:
+        pass
+    return out
 
 
 class AdapterContract(Protocol):
@@ -80,12 +131,20 @@ class AdapterContract(Protocol):
 def get_engine(db_type: str, task: dict, storage_root: str, logger=None):
     cls = ENGINE_REGISTRY.get(db_type)
     if not cls:
+        # 适配器未注册 → 尝试惰性注册（动态类型首次调度时）
+        try:
+            from core import db_adapters
+            if db_adapters.ensure_registered(db_type):
+                cls = ENGINE_REGISTRY.get(db_type)
+        except Exception:
+            pass
+    if not cls:
         raise ValueError(f"不支持的数据库类型: {db_type}")
     return cls(task, storage_root, logger)
 
 
-def supported_types() -> list:
-    return list(ENGINE_REGISTRY.keys())
+# supported_types() 已在引擎注册动态化改造中上移到模块中部（含适配器合并）。
+# 保留旧位置仅为兼容引用——> 真正的实现已在前文。
 
 
 def synthesize_full_for_task(task_id: int, target_storage_tier: int = None,

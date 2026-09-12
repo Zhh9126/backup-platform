@@ -9,7 +9,7 @@ logger = logging.getLogger("api.system")
 
 from auth import login_required
 from core import models, scheduler, db
-from core.engines import supported_types, ENGINE_DISPLAY
+from core.engines import supported_types, ENGINE_DISPLAY, engine_meta_map
 import config
 from . import api_bp
 
@@ -17,10 +17,16 @@ from . import api_bp
 @api_bp.route("/meta", methods=["GET"])
 @login_required
 def meta():
+    # 把 config.DEFAULT_PORTS 与适配器声明的 default_port 合并
+    default_ports = dict(config.DEFAULT_PORTS or {})
+    for t, info in engine_meta_map().items():
+        if info.get("default_port") and t not in default_ports:
+            default_ports[t] = info["default_port"]
     return jsonify({
         "db_types": supported_types(),
         "display_names": ENGINE_DISPLAY,
-        "default_ports": config.DEFAULT_PORTS,
+        "db_type_meta": engine_meta_map(),
+        "default_ports": default_ports,
         "demo_mode": config.DEMO_MODE,
         "scheduler_enabled": config.SCHEDULER_ENABLED,
         "backup_modes": {

@@ -67,6 +67,14 @@ def create_app() -> Flask:
     db.init_schema()
     # 本地备份存储位置（L1 落点）：界面配置 > 环境变量/config.json > 默认（程序目录）
     config.load_backup_root_from_db()
+    # 可插拔数据库适配器：把 db_adapters 表中所有 enabled=1 的项注入引擎注册表
+    try:
+        from core import db_adapters
+        n = db_adapters.register_all()
+        if n:
+            print(f"[startup] db_adapters: 已注册 {n} 个自定义适配器")
+    except Exception as e:
+        print(f"[startup] db_adapters 初始化失败（不影响内置引擎）: {e}")
     app.config["BACKUP_ROOT"] = str(config.get_backup_root())
     _root_info = config.backup_root_info()
     _store_log = db.get_logger("app")
@@ -269,6 +277,12 @@ def create_app() -> Flask:
     def plugins_page():
         """备份依赖插件管理（一键安装 xtrabackup / percona / mariabackup / pgbackrest 等）。"""
         return render_template("plugins.html", page="plugins")
+
+    @app.route("/db-adapters")
+    @login_required
+    def db_adapters_page():
+        """可插拔数据库类型：内置 + 用户脚本模板自定义。"""
+        return render_template("db_adapters.html", page="db-adapters")
 
     @app.route("/operations")
     @login_required

@@ -1093,9 +1093,6 @@ class BackupEngine:
             return self.restore(backup_path, **kwargs)
 
         from core import remote_dump
-        from core.engines.file import _ssh_exec_pipe
-        import time as _time
-
         ssh_host = kwargs.get("target_host_info") or remote_dump.resolve_ssh_host(self.task)
         if not ssh_host:
             return BackupResult(
@@ -1106,6 +1103,18 @@ class BackupEngine:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,
                 message=f"本地备份文件不存在: {backup_path}")
+
+        return self._restore_custom_remote(ssh_host, backup_path, script, extra, **kwargs)
+
+    def _restore_custom_remote(self, ssh_host: dict, backup_path: str,
+                               script: str, extra: dict, **kwargs) -> BackupResult:
+        """自定义恢复脚本的实际执行（run_restore / CustomDBEngine.restore 复用）。
+
+        步骤：SFTP 推送备份文件 → 上传脚本 → bash 执行（注入 PLATFORM_*）。
+        """
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+        import time as _time
 
         ts = self._timestamp()
         timeout_sec = int(extra.get("custom_timeout") or 7200)
@@ -1140,6 +1149,7 @@ class BackupEngine:
             out, err, rc = _ssh_exec_pipe(client, shell, timeout=timeout_sec)
             duration = round(_time.time() - start, 3)
             out_text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+            err_text = err or ""
 
             if rc != 0:
                 detail = (out_text or err_text or "")[-1200:]

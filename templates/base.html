@@ -29,6 +29,7 @@
         <a class="nav-link {% if page=='storage' %}active{% endif %}" href="/storage" title="存储管理"><i class="bi bi-hdd-rack"></i> <span class="nav-label">存储管理</span></a>
         <a class="nav-link {% if page=='protection' %}active{% endif %}" href="/protection" title="备份策略"><i class="bi bi-shield-lock"></i> <span class="nav-label">备份策略</span></a>
         <a class="nav-link {% if page=='plugins' %}active{% endif %}" href="/plugins" title="备份依赖插件（一键安装 xtrabackup / percona / mariabackup 等）"><i class="bi bi-plug"></i> <span class="nav-label">备份插件</span></a>
+        <a class="nav-link {% if page=='db-adapters' %}active{% endif %}" href="/db-adapters" title="可插拔数据库类型（界面新增一种数据库即可用于备份/恢复）"><i class="bi bi-stack"></i> <span class="nav-label">数据库类型</span></a>
         <a class="nav-link {% if page=='rt_timeline' %}active{% endif %}" href="/rt-timeline" title="实时备份（准 CDP）"><i class="bi bi-broadcast-pin"></i> <span class="nav-label">实时备份</span></a>
         <div class="nav-group-label">数据恢复管理</div>
         <a class="nav-link {% if page=='restore' %}active{% endif %}" href="/restore" title="数据恢复"><i class="bi bi-arrow-counterclockwise"></i> <span class="nav-label">数据恢复</span></a>

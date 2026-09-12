@@ -1,0 +1,355 @@
+{% extends "base.html" %}
+{% block title %}数据库类型 · 可插拔适配器{% endblock %}
+{% block content %}
+<div class="container-fluid py-3">
+  <div class="d-flex align-items-center mb-3">
+    <h4 class="mb-0"><i class="bi bi-stack me-2"></i>数据库类型（可插拔适配器）</h4>
+    <span class="badge bg-secondary ms-2" id="badgeCount">0</span>
+    <div class="ms-auto">
+      <button class="btn btn-outline-secondary me-2" id="btnTemplates"><i class="bi bi-file-earmark-code me-1"></i>从模板复制</button>
+      <button class="btn btn-primary" id="btnNew"><i class="bi bi-plus-lg me-1"></i>新增适配器</button>
+    </div>
+  </div>
+
+  <div class="alert alert-info py-2 small">
+    内置引擎（MySQL / Oracle / PG / …）由代码静态注册；本页面让你通过一段 bash
+    脚本模板在界面新增任意数据库类型。脚本在数据库服务器（SSH 主机）以 root
+    执行，平台注入 <code>PLATFORM_DB_HOST/PORT/USER/PASSWORD/NAME/BACKUP_TYPE/BACKUP_DIR</code>
+    等环境变量；<code>{{KEY}}</code> 占位渲染为 <code>${PLATFORM_KEY}</code>（不写明文）。
+  </div>
+
+  <div class="card">
+    <div class="table-responsive">
+      <table class="table table-sm table-hover mb-0 align-middle">
+        <thead class="table-light">
+          <tr>
+            <th style="width:140px">db_type</th>
+            <th>显示名称</th>
+            <th style="width:110px">分类</th>
+            <th style="width:80px">默认端口</th>
+            <th style="width:220px">能力</th>
+            <th style="width:80px">来源</th>
+            <th style="width:80px">状态</th>
+            <th style="width:80px">引用</th>
+            <th style="width:240px" class="text-end">操作</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- 编辑/新增 模态框 -->
+<div class="modal fade" id="editModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="editTitle">新增适配器</h5>
+        <button class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <ul class="nav nav-tabs mb-3" role="tablist">
+          <li class="nav-item"><a class="nav-link active" data-bs-toggle="tab" href="#tabBasic">基础</a></li>
+          <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabScript">脚本模板</a></li>
+          <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tabAdvanced">高级/参数</a></li>
+        </ul>
+        <div class="tab-content">
+          <div class="tab-pane fade show active" id="tabBasic">
+            <div class="row g-3">
+              <div class="col-md-3"><label class="form-label">db_type <span class="text-danger">*</span></label>
+                <input class="form-control" id="f_db_type" placeholder="例如 dmdb / tdengine"></div>
+              <div class="col-md-4"><label class="form-label">显示名称 <span class="text-danger">*</span></label>
+                <input class="form-control" id="f_display_name"></div>
+              <div class="col-md-2"><label class="form-label">默认端口</label>
+                <input class="form-control" id="f_default_port" type="number"></div>
+              <div class="col-md-3"><label class="form-label">分类</label>
+                <select class="form-select" id="f_category">
+                  <option value="custom">custom</option><option value="relational">relational</option>
+                  <option value="nosql">nosql</option><option value="timeseries">timeseries</option>
+                  <option value="file">file</option>
+                </select></div>
+              <div class="col-md-3"><label class="form-label">图标 (bi-* )</label>
+                <input class="form-control" id="f_icon" value="bi-box-seam"></div>
+              <div class="col-md-9"><label class="form-label">描述</label>
+                <input class="form-control" id="f_description"></div>
+              <div class="col-md-3"><label class="form-check-label mt-4">
+                <input type="checkbox" class="form-check-input" id="f_enabled" checked> 启用</label></div>
+              <div class="col-md-3"><label class="form-check-label mt-4">
+                <input type="checkbox" class="form-check-input" id="f_skip_client_check"> 跳过客户端检查</label></div>
+              <div class="col-md-12"><label class="form-label">客户端工具（逗号分隔，可空）</label>
+                <input class="form-control" id="f_client_tools" placeholder="例如 dexp,dmrman"></div>
+              <div class="col-md-3"><label class="form-check-label mt-4">
+                <input type="checkbox" class="form-check-input" id="f_supports_incremental"> 支持增量</label></div>
+              <div class="col-md-3"><label class="form-check-label mt-4">
+                <input type="checkbox" class="form-check-input" id="f_supports_full_instance"> 支持全实例</label></div>
+              <div class="col-md-3"><label class="form-check-label mt-4">
+                <input type="checkbox" class="form-check-input" id="f_supports_sync"> 支持数据同步</label></div>
+              <div class="col-md-3"><label class="form-label">备份模式 (logical/physical,逗号分隔)</label>
+                <input class="form-control" id="f_backup_modes" value="logical"></div>
+            </div>
+          </div>
+          <div class="tab-pane fade" id="tabScript">
+            <div class="row g-3">
+              <div class="col-md-6"><label class="form-label">script_backup_full <span class="text-danger">*</span></label>
+                <textarea class="form-control font-monospace small" id="f_script_backup_full" rows="10"></textarea></div>
+              <div class="col-md-6"><label class="form-label">script_backup_incremental</label>
+                <textarea class="form-control font-monospace small" id="f_script_backup_incremental" rows="10"></textarea></div>
+              <div class="col-md-6"><label class="form-label">script_backup_full_instance</label>
+                <textarea class="form-control font-monospace small" id="f_script_backup_full_instance" rows="8"></textarea></div>
+              <div class="col-md-6"><label class="form-label">script_restore</label>
+                <textarea class="form-control font-monospace small" id="f_script_restore" rows="8"></textarea></div>
+              <div class="col-md-6"><label class="form-label">script_verify <span class="text-muted small">（可选，留空走基类文件校验）</span></label>
+                <textarea class="form-control font-monospace small" id="f_script_verify" rows="6"></textarea></div>
+              <div class="col-md-6"><label class="form-label">script_list_dbs <span class="text-muted small">（每行一个库名，可空）</span></label>
+                <textarea class="form-control font-monospace small" id="f_script_list_dbs" rows="6"></textarea></div>
+              <div class="col-md-6"><label class="form-label">script_test_conn <span class="text-muted small">（测试连接/连通性）</span></label>
+                <textarea class="form-control font-monospace small" id="f_script_test_conn" rows="6"></textarea></div>
+            </div>
+            <div class="mt-2">
+              <button class="btn btn-sm btn-outline-secondary" id="btnPreview"><i class="bi bi-eye me-1"></i>渲染预览（当前 backup_full）</button>
+              <pre class="mt-2 small bg-light p-2 d-none" id="previewBox"></pre>
+            </div>
+          </div>
+          <div class="tab-pane fade" id="tabAdvanced">
+            <div class="row g-3">
+              <div class="col-md-6"><label class="form-label">artifact_dir <span class="text-muted small">（远端产物目录，空=平台默认）</span></label>
+                <input class="form-control" id="f_artifact_dir"></div>
+              <div class="col-md-3"><label class="form-label">timeout_sec</label>
+                <input class="form-control" id="f_timeout_sec" type="number" value="7200"></div>
+              <div class="col-md-12"><label class="form-label">params（JSON）— 注入 PLATFORM_PARAM_<KEY></label>
+                <textarea class="form-control font-monospace small" id="f_params" rows="4">{}</textarea></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="btnSave"><i class="bi bi-check2 me-1"></i>保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 测试 模态框 -->
+<div class="modal fade" id="testModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">测试连接</h5>
+        <button class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="row g-2 mb-3">
+          <div class="col-md-8"><label class="form-label">SSH 主机（host_id，留空用任务解析或本机）</label>
+            <input class="form-control" id="t_host_id" type="number" placeholder="例如 1"></div>
+          <div class="col-md-4 d-flex align-items-end"><button class="btn btn-primary w-100" id="btnDoTest"><i class="bi bi-play me-1"></i>执行</button></div>
+        </div>
+        <div id="tResult"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 模板 模态框 -->
+<div class="modal fade" id="tplModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">从模板复制</h5>
+        <button class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div id="tplList" class="list-group"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}
+{% block scripts %}
+<script>
+(function(){
+  const $=BKP.$; let list=[]; let editing=null; let testingId=null;
+
+  function render(){
+    const tb=$("#tbody"); tb.innerHTML="";
+    list.forEach(a=>{
+      const tr=document.createElement("tr");
+      const caps=[];
+      (a.backup_modes||[]).forEach(m=>caps.push(`<span class="badge bg-light text-dark border me-1">${m}</span>`));
+      if(a.supports_incremental) caps.push('<span class="badge bg-info-subtle text-dark border me-1">增量</span>');
+      if(a.supports_full_instance) caps.push('<span class="badge bg-info-subtle text-dark border me-1">全实例</span>');
+      if(a.supports_sync) caps.push('<span class="badge bg-info-subtle text-dark border me-1">同步</span>');
+      const src=a.source==="builtin"
+        ?'<span class="badge bg-secondary">内置</span>'
+        :'<span class="badge bg-primary-subtle text-dark border">自定义</span>';
+      const status=a.enabled? '<span class="badge bg-success">启用</span>':'<span class="badge bg-warning text-dark">停用</span>';
+      const using=a.using_tasks||0;
+      const builtin=a.source==="builtin";
+      const ops=builtin
+        ?'<span class="text-muted small">只读</span>'
+        :`<button class="btn btn-sm btn-outline-primary me-1" data-act="edit" data-id="${a.id}">编辑</button>
+           <button class="btn btn-sm btn-outline-info me-1" data-act="test" data-id="${a.id}">测试</button>
+           <button class="btn btn-sm btn-outline-${a.enabled?'warning':'success'} me-1" data-act="toggle" data-id="${a.id}" data-en="${a.enabled?0:1}">${a.enabled?'停用':'启用'}</button>
+           <button class="btn btn-sm btn-outline-danger" data-act="del" data-id="${a.id}">删除</button>`;
+      tr.innerHTML=`
+        <td><code>${a.db_type}</code></td>
+        <td><i class="bi ${a.icon||'bi-box-seam'} me-1 text-secondary"></i>${a.display_name||""}</td>
+        <td><span class="badge bg-light text-dark border">${a.category||""}</span></td>
+        <td>${a.default_port||""}</td>
+        <td>${caps.join("")}</td>
+        <td>${src}</td>
+        <td>${status}</td>
+        <td>${using}</td>
+        <td class="text-end">${ops}</td>`;
+      tb.appendChild(tr);
+    });
+    $("#badgeCount").textContent=list.length+" 项";
+  }
+
+  function reload(){
+    return BKP.api("/api/db-adapters").then(d=>{list=d.adapters||[]; render();});
+  }
+
+  function openEditor(a){
+    editing=a||null;
+    $("#editTitle").textContent=a?`编辑适配器：${a.db_type}`:"新增适配器";
+    const f=id=>$("#"+id);
+    const get=(k)=>a?a[k]:"";
+    f("f_db_type").value=get("db_type"); f("f_db_type").disabled=!!a;
+    f("f_display_name").value=get("display_name")||"";
+    f("f_default_port").value=get("default_port")||"";
+    f("f_category").value=get("category")||"custom";
+    f("f_icon").value=get("icon")||"bi-box-seam";
+    f("f_description").value=get("description")||"";
+    f("f_enabled").checked=!a||!!a.enabled;
+    f("f_skip_client_check").checked=!!(a&&a.skip_client_check);
+    f("f_client_tools").value=(a&&a.client_tools||[]).join(",");
+    f("f_supports_incremental").checked=!!(a&&a.supports_incremental);
+    f("f_supports_full_instance").checked=!!(a&&a.supports_full_instance);
+    f("f_supports_sync").checked=!!(a&&a.supports_sync);
+    f("f_backup_modes").value=(a&&a.backup_modes||["logical"]).join(",");
+    f("f_script_backup_full").value=get("script_backup_full")||"";
+    f("f_script_backup_incremental").value=get("script_backup_incremental")||"";
+    f("f_script_backup_full_instance").value=get("script_backup_full_instance")||"";
+    f("f_script_restore").value=get("script_restore")||"";
+    f("f_script_verify").value=get("script_verify")||"";
+    f("f_script_list_dbs").value=get("script_list_dbs")||"";
+    f("f_script_test_conn").value=get("script_test_conn")||"";
+    f("f_artifact_dir").value=get("artifact_dir")||"";
+    f("f_timeout_sec").value=get("timeout_sec")||7200;
+    f("f_params").value=JSON.stringify((a&&a.params)||{},null,2);
+    $("#previewBox").classList.add("d-none");
+    new bootstrap.Modal($("#editModal")).show();
+  }
+
+  function collect(){
+    const v=id=>$("#"+id).value;
+    return {
+      db_type:(v("f_db_type")||"").trim(),
+      display_name:(v("f_display_name")||"").trim(),
+      category:v("f_category"),
+      default_port:parseInt(v("f_default_port"))||null,
+      icon:v("f_icon")||"bi-box-seam",
+      description:v("f_description")||"",
+      enabled:$("#f_enabled").checked?1:0,
+      skip_client_check:$("#f_skip_client_check").checked?1:0,
+      client_tools:(v("f_client_tools")||"").split(",").map(s=>s.trim()).filter(Boolean),
+      supports_incremental:$("#f_supports_incremental").checked?1:0,
+      supports_full_instance:$("#f_supports_full_instance").checked?1:0,
+      supports_sync:$("#f_supports_sync").checked?1:0,
+      backup_modes:(v("f_backup_modes")||"logical").split(",").map(s=>s.trim()).filter(Boolean),
+      script_backup_full:v("f_script_backup_full")||"",
+      script_backup_incremental:v("f_script_backup_incremental")||"",
+      script_backup_full_instance:v("f_script_backup_full_instance")||"",
+      script_restore:v("f_script_restore")||"",
+      script_verify:v("f_script_verify")||"",
+      script_list_dbs:v("f_script_list_dbs")||"",
+      script_test_conn:v("f_script_test_conn")||"",
+      artifact_dir:v("f_artifact_dir")||"",
+      timeout_sec:parseInt(v("f_timeout_sec"))||7200,
+      params:(function(){try{return JSON.parse(v("f_params")||"{}");}catch(e){return {};}})(),
+    };
+  }
+
+  $("#btnNew").onclick=()=>openEditor(null);
+  $("#btnTemplates").onclick=()=>{
+    BKP.api("/api/db-adapters/templates").then(d=>{
+      const box=$("#tplList"); box.innerHTML="";
+      (d.templates||[]).forEach(t=>{
+        const a=document.createElement("a");
+        a.className="list-group-item list-group-item-action";
+        a.href="#"; a.innerHTML=`<div class="d-flex"><div><b>${t.label}</b><div class="text-muted small">${t.description||""}</div></div><i class="bi bi-arrow-right ms-auto"></i></div>`;
+        a.onclick=(e)=>{e.preventDefault(); openEditor({
+          db_type:"", display_name:t.label, category:t.category||"custom",
+          default_port:t.default_port||null, icon:t.icon||"bi-box-seam",
+          backup_modes:t.backup_modes||["logical"],
+          supports_incremental:t.supports_incremental?1:0,
+          supports_full_instance:t.supports_full_instance?1:0,
+          script_backup_full:t.script_backup_full||"",
+          script_restore:t.script_restore||"",
+          script_test_conn:t.script_test_conn||"",
+          script_list_dbs:t.script_list_dbs||"",
+          params:t.params_hint||{},
+        }); bootstrap.Modal.getInstance($("#tplModal")).hide();};
+        box.appendChild(a);
+      });
+      new bootstrap.Modal($("#tplModal")).show();
+    });
+  };
+  $("#btnPreview").onclick=()=>{
+    const script=$("#f_script_backup_full").value;
+    BKP.api("/api/db-adapters/preview",{method:"POST",body:JSON.stringify({script,params:collect().params})})
+      .then(d=>{
+        const b=$("#previewBox"); b.classList.remove("d-none");
+        b.textContent=(d.warnings&&d.warnings.length?"⚠ "+d.warnings.join("\n⚠ ")+"\n\n":"")+d.rendered;
+      }).catch(e=>BKP.toast("预览失败: "+e.message,"danger"));
+  };
+  $("#btnSave").onclick=()=>{
+    const data=collect();
+    if(!data.db_type){BKP.toast("db_type 必填","warning");return;}
+    if(!data.display_name){BKP.toast("显示名称必填","warning");return;}
+    const act=editing?`/api/db-adapters/${editing.id}`:"/api/db-adapters";
+    const opt=editing?{method:"PUT"}:{method:"POST"};
+    BKP.api(act,{...opt,body:JSON.stringify(data)})
+      .then(()=>{BKP.toast("保存成功","success"); bootstrap.Modal.getInstance($("#editModal")).hide(); reload();})
+      .catch(e=>BKP.toast(e.message||"保存失败","danger"));
+  };
+  $("#tbody").addEventListener("click",(e)=>{
+    const btn=e.target.closest("button[data-act]"); if(!btn) return;
+    const id=+btn.dataset.id; const a=list.find(x=>x.id===id); if(!a) return;
+    const act=btn.dataset.act;
+    if(act==="edit") openEditor(a);
+    else if(act==="toggle") BKP.api(`/api/db-adapters/${id}/toggle`,{method:"POST",body:JSON.stringify({enabled:!!+btn.dataset.en})}).then(()=>{BKP.toast("已更新","success");reload();});
+    else if(act==="del"){
+      if(!confirm(`删除适配器 ${a.db_type}?（被任务引用时会拒绝）`)) return;
+      BKP.api(`/api/db-adapters/${id}`,{method:"DELETE"}).then(()=>{BKP.toast("已删除","success");reload();}).catch(er=>BKP.toast(er.message||"删除失败","danger"));
+    }
+    else if(act==="test"){
+      testingId=id; $("#t_host_id").value=""; $("#tResult").innerHTML="";
+      new bootstrap.Modal($("#testModal")).show();
+    }
+  });
+  $("#btnDoTest").onclick=()=>{
+    const hostId=parseInt($("#t_host_id").value)||null;
+    $("#tResult").innerHTML='<div class="text-muted">执行中…</div>';
+    BKP.api(`/api/db-adapters/${testingId}/test`,{method:"POST",body:JSON.stringify({host_id:hostId})})
+      .then(d=>{
+        const ok=d.ok;
+        $("#tResult").innerHTML=`
+          <div class="alert alert-${ok?"success":"danger"} py-2">
+            <b>${ok?"✓ 成功":"✗ 失败"}</b> &nbsp; rc=${d.rc} &nbsp; ${d.duration_sec}s &nbsp; ssh=${d.ssh_host||""}
+          </div>
+          ${d.error?`<div class="alert alert-warning py-2">${d.error}</div>`:""}
+          <label class="small text-muted">stdout</label>
+          <pre class="bg-light p-2 small" style="max-height:240px;overflow:auto">${(d.stdout||"").replace(/</g,"&lt;")}</pre>
+          <label class="small text-muted">stderr</label>
+          <pre class="bg-light p-2 small" style="max-height:180px;overflow:auto">${(d.stderr||"").replace(/</g,"&lt;")}</pre>`;
+      }).catch(e=>$("#tResult").innerHTML=`<div class="alert alert-danger">${e.message}</div>`);
+  };
+
+  reload().catch(e=>console.error(e));
+})();
+</script>
+{% endblock %}

@@ -61,10 +61,11 @@ def create_app() -> Flask:
     config.load_backup_root_from_db()
     app.config["BACKUP_ROOT"] = str(config.get_backup_root())
     _root_info = config.backup_root_info()
-    app.logger.info("[存储] 本地备份目录: %s（来源：%s）",
+    _store_log = db.get_logger("app")
+    _store_log.info("[存储] 本地备份目录: %s（来源：%s）",
                     _root_info["path"], _root_info["source_label"])
     if _root_info["persistence"]["level"] == "warn":
-        app.logger.warning("[存储] %s", _root_info["persistence"]["message"])
+        _store_log.warning("[存储] %s", _root_info["persistence"]["message"])
 
     @app.after_request
     def _security_headers(resp):

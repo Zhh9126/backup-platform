@@ -24,8 +24,13 @@ def main():
     except Exception as _e:
         import logging
         logging.getLogger("core.ferry").warning("摆渡收件箱启动失败: %s", _e)
+    # 启动日志里明确写出备份落点：未部署对象存储时这是用户唯一能确认的位置
+    _root = config.backup_root_info()
     db.add_log("INFO", "system",
-               f"AIDBM 启动，监听 {config.WEB_HOST}:{config.WEB_PORT}")
+               f"AIDBM 启动，监听 {config.WEB_HOST}:{config.WEB_PORT}；"
+               f"本地备份目录 {_root['path']}（{_root['source_label']}）")
+    if _root["persistence"]["level"] == "warn":
+        db.add_log("WARNING", "system", f"备份目录持久化风险：{_root['persistence']['message']}")
     app.run(host=config.WEB_HOST, port=config.WEB_PORT, debug=False)
 
 

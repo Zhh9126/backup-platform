@@ -3,7 +3,8 @@
 import logging
 from typing import Any, List
 
-from .base import BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader, SyncConfig
+from .base import (BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader,
+                   SyncConfig, matrix_suggest)
 from ..type_mapper import db_type_to_java_type, to_java
 
 logger = logging.getLogger(__name__)
@@ -126,22 +127,117 @@ class SQLServerSinkWriter(SinkWriter):
         defs = []
         for c in columns:
             name, t = c.name, c.type.upper()
-            ss_t = "NVARCHAR(4000)"
-            if t in ("INT", "INTEGER"):
-                ss_t = "INT"
-            elif t == "BIGINT":
-                ss_t = "BIGINT"
-            elif t in ("FLOAT", "DOUBLE", "DECIMAL", "NUMERIC"):
-                ss_t = "FLOAT"
-            elif t.startswith("DATETIME") or t in ("TIMESTAMP", "DATE"):
-                ss_t = "DATETIME2" if t != "DATE" else "DATE"
-            elif "TEXT" in t:
-                ss_t = "NVARCHAR(MAX)"
+            ss_t = self._map_to_sqlserver_type(c, t)
             defs.append(f"[{name}] {ss_t}" + ("" if c.nullable else " NOT NULL"))
         pk = [c.name for c in columns if getattr(c, "is_primary", False)]
         if pk:
             defs.append("PRIMARY KEY (" + ", ".join(f"[{p}]" for p in pk) + ")")
         return f"CREATE TABLE [{schema}].[{table}] ({', '.join(defs)})"
+
+    def _map_to_sqlserver_type(self, c: ColumnMeta, t: str) -> str:
+        """SQL Server 建表类型映射：覆盖所有偏门类型，避免落 NVARCHAR(4000) 兜底。"""
+        base = t.split("(")[0].strip()
+        # 整数
+        if base == "TINYINT":
+            return "TINYINT"
+        if base == "SMALLINT":
+            return "SMALLINT"
+        if base in ("INT", "INTEGER"):
+            return "INT"
+        if base == "BIGINT":
+            return "BIGINT"
+        # 浮点/精确小数
+        if base in ("DECIMAL", "NUMERIC"):
+            p = c.numeric_precision or 18
+            s = c.numeric_scale if c.numeric_scale is not None else 0
+            return f"DECIMAL({p},{s})"
+        if base == "REAL":
+            return "REAL"
+        if base in ("FLOAT", "DOUBLE", "BINARY_FLOAT", "BINARY_DOUBLE", "DOUBLE PRECISION"):
+            return "FLOAT"
+        # 字符
+        if base in ("CHAR", "NCHAR"):
+            return f"{base}({c.max_length or 1})"
+        if base in ("VARCHAR", "NVARCHAR"):
+            ln = c.max_length or 1
+            if ln <= 0 or ln > 4000:             # 超 4000 用 MAX
+                return f"{base}(MAX)"
+            return f"{base}({ln})"
+        if base == "TEXT" or base == "NTEXT":     # 已弃用，转 MAX
+            return "NVARCHAR(MAX)" if base == "NTEXT" else "VARCHAR(MAX)"
+        # 二进制
+        if base in ("BINARY", "VARBINARY"):
+            ln = c.max_length or 1
+            if base == "VARBINARY" and ln > 8000:
+                return "VARBINARY(MAX)"
+            return f"{base}({ln})" if ln else f"{base}(1)"
+        if base in ("BLOB", "BYTEA", "IMAGE", "LONG RAW"):
+            return "VARBINARY(MAX)"
+        # 时间
+        if base == "DATE":
+            return "DATE"
+        if base in ("DATETIME", "DATETIME2"):
+            return "DATETIME2(6)"                 # 默认 6 位精度
+        if base == "DATETIMEOFFSET" or base == "TIMESTAMPTZ":
+            return "DATETIMEOFFSET(6)"
+        if base == "SMALLDATETIME":
+            return "SMALLDATETIME"
+        if base == "TIME":
+            return "TIME(6)"
+        if base == "TIMESTAMP" or base == "ROWVERSION":
+            return "ROWVERSION"
+        if base == "YEAR":
+            return "SMALLINT"
+        if base == "INTERVAL" or base.startswith("INTERVAL"):
+            return "VARCHAR(64)"                   # SQL Server 无原生 INTERVAL
+        # 布尔
+        if base in ("BOOLEAN", "BOOL"):
+            return "BIT"
+        # 位串
+        if base == "BIT":
+            return "BIT"
+        # 特殊
+        if base in ("JSON", "JSONB", "JSONPATH"):
+            return "NVARCHAR(MAX)"                # SQL Server 无原生 JSON
+        if base == "UUID" or base == "UNIQUEIDENTIFIER":
+            return "UNIQUEIDENTIFIER"
+        if base == "XML":
+            return "XML"
+        if base == "HIERARCHYID":
+            return "HIERARCHYID"
+        if base == "GEOGRAPHY":
+            return "GEOGRAPHY"
+        if base == "GEOMETRY":
+            return "GEOMETRY"
+        if base == "VECTOR":
+            ln = c.max_length or 3
+            return f"VECTOR({ln})"
+        if base == "SQL_VARIANT":
+            return "SQL_VARIANT"
+        if base == "MONEY":
+            return "MONEY"
+        if base == "SMALLMONEY":
+            return "SMALLMONEY"
+        if base in ("ENUM", "SET"):
+            return "VARCHAR(128)"
+        if base == "LONG":                        # Oracle LONG 是大文本，不能截成 64
+            return "NVARCHAR(MAX)"
+        if base in ("UROWID", "ROWID", "ROWVERSION", "BFILE"):
+            return "VARCHAR(64)"
+        if base in ("XMLTYPE",):
+            return "XML"
+        # 跨源兜底：源端类型来自其它库（JSONB/INET/TSVECTOR/HSTORE/ST_GEOMETRY/
+        # SDO_GEOMETRY/INTERVAL...）时用统一矩阵翻译，避免一律落 NVARCHAR(4000)
+        sug = matrix_suggest(getattr(self, "config", None), "sqlserver", t)
+        if sug:
+            if sug in ("VARCHAR", "NVARCHAR", "CHAR", "NCHAR"):
+                name = "NVARCHAR" if sug.startswith("N") else "VARCHAR"
+                ln = c.max_length or 4000
+                return f"{name}(MAX)" if ln > 4000 else f"{name}({ln})"
+            if sug in ("NUMERIC", "DECIMAL"):
+                return f"DECIMAL({c.numeric_precision or 18},{c.numeric_scale or 0})"
+            return sug
+        return "NVARCHAR(4000)"
 
     def prepare_table(self, conn: Any, columns: List[ColumnMeta]) -> None:
         cfg = self.config

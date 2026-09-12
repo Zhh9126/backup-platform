@@ -123,7 +123,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 | 检查项 | 说明 |
 |---|---|
 | 连通性 / 表存在性 | 源目标连接、源表可读、目标表存在性（overwrite 自动建表提示）|
-| 异构类型映射矩阵 | 对标 DTS 结构初始化映射：UNSIGNED 升位、精度降级、ENUM/SET/JSON/BIT 特殊类型、TIME/空间类型目标不支持判定，逐列输出建表类型建议 |
+| 异构类型映射矩阵 | 对标 DTS 结构初始化映射：UNSIGNED 升位、精度降级、ENUM/SET/JSON/BIT 特殊类型、TIME/空间类型目标不支持判定，逐列输出建表类型建议。覆盖 7 个源库 × 7 个目标库的偏门类型（数组 / JSONB / jsonpath / RANGE / ENUM / SET / RAW / ROWID / XMLTYPE / SDO_GEOMETRY / UNIQUEIDENTIFIER / HIERARCHYID / SQL_VARIANT / ROWVERSION / ST_GEOMETRY / VECTOR 等），每列给出 `ok` / `warn` / `fail` 级别与原因（`fail` 为预校验直接拦截项）|
 | 主键检查 | upsert/实时同步要求目标表单列主键 |
 | 增量列检查 | 增量列存在性与类型（数值/时间）|
 | 数据级试写 | 源端采样 N 行 → 目标端按映射建议 DDL 建临时表试写 → 对账 → 清理（采样行数可配，0=跳过）|
@@ -477,7 +477,24 @@ docker build -t backup-platform:local .
   - 侧边栏 25 个菜单按权限自动隐藏；`permission_required()` 装饰器在 API 层二次校验（前端隐藏失败仍会 403 兜底）
   - 用户可叠加附加权限（`permissions` 字段）；支持管理员重置密码、用户自助改密、`must_change_password` 首登改密提醒
   - 兼容升级：`users` 表为空时自动用 `config.WEB_USERNAME/WEB_PASSWORD` 种子首个 admin；旧会话（字符串 user）自动兼容；外部 API Token 调用方不受影响
-- **fix(mariadb)**：MariaDB 10.x 适配与 `db_adapters` 表迁移（存量库幂等补齐）
+- **本地备份存储位置（L1 落点）可见可配置**：生效优先级「界面配置（`system_config.backup_root`）> 环境变量 `BACKUP_ROOT` / `config.json` > 程序目录 `backups` 兜底」，实时日志与实时文件目录跟随根目录；存储管理页新增卡片展示实际路径、来源与磁盘用量，`GET/PUT /api/storage/local-root` 支持在线改路径（路径校验 + 写探测 + 可选迁移历史备份）；启动与运维日志明确提示持久化风险（安装目录内 / 容器未挂卷告警）。
+- **失败可定位的日志体系**：日志目录可写性兜底（配置目录不可写时降级并标识来源）、`platform.log` / `error.log` 大小轮转（20MB × 10）、`faulthandler` 段错误兜底（`crash.log`）、启动横幅打印运行形态 / PID / 日志 / 备份 / 元数据库路径；全链路脱敏（口令、令牌、连接串）；每次备份 / 恢复 / 校验生成**独立详细日志**（`logs/oper/`，含完整执行命令与输出）。
+- **数据迁移与同步：全库字段类型保真映射（本次重点）**：类型映射升级为三层架构——预检矩阵（`core/sync/type_matrix.py`）→ 列元数据真实精度（各插件 `list_columns`）→ 建表 DDL 方言。覆盖 **7 种数据库（PostgreSQL / 金仓 / MySQL / MariaDB / Oracle / 达梦 / SQL Server）× 7 个目标库** 的偏门类型：
+  - PG 系：数组 `integer[]` / `text[]`、`jsonb` / `json` / `jsonpath`、RANGE 族、`hstore` / `tsvector` / `citext` / `ltree`、`inet` / `cidr` / `macaddr`、`character varying`、`timestamp with time zone`、`interval`
+  - MySQL 系：`ENUM` / `SET`（同库原写法透传）、`YEAR`、`BIT(n)`、空间族、`VECTOR(n)`、`TINYINT(1)`、无符号整数升位
+  - Oracle：`RAW` / `LONG RAW` / `LONG`、`ROWID` / `UROWID`、`XMLTYPE`、`SDO_GEOMETRY`、`ANYDATA` 族、`BFILE`、`PLS_INTEGER` / `BINARY_INTEGER`、`INTERVAL YEAR TO MONTH / DAY TO SECOND`
+  - SQL Server：`UNIQUEIDENTIFIER`、`HIERARCHYID`、`GEOGRAPHY` / `GEOMETRY`、`SQL_VARIANT`、`ROWVERSION` / `TIMESTAMP`、`DATETIME2` / `DATETIMEOFFSET` / `SMALLDATETIME`、`MONEY` / `SMALLMONEY`
+  - 达梦 / 金仓：`TEXT` / `LONGVARCHAR`、`IMAGE`、`ST_GEOMETRY`、`BIGDATETIME`、`SERIAL` / `INT2` / `INT4` / `INT8`
+  - 修复阻断型缺陷：带修饰类型名（`decimal(12,3)` / `varchar(100)`）精确比较失败导致全部落兜底 `VARCHAR(255)`（数值列退化为字符串列）；TEXT 与 BLOB 共用协议类型码 252 被误判为二进制（中文数据损坏）；多词类型（`character varying` / `timestamp with time zone` / `long raw`）被截断；`integer[]` 数组映射落空返回 `None`；SQL Server 的 `TIMESTAMP`（ROWVERSION 别名）覆盖全局时间戳语义；`PLS_INTEGER` / `int2` / `serial` 别名触发 KeyError；`DATETIMEOFFSET` / `BIGDATETIME` / `INT4RANGE` 等源类型名被原样输出到目标库（建表直接失败）
+  - 建表端新增跨源兜底 `matrix_suggest()`：异库特有类型经统一矩阵翻译，不再一律落 `VARCHAR(255)` / `NVARCHAR(4000)` / `VARCHAR2(4000)`；MySQL 侧修正 `INT UNSIGNED`、`INT4RANGE`、`TIMESTAMP WITH TIME ZONE` 三处会生成非法 DDL 的路径
+  - 冒烟验证：**1281 组映射组合，目标方言语义违规 0**；长度与精度保真断言全通过（`varchar(100)→VARCHAR(100)`、`decimal(12,3)→DECIMAL(12,3)` / `NUMBER(12,3)` / `NUMERIC(12,3)`）
+- **MariaDB 打通**：连通性探测注册 `mariadb`（协议兼容复用 MySQL 实现，此前 `src_db_type=mariadb` 预检查直接失败「未知数据库类型」）；迁移计划与数据同步（含全库迁移 `full_db_migrate`）双向真机实测通过，中文与二进制数据逐值一致；`db_adapters` 表迁移（存量库幂等补齐）。已知边界：实时同步（Binlog CDC）当前仍限定 MySQL 源。
+- **物理备份与恢复加固**：
+  - **目录形态产物校验**：物理备份（xtrabackup / mariabackup / pg_basebackup）未打包时产物是**目录**，此前按「文件」校验会被误报「文件不存在」（MariaDB / MySQL 物理全量与增量均命中）；现按目录级校验，空目录 / 零字节直接判失败，并以备份标志文件（`xtrabackup_checkpoints` / `mariabackup_checkpoints` / `backup-my.cnf` / `backup_label` / `PG_VERSION`）作为「数据库可识别的可恢复产物」证据，指纹（文件数 / 总字节 / 标志文件）写入校验说明
+  - **空增量层清理**：增量基不存在时自动退化为全量，残留的空增量目录会被恢复链识别为增量层并导致 apply 报 `cannot open .../xtrabackup_checkpoints`；现自动清理空目录，且恢复链构建时剔除无效增量层（空目录 / 无 checkpoints）
+  - **物理恢复校验改为整实例级**：物理恢复是数据目录级，任务表单的 `target_db` 属逻辑恢复语义常不成立；校验改为先查目标库、不存在则回退实例级（库数 + 业务表数），业务表数为 0 时如实判失败，消除「查不到表仍报通过」的假通过
+
+> 本次更新的完整说明（含逐库类型映射对照表、验证记录与已知边界）见 [readme_20260912.md](readme_20260912.md)。
 
 ### v1.4.4（2026-09-09）
 

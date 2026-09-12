@@ -9,7 +9,8 @@ import logging
 import os
 from typing import Any, List
 
-from .base import BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader, SyncConfig
+from .base import (BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader,
+                   SyncConfig, matrix_suggest)
 from ..type_mapper import db_type_to_java_type, to_java
 
 logger = logging.getLogger(__name__)
@@ -139,7 +140,8 @@ class DamengSourceReader(SourceReader):
             schema = _upper(self.config.src_schema or self.config.src_username
                             or "SYSDBA")
             cur.execute(
-                "SELECT column_name, data_type, nullable, data_default "
+                "SELECT column_name, data_type, nullable, data_default, "
+                "data_length, data_precision, data_scale "
                 "FROM dba_tab_columns WHERE owner=? AND table_name=? "
                 "ORDER BY column_id", (schema, _upper(table)))
             rows = cur.fetchall()
@@ -152,10 +154,24 @@ class DamengSourceReader(SourceReader):
             pk_set = {_s(r[0]) for r in cur.fetchall()}
             cols = []
             for row in rows:
-                c = ColumnMeta(name=_s(row[0]), type=_s(row[1] or "").upper(),
+                base = _s(row[1] or "").upper()
+                # 字符/数值类型归一：达梦 data_length 用于字符长度；data_precision/scale 用于数值
+                mlen = row[4] if base in ("CHAR", "VARCHAR", "VARCHAR2",
+                                          "NCHAR", "NVARCHAR", "NVARCHAR2",
+                                          "CLOB", "NCLOB", "TEXT", "LONG") else None
+                nprec = row[5] if base in ("NUMBER", "DECIMAL", "NUMERIC",
+                                           "TINYINT", "SMALLINT",
+                                           "INTEGER", "BIGINT",
+                                           "BINARY_FLOAT", "BINARY_DOUBLE",
+                                           "FLOAT", "DOUBLE", "REAL") else None
+                nscale = row[6] if nprec is not None else None
+                c = ColumnMeta(name=_s(row[0]), type=base,
                                nullable=(_s(row[2]) == "Y" or row[2] == 1 or
                                          _s(row[2]).upper() == "Y"),
-                               default=row[3])
+                               default=row[3],
+                               max_length=mlen,
+                               numeric_precision=nprec,
+                               numeric_scale=nscale)
                 c.is_primary = c.name in pk_set
                 cols.append(c)
             return cols
@@ -234,22 +250,105 @@ class DamengSinkWriter(SinkWriter):
         defs = []
         for c in columns:
             name, t = _upper(c.name), c.type.upper()
-            dm_t = "VARCHAR(4000)"
-            if t in ("INT", "INTEGER", "BIGINT", "SMALLINT"):
-                dm_t = "BIGINT"
-            elif t in ("FLOAT", "DOUBLE", "DECIMAL", "NUMERIC"):
-                dm_t = "DOUBLE"
-            elif t.startswith("DATETIME") or t in ("TIMESTAMP", "DATE"):
-                dm_t = "TIMESTAMP" if t != "DATE" else "DATE"
-            elif "TEXT" in t:
-                dm_t = "TEXT"
-            elif "BLOB" in t or "BYTEA" in t:
-                dm_t = "BLOB"
+            dm_t = self._map_to_dameng_type(c, t)
             defs.append(f'"{name}" {dm_t}' + ("" if c.nullable else " NOT NULL"))
         pk = [c.name for c in columns if getattr(c, "is_primary", False)]
         if pk:
             defs.append("PRIMARY KEY (" + ", ".join(f'"{_upper(p)}"' for p in pk) + ")")
         return f'CREATE TABLE {schema}.{tbl} ({", ".join(defs)})'
+
+    def _map_to_dameng_type(self, c: ColumnMeta, t: str) -> str:
+        """达梦建表类型映射：覆盖所有偏门类型，避免落 VARCHAR(4000) 兜底。
+
+        优先级：精确基类型 → 模糊匹配 → 兜底。
+        字符类型用 c.max_length（列解析时填）；数值类型用 c.numeric_precision/scale。
+        """
+        base = t.split("(")[0].strip()
+        # 整数
+        if base in ("TINYINT",):
+            return "TINYINT"
+        if base == "SMALLINT":
+            return "SMALLINT"
+        if base in ("INT", "INTEGER"):
+            return "INT"
+        if base == "BIGINT":
+            return "BIGINT"
+        # 浮点/精确小数
+        if base in ("DECIMAL", "NUMERIC", "NUMBER"):
+            p = c.numeric_precision or 18
+            s = c.numeric_scale if c.numeric_scale is not None else 0
+            return f"DECIMAL({p},{s})" if s else f"NUMBER({p})"
+        if base in ("FLOAT", "DOUBLE", "REAL", "BINARY_FLOAT", "BINARY_DOUBLE", "DOUBLE PRECISION"):
+            return "DOUBLE"
+        # 字符
+        if base in ("CHAR", "NCHAR"):
+            return f"{base}({c.max_length or 1})"
+        if base in ("VARCHAR", "VARCHAR2", "NVARCHAR", "NVARCHAR2"):
+            ln = c.max_length or 4000
+            if ln > 3900:                       # 达梦 VARCHAR 上限 3900
+                return "TEXT"
+            return f"VARCHAR2({ln})" if base == "VARCHAR2" else f"{base}({ln})"
+        # 大对象
+        if "TEXT" in base or base in ("CLOB", "NCLOB"):
+            return "TEXT"
+        if "BLOB" in base or base in ("BYTEA", "IMAGE", "LONG RAW"):
+            return "BLOB"
+        # 时间
+        if base == "DATE":
+            return "DATE"
+        if base in ("TIMESTAMPTZ",):
+            return "TIMESTAMP WITH TIME ZONE"
+        if base.startswith("DATETIME") or base in ("TIMESTAMP", "DATETIME2", "SMALLDATETIME"):
+            return "TIMESTAMP"
+        if base == "DATETIMEOFFSET":
+            return "TIMESTAMP WITH TIME ZONE"
+        if base == "TIME":
+            return "TIME"
+        if base == "INTERVAL" or base.startswith("INTERVAL"):
+            return "INTERVAL DAY TO SECOND"
+        # YEAR（MySQL 1901-2155 → SMALLINT 足够）
+        if base == "YEAR":
+            return "SMALLINT"
+        # 布尔
+        if base in ("BOOLEAN", "BOOL"):
+            return "TINYINT"
+        # 字节串
+        if base == "BIT":
+            return "BIT"
+        # 特殊
+        if base in ("JSON", "JSONB", "JSONPATH"):
+            return "TEXT"                        # 达梦无原生 JSON
+        if base == "UUID" or base == "UNIQUEIDENTIFIER":
+            return "VARCHAR2(36)"
+        if base in ("XML", "XMLTYPE"):
+            return "TEXT"                        # 达梦无原生 XML
+        if base in ("ENUM", "SET"):
+            return "VARCHAR(128)"
+        if base in ("UROWID", "ROWID"):
+            return "VARCHAR(18)"
+        if base == "BFILE":
+            return "VARCHAR(1024)"
+        if base == "LONG":
+            return "TEXT"
+        if base == "ROWVERSION":
+            return "BLOB"
+        # 几何（达梦需 ST_GEOMETRY，需 spatial 扩展；无扩展时降 TEXT）
+        if base in ("GEOMETRY", "POINT", "LINESTRING", "POLYGON",
+                    "MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON",
+                    "GEOMETRYCOLLECTION", "GEOMCOLLECTION", "GEOGRAPHY",
+                    "SDO_GEOMETRY", "SDO_TOPO_GEOMETRY", "SDO_GEORASTER"):
+            return "ST_GEOMETRY" if base == "GEOMETRY" else "TEXT"
+        # 跨源兜底：源端类型来自其它库（JSONB/INET/TSVECTOR/HIERARCHYID/VECTOR/
+        # SDO_GEOMETRY...）时用统一矩阵翻译，避免一律落 VARCHAR(4000)
+        sug = matrix_suggest(getattr(self, "config", None), "dameng", t)
+        if sug:
+            if sug in ("VARCHAR", "CHAR", "NVARCHAR"):
+                return f"VARCHAR({min(c.max_length or 3900, 3900)})"
+            if sug in ("NUMERIC", "DECIMAL", "NUMBER"):
+                return f"DECIMAL({c.numeric_precision or 18},{c.numeric_scale or 0})"
+            return sug
+        # 其他
+        return "VARCHAR(4000)"
 
     def prepare_table(self, conn: Any, columns: List[ColumnMeta]) -> None:
         cfg = self.config

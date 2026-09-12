@@ -11,7 +11,8 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, List
 
-from .base import BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader, SyncConfig
+from .base import (BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader,
+                   SyncConfig, matrix_suggest)
 from ..type_mapper import db_type_to_java_type, to_java, JavaType
 
 logger = logging.getLogger(__name__)
@@ -199,26 +200,122 @@ class OracleSinkWriter(SinkWriter):
         defs = []
         for c in columns:
             name, t = _upper(c.name), c.type.upper()
-            ora_t = "VARCHAR2(4000)"
-            if t in ("INT", "INTEGER", "BIGINT", "SMALLINT"):
-                ora_t = "NUMBER(19)"
-            elif t in ("FLOAT", "DOUBLE", "DECIMAL", "NUMERIC"):
-                ora_t = "NUMBER"
-            elif t.startswith("DATETIME") or t in ("TIMESTAMP", "DATE"):
-                # DATETIME/TIMESTAMP 统一 DATE（MySQL DATETIME 秒精度语义一致；
-                # 且字符串写入走 NLS_DATE_FORMAT 会话格式，避免 TIMESTAMP 的
-                # NLS_TIMESTAMP_FORMAT 小数秒缺失问题 ORA-01843）
-                ora_t = "DATE"
-            elif t.startswith("VARCHAR"):
-                ora_t = "VARCHAR2(4000)"
-            elif "TEXT" in t or "BLOB" in t or "BYTEA" in t:
-                ora_t = "CLOB"
+            ora_t = self._map_to_oracle_type(c, t)
             defs.append(f"{name} {ora_t}"
                         + ("" if c.nullable else " NOT NULL"))
         pk = [c.name for c in columns if getattr(c, "is_primary", False)]
         if pk:
             defs.append("PRIMARY KEY (" + ", ".join(_upper(p) for p in pk) + ")")
         return f'CREATE TABLE {schema}.{tbl} ({", ".join(defs)})'
+
+    def _map_to_oracle_type(self, c: ColumnMeta, t: str) -> str:
+        """Oracle 建表类型映射：覆盖所有偏门类型，避免落 VARCHAR2(4000) 兜底。"""
+        base = t.split("(")[0].strip()
+        # 整数（Oracle 用 NUMBER(p) 表达）
+        if base == "TINYINT":
+            return "NUMBER(3)"
+        if base == "SMALLINT":
+            return "NUMBER(5)"
+        if base in ("INT", "INTEGER"):
+            return "NUMBER(10)"
+        if base == "BIGINT":
+            return "NUMBER(19)"
+        if base in ("BINARY_INTEGER", "PLS_INTEGER"):
+            return "NUMBER(10)"
+        # 浮点/精确小数
+        if base in ("DECIMAL", "NUMERIC", "NUMBER"):
+            p = c.numeric_precision or 38
+            s = c.numeric_scale if c.numeric_scale is not None else 0
+            if p > 38:                            # Oracle NUMBER 上限 38
+                p = 38
+            return f"NUMBER({p},{s})" if s else f"NUMBER({p})"
+        if base in ("FLOAT", "DOUBLE", "REAL", "BINARY_FLOAT", "BINARY_DOUBLE",
+                    "DOUBLE PRECISION"):
+            return "BINARY_DOUBLE"
+        # 字符
+        if base in ("CHAR", "NCHAR"):
+            ln = c.max_length or 1
+            if ln > 2000:                          # Oracle CHAR 上限 2000
+                return f"{base}(2000)"
+            return f"{base}({ln})"
+        if base in ("VARCHAR", "VARCHAR2", "NVARCHAR", "NVARCHAR2"):
+            ln = c.max_length or 4000
+            if ln > 4000:                          # Oracle VARCHAR2 上限 4000
+                return "CLOB" if base not in ("NVARCHAR", "NVARCHAR2") else "NCLOB"
+            # Oracle 没有 VARCHAR/NVARCHAR 标准类型，统一转 VARCHAR2/NVARCHAR2
+            if base == "VARCHAR":
+                base = "VARCHAR2"
+            elif base == "NVARCHAR":
+                base = "NVARCHAR2"
+            return f"{base}({ln})"
+        # 大对象
+        if base in ("TEXT", "CLOB"):
+            return "CLOB"
+        if base == "NCLOB":
+            return "NCLOB"
+        if base in ("BLOB", "BYTEA", "IMAGE", "LONG RAW"):
+            return "BLOB"
+        if base == "LONG":
+            return "CLOB"
+        # 时间（DATETIME/TIMESTAMP 统一 DATE：避免 NLS_TIMESTAMP_FORMAT
+        # 小数秒缺失问题 ORA-01843）
+        if base == "DATE":
+            return "DATE"
+        if base.startswith("DATETIME") or base in ("TIMESTAMP", "DATETIME2", "SMALLDATETIME"):
+            return "DATE"
+        if base == "TIMESTAMPTZ" or base == "DATETIMEOFFSET":
+            return "TIMESTAMP WITH TIME ZONE"
+        if base == "TIME":
+            return "VARCHAR(20)"                   # Oracle 无原生 TIME
+        if base == "YEAR":
+            return "NUMBER(4)"
+        if base == "INTERVAL" or base.startswith("INTERVAL"):
+            return "INTERVAL DAY TO SECOND"
+        # 布尔
+        if base in ("BOOLEAN", "BOOL"):
+            return "NUMBER(1,0)"
+        # 位串
+        if base == "BIT":
+            return "NUMBER(1,0)"
+        # 特殊
+        if base in ("JSON", "JSONB", "JSONPATH"):
+            return "CLOB"                          # Oracle 无原生 JSON
+        if base == "UUID" or base == "UNIQUEIDENTIFIER":
+            return "VARCHAR2(36)"
+        if base == "XML" or base == "XMLTYPE":
+            return "XMLTYPE"
+        if base in ("ENUM", "SET"):
+            # Oracle 不支持 ENUM/SET（DTS 规则）；建表时只能兜底为 VARCHAR，
+            # precheck/type_matrix 应在更早阶段拦截此组合，避免无效建表
+            return "VARCHAR2(4000)"
+        if base in ("UROWID", "ROWID"):
+            return "UROWID" if base == "UROWID" else "ROWID"
+        if base == "BFILE":
+            return "BFILE"
+        if base == "RAW":
+            return f"RAW({min(c.max_length or 2000, 2000)})"
+        if base in ("ROWVERSION",):
+            return "RAW(8)"
+        # 几何（Oracle 需 MDSYS.SDO_GEOMETRY + Oracle Spatial）
+        if base in ("GEOMETRY", "POINT", "LINESTRING", "POLYGON",
+                    "MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON",
+                    "GEOMETRYCOLLECTION", "GEOMCOLLECTION", "GEOGRAPHY",
+                    "SDO_GEOMETRY", "SDO_TOPO_GEOMETRY", "SDO_GEORASTER"):
+            return "MDSYS.SDO_GEOMETRY" if base in ("GEOMETRY", "SDO_GEOMETRY") else "CLOB"
+        if base in ("ANYDATA", "ANYTYPE", "ANYDATASET", "REF"):
+            return "CLOB"
+        # 跨源兜底：源端类型来自其它库（JSONB/INET/TSVECTOR/HSTORE/HIERARCHYID/
+        # SQL_VARIANT/VECTOR/ST_GEOMETRY...）时用统一矩阵翻译，避免一律落 VARCHAR2(4000)
+        sug = matrix_suggest(getattr(self, "config", None), "oracle", t)
+        if sug:
+            if sug in ("VARCHAR", "CHAR", "NVARCHAR", "NVARCHAR2", "VARCHAR2"):
+                name = "NVARCHAR2" if sug.startswith("N") else "VARCHAR2"
+                return f"{name}({min(c.max_length or 4000, 4000)})"
+            if sug in ("NUMERIC", "DECIMAL", "NUMBER"):
+                p = min(c.numeric_precision or 38, 38)
+                return f"NUMBER({p},{c.numeric_scale or 0})"
+            return sug
+        return "VARCHAR2(4000)"
 
     def prepare_table(self, conn: Any, columns: List[ColumnMeta]) -> None:
         cfg = self.config

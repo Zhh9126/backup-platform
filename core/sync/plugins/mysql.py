@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """MySQL / MariaDB 同步插件。"""
 import logging
+import re
 from typing import Any, List
 
-from .base import BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader, SyncConfig
+from .base import (BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader,
+                   SyncConfig, matrix_suggest)
 from ..type_mapper import JavaType, db_type_to_java_type, to_db, to_java
 
 logger = logging.getLogger(__name__)
@@ -198,18 +200,58 @@ class MySQLSinkWriter(SinkWriter):
         return f"CREATE TABLE IF NOT EXISTS {table_ref} (\n" + ",\n".join(lines) + "\n)"
 
     def _map_to_mysql_type(self, col: ColumnMeta) -> str:
-        t = (col.type or "VARCHAR").upper()
-        # 尽量保留原类型，若跨库差异大再做映射
-        if t in ("VARCHAR", "CHAR"):
-            return f"{t}({col.max_length or 255})"
-        if t in ("DECIMAL", "NUMERIC"):
-            return f"{t}({col.numeric_precision or 10},{col.numeric_scale or 0})"
-        if "INT" in t:
+        t = (col.type or "VARCHAR").upper().strip()
+        # COLUMN_TYPE 携带完整修饰（'decimal(12,3)' / 'varchar(100)' / 'int unsigned'），
+        # 必须先拆出基类型再比较：否则带修饰的类型名与裸名精确比较不相等，
+        # 会全部落到末尾兜底 VARCHAR(255)，导致长度/精度丢失、数值列退化为字符串列
+        # （同构 MySQL/MariaDB 迁移同样必须保真）。参考 postgresql.py 的同款处理。
+        head = t.split("(")[0].strip()
+        # 去掉 unsigned/signed/zerofill 修饰后再取首词：'BIGINT(20) UNSIGNED' → bigint；
+        # 否则 head.split()[0] 会取到 'unsigned' 而落到兜底 VARCHAR(255)（实测命中）
+        head = re.sub(r"\b(unsigned|signed|zerofill)\b", " ", head).strip()
+        base = head.split()[0] if head else t
+        # 偏门类型优先：ENUM/SET/JSON/YEAR/SPATIAL/UUID/VECTOR 等需要保留精确写法
+        if base in ("ENUM", "SET"):
+            # ENUM/SET 关键字大写，括号内枚举值原大小写（MySQL 关键字大小写
+            # 不敏感但官方推荐大写；枚举值大小写敏感必须原样保留）
+            src = (col.type or "").strip()
+            m = re.match(r"^\s*\w+\s*(\(.*\))\s*$", src, re.DOTALL)
+            return f"{base}{m.group(1)}" if m else "VARCHAR(128)"
+        if base == "JSON":
+            return "JSON"
+        if base == "YEAR":
+            # MySQL YEAR[(2|4)]：原写法需保留 (4)/(2)，不能丢精度修饰
+            return t if "(" in t else "YEAR"
+        if base in ("GEOMETRY", "POINT", "LINESTRING", "POLYGON",
+                    "MULTIPOINT", "MULTILINESTRING", "MULTIPOLYGON",
+                    "GEOMETRYCOLLECTION", "GEOMCOLLECTION"):
+            return base
+        if base == "VECTOR":
+            # MySQL 8.0.28+ VECTOR 类型，原写法形如 'VECTOR(384)'
+            return t if "(" in t else "VECTOR"
+        # 标准类型
+        if base in ("VARCHAR", "CHAR"):
+            return f"{base}({col.max_length or 255})"
+        if base in ("DECIMAL", "NUMERIC"):
+            return f"{base}({col.numeric_precision or 10},{col.numeric_scale or 0})"
+        if base in ("TINYINT", "SMALLINT", "MEDIUMINT", "INT", "INTEGER", "BIGINT"):
             return t
-        if t in ("TEXT", "LONGTEXT", "MEDIUMTEXT", "TINYTEXT", "BLOB", "LONGBLOB",
-                 "MEDIUMBLOB", "TINYBLOB", "DATE", "DATETIME", "TIMESTAMP", "TIME",
-                 "FLOAT", "DOUBLE", "REAL", "BIT", "JSON", "BINARY", "VARBINARY"):
+        if base in ("TEXT", "LONGTEXT", "MEDIUMTEXT", "TINYTEXT", "BLOB", "LONGBLOB",
+                    "MEDIUMBLOB", "TINYBLOB", "DATE", "DATETIME", "TIMESTAMP", "TIME",
+                    "FLOAT", "DOUBLE", "REAL", "BIT", "JSON", "BINARY", "VARBINARY"):
+            # MySQL 没有带时区的时间戳，'TIMESTAMP WITH TIME ZONE' 原样输出会建表报错
+            if base == "TIMESTAMP" and "WITH" in t:
+                return "TIMESTAMP"
             return t
+        # 跨源兜底：源端列类型来自别的库（JSONB/XMLTYPE/HIERARCHYID/INET/ROWID/
+        # TSVECTOR...）时用统一类型矩阵翻译，避免无脑落 VARCHAR(255) 丢语义
+        sug = matrix_suggest(getattr(self, "config", None), "mysql", col.type)
+        if sug:
+            if sug in ("VARCHAR", "CHAR", "NVARCHAR"):
+                return f"VARCHAR({col.max_length or 255})"
+            if sug in ("DECIMAL", "NUMERIC"):
+                return f"DECIMAL({col.numeric_precision or 10},{col.numeric_scale or 0})"
+            return sug
         return "VARCHAR(255)"
 
     def prepare_table(self, conn: Any, columns: List[ColumnMeta]) -> None:
@@ -262,6 +304,12 @@ class MySQLSinkWriter(SinkWriter):
                 target_type = JavaType.STRING
                 if mapped and mapped.get("target_type"):
                     target_type = mapped.get("target_type")
+                # bytes 原样透传（BLOB/VARBINARY 等二进制列）：默认 target_type
+                # 为 STRING 时 to_db 会 str() 成 "b'...'" 字面量损坏二进制数据
+                # （与 postgresql.py 的同款处理保持一致）
+                if isinstance(row[i], (bytes, bytearray)):
+                    out.append(bytes(row[i]))
+                    continue
                 java_val = self.plugin.type_to_java(target_type, row[i])
                 out.append(to_db(java_val, target_type))
             return tuple(out)
@@ -398,7 +446,13 @@ class MySQLPlugin(BasePlugin):
         if jt == JavaType.BYTES:
             if isinstance(value, (bytes, bytearray)):
                 return bytes(value)
-            return str(value).encode("utf-8")
+            # 值已是 str：MySQL 协议中 TEXT 与 BLOB 共用类型码 252（TEXT 靠字段
+            # 字符集区分，pymysql 的 description 不暴露 charsetnr），按类型码判定
+            # 会把 TEXT 误判为 BYTES。pymysql 已按列字符集把 TEXT 解码为 str、
+            # 二进制列保持 bytes，故以实际值类型为准：str 原样保留。
+            # 否则 str 会被 encode 成 bytes，目标端再 str() 成 "b'\xe6\x96\x87...'"
+            # 字面量，导致中文文本损坏。
+            return value
         if jt in (JavaType.DATE, JavaType.TIME, JavaType.DATETIME):
             return str(value)
         return str(value)

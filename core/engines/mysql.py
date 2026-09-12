@@ -520,12 +520,23 @@ class MySQLEngine(BackupEngine):
             else:
                 # 无全量基，自动退化为全量
                 backup_type = BackupType.FULL
+                inc_target = target_dir
                 target_dir = os.path.join(out_dir, f"xtrabackup_full_{ts}")
                 os.makedirs(target_dir, exist_ok=True)
                 for i, a in enumerate(cmd):
                     if a.startswith("--target-dir="):
                         cmd[i] = f"--target-dir={target_dir}"
                 note = " 增量基不存在，已自动退化为全量"
+                # 退化为全量后，之前为增量预创建的空目录必须清掉：否则它会以
+                # "空增量层"的形式留在产物目录里，被恢复链按目录名识别为增量，
+                # 导致增量恢复在 apply 阶段报
+                # "cannot open .../inc_N//xtrabackup_checkpoints"（实测命中）。
+                try:
+                    if inc_target != target_dir and os.path.isdir(inc_target) \
+                            and not os.listdir(inc_target):
+                        os.rmdir(inc_target)
+                except OSError:
+                    pass
         note += note_cmp
 
         start = time.time()
@@ -1237,6 +1248,80 @@ class MySQLEngine(BackupEngine):
         except Exception:
             return 0
 
+    @staticmethod
+    def _physical_verify_sql(target_db: str) -> str:
+        """生成物理恢复后的可读性校验 SQL（整实例级语义）。
+
+        物理恢复是数据目录级：备份里有什么库就按原名恢复什么库。任务表单的
+        target_db 属于逻辑恢复语义，对物理恢复常常不成立（例如恢复 MariaDB 的
+        bmaria1，目标库却填成 bmaria1_restored）。所以校验不能只查 target_db，
+        改为一次性输出 4 个计数交由 _parse_physical_verify 判定：
+        <目标库是否存在>,<目标库表数>,<业务表数>,<库总数>
+        """
+        sys_dbs = "('mysql','information_schema','performance_schema','sys')"
+        td = (target_db or "").replace("'", "")
+        return (
+            "SELECT CONCAT("
+            f"(SELECT COUNT(*) FROM information_schema.schemata "
+            f"WHERE schema_name='{td}'),',',"
+            f"(SELECT COUNT(*) FROM information_schema.tables "
+            f"WHERE table_schema='{td}'),',',"
+            "(SELECT COUNT(*) FROM information_schema.tables "
+            f"WHERE table_schema NOT IN {sys_dbs}),',',"
+            "(SELECT COUNT(*) FROM information_schema.schemata));")
+
+    def _parse_physical_verify(self, out: str, target_db: str,
+                               logs: list = None) -> tuple:
+        """解析 _physical_verify_sql 的输出，返回 (label, verify_out)。
+
+        判定规则：
+        - 目标库在恢复实例中存在且有数据表 → 按目标库校验（保留逻辑恢复语义）；
+        - 否则回退整实例级校验（库数 + 业务表数），并在 label 中如实说明原因；
+        - 业务表数为 0 时直接失败——绝不在"什么都没读出来"时报校验通过。
+        """
+        # 远端 stdout 可能夹带登录提示等噪声，只取最后一个非空行的 CSV 结果
+        lines = [ln for ln in (out or "").splitlines() if ln.strip()]
+        nums = []
+        for tok in (lines[-1] if lines else "").strip().split(",")[:4]:
+            try:
+                nums.append(int(str(tok).strip() or 0))
+            except ValueError:
+                nums.append(0)
+        nums += [0] * (4 - len(nums))
+        db_exists, db_tables, biz_tables, dbs = nums[:4]
+        if target_db and db_exists and db_tables > 0:
+            return f"目标库 {target_db}", f"tables={db_tables}"
+        if biz_tables == 0:
+            raise RuntimeError(
+                "物理恢复校验失败：恢复实例中读不到任何业务数据表"
+                f"（目标库 {target_db or '-'} "
+                f"{'不存在' if target_db and not db_exists else '内无数据表'}，"
+                f"库总数={dbs}）；物理恢复为整实例级，请核对备份产物是否为空。")
+        if target_db:
+            why = "不在物理恢复产物中" if not db_exists else "内无数据表"
+            if isinstance(logs, list):
+                logs.append(
+                    f"[物理恢复] 目标库 {target_db} {why}（物理恢复为整实例级，"
+                    f"备份中的库按原名恢复）；已改用整实例级校验。")
+            return (f"实例级（目标库 {target_db} {why}）",
+                    f"databases={dbs} business_tables={biz_tables}")
+        return "实例级", f"databases={dbs} business_tables={biz_tables}"
+
+    def _verify_physical_datadir(self, mysql_cli: str, sock: str, target_db: str,
+                                 logs: list = None) -> tuple:
+        """用恢复出来的数据目录起临时实例后，校验数据是否真的可读。
+
+        返回 (label, verify_out)；读不到业务数据时抛 RuntimeError 如实失败。
+        """
+        r = subprocess.run(
+            [mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}", "-N",
+             "-e", self._physical_verify_sql(target_db)],
+            capture_output=True, text=True, timeout=60,
+            env=self._tool_env(mysql_cli))
+        if r.returncode != 0:
+            raise RuntimeError(f"校验查询失败: {(r.stderr or '')[:300]}")
+        return self._parse_physical_verify(r.stdout, target_db, logs)
+
     def _verify_prepared_remote(self, ssh_host: dict, work_dir: str,
                                 target_db: str, logs: list) -> tuple:
         """把 prepare 后的数据目录推到数据库服务器，用其**自带** mysqld 启动
@@ -1293,15 +1378,10 @@ class MySQLEngine(BackupEngine):
                         k = k.strip()
                         if k in safe_keys:
                             xb_args.append(f"--{k.replace('_', '-')}={v.strip()}")
-            if target_db:
-                verify_sql = (f'SELECT CONCAT("tables=", COUNT(*)) FROM '
-                              f'information_schema.tables WHERE '
-                              f'table_schema="{target_db}"')
-                label = f"目标库 {target_db}"
-            else:
-                verify_sql = ('SELECT CONCAT("databases=", COUNT(*)) FROM '
-                              'information_schema.schemata')
-                label = "实例库"
+            # 与本地分支同一套判定：物理恢复是整实例级恢复，target_db 不成立时回退
+            # 实例级校验，读不到业务表则如实失败（历史实现只查 target_db 表数，
+            # 查到 0 张也照样报"校验通过"）。
+            verify_sql = self._physical_verify_sql(target_db)
 
             def _attempt_script() -> str:
                 """构建远端校验脚本。
@@ -1348,7 +1428,7 @@ class MySQLEngine(BackupEngine):
             if rc != 0:
                 detail = (txt.strip() or v_err_txt.strip())[-600:]
                 raise RuntimeError(f"远端临时实例校验失败(rc={rc}): {detail}")
-            return label, txt.strip()
+            return self._parse_physical_verify(txt, target_db, logs)
         finally:
             # best-effort 清理（异常路径兜底强杀临时实例；锚定 mysqld 路径防自杀匹配）
             try:
@@ -1447,8 +1527,34 @@ class MySQLEngine(BackupEngine):
                     backup_path=backup_path,
                     message="增量恢复失败：未找到可用全量基备（xtrabackup_full_*）")
             base_ts = _ts_of(base_dir)
+            def _inc_valid(p: str) -> bool:
+                """增量层有效性：目录形态必须带 checkpoints / .success 标记。
+
+                历史遗留的空 xtrabackup_inc_* 目录（增量任务因无基备退化为全量时
+                预创建的空目录）不能作为增量层，否则 apply 阶段会报
+                "cannot open .../inc_N//xtrabackup_checkpoints"（实测命中）。
+                tar 包无法廉价预检，按名接受，解包后仍会在 apply 阶段如实失败。
+                """
+                if os.path.isdir(p):
+                    return (os.path.isfile(os.path.join(p, "xtrabackup_checkpoints"))
+                            or os.path.isfile(os.path.join(p, ".success")))
+                return True
+
+            if not _inc_valid(backup_path):
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path,
+                    message="增量恢复失败：待恢复的增量产物无效"
+                            "（空目录或缺少 xtrabackup_checkpoints 基线信息）")
             inc_arts = {p for p in xb_arts if self._xb_artifact_kind(p) == "inc"
                         and base_ts <= _ts_of(p) <= target_ts}
+            dropped = sorted(p for p in inc_arts if not _inc_valid(p))
+            if dropped:
+                inc_arts -= set(dropped)
+                logs.append(
+                    "[增量恢复] 已剔除 %d 个无效增量层（空目录/无 checkpoints）：%s"
+                    % (len(dropped),
+                       ", ".join(os.path.basename(x) for x in dropped)))
             inc_arts.add(backup_path)          # 被恢复的增量必须在链内
             incr_chain = sorted(inc_arts, key=_ts_of)
             logs.append(f"[增量恢复] 基备: {base_dir}，增量链 {len(incr_chain)} 层")
@@ -1607,22 +1713,13 @@ class MySQLEngine(BackupEngine):
                     raise RuntimeError(f"临时实例启动超时/失败: {tail or '无错误日志'}")
 
                 # 5) 校验数据可读
-                if target_db:
-                    verify_sql = (
-                        f"SELECT CONCAT('tables=', COUNT(*)) FROM information_schema.tables "
-                        f"WHERE table_schema='{target_db}';")
-                    label = f"目标库 {target_db}"
-                else:
-                    verify_sql = ("SELECT CONCAT('databases=', COUNT(*)) "
-                                  "FROM information_schema.schemata;")
-                    label = "实例库"
-                r = subprocess.run([mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}",
-                                    "-N", "-e", verify_sql],
-                                   capture_output=True, text=True, timeout=60,
-                                   env=self._tool_env(mysql_cli))
-                if r.returncode != 0:
-                    raise RuntimeError(f"校验查询失败: {(r.stderr or '')[:300]}")
-                verify_out = r.stdout.strip()
+                # 物理恢复是"整实例级"落地（数据目录级）：备份里有什么库就恢复什么库，
+                # 任务表单里的 target_db 属于逻辑恢复语义，对物理恢复通常不成立。
+                # 因此不能拿 target_db 一查了事——查不到表仍报"通过"就是假通过。
+                # 规则：目标库存在且有表 → 校验该库；否则回退实例级（库数 + 业务表数），
+                # 且业务表数为 0 时如实判失败（否则等于根本没校验）。
+                label, verify_out = self._verify_physical_datadir(
+                    mysql_cli, sock, target_db, logs)
             logs.append(f"[物理恢复] 校验通过: {label} {verify_out}")
 
             duration = round(time.time() - start, 3)

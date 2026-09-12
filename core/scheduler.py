@@ -675,6 +675,78 @@ def _make_trigger(task: dict, st_key: str = "schedule_type", expr_key: str = "cr
     return None
 
 
+# 物理备份的标志文件：出现其一即证明产物是"数据库可识别的物理备份"，
+# 而不是碰巧非空的普通目录。
+_PHYS_MARKERS = (
+    "xtrabackup_checkpoints", "mariabackup_checkpoints", "xtrabackup_info",
+    "backup-my.cnf", "backup_label", "PG_VERSION", "xtrabackup_binlog_info",
+)
+
+
+def _dir_digest(backup_path: str) -> tuple:
+    """递归统计目录产物的 文件数 / 总字节 / 命中的物理标志文件。"""
+    import os as _os
+    files = 0
+    size = 0
+    markers = []
+    for root, _dirs, fnames in _os.walk(backup_path):
+        for fn in fnames:
+            files += 1
+            try:
+                size += _os.path.getsize(_os.path.join(root, fn))
+            except OSError:
+                pass
+            if fn in _PHYS_MARKERS and fn not in markers:
+                markers.append(fn)
+    return files, size, markers
+
+
+def _verify_backup_dir(task: dict, backup_path: str, checksum: str = None,
+                       record_id: int = None) -> tuple:
+    """目录形态备份产物的校验（物理备份未打包时的默认形态）。
+
+    与文件形态的差异：
+    - 空目录 / 零字节目录直接判失败，绝不谎报通过；
+    - 以物理备份标志文件（*checkpoints / backup-my.cnf / backup_label 等）
+      作为"数据库可识别的可恢复产物"证据；一个都没有时如实说明按规模校验；
+    - 目录无法算内容 sha256（开销与语义都不合适），指纹信息（文件数 / 总字节 /
+      标志文件）写入 verify_msg，checksum 沿用引擎写入值。
+    """
+    import os as _os
+    if not _os.path.isdir(backup_path):
+        return False, f"备份产物不存在: {backup_path}"
+
+    files, size, markers = _dir_digest(backup_path)
+    if files == 0:
+        return False, f"备份目录为空: {backup_path}"
+    if size == 0:
+        return False, f"备份目录内所有文件总字节为 0: {backup_path}"
+
+    # ---- L1：校验和落库与历史比对（目录形态沿用引擎写入的指纹）----
+    digest = (checksum or "").strip()
+    suffix = ""
+    if digest:
+        if record_id is not None:
+            try:
+                db.execute(
+                    "UPDATE backup_records SET checksum=? "
+                    "WHERE id=? AND (checksum IS NULL OR checksum='')",
+                    (digest, record_id))
+            except Exception as e:
+                _logger.warning("[verify] 目录备份 checksum 落库失败: %s", e)
+        prev = _previous_checksum(task.get("id"), exclude_record_id=record_id)
+        if prev and prev == digest:
+            suffix = "；与上次一致（疑似源未变更）"
+        else:
+            suffix = f"；指纹={digest[:12]}"
+
+    if markers:
+        return True, (f"通过（目录产物 {files} 个文件 / {size} bytes；"
+                      f"物理标志 {','.join(markers[:3])}）{suffix}")
+    return True, (f"通过（目录产物 {files} 个文件 / {size} bytes；"
+                  f"未发现标准物理标志文件，按产物规模校验）{suffix}")
+
+
 def _verify_backup(task: dict, backup_path: str, checksum: str = None,
                    record_id: int = None) -> tuple:
     """备份后自动校验：文件存在 + 可读 + 数据库客户端可识别 + 校验和落库。
@@ -694,8 +766,16 @@ def _verify_backup(task: dict, backup_path: str, checksum: str = None,
         (ok, msg) 二元组；ok 为 bool，msg 为中文校验说明。
     """
     import os
-    if not os.path.isfile(backup_path):
-        return False, f"文件不存在: {backup_path}"
+    if not os.path.exists(backup_path):
+        return False, f"备份产物不存在: {backup_path}"
+
+    # 目录形态产物：物理备份（xtrabackup / mariabackup / pg_basebackup）未打包时
+    # 产物本身是备份目录。目录不能按"文件"判存在，否则未压缩的物理备份会被误判
+    # 为"文件不存在"（实测 MariaDB / MySQL 物理全量、增量均命中），改走目录级校验。
+    if os.path.isdir(backup_path):
+        return _verify_backup_dir(task, backup_path,
+                                  checksum=checksum, record_id=record_id)
+
     size = os.path.getsize(backup_path)
     if size == 0:
         return False, "备份文件大小为 0"

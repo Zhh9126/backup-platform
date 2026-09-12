@@ -6,7 +6,8 @@ from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, List
 
-from .base import BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader, SyncConfig
+from .base import (BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader,
+                   SyncConfig, matrix_suggest)
 from ..type_mapper import JavaType, db_type_to_java_type, to_db, to_java
 
 logger = logging.getLogger(__name__)
@@ -62,11 +63,38 @@ class PostgreSQLSourceReader(SourceReader):
                     (f"{schema}.{table}",),
                 )
                 pk_set = {r[0] for r in cur.fetchall()}
+                # 字符类型（max_length 用字符长度）与数值类型（precision/scale 用精度）的归一
+                _CHAR_BASES = {"CHARACTER VARYING", "VARCHAR", "CHARACTER", "CHAR",
+                               "NCHAR", "NVARCHAR", "NVARCHAR2", "BPCHAR"}
+                _NUM_BASES = {"NUMERIC", "DECIMAL"}
                 cols = []
                 for row in rows:
-                    ctype = row[1].upper().split("(")[0]
-                    cols.append(ColumnMeta(name=row[0], type=ctype, nullable=row[2],
-                                           default=row[3]))
+                    raw = (row[1] or "").strip()
+                    # 拆出精度括号与数组后缀（PG 列类型形如 'numeric(12,3)'/'integer[]'/'varchar(64)'）
+                    m = re.match(r"^\s*([^(]+?)\s*(?:\(([^)]*)\))?\s*(\[\])?\s*$", raw)
+                    if m:
+                        base = m.group(1).strip().upper()
+                        inner = (m.group(2) or "").strip()
+                        arr_sfx = m.group(3) or ""
+                    else:
+                        base = raw.upper().strip()
+                        inner = ""
+                        arr_sfx = ""
+                    ctype = base + arr_sfx
+                    prec = scale = None
+                    if inner and re.fullmatch(r"\s*\d+\s*(?:,\s*\d+)?\s*", inner):
+                        parts = inner.split(",")
+                        try: prec = int(parts[0])
+                        except Exception: pass
+                        if len(parts) > 1:
+                            try: scale = int(parts[1])
+                            except Exception: pass
+                    cols.append(ColumnMeta(
+                        name=row[0], type=ctype, nullable=row[2], default=row[3],
+                        max_length=prec if base in _CHAR_BASES else None,
+                        numeric_precision=prec if base in _NUM_BASES else None,
+                        numeric_scale=scale if base in _NUM_BASES else None,
+                    ))
                 for c in cols:
                     c.is_primary = c.name in pk_set
                 return cols
@@ -163,12 +191,14 @@ class PostgreSQLSinkWriter(SinkWriter):
         "YEAR": "SMALLINT",
         "FLOAT": "REAL",
         "DOUBLE": "DOUBLE PRECISION",
+        "REAL": "REAL",
         "BOOL": "BOOLEAN",
         "BOOLEAN": "BOOLEAN",
         "DATE": "DATE",
         "DATETIME": "TIMESTAMP",
         "TIMESTAMP": "TIMESTAMP",
         "TIME": "TIME",
+        "TIMESTAMPTZ": "TIMESTAMP WITH TIME ZONE",
         "CHAR": "CHAR",
         "VARCHAR": "VARCHAR",
         "TINYTEXT": "TEXT",
@@ -181,11 +211,78 @@ class PostgreSQLSinkWriter(SinkWriter):
         "BLOB": "BYTEA",
         "MEDIUMBLOB": "BYTEA",
         "LONGBLOB": "BYTEA",
-        "JSON": "JSONB",
-        "ENUM": "TEXT",
+        "JSON": "JSONB",            # MySQL JSON → PG JSONB（性能与索引更优）
+        "ENUM": "TEXT",             # 跨库枚举约束丢失，DTS 规则
         "SET": "TEXT",
+        "BIT": "SMALLINT",          # MySQL BIT(n) → PG SMALLINT（位串类型绑定兼容问题）
         "DECIMAL": "NUMERIC",
         "NUMERIC": "NUMERIC",
+        # 各数据库偏门类型（跨库映射）
+        "GEOMETRY": "TEXT",         # PG 需 PostGIS 扩展，否则降 TEXT
+        "POINT": "TEXT",
+        "LINESTRING": "TEXT",
+        "POLYGON": "TEXT",
+        "MULTIPOINT": "TEXT",
+        "MULTILINESTRING": "TEXT",
+        "MULTIPOLYGON": "TEXT",
+        "GEOMETRYCOLLECTION": "TEXT",
+        "GEOMCOLLECTION": "TEXT",
+        "GEOGRAPHY": "TEXT",        # SQL Server 地理 → 字符串
+        "UNIQUEIDENTIFIER": "UUID", # SQL Server UUID → PG 原生 UUID
+        "HIERARCHYID": "TEXT",      # SQL Server 层次路径 → 字符串
+        "ROWVERSION": "BYTEA",      # SQL Server 8 字节二进制
+        "SQL_VARIANT": "TEXT",
+        "VECTOR": "TEXT",
+        "MONEY": "NUMERIC(19,4)",
+        "SMALLMONEY": "NUMERIC(10,4)",
+        "XML": "XML",               # PG XML 类型
+        "XMLTYPE": "XML",
+        "UROWID": "VARCHAR(40)",
+        "ROWID": "VARCHAR(40)",
+        "BFILE": "TEXT",            # 外部文件路径
+        "LONG": "TEXT",             # Oracle 已弃用 LONG
+        "LONG RAW": "BYTEA",
+        "LONG VARCHAR": "TEXT",
+        "LONG VARBINARY": "BYTEA",
+        "IMAGE": "BYTEA",
+        "ANYDATA": "TEXT",
+        "ANYTYPE": "TEXT",
+        "ANYDATASET": "TEXT",
+        "REF": "TEXT",
+        "NVARCHAR": "VARCHAR",
+        "NVARCHAR2": "VARCHAR",
+        "NCHAR": "CHAR",
+        "NCHAR2": "CHAR",
+        "RAW": "BYTEA",
+        "NCLOB": "TEXT",
+        "INTERVAL": "INTERVAL",
+        "DATETIME2": "TIMESTAMP",
+        "DATETIMEOFFSET": "TIMESTAMP WITH TIME ZONE",
+        "SMALLDATETIME": "TIMESTAMP",
+        "BINARY_DOUBLE": "DOUBLE PRECISION",
+        "BINARY_FLOAT": "REAL",
+        "PLS_INTEGER": "INTEGER",
+        "BINARY_INTEGER": "INTEGER",
+        "JSONB": "JSONB",           # PG 同库保形
+        "JSONPATH": "TEXT",
+        "UUID": "UUID",             # PG 原生 UUID
+        "ARRAY": "JSONB",           # PG 数组 → JSONB（应用层适配）
+        "INET": "TEXT",
+        "CIDR": "TEXT",
+        "MACADDR": "TEXT",
+        "MACADDR8": "TEXT",
+        "HSTORE": "TEXT",
+        "TSVECTOR": "TEXT",
+        "TSQUERY": "TEXT",
+        "INT4RANGE": "TEXT",
+        "INT8RANGE": "TEXT",
+        "NUMRANGE": "TEXT",
+        "DATERANGE": "TEXT",
+        "TSRANGE": "TEXT",
+        "TSTZRANGE": "TEXT",
+        "CITEXT": "TEXT",
+        "LTREE": "TEXT",
+        "CUBE": "TEXT",
     }
 
     _PG_FUNC_DEFAULTS = {
@@ -201,6 +298,15 @@ class PostgreSQLSinkWriter(SinkWriter):
             return "NUMERIC(20,0)"
         pg = self._MYSQL_TYPE_MAP.get(base)
         if pg is None:
+            # 跨源兜底：源端类型是其它库特有/偏门类型（XMLTYPE/ROWID/BFILE/INET/
+            # HIERARCHYID/VECTOR/ST_GEOMETRY...）时用统一类型矩阵翻译，避免一律落 TEXT
+            sug = matrix_suggest(getattr(self, "config", None), "postgresql", col.type)
+            if sug:
+                if sug.startswith("VARCHAR") or sug.startswith("CHAR"):
+                    return f"{sug.split('(')[0]}({col.max_length or 255})"
+                if sug in ("NUMERIC", "DECIMAL"):
+                    return f"NUMERIC({col.numeric_precision or 10},{col.numeric_scale or 0})"
+                return sug
             return "TEXT"
         if pg in ("VARCHAR", "CHAR"):
             return f"{pg}({col.max_length or 255})"

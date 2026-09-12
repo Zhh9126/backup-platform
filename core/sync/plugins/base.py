@@ -76,6 +76,26 @@ class ColumnMeta:
     numeric_scale: Optional[int] = None
 
 
+def matrix_suggest(config, tgt_db: str, type_str: str) -> Optional[str]:
+    """跨源类型兜底建议：用统一类型矩阵把"异库特有类型"翻译成目标库可用类型。
+
+    各 SinkWriter 的 _map_to_xxx_type 主要识别本库类型名；而源端列的 type 直接来自
+    源库 list_columns（可能是 JSONB / XMLTYPE / ROWID / INET / HIERARCHYID 等）。
+    若未命中就落到 VARCHAR(255)/NVARCHAR(4000)/VARCHAR2(4000) 兜底，会丢语义
+    （数值列变字符串列、大对象被截断）。此处调用 core.sync.type_matrix 给出建议
+    类型；未识别或目标库明确不支持（level=fail）时返回 None，由调用方保留兜底。
+    """
+    src = getattr(config, "src_db_type", "") or ""
+    try:
+        from core.sync.type_matrix import map_type
+        r = map_type(src, tgt_db, type_str)
+    except Exception:
+        return None
+    if r.get("level") == "fail":
+        return None
+    return r.get("target_type") or None
+
+
 @dataclass
 class ReadResult:
     """Reader 返回的一批记录。"""

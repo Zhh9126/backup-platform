@@ -313,6 +313,8 @@ def _probe_unimplemented(_h, _p, _u, _pw, _db, _t):
 # Python 驱动（pymysql/psycopg2/redis/pymongo），由探测函数内部驱动优先。
 _PROBES = {
     "mysql": ([], _probe_mysql),
+    # MariaDB 与 MySQL 协议兼容（pymysql 直连），复用同一探测实现
+    "mariadb": ([], _probe_mysql),
     "postgresql": ([], _probe_postgresql),
     "redis": ([], _probe_redis),
     "mongodb": ([], _probe_mongodb),

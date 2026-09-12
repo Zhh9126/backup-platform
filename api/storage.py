@@ -10,12 +10,152 @@ import json
 import os
 import shutil
 import time
-from flask import request, jsonify
+from flask import request, jsonify, current_app
 
+import config
 import core.db as db
 from auth import login_required
 from core.storage_backends import get_backend, list_supported_types, check_dependencies, TYPE_META, TIER_NAMES
 from . import api_bp
+
+
+# ------------------------- 本地备份存储位置（L1 落点） -------------------------
+# 未部署 MinIO/S3 时本地目录是备份的唯一落点，故该位置必须对用户可见且可配置：
+# 界面配置持久化到 system_config.backup_root，重启后仍生效。
+_LOCAL_ROOT_KEY = "backup_root"
+# 拒绝把备份目录设到系统关键目录（防误操作）
+_FORBIDDEN_ROOTS = {
+    "/", "/bin", "/sbin", "/lib", "/lib64", "/usr", "/etc", "/boot", "/proc",
+    "/sys", "/dev", "/run", "/var/run", "/var/log", "/tmp",
+}
+_MAX_STAT_ENTRIES = 20000  # 目录用量统计上限（防超大目录拖慢接口）
+
+
+def _dir_usage(path: str) -> dict:
+    """统计目录内文件总量（超过上限则标记为近似值）。"""
+    total = 0
+    files = 0
+    scanned = 0
+    approximate = False
+    for dirpath, _dirnames, filenames in os.walk(path, onerror=lambda _e: None):
+        for fn in filenames:
+            scanned += 1
+            if scanned > _MAX_STAT_ENTRIES:
+                approximate = True
+                break
+            try:
+                total += os.path.getsize(os.path.join(dirpath, fn))
+                files += 1
+            except OSError:
+                continue
+        if approximate:
+            break
+    return {"bytes": total, "files": files, "approximate": approximate}
+
+
+@api_bp.route("/storage/local-root", methods=["GET"])
+@login_required
+def api_get_local_root():
+    """本地备份存储位置：实际路径、来源、磁盘用量、持久化风险提示。"""
+    info = config.backup_root_info()
+    path = info["path"]
+    info["exists"] = os.path.isdir(path)
+    info["writable"] = (os.access(path, os.W_OK) if info["exists"]
+                        else os.access(os.path.dirname(path) or "/", os.W_OK))
+    try:
+        du = shutil.disk_usage(path)
+        info["disk"] = {
+            "total_bytes": du.total,
+            "used_bytes": du.used,
+            "free_bytes": du.free,
+            "used_percent": round(du.used / du.total * 100, 1),
+        }
+    except Exception:
+        info["disk"] = {}
+    info["data"] = _dir_usage(path) if info["exists"] else {"bytes": 0, "files": 0, "approximate": False}
+    # 是否已配置对象存储（决定"仅本地保存"的提示强度）
+    row = db.query_one(
+        "SELECT COUNT(*) AS cnt FROM storage_targets "
+        "WHERE enabled=1 AND type IN ('minio','s3')"
+    )
+    info["object_storage_configured"] = bool(row and row["cnt"])
+    return jsonify(info)
+
+
+@api_bp.route("/storage/local-root", methods=["PUT"])
+@login_required
+def api_set_local_root():
+    """修改本地备份存储位置（界面配置，重启后仍生效）。
+
+    body: {"path": "/data/backups", "migrate": false}
+    migrate=true 时把旧目录内的历史备份移动到新目录（同名已存在则跳过并报告）。
+    """
+    data = request.get_json(silent=True) or {}
+    raw = (data.get("path") or "").strip()
+    migrate = bool(data.get("migrate"))
+    if not raw:
+        return jsonify({"error": "请填写备份存储目录"}), 400
+    if not os.path.isabs(os.path.expanduser(raw)):
+        return jsonify({"error": "请填写绝对路径，例如 /data/backups"}), 400
+
+    new_path = os.path.abspath(os.path.expanduser(raw))
+    if new_path.rstrip("/") in _FORBIDDEN_ROOTS:
+        return jsonify({"error": f"不允许将备份目录设置为系统目录：{new_path}"}), 400
+    if os.path.isfile(new_path):
+        return jsonify({"error": "该路径已是一个文件，请填写目录路径"}), 400
+
+    old_path = os.path.abspath(str(config.get_backup_root()))
+    try:
+        os.makedirs(new_path, exist_ok=True)
+        probe = os.path.join(new_path, ".aidbm_write_test")
+        with open(probe, "wb") as f:
+            f.write(b"ok")
+        os.remove(probe)
+    except Exception as e:
+        return jsonify({"error": f"目录不可写：{e}"}), 400
+
+    if os.path.realpath(new_path) == os.path.realpath(old_path):
+        return jsonify({"ok": True, "path": new_path, "unchanged": True,
+                        "message": "路径未变化"})
+
+    # 持久化 + 运行时生效（config 全局值 + flask 配置同步）
+    db.execute(
+        "INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)",
+        (_LOCAL_ROOT_KEY, new_path),
+    )
+    config.set_backup_root(new_path, origin="ui")
+    try:
+        current_app.config["BACKUP_ROOT"] = new_path
+    except Exception:
+        pass
+
+    migrated = None
+    if migrate and os.path.isdir(old_path):
+        moved, failed = [], []
+        for name in sorted(os.listdir(old_path)):
+            src = os.path.join(old_path, name)
+            dst = os.path.join(new_path, name)
+            try:
+                if os.path.exists(dst):
+                    failed.append(f"{name}（目标已存在，已跳过）")
+                    continue
+                shutil.move(src, dst)
+                moved.append(name)
+            except Exception as e:
+                failed.append(f"{name}（{e}）")
+        migrated = {"from": old_path, "moved": moved, "failed": failed}
+
+    db.add_log("info", "storage",
+               f"本地备份存储位置变更：{old_path} -> {new_path}"
+               + (f"（迁移 {len(migrated['moved'])} 项）" if migrated else ""))
+    return jsonify({
+        "ok": True,
+        "path": new_path,
+        "old_path": old_path,
+        "migrated": migrated,
+        "message": "本地备份存储位置已更新",
+        "info": config.backup_root_info(),
+    })
 
 
 # ------------------------- 工具函数 -------------------------
@@ -271,24 +411,27 @@ def api_storage_stats():
 @api_bp.route("/storage/usage", methods=["GET"])
 @login_required
 def api_storage_usage():
-    """本地存储（L1）所在磁盘的容量/用量概览。"""
-    row = db.query_one(
-        "SELECT endpoint FROM storage_targets WHERE type='local' AND enabled=1 ORDER BY is_default DESC, id LIMIT 1"
-    )
-    path = (row and row["endpoint"]) or "./backups"
-    path = os.path.abspath(path)
+    """本地存储（L1 落点）所在磁盘的容量/用量概览。
+
+    路径以实际生效的备份根目录为准（界面配置 > 环境变量 > 默认），
+    不再依赖 storage_targets 中是否登记了 local 目标——未登记时也必须
+    能告诉用户备份到底存在哪里。
+    """
+    path = os.path.abspath(str(config.get_backup_root()))
     try:
         du = shutil.disk_usage(path)
         used_percent = round(du.used / du.total * 100, 1)
         return jsonify({
             "path": path,
+            "source": config.backup_root_source(),
+            "source_label": config.backup_root_source_label(),
             "total_bytes": du.total,
             "used_bytes": du.used,
             "free_bytes": du.free,
             "used_percent": used_percent,
         })
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        return jsonify({"path": path, "error": str(e)}), 400
 
 
 @api_bp.route("/storage/replicate/<int:record_id>", methods=["POST"])

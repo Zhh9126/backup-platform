@@ -51,13 +51,20 @@ def create_app() -> Flask:
                 static_folder="static")
     app.secret_key = config.SECRET_KEY
     app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024 * 1024  # 20GB（安装包可达 4GB+）
-    app.config["BACKUP_ROOT"] = str(config.BACKUP_ROOT)
     # 会话安全：HttpOnly + SameSite=Lax 缓解 CSRF；会话超时按配置（默认 8 小时）
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
     app.config["PERMANENT_SESSION_LIFETIME"] = _dt.timedelta(seconds=config.SESSION_TIMEOUT)
     db.init_schema()
+    # 本地备份存储位置（L1 落点）：界面配置 > 环境变量/config.json > 默认（程序目录）
+    config.load_backup_root_from_db()
+    app.config["BACKUP_ROOT"] = str(config.get_backup_root())
+    _root_info = config.backup_root_info()
+    app.logger.info("[存储] 本地备份目录: %s（来源：%s）",
+                    _root_info["path"], _root_info["source_label"])
+    if _root_info["persistence"]["level"] == "warn":
+        app.logger.warning("[存储] %s", _root_info["persistence"]["message"])
 
     @app.after_request
     def _security_headers(resp):

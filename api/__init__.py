@@ -50,7 +50,13 @@ def safe_download_path(path: str):
     if not path or not os.path.isabs(path):
         return None
     real = os.path.realpath(path)
-    root = os.path.realpath(str(current_app.config.get("BACKUP_ROOT") or "backups"))
+    # 备份根目录支持界面运行时修改，故优先取 config 当前值（flask 配置为启动快照）
+    try:
+        import config as _cfg
+        _root = str(_cfg.get_backup_root())
+    except Exception:
+        _root = str(current_app.config.get("BACKUP_ROOT") or "backups")
+    root = os.path.realpath(_root)
     if real != root and not real.startswith(root + os.sep):
         return None
     if not os.path.isfile(real):

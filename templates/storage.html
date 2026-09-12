@@ -5,6 +5,43 @@
   <p class="text-muted mb-0">三重备份体系：MinIO 热数据（L1）→ S3 冷数据（L2）→ 源端本地路径导出（L3）</p>
 </div>
 
+<!-- 本地备份存储位置（备份第一落点，未配对象存储时的唯一落点） -->
+<div class="page-card mb-3" id="localRootCard">
+  <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
+    <div>
+      <h6 class="mb-1"><i class="bi bi-folder2-open me-1"></i>本地备份存储位置
+        <span class="badge bg-secondary ms-1">备份第一落点</span>
+      </h6>
+      <small class="text-muted">备份文件先落盘到该目录，再按策略复制到 MinIO / S3。未配置对象存储时，这里是备份的唯一存放位置。</small>
+    </div>
+    <button class="btn btn-outline-primary btn-sm" onclick="openLocalRootModal()">
+      <i class="bi bi-pencil-square me-1"></i>修改存储位置
+    </button>
+  </div>
+  <div class="row g-3 mt-2">
+    <div class="col-md-6">
+      <div class="small text-muted">当前存储路径</div>
+      <div class="font-code text-break" id="lrPath">加载中...</div>
+      <div class="mt-1" id="lrSource"></div>
+    </div>
+    <div class="col-md-3">
+      <div class="small text-muted">该目录已存放备份</div>
+      <div id="lrData">-</div>
+    </div>
+    <div class="col-md-3">
+      <div class="small text-muted">所在磁盘可用</div>
+      <div id="lrDisk">-</div>
+    </div>
+  </div>
+  <div class="mt-2" id="lrUsage"></div>
+  <div class="alert alert-warning py-2 px-3 mt-3 mb-0 d-none" id="lrWarn">
+    <i class="bi bi-exclamation-triangle-fill me-1"></i><span id="lrWarnMsg"></span>
+  </div>
+  <div class="alert alert-info py-2 px-3 mt-3 mb-0 d-none" id="lrNoObject">
+    <i class="bi bi-info-circle-fill me-1"></i><span id="lrNoObjectMsg"></span>
+  </div>
+</div>
+
 <!-- 三级架构卡片（内嵌目标详情） -->
 <div class="row g-3 mb-3" id="tierOverview">
   <!-- L1 MinIO 热数据 -->
@@ -373,6 +410,44 @@
       <div class="modal-footer">
         <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
         <button type="button" class="btn btn-primary" onclick="saveReplicateConfig()"><i class="bi bi-check-lg me-1"></i>保存策略</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 修改本地备份存储位置 -->
+<div class="modal fade" id="localRootModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-folder2-open me-1"></i>修改本地备份存储位置</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-3">
+          <label class="form-label fw-semibold">存储目录（绝对路径）</label>
+          <input type="text" class="form-control font-code" id="lr_path_input" placeholder="/data/backups">
+          <div class="form-text" id="lr_modal_tip"></div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label fw-semibold">目录布局</label>
+          <div class="small text-muted font-code">&lt;该路径&gt;/&lt;数据库类型&gt;/&lt;任务ID_任务名&gt;/</div>
+        </div>
+        <div class="form-check mb-2">
+          <input class="form-check-input" type="checkbox" id="lr_migrate">
+          <label class="form-check-label" for="lr_migrate">同时迁移旧目录中的历史备份（同名文件跳过）</label>
+        </div>
+        <div class="alert alert-warning py-2 px-3 small mb-0">
+          <i class="bi bi-info-circle me-1"></i>请填写<strong>持久化</strong>目录：容器部署必须使用已挂载卷内的路径（如 <code>/data/backups</code>），
+          否则重建容器会丢失备份；修改后新的备份立即写入新目录。
+        </div>
+        <div class="small mt-2" id="lr_save_msg"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn btn-primary" id="lrSaveBtn" onclick="saveLocalRoot()">
+          <i class="bi bi-check-lg me-1"></i>保存
+        </button>
       </div>
     </div>
   </div>

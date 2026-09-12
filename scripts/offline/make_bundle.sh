@@ -52,6 +52,8 @@ SRC="$(dirname "$0")/../.."
 for d in core api static templates drivers skills; do cp -a "$SRC/$d" "$BUNDLE/app/"; done
 cp "$SRC"/*.py "$SRC/start.sh" "$SRC/requirements.txt" "$BUNDLE/app/" 2>/dev/null || true
 cp "$SRC/scripts/offline/install.sh" "$BUNDLE/install.sh"
+# 安装器的镜像版本随包版本注入（避免 install.sh 内硬编码版本与镜像不一致）
+sed -i "s|__BUNDLE_VERSION__|${VER}|g" "$BUNDLE/install.sh"
 chmod +x "$BUNDLE/install.sh"
 cp "$SRC/scripts/offline/healthcheck.sh" "$BUNDLE/tools/" 2>/dev/null || true
 

@@ -4668,6 +4668,127 @@
   let storageModal;
   let editingStorageId = null;
   let storageUsage = null;
+  let localRootModal = null;
+  let localRootInfo = null;
+
+  // 字节可读化（未配置对象存储时需要向用户明确展示本地落点容量）
+  const fmtBytes = (n) => {
+    if (n == null || isNaN(n)) return "-";
+    const u = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let i = 0, v = Number(n);
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? v : v.toFixed(v >= 100 ? 0 : 1)) + " " + u[i];
+  };
+
+  // ---- 本地备份存储位置（L1 落点）：展示实际路径 + 修改 ----
+  async function loadLocalRoot() {
+    try {
+      const d = await api("GET", "/api/storage/local-root");
+      localRootInfo = d;
+      $("lrPath").textContent = d.path || "-";
+      const badge = d.source === "ui"
+        ? '<span class="badge bg-primary">界面配置</span>'
+        : (d.source === "env"
+          ? '<span class="badge bg-secondary">环境变量 / config.json</span>'
+          : '<span class="badge bg-warning text-dark">默认路径（未配置）</span>');
+      let extra = "";
+      if (d.source !== "ui" && d.env_path) extra = ' <small class="text-muted">BACKUP_ROOT=' + esc(d.env_path) + '</small>';
+      else if (d.source === "default") extra = ' <small class="text-muted">默认为程序安装目录下 backups</small>';
+      if (!d.writable) extra += ' <span class="badge bg-danger">不可写</span>';
+      $("lrSource").innerHTML = badge + extra;
+
+      const data = d.data || {};
+      $("lrData").innerHTML = '<strong>' + fmtBytes(data.bytes) + '</strong>'
+        + ' <small class="text-muted">/ ' + (data.files || 0) + ' 个文件'
+        + (data.approximate ? '（近似）' : '') + '</small>';
+
+      const disk = d.disk || {};
+      $("lrDisk").innerHTML = disk.total_bytes
+        ? '<strong>' + fmtBytes(disk.free_bytes) + '</strong> <small class="text-muted">/ ' + fmtBytes(disk.total_bytes) + '</small>'
+        : '<span class="text-muted">-</span>';
+
+      if (disk.total_bytes) {
+        const pct = disk.used_percent || 0;
+        const cls = pct >= 95 ? "bg-danger" : (pct >= 85 ? "bg-warning" : "bg-success");
+        $("lrUsage").innerHTML = '<div class="progress" style="height:6px">'
+          + '<div class="progress-bar ' + cls + '" style="width:' + pct + '%"></div></div>'
+          + '<small class="text-muted">磁盘已用 ' + pct + '%</small>';
+      } else {
+        $("lrUsage").innerHTML = "";
+      }
+
+      const per = d.persistence || {};
+      if (per.level === "warn") {
+        $("lrWarn").classList.remove("d-none");
+        $("lrWarnMsg").textContent = per.message;
+      } else {
+        $("lrWarn").classList.add("d-none");
+      }
+
+      if (!d.object_storage_configured) {
+        $("lrNoObject").classList.remove("d-none");
+        $("lrNoObjectMsg").innerHTML = '尚未配置 MinIO / S3 对象存储，备份文件只保存在本地：<code>'
+          + esc(d.path) + '</code>（布局 <code>' + esc(d.layout || "") + '</code>）。请确认该目录磁盘容量充足，'
+          + '并做好持久化或定期向离线介质转移。';
+      } else {
+        $("lrNoObject").classList.add("d-none");
+      }
+    } catch (e) {
+      $("lrPath").textContent = "加载失败: " + e.message;
+    }
+  }
+  window.loadLocalRoot = loadLocalRoot;
+
+  window.openLocalRootModal = () => {
+    if (!localRootInfo) return;
+    $("lr_path_input").value = localRootInfo.path || "";
+    $("lr_migrate").checked = false;
+    $("lr_save_msg").textContent = "";
+    let tip = '当前来源：' + (localRootInfo.source_label || "-") + '。';
+    if (localRootInfo.source !== "ui") {
+      tip += '保存后将写入界面配置（优先级高于环境变量）。';
+    }
+    $("lr_modal_tip").textContent = tip;
+    if (!localRootModal) {
+      const el = document.getElementById("localRootModal");
+      if (el) localRootModal = new bootstrap.Modal(el);
+    }
+    if (localRootModal) localRootModal.show();
+  };
+
+  window.saveLocalRoot = async () => {
+    const path = ($("lr_path_input").value || "").trim();
+    if (!path) {
+      $("lr_save_msg").innerHTML = '<span class="text-danger">请填写目录路径</span>';
+      return;
+    }
+    const btn = $("lrSaveBtn");
+    const orig = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>保存中...';
+    $("lr_save_msg").textContent = "";
+    try {
+      const r = await api("PUT", "/api/storage/local-root",
+        { path: path, migrate: $("lr_migrate").checked });
+      toast("本地备份存储位置已更新", "success");
+      const mv = r.migrated;
+      if (mv && mv.moved && mv.moved.length) {
+        toast("已迁移 " + mv.moved.length + " 项历史备份", "success");
+      }
+      if (mv && mv.failed && mv.failed.length) {
+        $("lr_save_msg").innerHTML = '<span class="text-warning">部分未迁移：' + esc(mv.failed.join("；")) + '</span>';
+      }
+      if (localRootModal) localRootModal.hide();
+      try { storageUsage = await api("GET", "/api/storage/usage"); } catch (e) { /* ignore */ }
+      await loadLocalRoot();
+      await loadTargets();
+    } catch (e) {
+      $("lr_save_msg").innerHTML = '<span class="text-danger">' + esc(e.message) + '</span>';
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = orig;
+    }
+  };
 
   // 相对时间（“3 分钟前检查”），借鉴 Databasus 的健康检查时间展示
   const fromNow = (iso) => {
@@ -4785,17 +4906,19 @@
           + (errors ? ' <span class="text-danger"><i class="bi bi-exclamation-triangle me-1"></i>' + errors + ' 个异常</span>' : '')
         : '<span class="text-muted"><i class="bi bi-dash-circle me-1"></i>未配置</span>';
     }
-    // L1 本地磁盘用量可视化（TOP 5）
+    // L1 本地磁盘用量可视化（未配 MinIO 时同步显示实际本地落点）
     const uEl = $("tier1Usage");
     if (uEl) {
       if (storageUsage && !storageUsage.error) {
-        const pct = storageUsage.used_percent;
+        const pct = storageUsage.used_percent || 0;
         const barCls = pct >= 95 ? "bg-danger" : (pct >= 85 ? "bg-warning" : "bg-success");
-        const totalGb = (storageUsage.total_bytes / 1073741824).toFixed(0);
-        const usedGb = (storageUsage.used_bytes / 1073741824).toFixed(0);
+        const hasMinio = targets.some(t => t.enabled && t.type === "minio");
         uEl.innerHTML = '<div class="progress" style="height:6px">' +
           '<div class="progress-bar ' + barCls + '" style="width:' + pct + '%"></div></div>' +
-          '<small class="text-muted">已用 ' + pct + '% · ' + usedGb + '/' + totalGb + ' GB</small>';
+          '<small class="text-muted">已用 ' + pct + '% · ' + fmtBytes(storageUsage.used_bytes) + '/' + fmtBytes(storageUsage.total_bytes) + '</small>' +
+          (!hasMinio && storageUsage.path
+            ? '<div class="small text-muted mt-1 text-truncate" title="' + esc(storageUsage.path) + '">未配 MinIO，本地落盘：<code>' + esc(storageUsage.path) + '</code></div>'
+            : '');
       } else {
         uEl.innerHTML = storageUsage && storageUsage.error ? '<small class="text-muted">容量获取失败</small>' : '';
       }
@@ -5027,6 +5150,7 @@
     } catch (e) {
       storageUsage = { error: String(e.message) };
     }
+    await loadLocalRoot();
     await loadTargets();
     try { await loadLifecycle(); } catch (e) { /* 生命周期模块未就绪时忽略 */ }
   }

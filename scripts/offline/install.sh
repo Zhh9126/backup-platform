@@ -59,15 +59,20 @@ if [[ "$MODE" == "docker" ]]; then
     docker load -i "$img"
   done
   mkdir -p "$INSTALL_DIR"
+  # 备份产物持久化目录：容器内落盘 /data/backups，映射到 ${INSTALL_DIR}/data（宿主持久卷）
+  mkdir -p "$INSTALL_DIR/data/backups" "$INSTALL_DIR/data/instance" "$INSTALL_DIR/data/logs"
   cat > "$INSTALL_DIR/docker-compose.yml" <<EOF
 services:
   backup-platform:
-    image: ghcr.io/zhh9126/backup-platform:v1.3.3
+    image: ghcr.io/zhh9126/backup-platform:__BUNDLE_VERSION__
     container_name: backup-platform
     network_mode: host            # 直连内网数据库与 SSH 目标机
     environment:
       - WEB_PORT=${WEB_PORT}
       - TZ=Asia/Shanghai
+      # 本地备份存储位置（L1 落点）：落在此挂载卷内，容器重建不丢数据；
+      # 也可在平台「备份存储管理」页按界面配置覆盖（界面配置优先级更高）
+      - BACKUP_ROOT=/data/backups
     volumes:
       - ${INSTALL_DIR}/data:/data
     restart: unless-stopped
@@ -103,6 +108,8 @@ else
   .venv/bin/pip install --no-index --find-links "$BASE_DIR/wheelhouse" \
       -r requirements.txt jpype1 jaydebeapi
   log "写入 systemd 服务..."
+  # 本地备份存储位置（L1 落点）：独立数据目录，避免把备份写进程序安装目录
+  mkdir -p "$INSTALL_DIR/data/backups" "$INSTALL_DIR/data/logs"
   cat > /etc/systemd/system/backup-platform.service <<EOF
 [Unit]
 Description=Backup Platform (offline)
@@ -113,6 +120,7 @@ WorkingDirectory=$INSTALL_DIR
 ExecStart=$INSTALL_DIR/.venv/bin/python run.py
 Environment=WEB_PORT=$WEB_PORT
 Environment=TZ=Asia/Shanghai
+Environment=BACKUP_ROOT=$INSTALL_DIR/data/backups
 Environment=CODEBUDDY_SAFE_DELETE_ENABLED=0
 Restart=always
 RestartSec=5

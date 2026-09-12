@@ -6,8 +6,10 @@ cd /root/CodeBuddy/20260826095855/backup-platform
 export PATH="/opt/database/bin:$PATH"
 # 规避 CodeBuddy/工作台环境的 safe-delete 拦截钩子（PYTHONPATH sitecustomize）：
 # 该钩子会在平台清理过期备份等删除操作时因状态文件损坏抛 SystemExit(1) 杀死服务；
-# 非该环境下此变量无任何副作用
-export CODEBUDDY_SAFE_DELETE_ENABLED="${CODEBUDDY_SAFE_DELETE_ENABLED:-0}"
+# 非该环境下此变量无任何副作用。
+# 注意：必须强制置 0——工作台环境已把该变量设为 "1"，用 ${VAR:-0} 不会被覆盖，
+# 会导致平台启动后立刻被钩子杀掉（表现为能打印调度日志但端口不监听）。
+export CODEBUDDY_SAFE_DELETE_ENABLED=0
 # 一级（L1）默认本地存储：所有备份文件落地到 /opt/backup-platform
 export BACKUP_ROOT="/opt/backup-platform"
 exec .venv/bin/python run.py

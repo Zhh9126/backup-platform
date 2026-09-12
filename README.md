@@ -326,11 +326,15 @@ docker load -i backup-platform.tar
 ```bash
 docker run -d --name backup-platform \
   -p 8080:8080 \
-  -v backup-data:/app/instance \
-  -v backup-files:/app/backups \
+  -v backup-data:/data \
+  -e BACKUP_ROOT=/data/backups \
   --restart unless-stopped \
   ghcr.io/zhh9126/backup-platform:latest
 ```
+
+> **备份文件存在哪？** 镜像默认把备份产物写到容器内 `/data/backups`（布局 `<该路径>/<数据库类型>/<任务ID_任务名>/`）。
+> **必须把 `/data` 挂载到宿主机持久化卷**，否则备份会写进容器可写层（`docker inspect` 的 UpperDir 里能看到，重建容器即丢失）。
+> 平台「备份存储管理」页顶部的**本地备份存储位置**卡片会显示实际路径、磁盘用量与持久化风险提示，并支持在线修改（界面配置优先级高于环境变量，重启后仍生效）。
 
 ### Docker Compose（推荐生产）
 
@@ -339,9 +343,10 @@ services:
   backup-platform:
     image: ghcr.io/zhh9126/backup-platform:latest
     ports: ["8080:8080"]
+    environment:
+      - BACKUP_ROOT=/data/backups
     volumes:
-      - ./instance:/app/instance
-      - ./backups:/app/backups
+      - ./data:/data          # 元数据库 / 备份产物 / 日志统一持久化
     restart: unless-stopped
 ```
 
@@ -358,7 +363,7 @@ docker build -t backup-platform:local .
 | 环境变量 | 说明 | 默认 |
 |---|---|---|
 | `WEB_HOST` / `WEB_PORT` | 监听地址 / 端口 | `0.0.0.0` / `8080` |
-| `BACKUP_ROOT` | 备份产物根目录 | `./backups` |
+| `BACKUP_ROOT` | 备份产物根目录（界面「备份存储管理 → 本地备份存储位置」可实时修改并持久化，**界面配置优先级更高**） | `./backups` |
 | `SCHEDULER_ENABLED` | 是否启用定时调度 | `true` |
 | `DEFAULT_RETENTION_DAYS` / `DEFAULT_RETENTION_COUNT` | 默认保留天数 / 份数 | `30` / `50` |
 | `LLM_API_KEY` / `LLM_BASE_URL` / `LLM_MODEL` | AI 智能体模型端点（不可达时自动本地兜底） | 见 `config.py` |

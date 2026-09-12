@@ -35,7 +35,24 @@ ENV PYTHONUNBUFFERED=1 \
     WEB_PORT=8080 \
     BACKUP_ROOT=/data/backups \
     INSTANCE_DIR=/data/instance \
-    LOG_DIR=/data/logs
+    LOG_DIR=/data/logs \
+    LOG_LEVEL=INFO \
+    LOG_MAX_BYTES=20971520 \
+    LOG_BACKUP_COUNT=10 \
+    OPLOG_RETENTION_DAYS=30
+
+# 运行期日志（失败排查入口，均位于 /data/logs，随挂载卷持久化）：
+#   /data/logs/platform.log    全量日志（默认 20MB × 10 份轮转）—— 容器 / 可执行文件通用
+#   /data/logs/error.log       仅 ERROR 及以上（排查时先看这份）
+#   /data/logs/crash.log       段错误 / 致命崩溃栈（faulthandler）
+#   /data/logs/operations/     每次备份/恢复的独立详细日志（命令原文、退出码、
+#                              stdout/stderr 全文、各阶段耗时）
+# 查看方式：
+#   docker logs -f <container>                      实时控制台（含启动横幅：日志/备份目录）
+#   docker exec <container> tail -f /data/logs/error.log
+#   docker exec <container> ls -lt /data/logs/operations/$(date +%Y%m%d)
+#   平台界面「日志」页 → 操作日志 / 诊断包导出（一键 zip，可离线外发）
+# 日志目录不可写时会自动降级到用户目录/临时目录，并在启动横幅与页面标出真实路径。
 
 # tzdata 供时区；default-jre-headless（OpenJDK 17）仅供 JDBC 可选兜底通道；
 # gzip/zstd 供备份产物压缩 CLI；libaio1/libnuma1 供烘焙的 mysqld 临时校验实例

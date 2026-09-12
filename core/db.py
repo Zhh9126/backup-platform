@@ -20,8 +20,17 @@ import config
 
 INSTANCE_DIR = config.INSTANCE_DIR
 INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
+# 日志目录：真实可用位置由 core.logging_setup 解析（配置目录不可写时自动降级），
+# 这里仅做惰性兜底，避免只读环境（容器未挂卷 / EXE 放只读目录）启动即崩。
 LOG_DIR = config.LOG_DIR
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    LOG_DIR = Path(tempfile.gettempdir()) / "aidbm-logs"
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
 # 多线程（Flask + APScheduler）访问 SQLite，需要关闭单线程检查并加写锁
 _write_lock = threading.Lock()
@@ -200,8 +209,16 @@ CREATE TABLE IF NOT EXISTS system_logs (
     ts        TEXT,
     level     TEXT,
     source    TEXT,
-    message   TEXT
+    message   TEXT,
+    task_id   INTEGER,                            -- 关联任务（可空）
+    record_id INTEGER,                            -- 关联备份记录（可空）
+    detail    TEXT,                               -- 详细上下文（堆栈/完整命令/退出码等）
+    log_path  TEXT                                -- 该次操作的操作日志文件路径
 );
+
+-- 索引放在 init_schema 迁移块中（先 ALTER 加列，再建索引）。
+-- 原因：老库若没有 task_id/record_id 列，在 SCHEMA 里建索引会被 SQLite 解析失败，
+-- 进而导致整个 executescript(SCHEMA) 抛错，平台启动不了。
 
 CREATE TABLE IF NOT EXISTS ssh_hosts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -669,6 +686,7 @@ CREATE TABLE IF NOT EXISTS ai_messages (
 
 CREATE INDEX IF NOT EXISTS idx_ai_messages_session
     ON ai_messages(session_id, created_at);
+
 """
 
 # ------------------------- 连接与执行 -------------------------
@@ -701,6 +719,27 @@ def init_schema() -> None:
                 conn.execute("ALTER TABLE restore_records ADD COLUMN detail_log TEXT")
             except Exception:
                 pass
+            # 迁移：操作日志文件路径列（备份/恢复各一份独立详细日志，便于事后回溯）
+            for tbl in ("backup_records", "restore_records"):
+                try:
+                    conn.execute(f"ALTER TABLE {tbl} ADD COLUMN log_path TEXT")
+                except Exception:
+                    pass
+            # 迁移：system_logs 关联与详情列（按任务/记录回溯日志、保留完整上下文）
+            for col, typedef in [("task_id", "INTEGER"), ("record_id", "INTEGER"),
+                                 ("detail", "TEXT"), ("log_path", "TEXT")]:
+                try:
+                    conn.execute(f"ALTER TABLE system_logs ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass
+            for idx_sql in (
+                "CREATE INDEX IF NOT EXISTS idx_system_logs_task ON system_logs(task_id)",
+                "CREATE INDEX IF NOT EXISTS idx_system_logs_record ON system_logs(record_id)",
+            ):
+                try:
+                    conn.execute(idx_sql)
+                except Exception:
+                    pass
             # 迁移：backup_records CDC/校验列
             for col, typedef in [("binlog_file", "TEXT"), ("binlog_pos", "INTEGER"),
                                  ("wal_lsn", "TEXT"), ("verified", "INTEGER DEFAULT 0"),
@@ -1105,6 +1144,7 @@ def init_schema() -> None:
             except Exception:
                 pass  # 表已存在，忽略
 
+
             conn.commit()
         finally:
             conn.close()
@@ -1267,28 +1307,43 @@ def sha256_file(path: str) -> str:
 
 
 def get_logger(name: str = "backup") -> logging.Logger:
-    logger = logging.getLogger(name)
-    if logger.handlers:
-        return logger
-    logger.setLevel(logging.INFO)
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    fh = logging.FileHandler(LOG_DIR / "platform.log", encoding="utf-8")
-    fh.setFormatter(fmt)
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    logger.addHandler(fh)
-    logger.addHandler(sh)
-    return logger
+    """获取统一 logger。
+
+    统一委托给 core.logging_setup：
+      - 目录可写性兜底（配置目录不可写时降级到用户目录/临时目录）
+      - 按大小轮转（platform.log / error.log），容器与可执行文件长期运行不撑盘
+      - 输出整体脱敏（口令/令牌/连接串不会落盘）
+      - 附带崩溃兜底与启动横幅
+
+    保持本函数签名不变，历史上 40+ 处 ``db.get_logger(...)`` 调用无需改动。
+    """
+    from core import logging_setup
+    return logging_setup.get_logger(name)
 
 
-def add_log(level: str, source: str, message: str) -> None:
+def add_log(level: str, source: str, message: str, task_id: int = None,
+            record_id: int = None, detail: str = "",
+            log_path: str = "") -> None:
+    """写一条系统日志。
+
+    新增关联字段（task_id / record_id / detail / log_path）用于把日志与
+    具体任务、备份记录、操作日志文件串起来，排查时可从任一入口回溯全链路。
+    """
     try:
         execute(
-            "INSERT INTO system_logs(ts, level, source, message) VALUES (?,?,?,?)",
-            (now_iso(), level, source, message),
+            "INSERT INTO system_logs(ts, level, source, message, task_id, "
+            "record_id, detail, log_path) VALUES (?,?,?,?,?,?,?,?)",
+            (now_iso(), level, source, message, task_id, record_id, detail, log_path),
         )
     except Exception:
-        pass
+        # 旧库尚未迁移列时退化为四列写入，保证日志不丢
+        try:
+            execute(
+                "INSERT INTO system_logs(ts, level, source, message) VALUES (?,?,?,?)",
+                (now_iso(), level, source, str(message)[:4000]),
+            )
+        except Exception:
+            pass
 
 
 # ------------------------- 系统配置（键值） -------------------------

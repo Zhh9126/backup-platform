@@ -31,6 +31,18 @@ def shlex_quote(s: str) -> str:
     return shlex.quote(str(s))
 
 
+def _decode_maybe(data) -> str:
+    """把 subprocess 超时异常里可能携带的部分输出解码为文本。"""
+    if not data:
+        return ""
+    try:
+        if isinstance(data, bytes):
+            return data.decode("utf-8", "ignore")
+        return str(data)
+    except Exception:
+        return ""
+
+
 def _is_network_error(exc: Exception) -> bool:
     """判断异常是否属于可重试的网络/连接错误。"""
     msg = str(exc).lower()

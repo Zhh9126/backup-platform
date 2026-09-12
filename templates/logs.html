@@ -1,118 +1,280 @@
 {% extends "base.html" %}
-{% block title %}系统日志 - AIDBM{% endblock %}
+{% block title %}日志中心 - AIDBM{% endblock %}
 
 {% block styles %}
 <style>
-  .log-row td {
-    vertical-align: middle;
-    font-size: 13px;
-  }
-  .log-level {
-    display: inline-block;
-    min-width: 60px;
-    text-align: center;
-    font-weight: 600;
-    border-radius: 4px;
-    padding: 2px 8px;
-    font-size: 12px;
-  }
-  .log-level-INFO    { background: #cfe2ff; color: #084298; }
-  .log-level-ERROR   { background: #f8d7da; color: #842029; }
-  .log-level-WARN    { background: #fff3cd; color: #664d03; }
-  .log-level-DEBUG   { background: #e2e3e5; color: #41464b; }
-  .log-level-UNKNOWN { background: #f0f0f0; color: #555; }
-  .log-source {
-    display: inline-block;
-    background: #f1f3f5;
-    color: #495057;
-    border-radius: 4px;
-    padding: 2px 8px;
-    font-size: 12px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  }
-  .log-msg {
-    word-break: break-all;
-    color: #212529;
-  }
-  .log-time {
-    color: #6c757d;
-    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 12px;
-    white-space: nowrap;
-  }
+  .log-row td { vertical-align: middle; font-size: 13px; }
+  .log-level { display:inline-block; min-width:60px; text-align:center; font-weight:600;
+               border-radius:4px; padding:2px 8px; font-size:12px; }
+  .log-level-INFO    { background:#cfe2ff; color:#084298; }
+  .log-level-ERROR   { background:#f8d7da; color:#842029; }
+  .log-level-WARN    { background:#fff3cd; color:#664d03; }
+  .log-level-DEBUG   { background:#e2e3e5; color:#41464b; }
+  .log-level-UNKNOWN { background:#f0f0f0; color:#555; }
+  .log-source { display:inline-block; background:#f1f3f5; color:#495057; border-radius:4px;
+                padding:2px 8px; font-size:12px;
+                font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .log-msg { word-break:break-all; color:#212529; }
+  .log-time { color:#6c757d; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+              font-size:12px; white-space:nowrap; }
+  .rel-tag { display:inline-block; padding:1px 6px; margin-left:4px; border-radius:3px;
+             font-size:11px; cursor:pointer; background:#e7f1ff; color:#084298;
+             border:1px solid #b6daff; }
+  .rel-tag:hover { background:#cfe2ff; }
+  .op-kind { display:inline-block; padding:1px 6px; border-radius:3px; font-size:11px;
+             background:#f1f3f5; color:#495057;
+             font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .op-kind.backup  { background:#e7f1ff; color:#084298; }
+  .op-kind.restore { background:#d1e7dd; color:#0f5132; }
+  .op-kind.drill   { background:#fff3cd; color:#664d03; }
+  .loc-card { font-size:13px; }
+  .loc-card code { font-size:12px; word-break:break-all; color:#495057; }
+  .loc-card .kv { display:flex; gap:6px; padding:2px 0; align-items:flex-start; }
+  .loc-card .k  { color:#6c757d; min-width:80px; flex-shrink:0; }
+  .loc-card .v  { color:#212529; }
+  .loc-warn { background:#fff3cd; border-left:3px solid #f59f00; padding:10px 12px;
+              border-radius:4px; margin-bottom:8px; font-size:13px; color:#664d03; }
+  .nav-tabs .nav-link { color:#495057; }
+  .nav-tabs .nav-link.active { color:#0d6efd; font-weight:600; }
+  .viewer-body { background:#0f172a; color:#e2e8f0; padding:14px;
+                 font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12.5px;
+                 white-space:pre-wrap; word-break:break-all; max-height:60vh; overflow:auto; }
 </style>
 {% endblock %}
 
 {% block content %}
 <div class="toolbar">
   <div>
-    <div class="page-title">系统日志</div>
-    <div class="page-sub">集中展示平台运行产生的所有系统级日志，支持按级别、来源筛选和自动刷新</div>
+    <div class="page-title">日志中心</div>
+    <div class="page-sub">失败可定位：系统日志 + 每次操作的独立详细日志 + 平台运行日志，一键导出诊断包</div>
   </div>
   <div class="toolbar-actions">
+    <button class="btn btn-outline-primary" id="btn-export"
+            title="打包环境+日志+失败记录为 zip，离线可外发">
+      <i class="bi bi-download"></i> 导出诊断包
+    </button>
     <button class="btn btn-light" id="btn-refresh" title="手动刷新">
       <i class="bi bi-arrow-clockwise"></i> 刷新
     </button>
-    <label class="btn btn-light mb-0" title="自动刷新">
-      <input type="checkbox" id="auto-refresh" checked style="margin-right:6px;vertical-align:middle;">
-      自动刷新
+    <label class="btn btn-light mb-0" title="自动刷新（系统日志）">
+      <input type="checkbox" id="auto-refresh" checked
+             style="margin-right:6px;vertical-align:middle;"> 自动刷新
     </label>
-    <button class="btn btn-outline-danger" id="btn-clear">
-      <i class="bi bi-trash3"></i> 清空日志
-    </button>
   </div>
 </div>
 
-<div class="page-card">
-  <div class="d-flex align-items-center flex-wrap" style="gap:12px;">
-    <div class="d-flex align-items-center" style="gap:6px;">
-      <label class="form-label mb-0">级别</label>
-      <select id="filter-level" class="form-select form-select-sm" style="width:120px;">
-        <option value="">全部</option>
-        <option value="INFO">INFO</option>
-        <option value="WARN">WARN</option>
-        <option value="ERROR">ERROR</option>
-        <option value="DEBUG">DEBUG</option>
-      </select>
+<div class="page-card loc-card" id="loc-card">
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <strong><i class="bi bi-folder-symlink"></i> 日志位置</strong>
+    <small class="text-muted" id="loc-runtime"></small>
+  </div>
+  <div id="loc-warn" class="loc-warn" style="display:none;"></div>
+  <div class="kv"><span class="k">目录：</span><span class="v" id="loc-dir">—</span></div>
+  <div class="kv"><span class="k">来源：</span><span class="v" id="loc-source">—</span></div>
+  <div class="kv"><span class="k">可写：</span><span class="v" id="loc-writable">—</span></div>
+  <div class="kv"><span class="k">平台日志：</span><span class="v"><code id="loc-platform">—</code></span></div>
+  <div class="kv"><span class="k">错误日志：</span><span class="v"><code id="loc-error">—</code></span></div>
+  <div class="kv"><span class="k">崩溃日志：</span><span class="v"><code id="loc-crash">—</code></span></div>
+  <div class="kv"><span class="k">操作日志：</span><span class="v"><code id="loc-ops">—</code></span></div>
+</div>
+
+<ul class="nav nav-tabs mt-3" id="logTabs" role="tablist">
+  <li class="nav-item"><a class="nav-link active" data-bs-toggle="tab" href="#tab-system">
+    <i class="bi bi-journal-text"></i> 系统日志</a></li>
+  <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tab-ops">
+    <i class="bi bi-files"></i> 操作日志</a></li>
+  <li class="nav-item"><a class="nav-link" data-bs-toggle="tab" href="#tab-files">
+    <i class="bi bi-folder2"></i> 平台日志文件</a></li>
+</ul>
+
+<div class="tab-content">
+  <!-- 系统日志 -->
+  <div class="tab-pane fade show active" id="tab-system">
+    <div class="page-card">
+      <div class="d-flex align-items-center flex-wrap" style="gap:12px;">
+        <div class="d-flex align-items-center" style="gap:6px;">
+          <label class="form-label mb-0">级别</label>
+          <select id="filter-level" class="form-select form-select-sm" style="width:120px;">
+            <option value="">全部</option>
+            <option value="INFO">INFO</option>
+            <option value="WARN">WARN</option>
+            <option value="ERROR">ERROR</option>
+            <option value="DEBUG">DEBUG</option>
+          </select>
+        </div>
+        <div class="d-flex align-items-center" style="gap:6px;">
+          <label class="form-label mb-0">来源</label>
+          <select id="filter-source" class="form-select form-select-sm" style="width:160px;">
+            <option value="">全部</option>
+          </select>
+        </div>
+        <div class="d-flex align-items-center" style="gap:6px;">
+          <label class="form-label mb-0">关键字</label>
+          <input id="filter-q" class="form-control form-control-sm" placeholder="消息/详情/日志路径"
+                 style="width:220px;">
+        </div>
+        <div class="d-flex align-items-center" style="gap:6px;">
+          <label class="form-label mb-0">任务ID</label>
+          <input id="filter-task-id" class="form-control form-control-sm" placeholder="可空"
+                 style="width:90px;">
+        </div>
+        <div class="d-flex align-items-center" style="gap:6px;">
+          <label class="form-label mb-0">记录ID</label>
+          <input id="filter-record-id" class="form-control form-control-sm" placeholder="可空"
+                 style="width:90px;">
+        </div>
+        <div class="d-flex align-items-center" style="gap:6px;">
+          <label class="form-label mb-0">条数</label>
+          <select id="filter-limit" class="form-select form-select-sm" style="width:100px;">
+            <option value="100">100</option>
+            <option value="200" selected>200</option>
+            <option value="500">500</option>
+            <option value="1000">1000</option>
+          </select>
+        </div>
+        <button class="btn btn-sm btn-light" id="btn-reset">重置</button>
+        <div class="ms-auto text-muted small">
+          共 <span id="log-count">0</span> 条
+          <span class="mx-2">|</span>
+          <span id="log-status">就绪</span>
+        </div>
+      </div>
     </div>
-    <div class="d-flex align-items-center" style="gap:6px;">
-      <label class="form-label mb-0">来源</label>
-      <select id="filter-source" class="form-select form-select-sm" style="width:160px;">
-        <option value="">全部</option>
-      </select>
+    <div class="page-card">
+      <div class="table-responsive">
+        <table class="table table-hover align-middle">
+          <thead>
+            <tr>
+              <th style="width:170px;">时间</th>
+              <th style="width:80px;">级别</th>
+              <th style="width:140px;">来源</th>
+              <th>消息</th>
+              <th style="width:140px;">操作</th>
+            </tr>
+          </thead>
+          <tbody id="log-tbody">
+            <tr><td colspan="5" class="text-center text-muted py-4">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
-    <div class="d-flex align-items-center" style="gap:6px;">
-      <label class="form-label mb-0">条数</label>
-      <select id="filter-limit" class="form-select form-select-sm" style="width:100px;">
-        <option value="100">100</option>
-        <option value="200" selected>200</option>
-        <option value="500">500</option>
-        <option value="1000">1000</option>
-      </select>
+  </div>
+
+  <!-- 操作日志 -->
+  <div class="tab-pane fade" id="tab-ops">
+    <div class="page-card">
+      <div class="d-flex align-items-center flex-wrap" style="gap:12px;">
+        <div class="d-flex align-items-center" style="gap:6px;">
+          <label class="form-label mb-0">类型</label>
+          <select id="op-kind" class="form-select form-select-sm" style="width:140px;">
+            <option value="">全部</option>
+            <option value="backup">备份</option>
+            <option value="restore">恢复</option>
+            <option value="drill">演练</option>
+          </select>
+        </div>
+        <div class="d-flex align-items-center" style="gap:6px;">
+          <label class="form-label mb-0">关键字</label>
+          <input id="op-q" class="form-control form-control-sm" placeholder="文件名包含"
+                 style="width:220px;">
+        </div>
+        <div class="d-flex align-items-center" style="gap:6px;">
+          <label class="form-label mb-0">条数</label>
+          <select id="op-limit" class="form-select form-select-sm" style="width:100px;">
+            <option value="50">50</option>
+            <option value="100" selected>100</option>
+            <option value="200">200</option>
+            <option value="500">500</option>
+          </select>
+        </div>
+        <button class="btn btn-sm btn-light" id="op-btn-refresh">
+          <i class="bi bi-arrow-clockwise"></i> 刷新
+        </button>
+        <button class="btn btn-sm btn-outline-danger" id="op-btn-purge" title="清理过期操作日志">
+          <i class="bi bi-trash3"></i> 清理过期
+        </button>
+        <div class="ms-auto text-muted small">
+          共 <span id="op-count">0</span> 份
+          <span class="mx-2">|</span>
+          目录 <code id="op-dir">—</code>
+        </div>
+      </div>
     </div>
-    <div class="ms-auto text-muted small">
-      共 <span id="log-count">0</span> 条
-      <span class="mx-2">|</span>
-      <span id="log-status">就绪</span>
+    <div class="page-card">
+      <div class="table-responsive">
+        <table class="table table-hover align-middle">
+          <thead>
+            <tr>
+              <th style="width:170px;">时间</th>
+              <th style="width:90px;">类型</th>
+              <th>名称</th>
+              <th style="width:90px;">大小</th>
+              <th style="width:160px;">操作</th>
+            </tr>
+          </thead>
+          <tbody id="op-tbody">
+            <tr><td colspan="5" class="text-center text-muted py-4">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- 平台日志文件 -->
+  <div class="tab-pane fade" id="tab-files">
+    <div class="page-card">
+      <div class="d-flex align-items-center flex-wrap" style="gap:12px;">
+        <button class="btn btn-sm btn-light" id="files-btn-refresh">
+          <i class="bi bi-arrow-clockwise"></i> 刷新
+        </button>
+        <span class="text-muted small">目录 <code id="files-dir">—</code></span>
+        <div class="ms-auto text-muted small">共 <span id="files-count">0</span> 个</div>
+      </div>
+    </div>
+    <div class="page-card">
+      <div class="table-responsive">
+        <table class="table table-hover align-middle">
+          <thead>
+            <tr>
+              <th>文件</th>
+              <th style="width:120px;">大小</th>
+              <th style="width:200px;">最后修改</th>
+              <th style="width:260px;">操作</th>
+            </tr>
+          </thead>
+          <tbody id="files-tbody">
+            <tr><td colspan="4" class="text-center text-muted py-4">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </div>
 </div>
 
-<div class="page-card">
-  <div class="table-responsive">
-    <table class="table table-hover align-middle">
-      <thead>
-        <tr>
-          <th style="width:170px;">时间</th>
-          <th style="width:80px;">级别</th>
-          <th style="width:140px;">来源</th>
-          <th>消息</th>
-        </tr>
-      </thead>
-      <tbody id="log-tbody">
-        <tr><td colspan="4" class="text-center text-muted py-4">加载中…</td></tr>
-      </tbody>
-    </table>
+<!-- 日志查看器（Bootstrap modal） -->
+<div class="modal fade" id="logViewer" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="logViewerTitle">日志</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body p-0">
+        <div class="d-flex justify-content-between align-items-center px-3 py-2 small text-muted"
+             style="border-bottom:1px solid #e9ecef;">
+          <span id="logViewerMeta">—</span>
+          <span>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="logViewerCopy">
+              <i class="bi bi-clipboard"></i> 复制
+            </button>
+            <button type="button" class="btn btn-sm btn-outline-secondary" id="logViewerDownload">
+              <i class="bi bi-download"></i> 下载
+            </button>
+          </span>
+        </div>
+        <pre class="viewer-body m-0" id="logViewerBody">加载中…</pre>
+      </div>
+    </div>
   </div>
 </div>
 {% endblock %}
@@ -122,28 +284,44 @@
 (function () {
   const $ = (id) => document.getElementById(id);
   const api = window.BKP.api;
-
-  const tbody   = $("log-tbody");
-  const status  = $("log-status");
-  const cnt     = $("log-count");
-  const selLvl  = $("filter-level");
-  const selSrc  = $("filter-source");
-  const selLim  = $("filter-limit");
-  const btnRef  = $("btn-refresh");
-  const btnClr  = $("btn-clear");
-  const autoChk = $("auto-refresh");
-
-  let sourcesLoaded = false;
-  let timer = null;
-
   const escape = (s) =>
-    String(s == null ? "" : s)
-      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+    String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  const toast = (msg, kind) => window.BKP.toast && window.BKP.toast(msg, kind);
 
-  function render(rows) {
+  // -------------------- 日志位置 -------------------- //
+  async function loadLocations() {
+    try {
+      const r = await api("GET", "/api/logs/locations");
+      if (!r || !r.ok) return;
+      $("loc-dir").textContent = r.log_dir || "—";
+      $("loc-source").textContent = r.log_dir_source || "—";
+      $("loc-writable").innerHTML = r.writable
+        ? '<span class="badge bg-success">可写</span>'
+        : '<span class="badge bg-danger">不可写（已降级）</span>';
+      $("loc-platform").textContent = r.platform_log || "—";
+      $("loc-error").textContent = r.error_log || "—";
+      $("loc-crash").textContent = r.crash_log || "—";
+      $("loc-ops").textContent = r.operations_dir || "—";
+      $("loc-runtime").textContent = (r.runtime_form || "") + " · " + (r.log_dir || "");
+      if (!r.writable) {
+        const w = $("loc-warn");
+        w.style.display = "block";
+        w.textContent = "⚠ 日志目录不可写。请配置环境变量 LOG_DIR 指向持久化目录（容器场景：/data/logs）。当前降级到：" + (r.log_dir || "—");
+      }
+    } catch (e) {
+      // 静默
+    }
+  }
+
+  // -------------------- 系统日志 -------------------- //
+  const sysTbody = $("log-tbody");
+  let sysTimer = null;
+  let sourcesLoaded = false;
+
+  function renderSysLogs(rows) {
     if (!rows || !rows.length) {
-      tbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted py-4">暂无日志</td></tr>`;
+      sysTbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted py-4">暂无日志</td></tr>`;
       return;
     }
     const html = rows.map((r) => {
@@ -151,86 +329,361 @@
       const src = escape(r.source || "-");
       const ts  = escape(r.ts || "-");
       const msg = escape(r.message || "");
+      const tags = [];
+      if (r.task_id) {
+        tags.push(`<span class="rel-tag" data-fill="task" data-val="${r.task_id}">任务#${r.task_id}</span>`);
+      }
+      if (r.record_id) {
+        tags.push(`<span class="rel-tag" data-fill="record" data-val="${r.record_id}">记录#${r.record_id}</span>`);
+      }
+      const ops = [];
+      if (r.detail) {
+        ops.push(`<button class="btn btn-sm btn-link p-0 me-2" data-act="detail" data-detail="${encodeURIComponent(r.detail)}">详情</button>`);
+      }
+      if (r.record_id) {
+        ops.push(`<button class="btn btn-sm btn-link p-0 me-2" data-act="record" data-rec="${r.record_id}">关联记录</button>`);
+      }
+      if (r.log_path) {
+        ops.push(`<button class="btn btn-sm btn-link p-0 me-2" data-act="logpath" data-path="${escape(r.log_path)}">详细日志</button>`);
+      }
       return `<tr class="log-row">
         <td class="log-time">${ts}</td>
         <td><span class="log-level log-level-${escape(lvl)}">${escape(lvl)}</span></td>
         <td><span class="log-source">${src}</span></td>
-        <td class="log-msg">${msg}</td>
+        <td class="log-msg">${msg}${tags.join("")}</td>
+        <td>${ops.join("") || '<span class="text-muted">—</span>'}</td>
       </tr>`;
     }).join("");
-    tbody.innerHTML = html;
+    sysTbody.innerHTML = html;
   }
 
-  async function loadSources() {
-    try {
-      const r = await api("GET", "/api/logs");
-      if (r && r.ok && Array.isArray(r.sources)) {
-        const cur = selSrc.value;
-        selSrc.innerHTML = `<option value="">全部</option>` +
-          r.sources.map((s) => `<option value="${escape(s)}">${escape(s)}</option>`).join("");
-        if (cur && r.sources.includes(cur)) selSrc.value = cur;
-        sourcesLoaded = true;
-      }
-    } catch (e) { /* ignore */ }
-  }
-
-  async function loadLogs() {
+  async function loadSysLogs() {
     const params = new URLSearchParams();
-    if (selLvl.value) params.set("level", selLvl.value);
-    if (selSrc.value) params.set("source", selSrc.value);
-    params.set("limit", selLim.value || "200");
-    status.textContent = "加载中…";
+    if ($("filter-level").value) params.set("level", $("filter-level").value);
+    if ($("filter-source").value) params.set("source", $("filter-source").value);
+    if ($("filter-q").value) params.set("q", $("filter-q").value);
+    if ($("filter-task-id").value) params.set("task_id", $("filter-task-id").value);
+    if ($("filter-record-id").value) params.set("record_id", $("filter-record-id").value);
+    params.set("limit", $("filter-limit").value || "200");
+    $("log-status").textContent = "加载中…";
     try {
       const r = await api("GET", "/api/logs?" + params.toString());
       if (r && r.ok) {
-        render(r.logs || []);
-        cnt.textContent = r.count || 0;
+        renderSysLogs(r.logs || []);
+        $("log-count").textContent = r.count || 0;
         if (!sourcesLoaded && Array.isArray(r.sources)) {
-          const cur = selSrc.value;
-          selSrc.innerHTML = `<option value="">全部</option>` +
+          const cur = $("filter-source").value;
+          $("filter-source").innerHTML = `<option value="">全部</option>` +
             r.sources.map((s) => `<option value="${escape(s)}">${escape(s)}</option>`).join("");
-          if (cur && r.sources.includes(cur)) selSrc.value = cur;
+          if (cur && r.sources.includes(cur)) $("filter-source").value = cur;
           sourcesLoaded = true;
         }
-        status.textContent = "就绪";
+        $("log-status").textContent = "就绪";
       } else {
-        status.textContent = "加载失败";
+        $("log-status").textContent = "加载失败";
       }
     } catch (e) {
-      status.textContent = "加载失败：" + (e && e.message ? e.message : e);
+      $("log-status").textContent = "加载失败：" + (e && e.message ? e.message : e);
     }
   }
 
-  function scheduleAuto() {
-    if (timer) { clearInterval(timer); timer = null; }
-    if (autoChk.checked) {
-      timer = setInterval(loadLogs, 5000);
-    }
+  function scheduleSysAuto() {
+    if (sysTimer) { clearInterval(sysTimer); sysTimer = null; }
+    if ($("auto-refresh").checked) sysTimer = setInterval(loadSysLogs, 5000);
   }
 
-  selLvl.addEventListener("change", loadLogs);
-  selSrc.addEventListener("change", loadLogs);
-  selLim.addEventListener("change", loadLogs);
-  btnRef.addEventListener("click", loadLogs);
-  autoChk.addEventListener("change", scheduleAuto);
+  ["filter-level","filter-source","filter-limit"].forEach((id) =>
+    $(id).addEventListener("change", loadSysLogs));
+  ["filter-q","filter-task-id","filter-record-id"].forEach((id) => {
+    $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") loadSysLogs(); });
+  });
+  $("btn-reset").addEventListener("click", () => {
+    ["filter-level","filter-source","filter-q","filter-task-id","filter-record-id"]
+      .forEach((id) => { $(id).value = ""; });
+    $("filter-limit").value = "200";
+    loadSysLogs();
+  });
+  $("btn-refresh").addEventListener("click", loadSysLogs);
+  $("auto-refresh").addEventListener("change", scheduleSysAuto);
 
-  btnClr.addEventListener("click", async () => {
-    if (!confirm("确认清空全部系统日志？此操作不可恢复。")) return;
-    try {
-      const r = await api("POST", "/api/logs/clear", {});
-      if (r && r.ok) {
-        BKP.toast && BKP.toast(`已清空 ${r.deleted} 条日志`, "success");
-        loadLogs();
-      } else {
-        BKP.toast && BKP.toast("清空失败", "danger");
-      }
-    } catch (e) {
-      BKP.toast && BKP.toast("清空失败：" + (e && e.message ? e.message : e), "danger");
+  // 表格内按钮委托
+  sysTbody.addEventListener("click", async (e) => {
+    const t = e.target.closest("[data-act],[data-fill]");
+    if (!t) return;
+    if (t.dataset.fill === "task") {
+      $("filter-task-id").value = t.dataset.val; loadSysLogs(); return;
+    }
+    if (t.dataset.fill === "record") {
+      $("filter-record-id").value = t.dataset.val; loadSysLogs(); return;
+    }
+    if (t.dataset.act === "detail") {
+      openViewer({title:"消息详情", content:decodeURIComponent(t.dataset.detail)});
+      return;
+    }
+    if (t.dataset.act === "record") {
+      await openRecordLog(t.dataset.rec);
+      return;
+    }
+    if (t.dataset.act === "logpath") {
+      openOperationByPath(t.dataset.path);
+      return;
     }
   });
 
-  // 首屏：先加载日志（自带 source 列表），再启动自动刷新
-  loadLogs().then(() => scheduleAuto());
+  // -------------------- 操作日志 -------------------- //
+  const opTbody = $("op-tbody");
+
+  function renderOpLogs(rows) {
+    if (!rows || !rows.length) {
+      opTbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted py-4">暂无操作日志</td></tr>`;
+      return;
+    }
+    opTbody.innerHTML = rows.map((r) => {
+      const mtime = escape(r.mtime || "-");
+      const kind = escape(r.kind || "-");
+      const name = escape(r.name || "-");
+      const size = escape(r.size_human || "-");
+      return `<tr>
+        <td class="log-time">${mtime}</td>
+        <td><span class="op-kind ${kind}">${kind}</span></td>
+        <td><span style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;">${name}</span></td>
+        <td>${size}</td>
+        <td>
+          <button class="btn btn-sm btn-outline-primary" data-op-view
+                  data-name="${escape(r.name)}" data-day="${escape(r.day)}">
+            <i class="bi bi-eye"></i> 查看
+          </button>
+          <button class="btn btn-sm btn-outline-secondary" data-op-dl
+                  data-name="${escape(r.name)}" data-day="${escape(r.day)}">
+            <i class="bi bi-download"></i> 下载
+          </button>
+        </td>
+      </tr>`;
+    }).join("");
+  }
+
+  async function loadOpLogs() {
+    const params = new URLSearchParams();
+    if ($("op-kind").value) params.set("kind", $("op-kind").value);
+    if ($("op-q").value) params.set("q", $("op-q").value);
+    params.set("limit", $("op-limit").value || "100");
+    try {
+      const r = await api("GET", "/api/logs/operations?" + params.toString());
+      if (r && r.ok) {
+        renderOpLogs(r.operations || []);
+        $("op-count").textContent = r.count || 0;
+        $("op-dir").textContent = (r.dir || "—").replace(/^.*\/(operations\/)$/, "$1");
+      }
+    } catch (e) {
+      opTbody.innerHTML = `<tr><td colspan="5" class="text-center text-danger py-4">${
+        escape(e && e.message ? e.message : e)}</td></tr>`;
+    }
+  }
+  $("op-btn-refresh").addEventListener("click", loadOpLogs);
+  $("op-kind").addEventListener("change", loadOpLogs);
+  $("op-limit").addEventListener("change", loadOpLogs);
+  $("op-q").addEventListener("keydown", (e) => { if (e.key === "Enter") loadOpLogs(); });
+
+  opTbody.addEventListener("click", async (e) => {
+    const view = e.target.closest("[data-op-view]");
+    if (view) {
+      openOperation(view.dataset.name, view.dataset.day);
+      return;
+    }
+    const dl = e.target.closest("[data-op-dl]");
+    if (dl) {
+      downloadOperation(dl.dataset.name, dl.dataset.day);
+      return;
+    }
+  });
+
+  $("op-btn-purge").addEventListener("click", async () => {
+    if (!confirm("清理超过保留期的操作日志（默认 30 天）？此操作不可恢复。")) return;
+    try {
+      const r = await api("POST", "/api/logs/operations/purge", {});
+      if (r && r.ok) {
+        toast(`已清理 ${r.removed_days || 0} 个日期目录`, "success");
+        loadOpLogs();
+      } else {
+        toast("清理失败", "danger");
+      }
+    } catch (e) {
+      toast("清理失败：" + (e && e.message ? e.message : e), "danger");
+    }
+  });
+
+  async function openOperation(name, day) {
+    try {
+      const params = new URLSearchParams({name, day});
+      const r = await api("GET", "/api/logs/operations/content?" + params.toString());
+      if (!r || !r.ok) { toast("读取失败", "danger"); return; }
+      openViewer({title:`${name}`, meta:`${day} · ${name}`, content:r.content || "（空）"});
+    } catch (e) {
+      toast("读取失败：" + (e && e.message ? e.message : e), "danger");
+    }
+  }
+
+  async function downloadOperation(name, day) {
+    try {
+      const params = new URLSearchParams({name, day});
+      const r = await api("GET", "/api/logs/operations/content?" + params.toString());
+      if (!r || !r.ok) { toast("读取失败", "danger"); return; }
+      downloadText(`${day}_${name}`, r.content || "");
+    } catch (e) {
+      toast("读取失败：" + (e && e.message ? e.message : e), "danger");
+    }
+  }
+
+  // 通过 record_id 取日志
+  async function openRecordLog(recId) {
+    try {
+      const r = await api("GET", "/api/logs/record/" + encodeURIComponent(recId));
+      if (!r || !r.ok) { toast("读取失败", "danger"); return; }
+      const rec = r.record || {};
+      openViewer({
+        title:`备份记录 #${recId} - 详细日志`,
+        meta:`任务#${rec.task_id || "-"} · ${rec.db_type || "-"} · ${rec.backup_type || "-"} · 状态 ${rec.status || "-"}`,
+        content: r.content || "（该记录暂无独立操作日志）"
+      });
+    } catch (e) {
+      toast("读取失败：" + (e && e.message ? e.message : e), "danger");
+    }
+  }
+
+  // 通过 log_path 推断 day/name 后打开
+  async function openOperationByPath(path) {
+    try {
+      const m = /\/operations\/(\d{8})\/([^/]+)$/.exec(path || "");
+      if (!m) { toast("日志路径格式无法识别：" + path, "warning"); return; }
+      await openOperation(m[2], m[1]);
+    } catch (e) {
+      toast("读取失败：" + (e && e.message ? e.message : e), "danger");
+    }
+  }
+
+  // -------------------- 平台日志文件 -------------------- //
+  const filesTbody = $("files-tbody");
+  async function loadFiles() {
+    try {
+      const r = await api("GET", "/api/logs/files");
+      if (!r || !r.ok) return;
+      $("files-dir").textContent = r.dir || "—";
+      $("files-count").textContent = r.count || 0;
+      const files = r.files || [];
+      if (!files.length) {
+        filesTbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted py-4">暂无日志文件</td></tr>`;
+        return;
+      }
+      filesTbody.innerHTML = files.map((f) => {
+        const tag = f.is_error ? '<span class="badge bg-danger ms-2">ERROR</span>'
+                    : f.is_crash ? '<span class="badge bg-warning ms-2">CRASH</span>' : "";
+        return `<tr>
+          <td><code>${escape(f.name)}</code>${tag}</td>
+          <td>${escape(f.size_human)}</td>
+          <td class="log-time">${escape(f.mtime)}</td>
+          <td>
+            <button class="btn btn-sm btn-outline-primary" data-file-view data-name="${escape(f.name)}" data-tail="500">
+              <i class="bi bi-eye"></i> 最近 500 行
+            </button>
+            <button class="btn btn-sm btn-outline-secondary" data-file-view data-name="${escape(f.name)}" data-tail="2000">
+              最近 2000 行
+            </button>
+            <button class="btn btn-sm btn-outline-secondary" data-file-dl data-name="${escape(f.name)}">
+              <i class="bi bi-download"></i> 下载
+            </button>
+          </td>
+        </tr>`;
+      }).join("");
+    } catch (e) {
+      filesTbody.innerHTML = `<tr><td colspan="4" class="text-center text-danger py-4">${
+        escape(e && e.message ? e.message : e)}</td></tr>`;
+    }
+  }
+  $("files-btn-refresh").addEventListener("click", loadFiles);
+
+  filesTbody.addEventListener("click", async (e) => {
+    const v = e.target.closest("[data-file-view]");
+    if (v) {
+      const tail = parseInt(v.dataset.tail || "500", 10);
+      try {
+        const r = await api("GET", "/api/logs/file?name=" + encodeURIComponent(v.dataset.name) + "&tail=" + tail);
+        if (!r || !r.ok) { toast("读取失败", "danger"); return; }
+        openViewer({
+          title: r.name + "（最近 " + tail + " 行）",
+          meta: r.path + " · " + (r.size_bytes || 0) + " 字节",
+          content: r.content || "（空）"
+        });
+      } catch (ex) {
+        toast("读取失败：" + (ex && ex.message ? ex.message : ex), "danger");
+      }
+      return;
+    }
+    const d = e.target.closest("[data-file-dl]");
+    if (d) {
+      try {
+        const r = await api("GET", "/api/logs/file?name=" + encodeURIComponent(d.dataset.name));
+        if (!r || !r.ok) { toast("读取失败", "danger"); return; }
+        downloadText(d.dataset.name, r.content || "");
+      } catch (ex) {
+        toast("读取失败：" + (ex && ex.message ? ex.message : ex), "danger");
+      }
+    }
+  });
+
+  // -------------------- 查看器（Bootstrap modal） -------------------- //
+  let viewerContent = "";
+  let viewerTitle = "";
+  function openViewer({title, meta, content}) {
+    viewerContent = content || "";
+    viewerTitle = title || "日志";
+    $("logViewerTitle").textContent = viewerTitle;
+    $("logViewerMeta").textContent = meta || "";
+    $("logViewerBody").textContent = viewerContent;
+    const el = document.getElementById("logViewer");
+    const m = window.bootstrap && window.bootstrap.Modal
+      ? window.bootstrap.Modal.getOrCreateInstance(el)
+      : null;
+    if (m) m.show(); else el.classList.add("show");
+  }
+  $("logViewerCopy").addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(viewerContent);
+      toast("已复制到剪贴板", "success");
+    } catch (e) {
+      toast("复制失败：浏览器权限受限", "warning");
+    }
+  });
+  $("logViewerDownload").addEventListener("click", () => downloadText(viewerTitle, viewerContent));
+  function downloadText(name, text) {
+    const blob = new Blob([text], {type:"text/plain;charset=utf-8"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = (name || "log").replace(/[\\/:*?"<>|]+/g, "_") + ".log";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+  }
+
+  // -------------------- 导出诊断包 -------------------- //
+  $("btn-export").addEventListener("click", () => {
+    toast("正在打包诊断包…", "info");
+    // 浏览器下载走 GET 同源自动带 session cookie
+    window.location.href = "/api/diagnostics/export";
+  });
+
+  // -------------------- 首屏 -------------------- //
+  loadLocations();
+  loadSysLogs().then(() => scheduleSysAuto());
+  // 切换 tab 时按需懒加载
+  document.querySelectorAll('a[data-bs-toggle="tab"]').forEach((el) => {
+    el.addEventListener("shown.bs.tab", (e) => {
+      const t = e.target.getAttribute("href");
+      if (t === "#tab-ops") loadOpLogs();
+      else if (t === "#tab-files") loadFiles();
+      else if (t === "#tab-system") loadSysLogs();
+    });
+  });
 })();
 </script>
 {% endblock %}

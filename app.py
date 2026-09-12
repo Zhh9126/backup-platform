@@ -47,6 +47,14 @@ def _register_login_fail(ip: str):
 
 
 def create_app() -> Flask:
+    # 0) 日志基础设施最先初始化：目录可写性兜底 / 轮转 / 崩溃落盘 / 脱敏 / 启动横幅。
+    #    这样后续任何初始化失败都能在日志里看到原因（可执行文件与容器场景尤其重要）。
+    try:
+        from core import logging_setup
+        logging_setup.init_logging("AIDBM")
+    except Exception as _e:  # 日志不可用也不能阻止服务启动
+        print(f"[日志] 初始化失败（降级为控制台输出）: {_e}", flush=True)
+
     app = Flask(__name__, template_folder="templates",
                 static_folder="static")
     app.secret_key = config.SECRET_KEY

@@ -218,15 +218,87 @@ def _get_ssh_client(host_key: str, password: str = None):
     return client
 
 
+def _remote_log_start(cmd: str, timeout: int, note: str = "",
+                      input_len: int = 0) -> float:
+    """远端命令开跑：写系统日志 + 操作日志（命令脱敏）。返回起始时间。"""
+    import time as _time
+    from core.logging_setup import mask_command
+    try:
+        import logging as _lg
+        _lg.getLogger("engine.file").info(
+            "SSH 执行%s: %s", (f"（{note}）" if note else ""), mask_command(cmd))
+    except Exception:
+        pass
+    try:
+        from core import oplog
+        op = oplog.current()
+        if op:
+            extra_note = note or "远端 SSH 执行"
+            if input_len:
+                extra_note += f"，stdin {input_len} 字节"
+            op.command(cmd, note=extra_note, timeout=timeout)
+    except Exception:
+        pass
+    return _time.time()
+
+
+def _remote_log_end(rc, out, err, cost: float, binary: bool = False) -> None:
+    """远端命令结束：退出码 + stderr 全文 + stdout 摘要写入操作日志。
+
+    stdout 为二进制流（tar 等）时只记录字节数与文本预览，
+    避免把二进制垃圾写进日志；stderr 是排查主战场，全文保留。
+    """
+    try:
+        import logging as _lg
+        lg = _lg.getLogger("engine.file")
+        if rc not in (0,):
+            lg.warning("SSH 执行结束 rc=%s 耗时=%.3fs；stderr: %s",
+                       rc, cost, (err or "")[-800:])
+        else:
+            lg.info("SSH 执行结束 rc=%s 耗时=%.3fs，stdout %d 字节",
+                    rc, cost, len(out or b""))
+    except Exception:
+        pass
+    try:
+        from core import oplog
+        op = oplog.current()
+        if not op:
+            return
+        err_text = err or ""
+        if binary:
+            size = len(out or b"")
+            preview = ""
+            if 0 < size <= 8192:
+                try:
+                    cand = (out or b"").decode("utf-8")
+                    if cand.isprintable() or "\n" in cand:
+                        preview = cand
+                except Exception:
+                    preview = ""
+            out_text = f"（二进制 stdout {size} 字节）"
+            if preview:
+                out_text += "\n" + preview
+            op.output(rc, out_text, err_text, label="远端 SSH 耗时 %.3fs" % cost)
+        else:
+            out_text = out if isinstance(out, str) else (
+                (out or b"").decode("utf-8", "replace"))
+            op.output(rc, out_text, err_text, label="远端 SSH 耗时 %.3fs" % cost)
+    except Exception:
+        pass
+
+
 def _ssh_exec(client, cmd: str, timeout: int = 30) -> Tuple[str, str, int]:
     """在已连接的 SSH 客户端上执行命令。"""
     t = client.get_transport()
     if t is None or not t.is_active():
         raise RuntimeError("SSH transport dead")
+    t0 = _remote_log_start(cmd, timeout, note="SSH 文本命令")
     _, sout, serr = client.exec_command(cmd, timeout=timeout)
     out = sout.read().decode("utf-8", errors="replace")
     err = serr.read().decode("utf-8", errors="replace")
     rc = sout.channel.recv_exit_status()
+    import time as _time
+    _remote_log_end(rc, out, err, _time.time() - t0)
     return out, err, rc
 
 
@@ -234,16 +306,23 @@ def _ssh_exec_pipe(client, cmd: str, input_data: bytes = None, timeout: int = 60
     """流式管道执行（用于 tar 数据传输）。stdout 保持原始 bytes 以保真二进制。
 
     timeout: 最大等待秒数，超时抛 RuntimeError。默认 600 秒（10 分钟）。
+
+    失败可排查：命令、耗时、退出码、stderr 全文均写入操作日志；
+    超时会记录"已等待多久、已传输多少字节、命令是什么"，用于判断卡在哪。
     """
     import time as _time
     t = client.get_transport()
     if not t or not t.is_active():
         raise RuntimeError("SSH transport dead")
-    sess = t.open_session()
-    sess.exec_command(cmd)
+    in_len = 0
     if input_data:
         if isinstance(input_data, str):
             input_data = input_data.encode("utf-8")
+        in_len = len(input_data)
+    t0 = _remote_log_start(cmd, timeout, note="SSH 数据管道", input_len=in_len)
+    sess = t.open_session()
+    sess.exec_command(cmd)
+    if input_data:
         sess.sendall(input_data)
         sess.shutdown_write()
     out, err = b"", b""
@@ -252,6 +331,16 @@ def _ssh_exec_pipe(client, cmd: str, input_data: bytes = None, timeout: int = 60
     while not sess.exit_status_ready():
         if _time.time() - start > timeout:
             sess.close()
+            try:
+                from core import oplog
+                op = oplog.current()
+                if op:
+                    op.error("SSH 命令超时（%ss）：已等待 %.0fs，已收 stdout %d 字节、"
+                             "stderr %d 字节\nstderr 尾部: %s",
+                             timeout, _time.time() - start, len(out), len(err),
+                             err.decode("utf-8", "replace")[-1500:])
+            except Exception:
+                pass
             raise RuntimeError(f"SSH 命令超时({timeout}s): {cmd[:80]}")
         # 每 30s 输出一次心跳（仅在确实没有数据流动时）
         now = _time.time()
@@ -260,6 +349,14 @@ def _ssh_exec_pipe(client, cmd: str, input_data: bytes = None, timeout: int = 60
             _lg.getLogger("engine.file").info(
                 "SSH 心跳: 已等待 %.0fs, 已收 %d bytes (err %d) cmd=%s",
                 now-start, len(out), len(err), cmd[:60])
+            try:
+                from core import oplog
+                op = oplog.current()
+                if op:
+                    op.info("SSH 心跳: 已等待 %.0fs, 已收 %d bytes (err %d)",
+                            now - start, len(out), len(err))
+            except Exception:
+                pass
             last_heartbeat = now
         if sess.recv_ready():
             out += sess.recv(65536)
@@ -274,8 +371,10 @@ def _ssh_exec_pipe(client, cmd: str, input_data: bytes = None, timeout: int = 60
         err += sess.recv_stderr(4096)
     rc = sess.recv_exit_status()
     sess.close()
+    err_text = err.decode("utf-8", errors="replace")
+    _remote_log_end(rc, out, err_text, _time.time() - t0, binary=True)
     # stdout 返回原始 bytes（tar.gz 为二进制，绝不能按文本编解码）
-    return out, err.decode("utf-8", errors="replace"), rc
+    return out, err_text, rc
 
 
 # ---------- 文件列表获取 ----------

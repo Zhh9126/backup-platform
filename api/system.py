@@ -187,13 +187,36 @@ def logs():
     limit = min(int(request.args.get("limit", 200)), 1000)
     level = (request.args.get("level") or "").strip().upper()
     source = (request.args.get("source") or "").strip()
-    rows = models.list_logs(limit=limit, level=level, source=source)
+    keyword = (request.args.get("q") or request.args.get("keyword") or "").strip()
+    since = (request.args.get("since") or "").strip()
+
+    def _int_or_none(name):
+        raw = (request.args.get(name) or "").strip()
+        try:
+            return int(raw) if raw else None
+        except ValueError:
+            return None
+
+    task_id = _int_or_none("task_id")
+    record_id = _int_or_none("record_id")
+    with_detail = (request.args.get("with_detail") or "1") not in ("0", "false", "no")
+    rows = models.list_logs(limit=limit, level=level, source=source,
+                            task_id=task_id, record_id=record_id,
+                            keyword=keyword, since=since, with_detail=with_detail)
     sources = models.list_log_sources()
+    try:
+        from core import logging_setup
+        locations = logging_setup.log_locations()
+    except Exception:
+        locations = {}
     return jsonify({
         "ok": True,
         "logs": rows,
         "count": len(rows),
         "sources": sources,
+        "log_dir": locations.get("log_dir", ""),
+        "log_dir_source": locations.get("log_dir_source", ""),
+        "error_log": locations.get("error_log", ""),
     })
 
 

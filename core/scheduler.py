@@ -288,15 +288,37 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
     })
     _logger.info("开始备份 task=%s(%s) type=%s", task["id"], task["name"], bt.value)
 
+    # ---- 操作日志：本次备份的完整现场（上下文/阶段耗时/命令/退出码/输出） ----
+    from core import oplog as _oplog
+    op = _oplog.OperationLog(kind="backup", task=task, record_id=rec_id,
+                             operator=operator or "")
+    _op_token = _oplog.attach(op)
+    op.context({
+        "任务ID": task["id"],
+        "任务名": task.get("name"),
+        "数据库类型": task.get("db_type"),
+        "备份类型": bt.value,
+        "目标实例": "%s:%s" % (task.get("host") or "-", task.get("port") or "-"),
+        "目标库": task.get("db_name") or "(全部实例)",
+        "备份模式": task.get("backup_mode") or "default",
+        "触发方式": "手动触发" if operator else "调度执行",
+        "操作人": operator or "-",
+        "产物根目录": config.BACKUP_ROOT,
+    }, title="备份任务上下文")
+
     result = BackupResult(success=False, message="未执行")
     try:
         from core.engines import get_engine
         engine = get_engine(task["db_type"], task, config.BACKUP_ROOT, _logger)
+        op.info("备份引擎: %s", engine.__class__.__name__)
         # 备份前置检查：物理备份必须有真实客户端；逻辑备份允许仿真兜底
-        pre_ok, pre_detail = engine.preflight()
+        with op.step("备份前置检查"):
+            pre_ok, pre_detail = engine.preflight()
+            op.info("前置检查结论: ok=%s | %s", pre_ok, pre_detail)
         if not pre_ok:
             result = BackupResult(success=False, status=BackupStatus.FAILED, message=pre_detail)
             _logger.warning("备份前置检查失败 task=%s: %s", task["id"], pre_detail)
+            op.error("前置检查未通过，备份终止：%s", pre_detail)
         else:
             if pre_detail and pre_detail != "ok":
                 _logger.info("备份前置提示 task=%s: %s", task["id"], pre_detail)
@@ -304,12 +326,23 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
             from core import remote_dump as _rd
             _env_token = _rd.set_task_env_export(_rd.task_env_export(task))
             try:
-                result = engine.run_backup(bt)
+                with op.step("执行备份"):
+                    result = engine.run_backup(bt)
+                op.info("引擎返回: success=%s, status=%s, 大小=%s, 产物=%s",
+                        getattr(result, "success", None),
+                        getattr(result, "status", "-"),
+                        db.human_size(int(getattr(result, "size_bytes", 0) or 0)),
+                        getattr(result, "backup_path", "-"))
+                for _extra in ("detail_log", "message"):
+                    _v = getattr(result, _extra, "")
+                    if _v:
+                        op.info("引擎 %s:\n%s", _extra, _v)
             finally:
                 _rd.reset_task_env_export(_env_token)
     except Exception as e:
         result = BackupResult(success=False, status=BackupStatus.FAILED, message=f"执行异常: {e}")
         _logger.exception("备份异常 task=%s", task["id"])
+        op.exception(e, note="[备份流程异常]")
 
     finished = db.now_iso()
     status = result.status if hasattr(result, "status") else (
@@ -419,9 +452,20 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
     notifier.Notifier(task, _logger).notify(
         "success" if result.success else "failure", title, text=text, html=html)
     db.add_log("INFO" if result.success else "ERROR", "scheduler",
-               f"task={task['id']} {task['name']} -> {status} ({db.human_size(size)})")
+               f"task={task['id']} {task['name']} -> {status} ({db.human_size(size)})",
+               task_id=task["id"], record_id=rec_id,
+               detail=(msg or "")[:4000], log_path=str(op.path))
 
-    # M2 对象目录：备份成功后异步扫描产物内对象清单（表级恢复的数据基础）
+    # 收尾：写入失败结论并保留详细日志文件路径（排查入口）
+    try:
+        _final = "success" if result.success else "failed"
+        op.close(status=_final, message=msg or status)
+        if not result.success:
+            _logger.error("备份失败 task=%s 详细日志: %s", task["id"], op.path)
+    finally:
+        _oplog.detach(_op_token)
+
+    # M2 对象目录：备份成功后异步扫描产物内对象清单（表级恢复的基础）
     if result.success:
         try:
             from core import object_catalog
@@ -492,21 +536,43 @@ def run_restore_now(record_id: int, target_host: str = None,
         "target_host": target_host_label, "target_db": target_db,
         "started_at": started, "status": "running", "operator": operator,
     })
+    # ---- 操作日志：本次恢复的完整现场 ----
+    from core import oplog as _oplog
+    op = _oplog.OperationLog(kind="restore", task=task, record_id=record_id,
+                             operator=operator or "")
+    _op_token = _oplog.attach(op)
+    op.context({
+        "任务ID": task["id"],
+        "任务名": task.get("name"),
+        "数据库类型": task.get("db_type"),
+        "备份记录ID": record_id,
+        "备份产物": rec.get("backup_path"),
+        "源实例": "%s:%s" % (task.get("host") or "-", task.get("port") or "-"),
+        "恢复目标主机": target_host_label or "-",
+        "恢复目标库": target_db or "(原库)",
+        "目标端口": target_port or "-",
+        "恢复时间点(PITR)": target_time or "-",
+        "指定表": ",".join(tables) if tables else "(全部)",
+        "操作人": operator or "-",
+    }, title="恢复任务上下文")
+
     result = BackupResult(success=False, message="未执行")
     try:
         from core.engines import get_engine
         engine = get_engine(task["db_type"], task, config.BACKUP_ROOT, _logger)
+        op.info("恢复引擎: %s", engine.__class__.__name__)
         # 任务级自定义环境变量：注入本机执行与所有远程 SSH 命令
         from core import remote_dump as _rd
         _env_token = _rd.set_task_env_export(_rd.task_env_export(task))
         try:
-            result = engine.run_restore(rec["backup_path"], target_host=target_host,
-                                    target_host_info=target_host_info,
-                                    target_db=target_db,
-                                    target_port=target_port,
-                                    target_time=target_time,
-                                    pitr_restore_dir=pitr_restore_dir,
-                                    tables=tables)
+            with op.step("执行恢复"):
+                result = engine.run_restore(rec["backup_path"], target_host=target_host,
+                                        target_host_info=target_host_info,
+                                        target_db=target_db,
+                                        target_port=target_port,
+                                        target_time=target_time,
+                                        pitr_restore_dir=pitr_restore_dir,
+                                        tables=tables)
         finally:
             _rd.reset_task_env_export(_env_token)
         detail_log_lines.append(f"[引擎结果] success={result.success}, status={getattr(result, 'status', '-')}")
@@ -515,10 +581,14 @@ def run_restore_now(record_id: int, target_host: str = None,
             detail_log_lines.append(f"[引擎 stdout]\n{result.stdout}")
         if getattr(result, "stderr", None):
             detail_log_lines.append(f"[引擎 stderr]\n{result.stderr}")
+        op.info("引擎返回: success=%s, status=%s, message=%s",
+                result.success, getattr(result, "status", "-"),
+                getattr(result, "message", ""))
     except Exception as e:
         result = BackupResult(success=False, status=BackupStatus.FAILED, message=f"恢复异常: {e}")
         _logger.exception("恢复异常 record=%s", record_id)
         detail_log_lines.append(f"[异常] {e}")
+        op.exception(e, note="[恢复流程异常]")
     finished = db.now_iso()
     detail_log_lines.append(f"[结束] 完成时间: {finished}")
     detail_log = "\n".join(detail_log_lines)
@@ -528,11 +598,24 @@ def run_restore_now(record_id: int, target_host: str = None,
         detail_log = engine_detail + "\n" + detail_log
     status = result.status if hasattr(result, "status") else (
         "success" if result.success else "failed")
+    # 收尾操作日志（详细命令/输出已落盘）
+    try:
+        op.info("恢复结果汇总:\n%s", detail_log)
+        op.close(status="success" if result.success else "failed",
+                 message=getattr(result, "message", "") or status)
+        if not result.success:
+            _logger.error("恢复失败 record=%s 详细日志: %s", record_id, op.path)
+    finally:
+        _oplog.detach(_op_token)
     db.execute(
-        "UPDATE restore_records SET finished_at=?, status=?, message=?, detail_log=? WHERE id=?",
-        (finished, status, getattr(result, "message", ""), detail_log, rid))
+        "UPDATE restore_records SET finished_at=?, status=?, message=?, detail_log=?, "
+        "log_path=? WHERE id=?",
+        (finished, status, getattr(result, "message", ""), detail_log,
+         str(op.path), rid))
     db.add_log("INFO" if result.success else "ERROR", "scheduler",
-               f"restore record={record_id} -> {status}")
+               f"restore record={record_id} -> {status}",
+               task_id=rec["task_id"], record_id=record_id,
+               detail=detail_log[:4000], log_path=str(op.path))
     # M5 Webhooks：恢复结果事件
     try:
         from core import webhooks

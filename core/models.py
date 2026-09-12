@@ -804,9 +804,19 @@ def list_inspections(limit: int = 200) -> list:
 
 
 # ------------------------- 日志 -------------------------
-def list_logs(limit: int = 200, level: str = "", source: str = "") -> list:
-    """读取系统日志，可按 level / source 过滤；按 id DESC 倒序返回。"""
-    sql = "SELECT * FROM system_logs WHERE 1=1"
+def list_logs(limit: int = 200, level: str = "", source: str = "",
+              task_id: int = None, record_id: int = None,
+              keyword: str = "", since: str = "", with_detail: bool = True) -> list:
+    """读取系统日志，可按 level / source / 任务 / 记录 / 关键字 / 起始时间过滤。
+
+    - task_id / record_id：把一次任务或一次备份的日志串起来（排查主入口）
+    - keyword：在 message 与 detail 中模糊匹配
+    - since：ISO 时间字符串，只取该时间之后的日志
+    - with_detail=False：不返回 detail（列表页体积更小）
+    """
+    cols = "*" if with_detail else (
+        "id, ts, level, source, message, task_id, record_id, log_path")
+    sql = f"SELECT {cols} FROM system_logs WHERE 1=1"
     params: list = []
     if level:
         sql += " AND level = ?"
@@ -814,6 +824,19 @@ def list_logs(limit: int = 200, level: str = "", source: str = "") -> list:
     if source:
         sql += " AND source = ?"
         params.append(source)
+    if task_id is not None:
+        sql += " AND task_id = ?"
+        params.append(int(task_id))
+    if record_id is not None:
+        sql += " AND record_id = ?"
+        params.append(int(record_id))
+    if keyword:
+        sql += " AND (message LIKE ? OR IFNULL(detail,'') LIKE ? OR IFNULL(log_path,'') LIKE ?)"
+        kw = f"%{keyword}%"
+        params.extend([kw, kw, kw])
+    if since:
+        sql += " AND ts >= ?"
+        params.append(since)
     sql += " ORDER BY id DESC LIMIT ?"
     params.append(int(limit))
     return db.query(sql, tuple(params))

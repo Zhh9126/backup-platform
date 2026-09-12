@@ -251,6 +251,150 @@ class MySQLEngine(BackupEngine):
                 "xtrabackup 2.4")
 
     @staticmethod
+    def _is_maria_tool(bin_path: str) -> bool:
+        """判断物理备份二进制是否为 MariaDB 官方 mariabackup。
+
+        mariabackup 与 Percona xtrabackup 参数并非完全兼容：
+          - 不支持 xtrabackup 的 --no-server-version-check（会直接报 unknown option）
+          - 不支持 --compress=zstd / --compress-zstd-level（QuickLZ 已废弃）
+        必须按工具族区分参数，否则 MariaDB 物理备份 100% 失败。
+        """
+        b = os.path.basename(bin_path or "").lower()
+        return "mariabackup" in b or "mariadb-backup" in b
+
+    @staticmethod
+    def _read_xb_checkpoints(path: str) -> dict:
+        """读取物理备份产物中的 xtrabackup_checkpoints，返回 key=value 字典。
+
+        支持三种产物形态：备份目录、.tar.gz/.tgz、.tar。增量备份需要基备的
+        to_lsn（远端按 --incremental-lsn 做真增量，无需把基备推回数据库服务器）。
+        """
+        import tarfile as _tarfile
+        text = ""
+        try:
+            if os.path.isdir(path):
+                cp = os.path.join(path, "xtrabackup_checkpoints")
+                if not os.path.isfile(cp):
+                    return {}
+                with open(cp, errors="replace") as f:
+                    text = f.read()
+            elif path.endswith((".tar", ".tar.gz", ".tgz")):
+                mode = "r:gz" if path.endswith((".tar.gz", ".tgz")) else "r:"
+                with _tarfile.open(path, mode) as tf:
+                    member = None
+                    for m in tf:
+                        if os.path.basename(m.name) == "xtrabackup_checkpoints":
+                            member = m
+                            break
+                    if member is None:
+                        return {}
+                    text = tf.extractfile(member).read().decode("utf-8", "replace")
+            else:
+                return {}
+        except Exception:
+            return {}
+        info = {}
+        for line in text.splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                info[k.strip()] = v.strip()
+        return info
+
+    @staticmethod
+    def _xb_artifact_kind(name: str) -> str:
+        """按产物名判断物理备份类型：full / inc / ''（非物理产物）。"""
+        b = os.path.basename(name or "")
+        if not b.startswith("xtrabackup_"):
+            return ""
+        if "_full_" in b or b.startswith("xtrabackup_full"):
+            return "full"
+        if "_inc_" in b or "_incr_" in b:
+            return "inc"
+        return ""
+
+    def _xb_latest(self, out_dir: str, kinds=("full", "inc")) -> str:
+        """在任务产物目录中找最近的物理备份产物（目录或 tar 包）。
+
+        供远端增量使用：以最近一次物理备份的 to_lsn 作为 --incremental-lsn。
+        """
+        best, best_ts = "", ""
+        try:
+            names = os.listdir(out_dir)
+        except OSError:
+            return ""
+        for n in names:
+            if self._xb_artifact_kind(n) not in kinds:
+                continue
+            m = re.search(r"(20\d{6}_\d{6})", n)
+            ts = m.group(1) if m else ""
+            if ts >= best_ts:
+                best, best_ts = os.path.join(out_dir, n), ts
+        return best
+
+    @staticmethod
+    def _pick_mariadb_server() -> tuple:
+        """在平台侧查找 MariaDB 服务端/客户端二进制（物理恢复的临时校验实例）。
+
+        离线环境不联网安装，按 配置项 → which → 常见安装前缀 顺序探测；
+        返回 (mariadbd, client)，未找到时对应项为空字符串。
+        """
+        import glob as _glob
+        import config as _cfg
+        srv = [getattr(_cfg, "MARIADBD_PATH", "") or "", shutil.which("mariadbd") or "",
+               "/usr/sbin/mariadbd", "/usr/local/mysql/bin/mariadbd"]
+        cli = [getattr(_cfg, "MARIADB_CLIENT_PATH", "") or "",
+               shutil.which("mariadb") or "", shutil.which("mysql") or ""]
+        for pat in ("/opt/mariadb*/usr/sbin/mariadbd", "/data/mariadb*/usr/sbin/mariadbd",
+                    "/opt/mariadb*/bin/mariadbd", "/usr/local/mariadb*/bin/mariadbd",
+                    "/opt/mariadb*/usr/libexec/mariadbd"):
+            srv += sorted(_glob.glob(pat))
+        for pat in ("/opt/mariadb*/usr/bin/mariadb", "/data/mariadb*/usr/bin/mariadb",
+                    "/opt/mariadb*/bin/mariadb", "/usr/local/mariadb*/bin/mariadb"):
+            cli += sorted(_glob.glob(pat))
+        srv_bin = next((c for c in srv if c and os.path.isfile(c)), "")
+        cli_bin = next((c for c in cli if c and os.path.isfile(c)), "")
+        return srv_bin, cli_bin
+
+    @staticmethod
+    def _tool_env(bin_path: str) -> dict:
+        """为平台侧二进制补 LD_LIBRARY_PATH：私有前缀安装（如解包部署）时
+        动态库在其同级 lib/lib64/mysql 下，否则会 error while loading libraries。
+        """
+        env = dict(os.environ)
+        if not bin_path:
+            return env
+        prefix = os.path.dirname(os.path.dirname(os.path.abspath(bin_path)))
+        libs = [os.path.join(prefix, "lib64", "mysql"), os.path.join(prefix, "lib", "mysql"),
+                os.path.join(prefix, "lib64"), os.path.join(prefix, "lib")]
+        parts = [p for p in libs if os.path.isdir(p)]
+        if parts:
+            cur = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = ":".join(parts + ([cur] if cur else []))
+        return env
+
+    @staticmethod
+    def _materialize_xb(src: str, dest: str, timeout: int = 7200) -> None:
+        """把物理备份产物（备份目录 / .tar.gz / .tar）落地为 dest 目录。
+
+        远端物理备份产物是 tar.gz（拉回平台），本地模式是备份目录，
+        两者在恢复链里统一按目录处理。
+        """
+        if os.path.isdir(src):
+            shutil.copytree(src, dest)
+            return
+        os.makedirs(dest, exist_ok=True)
+        if src.endswith((".tar.gz", ".tgz")):
+            args = ["tar", "xzf", src, "-C", dest]
+        elif src.endswith(".tar"):
+            args = ["tar", "xf", src, "-C", dest]
+        else:
+            raise RuntimeError(f"不支持的物理备份产物: {src}")
+        ret = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        if ret.returncode != 0:
+            raise RuntimeError(
+                f"解包物理产物失败 {os.path.basename(src)}: {(ret.stderr or '')[:300]}")
+
+    @staticmethod
     def _local_lib_map(local_bin: str) -> dict:
         """解析平台侧二进制的 ldd 输出，返回 {库名: 本地绝对路径}。"""
         try:
@@ -339,24 +483,35 @@ class MySQLEngine(BackupEngine):
         target_dir = os.path.join(out_dir, f"xtrabackup_{'full' if backup_type==BackupType.FULL else 'inc'}_{ts}")
         os.makedirs(target_dir, exist_ok=True)
 
-        cmd = [xtrabackup, "--backup", f"--target-dir={target_dir}",
+        is_maria = self._is_maria_tool(xtrabackup)
+        # --no-defaults 必须紧跟二进制：避免数据库服务器/平台的 /etc/my.cnf、
+        # ~/.my.cnf 干扰（凭据串味、datadir 误指向），凭据一律走命令行显式传入。
+        cmd = [xtrabackup, "--no-defaults", "--backup", f"--target-dir={target_dir}",
                f"--user={user}", f"--password={pw}",
-               f"--host={host}", f"--port={port}", "--no-lock",
-               "--no-server-version-check"]
+               f"--host={host}", f"--port={port}", "--no-lock"]
+        note_cmp = ""
+        if not is_maria:
+            # 仅 Percona xtrabackup 支持；mariabackup 传了会直接 unknown option 失败
+            cmd.append("--no-server-version-check")
         if comp:
-            # 最高压缩：zstd 级别取任务 compress_level（上限 19，xtrabackup 支持范围）
-            zl = int(self.task.get("compress_level") or 0)
-            zl = max(1, min(zl, 19)) if zl else 19
-            cmd += ["--compress=zstd", f"--compress-zstd-level={zl}", "--compress-threads=4"]
+            if is_maria:
+                # mariabackup 的 --compress 依赖已废弃的 QuickLZ（.qp 需 qpress 才能解），
+                # 明确降级为未压缩物理备份，不谎报压缩
+                note_cmp = "（mariabackup 不支持 --compress=zstd，按未压缩物理备份执行）"
+            else:
+                # 最高压缩：zstd 级别取任务 compress_level（上限 19，xtrabackup 支持范围）
+                zl = int(self.task.get("compress_level") or 0)
+                zl = max(1, min(zl, 19)) if zl else 19
+                cmd += ["--compress=zstd", f"--compress-zstd-level={zl}", "--compress-threads=4"]
 
         note = ""
         if backup_type == BackupType.INCREMENTAL:
-            # 找最近全量作为增量基
+            # 找最近全量作为增量基（目录形态）
             import glob as _glob
             full_dirs = sorted(_glob.glob(os.path.join(out_dir, "xtrabackup_full_*")), reverse=True)
             base_dir = None
             for d in full_dirs:
-                if os.path.isfile(os.path.join(d, ".success")):
+                if os.path.isdir(d) and os.path.isfile(os.path.join(d, "xtrabackup_checkpoints")):
                     base_dir = d
                     break
             if base_dir:
@@ -367,8 +522,11 @@ class MySQLEngine(BackupEngine):
                 backup_type = BackupType.FULL
                 target_dir = os.path.join(out_dir, f"xtrabackup_full_{ts}")
                 os.makedirs(target_dir, exist_ok=True)
-                cmd[2] = f"--target-dir={target_dir}"
+                for i, a in enumerate(cmd):
+                    if a.startswith("--target-dir="):
+                        cmd[i] = f"--target-dir={target_dir}"
                 note = " 增量基不存在，已自动退化为全量"
+        note += note_cmp
 
         start = time.time()
         ret = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
@@ -408,7 +566,8 @@ class MySQLEngine(BackupEngine):
           明文出现在进程参数(ps)中。
         - xtrabackup 连接数据库走 TCP（--host/--port），故 SSH 登录身份无需是
           数据库 OS 用户；远端目录 /tmp 世界可写，无需额外 chown。
-        - incremental/differential 在远端无基准目录跟踪，统一按全量(full)执行。
+        - incremental/differential：用平台侧最近物理备份的 to_lsn 作
+          --incremental-lsn，实现真增量；无基备时诚实退化并在消息中说明。
         """
         from core import remote_dump
         from core.engines.file import _ssh_exec_pipe
@@ -418,6 +577,28 @@ class MySQLEngine(BackupEngine):
         port = self.task.get("port") or 3306
         user = self.task.get("username") or "root"
         pw = db.decrypt_secret(self.task.get("password") or "")
+
+        out_dir = self._output_dir()
+        os.makedirs(out_dir, exist_ok=True)
+
+        # 增量：真增量而不是"退化全量"。远端不保留基备（数据库服务器零残留），
+        # 改为读取平台侧最近一次物理备份的 to_lsn，用 --incremental-lsn 让
+        # xtrabackup/mariabackup 只备份该 LSN 之后的页变化。
+        inc_lsn = ""
+        inc_note = ""
+        bt = backup_type if isinstance(backup_type, BackupType) else BackupType(str(backup_type))
+        if bt == BackupType.INCREMENTAL:
+            base_art = self._xb_latest(out_dir, ("full", "inc"))
+            if base_art:
+                cp = self._read_xb_checkpoints(base_art)
+                inc_lsn = str(cp.get("to_lsn") or "").strip()
+                if inc_lsn:
+                    inc_note = (f" 增量基于 {os.path.basename(base_art)} 的 to_lsn={inc_lsn}")
+                else:
+                    inc_note = (f" 未能从 {os.path.basename(base_art)} 解析 to_lsn，"
+                                "已自动退化为全量")
+            else:
+                inc_note = " 未找到可用物理基备，已自动退化为全量"
 
         client = remote_dump._connect(ssh_host)
         remote_tmp = f"/tmp/mysql_xtra_{ts}"
@@ -487,10 +668,12 @@ class MySQLEngine(BackupEngine):
 
             # 3) 远端执行：xtrabackup --backup -> tar czf（密码不在命令行）
             # 注意：--defaults-file 必须是第一个参数（xtrabackup 硬性要求）
+            inc_flag = f"--incremental-lsn={inc_lsn} " if inc_lsn else ""
             inner = (
                 f"{env_pre}{tool} --defaults-file={remote_cnf} "
                 f"--backup --target-dir={remote_tmp} "
                 f"--host={shlex.quote(host)} --port={port} --no-lock "
+                f"{inc_flag}"
                 f"&& tar czf {remote_tar} -C {remote_tmp} ."
             )
             wrapped = remote_dump._wrap_login(inner)
@@ -508,16 +691,16 @@ class MySQLEngine(BackupEngine):
                     message=f"远端 XtraBackup 物理备份失败(rc={rc}): {snippet}")
 
             # 4) SFTP 拉回 tar.gz 到本机，计算真实 size + sha256
-            out_dir = self._output_dir()
-            os.makedirs(out_dir, exist_ok=True)
-            local_path = os.path.join(out_dir, f"xtrabackup_{ts}.tar.gz")
+            # 产物名区分 full/inc：恢复侧据此识别增量链（含 to_lsn 元数据）
+            kind = "inc" if inc_lsn else "full"
+            local_path = os.path.join(out_dir, f"xtrabackup_{kind}_{ts}.tar.gz")
             sftp.get(remote_tar, local_path)
 
             size = os.path.getsize(local_path)
             checksum = db.sha256_file(local_path)
             hk = ssh_host.get("host_key", "remote")
             msg = (f"通过 SSH 在 {hk} 以 {os.path.basename(tool)} 执行 MySQL 物理备份成功，"
-                   f"已拉回 {local_path} ({db.human_size(size)}){push_note}")
+                   f"已拉回 {local_path} ({db.human_size(size)}){push_note}{inc_note}")
             self.logger.info("[%s] %s", self.task_name, msg)
 
             # 清理远端临时目录与 tar 包（best-effort，失败不致命）
@@ -1201,7 +1384,8 @@ class MySQLEngine(BackupEngine):
         # 恢复（prepare/临时实例校验）全部在平台侧执行，不触碰数据库服务器；
         # 二进制需与备份产出工具版本匹配（MySQL 5.5-5.7 → 2.4，8.0+ → 8.0，
         # MariaDB → mariabackup），各版本只装在平台侧。
-        xtrabackup, _xb_label = self._pick_physical_bin(self._server_version_str())
+        sv = self._server_version_str()
+        xtrabackup, _xb_label = self._pick_physical_bin(sv)
         if not os.path.isfile(xtrabackup):
             xtrabackup = shutil.which("xtrabackup") or shutil.which("mariabackup") \
                 or "/opt/xtrabackup/bin/xtrabackup"
@@ -1209,78 +1393,82 @@ class MySQLEngine(BackupEngine):
             return BackupResult(success=False, status=BackupStatus.FAILED,
                                 backup_path=backup_path,
                                 message="物理恢复需要 xtrabackup，请先在插件市场安装 Percona XtraBackup")
-        mysqld = shutil.which("mysqld") or "/opt/database/bin/mysqld"
+        # MariaDB 数据目录无法用 MySQL 服务端启动（InnoDB/redo 格式不兼容），
+        # 校验实例必须用 MariaDB 服务端；平台侧没有时再走远端自带服务端或
+        # 降级为 prepare 级校验（不谎报"已启动校验"）。
+        is_maria_src = ("mariadb" in (sv or "").lower()) or self._is_maria_tool(xtrabackup)
+        mysqld, mysql_cli = ("", "")
+        if is_maria_src:
+            mysqld, mysql_cli = self._pick_mariadb_server()
+        if not mysqld:
+            mysqld = shutil.which("mysqld") or "/opt/database/bin/mysqld"
+        if not mysql_cli:
+            mysql_cli = shutil.which("mysql") or "/opt/database/bin/mysql"
         if not os.path.isfile(mysqld):
-            return BackupResult(success=False, status=BackupStatus.FAILED,
-                                backup_path=backup_path,
-                                message="物理恢复需要本机 mysqld 用于启动临时校验实例")
-        mysql_cli = shutil.which("mysql") or "/opt/database/bin/mysql"
+            if not is_maria_src:
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                    backup_path=backup_path,
+                                    message="物理恢复需要本机 mysqld 用于启动临时校验实例")
+            mysqld = ""      # MariaDB：留空，后面按"无本地校验实例"处理
 
         logs = [f"[物理恢复] 备份产物: {backup_path}",
-                f"[物理恢复] xtrabackup: {xtrabackup}", f"[物理恢复] mysqld: {mysqld}"]
+                f"[物理恢复] 备份工具: {xtrabackup}",
+                f"[物理恢复] 校验实例: {mysqld or '（平台侧无匹配服务端，将按 prepare 级校验）'}"]
         tmp = tempfile.mkdtemp(prefix="xb_restore_")
         start = time.time()
         sock = f"/tmp/xb_restore_{os.getpid()}_{int(time.time() * 1000)}.sock"
         pid_file = sock + ".pid"
         err_file = sock + ".err"
         proc = None
-        # 增量产物识别：xtrabackup_incr_* 目录 → 增量链恢复
+        # 增量产物识别：xtrabackup_inc_*/xtrabackup_incr_*（目录或 tar 包）→ 增量链恢复
         # （先 prepare 最近全量基，再按时间序逐层 --incremental-dir 合并增量）
         _bn = os.path.basename(backup_path.rstrip("/"))
-        is_incr = os.path.isdir(backup_path) and (
-            "xtrabackup_inc_" in _bn or "xtrabackup_incr_" in _bn)
+        is_incr = self._xb_artifact_kind(_bn) == "inc"
         base_dir = None
         incr_chain = []
         if is_incr:
-            out_dir = os.path.dirname(backup_path.rstrip("/"))
-            full_dirs = sorted(
-                (d for d in glob.glob(os.path.join(out_dir, "xtrabackup_full_*"))
-                 if os.path.isfile(os.path.join(d, ".success"))), reverse=True)
-            base_dir = full_dirs[0] if full_dirs else None
+            out_dir = os.path.dirname(os.path.abspath(backup_path))
+            entries = sorted(os.listdir(out_dir)) if os.path.isdir(out_dir) else []
+            xb_arts = [os.path.join(out_dir, n) for n in entries
+                       if self._xb_artifact_kind(n) in ("full", "inc")]
+
+            def _ts_of(p):
+                m = re.search(r"(20\d{6}_\d{6})", os.path.basename(p))
+                return m.group(1) if m else ""
+
+            target_ts = _ts_of(backup_path)
+            fulls = [p for p in xb_arts if self._xb_artifact_kind(p) == "full"]
+            # 取时间上不晚于被恢复增量的最近全量基（兜底取最新全量）
+            pre = [p for p in fulls if _ts_of(p) <= target_ts] or fulls
+            base_dir = max(pre, key=_ts_of, default="")
             if not base_dir:
                 return BackupResult(
                     success=False, status=BackupStatus.FAILED,
                     backup_path=backup_path,
                     message="增量恢复失败：未找到可用全量基备（xtrabackup_full_*）")
-            # 同任务全部增量层（inc/incr 两种命名），按时间序（旧→新）应用
-            incr_all = sorted(
-                d for d in glob.glob(os.path.join(out_dir, "xtrabackup_inc*"))
-                if os.path.isdir(d))
-            incr_chain = [d for d in incr_all
-                          if d.rstrip("/") != backup_path.rstrip("/")
-                          and os.path.basename(d) <= _bn]
-            incr_chain.append(backup_path)   # 被恢复的增量最后应用
+            base_ts = _ts_of(base_dir)
+            inc_arts = {p for p in xb_arts if self._xb_artifact_kind(p) == "inc"
+                        and base_ts <= _ts_of(p) <= target_ts}
+            inc_arts.add(backup_path)          # 被恢复的增量必须在链内
+            incr_chain = sorted(inc_arts, key=_ts_of)
             logs.append(f"[增量恢复] 基备: {base_dir}，增量链 {len(incr_chain)} 层")
 
         try:
-            # 1) 准备工作目录
+            # 1) 准备工作目录（目录 / tar.gz / tar / xbstream 统一落地为目录）
             work = os.path.join(tmp, "data")
             if is_incr:
-                logs.append("[增量恢复] 复制全量基备到临时工作区 ...")
-                shutil.copytree(base_dir, work)
-            elif backup_path.endswith((".tar.gz", ".tgz")):
-                os.makedirs(work)
-                ret = subprocess.run(["tar", "xzf", backup_path, "-C", work],
-                                     capture_output=True, text=True, timeout=3600)
-                if ret.returncode != 0:
-                    raise RuntimeError(f"解包 tar.gz 失败: {(ret.stderr or '')[:300]}")
-            elif backup_path.endswith(".tar"):
-                os.makedirs(work)
-                ret = subprocess.run(["tar", "xf", backup_path, "-C", work],
-                                     capture_output=True, text=True, timeout=3600)
-                if ret.returncode != 0:
-                    raise RuntimeError(f"解包 tar 失败: {(ret.stderr or '')[:300]}")
+                logs.append("[增量恢复] 落地全量基备到临时工作区 ...")
+                self._materialize_xb(base_dir, work)
             elif backup_path.endswith(".xbstream"):
                 os.makedirs(work)
                 ret = subprocess.run([xtrabackup, "--xbstream", "-x", "-C", work],
                                      capture_output=True, text=True, timeout=7200)
                 if ret.returncode != 0:
                     raise RuntimeError(f"xbstream 解流失败: {(ret.stderr or '')[:300]}")
-            elif os.path.isdir(backup_path):
-                logs.append("[物理恢复] 复制备份目录到临时工作区（避免 prepare 污染原备份/增量基）...")
-                shutil.copytree(backup_path, work)
             else:
-                raise RuntimeError(f"不支持的物理备份产物: {backup_path}")
+                logs.append("[物理恢复] 落地备份产物到临时工作区"
+                            "（避免 prepare 污染原备份/增量基）...")
+                self._materialize_xb(backup_path, work)
 
             # 2) 解压 .zst（若存在）
             try:
@@ -1297,12 +1485,17 @@ class MySQLEngine(BackupEngine):
                     raise RuntimeError(f"xtrabackup --decompress 失败: {(ret.stderr or '')[:300]}")
 
             # 3) prepare（并行 apply-log，加快恢复）
+            # --apply-log-only 为 Percona xtrabackup 专有：增量链的基备必须只
+            # 应用 redo、不推进 LSN，否则后续 --incremental-dir 会报
+            # "needs target prepared with --apply-log-only"。mariabackup 没有该
+            # 参数（传了直接 unknown option 失败），其 --prepare 在增量链中途
+            # 本身不会做事务回滚，行为等价。
+            apply_only = [] if self._is_maria_tool(xtrabackup) else ["--apply-log-only"]
             if is_incr:
-                # 关键：增量链的基备必须 --apply-log-only（只应用 redo 不推进
-                # LSN），否则增量应用报 "needs target prepared with
-                # --apply-log-only"；全部增量应用完后再做最终普通 prepare。
-                logs.append("[增量恢复] prepare 全量基备（--apply-log-only）...")
-                prep_cmd = [xtrabackup, "--prepare", "--apply-log-only"]
+                logs.append("[增量恢复] prepare 全量基备"
+                            + ("（--apply-log-only）" if apply_only
+                               else "（mariabackup：无 apply-log-only 选项）") + " ...")
+                prep_cmd = [xtrabackup, "--prepare"] + apply_only
                 if self._restore_parallel() > 1:
                     prep_cmd.append(f"--parallel={self._restore_parallel()}")
                 prep_cmd.append(f"--target-dir={work}")
@@ -1312,9 +1505,10 @@ class MySQLEngine(BackupEngine):
                     raise RuntimeError(
                         f"增量恢复: 基备 prepare 失败: {(ret.stderr or ret.stdout or '')[-400:]}")
                 for i, inc in enumerate(incr_chain):
-                    # 增量层可能是 zstd 压缩产物：解压到临时副本（不污染原备份）
+                    # 增量层可能是备份目录或 tar 包，也可能是 zstd 压缩产物：
+                    # 统一落地到临时副本（不污染原备份）
                     inc_work = os.path.join(tmp, f"inc_{i}")
-                    shutil.copytree(inc, inc_work)
+                    self._materialize_xb(inc, inc_work)
                     try:
                         n = self._decompress_xtrabackup_dir(inc_work)
                         if n:
@@ -1359,23 +1553,30 @@ class MySQLEngine(BackupEngine):
                 if ret.returncode != 0:
                     raise RuntimeError(f"xtrabackup --prepare 失败: {(ret.stderr or ret.stdout or '')[-500:]}")
 
-            # 4) 启动临时 mysqld 校验：优先平台本机实例；平台 mysqld 大版本
-            #    与源实例不一致（或 MariaDB）且可 SSH 时，改用数据库服务器
-            #    自带 mysqld 做远端临时实例校验（DBMS 自带二进制，零安装）。
-            sv = self._server_version_str()
-            lm_major = self._mysqld_major(mysqld)
+            # 4) 启动临时服务端校验：优先平台本机实例；平台服务端与源实例不匹配
+            #    （MariaDB 或大版本不同）且可 SSH 时，用数据库服务器自带服务端做
+            #    远端临时实例校验（DBMS 自带二进制，零安装）；两者都不可用时降级
+            #    为 prepare 级校验并如实说明（不谎报已做实例级校验）。
+            local_ok = bool(mysqld) and os.path.isfile(mysqld)
+            lm_major = self._mysqld_major(mysqld) if local_ok else 0
             sv_major = self._parse_major(sv)
-            mismatch = ("mariadb" in (sv or "").lower()) or (lm_major != sv_major)
+            mismatch = is_maria_src or (lm_major != sv_major)
             remote_ssh = None
             if mismatch:
                 from core import remote_dump as _rd
                 remote_ssh = _rd.resolve_ssh_host(self.task)
             if mismatch and remote_ssh:
                 logs.append(
-                    f"[物理恢复] 平台 mysqld({lm_major}.x) 与源实例({sv or '未知'})"
-                    f" 大版本不一致，改用远端自带 mysqld 启动临时校验实例 ...")
+                    f"[物理恢复] 平台服务端({lm_major or '无'}.x) 与源实例({sv or '未知'})"
+                    f" 不匹配，改用远端自带服务端启动临时校验实例 ...")
                 label, verify_out = self._verify_prepared_remote(
                     remote_ssh, work, target_db, logs)
+            elif not local_ok:
+                label = "prepare 级校验"
+                verify_out = ("redo log 已应用完成（未启动临时实例：平台侧缺少匹配的服务端"
+                              "二进制，可配置 MARIADBD_PATH 或为任务绑定 SSH 主机以用"
+                              "数据库服务器自带服务端做实例级校验）")
+                logs.append(f"[物理恢复] {verify_out}")
             else:
                 logs.append("[物理恢复] 启动临时 mysqld 实例做可恢复性校验 ...")
                 proc = subprocess.Popen(
@@ -1384,14 +1585,16 @@ class MySQLEngine(BackupEngine):
                      "--skip-networking", "--skip-grant-tables",
                      "--user=root", f"--pid-file={pid_file}",
                      f"--log-error={err_file}"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    env=self._tool_env(mysqld))
                 ready = False
                 for _ in range(90):
                     if proc.poll() is not None:
                         break
                     r = subprocess.run([mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}",
-                                        "-N", "-e", "SELECT 1"],
-                                       capture_output=True, text=True, timeout=15)
+                                       "-N", "-e", "SELECT 1"],
+                                      capture_output=True, text=True, timeout=15,
+                                      env=self._tool_env(mysql_cli))
                     if r.returncode == 0 and r.stdout.strip() == "1":
                         ready = True
                         break
@@ -1415,7 +1618,8 @@ class MySQLEngine(BackupEngine):
                     label = "实例库"
                 r = subprocess.run([mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}",
                                     "-N", "-e", verify_sql],
-                                   capture_output=True, text=True, timeout=60)
+                                   capture_output=True, text=True, timeout=60,
+                                   env=self._tool_env(mysql_cli))
                 if r.returncode != 0:
                     raise RuntimeError(f"校验查询失败: {(r.stderr or '')[:300]}")
                 verify_out = r.stdout.strip()
@@ -1440,7 +1644,8 @@ class MySQLEngine(BackupEngine):
             try:
                 if proc and proc.poll() is None:
                     subprocess.run([mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}",
-                                    "-e", "SHUTDOWN"], capture_output=True, timeout=30)
+                                    "-e", "SHUTDOWN"], capture_output=True, timeout=30,
+                                   env=self._tool_env(mysql_cli))
             except Exception:
                 pass
             if os.path.exists(pid_file):

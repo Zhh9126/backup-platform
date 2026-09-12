@@ -687,6 +687,46 @@ CREATE TABLE IF NOT EXISTS ai_messages (
 CREATE INDEX IF NOT EXISTS idx_ai_messages_session
     ON ai_messages(session_id, created_at);
 
+-- 数据库适配器（可插拔数据库类型）：界面新增一种数据库后即可用于备份/恢复。
+-- 适配器用「脚本模板 + 能力声明」描述一种数据库，运行时动态注册为引擎。
+-- 内置类型（mysql/oracle/...）不落此表，由代码注册；本表只存用户新增的适配器。
+CREATE TABLE IF NOT EXISTS db_adapters (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    db_type                     TEXT NOT NULL UNIQUE,   -- 类型键（任务/同步引用）
+    display_name                TEXT NOT NULL,          -- 界面展示名
+    category                    TEXT DEFAULT 'custom',  -- relational/nosql/file/custom
+    default_port                INTEGER,
+    icon                        TEXT DEFAULT 'bi-box-seam',
+    description                 TEXT DEFAULT '',
+    enabled                     INTEGER DEFAULT 1,
+    -- 能力声明（JSON）
+    backup_modes                TEXT DEFAULT '["logical"]',
+    supports_incremental        INTEGER DEFAULT 0,
+    supports_full_instance      INTEGER DEFAULT 0,
+    supports_sync               INTEGER DEFAULT 0,
+    -- 远端客户端工具（JSON 数组，如 ["dmexp"]）；skip_client_check=1 时仅提示不拦截
+    client_tools                TEXT DEFAULT '[]',
+    skip_client_check           INTEGER DEFAULT 0,
+    -- 脚本模板（bash，在数据库服务器上以 root 执行，注入 PLATFORM_* 环境变量）
+    script_backup_full          TEXT DEFAULT '',
+    script_backup_incremental   TEXT DEFAULT '',
+    script_backup_full_instance TEXT DEFAULT '',
+    script_restore              TEXT DEFAULT '',
+    script_verify               TEXT DEFAULT '',
+    script_list_dbs             TEXT DEFAULT '',
+    script_test_conn            TEXT DEFAULT '',
+    -- 运行参数
+    artifact_dir                TEXT DEFAULT '',        -- 远端产物目录（空=平台默认临时目录）
+    timeout_sec                 INTEGER DEFAULT 7200,
+    params                      TEXT DEFAULT '{}',      -- JSON：工具路径等，注入 PLATFORM_PARAM_<KEY>
+    -- 元信息
+    builtin                     INTEGER DEFAULT 0,
+    created_by                  TEXT,
+    created_at                  TEXT,
+    updated_at                  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_db_adapters_enabled ON db_adapters(enabled, db_type);
 """
 
 # ------------------------- 连接与执行 -------------------------
@@ -1144,6 +1184,32 @@ def init_schema() -> None:
             except Exception:
                 pass  # 表已存在，忽略
 
+            # 迁移：数据库适配器表（可插拔数据库类型）—— 幂等建表，供存量 DB 补齐
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS db_adapters ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "db_type TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, "
+                    "category TEXT DEFAULT 'custom', default_port INTEGER, "
+                    "icon TEXT DEFAULT 'bi-box-seam', description TEXT DEFAULT '', "
+                    "enabled INTEGER DEFAULT 1, "
+                    "backup_modes TEXT DEFAULT '[\"logical\"]', "
+                    "supports_incremental INTEGER DEFAULT 0, "
+                    "supports_full_instance INTEGER DEFAULT 0, "
+                    "supports_sync INTEGER DEFAULT 0, "
+                    "client_tools TEXT DEFAULT '[]', skip_client_check INTEGER DEFAULT 0, "
+                    "script_backup_full TEXT DEFAULT '', "
+                    "script_backup_incremental TEXT DEFAULT '', "
+                    "script_backup_full_instance TEXT DEFAULT '', "
+                    "script_restore TEXT DEFAULT '', script_verify TEXT DEFAULT '', "
+                    "script_list_dbs TEXT DEFAULT '', script_test_conn TEXT DEFAULT '', "
+                    "artifact_dir TEXT DEFAULT '', timeout_sec INTEGER DEFAULT 7200, "
+                    "params TEXT DEFAULT '{}', builtin INTEGER DEFAULT 0, "
+                    "created_by TEXT, created_at TEXT, updated_at TEXT)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_db_adapters_enabled "
+                             "ON db_adapters(enabled, db_type)")
+            except Exception:
+                pass  # 表已存在，忽略
 
             conn.commit()
         finally:

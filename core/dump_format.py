@@ -117,6 +117,39 @@ DUMP_FORMATS = {
             "note": "sys_dump -Fd：目录归档，支持并行；平台打包 tar.gz 拉回，恢复时解开后回放。",
         },
     ],
+    # openGauss（gs_dump 与 pg_dump 同源，格式开关一致；恢复分别用 gs_restore/gsql）
+    "opengauss": [
+        {
+            "value": "auto", "label": "跟随压缩设置（默认）", "default": True,
+            "flag": None, "ext": "", "restore": "auto",
+            "note": "保持平台默认行为：任务开启压缩 → gs_dump -Fc（.dump，自带压缩，支持 gs_restore "
+                    "选择性恢复）；未开压缩 → gs_dump -Fp 纯文本（.sql，用 gsql 回放）。",
+        },
+        {
+            "value": "custom", "label": "自定义格式 -Fc（.dump）",
+            "flag": "-Fc", "ext": ".dump", "restore": "pg_restore",
+            "note": "gs_dump -Fc：二进制归档，自带压缩、体积最小；支持 gs_restore 按表/按 schema "
+                    "选择性恢复，推荐生产使用。",
+        },
+        {
+            "value": "plain", "label": "纯文本 SQL -Fp（.sql）",
+            "flag": "-Fp", "ext": ".sql", "restore": "psql",
+            "note": "gs_dump -Fp：可读 SQL 脚本，可用 gsql 直接回放（openGauss 的 gsql 语言与 PG 高度兼容）；"
+                    "体积较大、不支持选择性恢复。",
+        },
+        {
+            "value": "tar", "label": "tar 归档 -Ft（.tar）",
+            "flag": "-Ft", "ext": ".tar", "restore": "pg_restore",
+            "note": "gs_dump -Ft：tar 归档（每表一个成员），可用 gs_restore 选择性恢复，"
+                    "但不支持压缩且单表有 8GB 限制。",
+        },
+        {
+            "value": "directory", "label": "目录格式 -Fd（打包 .tar.gz）",
+            "flag": "-Fd", "ext": ".tar.gz", "dir": True, "restore": "pg_restore_dir",
+            "note": "gs_dump -Fd：目录归档，支持并行 dump 与并行恢复；平台在数据库服务器侧打包为 "
+                    "tar.gz 拉回，恢复时自动解开再用 gs_restore 回放。",
+        },
+    ],
     "mongodb": [
         {
             "value": "archive", "label": "单文件归档 --archive（.archive）", "default": True,
@@ -170,8 +203,9 @@ DUMP_FORMATS = {
     ],
 }
 
-# PG 系（postgresql / kingbase）在 dump_format=auto 时的行为：按压缩开关决定
+# PG 系（postgresql / kingbase / opengauss）在 dump_format=auto 时的行为：按压缩开关决定
 _PG_AUTO = {True: "custom", False: "plain"}
+_PG_FAMILY = ("postgresql", "kingbase", "opengauss")
 
 
 def supported_formats(db_type: str) -> list:
@@ -222,7 +256,7 @@ def resolve(db_type: str, extra: dict = None, compress: bool = True) -> dict:
 
     out = dict(chosen)
     # PG 系 auto：按压缩开关落到 custom / plain（保持历史默认行为）
-    if out.get("value") == "auto" and db_type in ("postgresql", "kingbase"):
+    if out.get("value") == "auto" and db_type in _PG_FAMILY:
         target = _PG_AUTO[bool(compress)]
         for it in items:
             if it["value"] == target:

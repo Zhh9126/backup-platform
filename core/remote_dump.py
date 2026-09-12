@@ -370,10 +370,18 @@ def _resolve_remote_bin(client, tool: str, extra_paths: str = None) -> str | Non
     #    导致 "invalid option" 或 rc=127 类失败。
     _pg_like = ("ksql", "sys_dump", "sys_restore", "sys_basebackup",
                 "sys_receivewal", "sys_dumpall")
+    # openGauss：主进程名为 gaussdb，工具名为 gs_*（gs_dump/gs_basebackup/...）
+    _gs_like = ("gs_dump", "gs_dumpall", "gs_restore", "gsql", "gs_basebackup",
+                "gs_ctl", "gs_probackup", "gs_verifybackup")
     if (tool.startswith("pg_") or tool == "psql"
-            or tool in _pg_like):
+            or tool in _pg_like or tool in _gs_like):
         try:
-            if tool in _pg_like:
+            if tool in _gs_like:
+                # openGauss：主进程名 gaussdb，客户端工具与其同目录（GAUSSHOME/bin）
+                proc_cmd = (
+                    r"ps -eo cmd= | awk '/\/gaussdb(\s|$)/ && !/awk/ && !/grep/ {print $1; exit}'"
+                )
+            elif tool in _pg_like:
                 # 金仓：主进程名为 kingbase，工具在其 bin 目录
                 proc_cmd = (
                     r"ps -eo cmd= | awk '/\/kingbase(\s|$)/ && !/awk/ && !/grep/ {print $1; exit}'"
@@ -415,6 +423,11 @@ def _resolve_remote_bin(client, tool: str, extra_paths: str = None) -> str | Non
         "/opt/Kingbase/ES/V*/bin /opt/kingbase/*/bin /KingbaseES/V*/bin "
         "/opt/Kingbase/ES/V*/KESRealPro/*/Server/bin "
         "/opt/Kingbase/ES/V*/KESRealPro/*/ClientTools/bin "
+        # openGauss（企业版/社区版安装布局：GAUSSHOME/bin 存放 gs_* 工具）
+        "/opt/soft/openGauss/*/bin /opt/opengauss/*/bin /opt/openGauss/*/bin "
+        "/usr/local/opengauss/bin /usr/local/openGauss/bin "
+        "/opt/huawei/install/app/bin /opt/huawei/*/bin /opt/gauss/*/bin "
+        "/gauss/*/bin /gaussdb/*/bin /opt/gaussdb/*/bin /home/omm/*/bin "
         # Redis / MongoDB
         "/usr/local/redis*/bin /usr/local/redis/bin /opt/redis*/bin "
         "/usr/local/mongodb*/bin /opt/mongodb*/bin /usr/local/mongodb/bin "
@@ -810,6 +823,16 @@ def _remote_kingbase_dump(task: dict, ssh_host: dict, compress: int) -> tuple:
     return _pg_family_dump(task, ssh_host, "kingbase", compress)
 
 
+def _remote_opengauss_dump(task: dict, ssh_host: dict, compress: int) -> tuple:
+    """在远端数据库服务器以 gs_dump 导出，返回 (原始字节, 产物格式)。
+
+    openGauss 客户端工具通常只对 omm 用户可见（GAUSSHOME/bin），工具解析走
+    resolve_remote_tool(check_user=omm)；gs_* 动态库依赖由 LD_LIBRARY_PATH 兜底。
+    全实例语义见 _pg_family_dump（openGauss 无 --all-databases，逐库 tar.gz）。
+    """
+    return _pg_family_dump(task, ssh_host, "opengauss", compress)
+
+
 # 旧实现占位（由下方 PG 系共用实现整体接管）：
 # ---------------------------------------------------------------------------
 # PG 系（PostgreSQL / KingbaseES）共用 dump 实现
@@ -823,6 +846,7 @@ _PG_FAMILY_TOOLING = {
     "postgresql": {
         "label": "PostgreSQL",
         "dump_tool": "pg_dump",
+        "restore_candidates": ("pg_restore",),
         "query_candidates": ("psql",),
         "dumpall_candidates": ("pg_dumpall",),
         "catalog_table": "pg_database",
@@ -831,10 +855,12 @@ _PG_FAMILY_TOOLING = {
         "default_user": "postgres",
         "check_user": None,
         "env_exports": ("PGPASSWORD",),
+        "db_type": "postgresql",
     },
     "kingbase": {
         "label": "KingbaseES",
         "dump_tool": "sys_dump",
+        "restore_candidates": ("sys_restore", "pg_restore"),
         "query_candidates": ("ksql", "sys_psql", "psql"),
         "dumpall_candidates": ("sys_dumpall", "kb_dumpall", "ksy_dumpall", "pg_dumpall"),
         # V8/V009R003 系统目录为 sys_database；V9R1 为 pg_database——运行时探测
@@ -845,6 +871,27 @@ _PG_FAMILY_TOOLING = {
         "check_user": "kingbase",
         # V8 兼容 PGPASSWORD；V9 起用 KINGBASE_PASSWORD，两个都注入最稳
         "env_exports": ("KINGBASE_PASSWORD", "PGPASSWORD"),
+        "db_type": "kingbase",
+    },
+    # openGauss（华为开源高斯，PG 9.2 内核分支）：
+    # - 工具族名为 gs_*：gs_dump/gs_dumpall/gs_restore/gsql
+    # - 集群属主为 omm，客户端工具通常只在其 profile PATH 中可见 → check_user=omm
+    # - gs_* 动态链接 GAUSSHOME/lib，远端执行需注入 LD_LIBRARY_PATH（set_lib_path）
+    # - 密码统一走 PGPASSWORD（gsql/gs_dump/gs_basebackup 均支持）
+    "opengauss": {
+        "label": "openGauss",
+        "dump_tool": "gs_dump",
+        "restore_candidates": ("gs_restore",),
+        "query_candidates": ("gsql", "psql"),
+        "dumpall_candidates": ("gs_dumpall", "pg_dumpall"),
+        "catalog_table": "pg_database",
+        "maint_candidates": ("postgres", "template1"),
+        "default_port": 5432,
+        "default_user": "omm",
+        "check_user": "omm",
+        "env_exports": ("PGPASSWORD",),
+        "db_type": "opengauss",
+        "set_lib_path": True,
     },
 }
 
@@ -862,9 +909,26 @@ def _pg_family_parse_extra(task: dict) -> dict:
     return {}
 
 
-def _pg_family_env_exports(cfg: dict, pw: str) -> str:
-    """密码只走环境变量，不进 argv（各类型注入自己认的环境变量集）。"""
-    return " ".join(f"export {e}={shlex.quote(pw)};" for e in cfg["env_exports"])
+def _pg_family_env_exports(cfg: dict, pw: str, bin_path: str = "") -> str:
+    """密码只走环境变量，不进 argv（各类型注入自己认的环境变量集）。
+
+    openGauss（cfg.set_lib_path）额外注入 GAUSSHOME/PATH/LD_LIBRARY_PATH：
+    gs_* 客户端工具默认从 <GAUSSHOME>/lib 加载动态库，且 GAUSSHOME 往往只在
+    omm 用户的 profile 中定义；SSH 非登录 shell 下直接调用绝对路径会报
+    "error while loading shared libraries"，故按工具路径反推 GAUSSHOME 兜底。
+    """
+    exports = " ".join(f"export {e}={shlex.quote(pw)};" for e in cfg["env_exports"])
+    if cfg.get("set_lib_path"):
+        if bin_path:
+            guess = f"$(dirname $(dirname {shlex.quote(bin_path)}))"
+        else:
+            guess = '"${GAUSSHOME:-}"'
+        exports += (
+            f' [ -n "${{GAUSSHOME:-}}" ] || export GAUSSHOME={guess};'
+            ' export LD_LIBRARY_PATH="$GAUSSHOME/lib:${LD_LIBRARY_PATH:-}";'
+            ' export PATH="$GAUSSHOME/bin:$PATH";'
+        )
+    return exports
 
 
 def _pg_family_resolve_query_bin(client, cfg) -> str:
@@ -904,12 +968,14 @@ def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
             "无法枚举数据库清单以执行全实例备份。")
     dumpall_bin = _pg_family_resolve_dumpall_bin(client, cfg)
 
-    env = _pg_family_env_exports(cfg, pw)
+    env = _pg_family_env_exports(cfg, pw, bin_path=dump_bin)
     # 系统目录表：V8/V009R003=sys_database、V9R1=pg_database —— 候选探测
     catalogs = cfg.get("catalog_candidates") or (cfg["catalog_table"],)
     maints = " ".join(cfg["maint_candidates"])
     ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    db_type = "kingbase" if cfg["dump_tool"].startswith("sys_") else "postgresql"
+    # 备份记录归属的 db_type：优先取 cfg 显式声明（openGauss 等新增类型）
+    db_type = cfg.get("db_type") or (
+        "kingbase" if cfg["dump_tool"].startswith("sys_") else "postgresql")
 
     # 系统库排除：SQL 层 NOT IN 过滤（include_sys 时不过滤）
     sys_dbs = SYSTEM_DBS.get(db_type) or ()
@@ -990,7 +1056,7 @@ def _pg_family_dumpall_stream(client, cfg: dict,
         raise RuntimeError(
             f"远端主机未找到 dumpall 工具（{'/'.join(cfg['dumpall_candidates'])}）。"
             "可在 extra_options 中去掉 all_db_mode 使用默认逐库 tar 模式。")
-    env = _pg_family_env_exports(cfg, pw)
+    env = _pg_family_env_exports(cfg, pw, bin_path=dumpall_bin)
     shell = (
         f"set -o pipefail; {_tool_path_export(tool_path)}{env} "
         f"{dumpall_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}"
@@ -1050,7 +1116,7 @@ def _pg_family_dump(task: dict, ssh_host: dict, db_type: str, compress: int) -> 
     # ---- 单库/多表/多 schema（原有行为）----
     # 注意：不使用 "-f -"（显式指定 stdout）。某些环境下 pg_dump 的 "-f -"
     # 参数异常导致输出 0 字节；不带 -f 时默认输出 stdout，行为一致且兼容性更好。
-    env = _pg_family_env_exports(cfg, pw)
+    env = _pg_family_env_exports(cfg, pw, bin_path=dump_bin)
     base = (
         f"set -o pipefail; {_tool_path_export(tp)}{env} "
         f"{dump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt_flag}"
@@ -1257,6 +1323,10 @@ def remote_db_dump(task: dict, ssh_host: dict, db_type: str, compress: int = 0,
     if db_type == "kingbase":
         data, fmt = _remote_kingbase_dump(task, ssh_host, compress)
         return data, bool(compress) and fmt == "single", fmt
+    if db_type == "opengauss":
+        # openGauss 与 PG 同源（gs_dump），复用 PG 系 dump 通道（含全实例逐库 tar）
+        data, fmt = _remote_opengauss_dump(task, ssh_host, compress)
+        return data, bool(compress) and fmt == "single", fmt
     if db_type == "redis":
         return _remote_redis_dump(task, ssh_host), False, "single"
     if db_type == "mongodb":
@@ -1271,11 +1341,21 @@ def remote_db_dump(task: dict, ssh_host: dict, db_type: str, compress: int = 0,
 # PG 协议的库）共用同一套逻辑，避免每个引擎把路径、端口、用户名、临时目录写死。
 # 通过参数驱动，调用方只传入工具名与少量差异项即可。
 
+# pg_basebackup / sys_basebackup 的默认基础参数（tar 流式 + 压缩 + 快速检查点）
+_PG_BASEBACKUP_FLAGS = ["-Ft", "-z", "--checkpoint=fast", "--no-password"]
+
 def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
                            default_port: int, default_user: str,
                            extra_args_key: str = "pg_basebackup_extra_args",
-                           tool_label: str = None, check_user: str = None) -> dict:
-    """在远端数据库服务器执行流式物理备份（pg_basebackup / sys_basebackup 等）。
+                           tool_label: str = None, check_user: str = None,
+                           base_flags: list = None,
+                           extra_env: dict = None) -> dict:
+    """在远端数据库服务器执行流式物理备份（pg_basebackup / sys_basebackup / gs_basebackup）。
+
+    base_flags: 覆盖默认的基础参数（默认 -Ft -z --checkpoint=fast --no-password）。
+                openGauss 的 gs_basebackup 不支持 --checkpoint 且需要显式 -X stream，
+                由调用方传入 ["-Ft", "-z", "-X", "stream", "-w"]。
+    extra_env : 额外环境变量（如 openGauss 的 GAUSSHOME/LD_LIBRARY_PATH）。
 
     参数
     ----
@@ -1344,12 +1424,18 @@ def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
         extra = []
 
     # 密码环境变量：PG 兼容库 V8 用 PGPASSWORD，KingbaseES V9 用 KINGBASE_PASSWORD，
-    # 两个都注入避免版本差异导致鉴权失败
+    # 两个都注入避免版本差异导致鉴权失败；openGauss 另需 GAUSSHOME/lib
+    env_extra = ""
+    if extra_env:
+        env_extra = "".join(
+            f" export {k}={shlex.quote(str(v))};" for k, v in extra_env.items())
+    flags = " ".join(shlex.quote(a) for a in (base_flags or _PG_BASEBACKUP_FLAGS))
     inner = (
         f"export PGPASSWORD={shlex.quote(pw)}; "
-        f"export KINGBASE_PASSWORD={shlex.quote(pw)}; "
+        f"export KINGBASE_PASSWORD={shlex.quote(pw)};"
+        f"{env_extra} "
         f"{resolved} -h {shlex.quote(db_host)} -p {port} -U {shlex.quote(user)} "
-        f"-D {remote_tmp} -Ft -z --checkpoint=fast --no-password"
+        f"-D {remote_tmp} {flags}"
     )
     if extra:
         inner += " " + " ".join(shlex.quote(a) for a in extra)
@@ -1451,16 +1537,28 @@ def _remote_list_mysql_databases(task: dict, ssh_host: dict) -> list:
         sftp.close()
 
 
-def _remote_list_pg_databases(task: dict, ssh_host: dict) -> list:
-    """通过 SSH 在 PG/kingbase 上跑 SELECT datname FROM pg_database。"""
+def _remote_list_pg_databases(task: dict, ssh_host: dict, db_type: str = "postgresql") -> list:
+    """通过 SSH 在 PG/kingbase/openGauss 上跑 SELECT datname FROM pg_database。
+
+    客户端（psql/ksql/gsql）与默认端口按类型解析；openGauss 额外注入
+    GAUSSHOME/lib 以便 gsql 正常加载动态库。
+    """
+    cfg = _PG_FAMILY_TOOLING.get(db_type) or _PG_FAMILY_TOOLING["postgresql"]
     client = _connect(ssh_host)
-    user = task.get("username") or "postgres"
+    user = task.get("username") or cfg["default_user"]
     pw = db.decrypt_secret(task.get("password") or "")
-    pg_bin = _resolve_remote_bin(client, "psql") or "psql"
-    port = task.get("port") or 5432
+    pg_bin = ""
+    for _name in cfg["query_candidates"]:
+        pg_bin = _resolve_remote_bin(client, _name) or ""
+        if pg_bin:
+            break
+    pg_bin = pg_bin or cfg["query_candidates"][0]
+    port = task.get("port") or cfg["default_port"]
+    maint = "postgres"
+    env = _pg_family_env_exports(cfg, pw, bin_path=pg_bin)
     shell = (
-        f"set -o pipefail; export PGPASSWORD={shlex.quote(pw)}; "
-        f"{pg_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d postgres -tA -c "
+        f"set -o pipefail; {env} "
+        f"{pg_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d {maint} -tA -c "
         f'"SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY datname"'
     )
     wrapped = _wrap_login(shell)
@@ -1494,8 +1592,8 @@ def remote_list_databases(task: dict, db_type: str) -> list:
         )
     if db_type in ("mysql", "mariadb"):
         return _remote_list_mysql_databases(task, ssh_host)
-    if db_type in ("postgresql", "kingbase"):
-        return _remote_list_pg_databases(task, ssh_host)
+    if db_type in ("postgresql", "kingbase", "opengauss"):
+        return _remote_list_pg_databases(task, ssh_host, db_type)
     raise RuntimeError(f"暂不支持为 {db_type} 拉取库/schema 列表")
 
 
@@ -1713,7 +1811,7 @@ def _pg_family_detect_maint_db(client, cfg: dict, query_bin: str,
     返回第一个可连通的维护库名；全部失败抛 RuntimeError。
     """
     from core.engines.file import _ssh_exec_pipe
-    env = _pg_family_env_exports(cfg, pw)
+    env = _pg_family_env_exports(cfg, pw, bin_path=query_bin)
     catalogs = cfg.get("catalog_candidates") or (cfg["catalog_table"],)
     for mdb in cfg["maint_candidates"]:
         probe = (
@@ -1731,30 +1829,35 @@ def _pg_family_detect_maint_db(client, cfg: dict, query_bin: str,
 
 def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
                        is_custom: bool, db_type: str = "postgresql") -> None:
-    """单库 dump 恢复（PG 系通用：postgresql=psql/pg_restore，kingbase=ksql/sys_restore）。"""
+    """单库 dump 恢复（PG 系通用：postgresql=psql/pg_restore，kingbase=ksql/sys_restore，
+    openGauss=gsql/gs_restore）。"""
     cfg = _PG_FAMILY_TOOLING[db_type]
-    restore_tool = "sys_restore" if db_type == "kingbase" else "pg_restore"
+    # 还原工具按类型候选解析（sys_restore/gs_restore/pg_restore 命名不同）
+    restore_tool = (cfg.get("restore_candidates") or ("pg_restore",))[0]
     user = task.get("username") or cfg["default_user"]
     pw = db.decrypt_secret(task.get("password") or "")
     db_name = task.get("db_name") or ""
     port = int(task.get("port") or cfg["default_port"])
-    env = _pg_family_env_exports(cfg, pw)
     # 探测工具路径
     client = _connect(ssh_host)
     from core.engines.file import _ssh_exec_pipe
+    # SQL 客户端提前解析：openGauss 需按工具路径反推 GAUSSHOME（LD_LIBRARY_PATH）
+    query_bin_probe = _pg_family_resolve_query_bin(client, cfg)
+    env = _pg_family_env_exports(cfg, pw, bin_path=query_bin_probe)
 
     # 0) 远程先 DROP+CREATE 目标库，保证干净恢复。
     #    pg_restore 的 "-C" 在目标库同名已存在时会因 "cannot drop the
     #    currently open database" 失败，导致旧对象残留，这里改为两步建库。
     #    维护库不写死 postgres（金仓 V9R1 无 postgres 库）——候选探测。
     if db_name:
-        psql_tool = _pg_family_resolve_query_bin(client, cfg)
+        psql_tool = query_bin_probe or _pg_family_resolve_query_bin(client, cfg)
         if not psql_tool:
             raise RuntimeError(
                 f"远端主机未找到 SQL 客户端（{'/'.join(cfg['query_candidates'])}），无法恢复。")
         maint = _pg_family_detect_maint_db(client, cfg, psql_tool, user, pw, port)
         safe_db = db_name.replace('"', '""')
-        # DROP ... WITH (FORCE) 需 PG13+/金仓较新版本；老版本先杀连接再 DROP
+        # DROP ... WITH (FORCE) 需 PG13+/金仓较新版本；openGauss/PG9.2 系不支持，
+        # 老版本先杀连接再 DROP（pg_terminate_backend 在 openGauss 同样可用）
         prep = (
             f"set -o pipefail; {env} "
             f"{psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d {shlex.quote(maint)} "
@@ -1776,7 +1879,7 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
     if is_custom:
         tool = _resolve_remote_bin(client, restore_tool) or restore_tool
     else:
-        tool = _pg_family_resolve_query_bin(client, cfg)
+        tool = query_bin_probe or _pg_family_resolve_query_bin(client, cfg)
         if not tool:
             raise RuntimeError(
                 f"远端主机未找到 SQL 客户端（{'/'.join(cfg['query_candidates'])}），无法恢复。")
@@ -1795,7 +1898,7 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
 def _pg_family_tar_restore_script(cfg: dict, restore_bin: str, query_bin: str,
                                   pkg_path: str, user: str, pw: str, port: int) -> str:
     """构造全实例 tar 包恢复脚本：globals + 逐库（缺失自动建库，-c 清理覆盖）。"""
-    env = _pg_family_env_exports(cfg, pw)
+    env = _pg_family_env_exports(cfg, pw, bin_path=restore_bin)
     # 系统目录表候选探测（V8=sys_database / V9R1=pg_database）
     catalogs = cfg.get("catalog_candidates") or (cfg["catalog_table"],)
     maints = " ".join(cfg["maint_candidates"])
@@ -1854,10 +1957,18 @@ def _remote_pg_family_restore_tar(task: dict, ssh_host: dict, db_type: str,
 
     cfg = _PG_FAMILY_TOOLING[db_type]
     client = _connect(ssh_host)
-    restore_tool = "sys_restore" if db_type == "kingbase" else "pg_restore"
-    restore_bin = _resolve_remote_bin(client, restore_tool)
+    restore_tool = ""
+    restore_bin = ""
+    # 还原工具候选（sys_restore/gs_restore/pg_restore），逐个探测取第一个可用
+    for _name in (cfg.get("restore_candidates") or ("pg_restore",)):
+        restore_bin = _resolve_remote_bin(client, _name) or ""
+        if restore_bin:
+            restore_tool = _name
+            break
     if not restore_bin:
-        raise RuntimeError(f"远端主机未找到 {restore_tool}，无法执行全实例恢复。")
+        raise RuntimeError(
+            f"远端主机未找到还原工具（{'/'.join(cfg.get('restore_candidates') or ('pg_restore',))}），"
+            "无法执行全实例恢复。")
     query_bin = _pg_family_resolve_query_bin(client, cfg)
     if not query_bin:
         raise RuntimeError(
@@ -1912,7 +2023,7 @@ def remote_db_restore(task: dict, ssh_host: dict, db_type: str,
 
     自动识别 multi-db-tar（全实例逐库 tar.gz）产物并走整实例恢复分支。
     """
-    if db_type in ("postgresql", "kingbase") and _looks_like_full_instance_tar(dump_bytes):
+    if db_type in ("postgresql", "kingbase", "opengauss") and _looks_like_full_instance_tar(dump_bytes):
         _remote_pg_family_restore_tar(task, ssh_host, db_type, dump_bytes)
         return
     if db_type in ("mysql", "mariadb") and _looks_like_full_instance_tar(dump_bytes):
@@ -1920,9 +2031,7 @@ def remote_db_restore(task: dict, ssh_host: dict, db_type: str,
         return
     if db_type == "mysql":
         _remote_mysql_restore(task, ssh_host, dump_bytes)
-    elif db_type == "postgresql":
-        _remote_pg_restore(task, ssh_host, dump_bytes, is_custom, db_type="postgresql")
-    elif db_type == "kingbase":
-        _remote_pg_restore(task, ssh_host, dump_bytes, is_custom, db_type="kingbase")
+    elif db_type in ("postgresql", "kingbase", "opengauss"):
+        _remote_pg_restore(task, ssh_host, dump_bytes, is_custom, db_type=db_type)
     else:
         raise RuntimeError(f"不支持的远程恢复类型: {db_type}")

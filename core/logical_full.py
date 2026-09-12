@@ -25,12 +25,17 @@ import tarfile
 import tempfile
 import time
 
+# PG 协议系（逐库 dump + globals 语义一致），新增同源库时加入此元组即可
+PG_FAMILY = ("postgresql", "kingbase", "opengauss")
+
 # 各库类型的系统库清单（全实例默认排除，业务库优先）
 SYSTEM_DBS = {
     "mysql": ("information_schema", "performance_schema", "mysql", "sys"),
     "mariadb": ("information_schema", "performance_schema", "mysql", "sys"),
     "postgresql": ("postgres", "template0", "template1"),
     "kingbase": ("template0", "template1", "template2", "security", "test"),
+    # openGauss 默认库：postgres（维护库）+ 两个模板库
+    "opengauss": ("postgres", "template0", "template1"),
 }
 
 # 各库类型差异点
@@ -54,6 +59,16 @@ TOOLING = {
         "env_exports": ("KINGBASE_PASSWORD", "PGPASSWORD"),
         "default_query": "ksql",
         "default_dumpall": "sys_dumpall",
+    },
+    # openGauss：gsql/gs_dump/gs_dumpall（工具随 GAUSSHOME/bin 提供）
+    "opengauss": {
+        "catalog_sqls": (
+            "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY 1",
+        ),
+        "maint_candidates": ("postgres", "template1"),
+        "env_exports": ("PGPASSWORD",),
+        "default_query": "gsql",
+        "default_dumpall": "gs_dumpall",
     },
     "mysql": {
         "catalog_sqls": ("SHOW DATABASES",),
@@ -104,7 +119,7 @@ def enumerate_databases(db_type: str, query_tool: str, host: str, port,
     无需维护库。全部候选失败返回 ("", [])。
     """
     cfg = TOOLING[db_type]
-    is_pg = db_type in ("postgresql", "kingbase")
+    is_pg = db_type in PG_FAMILY
     sys_set = set() if include_system_dbs else set(SYSTEM_DBS.get(db_type) or ())
     for mdb in cfg["maint_candidates"]:
         for catalog_sql in cfg["catalog_sqls"]:
@@ -141,7 +156,7 @@ def backup_full_instance(db_type: str, *, host, port, user, password,
     """本机全实例备份：逐库一个文件 + globals（PG 系）→ tar.gz。返回 manifest。"""
     cfg = TOOLING[db_type]
     env = _build_env(db_type, password)
-    is_pg = db_type in ("postgresql", "kingbase")
+    is_pg = db_type in PG_FAMILY
     query_tool = query_tool or _which_any(cfg["default_query"])
     if not query_tool:
         raise RuntimeError(
@@ -229,7 +244,7 @@ def restore_full_instance(db_type: str, *, host, port, user, password,
     """
     cfg = TOOLING[db_type]
     env = _build_env(db_type, password)
-    is_pg = db_type in ("postgresql", "kingbase")
+    is_pg = db_type in PG_FAMILY
     query_tool = query_tool or _which_any(cfg["default_query"])
     if not query_tool:
         raise RuntimeError(

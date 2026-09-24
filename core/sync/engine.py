@@ -306,6 +306,11 @@ class SyncEngine:
                     break
                 total_read += len(result.records)
                 try:
+                    # 零日期消毒：MySQL '0000-00-00' 在达梦/Oracle/PG 全部非法，
+                    # 转为 NULL（保持行数与行语义，仅空日期语义归一）
+                    from .compat_advisor import sanitize_zero_dates
+                    sanitize_zero_dates(result.records, result.columns,
+                                        cfg.tgt_db_type)
                     written = self.writer.write_batch(tgt_conn, result.records, result.columns)
                     total_write += written
                 except Exception as e:
@@ -462,6 +467,8 @@ class SyncEngine:
                     while rows:
                         records = [[tgt_plugin.type_to_java(
                             "VARCHAR", v) for v in row] for row in rows]
+                        from .compat_advisor import sanitize_zero_dates
+                        sanitize_zero_dates(records, columns, cfg.tgt_db_type)
                         total += writer.write_batch(wconn, records, columns)
                         rows = cur.fetchmany(cfg.batch_size)
                 finally:

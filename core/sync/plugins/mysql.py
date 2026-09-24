@@ -70,9 +70,10 @@ class MySQLSourceReader(SourceReader):
                 cols = []
                 for row in cur.fetchall():
                     extra = (row[7] or "").lower()
+                    col_type = (row[1] or "").upper()
                     cols.append(ColumnMeta(
                         name=row[0],
-                        type=row[1].upper(),
+                        type=col_type,
                         nullable=row[2] == "YES",
                         default=row[3],
                         max_length=row[4],
@@ -82,6 +83,8 @@ class MySQLSourceReader(SourceReader):
                         # 只有 EXTRA 带 auto_increment。不读 EXTRA 会导致目标表丢自增，
                         # 后续插入数据主键冲突。
                         auto_increment=("auto_increment" in extra),
+                        # 'int unsigned'/'tinyint unsigned'：目标端无符号整型升位依赖此标记
+                        unsigned="UNSIGNED" in col_type,
                     ))
                 for c in cols:
                     c.is_primary = c.name in pk_set

@@ -108,9 +108,14 @@ def check_data_sample(cfg, src_conn, tgt_conn, table: str,
         cur = src_conn.cursor()
         cur.execute(f"SELECT * FROM {ref_s}{order}{top}")
         rows = cur.fetchall()
+        col_names = [d[0] for d in cur.description]
         src_cols = _get_cols_typed(src_conn, cfg.src_db_type,
                                    cfg.src_db_name, cfg.src_schema, table)
         cur.close()
+        # 零日期消毒：MySQL '0000-00-00' 写入达梦/Oracle/PG 目标必报
+        # DatetimeFieldOverflow，预检试写与正式链路口径一致（转 NULL）
+        from .compat_advisor import sanitize_zero_dates
+        sanitize_zero_dates(rows, col_names, cfg.tgt_db_type)
     except Exception as e:
         return {"status": "warn", "message": f"源端采样失败（跳过试写）: {e}",
                 "detail": []}

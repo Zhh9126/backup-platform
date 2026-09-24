@@ -7,6 +7,7 @@
 """
 import logging
 import os
+import re
 from typing import Any, List
 
 from .base import (BasePlugin, ColumnMeta, ReadResult, SinkWriter, SourceReader,
@@ -263,6 +264,12 @@ class DamengSourceReader(SourceReader):
 
 
 class DamengSinkWriter(SinkWriter):
+    # 长度语义探测结果（prepare_table 时填充；默认按字符语义=不放大，
+    # 探测失败会保守切换为字节语义放大）
+    _sem_probed = False
+    _len_in_char = 1
+    _charset_factor = 3
+
     def connect(self) -> Any:
         cfg = self.config
         return _connect_dameng(cfg.tgt_host, cfg.tgt_port or 5236,
@@ -328,22 +335,69 @@ class DamengSinkWriter(SinkWriter):
             defs.append("PRIMARY KEY (" + ", ".join(f'"{_upper(p)}"' for p in pk) + ")")
         return f'CREATE TABLE {schema}.{tbl} ({", ".join(defs)})'
 
+    def _probe_length_semantics(self, conn: Any) -> None:
+        """探测达梦长度语义参数（建表前调用一次，探测失败保守按字节语义放大）。
+
+        LENGTH_IN_CHAR：0=VARCHAR 按字节（默认，MySQL 语义的 N 会截断汉字）；
+        UNICODE()：0=GB18030（汉字 2 字节），1=UTF-8（汉字 3 字节）。
+        """
+        if getattr(self, "_sem_probed", False):
+            return
+        self._sem_probed = True
+        self._len_in_char = 1
+        self._charset_factor = 3
+        try:
+            cur = conn.cursor()
+            v = self._probe_one(cur, "SELECT SF_GET_PARA_VALUE(2, 'LENGTH_IN_CHAR')")
+            if v is not None:
+                self._len_in_char = int(v or 0)
+            u = self._probe_one(cur, "SELECT UNICODE()")
+            self._charset_factor = 2 if (u is not None and int(u or 0) == 0) else 3
+            try:
+                cur.close()
+            except Exception:
+                pass
+        except Exception as e:  # noqa: BLE001 - 探测失败走保守放大
+            logger.info("[dameng-plugin] 长度语义探测失败（按字节语义保守放大）: %s", e)
+            self._len_in_char = 0
+        logger.info("[dameng-plugin] LENGTH_IN_CHAR=%s charset_factor=%s",
+                    self._len_in_char, self._charset_factor)
+
+    @staticmethod
+    def _probe_one(cur: Any, sql: str):
+        try:
+            cur.execute(sql)
+            row = cur.fetchone()
+            return row[0] if row else None
+        except Exception:
+            return None
+
     def _map_to_dameng_type(self, c: ColumnMeta, t: str) -> str:
         """达梦建表类型映射：覆盖所有偏门类型，避免落 VARCHAR(4000) 兜底。
 
         优先级：精确基类型 → 模糊匹配 → 兜底。
         字符类型用 c.max_length（列解析时填）；数值类型用 c.numeric_precision/scale。
+        内置信创迁移暗坑防御：
+        - 无符号整型升位（达梦无 unsigned，超 21 亿直接溢出）；
+        - VARCHAR 按目标字节语义自动放大（LENGTH_IN_CHAR=0 时 UTF-8 汉字 3 字节）。
         """
         base = t.split("(")[0].strip()
-        # 整数
+        uns = bool(getattr(c, "unsigned", False))
+        # 剥离修饰词再取基类型（'INT UNSIGNED'/'TINYINT UNSIGNED' 不剥离会
+        # 错过精确分支，落到兜底矩阵被错误升档）
+        base = re.sub(r"\b(UNSIGNED|SIGNED|ZEROFILL)\b", " ", base,
+                      flags=re.I).strip()
+        uns = uns or bool(c.type and "UNSIGNED" in c.type.upper())
+        # 整数（含无符号升位）
         if base in ("TINYINT",):
-            return "TINYINT"
+            return "SMALLINT" if uns else "TINYINT"
         if base == "SMALLINT":
-            return "SMALLINT"
+            return "INT" if uns else "SMALLINT"
         if base in ("INT", "INTEGER"):
-            return "INT"
+            return "BIGINT" if uns else "INT"
         if base == "BIGINT":
-            return "BIGINT"
+            # 64 位无符号上限 1.8e19 超 BIGINT，用 NUMBER(20,0)
+            return "NUMBER(20,0)" if uns else "BIGINT"
         # 浮点/精确小数
         if base in ("DECIMAL", "NUMERIC", "NUMBER"):
             p = c.numeric_precision or 18
@@ -356,6 +410,14 @@ class DamengSinkWriter(SinkWriter):
             return f"{base}({c.max_length or 1})"
         if base in ("VARCHAR", "VARCHAR2", "NVARCHAR", "NVARCHAR2"):
             ln = c.max_length or 4000
+            if self._len_in_char == 0:
+                # 目标按字节计长 + 源按字符计长（MySQL/PG 等）：
+                # 汉字 UTF-8 占 3 字节（GB18030 占 2），不放大必截断（-6169）
+                from ..compat_advisor import scale_char_length
+                src_t = getattr(self, "config", None)
+                src_db = getattr(src_t, "src_db_type", "") if src_t else ""
+                ln = scale_char_length(ln, src_db, dst_by_bytes=True,
+                                       dst_charset_factor=self._charset_factor)
             if ln > 3900:                       # 达梦 VARCHAR 上限 3900
                 return "TEXT"
             return f"VARCHAR2({ln})" if base == "VARCHAR2" else f"{base}({ln})"
@@ -440,6 +502,8 @@ class DamengSinkWriter(SinkWriter):
             cur.execute(f"DROP TABLE {self._table_ref(table)}")
             exists = False
         if not exists:
+            # 建表前探测目标库长度语义（LENGTH_IN_CHAR/字符集），用于 VARCHAR 放大
+            self._probe_length_semantics(conn)
             cur.execute(self._create_table_sql(table, columns))
         conn.commit()
 

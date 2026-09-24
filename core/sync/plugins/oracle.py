@@ -6,6 +6,7 @@
 - 增量同步：基于时间戳/数值增量列（incremental_column + incremental_value）。
 """
 import logging
+import re
 import time
 from datetime import date, datetime
 from decimal import Decimal
@@ -209,8 +210,18 @@ class OracleSinkWriter(SinkWriter):
         return f'CREATE TABLE {schema}.{tbl} ({", ".join(defs)})'
 
     def _map_to_oracle_type(self, c: ColumnMeta, t: str) -> str:
-        """Oracle 建表类型映射：覆盖所有偏门类型，避免落 VARCHAR2(4000) 兜底。"""
+        """Oracle 建表类型映射：覆盖所有偏门类型，避免落 VARCHAR2(4000) 兜底。
+
+        信创迁移暗坑防御：无符号整型升位（NUMBER 天然无符号，只需位数够：
+        TINYINT U→NUMBER(3) 已够 / INT U 4.29e9→NUMBER(10) 已够 /
+        BIGINT U 1.8e19→NUMBER(20)）；VARCHAR2 字节语义放大见 _ora_char_scale。
+        """
         base = t.split("(")[0].strip()
+        uns = bool(getattr(c, "unsigned", False))
+        # 剥离修饰词（'BIGINT UNSIGNED' 不剥离会错过精确分支落兜底）
+        base = re.sub(r"\b(UNSIGNED|SIGNED|ZEROFILL)\b", " ", base,
+                      flags=re.I).strip()
+        uns = uns or bool(c.type and "UNSIGNED" in c.type.upper())
         # 整数（Oracle 用 NUMBER(p) 表达）
         if base == "TINYINT":
             return "NUMBER(3)"
@@ -219,7 +230,7 @@ class OracleSinkWriter(SinkWriter):
         if base in ("INT", "INTEGER"):
             return "NUMBER(10)"
         if base == "BIGINT":
-            return "NUMBER(19)"
+            return "NUMBER(20)" if uns else "NUMBER(19)"
         if base in ("BINARY_INTEGER", "PLS_INTEGER"):
             return "NUMBER(10)"
         # 浮点/精确小数
@@ -240,7 +251,14 @@ class OracleSinkWriter(SinkWriter):
             return f"{base}({ln})"
         if base in ("VARCHAR", "VARCHAR2", "NVARCHAR", "NVARCHAR2"):
             ln = c.max_length or 4000
-            if ln > 4000:                          # Oracle VARCHAR2 上限 4000
+            if self._ora_byte_semantics:
+                # 目标 NLS_LENGTH_SEMANTICS=BYTE + 源按字符计长（MySQL 等）：
+                # UTF-8 汉字 3 字节，不放大触发 ORA-12899 截断；超限降 CLOB
+                from ..compat_advisor import scale_char_length
+                src_db = getattr(getattr(self, "config", None), "src_db_type", "")
+                ln = scale_char_length(ln, src_db, dst_by_bytes=True,
+                                       dst_charset_factor=3)
+            if ln > 4000:                          # Oracle VARCHAR2 上限 4000（SQL 层）
                 return "CLOB" if base not in ("NVARCHAR", "NVARCHAR2") else "NCLOB"
             # Oracle 没有 VARCHAR/NVARCHAR 标准类型，统一转 VARCHAR2/NVARCHAR2
             if base == "VARCHAR":
@@ -339,8 +357,24 @@ class OracleSinkWriter(SinkWriter):
                 cur.execute(f"DROP TABLE {self._table_ref(table)}")
                 exists = False
             if not exists:
+                # 建表前探测 NLS_LENGTH_SEMANTICS（BYTE 语义下 VARCHAR 需放大）
+                self._ora_byte_semantics = self._probe_nls_byte(conn)
                 cur.execute(self._create_table_sql(table, columns))
             conn.commit()
+
+    _ora_byte_semantics = False
+
+    @staticmethod
+    def _probe_nls_byte(conn: Any) -> bool:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM nls_database_parameters "
+                    "WHERE parameter='NLS_LENGTH_SEMANTICS'")
+                row = cur.fetchone()
+                return bool(row) and (str(row[0] or "").upper() == "BYTE")
+        except Exception:
+            return False
 
     def write_batch(self, conn: Any, records: List[List[Any]],
                     columns: List[str]) -> int:

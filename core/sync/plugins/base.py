@@ -79,6 +79,10 @@ class ColumnMeta:
     # 否则迁移产物无主键/无自增，后续同步写入会出现重复行与主键冲突。
     is_primary: bool = False
     auto_increment: bool = False
+    # 无符号整型（MySQL COLUMN_TYPE 'int unsigned' 等）。达梦/Oracle/PG 无
+    # 无符号整型，映射时必须升位（TINYINT U→SMALLINT / INT U→BIGINT /
+    # BIGINT U→DECIMAL(20)），否则 21 亿以上的值直接溢出。
+    unsigned: bool = False
 
 
 def matrix_suggest(config, tgt_db: str, type_str: str) -> Optional[str]:

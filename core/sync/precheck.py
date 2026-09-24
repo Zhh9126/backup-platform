@@ -256,6 +256,18 @@ def run_precheck(cfg) -> Dict[str, Any]:
              f"目标库连接失败: {e}" + (f"（{hint}）" if hint else ""))
         return _summary(items)
 
+    # ---- 1.5) 异构兼容性暗坑探测（不阻断，warn/info 级）----
+    # 达梦：大小写敏感 / VARCHAR 按字节计长 / COMPATIBLE_MODE / 字符集 / 保留字
+    # Oracle：VARCHAR2 字节语义 / 空串=NULL / 30 字节标识符
+    # PG/MySQL：server 编码 / 零日期 / sql_mode
+    try:
+        from .compat_advisor import run_compat_advisory
+        for f in run_compat_advisory(cfg, tgt_conn, tables):
+            _add(items, f.get("code", "compat"), f.get("level", "info"),
+                 f.get("message", ""))
+    except Exception as e:  # noqa: BLE001 - 顾问绝不阻断迁移
+        _add(items, "compat_advisor", "info", f"兼容性探测跳过: {e}")
+
     overwrite = cfg.save_mode == "overwrite"
     create_if_ne = cfg.save_mode == "create_if_not_exists"
 

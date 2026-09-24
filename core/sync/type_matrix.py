@@ -229,9 +229,12 @@ def _int_target(tgt: str, t: dict):
     base, uns = t["base"], t["unsigned"]
     if uns and base == "bigint":
         # BIGINT UNSIGNED 最大 18446744073709551615，任何 64 位有符号都装不下
-        if tgt in ("oracle", "dameng", "kingbase"):
+        if tgt in ("oracle", "dameng"):
             return ("NUMBER(20,0)", "warn",
                     "BIGINT UNSIGNED → NUMBER(20,0)（64位无符号超有符号范围，需 20 位十进制）")
+        if tgt == "kingbase":
+            return ("NUMERIC(20,0)", "warn",
+                    "BIGINT UNSIGNED → NUMERIC(20,0)（PG 家族无 NUMBER 类型名）")
         return ("DECIMAL(20,0)", "warn",
                 "BIGINT UNSIGNED → DECIMAL(20,0)（超出 BIGINT 上限 9223372036854775807，"
                 "映射为 BIGINT 会静默降级/溢出）")
@@ -243,11 +246,22 @@ def _int_target(tgt: str, t: dict):
         return (up, "warn",
                 f"INT UNSIGNED → {up}（无符号 32 位超有符号范围，升位 64 位）")
     if uns:
-        # TINYINT/SMALLINT UNSIGNED 升一级
-        up = {"tinyint": ("SMALLINT", "MEDIUMINT"), "smallint": ("INT", "BIGINT"),
-              "mediumint": ("INT", "BIGINT")}[base]
-        return (up[0] if tgt in ("mysql", "mariadb") else up[1], "warn",
-                f"{base.upper()} UNSIGNED → {up[0]}（无符号升位）")
+        # TINYINT/SMALLINT/MEDIUMINT UNSIGNED 升一级。
+        # 注意：MEDIUMINT 仅 MySQL 家族存在——此前对非 MySQL 目标也返回
+        # MEDIUMINT，导致 PG/达梦/Oracle 试写建表直接报「类型不存在」。
+        if tgt in ("mysql", "mariadb"):
+            up = {"tinyint": "SMALLINT", "smallint": "MEDIUMINT",
+                  "mediumint": "INT"}[base]
+        elif tgt in ("postgresql", "kingbase"):
+            up = {"tinyint": "SMALLINT", "smallint": "INTEGER",
+                  "mediumint": "INTEGER"}[base]
+        elif tgt in ("oracle", "dameng"):
+            up = {"tinyint": "SMALLINT", "smallint": "INTEGER",
+                  "mediumint": "INTEGER"}[base]
+        else:
+            up = {"tinyint": "SMALLINT", "smallint": "INT",
+                  "mediumint": "INT"}[base]
+        return (up, "warn", f"{base.upper()} UNSIGNED → {up}（无符号升位）")
     # 有符号整数：宽度对齐
     width = _INT_UPGRADE.get((base, False), 32)
     if tgt in ("oracle", "dameng"):

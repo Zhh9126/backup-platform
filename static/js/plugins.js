@@ -296,6 +296,9 @@
   }
 
   function renderStatusBadge(p) {
+    if (p.builtin) {
+      return `<span class="plugin-badge plugin-badge-ok" title="${esc(p.builtin_note || "平台内置组件，随镜像分发，不可卸载")}"><i class="bi bi-box-seam-fill"></i> 内置</span>`;
+    }
     if (p.status === "installing") {
       return `<span class="plugin-badge plugin-badge-running"><span class="spinner-border spinner-border-sm"></span> 安装中</span>`;
     }
@@ -316,6 +319,16 @@
 
   function renderActions(p) {
     const hostLabel = CURRENT_HOST_ID ? `安装到${esc(currentHostName())}` : "一键安装";
+    if (p.builtin) {
+      // 内置组件：随镜像分发，物理备份引擎直接使用，不提供卸载/安装
+      return `
+        <button class="btn btn-outline-secondary btn-sm" data-act="log">
+          <i class="bi bi-file-text"></i> 日志
+        </button>
+        <button class="btn btn-outline-success btn-sm disabled" title="${esc(p.builtin_note || "平台内置组件，随镜像分发，不可卸载")}">
+          <i class="bi bi-box-seam-fill"></i> 内置
+        </button>`;
+    }
     if (p.installed) {
       return `
         <button class="btn btn-outline-secondary btn-sm" data-act="log">

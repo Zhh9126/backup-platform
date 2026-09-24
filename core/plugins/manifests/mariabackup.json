@@ -10,6 +10,9 @@
   "icon": "bi-hdd-rack",
   "homepage": "https://mariadb.com/kb/en/mariabackup-overview/",
   "offline_first": true,
+  "builtin": true,
+  "bundled_paths": ["/opt/mariabackup/usr/bin/mariabackup"],
+  "builtin_note": "平台内置组件：随镜像/安装包分发，作为物理备份引擎零安装推送的二进制源，不可卸载。",
   "packages": {
     "linux": {
       "fallback": {

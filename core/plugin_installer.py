@@ -314,6 +314,36 @@ def _guess_ext_from_url(url: str) -> str:
     return ".download"
 
 
+# ----------------------------------------------------------------------------
+# 离线包源：完全离线环境无法在线下载，市场安装优先使用本地预置包
+# ----------------------------------------------------------------------------
+OFFLINE_PKG_DIR = PLUGIN_DIR / "offline_packages"
+
+
+def _find_offline_pkg(pid: str) -> Optional[Path]:
+    """离线包查找：core/plugins/offline_packages/<pid>/ 下任意安装包（取最新）。
+
+    离线交付环境把安装包（tar.gz/zip 等）提前放进该目录即可让
+    「一键安装」走本地包，不再尝试联网（离线打包脚本同步携带）。
+    """
+    d = OFFLINE_PKG_DIR / _safe_pid(pid)
+    try:
+        cands = [p for p in d.iterdir() if p.is_file() and p.stat().st_size > 0]
+    except OSError:
+        return None
+    if not cands:
+        return None
+    cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return cands[0]
+
+
+def _offline_hint(pid: str, url: str) -> str:
+    """在线下载失败时的离线指引文案。"""
+    return (f"在线下载失败（离线环境无法访问 {url}）。"
+            f"请把安装包放到平台目录 core/plugins/offline_packages/{pid}/ 下"
+            f"（支持 .tar.gz / .zip），再点一键安装即可走本地离线包。")
+
+
 def _safe_urlopen(url: str, timeout: int = 600):
     """打开远程 URL，SSL 失败时降级为不验证并写一条日志。
 
@@ -352,6 +382,18 @@ def _download_to_local(url: str, pid: str, host_key: str = "local") -> dict:
     tmp_path = INSTALL_ROOT / f"{pid}_{int(time.time())}{real_suffix}"
     _append_log(pid, f"tmp file: {tmp_path.name}", host_key=host_key)
 
+    # 离线优先：本地预置包存在则直接使用，不访问网络
+    offline = _find_offline_pkg(pid)
+    if offline:
+        _append_log(pid, f"offline package: {offline}", host_key=host_key)
+        try:
+            shutil.copyfile(offline, tmp_path)
+        except Exception as e:
+            return {"ok": False, "path": "", "ext": real_suffix,
+                    "message": f"离线包拷贝失败: {e}"}
+        return {"ok": True, "path": str(tmp_path), "ext": real_suffix,
+                "message": ""}
+
     try:
         with _safe_urlopen(url, timeout=600) as resp, \
                 open(tmp_path, "wb") as out:
@@ -364,7 +406,12 @@ def _download_to_local(url: str, pid: str, host_key: str = "local") -> dict:
                      host_key=host_key)
         return {"ok": True, "path": str(tmp_path), "ext": real_suffix, "message": ""}
     except Exception as e:
-        return {"ok": False, "path": "", "ext": real_suffix, "message": str(e)}
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return {"ok": False, "path": "", "ext": real_suffix,
+                "message": _offline_hint(pid, url) + f"（原始错误: {str(e)[:200]}）"}
 
 
 def _download_and_extract(strategy: dict, pid: str,
@@ -385,18 +432,35 @@ def _download_and_extract(strategy: dict, pid: str,
     tmp_path = INSTALL_ROOT / f"{pid}_{int(time.time())}{real_suffix}"
     _append_log(pid, f"tmp file: {tmp_path.name}", host_key=host_key)
 
-    try:
-        with _safe_urlopen(url, timeout=600) as resp, \
-                open(tmp_path, "wb") as out:
-            while True:
-                chunk = resp.read(64 * 1024)
-                if not chunk:
-                    break
-                out.write(chunk)
+    # 离线优先：本地预置包存在则直接使用，不访问网络
+    offline = _find_offline_pkg(pid)
+    if offline:
+        _append_log(pid, f"offline package: {offline}", host_key=host_key)
+        try:
+            shutil.copyfile(offline, tmp_path)
+        except Exception as e:
+            return {"ok": False, "message": f"离线包拷贝失败: {e}"}
+    else:
+        try:
+            with _safe_urlopen(url, timeout=600) as resp, \
+                    open(tmp_path, "wb") as out:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+        except Exception as e:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return {"ok": False, "message": _offline_hint(pid, url) +
+                    f"（原始错误: {str(e)[:200]}）"}
         _append_log(pid, f"downloaded: {tmp_path.stat().st_size} bytes",
                      host_key=host_key)
 
-        # 按扩展名选择解压方式
+    # 按扩展名选择解压方式
+    try:
         if real_suffix in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz",
                            ".tbz2", ".txz", ".gz", ".bz2", ".xz", ".tar"):
             with tarfile.open(tmp_path, "r:*") as tf:
@@ -931,11 +995,10 @@ def install(pid: str, host_id: Optional[int] = None) -> dict:
     # ---- 本机安装（host_id=None） ----
     # 幂等：本机已安装
     if catalog.check_installed(manifest)["installed"]:
-        return {
-            "ok": True,
-            "message": "已安装，无需重复操作",
-            "installed": True,
-        }
+        if manifest.get("builtin"):
+            return {"ok": True, "installed": True, "message":
+                    "平台内置组件已就绪（随镜像分发），无需安装"}
+        return {"ok": True, "message": "已安装，无需重复操作", "installed": True}
 
     _append_log(pid, "=== install requested (local) ===", host_key="local")
     t = threading.Thread(
@@ -959,6 +1022,24 @@ def uninstall(pid: str, host_id: Optional[int] = None) -> dict:
     这里给出明确指引。
     """
     msg: List[str] = []
+
+    # 内置组件守卫：xtrabackup/mariabackup 等随镜像分发，是物理备份引擎
+    # "零安装推送"的二进制源——删除它们等于废掉物理备份功能，且容器镜像
+    # 里的文件删了重启就回来（用户看到的"卸载后还在"就是这个问题）。
+    try:
+        m = catalog.load_all().get(_safe_pid(pid)) or {}
+    except Exception:
+        m = {}
+    bundled = [p for p in (m.get("bundled_paths") or []) if os.path.isfile(p)]
+    if m.get("builtin") and (bundled or host_id is None):
+        if bundled:
+            return {"ok": False, "message": (
+                f"「{m.get('name', pid)}」是平台内置组件（{bundled[0]}），"
+                "作为物理备份引擎零安装推送的二进制源随镜像分发，"
+                "不可卸载。它已直接可用于备份任务，无需任何操作。")}
+        return {"ok": False, "message": (
+            f"「{m.get('name', pid)}」为平台内置组件，仅在平台本机随镜像提供，"
+            "远端主机无需安装。")}
 
     if host_id is not None and host_id != 0:
         # ---- 远端卸载 ----

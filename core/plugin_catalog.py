@@ -141,6 +141,22 @@ def check_installed(manifest: dict, ssh_host: Optional[dict] = None) -> dict:
     found: Dict[str, str] = {}
     missing: List[str] = []
 
+    # 内置组件：平台自带二进制路径（随镜像/安装包分发，物理备份引擎的
+    # 免安装推送源）。存在即视为已安装——卸载不应删除它们。
+    bundled = [p for p in (manifest.get("bundled_paths") or []) if p]
+    if bundled:
+        ok_paths = [p for p in bundled if os.path.isfile(p)]
+        if ok_paths:
+            for cli in required:
+                found[cli] = ok_paths[0]
+            return {
+                "installed": True,
+                "missing": [],
+                "found_paths": found,
+                "bundled": True,
+            }
+        # 内置路径不存在（异常环境）：继续走常规探测
+
     if ssh_host:
         from core import plugin_runtime
         chk = plugin_runtime.remote_check_clients(ssh_host, required)
@@ -407,6 +423,10 @@ def list_plugins(filter_category: Optional[str] = None,
             "installed": status["installed"],
             "missing": status["missing"],
             "found_paths": status["found_paths"],
+            # 内置组件：随镜像分发（物理备份引擎的推送源），不可卸载
+            "builtin": bool(m.get("builtin")) and bool(
+                status.get("bundled")),
+            "builtin_note": m.get("builtin_note", ""),
             "status": plugin_status,
             "last_message": last_message,
             # OS / 安装策略
@@ -458,6 +478,8 @@ def get_plugin(pid: str, host_id=None) -> Optional[dict]:
             "installed": st.get("installed"),
             "missing": st.get("missing"),
             "found_paths": st.get("found_paths"),
+            "builtin": bool(m.get("builtin")),
+            "builtin_note": m.get("builtin_note", ""),
             "status": st.get("status"),
             "host_key": host_key,
             "host_id": ssh_host.get("id"),
@@ -485,6 +507,8 @@ def get_plugin(pid: str, host_id=None) -> Optional[dict]:
         "installed": status["installed"],
         "missing": status["missing"],
         "found_paths": status["found_paths"],
+        "builtin": bool(m.get("builtin")) and bool(status.get("bundled")),
+        "builtin_note": m.get("builtin_note", ""),
         "current_os": os_name,
         "os_supported": os_supported,
         "package_manager": detect_package_manager(),

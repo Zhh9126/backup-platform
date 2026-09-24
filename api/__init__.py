@@ -78,7 +78,7 @@ from . import (tasks, records, restore, system, hosts, sync, inspection, deploy,
                 clone, itsm, link, ai_alert, datamining, ai_agent, rt, plugins,
                 restore_verify, synthesize, dedup, jdbc, data_compare,
                 tape, logs, db_adapters, rbac, cdc, vm, openapi,
-                agentless, object_storage, backup_cleanup)  # noqa: E402,F401
+                agentless, object_storage, backup_cleanup, meta_db)  # noqa: E402,F401
 
 # 统一契约钩子（三段式错误体 + 版本/弃用响应头）。必须在 app.register_blueprint
 # 之前声明：Flask 在注册蓝图时冻结其请求钩子列表。

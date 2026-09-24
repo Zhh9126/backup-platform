@@ -35,3 +35,13 @@ __pycache__/
 *.pyo
 *.dmp
 *.tar.gz
+
+# 交付产物镜像 tar（1.4G+，绝不入构建上下文）
+packages/
+
+# AI 助手：收费功能，约定不进 git 与打包产物（2026-09-19 用户决定）
+core/ai_agent/
+static/js/agent-render.js
+static/css/agent-render.css
+static/css/agent.css
+templates/agent.html

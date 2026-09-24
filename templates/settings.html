@@ -283,6 +283,158 @@
   <div class="alert alert-danger d-none mt-3" id="pcError"></div>
 </div>
 
+<!-- ===== 元数据库后端 ===== -->
+<div class="page-card">
+  <div class="card-section-title">
+    <i class="bi bi-database-gear me-1"></i> 元数据库
+    <span class="badge ms-2" id="mdbBadge">检测中…</span>
+  </div>
+  <p class="form-text-hint mb-3">
+    平台自身元数据默认存于本机 SQLite（零依赖）。数据量大或需要 HA 时，可切换为 PostgreSQL / MySQL：
+    填入账号密码 → <b>测试连接</b> → <b>预检（建表+行数预览）</b> → <b>执行切换</b>（全量搬移并逐表校验，切换即热生效，重启后仍生效）。
+    原 SQLite 文件保留，可随时回切。
+  </p>
+  <div class="row g-3">
+    <div class="col-md-3">
+      <label class="form-label small">目标后端</label>
+      <select class="form-select form-select-sm" id="mdb_backend">
+        <option value="postgresql">PostgreSQL</option>
+        <option value="mysql">MySQL / MariaDB</option>
+      </select>
+    </div>
+    <div class="col-md-3"><label class="form-label small">主机</label>
+      <input class="form-control form-control-sm" id="mdb_host" value="127.0.0.1"></div>
+    <div class="col-md-2"><label class="form-label small">端口</label>
+      <input class="form-control form-control-sm" id="mdb_port" value="5432"></div>
+    <div class="col-md-4"><label class="form-label small">数据库名</label>
+      <input class="form-control form-control-sm" id="mdb_name" placeholder="如 aidbm（需已创建）"></div>
+    <div class="col-md-4"><label class="form-label small">用户名</label>
+      <input class="form-control form-control-sm" id="mdb_user" autocomplete="off"></div>
+    <div class="col-md-4"><label class="form-label small">密码</label>
+      <input class="form-control form-control-sm" id="mdb_password" type="password" autocomplete="new-password"></div>
+    <div class="col-md-4 d-flex align-items-end">
+      <div class="form-check">
+        <input class="form-check-input" type="checkbox" id="mdb_allow_missing">
+        <label class="form-check-label small">库不存在时自动创建（PG）</label>
+      </div>
+    </div>
+    <div class="col-12 d-flex gap-2 flex-wrap align-items-center">
+      <button class="btn btn-outline-info btn-sm" id="mdbTestBtn" type="button">
+        <i class="bi bi-plug me-1"></i>测试连接
+      </button>
+      <button class="btn btn-outline-primary btn-sm" id="mdbPlanBtn" type="button">
+        <i class="bi bi-clipboard-check me-1"></i>预检（建表+行数预览）
+      </button>
+      <button class="btn btn-primary btn-sm" id="mdbMigrateBtn" type="button">
+        <i class="bi bi-arrow-left-right me-1"></i>执行切换
+      </button>
+      <button class="btn btn-outline-warning btn-sm" id="mdbRollbackBtn" type="button">
+        <i class="bi bi-arrow-counterclockwise me-1"></i>回切 SQLite
+      </button>
+      <span class="form-text ms-2 text-muted" id="mdb_result"></span>
+    </div>
+    <div class="col-12">
+      <div class="alert alert-danger d-none mt-2" id="mdbError"></div>
+      <div class="small text-muted d-none mt-1" id="mdbPlanOut"></div>
+    </div>
+  </div>
+</div>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  const $ = (id) => document.getElementById(id);
+  const showErr = (msg) => {
+    const el = $("mdbError");
+    if (msg) { el.textContent = msg; el.classList.remove("d-none"); }
+    else { el.classList.add("d-none"); }
+  };
+  const setBusy = (busy) => {
+    ["mdbTestBtn", "mdbPlanBtn", "mdbMigrateBtn", "mdbRollbackBtn"].forEach(
+      (id) => { $(id).disabled = busy; });
+  };
+  const api = async (path, body) => {
+    const opt = { credentials: "include", headers: { "Content-Type": "application/json" } };
+    if (body) { opt.method = "POST"; opt.body = JSON.stringify(body); }
+    const r = await fetch(path, opt);
+    const j = await r.json();
+    if (!j.success && !j.error) j.error = "HTTP " + r.status;
+    return j;
+  };
+  const cfg = () => ({
+    backend: $("mdb_backend").value,
+    host: $("mdb_host").value.trim(),
+    port: $("mdb_port").value.trim(),
+    name: $("mdb_name").value.trim(),
+    user: $("mdb_user").value.trim(),
+    password: $("mdb_password").value,
+  });
+  // 初始状态
+  api("/api/meta-db/status").then((j) => {
+    if (!j.success) return;
+    const kind = j.backend || "sqlite";
+    const badge = $("mdbBadge");
+    badge.textContent = kind === "sqlite" ? "当前：SQLite（本机）" : `当前：${kind} ${j.host}:${j.port}/${j.name}`;
+    badge.className = "badge ms-2 " + (kind === "sqlite" ? "bg-secondary" : "bg-success");
+    if (j.backend && j.backend !== "sqlite") {
+      $("mdb_backend").value = j.backend === "postgresql" ? "postgresql" : "mysql";
+    }
+    if (j.drivers) {
+      const miss = [];
+      if (!j.drivers.postgresql) miss.push("PostgreSQL(psycopg2)");
+      if (!j.drivers.mysql) miss.push("MySQL(pymysql)");
+      if (miss.length) $("mdb_result").textContent = "驱动缺失：" + miss.join("、");
+    }
+  }).catch(() => {});
+  $("mdb_backend").addEventListener("change", () => {
+    $("mdb_port").value = $("mdb_backend").value === "postgresql" ? "5432" : "3306";
+  });
+  $("mdbTestBtn").addEventListener("click", async () => {
+    showErr(""); setBusy(true); $("mdb_result").textContent = "测试中…";
+    try { const j = await api("/api/meta-db/test", cfg());
+      $("mdb_result").textContent = j.success ? j.message : "";
+      if (!j.success) showErr(j.error);
+    } catch (e) { showErr("测试失败：" + e); } finally { setBusy(false); }
+  });
+  $("mdbPlanBtn").addEventListener("click", async () => {
+    showErr(""); setBusy(true); $("mdb_result").textContent = "预检中…";
+    $("mdbPlanOut").classList.add("d-none");
+    try { const j = await api("/api/meta-db/plan", cfg());
+      $("mdb_result").textContent = j.success ? "预检完成" : "";
+      if (j.success) {
+        const out = $("mdbPlanOut");
+        const lines = j.tables.slice(0, 60).map(
+          (t) => `${t.table}: 源 ${t.source} 行，目标表${t.target_exists ? "已存在" : "将创建"}`);
+        out.textContent = `共 ${j.table_count} 张表。` + lines.join("；");
+        out.classList.remove("d-none");
+      } else showErr(j.error);
+    } catch (e) { showErr("预检失败：" + e); } finally { setBusy(false); }
+  });
+  $("mdbMigrateBtn").addEventListener("click", async () => {
+    showErr("");
+    if (!confirm("将把元数据全量搬移到目标库并热切换（期间平台写入短暂阻塞）。确定继续？")) return;
+    setBusy(true); $("mdb_result").textContent = "切换中（数据量大时可能耗时较长，请勿关闭页面）…";
+    try { const j = await api("/api/meta-db/migrate", cfg());
+      if (j.success) {
+        $("mdb_result").textContent = `切换完成：${j.from} → ${j.to}，${(j.tables || []).length} 张表，共 ${j.total_rows} 行。`;
+        $("mdbBadge").textContent = `当前：${j.to}`;
+        $("mdbBadge").className = "badge ms-2 bg-success";
+      } else showErr(j.error);
+    } catch (e) { showErr("切换失败：" + e); } finally { setBusy(false); }
+  });
+  $("mdbRollbackBtn").addEventListener("click", async () => {
+    showErr("");
+    if (!confirm("回切前会先把当前后端数据全量搬回 SQLite 并校验。确定回切？")) return;
+    setBusy(true); $("mdb_result").textContent = "回切中…";
+    try { const j = await api("/api/meta-db/rollback", {});
+      if (j.success) {
+        $("mdb_result").textContent = `已回切到 SQLite：${(j.tables || []).length} 张表，共 ${j.total_rows} 行。`;
+        $("mdbBadge").textContent = "当前：SQLite（本机）";
+        $("mdbBadge").className = "badge ms-2 bg-secondary";
+      } else showErr(j.error);
+    } catch (e) { showErr("回切失败：" + e); } finally { setBusy(false); }
+  });
+});
+</script>
+
 <!-- ===== Webhooks 事件中心 ===== -->
 <div class="page-card">
   <h6 style="font-size:var(--font-size-base);font-weight:600;color:var(--text-primary);margin-bottom:var(--space-md)">

@@ -265,7 +265,8 @@ def _get_replication_strategy(logger: logging.Logger = None) -> dict:
     }
     try:
         row = db.query_one(
-            "SELECT value FROM system_config WHERE key=?", ("replication_strategy",)
+            f"SELECT value FROM system_config WHERE {db.qcol('key')}=?",
+            ("replication_strategy",)
         )
         if row and row.get("value"):
             cfg = _json.loads(row["value"])

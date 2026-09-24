@@ -388,10 +388,18 @@ def _mark_expired(record_id: int, meta: dict = None, purge: bool = False,
         if purge:
             db.execute("DELETE FROM backup_records WHERE id=?", (record_id,))
         else:
-            db.execute(
-                "UPDATE backup_records SET status=?, backup_path='', "
-                "message=CASE WHEN message IS NULL OR message='' THEN ? "
-                "             ELSE message || ' | ' || ? END WHERE id=?",
-                (STATUS_EXPIRED, note, note, record_id))
+            if db.current_backend() == "mysql":
+                # MySQL 不支持 || 拼接（那是逻辑或），用 CONCAT
+                db.execute(
+                    "UPDATE backup_records SET status=?, backup_path='', "
+                    "message=CASE WHEN message IS NULL OR message='' THEN ? "
+                    "             ELSE CONCAT(message, ' | ', ?) END WHERE id=?",
+                    (STATUS_EXPIRED, note, note, record_id))
+            else:
+                db.execute(
+                    "UPDATE backup_records SET status=?, backup_path='', "
+                    "message=CASE WHEN message IS NULL OR message='' THEN ? "
+                    "             ELSE message || ' | ' || ? END WHERE id=?",
+                    (STATUS_EXPIRED, note, note, record_id))
     except Exception as e:
         _log().warning("[cleanup] 记录 %s 状态更新失败: %s", record_id, e)

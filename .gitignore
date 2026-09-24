@@ -48,3 +48,4 @@ core/plugins/state/
 # 测试产物（覆盖率数据与 JUnit 报告，随跑随生成，不入库）
 .coverage
 artifacts/
+packages/

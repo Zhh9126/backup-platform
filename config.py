@@ -23,7 +23,7 @@ else:
 # ---------- 产品标识 ----------
 # 产品正式名称与版本（对外 API 文档、健康检查、报告落款统一取这里，避免各处硬编码）。
 PLATFORM_NAME = os.environ.get("AIDBM_NAME", "AIDBM")
-PLATFORM_VERSION = os.environ.get("AIDBM_VERSION", "1.4.13")
+PLATFORM_VERSION = os.environ.get("AIDBM_VERSION", "1.4.14")
 
 # ---------- 路径 ----------
 BACKUP_ROOT = os.environ.get("BACKUP_ROOT", str(BASE_DIR / "backups"))
@@ -36,6 +36,36 @@ FULL_INSTANCE_WORK_DIR = os.environ.get("BP_WORK_DIR", "")
 INSTANCE_DIR = Path(os.environ.get("INSTANCE_DIR", str(BASE_DIR / "instance")))
 META_DB_PATH = os.environ.get("META_DB_PATH", str(INSTANCE_DIR / "meta.db"))
 LOG_DIR = Path(os.environ.get("LOG_DIR", str(BASE_DIR / "logs")))
+
+# ---------- 元数据库后端（可插拔：sqlite / postgresql / mysql） ----------
+# 默认仍为 SQLite（零依赖离线交付）；可在设置页切换为 PostgreSQL/MySQL，
+# 切换结果持久化到 instance/meta_backend.json（密码 enc: 加密），重启后自动生效。
+META_BACKEND_FILE = INSTANCE_DIR / "meta_backend.json"
+META_BACKEND_KINDS = ("sqlite", "postgresql", "mysql")
+
+
+def load_meta_backend() -> dict:
+    """解析元数据库后端配置。优先级：环境变量 > meta_backend.json > 默认 sqlite。"""
+    env_backend = os.environ.get("META_DB_BACKEND", "").strip().lower()
+    if env_backend in META_BACKEND_KINDS:
+        cfg = {"backend": env_backend}
+        # META_DB_HOST -> host / META_DB_PORT -> port ...
+        for k in ("META_DB_HOST", "META_DB_PORT", "META_DB_USER",
+                  "META_DB_PASSWORD", "META_DB_NAME"):
+            v = os.environ.get(k)
+            if v:
+                cfg[k[len("META_DB_"):].lower()] = v
+        return cfg
+    try:
+        data = json.loads(META_BACKEND_FILE.read_text(encoding="utf-8"))
+        if data.get("backend") in META_BACKEND_KINDS:
+            return data
+    except Exception:
+        pass
+    return {"backend": "sqlite"}
+
+
+META_BACKEND = load_meta_backend()
 
 # ---------- Web ----------
 WEB_HOST = os.environ.get("WEB_HOST", "0.0.0.0")
@@ -334,7 +364,7 @@ def load_backup_root_from_db() -> str:
     """
     try:
         import core.db as _db
-        row = _db.query_one("SELECT value FROM system_config WHERE key=?",
+        row = _db.query_one(f"SELECT value FROM system_config WHERE {_db.qcol('key')}=?",
                             (BACKUP_ROOT_SETTING_KEY,))
         p = (row["value"] if row and row["value"] else "").strip()
         if p:

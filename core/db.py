@@ -8,11 +8,14 @@ AIDBM 自身元数据（任务、记录、日志）存放在 SQLite，零外部�
 import sqlite3
 import os
 import json
+import re
 import base64
 import hashlib
 import logging
+import tempfile
 import threading
 import time
+from functools import lru_cache
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -32,8 +35,331 @@ except Exception:
     except Exception:
         pass
 
-# 多线程（Flask + APScheduler）访问 SQLite，需要关闭单线程检查并加写锁
-_write_lock = threading.Lock()
+# 多线程（Flask + APScheduler）访问元数据库，需要加写锁串行化写操作。
+# 用 RLock：元数据库切换流程（持锁）内部会再调 init_schema（同线程重入）。
+_write_lock = threading.RLock()
+
+
+# ========================= 可插拔元数据库后端 =========================
+# 默认 sqlite（零依赖离线交付）；可在设置页切换为 PostgreSQL / MySQL。
+# 切换后：_ACTIVE 保存运行时后端，instance/meta_backend.json 持久化（重启生效）。
+# 适配器把 sqlite3 的最小接口（execute/commit/close/executescript/lastrowid/
+# Row 字典访问）映射到 psycopg2 / pymysql，业务层 300+ 调用点无需改动。
+
+_ACTIVE = {"backend": (config.META_BACKEND or {}).get("backend", "sqlite"),
+           "host": (config.META_BACKEND or {}).get("host", ""),
+           "port": (config.META_BACKEND or {}).get("port", ""),
+           "user": (config.META_BACKEND or {}).get("user", ""),
+           "password": (config.META_BACKEND or {}).get("password", ""),
+           "name": (config.META_BACKEND or {}).get("name", "")}
+
+# MySQL 8 保留字（SCHEMA/运行时 SQL 里出现过的才需要引用处理）
+_MYSQL_RESERVED = {
+    "key", "usage", "order", "group", "condition", "rows", "rank", "groups",
+    "system", "default", "values", "option", "interval", "type", "zones",
+}
+
+
+def current_backend() -> str:
+    return _ACTIVE["backend"]
+
+
+def qcol(name: str) -> str:
+    """列名按当前后端引用：MySQL 保留字（如 system_config.key）加反引号。"""
+    if _ACTIVE["backend"] == "mysql" and name.lower() in _MYSQL_RESERVED:
+        return f"`{name}`"
+    return name
+
+
+@lru_cache(maxsize=8192)
+def _translate_sql(sql: str) -> str:
+    """qmark(?) -> pyformat(%s)，并把 SQL 文本中字面 % 转义为 %%（驱动还原为 %）。"""
+    return sql.replace("%", "%%").replace("?", "%s")
+
+
+def _split_sql(script: str) -> list:
+    out = []
+    for stmt in script.split(";"):
+        s = stmt.strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _is_dup_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return ("already exists" in msg or "duplicate" in msg
+            or "已存在" in msg)
+
+
+# ---- 表名 -> 主键列 映射（解析 SCHEMA，供 PG RETURNING 取自增 id） ----
+def _parse_table_pks(schema_sql: str) -> dict:
+    pks = {}
+    for m in re.finditer(r"CREATE TABLE IF NOT EXISTS\s+(\w+)\s*\((.*?)\n\s*\);",
+                         schema_sql, re.S):
+        table, body = m.group(1), m.group(2)
+        pk = None
+        m2 = re.search(r"^\s*(\w+)\s+INTEGER PRIMARY KEY", body, re.M)
+        if m2:
+            pk = m2.group(1)
+        pks[table] = pk
+    return pks
+
+
+def _insert_pk_of(table: str):
+    return (_TABLE_PK or {}).get(table)
+
+
+class _Row:
+    """映射式行对象：兼容 r["col"]、r[0]、dict(r)、迭代解包。"""
+
+    __slots__ = ("_cols", "_vals", "_map")
+
+    def __init__(self, cols, vals):
+        self._cols = list(cols)
+        self._vals = list(vals)
+        self._map = dict(zip(self._cols, self._vals))
+
+    def keys(self):
+        return list(self._cols)
+
+    def values(self):
+        return list(self._vals)
+
+    def get(self, k, d=None):
+        return self._map.get(k, d)
+
+    def __getitem__(self, k):
+        if isinstance(k, int):
+            return self._vals[k]
+        return self._map[k]
+
+    def __contains__(self, k):
+        return k in self._map
+
+    def __iter__(self):
+        return iter(self._vals)
+
+    def __len__(self):
+        return len(self._vals)
+
+    def __repr__(self):
+        return repr(self._map)
+
+
+class _MetaCursor:
+    """PG/MySQL 游标适配：翻译占位符、PG INSERT 自动 RETURNING 主键、行转 _Row。"""
+
+    def __init__(self, cur, conn):
+        self._cur = cur
+        self._conn = conn
+        self.lastrowid = None
+        self.description = cur.description
+
+    def execute(self, sql, params=()):
+        args = tuple(params) if params else None
+        sql2 = _translate_sql(sql) if args else sql
+        # DDL 自动方言翻译：init_schema 中有大量内联 CREATE TABLE（含
+        # AUTOINCREMENT），逐处包装易漏，这里按语句前缀统一处理。
+        head = sql2.lstrip()[:6].upper()
+        is_ddl = head.startswith(("CREATE", "ALTER", "DROP"))
+        if (self._conn._backend != "sqlite" and not args and is_ddl):
+            sql2 = _translate_schema_ddl(sql2, self._conn._backend)
+        returning = False
+        if self._conn._backend == "postgresql":
+            up = sql2.lstrip().upper()
+            if up.startswith("INSERT"):
+                pk = _insert_pk_of(self._insert_table(sql2))
+                if pk:
+                    sql2 = sql2.rstrip().rstrip(";") + f" RETURNING {pk}"
+                    returning = True
+        self._cur.execute(sql2, args)
+        if returning:
+            row = self._cur.fetchone()
+            self.lastrowid = row[0] if row else None
+        elif self._conn._backend == "mysql":
+            self.lastrowid = self._cur.lastrowid
+        if is_ddl:
+            # DDL 立即提交：避免后续失败语句的回滚丢弃已成功的建表/补丁
+            # （对齐 SQLite 语句级语义；init_schema 末尾仍有总 commit，幂等无害）
+            try:
+                self._conn._raw.commit()
+            except Exception:
+                pass
+        return self
+
+    @staticmethod
+    def _insert_table(sql: str):
+        m = re.match(r"\s*INSERT\s+INTO\s+(\w+)", sql, re.I)
+        return m.group(1).lower() if m else ""
+
+    def _wrap(self, row):
+        if row is None:
+            return None
+        cols = [d[0] for d in self._cur.description or []]
+        return _Row(cols, row)
+
+    def fetchone(self):
+        return self._wrap(self._cur.fetchone())
+
+    def fetchall(self):
+        return [self._wrap(r) for r in self._cur.fetchall()]
+
+    def fetchmany(self, n):
+        return [self._wrap(r) for r in self._cur.fetchmany(n)]
+
+    def close(self):
+        try:
+            self._cur.close()
+        except Exception:
+            pass
+
+
+class _MetaConn:
+    """PG/MySQL 连接适配器：对外暴露与 sqlite3.Connection 相同的最小接口。"""
+
+    def __init__(self, raw, backend):
+        self._raw = raw
+        self._backend = backend
+
+    def cursor(self):
+        return _MetaCursor(self._raw.cursor(), self)
+
+    def execute(self, sql, params=()):
+        cur = self.cursor()
+        try:
+            cur.execute(sql, params)
+        except Exception:
+            # 复刻 SQLite「语句失败不影响后续语句」的语义：PG/MySQL 事务一旦
+            # 被 failed statement 中止，必须先回滚才能继续执行后续语句。
+            self.rollback()
+            raise
+        return cur
+
+    def executescript(self, script: str):
+        for stmt in _split_sql(script):
+            cur = self._raw.cursor()
+            try:
+                cur.execute(stmt)
+                self._raw.commit()
+            except Exception as e:
+                self._raw.rollback()
+                if not _is_dup_error(e):
+                    raise
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+
+    def commit(self):
+        self._raw.commit()
+
+    def rollback(self):
+        try:
+            self._raw.rollback()
+        except Exception:
+            pass
+
+    def close(self):
+        self._raw.close()
+
+
+def open_backend_conn(cfg: dict) -> _MetaConn:
+    """按配置连接 PG/MySQL 元数据库，返回适配器连接。cfg 的 password 支持 enc: 密文。"""
+    backend = cfg.get("backend", "")
+    password = cfg.get("password", "")
+    if isinstance(password, str) and password.startswith("enc:"):
+        password = decrypt_secret(password)
+    if backend == "postgresql":
+        try:
+            import psycopg2
+        except ImportError as e:
+            raise RuntimeError("未安装 psycopg2，无法使用 PostgreSQL 元数据库：离线包需自带") from e
+        raw = psycopg2.connect(
+            host=cfg.get("host") or "127.0.0.1",
+            port=int(cfg.get("port") or 5432),
+            user=cfg.get("user") or "postgres",
+            password=password or "",
+            dbname=cfg.get("name") or "aidbm",
+            connect_timeout=10,
+            application_name="aidbm-meta",
+        )
+        return _MetaConn(raw, "postgresql")
+    if backend == "mysql":
+        try:
+            import pymysql
+        except ImportError as e:
+            raise RuntimeError("未安装 pymysql，无法使用 MySQL 元数据库：离线包需自带") from e
+        raw = pymysql.connect(
+            host=cfg.get("host") or "127.0.0.1",
+            port=int(cfg.get("port") or 3306),
+            user=cfg.get("user") or "root",
+            password=password or "",
+            database=cfg.get("name") or "aidbm",
+            charset="utf8mb4",
+            autocommit=False,
+            connect_timeout=10,
+        )
+        return _MetaConn(raw, "mysql")
+    raise ValueError(f"不支持的元数据库后端: {backend}")
+
+
+def _translate_schema_ddl(schema_sql: str, backend: str) -> str:
+    """把 SQLite DDL 翻译为目标后端 DDL。同时把新见到的表主键并入 _TABLE_PK
+    （init_schema 里有多段内联 DDL，同样要支持 PG RETURNING 取自增 id）。"""
+    for t, pk in _parse_table_pks(schema_sql).items():
+        _TABLE_PK.setdefault(t, pk)
+    if backend == "postgresql":
+        return schema_sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT",
+                                  "SERIAL PRIMARY KEY")
+    if backend == "mysql":
+        out = schema_sql.replace("INTEGER PRIMARY KEY AUTOINCREMENT",
+                                 "INT PRIMARY KEY AUTO_INCREMENT")
+        # MySQL 不支持 CREATE INDEX IF NOT EXISTS：去掉 IF NOT EXISTS，
+        # 重复执行由 executescript 的容错（Duplicate key name）兜住。
+        out = re.sub(r"CREATE INDEX IF NOT EXISTS", "CREATE INDEX", out, flags=re.I)
+        # MySQL 保留字列名加反引号（仅处理行首列定义与索引列引用）
+        out = re.sub(r"(?m)^(\s*)(\w+)(\s+(?:INTEGER|TEXT|INT)\b)",
+                     lambda m: f"{m.group(1)}`{m.group(2)}`{m.group(3)}" if m.group(2).lower() in _MYSQL_RESERVED else m.group(0),
+                     out)
+        out = re.sub(r"(?m)(CREATE INDEX \w+ ON \w+)\(([^)]*)\)",
+                     lambda m: m.group(1) + "(" + ",".join(
+                         f"`{c.strip()}`" if c.strip().lower() in _MYSQL_RESERVED else c.strip()
+                         for c in m.group(2).split(",")) + ")", out)
+        return out
+    return schema_sql
+
+
+def switch_backend(cfg: dict, persist: bool = True) -> None:
+    """切换运行时元数据库后端（热切换），并持久化到 meta_backend.json。"""
+    backend = cfg.get("backend")
+    if backend not in ("sqlite", "postgresql", "mysql"):
+        raise ValueError(f"不支持的元数据库后端: {backend}")
+    if backend != "sqlite":
+        conn = open_backend_conn(cfg)  # 先验证可连通
+        conn.close()
+    _ACTIVE.clear()
+    _ACTIVE.update({k: cfg.get(k, "") for k in
+                    ("backend", "host", "port", "user", "password", "name")})
+    if persist:
+        import copy
+        data = {k: _ACTIVE.get(k, "") for k in
+                ("backend", "host", "port", "user", "password", "name")}
+        if data["backend"] == "sqlite":
+            config.META_BACKEND_FILE.unlink(missing_ok=True)
+        else:
+            data["password"] = encrypt_secret(data.get("password") or "")
+            config.INSTANCE_DIR.mkdir(parents=True, exist_ok=True)
+            config.META_BACKEND_FILE.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def backend_status() -> dict:
+    d = {k: _ACTIVE.get(k, "") for k in
+         ("backend", "host", "port", "user", "name")}
+    d["config_file"] = str(config.META_BACKEND_FILE) if config.META_BACKEND_FILE.exists() else ""
+    return d
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS backup_tasks (
@@ -901,7 +1227,10 @@ CREATE INDEX IF NOT EXISTS idx_vm_jobs_vm ON vm_jobs(vm_id);
 """
 
 # ------------------------- 连接与执行 -------------------------
-def get_conn() -> sqlite3.Connection:
+# SCHEMA 已定义完毕，解析表名 -> 主键映射（供 PG INSERT ... RETURNING 取自增 id）
+_TABLE_PK = _parse_table_pks(SCHEMA)
+
+def open_sqlite_conn() -> sqlite3.Connection:
     # timeout/busy_timeout：多线程（Web 请求 + 调度器 + 备份线程）并发写 SQLite 时
     # 不会立刻抛 "database is locked"，而是等待锁释放（批量任务压测必需）。
     conn = sqlite3.connect(config.META_DB_PATH, timeout=30.0, check_same_thread=False)
@@ -913,11 +1242,38 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
-def init_schema() -> None:
+def get_conn():
+    # timeout/busy_timeout：多线程（Web 请求 + 调度器 + 备份线程）并发写 SQLite 时
+    # 不会立刻抛 "database is locked"，而是等待锁释放（批量任务压测必需）。
+    if _ACTIVE["backend"] != "sqlite":
+        return open_backend_conn(dict(_ACTIVE))
+    conn = open_sqlite_conn()
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+
+def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None:
+    """初始化/补丁元数据库 schema。
+
+    conn/backend 缺省时作用于当前活动后端（并自持连接的开关）；
+    迁移工具可显式传入目标库连接与后端，在其上幂等建表——此时默认
+    不关闭传入的连接（close_conn=False）。
+    """
+    backend = backend or _ACTIVE["backend"]
+    if close_conn is None:
+        close_conn = conn is None
     with _write_lock:
-        conn = get_conn()
+        conn = conn or get_conn()
         try:
-            conn.executescript(SCHEMA)
+            # SQLite 原生 executescript；PG/MySQL 走方言翻译 + 逐句容错
+            if backend == "sqlite":
+                conn.executescript(SCHEMA)
+            else:
+                conn.executescript(_translate_schema_ddl(SCHEMA, backend))
             # 迁移：确保 backup_mode 列存在（SQLite 不支持 IF NOT EXISTS 的 ALTER TABLE）
             try:
                 conn.execute("ALTER TABLE backup_tasks ADD COLUMN backup_mode TEXT DEFAULT 'logical'")
@@ -1172,10 +1528,15 @@ def init_schema() -> None:
                     "target_task_ids": [],
                     "auto_score": True,
                 }, ensure_ascii=False)
-                conn.execute(
-                    "INSERT INTO system_config(key, value) VALUES(?, ?) "
-                    "ON CONFLICT(key) DO NOTHING",
-                    ("drill_schedule", _default_drill_schedule))
+                if backend == "mysql":
+                    conn.execute(
+                        "INSERT IGNORE INTO system_config(`key`, value) VALUES(?, ?)",
+                        ("drill_schedule", _default_drill_schedule))
+                else:
+                    conn.execute(
+                        "INSERT INTO system_config(key, value) VALUES(?, ?) "
+                        "ON CONFLICT(key) DO NOTHING",
+                        ("drill_schedule", _default_drill_schedule))
             except Exception:
                 pass  # 配置已存在或写入失败，忽略
 
@@ -1229,7 +1590,7 @@ def init_schema() -> None:
                     pass  # 列已存在或表刚建好，忽略
 
             # 迁移：恢复校验策略与测试报告表
-            conn.executescript("""
+            conn.executescript(_translate_schema_ddl("""
                 CREATE TABLE IF NOT EXISTS restore_verify_policies (
                     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_id             INTEGER NOT NULL,
@@ -1259,10 +1620,10 @@ def init_schema() -> None:
                     created_at   TEXT,
                     finished_at  TEXT
                 );
-            """)
+            """, backend))
 
             # 迁移：数据对比任务与报告表（幂等，照顾存量库）
-            conn.executescript("""
+            conn.executescript(_translate_schema_ddl("""
                 CREATE TABLE IF NOT EXISTS data_compare_tasks (
                     id              INTEGER PRIMARY KEY AUTOINCREMENT,
                     name            TEXT NOT NULL,
@@ -1304,7 +1665,7 @@ def init_schema() -> None:
                     created_at   TEXT,
                     finished_at  TEXT
                 );
-            """)
+            """, backend))
 
             # 迁移：deployments 表新增直接输入主机字段
             for col, typedef in [
@@ -1332,7 +1693,8 @@ def init_schema() -> None:
             # 默认配置：自动合成全量（CDM "系统内自动合成全量"）
             try:
                 _seed_system_config(conn, "synthesize_config", {
-                    "enabled": True, "min_incremental": 2, "cron": "0 3 * * 0"})
+                    "enabled": True, "min_incremental": 2, "cron": "0 3 * * 0"},
+                    backend=backend)
             except Exception:
                 pass
 
@@ -1434,7 +1796,8 @@ def init_schema() -> None:
 
             conn.commit()
         finally:
-            conn.close()
+            if close_conn:
+                conn.close()
 
 
 def execute(sql: str, params: tuple = ()) -> int:
@@ -1471,6 +1834,24 @@ _PLUGIN_STATE_FIELDS = (
 )
 
 
+def upsert_sql(table: str, cols: list, conflict_cols: list,
+               update_cols: list) -> str:
+    """按当前后端生成 upsert 语句（占位符统一为 ?，由适配层翻译）。
+
+    sqlite/postgresql: ON CONFLICT(...) DO UPDATE SET c=excluded.c
+    mysql:             ON DUPLICATE KEY UPDATE c=VALUES(c)
+    """
+    if _ACTIVE["backend"] == "mysql":
+        sets = ",".join(f"{c}=VALUES({c})" for c in update_cols)
+        return (f"INSERT INTO {table} ({','.join(cols)}) "
+                f"VALUES ({','.join('?' * len(cols))}) "
+                f"ON DUPLICATE KEY UPDATE {sets}")
+    sets = ",".join(f"{c}=excluded.{c}" for c in update_cols)
+    return (f"INSERT INTO {table} ({','.join(cols)}) "
+            f"VALUES ({','.join('?' * len(cols))}) "
+            f"ON CONFLICT({','.join(conflict_cols)}) DO UPDATE SET {sets}")
+
+
 def upsert_plugin_host_state(host_key: str, plugin_id: str, fields: dict) -> int:
     """按 (host_key, plugin_id) 幂等 upsert 一条插件主机状态。
 
@@ -1485,14 +1866,8 @@ def upsert_plugin_host_state(host_key: str, plugin_id: str, fields: dict) -> int
     data.setdefault("updated_at", now_iso())
     cols = list(data.keys())
     update_cols = [c for c in cols if c not in ("host_key", "plugin_id")]
-    sql = (
-        "INSERT INTO plugin_host_state ({cols}) VALUES ({ph}) "
-        "ON CONFLICT(host_key, plugin_id) DO UPDATE SET {sets}"
-    ).format(
-        cols=",".join(cols),
-        ph=",".join("?" * len(cols)),
-        sets=",".join(f"{c}=excluded.{c}" for c in update_cols),
-    )
+    sql = upsert_sql("plugin_host_state", cols, ["host_key", "plugin_id"],
+                     update_cols)
     return execute(sql, tuple(data.values()))
 
 
@@ -1635,7 +2010,7 @@ def add_log(level: str, source: str, message: str, task_id: int = None,
 
 # ------------------------- 系统配置（键值） -------------------------
 def get_system_config(key: str, default=None):
-    row = query_one("SELECT value FROM system_config WHERE key=?", (key,))
+    row = query_one(f"SELECT value FROM system_config WHERE {qcol('key')}=?", (key,))
     return row["value"] if row else default
 
 
@@ -1643,21 +2018,29 @@ def set_system_config(key: str, value) -> None:
     with _write_lock:
         conn = get_conn()
         try:
-            conn.execute(
-                "INSERT INTO system_config(key, value) VALUES(?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, str(value)))
+            if _ACTIVE["backend"] == "mysql":
+                conn.execute(
+                    "INSERT INTO system_config(`key`, value) VALUES(?, ?) "
+                    "ON DUPLICATE KEY UPDATE value=VALUES(value)",
+                    (key, str(value)))
+            else:
+                conn.execute(
+                    "INSERT INTO system_config(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, str(value)))
             conn.commit()
         finally:
             conn.close()
 
 
-def _seed_system_config(conn, key: str, value) -> None:
+def _seed_system_config(conn, key: str, value, backend: str = None) -> None:
     """init_schema 阶段写入默认配置（仅当 key 不存在时），不依赖 _write_lock。"""
     import json
-    cur = conn.execute("SELECT 1 FROM system_config WHERE key=?", (key,))
+    b = backend or _ACTIVE["backend"]
+    k = f"`key`" if b == "mysql" else "key"
+    cur = conn.execute(f"SELECT 1 FROM system_config WHERE {k}=?", (key,))
     if cur.fetchone():
         return
     conn.execute(
-        "INSERT INTO system_config(key, value) VALUES(?, ?)",
+        f"INSERT INTO system_config({k}, value) VALUES(?, ?)",
         (key, json.dumps(value, ensure_ascii=False)))

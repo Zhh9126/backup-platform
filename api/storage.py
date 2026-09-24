@@ -119,10 +119,7 @@ def api_set_local_root():
                         "message": "路径未变化"})
 
     # 持久化 + 运行时生效（config 全局值 + flask 配置同步）
-    db.execute(
-        "INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)",
-        (_LOCAL_ROOT_KEY, new_path),
-    )
+    db.set_system_config(_LOCAL_ROOT_KEY, new_path)
     config.set_backup_root(new_path, origin="ui")
     try:
         current_app.config["BACKUP_ROOT"] = new_path
@@ -490,7 +487,8 @@ _DEFAULT_REPLICATION_CONFIG = {
 def _get_replication_config():
     """从 system_config 表读取复制策略，缺失字段用默认值补全。"""
     row = db.query_one(
-        "SELECT value FROM system_config WHERE key=?", (_REPLICATION_CONFIG_KEY,)
+        f"SELECT value FROM system_config WHERE {db.qcol('key')}=?",
+        (_REPLICATION_CONFIG_KEY,)
     )
     if not row or not row["value"]:
         return dict(_DEFAULT_REPLICATION_CONFIG)
@@ -530,8 +528,6 @@ def api_save_replication_config():
     if cfg.get("timing") not in valid_timings:
         cfg["timing"] = "immediate"
 
-    db.execute(
-        "INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)",
-        (_REPLICATION_CONFIG_KEY, json.dumps(cfg, ensure_ascii=False)),
-    )
+    db.set_system_config(_REPLICATION_CONFIG_KEY,
+                         json.dumps(cfg, ensure_ascii=False))
     return jsonify({"ok": True, "config": cfg})

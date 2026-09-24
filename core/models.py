@@ -1837,10 +1837,8 @@ def upsert_rt_state(task_id: int, data: dict) -> None:
     payload["updated_at"] = db.now_iso()
     cols = ["task_id"] + list(payload.keys())
     values = [int(task_id)] + list(payload.values())
-    placeholders = ",".join("?" * len(cols))
-    sets = ", ".join(f"{k}=excluded.{k}" for k in payload.keys())
-    sql = (f"INSERT INTO rt_capture_state ({','.join(cols)}) VALUES ({placeholders}) "
-           f"ON CONFLICT(task_id) DO UPDATE SET {sets}")
+    sql = db.upsert_sql("rt_capture_state", cols, ["task_id"],
+                        list(payload.keys()))
     db.execute(sql, tuple(values))
 
 

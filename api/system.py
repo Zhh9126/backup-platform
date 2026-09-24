@@ -71,6 +71,20 @@ def meta():
     return jsonify(build_meta())
 
 
+@api_bp.route("/path-info", methods=["GET"])
+@login_required
+def path_info():
+    """路径透明化：Docker 容器内路径 → 宿主机路径（挂载映射）与丢数据风险提示。
+
+    备份日志弹窗与存储管理页调用，解决「容器里备份成功、宿主机找不到文件」
+    的困惑；未挂载卷时给出高优先级警告。
+    """
+    p = (request.args.get("p") or "").strip()
+    from core import platform_env
+    info = platform_env.path_transparency(p)
+    return jsonify({"success": True, **info})
+
+
 @api_bp.route("/dashboard", methods=["GET"])
 @login_required
 def dashboard():
@@ -482,7 +496,7 @@ def _insights(tasks, records, total_size):
         last_dt = _parse_dt(items[0]["finished_at"]) if items else None
         interval_days = 90
         try:
-            _cfg = db.query_one("SELECT value FROM system_config WHERE key='drill_schedule'")
+            _cfg = db.query_one(f"SELECT value FROM system_config WHERE {db.qcol('key')}='drill_schedule'")
             if _cfg and _cfg.get("value"):
                 interval_days = int((json.loads(_cfg["value"]) or {}).get("interval_days") or 90)
         except Exception:

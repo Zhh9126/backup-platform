@@ -107,6 +107,22 @@ def create_app() -> Flask:
                     _root_info["path"], _root_info["source_label"])
     if _root_info["persistence"]["level"] == "warn":
         _store_log.warning("[存储] %s", _root_info["persistence"]["message"])
+    # Docker 部署检查：备份目录落在容器可写层（无卷挂载）→ 数据随容器销毁
+    try:
+        from core import platform_env
+        if platform_env.in_docker():
+            _mounts = platform_env._parse_mountinfo()
+            if not any(
+                    _root_info["path"].rstrip("/") == m.rstrip("/")
+                    or _root_info["path"].rstrip("/").startswith(m.rstrip("/") + "/")
+                    for m, _src in _mounts):
+                _store_log.warning(
+                    "[存储] 检测到 Docker 容器内运行，但备份目录 %s 未挂载卷——"
+                    "容器删除/重建后备份将全部丢失！请 docker run 时加 "
+                    "-v <宿主机目录>:/data，或把备份存储位置改到已挂载目录。",
+                    _root_info["path"])
+    except Exception as _pe:  # noqa: BLE001 - 检查失败不影响启动
+        _store_log.info("[存储] Docker 环境检查跳过: %s", _pe)
 
     @app.after_request
     def _security_headers(resp):

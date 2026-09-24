@@ -101,7 +101,7 @@
           <button class="btn btn-sm btn-outline-secondary mt-1" onclick="navigator.clipboard.writeText(document.getElementById('rl_message').textContent).then(()=>toast('已复制到剪贴板','success'))"><i class="bi bi-clipboard"></i> 复制日志</button>
         </div>
         <div class="row g-3">
-          <div class="col-md-12"><div class="border rounded p-2 bg-light"><div class="text-muted small">备份文件路径</div><div id="rl_backup_path" class="font-monospace small"></div></div></div>
+          <div class="col-md-12"><div class="border rounded p-2 bg-light"><div class="text-muted small">备份文件路径</div><div id="rl_backup_path" class="font-monospace small"></div><div id="rl_path_hint" class="small mt-1 d-none"></div></div></div>
         </div>
         <div class="row g-3 mt-1">
           <div class="col-md-6"><div class="border rounded p-2 bg-light"><div class="text-muted small">SHA256 校验和</div><div id="rl_checksum" class="font-monospace small text-truncate"></div></div></div>

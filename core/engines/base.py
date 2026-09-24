@@ -1045,20 +1045,69 @@ class BackupEngine:
         except Exception:
             return ""
 
+    # 常见安装目录（glob）：客户端工具不在 PATH 时的兜底候选。
+    # 实测坑：CentOS7 自带 /usr/bin/pg_dump 是 9.2，无法操作 PG14 服务器，
+    # 而 /pgdb/pgsql/bin 下有 14.12——必须做版本择优，不能命中第一个就用。
+    _COMMON_TOOL_DIR_GLOBS = (
+        "/pgdb/pgsql/bin", "/usr/pgsql-*/bin", "/usr/local/pgsql/bin",
+        "/usr/local/mysql*/bin", "/opt/mysql*/bin", "/opt/pgsql*/bin",
+        "/usr/local/mariadb*/bin", "/opt/mariadb*/bin",
+    )
+
+    @staticmethod
+    def _bin_version_tuple(path):
+        """跑 `<bin> --version` 解析 (主版本, 次版本)；失败返回 None（候选淘汰）。"""
+        import re as _re
+        try:
+            ret = subprocess.run([path, "--version"], capture_output=True,
+                                 text=True, timeout=10)
+            m = _re.search(r"(\d+)\.(\d+)",
+                           (ret.stdout or "") + (ret.stderr or ""))
+            return (int(m.group(1)), int(m.group(2))) if m else None
+        except Exception:
+            return None
+
     def _resolve_local_tool(self, *names) -> str:
-        """本机工具解析：任务级 tool_path 目录优先，其次 PATH。"""
-        import shutil
+        """本机工具解析：任务级 tool_path 目录优先 → PATH → 常见安装目录。
+
+        版本择优：同一名词存在多个候选时（CentOS7 自带 pg_dump 9.2 vs
+        /pgdb/pgsql/bin 的 14.12），用 --version 输出选版本最高者——
+        低版本客户端无法操作新版本服务器（pg_dump 报 server version mismatch）。
+        --version 解析失败的候选（坏 shim/误装的同名二进制）直接淘汰。
+        """
+        import glob
         tp = self._task_tool_path()
+        cands, seen = [], set()
         for d in filter(None, tp.split(":")):
             for n in names:
                 p = os.path.join(d, n)
-                if os.path.isfile(p) and os.access(p, os.X_OK):
-                    return p
+                if os.path.isfile(p) and os.access(p, os.X_OK) and p not in seen:
+                    cands.append(p)
+                    seen.add(p)
         for n in names:
             p = shutil.which(n)
-            if p:
-                return p
-        return names[0] if names else ""
+            if p and p not in seen:
+                cands.append(p)
+                seen.add(p)
+        for n in names:
+            for pattern in self._COMMON_TOOL_DIR_GLOBS:
+                for p in glob.glob(os.path.join(pattern, n)):
+                    if (os.path.isfile(p) and os.access(p, os.X_OK)
+                            and p not in seen):
+                        cands.append(p)
+                        seen.add(p)
+        if not cands:
+            return names[0] if names else ""
+        if len(cands) == 1:
+            return cands[0]
+        best, best_ver = None, (-1, -1)
+        for p in cands:
+            v = self._bin_version_tuple(p)
+            if v is None:
+                continue
+            if v > best_ver:
+                best, best_ver = p, v
+        return best or cands[0]
 
     def _apply_task_env_vars(self, env: dict) -> None:
         """把任务级自定义环境变量（extra_options.env_vars）注入执行环境。

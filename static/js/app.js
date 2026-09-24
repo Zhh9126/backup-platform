@@ -1641,14 +1641,37 @@
         <td>${scheduleCell(t)}</td>
         <td>${t.enabled ? statusBadge(t.last_status || "never") : '<span class="badge bg-secondary">已停用</span>'}</td>
         <td>${fmtTime(t.last_run_at) || "-"}</td>
-        <td class="text-end">
-          <button class="btn btn-sm btn-outline-success" onclick="runTask(${t.id})">备份</button>
-          <button class="btn btn-sm btn-outline-primary" onclick="editTask(${t.id})">编辑</button>
-          <button class="btn btn-sm btn-outline-danger" onclick="delTask(${t.id})">删除</button>
+        <td class="text-end" style="white-space:nowrap">
+          <button class="btn-row btn-row-primary" onclick="runTask(${t.id})" title="立即执行一次备份"><i class="bi bi-play-circle"></i> 立即备份</button>
+          <button class="btn-row" onclick="editTask(${t.id})" title="编辑任务"><i class="bi bi-pencil"></i> 编辑</button>
+          <button class="btn-row btn-row-danger" onclick="delTask(${t.id})" title="删除任务"><i class="bi bi-trash"></i> 删除</button>
         </td>
       </tr>`).join("") ||
-      '<tr><td colspan="11" class="text-muted text-center">暂无任务，点击右上角“新建任务”</td></tr>';
+      '<tr><td colspan="11"><div class="empty-state"><i class="bi bi-inboxes"></i>'
+      + '<div class="empty-title">还没有备份任务</div>'
+      + '点击右上角「新建任务」，一分钟配置第一个数据库备份</div></td></tr>';
+    renderTaskKpi(tasks);
     _focusTaskRow();
+  }
+
+  /** 页头健康度摘要（结论前置：首屏回答"备份体系健康吗"）。 */
+  function renderTaskKpi(tasks) {
+    const el = document.getElementById("taskKpi");
+    if (!el) return;
+    if (!tasks.length) { el.classList.add("d-none"); return; }
+    const enabled = tasks.filter((t) => t.enabled).length;
+    const failed = tasks.filter((t) => (t.last_status || "") === "failed").length;
+    const running = tasks.filter((t) => ["running", "pending"].indexOf(t.last_status || "") >= 0).length;
+    const ok = tasks.filter((t) => (t.last_status || "") === "success").length;
+    const item = (num, cls, label) =>
+      `<span class="kpi-item">${label} <span class="kpi-num ${cls || ""}">${num}</span></span>`;
+    el.innerHTML =
+      item(tasks.length, "", "任务总数")
+      + item(enabled, "", "已启用")
+      + item(ok, "kpi-ok", "最近成功")
+      + (failed ? item(failed, "kpi-bad", "最近失败") : "")
+      + (running ? item(running, "kpi-bad", "执行中") : "");
+    el.classList.remove("d-none");
   }
 
   /** 从首页「需要关注」跳转过来时（/tasks?focus=<任务id>）滚动并高亮该行。 */
@@ -1928,6 +1951,23 @@
 
   // ===== 备份日志查看 =====
   let recordLogModal = null;
+
+  // Docker 路径透明化：容器内路径显示宿主机映射/未挂载风险（核心平台诉求：
+  // 「容器里备份成功、宿主机找不到文件」必须在 UI 里直接讲清楚）
+  window.renderPathHint = async (p) => {
+    const el = document.getElementById("rl_path_hint");
+    if (!el) return;
+    el.classList.add("d-none");
+    if (!p) return;
+    try {
+      const j = await api("GET", "/api/path-info?p=" + encodeURIComponent(p));
+      if (!j || !j.success || !j.hint) return;
+      el.textContent = j.hint;
+      el.className = "small mt-1 " + (j.level === "danger"
+        ? "text-danger fw-bold" : "text-muted");
+      el.classList.remove("d-none");
+    } catch (e) { /* 提示失败不影响弹窗 */ }
+  };
   window.viewRecordLog = async (id) => {
     try {
       const r = await api("GET", `/api/records/${id}`);
@@ -1953,6 +1993,7 @@
         msgEl.style.backgroundColor = "#f8f9fa";
       }
       $("rl_backup_path").textContent = r.backup_path || "(无)";
+      renderPathHint(r.backup_path);
       $("rl_checksum").textContent = r.checksum || "-";
       // CDC 基线
       let cdc = "-";
@@ -5455,6 +5496,15 @@
       else if (d.source === "default") extra = ' <small class="text-muted">默认为程序安装目录下 backups</small>';
       if (!d.writable) extra += ' <span class="badge bg-danger">不可写</span>';
       $("lrSource").innerHTML = badge + extra;
+      // Docker 部署：展示容器内路径对应的宿主机路径 / 未挂载风险
+      if (d.path) {
+        api("GET", "/api/path-info?p=" + encodeURIComponent(d.path)).then((pi) => {
+          if (!pi || !pi.success || !pi.hint) return;
+          $("lrSource").innerHTML += '<div class="small mt-1 ' +
+            (pi.level === "danger" ? "text-danger fw-bold" : "text-muted") + '">'
+            + esc(pi.hint) + '</div>';
+        }).catch(() => {});
+      }
 
       const data = d.data || {};
       $("lrData").innerHTML = '<strong>' + fmtBytes(data.bytes) + '</strong>'

@@ -385,21 +385,44 @@ def backup_full_instance(db_type: str, *, host, port, user, password,
 
     maint, dbs, enum_err = enumerate_databases(
         db_type, query_tool, host, port, user, env, include_system_dbs)
+    include_system_dbs_orig = bool(include_system_dbs)
     if not is_pg:
         # mysqldump 无法导出虚拟库（--all-databases 同样跳过），勾选包含也排除
         dbs = [d for d in dbs
                if d not in ("information_schema", "performance_schema")]
     if not dbs:
-        if enum_err:
-            # 连不上/认证失败才是真原因，比"没有可备份的库"有用得多
-            hint = (f"连接或认证失败: {enum_err[:200]}。"
-                    f"请核对任务里配置的地址、端口、用户与密码")
-        elif not include_system_dbs:
-            hint = "排除系统库后没有可备份的库，可勾选「包含系统库」"
-        else:
-            hint = (f"候选维护库: {', '.join(cfg['maint_candidates'])}，"
-                    f"请检查连接信息")
-        raise RuntimeError(f"无法在 {host}:{port} 枚举到可备份的数据库——{hint}")
+        # 枚举成功但过滤系统库后为空（典型：实例里只有默认系统库）→
+        # 自动兜底包含系统库（information_schema/performance_schema 为虚拟库
+        # mysqldump 无法导出，仍排除），而不是直接失败让用户摸不着头脑。
+        if not enum_err and not include_system_dbs:
+            maint2, dbs2, _ = enumerate_databases(
+                db_type, query_tool, host, port, user, env,
+                include_system_dbs=True)
+            if not is_pg:
+                dbs2 = [d for d in dbs2
+                        if d not in ("information_schema", "performance_schema")]
+            if dbs2:
+                include_system_dbs = True
+                dbs = dbs2
+                maint = maint2 or maint
+                logger.warning("[全实例] %s:%s 无业务库，已自动包含系统库: %s",
+                               host, port, ", ".join(dbs))
+            else:
+                raise RuntimeError(
+                    f"无法在 {host}:{port} 枚举到可备份的数据库——"
+                    f"实例为空（仅含 information_schema/performance_schema 虚拟库），"
+                    f"请先创建业务库后再配置备份")
+        if not dbs:
+            if enum_err:
+                # 连不上/认证失败才是真原因，比"没有可备份的库"有用得多
+                hint = (f"连接或认证失败: {enum_err[:200]}。"
+                        f"请核对任务里配置的地址、端口、用户与密码")
+            elif not include_system_dbs:
+                hint = "排除系统库后没有可备份的库，可勾选「包含系统库」"
+            else:
+                hint = (f"候选维护库: {', '.join(cfg['maint_candidates'])}，"
+                        f"请检查连接信息")
+            raise RuntimeError(f"无法在 {host}:{port} 枚举到可备份的数据库——{hint}")
 
     # 工作目录默认与产物同盘：tempfile 默认的 /tmp 常是小分区/tmpfs，
     # 逐库 dump 会把它写满（表现为 mysqldump "Got errno 28 on write"）。
@@ -502,6 +525,9 @@ def backup_full_instance(db_type: str, *, host, port, user, password,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
             "globals": globals_status,
             "include_system_dbs": bool(include_system_dbs),
+            # 兜底标记：实例无业务库时自动包含了系统库（审计/恢复时区分）
+            "auto_include_system": bool(
+                not include_system_dbs_orig and include_system_dbs),
             "databases": dbs,
         }
         with open(os.path.join(work, "manifest.json"), "w", encoding="utf-8") as f:

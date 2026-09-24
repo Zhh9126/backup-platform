@@ -230,24 +230,86 @@ class MySQLEngine(BackupEngine):
     def _remote_server_version(self, client) -> str:
         """经 SSH 读取目标端服务端版本字符串（如 ``10.11.6-MariaDB``）。
 
-        只读且不落地任何东西：直接问目标端已存在的服务二进制要版本号。
+        只读且不落地任何东西。按可信度三级探测：
+        1) **端口握手横幅**（/dev/tcp 直连目标端口读 MySQL greeting）——
+           唯一能代表"目标端口上真正运行的服务"的探测（机器上装了多个
+           mysqld/mariadbd 二进制时，按名字找二进制取版本是错的，实测
+           MySQL5.7 实例被误判成 MariaDB 10.11）；
+        2) 常见安装目录下的服务二进制 --version（裸机部署常见）；
+        3) 推平台侧 mysql 客户端连 127.0.0.1 查 VERSION()（探测完即删）。
         """
         from core import remote_dump                            # noqa: F401
         from core.engines.file import _ssh_exec_pipe as _sep
-        cmd = ("for b in mariadbd mysqld mariadbd-safe mysqld-debug; do "
-               "p=$(command -v $b 2>/dev/null) && { $p --version 2>/dev/null | "
-               "head -1; break; }; done")
+        port = int(self.task.get("port") or 3306)
+        # 1) 握手横幅：greeting 包第 5 字节起是 NUL 结尾的版本串
         try:
-            out, _err, _rc = _sep(client, remote_dump._wrap_login(cmd), timeout=30)
-            text = out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out or "")
-            return text.strip()
-        except Exception as e:  # noqa: BLE001 - 探测失败只影响工具选型，不能中断备份
+            out, _e, _rc = _sep(
+                client, remote_dump._wrap_login(
+                    f"exec 3<>/dev/tcp/127.0.0.1/{port} && head -c 48 <&3; "
+                    f"exec 3<&-"),
+                timeout=20)
+            raw = out.decode("latin-1", "replace") if isinstance(out, bytes) \
+                else str(out or "")
+            m = re.search(r"(\d+\.\d+\.\d+[0-9A-Za-z\-]*)", raw or "")
+            if m:
+                return m.group(1)
+        except Exception:  # noqa: BLE001 - 换下一个探测
+            pass
+        # 2) 服务二进制 --version
+        for tool in ("mysqld", "mariadbd", "mariadbd-safe", "mysqld-debug"):
+            p = remote_dump._resolve_remote_bin(client, tool)
+            if not p:
+                continue
             try:
-                self.logger.warning("[%s] 远程读取服务端版本失败: %s",
-                                    self.task_name, str(e)[:160])
+                out, _err, _rc = _sep(
+                    client, remote_dump._wrap_login(
+                        f"{shlex.quote(p)} --version 2>/dev/null | head -1"),
+                    timeout=30)
+                text = out.decode("utf-8", "replace") if isinstance(out, bytes) \
+                    else str(out or "")
+                text = text.strip()
+                if text:
+                    return text
+            except Exception:  # noqa: BLE001 - 换下一个候选
+                continue
+        try:
+            return self._remote_version_via_client(client) or ""
+        except Exception:  # noqa: BLE001 - 探测失败只影响工具选型，不能中断备份
+            return ""
+
+    def _remote_version_via_client(self, client) -> str:
+        """推平台侧 mysql 客户端到远端 /tmp，连 127.0.0.1 查 VERSION()。
+
+        用完即删（零残留）。凭据走 MYSQL_PWD 环境变量 + --no-defaults，
+        不进 argv、不被远端 my.cnf 干扰。
+        """
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe as _sep
+        local_cli = self._resolve_local_tool("mysql")
+        if not local_cli or not os.path.isfile(local_cli):
+            return ""
+        sftp = client.open_sftp()
+        remote_cli = f"/tmp/bk_mysql_cli_{int(time.time())}"
+        try:
+            sftp.put(local_cli, remote_cli)
+            try:
+                sftp.chmod(remote_cli, 0o755)
             except Exception:
                 pass
-            return ""
+        finally:
+            sftp.close()
+        port = int(self.task.get("port") or 3306)
+        user = self.task.get("username") or "root"
+        pw = db.decrypt_secret(self.task.get("password") or "")
+        cmd = (f"MYSQL_PWD={shlex.quote(pw)} {shlex.quote(remote_cli)} "
+               f"--no-defaults -h 127.0.0.1 -P {port} "
+               f"-u {shlex.quote(user)} -N -B -e \"SELECT VERSION()\" 2>/dev/null; "
+               f"rm -f {shlex.quote(remote_cli)}")
+        out, _e, _rc = _sep(client, remote_dump._wrap_login(cmd), timeout=60)
+        text = out.decode("utf-8", "replace") if isinstance(out, bytes) \
+            else str(out or "")
+        text = text.strip()
+        return text.splitlines()[0].strip() if text else ""
 
     @staticmethod
     def _pick_physical_bin(server_version: str) -> tuple:
@@ -432,25 +494,130 @@ class MySQLEngine(BackupEngine):
         return mapping
 
     @staticmethod
-    def _remote_ldd_missing(client, remote_bin: str) -> list:
-        """在远端执行 ldd，返回缺失的动态库名列表（如 ['libev.so.4']）。"""
+    def _remote_ldd_missing(client, remote_bin: str) -> tuple:
+        """远端 ldd 体检：返回 (缺失库列表, 致命错误列表)。
+
+        - ``libxxx.so => not found``                    → 缺库，平台可推送补齐；
+        - ``version `GLIBC_2.28' not found``（glibc 过低）、bad ELF interpreter、
+          cannot execute binary file（架构不符）        → 推库无法解决，属致命：
+          必须换与远端系统匹配的二进制，而不是把错误报成"缺某个库"。
+        此前把 GLIBC 版本行解析成了二进制路径本身，导致报错
+        「远端缺失动态库 /tmp/bk_pushed_xb_xxx:，平台侧未找到对应库文件」。
+        """
         from core import remote_dump
         from core.engines.file import _ssh_exec_pipe
         try:
-            out, _err, _rc = _ssh_exec_pipe(
+            out, err, _rc = _ssh_exec_pipe(
                 client,
-                remote_dump._wrap_login(f"ldd {shlex.quote(remote_bin)} 2>/dev/null"),
+                remote_dump._wrap_login(f"ldd {shlex.quote(remote_bin)} 2>&1"),
                 timeout=60)
         except Exception:
-            return []
+            return [], []
         txt = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
-        missing = []
-        for line in txt.splitlines():
-            if "not found" in line:
-                name = line.strip().split("=>")[0].strip().split(" ")[0]
-                if name and name not in missing:
-                    missing.append(name)
-        return missing
+        etxt = err.decode("utf-8", "replace") if isinstance(err, bytes) else (err or "")
+        blob = (txt or "") + "\n" + (etxt or "")
+        missing, fatal = [], []
+        for line in blob.splitlines():
+            l = line.strip()
+            if not l:
+                continue
+            if "not a dynamic executable" in l:
+                return [], []                    # 静态链接：直接可用
+            m = re.match(r"\s*(\S+)\s+=>\s+not found", line)
+            if m:
+                if m.group(1) not in missing:
+                    missing.append(m.group(1))
+                continue
+            if "version `GLIBC_" in l and "not found" in l:
+                m2 = re.search(r"GLIBC_(\d+\.\d+)", l)
+                tag = f"远端 glibc 过低（二进制需要 GLIBC {m2.group(1)}）" if m2 \
+                    else "远端 glibc 过低"
+                if tag not in fatal:
+                    fatal.append(tag)
+                continue
+            if ("bad ELF interpreter" in l or "cannot execute binary file" in l
+                    or "wrong ELF class" in l or "wrong architecture" in l):
+                tag = ("二进制架构与远端系统不兼容" if "cannot execute binary file" in l
+                       else l[:160])
+                if tag not in fatal:
+                    fatal.append(tag)
+        return missing, fatal
+
+    @staticmethod
+    def _remote_arch(client) -> str:
+        """远端机器架构（uname -m，如 x86_64 / aarch64），失败返回空串。"""
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe as _sep
+        try:
+            out, _e, _rc = _sep(client, remote_dump._wrap_login("uname -m"),
+                                timeout=20)
+            text = out.decode("utf-8", "replace") if isinstance(out, bytes) \
+                else str(out or "")
+            return text.strip().splitlines()[0].strip() if text.strip() else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _elf_arch(local_bin: str) -> str:
+        """读 ELF 头取本机二进制架构（无需 objdump/readelf），失败返回空串。"""
+        try:
+            with open(local_bin, "rb") as f:
+                head = f.read(20)
+            if head[:4] != b"\x7fELF":
+                return ""
+            mach = int.from_bytes(head[18:20], "little")
+            return {0x03: "i686", 0x28: "armv7l", 0x3e: "x86_64",
+                    0xb7: "aarch64"}.get(mach, "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _remote_glibc_version(client) -> str:
+        """远端 glibc 版本（ldd --version 首行），如 '2.17'，失败返回空串。"""
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe as _sep
+        try:
+            out, _e, _rc = _sep(
+                client, remote_dump._wrap_login("ldd --version 2>/dev/null | head -1"),
+                timeout=20)
+            text = out.decode("utf-8", "replace") if isinstance(out, bytes) \
+                else str(out or "")
+            m = re.search(r"(\d+\.\d+)", text or "")
+            return m.group(1) if m else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _remote_tool_major(client, tool: str) -> tuple:
+        """远端物理备份工具的 (主版本号 int, 是否 mariabackup)。
+
+        xtrabackup --version 输出如 'xtrabackup version 8.0.35-31' /
+        'xtrabackup version 2.4.29'；mariabackup 输出含 'mariabackup'。
+        解析失败返回 (0, False)（0 视为未知，不触发不匹配逻辑）。
+        """
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe as _sep
+        try:
+            out, _e, _rc = _sep(
+                client, remote_dump._wrap_login(
+                    f"{shlex.quote(tool)} --version 2>/dev/null | head -1"),
+                timeout=30)
+            text = out.decode("utf-8", "replace") if isinstance(out, bytes) \
+                else str(out or "")
+            text = text.strip().lower()
+            is_maria = "mariabackup" in text or "mariadb-backup" in text
+            m = re.search(r"(\d+)\.(\d+)", text)
+            major = int(m.group(1)) if m else 0
+            return major, is_maria
+        except Exception:
+            return 0, False
+
+    @staticmethod
+    def _major_from_server_version(server_version: str) -> int:
+        """'5.7.44-log' → 5；'.../mariadbd  Ver 10.11.9-MariaDB' → 10；
+        空/解析失败返回 0（search 全串匹配，兼容带路径前缀的探测输出）。"""
+        m = re.search(r"(\d+)\.\d+", server_version or "")
+        return int(m.group(1)) if m else 0
 
     # ------------------------------------------------------------------ #
     # 备份
@@ -673,6 +840,27 @@ class MySQLEngine(BackupEngine):
             tool = "" if reuse else remote_dump._resolve_remote_bin(client, "xtrabackup")
             if not reuse and not tool:
                 tool = remote_dump._resolve_remote_bin(client, "mariabackup")
+            # 远端工具版本校验（实测现场坑）：远端"有"xtrabackup 不等于"能用"——
+            # 装着 xtrabackup 8.0 的机器跑 5.7 实例（或反之）、MariaDB 机器装
+            # Percona xtrabackup、甚至 --version 都跑不起来（缺 perl 模块），
+            # 都会直接 rc=1。规则：版本无法确认（major=0）或与服务器主版本/
+            # 工具族不匹配 → 忽略远端工具，改推平台侧与服务器版本匹配的二进制。
+            if tool and not reuse:
+                tool_major, tool_is_maria = self._remote_tool_major(client, tool)
+                srv_major = self._major_from_server_version(server_ver)
+                srv_is_maria = "mariadb" in (server_ver or "").lower()
+                mismatch = (
+                    tool_major == 0
+                    or (tool_is_maria != srv_is_maria)
+                    or (not tool_is_maria and srv_major and tool_major
+                        and tool_major != srv_major))
+                if mismatch:
+                    self.logger.warning(
+                        "[%s] 远端 %s 版本(%s)与服务器(%s)不匹配或无法确认，"
+                        "忽略远端工具改推平台侧二进制",
+                        self.task_name, os.path.basename(tool), tool_major,
+                        server_ver)
+                    tool = ""
             if not tool and not reuse:
                 local_bin, bin_label = self._pick_physical_bin(server_ver)
                 if not os.path.isfile(local_bin):
@@ -683,12 +871,35 @@ class MySQLEngine(BackupEngine):
                                  f"服务器版本 {server_ver or '未知'}）。"
                                  f"请先在平台侧部署对应版本二进制。"))
                 pushed_bin = f"/tmp/bk_pushed_xb_{int(time.time())}"
+                # 架构预检：x86_64 二进制推到 aarch64 必然 cannot execute，
+                # 先在平台侧讲清楚，不让用户猜
+                remote_arch = self._remote_arch(client)
+                bin_arch = self._elf_arch(local_bin)
+                if remote_arch and bin_arch and remote_arch != bin_arch:
+                    return BackupResult(
+                        success=False, status=BackupStatus.FAILED,
+                        message=(
+                            f"平台侧 {bin_label} 架构（{bin_arch}）与数据库服务器"
+                            f"架构（{remote_arch}）不一致，无法推送执行。"
+                            f"请在平台侧部署 {remote_arch} 架构的对应版本物理备份"
+                            f"二进制，或改用逻辑备份。"))
                 sftp.put(local_bin, pushed_bin)
                 try:
                     sftp.chmod(pushed_bin, 0o755)
                 except Exception:
                     pass
-                missing = self._remote_ldd_missing(client, pushed_bin)
+                missing, fatal = self._remote_ldd_missing(client, pushed_bin)
+                if fatal:
+                    # glibc 过低 / 解释器不兼容：推补库解决不了，直说根因与出路
+                    glibc_ver = self._remote_glibc_version(client)
+                    return BackupResult(
+                        success=False, status=BackupStatus.FAILED,
+                        message=(
+                            f"平台侧 {bin_label} 与数据库服务器系统不兼容"
+                            f"（{'；'.join(fatal)}，远端 glibc 为 "
+                            f"{glibc_ver or '未知版本'}）。此类不兼容无法通过推送"
+                            f"动态库解决：请改用逻辑备份，或在数据库服务器部署与"
+                            f"其系统匹配版本的 xtrabackup，或升级远端操作系统。"))
                 if missing:
                     lmap = self._local_lib_map(local_bin)
                     pushed_libs_dir = "/tmp/bk_pushed_xb_libs"
@@ -2131,6 +2342,49 @@ class MySQLEngine(BackupEngine):
                 return BackupResult(success=True, status=BackupStatus.SUCCESS,
                                     message="mysql: xtrabackup not available, file verified",
                                     verified=True, size_bytes=size)
+
+        # 逻辑备份：全实例 tar（multi-db-tar = manifest.json + dbs/*.sql）
+        # 此前把 .tar.gz 当单库 gzip SQL 读头，tar 魔数被判 "dump header invalid"
+        if backup_path.endswith((".tar.gz", ".tgz", ".tar")):
+            try:
+                import tarfile as _tf
+                import json as _json
+                with _tf.open(backup_path, "r:*") as tf:
+                    names = tf.getnames()
+                    mf_name = next((n for n in names
+                                    if n.endswith("manifest.json")), None)
+                    if not mf_name:
+                        return BackupResult(
+                            success=False, status=BackupStatus.FAILED,
+                            message="mysql: tar 包内无 manifest.json（非全实例产物，无法校验）")
+                    mf = _json.load(tf.extractfile(mf_name))
+                    dbs = mf.get("databases") or []
+                    import re as _re
+                    sqls = sorted(n for n in names
+                                  if _re.search(r"(^|/)dbs/[^/]+\.sql$", n))
+                    if not sqls:
+                        return BackupResult(
+                            success=False, status=BackupStatus.FAILED,
+                            message="mysql: 全实例 tar 内无逐库 SQL 文件")
+                    bad = []
+                    for n in sqls:
+                        head = (tf.extractfile(n).read(200) or b"").decode(
+                            "utf-8", "ignore")
+                        if not head.lstrip().startswith(("--", "/*!", "/*M!")):
+                            bad.append(n)
+                    if bad:
+                        return BackupResult(
+                            success=False, status=BackupStatus.FAILED,
+                            message=f"mysql: 逐库 dump 头异常: {bad[:3]}")
+                    return BackupResult(
+                        success=True, status=BackupStatus.SUCCESS,
+                        message=(f"mysql: 全实例 tar 校验通过（manifest 库数 "
+                                 f"{len(dbs)}，逐库 dump {len(sqls)} 个，"
+                                 f"头部均为 mysqldump 特征）"),
+                        verified=True, size_bytes=size)
+            except Exception as e:
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                    message=f"mysql: 全实例 tar 校验异常: {e}")
 
         # 逻辑备份：检查文件头
         try:

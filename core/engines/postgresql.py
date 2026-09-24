@@ -68,7 +68,9 @@ class PostgreSQLEngine(BackupEngine):
 
         target = os.path.join(out_dir, f"pg_basebackup_{ts}")
         os.makedirs(target, exist_ok=True)
-        cmd = ["pg_basebackup", "-h", host, "-p", str(port), "-U", user, "-D", target, "-Ft", "-z",
+        # 版本择优解析（/usr/bin 下 9.2 老客户端无法 backup 14 服务器）
+        bkb = self._resolve_local_tool("pg_basebackup")
+        cmd = [bkb, "-h", host, "-p", str(port), "-U", user, "-D", target, "-Ft", "-z",
                "--checkpoint=fast", "--no-password"]
         cmd.extend(self._pg_basebackup_extra_args())
         env = {"PGPASSWORD": pw} if pw else None
@@ -211,7 +213,7 @@ class PostgreSQLEngine(BackupEngine):
             os.makedirs(work_dir, exist_ok=True)
             dump_out = work_dir
         cmd = [
-            "pg_dump",
+            self._resolve_local_tool("pg_dump"),
             "--host", str(host),
             "--port", str(port),
             "--username", str(user),
@@ -290,7 +292,7 @@ class PostgreSQLEngine(BackupEngine):
         out_path = os.path.join(out_dir, f"{self._timestamp()}.tar.gz")
         dump_tool = self._resolve_local_tool("pg_dump")
         query_tool = self._resolve_local_tool("psql")
-        dumpall_tool = shutil.which("pg_dumpall") or ""
+        dumpall_tool = self._resolve_local_tool("pg_dumpall")
         try:
             manifest = logical_full.backup_full_instance(
                 "postgresql",
@@ -338,7 +340,7 @@ class PostgreSQLEngine(BackupEngine):
                     backup_path=backup_path, simulated=False,
                     message="目录格式归档中未找到 toc.dat，可能不是有效的 -Fd 归档")
             cmd = [
-                "pg_restore",
+                self._resolve_local_tool("pg_restore"),
                 "--host", str(host),
                 "--port", str(port),
                 "--username", str(user),
@@ -452,7 +454,7 @@ class PostgreSQLEngine(BackupEngine):
     def _pg_db_exists(self, host, port, user, db_name, env_extra) -> bool:
         """检查目标库是否已存在。"""
         chk = self._run(
-            ["psql", "--host", str(host), "--port", str(port),
+            [self._resolve_local_tool("psql"), "--host", str(host), "--port", str(port),
              "--username", str(user), "-d", "postgres", "-tAc",
              f"SELECT 1 FROM pg_database WHERE datname = '{db_name.replace(chr(39), chr(39)*2)}'"],
             env_extra=env_extra, timeout=120)
@@ -495,7 +497,7 @@ class PostgreSQLEngine(BackupEngine):
         safe_db = target_db.replace('"', '""')
         if not self._pg_db_exists(host, port, user, target_db, env_extra):
             chk = self._run(
-                ["psql", "--host", str(host), "--port", str(port),
+                [self._resolve_local_tool("psql"), "--host", str(host), "--port", str(port),
                  "--username", str(user), "-d", "postgres",
                  "-c", f'CREATE DATABASE "{safe_db}"'],
                 env_extra=env_extra, timeout=180)
@@ -508,7 +510,7 @@ class PostgreSQLEngine(BackupEngine):
         else:
             # 目标库已存在：DROP 后重建，保证恢复结果与备份完全一致
             chk = self._run(
-                ["psql", "--host", str(host), "--port", str(port),
+                [self._resolve_local_tool("psql"), "--host", str(host), "--port", str(port),
                  "--username", str(user), "-d", "postgres",
                  "-c", f'DROP DATABASE IF EXISTS "{safe_db}" WITH (FORCE)'],
                 env_extra=env_extra, timeout=180)
@@ -519,7 +521,7 @@ class PostgreSQLEngine(BackupEngine):
                     message=f"清理目标库 {target_db} 失败: {chk['stderr']}",
                     stderr=chk["stderr"], simulated=False)
             chk = self._run(
-                ["psql", "--host", str(host), "--port", str(port),
+                [self._resolve_local_tool("psql"), "--host", str(host), "--port", str(port),
                  "--username", str(user), "-d", "postgres",
                  "-c", f'CREATE DATABASE "{safe_db}"'],
                 env_extra=env_extra, timeout=180)
@@ -535,7 +537,7 @@ class PostgreSQLEngine(BackupEngine):
         if backup_path.endswith((".dump", ".tar")):
             # 自定义格式/tar 归档用 pg_restore（目标库已创建，无需 -C；库已全新无需 -c）
             cmd = [
-                "pg_restore",
+                self._resolve_local_tool("pg_restore"),
                 "--host", str(host),
                 "--port", str(port),
                 "--username", str(user),
@@ -549,7 +551,7 @@ class PostgreSQLEngine(BackupEngine):
         elif backup_path.endswith(".sql"):
             # 纯文本格式用 psql 执行 SQL 脚本
             cmd = [
-                "psql",
+                self._resolve_local_tool("psql"),
                 "--host", str(host),
                 "--port", str(port),
                 "--username", str(user),
@@ -718,7 +720,7 @@ class PostgreSQLEngine(BackupEngine):
         pw = db.decrypt_secret(self.task.get("password") or "")
 
         cmd = [
-            "psql",
+            self._resolve_local_tool("psql"),
             "--host", str(host),
             "--port", str(port),
             "--username", str(user),

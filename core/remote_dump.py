@@ -2679,12 +2679,17 @@ def _remote_mysql_full_instance_tar(client, mysqldump_bin: str, remote_cnf: str,
     mysql_bin = os.path.join(os.path.dirname(mysqldump_bin), "mysql")
     include_sys = bool(extra.get("include_system_dbs"))
     sys_dbs = SYSTEM_DBS.get("mysql") or ()
-    # 枚举过滤：include_sys 时不过滤
+    # 基线过滤：information_schema/performance_schema 是虚拟库，mysqldump
+    # 无法导出（--all-databases 同样跳过），无论如何排除。
+    # include_sys=false 时再排除 mysql/sys 等系统库；grep 空结果返回 1，
+    # set -e 下会让整个脚本意外退出，必须 || true 容错。
+    virtual_excl = "^(information_schema|performance_schema)$"
     if include_sys:
-        enum_filter = ""
+        enum_filter = f" | grep -vE '{virtual_excl}' || true"
     else:
-        excl = "|".join(sys_dbs)
-        enum_filter = f" | grep -vE '^({excl})$'"
+        excl = "|".join(list(sys_dbs) + ["information_schema",
+                                         "performance_schema"])
+        enum_filter = f" | grep -vE '^({excl})$' || true"
 
     dump_flags = ""
     if extra.get("schema_only"):
@@ -2710,8 +2715,18 @@ def _remote_mysql_full_instance_tar(client, mysqldump_bin: str, remote_cnf: str,
         'mkdir -p "$WORK/dbs"',
         f'DBS=$("$MYSQL_BIN" --defaults-file="$CNF" -h 127.0.0.1 -P $PORT '
         f'-N -B -e "SHOW DATABASES"{enum_filter})',
-        '[ -n "${DBS:-}" ] || { echo "no backupable databases after filtering'
-        ' (system dbs excluded; set include_system_dbs=true to include)" >&2; exit 31; }',
+        # 业务库兜底：默认排除系统库后为空（实例只有默认系统库）→ 自动包含
+        # mysql/sys 等系统库（虚拟库始终排除），不让任务直接失败
+        'AUTO_SYS=0',
+        'if [ -z "${DBS:-}" ] && [ ' + ("1" if include_sys else "0") + ' -eq 0 ]; then',
+        f'  DBS=$("$MYSQL_BIN" --defaults-file="$CNF" -h 127.0.0.1 -P $PORT '
+        f'-N -B -e "SHOW DATABASES" | grep -vE \'{virtual_excl}\' || true)',
+        '  [ -z "${DBS:-}" ] || AUTO_SYS=1',
+        'fi',
+        '[ -n "${DBS:-}" ] || { echo "no backupable databases: instance is empty'
+        ' (only information_schema/performance_schema virtual dbs)" >&2; exit 31; }',
+        'if [ "$AUTO_SYS" -eq 1 ] || [ ' + ("1" if include_sys else "0")
+        + ' -eq 1 ]; then INCSYS=true; else INCSYS=false; fi',
         'for d in $DBS; do',
         '  "$DUMP_BIN" --defaults-file="$CNF" -h 127.0.0.1 -P $PORT '
         '--single-transaction --routines --triggers --events '
@@ -2722,8 +2737,9 @@ def _remote_mysql_full_instance_tar(client, mysqldump_bin: str, remote_cnf: str,
         'DBJSON=$(printf \'%s\\n\' "$DBS" | awk \'BEGIN{ORS="";first=1} '
         '{if(!first)print ","; printf "\\"%s\\"",$0; first=0}\')',
         f'printf \'{{"format":"multi-db-tar","db_type":"mysql",'
-        '"generated_at":"' + ts + '","globals":"na","include_system_dbs":'
-        + ("true" if include_sys else "false") + ',"databases":[%s]}\' '
+        '"generated_at":"' + ts + '","globals":"na"'
+        ',"include_system_dbs":\'$INCSYS\',"auto_include_system":\'$AUTO_SYS\''
+        ',"databases":[%s]}\' '
         '"$DBJSON" > "$WORK/manifest.json"',
         'tar -czf - -C "$WORK" manifest.json dbs',
     ]

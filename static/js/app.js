@@ -1648,7 +1648,7 @@
         </td>
       </tr>`).join("") ||
       '<tr><td colspan="11"><div class="empty-state"><i class="bi bi-inboxes"></i>'
-      + '<div class="empty-title">${T("还没有备份任务")}</div>'
+      + '<div class="empty-title">' + T("还没有备份任务") + '</div>'
       + T('点击右上角「新建任务」，一分钟配置第一个数据库备份') + '</div></td></tr>';
     renderTaskKpi(tasks);
     _focusTaskRow();

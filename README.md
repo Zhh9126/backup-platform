@@ -14,7 +14,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 预校验 · 克隆 · 演练 · 巡检 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v1.4.13-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v1.4.14-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -330,7 +330,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v1.4.7   # 固定版本（可回滚）
+docker pull ghcr.io/zhh9126/backup-platform:v1.4.14   # 固定版本（可回滚）
+# 当前最新版本：v1.4.14（2026-09-24）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -354,9 +355,9 @@ python tools/check_env.py
 
 ```bash
 # 有网机器导出
-docker save ghcr.io/zhh9126/backup-platform:v1.4.10 -o backup-platform.tar
+docker save ghcr.io/zhh9126/backup-platform:v1.4.14 -o aidbm-v1.4.14.tar
 # 内网机器导入
-docker load -i backup-platform.tar
+docker load -i aidbm-v1.4.14.tar
 ```
 
 ### 运行
@@ -373,6 +374,46 @@ docker run -d --name backup-platform \
 > **备份文件存在哪？** 镜像默认把备份产物写到容器内 `/data/backups`（布局 `<该路径>/<数据库类型>/<任务ID_任务名>/`）。
 > **必须把 `/data` 挂载到宿主机持久化卷**，否则备份会写进容器可写层（`docker inspect` 的 UpperDir 里能看到，重建容器即丢失）。
 > 平台「备份存储管理」页顶部的**本地备份存储位置**卡片会显示实际路径、磁盘用量与持久化风险提示，并支持在线修改（界面配置优先级高于环境变量，重启后仍生效）。
+
+### 升级（旧版本 → 新版本）
+
+```bash
+# 1. 导入新版本镜像（离线环境在有网机器 docker save 后拷入）
+docker load -i aidbm-v1.4.14.tar
+
+# 2. 停止并删除旧容器（备份数据在 backup-data 卷中，不受影响）
+docker stop backup-platform
+docker rm backup-platform
+
+# 3. 用新版本镜像启动（命令与首次部署完全一致，仅换镜像 tag）
+docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v1.4.14
+
+# 4.（可选）删除旧版本镜像释放空间
+docker rmi ghcr.io/zhh9126/backup-platform:v1.4.13
+```
+
+> 升级不丢数据：元数据库、备份产物、日志都在 `backup-data` 卷（`/data`），
+> 换容器不影响。**删除旧镜像前确认容器已停止并移除**，否则会报
+> `conflict: unable to remove ... container is using`。
+
+### 卸载
+
+```bash
+# 1. 停止并删除容器
+docker stop backup-platform
+docker rm backup-platform
+
+# 2. 删除镜像
+docker rmi ghcr.io/zhh9126/backup-platform:v1.4.14
+
+# 3.（谨慎）删除数据卷 —— 会清掉全部备份产物与元数据，操作前务必
+#    先把备份文件拷贝转移！
+docker volume inspect backup-data      # 先查看卷在宿主机的实际位置
+docker volume rm backup-data           # 确认不再需要数据后再执行
+```
+
+> 卷的实际宿主机路径可用 `docker volume inspect backup-data`（Mountpoint 字段）查看，
+> 离线环境建议直接从该目录 tar 备份后再做删除操作。
 
 ### Docker Compose（推荐生产）
 

@@ -75,10 +75,18 @@ def safe_download_path(path: str):
 
 from . import (tasks, records, restore, system, hosts, sync, inspection, deploy,
                 restore_extras_api, drills, storage, policy, lifecycle, migration,
-                clone, itsm, link, ai_alert, datamining, ai_agent, rt, plugins,
+                clone, itsm, link, ai_alert, datamining, rt, plugins,
                 restore_verify, synthesize, dedup, jdbc, data_compare,
                 tape, logs, db_adapters, rbac, cdc, vm, openapi,
                 agentless, object_storage, backup_cleanup, meta_db)  # noqa: E402,F401
+
+# AI 助手（收费功能）：镜像/离线交付包中不含 core/ai_agent 与 api/ai_agent.py，
+# 这里必须容错注册——缺失时平台其余功能不受影响（2026-09-19 用户决定）。
+try:
+    from . import ai_agent  # noqa: E402,F401
+except Exception as _e:  # noqa: BLE001
+    import logging as _logging
+    _logging.getLogger("aidbm").info("AI 助手模块未随本包交付（收费功能），已跳过: %s", _e)
 
 # 统一契约钩子（三段式错误体 + 版本/弃用响应头）。必须在 app.register_blueprint
 # 之前声明：Flask 在注册蓝图时冻结其请求钩子列表。

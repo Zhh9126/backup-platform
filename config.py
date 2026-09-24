@@ -23,7 +23,7 @@ else:
 # ---------- 产品标识 ----------
 # 产品正式名称与版本（对外 API 文档、健康检查、报告落款统一取这里，避免各处硬编码）。
 PLATFORM_NAME = os.environ.get("AIDBM_NAME", "AIDBM")
-PLATFORM_VERSION = os.environ.get("AIDBM_VERSION", "1.4.14")
+PLATFORM_VERSION = os.environ.get("AIDBM_VERSION", "1.4.15")
 
 # ---------- 路径 ----------
 BACKUP_ROOT = os.environ.get("BACKUP_ROOT", str(BASE_DIR / "backups"))

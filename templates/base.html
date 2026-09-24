@@ -55,6 +55,8 @@
         <a class="nav-link {% if page=='logs' %}active{% endif %}" href="/logs" title="系统日志" data-perm="logs.view"><i class="bi bi-journal-text"></i> <span class="nav-label">系统日志</span></a>
         <a class="nav-link {% if page=='settings' %}active{% endif %}" href="/settings" title="系统设置" data-perm="system.settings"><i class="bi bi-gear"></i> <span class="nav-label">系统设置</span></a>
         <a class="nav-link {% if page=='users' %}active{% endif %}" href="/users" title="用户与角色管理（RBAC）" data-perm="users.manage"><i class="bi bi-people"></i> <span class="nav-label">用户管理</span></a>
+        <a class="nav-link" href="javascript:void(0)" id="langToggle" title="中文 / English">
+          <i class="bi bi-translate"></i> <span class="nav-label" id="langLabel">English</span></a>
         <a class="nav-link logout" href="/logout" title="退出登录"><i class="bi bi-box-arrow-right"></i> <span class="nav-label">退出登录</span></a>
       </nav>
     </aside>
@@ -89,6 +91,7 @@
   <!-- 首屏注入 META（数据库类型/显示名/默认端口）：必须在 bkp-core.js 之前，
        否则依赖 BKP.META 的下拉会被填成空（见 app.py context_processor 注释） -->
   <script>window.__BKP_META__ = {{ bkp_meta | default({}) | tojson }};</script>
+  <script src="/static/js/i18n.js?v=2026092401"></script>
   <script src="/static/js/bkp-core.js?v=2026091901"></script>
   <script src="/static/js/app.js?v=2026091901"></script>
   <script>

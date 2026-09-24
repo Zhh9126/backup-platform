@@ -178,7 +178,8 @@ window.BKP = (function () {
       expired_gfs: ["bg-secondary", "已清理（GFS 过期）"]
     };
     var pair = m[s] || ["bg-secondary", s || "-"];
-    return '<span class="badge ' + pair[0] + '">' + pair[1] + '</span>';
+    var text = (window.I18N && I18N.lang === "en") ? I18N.t(pair[1]) : pair[1];
+    return '<span class="badge ' + pair[0] + '">' + text + '</span>';
   };
 
   // ---- Toast 通知 ----

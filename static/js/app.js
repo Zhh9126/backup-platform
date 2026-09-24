@@ -1639,22 +1639,22 @@
         <td>${esc(t.backup_type_display || t.backup_type)}</td>
         <td>${esc(t.backup_mode_display || (t.backup_mode === "physical" ? "物理备份" : "逻辑备份"))}</td>
         <td>${scheduleCell(t)}</td>
-        <td>${t.enabled ? statusBadge(t.last_status || "never") : '<span class="badge bg-secondary">已停用</span>'}</td>
+        <td>${t.enabled ? statusBadge(t.last_status || "never") : '<span class="badge bg-secondary">' + T("已停用") + '</span>'}</td>
         <td>${fmtTime(t.last_run_at) || "-"}</td>
         <td class="text-end" style="white-space:nowrap">
-          <button class="btn-row btn-row-primary" onclick="runTask(${t.id})" title="立即执行一次备份"><i class="bi bi-play-circle"></i> 立即备份</button>
-          <button class="btn-row" onclick="editTask(${t.id})" title="编辑任务"><i class="bi bi-pencil"></i> 编辑</button>
-          <button class="btn-row btn-row-danger" onclick="delTask(${t.id})" title="删除任务"><i class="bi bi-trash"></i> 删除</button>
+          <button class="btn-row btn-row-primary" onclick="runTask(${t.id})" title="${T("立即备份")}"><i class="bi bi-play-circle"></i> ${T("立即备份")}</button>
+          <button class="btn-row" onclick="editTask(${t.id})" title="${T("编辑")}"><i class="bi bi-pencil"></i> ${T("编辑")}</button>
+          <button class="btn-row btn-row-danger" onclick="delTask(${t.id})" title="${T("删除")}"><i class="bi bi-trash"></i> ${T("删除")}</button>
         </td>
       </tr>`).join("") ||
       '<tr><td colspan="11"><div class="empty-state"><i class="bi bi-inboxes"></i>'
-      + '<div class="empty-title">还没有备份任务</div>'
-      + '点击右上角「新建任务」，一分钟配置第一个数据库备份</div></td></tr>';
+      + '<div class="empty-title">${T("还没有备份任务")}</div>'
+      + T('点击右上角「新建任务」，一分钟配置第一个数据库备份') + '</div></td></tr>';
     renderTaskKpi(tasks);
     _focusTaskRow();
   }
 
-  /** 页头健康度摘要（结论前置：首屏回答"备份体系健康吗"）。 */
+  /** 页头健康度统计卡（结论前置：首屏回答"备份体系健康吗"）。 */
   function renderTaskKpi(tasks) {
     const el = document.getElementById("taskKpi");
     if (!el) return;
@@ -1663,14 +1663,18 @@
     const failed = tasks.filter((t) => (t.last_status || "") === "failed").length;
     const running = tasks.filter((t) => ["running", "pending"].indexOf(t.last_status || "") >= 0).length;
     const ok = tasks.filter((t) => (t.last_status || "") === "success").length;
-    const item = (num, cls, label) =>
-      `<span class="kpi-item">${label} <span class="kpi-num ${cls || ""}">${num}</span></span>`;
+    const card = (icon, num, label, cls) =>
+      `<div class="stat-card ${cls || ""}">
+         <div class="stat-icon"><i class="bi ${icon}"></i></div>
+         <div><div class="stat-num ${cls || ""}">${num}</div>
+         <div class="stat-label">${T(label)}</div></div>
+       </div>`;
     el.innerHTML =
-      item(tasks.length, "", "任务总数")
-      + item(enabled, "", "已启用")
-      + item(ok, "kpi-ok", "最近成功")
-      + (failed ? item(failed, "kpi-bad", "最近失败") : "")
-      + (running ? item(running, "kpi-bad", "执行中") : "");
+      card("bi-list-check", tasks.length, "任务总数")
+      + card("bi-toggle-on", enabled, "已启用")
+      + card("bi-check2-circle", ok, "最近成功", "stat-ok")
+      + (failed ? card("bi-x-octagon", failed, "最近失败", "stat-bad") : "")
+      + (running ? card("bi-arrow-repeat", running, "执行中", "stat-run") : "");
     el.classList.remove("d-none");
   }
 
@@ -3206,7 +3210,7 @@
         <td><code>${esc((extra.source_host) || "-")}</code> → <code>${esc((extra.target_host) || "-")}</code></td>
         <td>${esc(t.backup_type_display || t.backup_type)}</td>
         <td>${scheduleCell(t)}</td>
-        <td>${t.enabled ? statusBadge(t.last_status || "never") : '<span class="badge bg-secondary">已停用</span>'}</td>
+        <td>${t.enabled ? statusBadge(t.last_status || "never") : '<span class="badge bg-secondary">' + T("已停用") + '</span>'}</td>
         <td class="text-end">
           <button class="btn btn-sm btn-outline-success" onclick="runFileTask(${t.id})">备份</button>
           <button class="btn btn-sm btn-outline-primary" onclick="editFileTask(${t.id})">编辑</button>
@@ -3435,7 +3439,7 @@
         <td class="text-truncate" style="max-width:180px">${src}</td>
         <td class="text-truncate" style="max-width:180px">${dst}</td>
         <td>${scheduleCell(t)}</td>
-        <td>${t.enabled ? statusBadge(t.last_status || "never") : '<span class="badge bg-secondary">已停用</span>'}</td>
+        <td>${t.enabled ? statusBadge(t.last_status || "never") : '<span class="badge bg-secondary">' + T("已停用") + '</span>'}</td>
         <td>${fmtTime(t.last_run_at) || "-"}</td>
         <td class="text-end">
           <button class="btn btn-sm btn-outline-success" onclick="runSync(${t.id})">同步</button>
@@ -6096,7 +6100,7 @@
         '<td>' + rpoText(p.rpo_target_min) + '</td>' +
         '<td>' + rtoText(p.rto_target_min) + '</td>' +
         '<td>' + backupModeText(p.backup_strategy) + '</td>' +
-        '<td>' + (p.enabled ? '<span class="badge badge-ok">已启用</span>' : '<span class="badge bg-secondary">已停用</span>') + '</td>' +
+        '<td>' + (p.enabled ? '<span class="badge badge-ok">已启用</span>' : '<span class="badge bg-secondary">' + T("已停用") + '</span>') + '</td>' +
         '<td>' + (p.bound_task_count || 0) + ' 个</td>' +
         '<td class="text-end">' +
           '<button class="btn btn-sm btn-outline-primary me-1" onclick="viewPolicyRecords(' + p.id + ')">备份记录</button>' +

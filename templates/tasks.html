@@ -14,25 +14,25 @@
 <div class="tab-pane fade show active" id="tabTasks" role="tabpanel">
 <div class="toolbar">
   <div>
-    <div class="page-title">数据库备份</div>
-    <div class="page-sub">配置数据库连接、备份类型与调度策略</div>
+    <div class="page-title" data-i18n="数据库备份">数据库备份</div>
+    <div class="page-sub" data-i18n="配置数据库连接、备份类型与调度策略">配置数据库连接、备份类型与调度策略</div>
   </div>
   <div class="d-flex align-items-center gap-2 flex-wrap">
     <button class="btn btn-outline-secondary btn-sm" id="cleanupBtn"
-            title="按每个任务的备份保留天数/份数，定期清理过期备份产物"><i class="bi bi-eraser"></i> 定期清理</button>
-    <button class="btn btn-outline-secondary btn-sm" onclick="refreshTasks()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
-    <button class="btn btn-outline-secondary btn-sm" onclick="importTasksCsv()" title="批量导入CSV"><i class="bi bi-upload"></i> 导入</button>
-    <a class="btn btn-outline-secondary btn-sm" href="/api/tasks/template?type=db" title="下载CSV模板"><i class="bi bi-file-earmark-spreadsheet"></i> 模板</a>
-    <button class="btn btn-primary" id="newTaskBtn"><i class="bi bi-plus-lg"></i> 新建任务</button>
+            title="按每个任务的备份保留天数/份数，定期清理过期备份产物"><i class="bi bi-eraser"></i> <span data-i18n="定期清理">定期清理</span></button>
+    <button class="btn btn-outline-secondary btn-sm" onclick="refreshTasks()" title="刷新"><i class="bi bi-arrow-clockwise"></i> <span data-i18n="刷新">刷新</span></button>
+    <button class="btn btn-outline-secondary btn-sm" onclick="importTasksCsv()" title="批量导入CSV"><i class="bi bi-upload"></i> <span data-i18n="导入">导入</span></button>
+    <a class="btn btn-outline-secondary btn-sm" href="/api/tasks/template?type=db" title="下载CSV模板"><i class="bi bi-file-earmark-spreadsheet"></i> <span data-i18n="模板">模板</span></a>
+    <button class="btn btn-primary" id="newTaskBtn"><i class="bi bi-plus-lg"></i> <span data-i18n="新建任务">新建任务</span></button>
   </div>
 </div>
-<div id="taskKpi" class="page-kpi mb-3 d-none"></div>
+<div id="taskKpi" class="stat-cards d-none mb-3"></div>
 <div class="page-card">
   <div class="table-responsive" style="flex:1">
     <table class="table table-hover align-middle mb-0">
       <thead><tr>
-        <th>ID</th><th>业务系统</th><th>名称</th><th>类型</th><th>备份 IP</th><th>端口/库</th><th>备份类型</th><th>备份模式</th>
-        <th>调度</th><th>状态</th><th>上次运行</th><th class="text-end">操作</th>
+        <th>ID</th><th data-i18n="业务系统">业务系统</th><th data-i18n="名称">名称</th><th data-i18n="类型">类型</th><th data-i18n="备份 IP">备份 IP</th><th data-i18n="端口/库">端口/库</th><th data-i18n="备份类型">备份类型</th><th data-i18n="备份模式">备份模式</th>
+        <th data-i18n="调度">调度</th><th data-i18n="状态">状态</th><th data-i18n="上次运行">上次运行</th><th class="text-end" data-i18n="操作">操作</th>
       </tr></thead>
       <tbody id="taskTable"></tbody>
     </table>

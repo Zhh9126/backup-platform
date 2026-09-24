@@ -850,3 +850,102 @@ textarea.form-control { height: auto; padding: 8px 12px; }
 .empty-state { padding: 48px 24px; text-align: center; color: var(--text-muted); }
 .empty-state i { display: block; font-size: 28px; margin-bottom: 8px; color: var(--border-strong); }
 .empty-state .empty-title { font-size: var(--font-size-base); color: var(--text-secondary); margin-bottom: 4px; }
+
+/* =============================================================
+   2026-09 科技感视觉层 v2（Slate+Teal 体系内加强，不引入违规色）
+   关键词：光晕背景 / 统计卡 / 卡片悬浮 / 品牌渐变 / 行级强调 / 精细滚动条
+   ============================================================= */
+
+/* ---- 背景：顶部极淡 teal 光晕，打破纯灰平板感 ---- */
+body {
+  background:
+    radial-gradient(1200px 300px at 20% -80px, rgba(13, 148, 136, .07), transparent 70%),
+    radial-gradient(900px 260px at 85% -60px, rgba(13, 148, 136, .05), transparent 70%),
+    var(--page-bg);
+}
+
+/* ---- 品牌区：logo 加 teal 光晕 ---- */
+.brand .brand-logo { text-shadow: 0 0 12px rgba(13, 148, 136, .55); }
+
+/* 侧边栏 active：左缘 3px teal 条 + 横向渐变底 */
+.sidebar .nav-link.active {
+  background: linear-gradient(90deg, rgba(13, 148, 136, .28), rgba(13, 148, 136, .06));
+  box-shadow: inset 3px 0 0 var(--primary);
+  border-radius: var(--radius-md);
+}
+
+/* ---- 页标题：品牌渐变短线 ---- */
+.page-title { position: relative; padding-bottom: 6px; }
+.page-title::after {
+  content: ""; position: absolute; left: 0; bottom: 0;
+  width: 34px; height: 3px; border-radius: 2px;
+  background: linear-gradient(90deg, var(--primary), rgba(13, 148, 136, .15));
+}
+
+/* ---- 主按钮：品牌渐变 + 光晕投影 ---- */
+.btn-primary {
+  background: linear-gradient(135deg, #14B8A6, var(--primary) 55%, var(--primary-hover));
+  border: none;
+  box-shadow: 0 2px 8px rgba(13, 148, 136, .35);
+}
+.btn-primary:hover {
+  background: linear-gradient(135deg, #0EA5A4, var(--primary-hover));
+  box-shadow: 0 4px 14px rgba(13, 148, 136, .45);
+  color: #fff;
+}
+
+/* ---- 页面卡片：顶部品牌渐变线 + 悬浮抬升 ---- */
+.page-card { position: relative; overflow: hidden; transition: box-shadow .2s ease, transform .2s ease; }
+.page-card::before {
+  content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+  background: linear-gradient(90deg, var(--primary), rgba(13, 148, 136, .08));
+  opacity: .8;
+}
+.page-card:hover { box-shadow: 0 6px 20px rgba(15, 23, 42, .08); transform: translateY(-1px); }
+
+/* ---- 统计卡（页头健康度，取代细条 KPI） ---- */
+.stat-cards { display: flex; gap: var(--space-md); flex-wrap: wrap; margin-bottom: var(--space-md); }
+.stat-card {
+  flex: 1 1 150px; max-width: 230px;
+  display: flex; align-items: center; gap: var(--space-md);
+  background: var(--card-bg);
+  border: 1px solid var(--border-base);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-card);
+  padding: 16px 18px;
+  transition: box-shadow .2s ease, transform .2s ease, border-color .2s ease;
+}
+.stat-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(13, 148, 136, .45);
+  box-shadow: 0 8px 22px rgba(13, 148, 136, .16);
+}
+.stat-icon {
+  width: 44px; height: 44px; flex: 0 0 44px;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 12px; font-size: 20px;
+  background: var(--primary-bg); color: var(--primary);
+}
+.stat-num { font-size: 24px; font-weight: var(--weight-bold); line-height: 1.1; color: var(--text-primary); }
+.stat-label { font-size: var(--font-size-xs); color: var(--text-muted); margin-top: 2px; }
+.stat-card.stat-ok .stat-icon { background: #ECFDF5; color: #047857; }
+.stat-card.stat-ok .stat-num { color: #047857; }
+.stat-card.stat-bad .stat-icon { background: #FEF2F2; color: var(--error); }
+.stat-card.stat-bad .stat-num { color: var(--error); }
+.stat-card.stat-run .stat-icon { background: var(--warning-light); color: var(--warning); }
+.stat-card.stat-run .stat-num { color: var(--warning); }
+
+/* ---- 表格：悬停行左缘 teal 竖条；表头吸顶 ---- */
+.table tbody tr:hover { background: #F8FAFC; box-shadow: inset 3px 0 0 var(--primary); }
+.page-card .table thead th { position: sticky; top: 0; z-index: 1; }
+
+/* ---- 精细滚动条 ---- */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--sidebar-text-muted); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ---- 模态框：顶缘品牌线 ---- */
+.modal-content { border-radius: var(--radius-xl); }
+.modal-header { border-bottom: 1px solid var(--border-base); }
+.modal-header::before { display: none; }

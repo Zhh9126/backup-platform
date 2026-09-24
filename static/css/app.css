@@ -763,3 +763,90 @@ textarea.form-control { height: auto; padding: 8px 12px; }
   .dm-bar-val { width: 62px; }
   .dm-dims { min-width: 150px; }
 }
+
+/* =============================================================
+   2026-09 视觉现代化层（信息架构原则借鉴 Atlassian：结论前置 /
+   语义色统一 / 操作降噪 / 状态可追溯；色彩仍严格沿用 Slate+Teal Tokens）
+   ============================================================= */
+
+/* ---- 1. 页头：主标题聚焦，副标题降级为辅助信息 ---- */
+.page-title { font-size: 22px; letter-spacing: -0.01em; margin-bottom: 2px; }
+.page-sub { font-size: var(--font-size-sm); color: var(--text-muted); margin-bottom: 0; }
+
+/* 页头健康度摘要行（首屏回答"备份体系健康吗"） */
+.page-kpi {
+  display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-sm);
+  padding: 10px 14px;
+  background: var(--card-bg);
+  border: 1px solid var(--border-base);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-toolbar);
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+}
+.page-kpi .kpi-item { display: inline-flex; align-items: center; gap: 6px; }
+.page-kpi .kpi-item + .kpi-item { padding-left: var(--space-sm); border-left: 1px solid var(--border-base); }
+.page-kpi .kpi-num { font-weight: var(--weight-semibold); color: var(--text-primary); }
+.page-kpi .kpi-num.kpi-ok { color: var(--success); }
+.page-kpi .kpi-num.kpi-bad { color: var(--error); }
+
+/* ---- 2. 工具栏：次要操作统一中性描边，主操作唯一强调 ---- */
+.toolbar { align-items: flex-start; }
+.toolbar .btn-outline-warning,
+.toolbar .btn-outline-info,
+.toolbar .btn-outline-success { color: var(--text-secondary); border-color: var(--border-strong); background: var(--card-bg); }
+.toolbar .btn-outline-warning:hover,
+.toolbar .btn-outline-info:hover,
+.toolbar .btn-outline-success:hover { background: var(--page-bg); color: var(--text-primary); border-color: var(--border-strong); }
+
+/* ---- 3. 状态徽章 → 语义色 pill + 圆点（运行中带呼吸动画） ---- */
+.badge-ok, .badge-fail, .badge-run, .badge-sim {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 10px; border-radius: 999px;
+  font-size: 12px; font-weight: var(--weight-semibold); line-height: 1.5;
+}
+.badge-ok::before, .badge-fail::before, .badge-run::before, .badge-sim::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; flex: 0 0 auto;
+}
+.badge-ok   { background: #ECFDF5; color: #047857; }
+.badge-fail { background: #FEF2F2; color: #B91C1C; }
+.badge-sim  { background: var(--warning-light); color: #92400E; }
+.badge-run  { background: var(--primary-bg); color: var(--primary-hover); }
+.badge-run::before { animation: kpi-pulse 1.2s ease-in-out infinite; }
+@keyframes kpi-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+
+/* ---- 4. 表格 v2：表头降灰、行距呼吸、悬停中性化 ---- */
+.page-card .table { background: transparent; }
+.table thead th {
+  background: #F8FAFC;
+  font-size: 12px; font-weight: var(--weight-semibold);
+  color: var(--text-secondary); letter-spacing: .02em;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-base);
+}
+.table tbody td { padding: 12px 14px; }
+.table tbody tr:hover { background: #F8FAFC; }
+.table td code { font-size: 12px; color: var(--text-secondary); }
+
+/* ---- 5. 行内操作：幽灵按钮（默认中性，危险操作悬停才显红） ---- */
+.btn-row {
+  display: inline-flex; align-items: center; gap: 4px;
+  border: 1px solid transparent; background: transparent;
+  color: var(--text-secondary);
+  padding: 4px 10px; border-radius: var(--radius-md);
+  font-size: var(--font-size-sm); font-weight: var(--weight-medium);
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+.btn-row:hover { background: var(--page-bg); color: var(--text-primary); }
+.btn-row.btn-row-primary { color: var(--primary); font-weight: var(--weight-semibold); }
+.btn-row.btn-row-primary:hover { background: var(--primary-bg); color: var(--primary-hover); }
+.btn-row.btn-row-danger:hover { background: var(--error-light); color: var(--error-hover); }
+.btn-row i { font-size: 13px; }
+.btn-row + .btn-row { margin-left: 2px; }
+
+/* ---- 6. 空状态 ---- */
+.empty-state { padding: 48px 24px; text-align: center; color: var(--text-muted); }
+.empty-state i { display: block; font-size: 28px; margin-bottom: 8px; color: var(--border-strong); }
+.empty-state .empty-title { font-size: var(--font-size-base); color: var(--text-secondary); margin-bottom: 4px; }

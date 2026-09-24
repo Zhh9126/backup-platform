@@ -70,7 +70,7 @@ def test_ldd_glibc_too_old_is_fatal_not_missing_lib():
         f"(required by {BIN})\n", "", 1)})
     missing, fatal = m.MySQLEngine._remote_ldd_missing(None, BIN)
     assert missing == []
-    assert len(fatal) == 1 and "GLIBC 2.28" in fatal[0]
+    assert len(fatal) == 1 and "GLIBC_2.28" in fatal[0]
 
 
 def test_ldd_bad_interpreter_is_fatal():
@@ -178,3 +178,50 @@ def test_remote_version_fallback_via_client(monkeypatch, tmp_path):
     assert "rm -f" in stub.calls[0]
     # 凭据走 MYSQL_PWD + --no-defaults（不进 argv 明文、不被 my.cnf 干扰）
     assert "MYSQL_PWD=" in stub.calls[0] and "--no-defaults" in stub.calls[0]
+
+
+# ----------------- openEuler 场景回归（用户现场） -----------------
+
+def test_ldd_openeuler_openssl_version_missing_is_pushable():
+    """openEuler：/lib64/libssl.so.10 存在但版本不符 → 缺失库 libssl.so.10
+    （可由平台内置库推送解决），而非致命。"""
+    fe._ssh_exec_pipe = _StubPipe({BIN: (
+        f"{BIN}: /lib64/libssl.so.10: version `libssl.so.10' not found "
+        f"(required by {BIN})\n"
+        f"{BIN}: /lib64/libcrypto.so.10: version `libcrypto.so.10' not found "
+        f"(required by {BIN})\n", "", 1)})
+    missing, fatal = m.MySQLEngine._remote_ldd_missing(None, BIN)
+    assert sorted(missing) == ["libcrypto.so.10", "libssl.so.10"]
+    assert fatal == []
+
+
+def test_ldd_glibc_version_still_fatal():
+    fe._ssh_exec_pipe = _StubPipe({BIN: (
+        f"{BIN}: /lib64/ld-linux-x86-64.so.2: version `GLIBC_2.28' not found "
+        f"(required by {BIN})\n", "", 1)})
+    missing, fatal = m.MySQLEngine._remote_ldd_missing(None, BIN)
+    assert missing == [] and len(fatal) == 1 and "GLIBC_2.28" in fatal[0]
+
+
+def test_local_lib_map_bundled_fallback(tmp_path, monkeypatch):
+    """本机 ldd 没有的库名 → 从镜像内置库目录 /opt/xtrabackup_libs 补。"""
+    fake_dir = tmp_path / "xtrabackup_libs"
+    fake_dir.mkdir()
+    (fake_dir / "libssl.so.10").write_bytes(b"x" * 8)
+    (fake_dir / "libcrypto.so.10").write_bytes(b"y" * 8)
+    monkeypatch.setenv("XB_BUNDLED_LIB_DIR", str(fake_dir))
+    eng = object.__new__(m.MySQLEngine)
+    eng.task = {}
+    monkeypatch.setattr(m.MySQLEngine, "_task_tool_path", lambda self: "", raising=False)
+    # 隔离真实镜像目录
+    import subprocess as _sp
+    real_run = _sp.run
+    def fake_run(cmd, **kw):
+        class R:
+            returncode = 0
+            stdout = "bin: not a dynamic executable\n"
+            stderr = ""
+        return R()
+    monkeypatch.setattr(_sp, "run", fake_run)
+    mapping = m.MySQLEngine._local_lib_map(eng.__class__ and "/fake/xb")
+    assert mapping.get("libssl.so.10", "").endswith("libssl.so.10")

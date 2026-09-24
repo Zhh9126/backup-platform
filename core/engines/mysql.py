@@ -480,17 +480,28 @@ class MySQLEngine(BackupEngine):
 
     @staticmethod
     def _local_lib_map(local_bin: str) -> dict:
-        """解析平台侧二进制的 ldd 输出，返回 {库名: 本地绝对路径}。"""
+        """解析平台侧二进制的 ldd 输出，返回 {库名: 本地绝对路径}。
+
+        兜底：镜像内置库目录 /opt/xtrabackup_libs（随镜像分发的一套
+        CentOS7 OpenSSL1.0/Krb5 等依赖，openEuler/Debian 系远端缺失时
+        由推送机制自动带上）——本机 ldd 找不到的库名从这里补。
+        """
+        import glob
+        mapping = {}
         try:
             ret = subprocess.run(["ldd", local_bin], capture_output=True,
                                  text=True, timeout=30)
+            for line in (ret.stdout or "").splitlines():
+                m = re.match(r"\s*(\S+)\s+=>\s+(/\S+)", line)
+                if m:
+                    mapping.setdefault(os.path.basename(m.group(1)), m.group(2))
         except Exception:
-            return {}
-        mapping = {}
-        for line in (ret.stdout or "").splitlines():
-            m = re.match(r"\s*(\S+)\s+=>\s+(/\S+)", line)
-            if m:
-                mapping.setdefault(os.path.basename(m.group(1)), m.group(2))
+            pass
+        bundled = os.environ.get(
+            "XB_BUNDLED_LIB_DIR", "/opt/xtrabackup_libs")
+        if os.path.isdir(bundled):
+            for name in os.listdir(bundled):
+                mapping.setdefault(name, os.path.join(bundled, name))
         return mapping
 
     @staticmethod
@@ -528,12 +539,19 @@ class MySQLEngine(BackupEngine):
                 if m.group(1) not in missing:
                     missing.append(m.group(1))
                 continue
-            if "version `GLIBC_" in l and "not found" in l:
-                m2 = re.search(r"GLIBC_(\d+\.\d+)", l)
-                tag = f"远端 glibc 过低（二进制需要 GLIBC {m2.group(1)}）" if m2 \
-                    else "远端 glibc 过低"
-                if tag not in fatal:
-                    fatal.append(tag)
+            m_ver = re.search(r"version [`']([A-Za-z0-9_.:+-]+)' not found", l)
+            if m_ver and "not found" in l:
+                tagname = m_ver.group(1)
+                if re.match(r"(GLIBC_|GCC_|CXXABI_|LIBC_)", tagname):
+                    # glibc 符号版本缺失：推库解决不了，属致命不兼容
+                    tag = (f"远端 glibc 过低（二进制需要 {tagname}）")
+                    if tag not in fatal:
+                        fatal.append(tag)
+                else:
+                    # OpenSSL 等库版本缺失（如 libssl.so.10）：目标系统里该
+                    # soname 存在但版本不符/由平台补库解决——按缺失库处理
+                    if tagname not in missing:
+                        missing.append(tagname)
                 continue
             if ("bad ELF interpreter" in l or "cannot execute binary file" in l
                     or "wrong ELF class" in l or "wrong architecture" in l):

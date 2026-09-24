@@ -81,6 +81,7 @@ COPY api/ ./api/
 COPY static/ ./static/
 COPY templates/ ./templates/
 COPY drivers/ ./drivers/
+COPY tools/xtrabackup_libs/ /opt/xtrabackup_libs/
 COPY skills/ ./skills/
 COPY tools/ ./tools/
 

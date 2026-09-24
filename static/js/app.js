@@ -1976,7 +1976,6 @@
     try {
       const r = await api("GET", `/api/records/${id}`);
       if (!r || r.error) { toast("记录不存在", "danger"); return; }
-      $("rl_record_id").textContent = `#${r.id}`;
       $("rl_task").textContent = window._taskNames?.[r.task_id] || r.task_id;
       $("rl_backup_type").textContent = r.backup_type_display || r.backup_type || "-";
       $("rl_db_type").textContent = r.db_type_display || r.db_type || "-";

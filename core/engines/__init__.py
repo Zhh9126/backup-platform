@@ -20,6 +20,7 @@ from core.engines.base import (BackupEngine, BackupType, BackupMode,
 from core.engines.mysql import MySQLEngine
 from core.engines.mariadb import MariaDBEngine
 from core.engines.postgresql import PostgreSQLEngine
+from core.engines.opengauss import OpenGaussEngine
 from core.engines.oracle import OracleEngine
 from core.engines.kingbase import KingbaseEngine
 from core.engines.dameng import DamengEngine
@@ -56,6 +57,7 @@ ENGINE_REGISTRY = {
     "postgresql": PostgreSQLEngine,
     "oracle": OracleEngine,
     "kingbase": KingbaseEngine,
+    "opengauss": OpenGaussEngine,
     "dameng": DamengEngine,
     "sqlserver": SQLServerEngine,
     "redis": RedisEngine,

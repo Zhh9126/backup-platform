@@ -166,6 +166,7 @@ SUPPORTED_DB_TYPES = [
 # 各类型默认端口（供前端预填）
 DEFAULT_PORTS = {
     "mysql": 3306, "mariadb": 3306, "postgresql": 5432, "oracle": 1521, "kingbase": 54321,
+    "opengauss": 26000,
     "dameng": 5236, "sqlserver": 1433, "redis": 6379, "mongodb": 27017,
     "neo4j": 7687, "object_storage": 9000,
 }
@@ -173,7 +174,7 @@ DEFAULT_PORTS = {
 # 各类型显示名
 DB_DISPLAY_NAMES = {
     "mysql": "MySQL", "mariadb": "MariaDB", "postgresql": "PostgreSQL",
-    "oracle": "Oracle", "kingbase": "KingBase",
+    "oracle": "Oracle", "kingbase": "KingBase", "opengauss": "openGauss",
     "dameng": "DM 达梦", "sqlserver": "SQL Server",
     "redis": "Redis", "mongodb": "MongoDB", "file": "文件",
     "neo4j": "Neo4j", "vm": "虚拟机", "object_storage": "对象存储",

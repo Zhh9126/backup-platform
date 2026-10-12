@@ -34,6 +34,11 @@ class PostgreSQLEngine(BackupEngine):
     required_clients = ["pg_dump", "pg_restore", "psql"]
     # 物理备份：PostgreSQL 自带 pg_basebackup 工具
     physical_bundled_tools = ["pg_basebackup"]
+    # 远端物理备份工具参数（openGauss 等子类覆写为 gs_basebackup 等）
+    _phys_tool = "pg_basebackup"
+    _phys_default_port = 5432
+    _phys_default_user = "postgres"
+    _phys_label = "pg_basebackup"
 
     # ------------------------- 备份 -------------------------
     def backup(self, backup_type: BackupType) -> BackupResult:
@@ -84,6 +89,16 @@ class PostgreSQLEngine(BackupEngine):
                             backup_path=target, duration_sec=dur, stdout=ret.stdout,
                             message=f"PostgreSQL 物理备份(pg_basebackup)成功")
 
+    def _remote_phys_backup(self, ssh_host: dict) -> dict:
+        """远端流式物理备份的参数注入点（子类可覆写工具名/端口/用户/附加参数）。"""
+        from core import remote_dump
+        return remote_dump.remote_physical_backup(
+            self.task, ssh_host,
+            tool=self._phys_tool, default_port=self._phys_default_port,
+            default_user=self._phys_default_user,
+            extra_args_key="pg_basebackup_extra_args", tool_label=self._phys_label,
+        )
+
     def _backup_physical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
         """物理备份：通过 SSH 在远端数据库服务器执行 pg_basebackup（-Ft -z 生成
         tar.gz），再经 SFTP 拉回本机落盘并计算 size/sha256。
@@ -93,11 +108,7 @@ class PostgreSQLEngine(BackupEngine):
         """
         from core import remote_dump
         client = remote_dump._connect(ssh_host)
-        res = remote_dump.remote_physical_backup(
-            self.task, ssh_host,
-            tool="pg_basebackup", default_port=5432, default_user="postgres",
-            extra_args_key="pg_basebackup_extra_args", tool_label="pg_basebackup",
-        )
+        res = self._remote_phys_backup(ssh_host)
         if not res["ok"]:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,

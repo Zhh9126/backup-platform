@@ -204,7 +204,12 @@ def test_advisor_dameng_optimized_library_quiet():
 def test_advisor_probe_failure_never_blocks():
     cfg = _mk_cfg()
     conn = _StubConn({})          # 无脚本 → 全部探测失败
-    assert ca.run_compat_advisory(cfg, conn, ["t1"]) == []
+    out = ca.run_compat_advisory(cfg, conn, ["t1"])
+    # 探测类 findings 为空（绝不抛异常阻断）；但 MySQL→DM8 应用 SQL
+    # 兼容清单是静态知识，探测失败时必须照常兜底给出（2026-10 行为增强）
+    assert [f for f in out if not f["code"].startswith("app_sql_")] == []
+    assert len([f for f in out if f["code"].startswith("app_sql_")]) == 6
+    assert all(f["level"] == "info" for f in out)
 
 
 def test_advisor_oracle_identifier_30():

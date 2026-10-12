@@ -18,7 +18,7 @@ import socket
 import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from core import db, models
@@ -34,6 +34,24 @@ from .schema_compare import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 水位时间戳可解析格式（回看窗口回拨 / 延迟计算共用，按精度从高到低）
+_WATERMARK_TS_FORMATS = (
+    "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d",
+)
+
+
+def _parse_watermark_ts(value: str):
+    """尝试把水位解析为时间戳。返回 (datetime, fmt) 或 None。"""
+    v = str(value or "").strip()
+    for fmt in _WATERMARK_TS_FORMATS:
+        try:
+            return datetime.strptime(v, fmt), fmt
+        except ValueError:
+            continue
+    return None
 
 
 # ======================== 工具函数 ========================
@@ -99,6 +117,7 @@ def _task_to_config(task: Dict[str, Any]) -> SyncConfig:
         validate_before_run=bool(task.get("validate_before_run")),
         verify_after_run=bool(task.get("verify_after_run")),
         precheck_sample_rows=int(task.get("precheck_sample_rows") or 20),
+        skip_tables=list(task.get("skip_tables") or []),
     )
     # managed 源：从 backup_tasks 读取连接信息
     if cfg.source_type == "managed" and cfg.source_task_id:
@@ -282,6 +301,7 @@ class SyncEngine:
         total_read = 0
         total_write = 0
         errors = 0
+        error_details: List[str] = []   # 失败明细（脏数据审计：表名+原因+样本量）
         next_value = None
 
         table = dst_table or src_table
@@ -311,11 +331,34 @@ class SyncEngine:
                     from .compat_advisor import sanitize_zero_dates
                     sanitize_zero_dates(result.records, result.columns,
                                         cfg.tgt_db_type)
-                    written = self.writer.write_batch(tgt_conn, result.records, result.columns)
+                    try:
+                        written = self.writer.write_batch(
+                            tgt_conn, result.records, result.columns)
+                    except Exception as werr:
+                        # 临时性异常重试（指数退避，最多 1 次重试）：
+                        # 先回滚本批半提交行，再重写整批。upsert/overwrite 模式
+                        # 重试幂等安全；append 模式无唯一键保护，重试可能造重复，
+                        # 故不自动重试（遵循"宁可可控重复，不可恢复遗漏"，但
+                        # append 语义下重复不可被目标端识别，交由错误明细披露）。
+                        if cfg.save_mode == "append":
+                            raise
+                        try:
+                            tgt_conn.rollback()
+                        except Exception:
+                            pass
+                        time.sleep(1)
+                        written = self.writer.write_batch(
+                            tgt_conn, result.records, result.columns)
+                        logger.warning("[sync#%s] 批次写入失败后重试成功（%s 行）: %s",
+                                       cfg.task_id, len(result.records), werr)
                     total_write += written
                 except Exception as e:
                     logger.exception("write_batch failed")
                     errors += len(result.records)
+                    if len(error_details) < 20:
+                        error_details.append(
+                            f"[{src_table}] {str(e)[:300]} "
+                            f"(本批 {len(result.records)} 行全部跳过)")
                     if cfg.error_threshold and errors > cfg.error_threshold:
                         self._enable_constraints(tgt_conn)
                         self.writer.close(conn=tgt_conn)
@@ -352,12 +395,15 @@ class SyncEngine:
 
             duration = (datetime.now() - start).total_seconds()
             message = f"同步完成：读取 {total_read} 行，写入 {total_write} 行，错误 {errors} 行"
+            if error_details:
+                message += "；失败明细: " + " | ".join(error_details[:5])
             return {
                 "success": errors == 0 or (cfg.error_threshold and errors <= cfg.error_threshold),
                 "message": message,
                 "total_read": total_read,
                 "total_write": total_write,
                 "errors": errors,
+                "error_details": error_details,
                 "duration": duration,
                 "next_value": next_value,
             }
@@ -369,6 +415,7 @@ class SyncEngine:
                 "total_read": total_read,
                 "total_write": total_write,
                 "errors": errors,
+                "error_details": error_details,
                 "duration": (datetime.now() - start).total_seconds(),
             }
 
@@ -393,7 +440,14 @@ class SyncEngine:
         轮询 `> watermark` 的新增/变更行，upsert 到目标端。
         - 适用所有已注册插件库型（MySQL/PG/Oracle/达梦/SQLServer/金仓）
         - 时延 = poll_interval 秒级；要求表有可比较的增量列
-        - 位点（watermark）持久化到 sync 任务 message，重启续传
+        - 位点（watermark）持久化到 sync_tasks.realtime_watermark，重启续传，
+          避免每次重启重做全量快照；快照与增量通过该交接点衔接，不重不漏
+        - flink_config.poll_overlap_seconds：时间戳水位回看窗口（默认 0），
+          允许少量重叠读取、由目标端 upsert 幂等吸收，消除边界丢数
+        - flink_config.reconcile_every_polls：周期行数对账间隔（默认 720 轮，
+          0=关闭），检测轮询模式无法捕获的 DELETE
+        - 注意：轮询模式天然无法捕获 DELETE；需要删除同步的表请使用
+          binlog/WAL/LogMiner 等日志级 CDC 通道，或依赖周期对账 + 数据对比补偿
         """
         cfg = self.config
         if not cfg.incremental_column:
@@ -403,31 +457,66 @@ class SyncEngine:
         from .realtime_runners import get_stop_event
 
         poll_interval = int((cfg.flink_config or {}).get("poll_interval", 5))
-        # 1) 全量快照（upsert 幂等，不重不漏）
-        logger.info("[sync#%s] 轮询实时同步：先执行全量快照（增量列 %s）",
-                    cfg.task_id, cfg.incremental_column)
-        models.update_sync_task(cfg.task_id, {
-            "message": f"轮询实时同步启动：全量快照（增量列 {cfg.incremental_column}）...",
-        })
-        # 快照：单表任务尊重 cfg.target_table（此前走全库迁移路径，
-        # 快照写到了源表名对应的表，target_table 被忽略——真机实测发现）
-        if not cfg.full_db_migrate and (cfg.source_table or len(cfg.source_tables_list or []) == 1):
-            snap = self._run_single_table(
-                cfg.source_tables_list[0] if cfg.source_tables_list else cfg.source_table,
-                cfg.target_table or (cfg.source_tables_list[0] if cfg.source_tables_list
-                                     else cfg.source_table),
-                progress_callback)
+        # 回看窗口（秒）：时间戳水位向前重叠读取，重叠部分由目标端 upsert
+        # 幂等吸收，消除同秒多条记录/时间精度不足造成的边界丢数
+        overlap = int((cfg.flink_config or {}).get("poll_overlap_seconds", 0) or 0)
+        # 1) 断点续传：持久化水位与当前增量列一致时，跳过全量快照直接续传
+        #    （水位在每批写入成功后才推进，续传既不丢也不重）
+        saved = self._load_persisted_watermark(cfg.task_id)
+        if saved and saved.get("col") == cfg.incremental_column and saved.get("value"):
+            watermark = str(saved["value"])
+            logger.info("[sync#%s] 轮询实时同步：从持久化水位续传（%s >= %s）",
+                        cfg.task_id, cfg.incremental_column, watermark)
+            models.update_sync_task(cfg.task_id, {
+                "message": f"轮询实时同步启动：从上次水位续传"
+                           f"（{cfg.incremental_column} > {watermark}）...",
+            })
         else:
-            snap = self._run_full_migration(progress_callback)
-        if not snap.get("success"):
-            return snap
-
-        # 2) 轮询增量：watermark 从当前最大值开始（快照已含）
-        stop = get_stop_event(cfg.task_id)
-        watermark = cfg.incremental_value or ""
+            # 全量快照（upsert 幂等，不重不漏）
+            logger.info("[sync#%s] 轮询实时同步：先执行全量快照（增量列 %s）",
+                        cfg.task_id, cfg.incremental_column)
+            models.update_sync_task(cfg.task_id, {
+                "message": f"轮询实时同步启动：全量快照（增量列 {cfg.incremental_column}）...",
+            })
+            # 快照：单表任务尊重 cfg.target_table（此前走全库迁移路径，
+            # 快照写到了源表名对应的表，target_table 被忽略——真机实测发现）
+            if not cfg.full_db_migrate and (cfg.source_table or len(cfg.source_tables_list or []) == 1):
+                snap = self._run_single_table(
+                    cfg.source_tables_list[0] if cfg.source_tables_list else cfg.source_table,
+                    cfg.target_table or (cfg.source_tables_list[0] if cfg.source_tables_list
+                                         else cfg.source_table),
+                    progress_callback)
+            else:
+                snap = self._run_full_migration(progress_callback)
+            if not snap.get("success"):
+                return snap
+            # 2) 快照→增量的交接点：以源端当前最大值建立初始水位并立即持久化
+            #    （全量读取期间新写入的行 > 该水位，会由增量轮询补齐，不漏）
+            _t = (cfg.source_tables_list or [cfg.source_table])[0] \
+                if (cfg.source_tables_list or cfg.source_table) else ""
+            _ref = f"{cfg.src_schema}.{_t}" if (cfg.src_schema and _t) else (_t or "")
+            watermark = (self._max_incremental_value(
+                cfg, _ref, cfg.incremental_column) if _ref else "") \
+                or (cfg.incremental_value or "")
+            self._save_persisted_watermark(cfg.task_id, cfg.incremental_column,
+                                           watermark)
+        # 至少一次投递语义告警（Checkpoint 管不丢、目标端幂等管不脏）：
+        # 轮询实时同步在重启续传/回看窗口时会重复读取同一窗口，目标端必须
+        # 幂等才能吸收重复投递；append 模式没有唯一键保护，重复会落重复行。
+        if (cfg.save_mode or "append") != "upsert":
+            logger.warning(
+                "[sync#%s] 轮询实时同步为「至少一次投递」语义：重启续传与回看"
+                "窗口会重复读取，目标端需幂等（建议 save_mode=upsert）；"
+                "当前 save_mode=%s，重复投递将在目标端产生重复行",
+                cfg.task_id, cfg.save_mode)
         src_plugin = registry.get_plugin(cfg.src_db_type)
         tgt_plugin = registry.get_plugin(cfg.tgt_db_type)
         poll_count = 0
+        cycles = 0
+        # 周期对账：每 N 轮轮询做一次源/目标行数比对，检测轮询模式
+        # 无法捕获的 DELETE（目标<源）与重复/脏数据（目标>源）
+        reconcile_every = int((cfg.flink_config or {}).get(
+            "reconcile_every_polls", 720) or 0)
         logger.info("[sync#%s] 轮询实时同步进入增量循环（间隔 %ss）",
                     cfg.task_id, poll_interval)
         while not stop.is_set():
@@ -443,13 +532,20 @@ class SyncEngine:
                     if (cfg.source_tables_list or cfg.source_table) else ""
                 schema = cfg.src_schema or ""
                 table_ref = (f"{schema}.{table}" if schema else table)
+                tgt_table = cfg.target_table or table
+                tgt_schema = cfg.tgt_schema or ""
+                target_ref = (f"{tgt_schema}.{tgt_table}" if tgt_schema else tgt_table)
                 col = cfg.incremental_column
                 # watermark 内联（跨驱动参数类型不一致：PG int 列与字符串
                 # 参数比较会报 operator does not exist）。数字直接字面量，
                 # 其他（时间戳）转义单引号后加引号。
+                # 回看窗口：时间戳水位向前重叠 overlap 秒，重叠行由 upsert
+                # 幂等吸收（允许可控重复，杜绝边界丢数）
                 where = ""
                 if watermark:
-                    wm = str(watermark).replace("'", "''")
+                    qwm = self._shift_watermark_back(watermark, overlap) \
+                        if overlap else watermark
+                    wm = str(qwm).replace("'", "''")
                     if wm.isdigit():
                         where = f" WHERE {col} > {wm}"
                     else:
@@ -469,21 +565,53 @@ class SyncEngine:
                             "VARCHAR", v) for v in row] for row in rows]
                         from .compat_advisor import sanitize_zero_dates
                         sanitize_zero_dates(records, columns, cfg.tgt_db_type)
-                        total += writer.write_batch(wconn, records, columns)
+                        # 批次写入临时性异常：回滚本批半提交行后重试一次
+                        # （对标 Flink JDBC Sink withMaxRetries；append 模式
+                        # 不重试——水位未推进，下一轮从原水位整体重读）
+                        try:
+                            written = writer.write_batch(wconn, records, columns)
+                        except Exception as werr:
+                            if (cfg.save_mode or "append") == "append":
+                                raise
+                            try:
+                                wconn.rollback()
+                            except Exception:
+                                pass
+                            time.sleep(1)
+                            written = writer.write_batch(wconn, records, columns)
+                            logger.warning(
+                                "[sync#%s] 批次写入失败后重试成功（%s 行）: %s",
+                                cfg.task_id, len(records), werr)
+                        total += written
                         rows = cur.fetchmany(cfg.batch_size)
                 finally:
                     writer.close(conn=wconn)
                 if total:
+                    # 先写目标端成功，再推进并持久化水位（断点提交顺序）
                     watermark = self._max_incremental_value(
                         cfg, table_ref, col)
                     poll_count += total
+                    self._save_persisted_watermark(cfg.task_id, col, watermark)
+                    lag = self._watermark_lag_seconds(watermark)
                     models.update_sync_task(cfg.task_id, {
-                        "message": f"轮询实时同步中：已同步 {poll_count} 行"
-                                   f"（watermark={watermark}）",
+                        "message": (f"轮询实时同步中：已同步 {poll_count} 行，"
+                                    f"水位 {watermark}"
+                                    + (f"，延迟约 {lag}s" if lag is not None else "")),
                     })
                     logger.info("[sync#%s] 轮询同步 %d 行，watermark=%s",
                                 cfg.task_id, total, watermark)
                 reader.close(cur, conn)
+                cycles += 1
+                if (reconcile_every and cycles % reconcile_every == 0
+                        and table_ref and target_ref):
+                    diff = self._reconcile_counts(cfg, table_ref, target_ref)
+                    if diff:
+                        logger.warning("[sync#%s] %s（轮询模式无法捕获 DELETE，"
+                                       "建议执行数据对比定位差异，必要时重新全量快照）",
+                                       cfg.task_id, diff)
+                        models.update_sync_task(cfg.task_id, {
+                            "message": f"轮询实时同步中：已同步 {poll_count} 行；{diff}",
+                        })
             except Exception as e:
                 if getattr(cfg, "debug", False) or os.environ.get("SYNC_DEBUG"):
                     logger.warning("[sync#%s] 轮询异常:\n%s",
@@ -515,6 +643,94 @@ class SyncEngine:
             return ""
         finally:
             reader.close(conn=conn)
+
+    @staticmethod
+    def _load_persisted_watermark(task_id) -> Optional[dict]:
+        """读取持久化水位（sync_tasks.realtime_watermark，JSON）。"""
+        try:
+            row = models.get_sync_task(task_id, include_secret=True)
+            raw = (row or {}).get("realtime_watermark")
+            if not raw:
+                return None
+            data = json.loads(raw)
+            if isinstance(data, dict) and data.get("col") \
+                    and data.get("value") is not None:
+                return data
+        except Exception:
+            logger.debug("[sync#%s] 读取持久化水位失败", task_id, exc_info=True)
+        return None
+
+    @staticmethod
+    def _save_persisted_watermark(task_id, col: str, value) -> None:
+        """持久化水位（写入成功后调用，断点提交顺序：目标先落库再推位点）。"""
+        try:
+            models.update_sync_task(task_id, {"realtime_watermark": json.dumps(
+                {"col": col, "value": str(value)}, ensure_ascii=False)})
+        except Exception:
+            logger.warning("[sync#%s] 水位持久化失败（不影响本轮数据）",
+                           task_id, exc_info=True)
+
+    @staticmethod
+    def _shift_watermark_back(value: str, seconds: int) -> str:
+        """把时间戳水位回拨 seconds 秒（回看窗口）。
+
+        仅对可解析为时间戳的值生效；自增主键等数值水位原样返回
+        （数值重叠会整段重读，交由用户自行权衡）。
+        重叠部分由目标端 upsert 幂等吸收：允许少量重复读取，
+        但绝不因边界卡得太死而永久漏数。
+        """
+        parsed = _parse_watermark_ts(value)
+        if not parsed:
+            return str(value).strip()
+        dt, fmt = parsed
+        return (dt - timedelta(seconds=int(seconds))).strftime(fmt)
+
+    @staticmethod
+    def _watermark_lag_seconds(value) -> Optional[int]:
+        """水位为时间戳时计算同步延迟（当前时间 - 水位），秒。
+
+        非时间戳水位（自增主键等）无法计算时间延迟，返回 None。
+        用于实时同步可观测：延迟持续增大说明消费速度跟不上写入速度。
+        """
+        parsed = _parse_watermark_ts(value)
+        if not parsed:
+            return None
+        dt, _ = parsed
+        return max(0, int((datetime.now() - dt).total_seconds()))
+
+    def _reconcile_counts(self, cfg, table_ref: str,
+                          target_ref: str) -> Optional[str]:
+        """源/目标行数对账。返回差异描述（一致返回 None）。
+
+        轮询 CDC 看不见 DELETE，目标行数少于源端即存在静默删除；
+        目标多于源端则可能是重复写入或目标端脏数据。
+        """
+        src_cnt = tgt_cnt = None
+        try:
+            reader = registry.create_reader(cfg.src_db_type, cfg)
+            conn = reader.connect()
+            try:
+                cur = conn.cursor()
+                cur.execute(f"SELECT COUNT(*) FROM {table_ref}")
+                src_cnt = int(cur.fetchone()[0])
+            finally:
+                reader.close(conn=conn)
+        except Exception:
+            logger.debug("[sync#%s] 对账源端计数失败", cfg.task_id, exc_info=True)
+        try:
+            writer = registry.create_writer(cfg.tgt_db_type, cfg)
+            wconn = writer.connect()
+            try:
+                wcur = wconn.cursor()
+                wcur.execute(f"SELECT COUNT(*) FROM {target_ref}")
+                tgt_cnt = int(wcur.fetchone()[0])
+            finally:
+                writer.close(conn=wconn)
+        except Exception:
+            logger.debug("[sync#%s] 对账目标端计数失败", cfg.task_id, exc_info=True)
+        if src_cnt is None or tgt_cnt is None or src_cnt == tgt_cnt:
+            return None
+        return f"对账差异：源 {src_cnt} 行 / 目标 {tgt_cnt} 行"
 
     @staticmethod
     def _interrupt_stream(stream: Any) -> None:
@@ -775,10 +991,16 @@ class SyncEngine:
         grand_total_write = 0
         grand_errors = 0
         failed_tables = []
+        skipped_tables = []
+        skip = set(cfg.skip_tables or [])
 
-        logger.info("全库迁移开始：%d 张表", len(tables))
+        logger.info("全库迁移开始：%d 张表（跳过 %d 张）", len(tables), len(skip))
 
         for idx, table in enumerate(tables):
+            if table in skip:
+                # 断点续跑：上次迁移已成功的表跳过，只补缺失/失败的表
+                skipped_tables.append(table)
+                continue
             if progress_callback:
                 progress_callback({
                     "stage": "table",
@@ -807,7 +1029,8 @@ class SyncEngine:
         success = (not failed_tables) and bool(
             grand_errors == 0 or (cfg.error_threshold and grand_errors <= cfg.error_threshold))
         message = (
-            f"全库迁移：{len(tables)} 张表，读取 {grand_total_read} 行，"
+            f"全库迁移：执行 {len(results)} 张 / 跳过 {len(skipped_tables)} 张"
+            f"（共 {len(tables)} 张），读取 {grand_total_read} 行，"
             f"写入 {grand_total_write} 行，错误 {grand_errors} 行"
         )
         if failed_tables:
@@ -822,6 +1045,7 @@ class SyncEngine:
             "duration": duration,
             "tables": results,
             "failed_tables": failed_tables,
+            "skipped_tables": skipped_tables,
         }
 
     # ---- 约束管理（pg2mysql 核心优化） ----

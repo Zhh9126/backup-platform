@@ -513,7 +513,14 @@ CREATE TABLE IF NOT EXISTS backup_records (
     wal_lsn       TEXT,
     verified      INTEGER DEFAULT 0,
     verify_msg    TEXT,
-    storage_tier  TEXT DEFAULT 'local'               -- local | minio | s3 | multi
+    storage_tier  TEXT DEFAULT 'local',          -- local | minio | s3 | multi
+    locked        INTEGER DEFAULT 0,             -- 保留锁定（不可变备份）
+    locked_at     TEXT,
+    retention_until TEXT,                        -- 锁到期时间（到期前禁止删除）
+    write_protected INTEGER DEFAULT 0,           -- 产物文件 chmod 只读已生效
+    checksum_verified_at TEXT,                   -- 最近一次完整性复检时间
+    checksum_ok   INTEGER,                       -- 复检结果 1=一致 0=漂移
+    lock_note     TEXT                           -- 锁定/解锁操作者与原因
 );
 
 CREATE TABLE IF NOT EXISTS restore_records (
@@ -613,6 +620,7 @@ CREATE TABLE IF NOT EXISTS sync_tasks (
     error_threshold    INTEGER DEFAULT 0,        -- 0=不容错，N=允许 N 条错误
     realtime_enabled   INTEGER DEFAULT 0,        -- 实时同步开关（预留 Flink CDC）
     flink_config       TEXT,                     -- JSON Flink CDC 配置
+    realtime_watermark TEXT,                     -- 轮询实时同步持久化水位 JSON {"col":..,"value":..}
     schedule_type      TEXT DEFAULT 'none',
     cron_expr          TEXT,
     interval_minutes   INTEGER,
@@ -632,6 +640,9 @@ CREATE TABLE IF NOT EXISTS sync_records (
     finished_at   TEXT,
     status        TEXT,
     rows_synced   INTEGER DEFAULT 0,
+    read_rows     INTEGER DEFAULT 0,          -- 源端读取行数
+    error_rows    INTEGER DEFAULT 0,          -- 失败/跳过行数
+    watermark     TEXT,                       -- 本次运行结束时的水位
     message       TEXT
 );
 
@@ -849,6 +860,7 @@ CREATE TABLE IF NOT EXISTS db_migration_plans (
     phases_json    TEXT,                     -- 各阶段结果明细（JSON）
     error_msg      TEXT,                     -- 失败原因
     note           TEXT,
+    verify_sample_rows INTEGER DEFAULT 100,  -- 校验阶段抽样内容比对行数（0=关闭）
     created_at     TEXT,
     updated_at     TEXT,
     finished_at    TEXT
@@ -1324,6 +1336,20 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                 conn.execute("ALTER TABLE backup_records ADD COLUMN storage_tier TEXT DEFAULT 'local'")
             except Exception:
                 pass
+            # 迁移：不可变备份/保留锁定（G13：保留锁定+产物写保护+完整性复检）
+            for col, typedef in [
+                ("locked", "INTEGER DEFAULT 0"),
+                ("locked_at", "TEXT"),
+                ("retention_until", "TEXT"),
+                ("write_protected", "INTEGER DEFAULT 0"),
+                ("checksum_verified_at", "TEXT"),
+                ("checksum_ok", "INTEGER"),
+                ("lock_note", "TEXT"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE backup_records ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass
             # 迁移：压缩率统计列（Phase 压缩增强）
             for col, typedef in [
                 ("original_size_bytes", "INTEGER DEFAULT 0"),
@@ -1490,6 +1516,7 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                 ("full_done_at", "TEXT"),                  # 全量迁移完成时刻（增量起点）
                 ("inc_events", "INTEGER DEFAULT 0"),       # 已追平的增量事件数
                 ("inc_last_apply_at", "TEXT"),             # 最近一次增量投递时刻
+                ("verify_sample_rows", "INTEGER DEFAULT 100"),  # 校验抽样行数（0=关闭）
             ]:
                 try:
                     conn.execute(f"ALTER TABLE db_migration_plans ADD COLUMN {col} {typedef}")
@@ -1502,9 +1529,21 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                 ("cdc_lag_sec", "INTEGER DEFAULT 0"),
                 ("cdc_last_apply_at", "TEXT"),
                 ("conflict_policy", "TEXT DEFAULT 'overwrite'"),  # overwrite | skip | error
+                ("realtime_watermark", "TEXT"),   # 轮询实时同步持久化水位
             ]:
                 try:
                     conn.execute(f"ALTER TABLE sync_tasks ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass  # 列已存在，忽略
+
+            # 迁移：同步记录 —— 读取量/错误量/水位（可观测性与对账）
+            for col, typedef in [
+                ("read_rows", "INTEGER DEFAULT 0"),
+                ("error_rows", "INTEGER DEFAULT 0"),
+                ("watermark", "TEXT"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE sync_records ADD COLUMN {col} {typedef}")
                 except Exception:
                     pass  # 列已存在，忽略
 

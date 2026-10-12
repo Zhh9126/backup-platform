@@ -62,6 +62,9 @@ class SyncConfig:
     full_db_migrate: bool = False         # 全库迁移模式（一次同步所有表）
     validate_before_run: bool = False     # 执行前做 Schema 兼容性校验
     verify_after_run: bool = False        # 执行后做迁移数据校验
+    # 断点续跑（对标 influxdb2tsfile --resume）：上次迁移已成功的表跳过不重迁，
+    # 只补做缺失/失败的表；由迁移计划依据 manifest 生成
+    skip_tables: List[str] = field(default_factory=list)
 
 
 @dataclass

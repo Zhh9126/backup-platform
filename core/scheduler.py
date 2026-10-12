@@ -405,6 +405,16 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
         except Exception as e:
             models.mark_record_verified(rec_id, False, f"verify exception: {e}")
 
+    # 自动保留锁定（G13 不可变备份）：任务 extra_options.retention_lock_days
+    # > 0 时备份成功即上锁（备份即上锁的防勒索默认姿势）
+    if result.success and not is_sim and path:
+        try:
+            from core.immutability import maybe_autolock
+            maybe_autolock(task, rec_id)
+        except Exception as e:
+            _logger.warning("[immutability] 自动锁定失败 record=%s: %s",
+                            rec_id, e)
+
     models.set_task_status(task["id"], finished, status)
 
     if result.success and path:
@@ -1146,6 +1156,41 @@ def _register_cleanup(sched):
     _logger.info("[cleanup] 已注册备份保留清理任务，cron=%s", cron)
 
 
+def _integrity_check_job_wrapper():
+    """调度触发的不可变备份完整性复检：运行 core.immutability.recheck_all()。
+
+    对全部保留锁保护期内的备份重算 sha256 与基线比对，漂移即 ERROR 日志
+    （抗勒索：篡改/位 rot 早期发现）。
+    """
+    try:
+        from core import immutability
+        report = immutability.recheck_all()
+        _logger.info("[immutability] 完整性复检: 检查 %s / 一致 %s / 漂移 %s / "
+                     "丢失 %s", report.get("total"), report.get("match"),
+                     report.get("drift"), report.get("missing"))
+    except Exception:
+        _logger.exception("[immutability] 完整性复检异常")
+
+
+def _register_immutable_check(sched):
+    """注册不可变备份完整性复检任务（默认每日 04:40，system_config
+    integrity_check_cron 可覆盖；start 与 reload 两条路径都要注册）。"""
+    from apscheduler.triggers.cron import CronTrigger
+    cron = db.get_system_config("integrity_check_cron") or "40 4 * * *"
+    try:
+        trig = CronTrigger.from_crontab(cron)
+    except Exception as e:
+        _logger.warning("[immutability] cron 非法(%s)，回退默认", e)
+        trig = CronTrigger.from_crontab("40 4 * * *")
+    try:
+        sched.remove_job("backup_integrity_check")
+    except Exception:
+        pass
+    sched.add_job(_integrity_check_job_wrapper, trig, id="backup_integrity_check",
+                  replace_existing=True, misfire_grace_time=86400)
+    _logger.info("[immutability] 已注册完整性复检任务，cron=%s", cron)
+
+
 # ------------------------- Phase 4：季度演练排程 -------------------------
 def _drill_schedule_job_wrapper():
     """调度触发的季度演练：运行 DrillEngine.run_scheduled_drill()。
@@ -1458,6 +1503,7 @@ def start_scheduler():
     _register_gfs(_scheduler)
     _register_ferry(_scheduler)
     _register_cleanup(_scheduler)
+    _register_immutable_check(_scheduler)
     _register_rt_backup(_scheduler)
     _scheduler.start()
     _logger.info("调度器已启动，已注册 %d 个任务", len(_scheduler.get_jobs()))
@@ -1524,6 +1570,7 @@ def _reload_scheduler_locked():
     _register_gfs(_scheduler)
     _register_ferry(_scheduler)
     _register_cleanup(_scheduler)
+    _register_immutable_check(_scheduler)
     # RT 周期任务幂等重注册；Supervisor 主循环 tick 已保留，不重启守护
     if config.RT_BACKUP_ENABLED:
         _register_rt_periodic_jobs(_scheduler)

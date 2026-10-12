@@ -268,6 +268,30 @@ def run_precheck(cfg) -> Dict[str, Any]:
     except Exception as e:  # noqa: BLE001 - 顾问绝不阻断迁移
         _add(items, "compat_advisor", "info", f"兼容性探测跳过: {e}")
 
+    # 达梦目标：源端「列名」× 保留字交叉比对（表名已由顾问覆盖）。
+    # 命中列的 DDL 引擎会双引号引用、可正常建表，但应用 SQL 引用该列必须
+    # 带双引号——迁移不报错、上线随机炸的典型（达梦保留字远多于 MySQL，
+    # 且版本升级还会新增）。
+    if (cfg.tgt_db_type or "").lower() == "dameng":
+        try:
+            from .compat_advisor import dm_reserved_word_hits
+            _col_hits = set()
+            for _t in tables[:30]:
+                try:
+                    _cols = _get_columns(src_conn, cfg.src_db_type,
+                                         cfg.src_db_name, cfg.src_schema, _t)
+                except Exception:  # noqa: BLE001 - 单表取列失败不阻断
+                    continue
+                _col_hits |= dm_reserved_word_hits(tgt_conn, _cols)
+            if _col_hits:
+                _add(items, "dm_reserved_columns", "warn",
+                     f"以下源端列名命中达梦保留字（建表正常，但应用 SQL 引用"
+                     f"该列必须带双引号，或迁移前改名）："
+                     f"{', '.join(sorted(_col_hits))}")
+        except Exception as e:  # noqa: BLE001 - 列级检查绝不阻断
+            _add(items, "dm_reserved_columns", "info",
+                 f"列级保留字检查跳过: {e}")
+
     overwrite = cfg.save_mode == "overwrite"
     create_if_ne = cfg.save_mode == "create_if_not_exists"
 

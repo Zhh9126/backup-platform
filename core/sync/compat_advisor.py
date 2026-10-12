@@ -258,6 +258,65 @@ def _mysql_findings(conn, cfg, tables: List[str]) -> List[Dict[str, str]]:
     return out
 
 
+def dm_reserved_word_hits(conn: Any, names: List[str]) -> set:
+    """names（表名/列名）与达梦保留字的交集（大写归一）。
+
+    V$RESERVED_WORDS 不可读时退回兜底清单。供预检做列级交叉比对。
+    """
+    reserved = _dm_reserved_words(conn)
+    return {n.upper() for n in (names or [])
+            if n and n.upper() in reserved}
+
+
+_APP_SQL_CHECKLIST_DM8 = (
+    ("app_sql_concat_null",
+     "CONCAT 遇 NULL 行为不同：MySQL 返回 NULL，达梦把 NULL 当空字符串"
+     "（CONCAT('%',NULL,'%') 得 '%'）。依赖 NULL 传播的逻辑（参数为空不拼接"
+     "条件）会静默失效，请显式改用 COALESCE。另：达梦双引号是标识符引用符"
+     "不是字符串，CONCAT(\"%\",...) 必须改单引号，否则被解析成列名"
+     "（不报错但结果错）。"),
+    ("app_sql_functions",
+     "函数对照：IFNULL(a,b)→NVL/COALESCE；GROUP_CONCAT(c SEPARATOR ',')→"
+     "LISTAGG(c,',') WITHIN GROUP(ORDER BY c)（排序必须写进 WITHIN GROUP）；"
+     "DATE_FORMAT/STR_TO_DATE→TO_CHAR/TO_DATE（格式符不同）；"
+     "DATE_ADD(d,INTERVAL 1 DAY)→ADD_DAYS(d,1)；DATEDIFF(d1,d2)→"
+     "DATEDIFF(day,d1,d2)（必须带单位）；CONVERT(值,类型)→CONVERT(类型,值)"
+     "（参数序相反）；CAST(x AS SIGNED)→CAST(x AS INT)；REGEXP→REGEXP_LIKE；"
+     "FIND_IN_SET 无内置需自建。"),
+    ("app_sql_division_paging",
+     "除零与分页：达梦除零直接报错（MySQL 返回 NULL），可能除零处加 "
+     "NULLIF(x,0)；LIMIT offset,count 改 ROWNUM/TOP（MyBatis PageHelper 指定"
+     " helperDialect: oracle）。"),
+    ("app_sql_identity_index",
+     "自增与索引：AUTO_INCREMENT→IDENTITY(1,1)，达梦不能直接给自增列赋值，"
+     "需要时按需开启 IDENTITY_INSERT；FORCE INDEX(idx) 改 Hint："
+     "SELECT /*+INDEX(T1,IDX_T1_ID)*/ ...。"),
+    ("app_sql_schema_session",
+     "模式与会话：MySQL 的 database 对应达梦「用户+同名模式」，请使用专用"
+     "用户承载业务（硬性规范：不要落在 SYSDBA/MAIN 下）；InnoDB 默认隔离"
+     "级别 RR，达梦默认 READ COMMITTED，依赖 RR 语义的应用需显式对齐。"),
+    ("app_sql_stats_conn",
+     "迁移后收尾：逐表执行 CALL SP_TAB_STAT_INIT('模式名','TABLE_NAME') 收集"
+     "统计信息，否则执行计划可能严重劣化（平台迁移计划对达梦目标已自动执行）；"
+     "应用连接串建议 jdbc:dm://host:5236/DB?compatible_mode=mysql"
+     "&clobAsString=true；数据库连接配置集中管理，保留随时切回 MySQL 的回滚"
+     "通道。"),
+)
+
+
+def app_sql_checklist_dm8(cfg) -> List[Dict[str, str]]:
+    """MySQL→DM8 应用 SQL 兼容性清单（静态知识，info 级）。
+
+    覆盖探测不到的应用层改造点：数据搬过去不代表应用能跑——CONCAT/函数/
+    分页/保留字/隔离级别等问题只在业务 SQL 触发时暴露（信创改造
+    「迁移工具跑通那天才是痛苦的开始」）。仅在源为 MySQL 系时输出。
+    """
+    if (cfg.src_db_type or "").lower() not in ("mysql", "mariadb"):
+        return []
+    return [{"code": code, "level": "info", "message": msg}
+            for code, msg in _APP_SQL_CHECKLIST_DM8]
+
+
 def run_compat_advisory(cfg, tgt_conn, tables: Optional[List[str]] = None
                         ) -> List[Dict[str, str]]:
     """连接目标库做兼容性参数探测，返回 findings 列表。
@@ -266,15 +325,18 @@ def run_compat_advisory(cfg, tgt_conn, tables: Optional[List[str]] = None
     """
     tgt = (cfg.tgt_db_type or "").lower()
     tables = tables or []
+    out: List[Dict[str, str]] = []
     try:
         if tgt == "dameng":
-            return _dameng_findings(tgt_conn, cfg, tables)
-        if tgt == "oracle":
-            return _oracle_findings(tgt_conn, cfg, tables)
-        if tgt in ("postgresql", "kingbase", "opengauss"):
-            return _pg_findings(tgt_conn, cfg, tables)
-        if tgt in ("mysql", "mariadb"):
-            return _mysql_findings(tgt_conn, cfg, tables)
+            out = _dameng_findings(tgt_conn, cfg, tables)
+            out.extend(app_sql_checklist_dm8(cfg))
+        elif tgt == "oracle":
+            out = _oracle_findings(tgt_conn, cfg, tables)
+        elif tgt in ("postgresql", "kingbase", "opengauss"):
+            out = _pg_findings(tgt_conn, cfg, tables)
+        elif tgt in ("mysql", "mariadb"):
+            out = _mysql_findings(tgt_conn, cfg, tables)
     except Exception as e:  # noqa: BLE001 - 顾问绝不阻断
         logger.warning("[compat] 兼容性探测异常（忽略）: %s", e)
-    return []
+        out = []
+    return out

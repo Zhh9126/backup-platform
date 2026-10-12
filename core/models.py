@@ -96,6 +96,16 @@ def update_task(task_id: int, data: dict) -> bool:
 
 
 def delete_task(task_id: int) -> bool:
+    # 保留锁守卫（G13 不可变备份）：锁保护期内的备份记录禁止随任务级联删除，
+    # 防止"删任务顺手清掉受保护备份"——先解锁（留审计）或等锁到期
+    locked = db.query_one(
+        "SELECT COUNT(*) AS c FROM backup_records "
+        "WHERE task_id=? AND locked=1 AND (retention_until IS NULL "
+        "OR retention_until>=?)", (task_id, db.now_iso()))
+    if locked and locked["c"] > 0:
+        raise ValueError(
+            f"任务下有 {locked['c']} 条保留锁定的备份记录，禁止删除任务；"
+            "请先解锁对应备份记录（留审计）或等待锁到期")
     with db._write_lock:
         conn = db.get_conn()
         try:
@@ -646,7 +656,7 @@ SYNC_FIELDS = [
     "field_ide", "incremental_column", "incremental_value", "batch_size",
     "source_where", "error_threshold", "realtime_enabled", "flink_config",
     "full_db_migrate", "validate_before_run", "verify_after_run",
-    "precheck_sample_rows",
+    "precheck_sample_rows", "realtime_watermark",
     "schedule_type", "cron_expr", "interval_minutes", "enabled", "status",
     "message",
 ]

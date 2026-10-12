@@ -7,5 +7,6 @@
 """
 from .engine import SyncEngine, run_sync_task
 from .plugins import registry
+from .runner import run_sync
 
-__all__ = ["SyncEngine", "run_sync_task", "registry"]
+__all__ = ["SyncEngine", "run_sync_task", "registry", "run_sync"]

@@ -227,7 +227,16 @@ class DbMigrationEngine:
             # ---------- 阶段 2：结构迁移 + 全量迁移 ----------
             if "structure" in types or "full" in types:
                 self._set(plan_id, status=ST_MIGRATING, current_phase="migrate")
-                mig = self._phase_migrate(plan, with_structure="structure" in types)
+                # 断点续跑：上次执行失败且留有 manifest → 只补失败表
+                prev_manifest = (phases.get("migrate") or {}).get("manifest") or []
+                resume = bool(prev_manifest) and plan.get("status") == ST_FAILED
+                if resume:
+                    self.logger.info("[db_migrate] 计划 #%s 断点续跑：上次已成功 %s 张表将跳过",
+                                     plan_id,
+                                     sum(1 for m in prev_manifest if m.get("status") == "ok"))
+                mig = self._phase_migrate(
+                    plan, with_structure="structure" in types,
+                    prev_manifest=prev_manifest if resume else None)
                 phases["migrate"] = mig
                 self._set(plan_id, phases_json=json.dumps(phases, ensure_ascii=False))
                 if not mig["ok"]:
@@ -237,7 +246,8 @@ class DbMigrationEngine:
             # ---------- 阶段 3：数据校验 ----------
             if "verify" in types:
                 self._set(plan_id, status=ST_VERIFYING, current_phase="verify")
-                ver = self._phase_verify(plan)
+                ver = self._phase_verify(
+                    plan, manifest=(phases.get("migrate") or {}).get("manifest"))
                 phases["verify"] = ver
                 self._set(plan_id, phases_json=json.dumps(phases, ensure_ascii=False))
                 if not ver["ok"]:
@@ -493,9 +503,32 @@ class DbMigrationEngine:
             except Exception:  # noqa: BLE001
                 pass
 
-    def _phase_migrate(self, plan: dict, with_structure: bool) -> dict:
-        """结构迁移 + 全量迁移：复用同步引擎（create_if_not_exists + 全库）。"""
+    def _phase_migrate(self, plan: dict, with_structure: bool,
+                       prev_manifest: Optional[list] = None) -> dict:
+        """结构迁移 + 全量迁移：复用同步引擎（create_if_not_exists + 全库）。
+
+        断点续跑（对标 influxdb2tsfile --resume）：计划失败后重跑时，依据
+        上次 manifest 跳过已成功的表，只补做失败/缺失的表；append 模式下
+        失败表可能残留部分写入的行，重迁前先清空目标表，保证单元级幂等。
+        """
         from core.sync.engine import run_sync_task_with_task
+        skip_tables: list = []
+        cleared_tables: list = []
+        clear_warnings: list = []
+        if prev_manifest:
+            for m in prev_manifest:
+                if m.get("status") == "ok" and m.get("source_table"):
+                    skip_tables.append(m["source_table"])
+            if not with_structure:
+                # 仅全量（append）模式：失败表目标端可能已有部分行，重迁前清空
+                for m in prev_manifest:
+                    if m.get("status") != "ok" and m.get("source_table"):
+                        ok, msg = self._clear_target_table(plan, m["source_table"])
+                        if ok:
+                            cleared_tables.append(m["source_table"])
+                        else:
+                            clear_warnings.append(
+                                f"{m['source_table']}: {msg}")
         synthetic_task = {
             "id": -int(plan["id"]),  # 负数 id 避免与真实同步任务混淆（仅日志用）
             "name": f"迁移计划-{plan['name']}",
@@ -518,13 +551,46 @@ class DbMigrationEngine:
             "full_db_migrate": True,
             "validate_before_run": False,
             "verify_after_run": False,
+            "skip_tables": skip_tables,
         }
         started = time.monotonic()
         res = run_sync_task_with_task(synthetic_task)
+        # manifest（对标 influxdb2tsfile manifest.json）：逐表记录状态、行数、
+        # 错误明细，作为断点续跑依据与迁移产物追溯凭据
+        manifest = []
+        for t in res.get("tables", []):
+            manifest.append({
+                "source_table": t.get("table"),
+                "target_table": t.get("table"),
+                "status": "ok" if t.get("success") else "failed",
+                "rows_read": t.get("total_read", 0),
+                "rows_written": t.get("total_write", 0),
+                "errors": t.get("errors", 0),
+                "error_detail": (t.get("error_details") or [])[:3],
+            })
+        executed = {m["source_table"] for m in manifest}
+        for m in (prev_manifest or []):
+            if m.get("status") == "ok" and m.get("source_table") not in executed:
+                manifest.append({**m, "resumed": True})
+        # 达梦目标：迁移完成后逐表收集统计信息（SP_TAB_STAT_INIT），
+        # 否则优化器没有统计，执行计划可能严重劣化（信创迁移高频踩坑）
+        stats_init = None
+        if res.get("success") and (plan.get("tgt_db_type") or "").lower() == "dameng":
+            try:
+                stats_init = self._collect_dm_table_stats(
+                    plan, [m["source_table"] for m in manifest
+                           if m.get("status") == "ok"])
+            except Exception as e:  # noqa: BLE001 - 统计收集绝不阻断迁移结论
+                stats_init = {"executed": False, "reason": str(e)[:200]}
         result = {
             "ok": bool(res.get("success")),
             "phase": "migrate",
             "structure": ("create_if_not_exists" if with_structure else "跳过"),
+            "resume": bool(prev_manifest),
+            "skipped_tables": skip_tables,
+            "cleared_tables": cleared_tables,
+            "stats_init": stats_init,
+            "manifest": manifest,
             "message": res.get("message", ""),
             "total_read": res.get("total_read", 0),
             "total_write": res.get("total_write", 0),
@@ -532,10 +598,15 @@ class DbMigrationEngine:
             "duration_sec": round(time.monotonic() - started, 1),
             "started_at": db.now_iso(),
         }
+        if clear_warnings:
+            result["clear_warnings"] = clear_warnings
+        # 引擎预校验未通过时，把明细透出（此前只显示"N 项失败"，看不到哪项）
+        if res.get("precheck_failed") and res.get("precheck"):
+            result["precheck"] = res["precheck"]
         return result
 
-    def _phase_verify(self, plan: dict) -> dict:
-        """数据校验：逐表行数比对（源 vs 目标）。"""
+    def _phase_verify(self, plan: dict, manifest: Optional[list] = None) -> dict:
+        """数据校验：逐表行数比对（源 vs 目标）+ manifest 对照。"""
         db_type = plan["src_db_type"].lower()
         tables = []
         if db_type in ("mysql", "mariadb"):
@@ -569,6 +640,15 @@ class DbMigrationEngine:
 
         results = []
         all_match = True
+        # 抽样内容比对：行数一致不能证明内容一致（金额截断、状态映射错位、
+        # 时区偏移只有内容级校验能发现）。verify_sample_rows=0 可关闭。
+        sample_rows = 100 if plan.get("verify_sample_rows") is None \
+            else int(plan.get("verify_sample_rows") or 0)
+        sampled = 0
+        content_diffs = 0
+        manifest_diffs = 0
+        m_rows = self._manifest_rows_map(manifest)
+        from core.data_compare import _norm_val
         for tb in tables:
             src_cnt = self._count_rows(plan["src_db_type"], plan["src_host"],
                                        plan["src_port"], plan["src_username"],
@@ -577,22 +657,134 @@ class DbMigrationEngine:
                                        plan["tgt_port"], plan["tgt_username"],
                                        plan["tgt_password"], plan["tgt_db_name"], tb)
             match = src_cnt == tgt_cnt
-            all_match = all_match and match
-            results.append({"table": tb, "source_rows": src_cnt,
-                            "target_rows": tgt_cnt, "match": match})
+            entry = {"table": tb, "source_rows": src_cnt,
+                     "target_rows": tgt_cnt, "match": match}
+            # manifest 对照：迁移时每表写入行数 vs 校验时实际行数，不一致说明
+            # 迁移后目标端又发生了变化（或存在绕过迁移链路的写入）
+            if m_rows:
+                mw = m_rows.get(str(tb).lower())
+                if mw is not None:
+                    entry["manifest_rows"] = mw
+                    if mw != tgt_cnt:
+                        entry["manifest_diff"] = True
+                        manifest_diffs += 1
+            if match and sample_rows > 0 and sampled < 50:
+                try:
+                    src_rows = self._fetch_sample(
+                        plan["src_db_type"], plan["src_host"], plan["src_port"],
+                        plan["src_username"], plan["src_password"],
+                        plan["src_db_name"], tb, sample_rows)
+                    tgt_rows = self._fetch_sample(
+                        plan["tgt_db_type"], plan["tgt_host"], plan["tgt_port"],
+                        plan["tgt_username"], plan["tgt_password"],
+                        plan["tgt_db_name"], tb, sample_rows)
+                    if src_rows is not None and tgt_rows is not None:
+                        sampled += 1
+                        diff = self._diff_samples(src_rows, tgt_rows)
+                        entry["sample_rows"] = min(sample_rows,
+                                                   max(len(src_rows), len(tgt_rows)))
+                        entry["sample_diff"] = diff
+                        if diff:
+                            entry["match"] = False
+                            entry["content_mismatch"] = True
+                            content_diffs += 1
+                except Exception as e:  # 抽样失败不阻断行数校验结论
+                    entry["sample_error"] = str(e)[:200]
+            all_match = all_match and entry["match"]
+            results.append(entry)
 
         ok = bool(results) and all_match
+        if content_diffs:
+            msg = (f"{content_diffs} 张表抽样内容不一致（可能因源端持续写入，"
+                   "或存在字段截断/映射错位），详见明细")
+        elif ok:
+            msg = (f"全部 {len(results)} 张表行数一致"
+                   + (f"，抽样内容比对 {sampled} 张通过" if sampled else ""))
+        else:
+            msg = "存在行数或内容不一致的表，详见明细"
         return {
             "ok": ok,
             "phase": "verify",
-            "check_type": "row_count_compare",
+            "check_type": "row_count_and_sample_compare",
             "tables_total": len(results),
             "tables_matched": sum(1 for r in results if r["match"]),
+            "sampled_tables": sampled,
+            "content_mismatched": content_diffs,
+            "manifest_compared": bool(m_rows),
+            "manifest_mismatched": manifest_diffs,
             "tables": results,
-            "message": ("全部 %d 张表行数一致" % len(results)
-                        if ok else "存在行数不一致的表，详见明细"),
+            "message": msg,
             "finished_at": db.now_iso(),
         }
+
+    @staticmethod
+    def _manifest_rows_map(manifest: Optional[list]) -> dict:
+        """manifest → {表名(小写): 迁移时写入行数}（大小写不敏感，兼容达梦/Oracle 大写）。"""
+        out = {}
+        for m in manifest or []:
+            if m.get("status") == "ok" and m.get("source_table"):
+                out[str(m["source_table"]).lower()] = int(m.get("rows_written") or 0)
+        return out
+
+    @staticmethod
+    def _diff_samples(src_rows, tgt_rows) -> int:
+        """逐行比对两侧归一化抽样行，返回差异行数。"""
+        norm = DbMigrationEngine._norm_sample_rows
+        s_rows = norm(src_rows)
+        t_rows = norm(tgt_rows)
+        diff = 0
+        for i in range(max(len(s_rows), len(t_rows))):
+            s = s_rows[i] if i < len(s_rows) else None
+            t = t_rows[i] if i < len(t_rows) else None
+            if s != t:
+                diff += 1
+        return diff
+
+    @staticmethod
+    def _norm_sample_rows(rows):
+        """归一化抽样行：bool→0/1（pymysql tinyint(1) 返回 bool，
+        与 PG smallint 的 1/0 直比会误报），其余复用数据对比的归一化规则
+        （None/bytes/datetime/float 统一成可比对字符串）。"""
+        from core.data_compare import _norm_val
+        out = []
+        for r in rows or []:
+            out.append(tuple("1" if v is True else "0" if v is False
+                             else _norm_val(v) for v in r))
+        return out
+
+    @staticmethod
+    def _fetch_sample(db_type, host, port, user, password, database, table, n):
+        """按第一列排序取前 n 行（内容校验抽样）。不支持的原生库型返回 None。"""
+        from core.data_compare import _get_columns, _sample_sql
+        db_type = (db_type or "").lower()
+        if db_type in ("mysql", "mariadb"):
+            import pymysql
+            conn = pymysql.connect(host=host, port=int(port or 3306), user=user,
+                                   password=password, database=database,
+                                   connect_timeout=5, charset="utf8mb4")
+        elif db_type == "postgresql":
+            import psycopg2
+            conn = psycopg2.connect(host=host, port=int(port or 5432), user=user,
+                                    password=password, dbname=database,
+                                    connect_timeout=5)
+        else:
+            return None
+        try:
+            cur = conn.cursor()
+            cols = _get_columns(conn, db_type, database, "", table)
+            if not cols:
+                return None
+            if db_type in ("mysql", "mariadb"):
+                ref = "`{}`".format(table.replace("`", ""))
+            else:
+                ref = '"{}"'.format(table.replace('"', ""))
+            cur.execute(_sample_sql(db_type, ref, cols[0], int(n)))
+            return cur.fetchall()
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     @staticmethod
     def _count_rows(db_type, host, port, user, password, database, table) -> int:
@@ -641,6 +833,209 @@ class DbMigrationEngine:
             finally:
                 conn.close()
         return -1
+
+
+    # ------------------------- 预演 / 断点续跑辅助 -------------------------
+    def dry_run(self, plan_id: int) -> dict:
+        """迁移预演（对标 influxdb2tsfile discover + --dry-run）。
+
+        只读操作：探查源库表清单与行数（系统统计采样值），给出将执行的
+        阶段与写入方式，不读取业务数据、不写目标端。结果存入
+        phases_json["dry_run"] 供前端/详情查看，不改变计划状态。
+        """
+        plan = self.get_plan(plan_id, hide_secret=False)
+        if not plan:
+            raise ValueError(f"迁移计划不存在: {plan_id}")
+        if plan["status"] in (ST_CHECKING, ST_MIGRATING, ST_VERIFYING):
+            raise ValueError("计划正在执行中，无法预演")
+        types = plan.get("migrate_types") or []
+        result: Dict[str, Any] = {
+            "ok": False, "phase": "dry_run",
+            "src": f"{plan['src_db_type']} {plan['src_host']}:{plan.get('src_port') or '-'}/"
+                   f"{plan['src_db_name']}",
+            "tgt": f"{plan['tgt_db_type']} {plan['tgt_host']}:{plan.get('tgt_port') or '-'}/"
+                   f"{plan['tgt_db_name']}",
+            "planned_phases": list(types),
+            "write_mode": ("overwrite（结构+全量：目标表按源端 schema 重建，可重复执行）"
+                           if "structure" in types else "append（仅全量追加，不清空目标表）"),
+            "tables": [], "tables_total": 0, "approx_rows_total": 0,
+            "note": ("行数取自源库系统统计信息（采样值，仅供预演评估）；"
+                     "结构映射由同步引擎按列元数据自动转换（含主键/自增还原与"
+                     "异源类型归一化）"),
+            "generated_at": db.now_iso(),
+        }
+        try:
+            tables, note = self._list_source_tables(plan)
+            if note:
+                result["note"] += f"；{note}"
+            result["tables"] = tables
+            result["tables_total"] = len(tables)
+            result["approx_rows_total"] = sum(int(t.get("approx_rows") or 0) for t in tables)
+            result["ok"] = True
+            result["message"] = (f"预演完成：{len(tables)} 张表，"
+                                 f"约 {result['approx_rows_total']} 行待迁移"
+                                 if tables else "未获取到表清单（见 note）")
+        except Exception as e:  # noqa: BLE001
+            result["message"] = f"预演失败: {e}"
+        phases = plan.get("phases_json") or {}
+        phases["dry_run"] = result
+        self._set(plan_id, phases_json=json.dumps(phases, ensure_ascii=False))
+        return result
+
+    def _list_source_tables(self, plan: dict) -> tuple:
+        """源库表清单（表名 + 统计行数采样值）。返回 ([{name, approx_rows}], note)。"""
+        db_type = (plan.get("src_db_type") or "").lower()
+        db_name = (plan.get("src_db_name") or "").strip()
+        user = (plan.get("src_username") or "").strip()
+        owner = (user or db_name).replace("'", "''").upper()
+        qname = db_name.replace("'", "''")
+        if db_type in ("mysql", "mariadb"):
+            sql = ("SELECT table_name, IFNULL(table_rows,0) FROM information_schema.tables"
+                   f" WHERE table_schema='{qname}' AND table_type='BASE TABLE'"
+                   " ORDER BY table_name")
+        elif db_type in ("postgresql", "kingbase"):
+            sql = ("SELECT t.table_name, COALESCE(s.n_live_tup, 0)"
+                   " FROM information_schema.tables t"
+                   " LEFT JOIN pg_stat_user_tables s ON s.relname = t.table_name"
+                   " WHERE t.table_schema NOT IN ('pg_catalog','information_schema',"
+                   "'sys_catalog','sys') AND t.table_type='BASE TABLE' ORDER BY 1")
+        elif db_type in ("oracle", "dameng"):
+            sql = (f"SELECT table_name, NVL(num_rows, 0) FROM all_tables"
+                   f" WHERE owner = '{owner}' ORDER BY table_name")
+        elif db_type == "sqlserver":
+            sql = ("SELECT t.TABLE_NAME, ISNULL(SUM(p.rows), 0)"
+                   " FROM INFORMATION_SCHEMA.TABLES t"
+                   " JOIN sys.objects o ON o.name = t.TABLE_NAME AND o.type='U'"
+                   " LEFT JOIN sys.partitions p ON p.object_id = o.object_id"
+                   " AND p.index_id IN (0,1)"
+                   f" WHERE t.TABLE_CATALOG='{qname}' AND t.TABLE_TYPE='BASE TABLE'"
+                   " GROUP BY t.TABLE_NAME ORDER BY 1")
+        else:
+            return [], f"暂不支持预览该源类型（{db_type}）的表清单"
+        conn = _stats_connect(db_type, plan.get("src_host") or "",
+                              int(plan.get("src_port") or 0) or None,
+                              db_name, user, plan.get("src_password") or "")
+        out = []
+        try:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql)
+                for r in cur.fetchall():
+                    out.append({"name": str(r[0]),
+                                "approx_rows": int(r[1] or 0)})
+            finally:
+                try:
+                    cur.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return out, ""
+
+    def _clear_target_table(self, plan: dict, table: str) -> tuple:
+        """清空目标端单表（断点续跑时失败表重迁前的幂等保障）。
+
+        达梦/Oracle 未加引号标识符按大写存储（与 writer 建表一致）。
+        返回 (ok, message)；不支持的类型如实返回原因（调用方记 warning，
+        绝不静默跳过——留着部分行重迁会制造重复）。
+        """
+        db_type = (plan.get("tgt_db_type") or "").lower()
+        table = (table or "").replace('"', "").replace("`", "")
+        if db_type in ("mysql", "mariadb"):
+            ref = "`{}`".format(table.replace("`", ""))
+        elif db_type in ("postgresql", "kingbase"):
+            ref = '"{}"'.format(table)
+        elif db_type in ("dameng", "oracle"):
+            tbl = table.upper()
+            ref = '"{}"'.format(tbl)
+            database = (plan.get("tgt_db_name") or "").replace('"', "")
+            if database:
+                ref = '"{}".'.format(database) + ref
+        else:
+            return False, f"目标类型 {db_type} 暂不支持自动清表，请手工清空后重试"
+        try:
+            conn = _stats_connect(db_type, plan.get("tgt_host") or "",
+                                  int(plan.get("tgt_port") or 0) or None,
+                                  plan.get("tgt_db_name") or "",
+                                  plan.get("tgt_username") or "",
+                                  plan.get("tgt_password") or "")
+        except Exception as e:  # noqa: BLE001
+            return False, f"目标库连接失败: {str(e)[:200]}"
+        try:
+            cur = conn.cursor()
+            try:
+                cur.execute(f"DELETE FROM {ref}")
+                conn.commit()
+                return True, "已清空"
+            finally:
+                try:
+                    cur.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as e:  # noqa: BLE001
+            return False, f"清表失败: {str(e)[:200]}"
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _collect_dm_table_stats(self, plan: dict, tables: list) -> dict:
+        """达梦目标迁移完成后逐表收集统计信息（CALL SP_TAB_STAT_INIT）。
+
+        best-effort：单表失败记入 failed 列表，不阻断迁移结论（可事后手工
+        补执行）；连接失败如实返回原因。
+        """
+        schema = (plan.get("tgt_username") or plan.get("tgt_db_name") or ""
+                  ).replace("'", "").upper()
+        if not schema or not tables:
+            return {"executed": False, "reason": "缺少模式名或表清单"}
+        try:
+            conn = _stats_connect("dameng", plan.get("tgt_host") or "",
+                                  int(plan.get("tgt_port") or 0) or None,
+                                  plan.get("tgt_db_name") or "",
+                                  plan.get("tgt_username") or "",
+                                  plan.get("tgt_password") or "")
+        except Exception as e:  # noqa: BLE001
+            # dmPython 缺失（DriverUnavailable）等 → JDBC 兜底（jar 随离线包内置）
+            try:
+                from core import jdbc
+                conn = jdbc.connect("dameng", plan.get("tgt_host") or "",
+                                    int(plan.get("tgt_port") or 0) or None,
+                                    plan.get("tgt_db_name") or "",
+                                    plan.get("tgt_username") or "",
+                                    plan.get("tgt_password") or "")
+            except Exception as e2:  # noqa: BLE001
+                return {"executed": False,
+                        "reason": f"目标达梦连接失败: {str(e2)[:200]}"}
+        collected, failed = [], []
+        try:
+            for t in tables:
+                tbl = (t or "").replace('"', "").upper()
+                if not tbl:
+                    continue
+                try:
+                    cur = conn.cursor()
+                    try:
+                        cur.execute(f"CALL SP_TAB_STAT_INIT('{schema}', '{tbl}')")
+                    finally:
+                        try:
+                            cur.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    collected.append(tbl)
+                except Exception as e:  # noqa: BLE001 - 单表失败不阻断
+                    failed.append({"table": tbl, "error": str(e)[:150]})
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        return {"executed": True, "schema": schema,
+                "collected": collected, "failed": failed}
 
 
 engine = DbMigrationEngine()

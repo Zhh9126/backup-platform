@@ -1,24 +1,17 @@
 # -*- coding: utf-8 -*-
-"""
-数据同步兼容入口。
+"""数据同步调度入口。
 
-新版同步引擎采用 DataX/LinkUp 风格：Source Reader → 统一 Java 类型 → Sink Writer，
-支持表级同步、字段映射、写入模式（append/overwrite/upsert/create_if_not_exists）、
-增量同步与实时同步（Flink CDC 预留）。
-
-本模块保留旧的 `run_sync(sync_task_id)` 调度入口，负责：
-- 解密连接密码
-- 创建/更新 sync_records
-- 调用 core.sync.engine 执行同步
-- 失败时触发通知与日志
+注意：本目录（core/sync/ 是包）会遮蔽同名的 core/sync.py 旧模块——
+旧模块里的 run_sync 因此从未被 import 到，调度器 core.sync.run_sync
+此前一直 AttributeError 静默失败（2026-10 体检发现并修复）。
+run_sync 现定居本文件，并由 core/sync/__init__.py 导出。
 """
 from datetime import datetime
 from typing import Optional
 
-import config
 import core.db as db
 from core import models, notifier
-from core.sync.engine import run_sync_task_with_task
+from .engine import run_sync_task_with_task
 
 _logger = db.get_logger("sync")
 
@@ -41,6 +34,7 @@ def run_sync(sync_task_id: int) -> Optional[dict]:
                  task["id"], task.get("name"),
                  task.get("src_db_type"), task.get("tgt_db_type"))
 
+    res = {}
     try:
         res = run_sync_task_with_task(task)
         status = "success" if res.get("success") else "failed"
@@ -67,9 +61,16 @@ def run_sync(sync_task_id: int) -> Optional[dict]:
         )
 
     finished = db.now_iso()
+    # 可观测对账：读取量 = 写入 + 过滤 + 失败，任何一项缺失即链路黑箱
     db.execute(
-        "UPDATE sync_records SET finished_at=?, status=?, rows_synced=?, message=? WHERE id=?",
-        (finished, status, rows, message, rec_id),
+        "UPDATE sync_records SET finished_at=?, status=?, rows_synced=?, "
+        "read_rows=?, error_rows=?, watermark=?, message=? WHERE id=?",
+        (finished, status, rows,
+         res.get("total_read", 0),
+         res.get("errors", 0),
+         (str(res.get("next_value")) if res.get("next_value") is not None
+          else None),
+         message, rec_id),
     )
 
     if status == "failed":

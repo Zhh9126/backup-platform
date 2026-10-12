@@ -142,3 +142,15 @@ def api_run_db_migrate(plan_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
     return jsonify(result)
+
+
+@api_bp.route("/db-migrate/<int:plan_id>/dry-run", methods=["POST"])
+@api_bp.route("/migration-plans/<int:plan_id>/dry-run", methods=["POST"])
+@login_required
+def api_dry_run_db_migrate(plan_id):
+    """迁移预演（只读：表清单/行数统计/写入方式），不执行迁移。"""
+    try:
+        result = _migrate_engine.dry_run(plan_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    return jsonify(result)

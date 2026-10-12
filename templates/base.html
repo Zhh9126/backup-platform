@@ -93,7 +93,7 @@
   <!-- 首屏注入 META（数据库类型/显示名/默认端口）：必须在 bkp-core.js 之前，
        否则依赖 BKP.META 的下拉会被填成空（见 app.py context_processor 注释） -->
   <script>window.__BKP_META__ = {{ bkp_meta | default({}) | tojson }};</script>
-  <script src="/static/js/i18n.js?v=2026101204"></script>
+  <script src="/static/js/i18n.js?v=2026101210"></script>
   <script src="/static/js/bkp-core.js?v=2026092402"></script>
   <script src="/static/js/app.js?v=2026101203"></script>
   <script>

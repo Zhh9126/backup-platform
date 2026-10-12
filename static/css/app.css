@@ -208,11 +208,11 @@ i.bi { line-height: 1; }
   pointer-events: none;
 }
 
-/* 内容区 — 撑满可用空间 */
+/* 内容区 — 撑满可用空间（顶部为右上角语言按钮预留空间） */
 .content {
   flex: 1;
   margin-left: var(--sidebar-w);
-  padding: var(--space-lg);
+  padding: calc(var(--space-lg) + 30px) var(--space-lg) var(--space-lg);
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -519,6 +519,32 @@ textarea.form-control { height: auto; padding: 8px 12px; }
 .font-code { font-family: var(--font-family-code); font-size: var(--font-size-sm); }
 
 /* ---------- 全站 UI 美观度增强 ---------- */
+
+/* 语言切换悬浮按钮（右上角） */
+.lang-fab {
+  position: fixed;
+  top: 12px;
+  right: 18px;
+  z-index: 1040;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border-base);
+  background: var(--card-bg);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  line-height: 1.4;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(15, 23, 42, .08);
+  transition: color .15s ease, border-color .15s ease, box-shadow .15s ease;
+}
+.lang-fab:hover {
+  color: var(--primary);
+  border-color: var(--primary);
+  box-shadow: 0 2px 8px rgba(13, 148, 136, .15);
+}
 
 /* 页面头部统一 */
 .page-header {

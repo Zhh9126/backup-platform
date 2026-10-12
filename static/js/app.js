@@ -3910,6 +3910,8 @@
                  redis_maxmem:"1gb",redis_evict:"allkeys-lru",redis_aof:"yes",redis_cluster:""},
       mongodb:  {base:"/usr/local/mongodb",data:"/data/mongodb",port:27017,version:"7.0",
                  mongo_repl:"",mongo_cache:"1",mongo_auth:"1"},
+      opengauss:{base:"/opt/gaussdb5",data:"/data/gaussdb5/data/db1",port:26000,version:"6.0.0",
+                 og_os_user:"omm",og_app_user:"gaussadmin",og_init_pwd:"Gauss@123"},
     };
     const d = defs[t] || defs.mysql;
     // 核心参数

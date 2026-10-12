@@ -67,6 +67,12 @@ DEPLOY_PARAMS = {
         "port": 27017,
         "password": "mongo123",
     },
+    "opengauss": {
+        "base_dir": "/opt/gaussdb5",
+        "data_dir": "/data/gaussdb5/data/db1",
+        "port": 26000,
+        "password": "AIDBM@2026",
+    },
 }
 
 # 安装脚本模板路径（项目根下的 scripts/ 目录）
@@ -930,6 +936,185 @@ ldconfig
 echo "[deploy] MongoDB 部署完成! 端口={port}  数据目录={data}  环境变量: /etc/profile.d/mongodb.sh"
 echo "提示：新开 SSH 终端前请先 source /etc/profile 或重新登录"
 echo "DEPLOY_OK"
+
+"""
+    elif db_type == "opengauss":
+        og_os_user = params.get("og_os_user", "omm")
+        og_app_user = params.get("og_app_user", "gaussadmin")
+        og_init_pwd = params.get("og_init_pwd", "Gauss@123")
+
+        return f"""#!/bin/bash
+# AIDBM openGauss 单机自包含部署（多 OS 兼容：openEuler/CentOS/RHEL/Ubuntu/Kylin/UOS）
+# 特性：自动适配包管理器、自动处理依赖、修复 libssl 与 core_pattern 兼容问题
+set +e
+echo "[deploy] ====== openGauss 部署开始 ======"
+if [ "$(id -u)" -ne 0 ]; then echo "[deploy] ERROR: 请使用 root 用户部署"; exit 1; fi
+
+INSTALL_DIR="{base}"
+DATA_DIR="{data}"
+PORT={port}
+DB_OS_USER="{og_os_user}"
+APP_USER="{og_app_user}"
+APP_PWD="{pw}"
+INIT_PWD="{og_init_pwd}"
+PKG="{pkg}"
+
+echo "[deploy] 1. 识别操作系统与包管理器..."
+if command -v dnf >/dev/null 2>&1; then PKG_MGR=dnf
+elif command -v yum >/dev/null 2>&1; then PKG_MGR=yum
+elif command -v apt-get >/dev/null 2>&1; then PKG_MGR=apt-get
+else echo "[deploy] ERROR: 未识别的包管理器，请手动安装依赖"; exit 1; fi
+echo "[deploy] 使用包管理器: $PKG_MGR"
+
+echo "[deploy] 2. 检查并安装系统依赖..."
+if [ "$PKG_MGR" = "apt-get" ]; then
+    apt-get update
+    for p in bzip2 libaio1 libreadline-dev flex bison libncurses5-dev libopenblas-dev wget make gcc perl zlib1g-dev; do
+        dpkg -s $p >/dev/null 2>&1 || apt-get install -y $p || echo "[deploy] WARN: $p 安装失败"
+    done
+else
+    for p in bzip2 libaio readline flex bison ncurses-devel openblas wget make gcc perl zlib-devel; do
+        rpm -q $p >/dev/null 2>&1 || $PKG_MGR install -y $p || echo "[deploy] WARN: $p 安装失败"
+    done
+fi
+
+echo "[deploy] 3. 修复系统 core dump 路径 (openGauss 强依赖)..."
+CORE_PATTERN=$(cat /proc/sys/kernel/core_pattern 2>/dev/null)
+if [[ "$CORE_PATTERN" == \\|* ]]; then
+    echo "检测到 core_pattern 以管道符开头，修改为普通路径"
+    echo "/tmp/core-%e.%p" > /proc/sys/kernel/core_pattern
+fi
+
+echo "[deploy] 4. 查找并校验安装包架构..."
+TARBALL="$PKG"
+if [ -z "$TARBALL" ] || [ ! -f "$TARBALL" ]; then
+    TARBALL=$(find /tmp /root -maxdepth 1 -name "*openGauss-Server-*.tar.bz2" 2>/dev/null | head -n 1)
+fi
+if [ -z "$TARBALL" ]; then echo "[deploy] ERROR: 未找到 openGauss 安装包(*openGauss-Server-*.tar.bz2)"; exit 1; fi
+echo "[deploy] 找到安装包: $TARBALL"
+PKG_ARCH=$(echo "$TARBALL" | grep -oE 'x86_64|aarch64')
+SYS_ARCH=$(uname -m)
+if [ -n "$PKG_ARCH" ] && [ "$SYS_ARCH" != "$PKG_ARCH" ]; then
+    echo "[deploy] ERROR: 架构不匹配！系统为 $SYS_ARCH，安装包为 $PKG_ARCH"; exit 1
+fi
+# glibc 预检：openEuler/Ubuntu 高版本构建的包在 CentOS 7 等低 glibc 系统上无法运行。
+# GLIBC 版本行属致命（无法像普通 so 那样推补），必须提前失败并给出明确指引。
+mkdir -p /tmp/aidbm_gauss_probe
+if tar -xf "$TARBALL" -C /tmp/aidbm_gauss_probe 2>/dev/null; then
+    PROBE_BIN=$(find /tmp/aidbm_gauss_probe -name gs_ctl -type f 2>/dev/null | head -1)
+    if [ -n "$PROBE_BIN" ]; then
+        MISS=$(ldd "$PROBE_BIN" 2>&1 | grep -E "version .GLIBC_" | head -3)
+        if [ -n "$MISS" ]; then
+            echo "[deploy] ERROR: 安装包与目标系统 glibc 不兼容（致命，无法通过推补依赖库解决）："
+            echo "$MISS"
+            echo "[deploy] ERROR: 当前系统 $(cat /etc/os-release 2>/dev/null | grep -oE 'VERSION="[0-9.]+"' | head -1) glibc $(ldd --version | head -1 | grep -oE '[0-9]+\\.[0-9]+$')"
+            echo "[deploy] ERROR: 请改用与目标 OS 匹配的 openGauss 安装包（CentOS 7 请用 openGauss CentOS 7 构建版，如 openGauss-Server-6.0.0-CentOS7-x86_64.tar.bz2）。"
+            rm -rf /tmp/aidbm_gauss_probe
+            exit 1
+        fi
+    fi
+fi
+rm -rf /tmp/aidbm_gauss_probe
+
+echo "[deploy] 5. 清理旧环境残留..."
+pkill -9 -f "$INSTALL_DIR/bin/gaussdb" 2>/dev/null
+pkill -9 -f "$INSTALL_DIR/bin/gs_ctl" 2>/dev/null
+ipcs -m | awk '$2 ~ /^[0-9]+$/ {{print $2}}' | xargs -r ipcrm -m 2>/dev/null
+rm -rf "$INSTALL_DIR" "$DATA_DIR" /tmp/aidbm_gauss_src
+rm -rf "/home/$DB_OS_USER/.bash_profile" 2>/dev/null
+
+echo "[deploy] 6. 创建系统用户与组..."
+id -u "$DB_OS_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$DB_OS_USER"
+groupadd -f dbgroup && usermod -a -G dbgroup "$DB_OS_USER"
+
+echo "[deploy] 7. 解压并部署二进制文件..."
+mkdir -p /tmp/aidbm_gauss_src
+tar -xf "$TARBALL" -C /tmp/aidbm_gauss_src || {{ echo "[deploy] ERROR: 解压失败"; exit 1; }}
+BIN_GS=$(find /tmp/aidbm_gauss_src -maxdepth 4 -type f -name gs_ctl 2>/dev/null | head -1)
+if [ -z "$BIN_GS" ]; then echo "[deploy] ERROR: 解压后未找到 gs_ctl"; exit 1; fi
+GAUSSHOME=$(dirname "$(dirname "$BIN_GS")")
+if [ "$GAUSSHOME" = "/" ]; then GAUSSHOME=$(dirname "$BIN_GS"); fi
+echo "[deploy] GAUSSHOME=$GAUSSHOME"
+mkdir -p "$INSTALL_DIR"
+cp -a "$GAUSSHOME"/* "$INSTALL_DIR"/
+chown -R "$DB_OS_USER":dbgroup "$INSTALL_DIR"
+
+echo "[deploy] 8. 处理底层依赖库兼容性..."
+for lib in libssl.so.1.1 libcrypto.so.1.1; do
+    if [ -f "/tmp/aidbm_gauss_src/lib/$lib" ]; then
+        cp -a "/tmp/aidbm_gauss_src/lib/$lib" "$INSTALL_DIR/lib/"
+        echo "[deploy] 已从安装包提取并部署 $lib"
+    fi
+done
+for lib in libopenblas.so.0 libgfortran.so.5 libquadmath.so.0; do
+    SYS_LIB=$(ldconfig -p | grep "$lib" | awk '{{print $NF}}' | head -n 1)
+    if [ -n "$SYS_LIB" ] && [ ! -e "$INSTALL_DIR/lib/$lib" ]; then
+        ln -sf "$SYS_LIB" "$INSTALL_DIR/lib/$lib"
+        echo "[deploy] 已链接 $lib -> $SYS_LIB"
+    fi
+done
+echo "$INSTALL_DIR/lib" > /etc/ld.so.conf.d/gaussdb.conf
+ldconfig
+# 释放磁盘：解压源目录中的 lib 兼容库已复制完毕，删除解压残留（数据目录在本盘空间紧张时必须）
+rm -rf /tmp/aidbm_gauss_src
+
+echo "[deploy] 9. 配置环境变量..."
+cat > "/home/$DB_OS_USER/.bash_profile" <<'PROFILEEOF'
+export GAUSSHOME="{base}"
+export PATH=$GAUSSHOME/bin:$PATH
+export LD_LIBRARY_PATH=$GAUSSHOME/lib:$LD_LIBRARY_PATH
+PROFILEEOF
+chown "$DB_OS_USER":dbgroup "/home/$DB_OS_USER/.bash_profile"
+
+echo "[deploy] 10. 初始化数据库 (gs_initdb)..."
+mkdir -p "$DATA_DIR"
+chown -R "$DB_OS_USER":dbgroup "$(dirname "$(dirname "$DATA_DIR")")" "$(dirname "$DATA_DIR")"
+su - "$DB_OS_USER" -c "ulimit -c unlimited; source ~/.bash_profile; gs_initdb -w $INIT_PWD -D '$DATA_DIR' --nodename single_node"
+if [ $? -ne 0 ]; then echo "[deploy] ERROR: gs_initdb 初始化失败，请查看上方日志"; exit 1; fi
+
+echo "[deploy] 11. 修改数据库配置 (监听/端口/md5认证)..."
+cat >> "$DATA_DIR/postgresql.conf" <<CONFEOF
+listen_addresses = '*'
+password_encryption_type = 0
+port = {port}
+max_process_memory = 2GB
+shared_buffers = 256MB
+CONFEOF
+cat >> "$DATA_DIR/pg_hba.conf" <<HBAEOF
+host    all             all             0.0.0.0/0               md5
+host    replication     all             0.0.0.0/0               md5
+HBAEOF
+chown -R "$DB_OS_USER":dbgroup "$DATA_DIR"
+
+echo "[deploy] 12. 启动数据库并创建业务账号..."
+su - "$DB_OS_USER" -c "source ~/.bash_profile; gs_ctl start -D '$DATA_DIR' -Z single_node -l '$DATA_DIR/start.log'"
+sleep 5
+cat > /tmp/aidbm_gauss_init.sql <<SQLEOF
+CREATE USER {og_app_user} WITH PASSWORD '{pw}';
+GRANT ALL PRIVILEGES TO {og_app_user};
+SQLEOF
+chown "$DB_OS_USER":dbgroup /tmp/aidbm_gauss_init.sql
+su - "$DB_OS_USER" -c "source ~/.bash_profile; gsql -d postgres -p {port} -f /tmp/aidbm_gauss_init.sql"
+if [ $? -ne 0 ]; then echo "[deploy] WARN: 业务用户创建失败（可能已存在）"; fi
+rm -f /tmp/aidbm_gauss_init.sql
+
+echo "[deploy] 13. 防火墙放行端口..."
+if systemctl is-active --quiet firewalld 2>/dev/null; then
+    firewall-cmd --zone=public --add-port=$PORT/tcp --permanent && firewall-cmd --reload
+elif command -v ufw >/dev/null 2>&1; then
+    ufw allow $PORT/tcp
+fi
+
+echo "[deploy] 14. 安装后自检..."
+if ss -tln | grep -q ":$PORT "; then
+    echo "[deploy] SUCCESS: openGauss 安装完成并成功启动！"
+    echo "[deploy] 端口: $PORT  业务账号: $APP_USER  数据目录: $DATA_DIR"
+    echo "DEPLOY_OK"
+else
+    echo "[deploy] ERROR: 端口 $PORT 未监听，请检查启动日志 $DATA_DIR/start.log"
+    tail -n 30 "$DATA_DIR/start.log" 2>/dev/null
+    exit 1
+fi
 
 """
     else:

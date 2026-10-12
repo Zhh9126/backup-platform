@@ -1011,6 +1011,12 @@ _PG_FAMILY_TOOLING = {
         "query_candidates": ("gsql", "psql"),
         "dumpall_candidates": ("gs_dumpall", "pg_dumpall"),
         "catalog_table": "pg_database",
+        # openGauss gs_dump 不支持 -d（PG 写法），库名是位置参数
+        "dbname_positional": True,
+        # openGauss sha256 认证下原生客户端（gs_dump/gsql/gs_restore/gs_dumpall/
+        # gs_basebackup）不读 PGPASSWORD/PGPASSFILE，必须 -W 显式传密码
+        # （密码进 argv 为 openGauss 平台限制，如实记录）
+        "use_w_password": True,
         "maint_candidates": ("postgres", "template1"),
         "default_port": 5432,
         "default_user": "omm",
@@ -1055,6 +1061,18 @@ def _pg_family_env_exports(cfg: dict, pw: str, bin_path: str = "") -> str:
             ' export PATH="$GAUSSHOME/bin:$PATH";'
         )
     return exports
+
+
+def _pg_w_pass(cfg: dict, pw: str) -> str:
+    """openGauss 的 -W 密码参数片段（sha256 认证不读 PGPASSWORD，必须 -W）。
+
+    非 openGauss（未声明 use_w_password）或无密码时返回空串。
+    注意：密码会出现在进程 argv 中，这是 openGauss sha256 认证的平台限制
+    （PGPASSWORD/PGPASSFILE 均不生效），无更安全的非交互通道。
+    """
+    if cfg.get("use_w_password") and pw:
+        return " -W " + shlex.quote(pw)
+    return ""
 
 
 def _pg_family_resolve_query_bin(client, cfg) -> str:
@@ -1120,6 +1138,8 @@ def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
         f"DUMPALL_BIN={shlex.quote(dumpall_bin or '')}",
         f"PORT={int(port)}",
         f"USERQ={shlex.quote(user)}",
+        # openGauss：-W 密码参数（sha256 认证不读 PGPASSWORD；非 openGauss 为空）
+        f"WARG={shlex.quote(_pg_w_pass(cfg, pw).strip())}",
         'WORK=$(mktemp -d /tmp/bp_fullinst.XXXXXX)',
         "trap 'rm -rf \"$WORK\"' EXIT",
         'mkdir -p "$WORK/dbs"',
@@ -1128,7 +1148,7 @@ def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
         'DBS=""',
         "for MDB in $MAINTS; do",
         '  for CAT in $CATALOGS; do',
-        f'    if DBS=$("$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -d "$MDB" -t -A '
+        f'    if DBS=$("$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" $WARG -d "$MDB" -t -A '
         f'-c "SELECT datname FROM $CAT WHERE {cond} ORDER BY 1" 2>/dev/null) '
         '&& [ -n "$DBS" ]; then MAINT="$MDB"; break 2; fi',
         "  done",
@@ -1136,12 +1156,12 @@ def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
         '[ -n "${DBS:-}" ] || { echo "no backupable databases after filtering'
         ' (system dbs excluded; set include_system_dbs=true to include)" >&2; exit 31; }',
         'for d in $DBS; do',
-        '  "$DUMP_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -Fc -f "$WORK/dbs/$d.dump" "$d"'
+        '  "$DUMP_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" $WARG -Fc -f "$WORK/dbs/$d.dump" "$d" > /dev/null'
         ' || { echo "dump failed for db $d" >&2; exit 32; }',
         "done",
         'GLOBALS="no"',
         'if [ -n "$DUMPALL_BIN" ]; then',
-        '  if "$DUMPALL_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -g > "$WORK/globals.sql" '
+        '  if "$DUMPALL_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" $WARG -g > "$WORK/globals.sql" '
         '2>"$WORK/globals.err" && [ -s "$WORK/globals.sql" ]; then GLOBALS="yes"; '
         'else GLOBALS="failed"; fi',
         "fi",
@@ -1184,9 +1204,13 @@ def _pg_family_dumpall_stream(client, cfg: dict,
             f"远端主机未找到 dumpall 工具（{'/'.join(cfg['dumpall_candidates'])}）。"
             "可在 extra_options 中去掉 all_db_mode 使用默认逐库 tar 模式。")
     env = _pg_family_env_exports(cfg, pw, bin_path=dumpall_bin)
+    wpass = _pg_w_pass(cfg, pw)
+    # gs_dumpall 的进度输出同样走 stdout 会污染 SQL 流：一律 -f 落盘再回传
+    tmpf = f"/tmp/.aidbm_ogdumpall_{os.getpid()}_{int(time.time())}"
     shell = (
         f"set -o pipefail; {_tool_path_export(tool_path)}{env} "
-        f"{dumpall_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}"
+        f"{dumpall_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} "
+        f"-f {tmpf} > /dev/null && cat {tmpf}; RC=$?; rm -f {tmpf}; exit $RC"
     )
     out, err, rc = _ssh_exec_pipe(client, _wrap_login(shell), timeout=7200)
     if rc != 0:
@@ -1249,15 +1273,23 @@ def _pg_family_dump(task: dict, ssh_host: dict, db_type: str, compress: int) -> 
         f"{dump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt_flag}"
     )
 
+    # 库名传法：PG/金仓用 -d；openGauss gs_dump 不支持 -d，库名为位置参数
+    wpass = _pg_w_pass(cfg, pw)
+    if cfg.get("dbname_positional"):
+        db_ref = (shlex.quote(db_name) + wpass) if db_name else wpass
+    else:
+        db_ref = (f"-d {shlex.quote(db_name)}" + wpass) if db_name else wpass
+
     if tables:
         if not db_name:
             raise RuntimeError("指定表（tables）时必须同时填写库名（db_name）")
-        target_args = f"-d {shlex.quote(db_name)} " + " ".join(
+        target_args = f"{db_ref} " + " ".join(
             f"-t {shlex.quote(t)}" for t in tables)
     elif schemas:
-        target_args = " ".join(f"-n {shlex.quote(s)}" for s in schemas)
+        target_args = (f"{db_ref} " if db_ref else "") + " ".join(
+            f"-n {shlex.quote(s)}" for s in schemas)
     else:
-        target_args = f"-d {shlex.quote(db_name)}"
+        target_args = db_ref
 
     extra_args = ""
     if extra.get("extra_args"):
@@ -1273,13 +1305,26 @@ def _pg_family_dump(task: dict, ssh_host: dict, db_type: str, compress: int) -> 
         work = f"/tmp/.bk_pgdir_{os.getpid()}_{int(time.time())}"
         shell = (
             f"set -o pipefail; {_tool_path_export(tp)}{env} "
-            f"rm -rf {work} && mkdir -p {work}/db && "
+            # gs_dump -Fd 要求目标目录不存在（工具自行创建），只预建父目录
+            f"rm -rf {work} && mkdir -p {work} && "
             f"{dump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt_flag} "
-            f"-f {work}/db {target_args}{extra_args} && "
+            f"-f {work}/db {target_args}{extra_args} > /dev/null && "
             f"tar -C {work} -czf - db; RC=$?; rm -rf {work}; exit $RC"
         )
     else:
-        shell = f"{base} {target_args}{extra_args}"
+        if cfg.get("dbname_positional"):
+            # openGauss gs_dump：任何格式都必须 -f 落盘（含 -Fp——
+            # gs_dump 的进度输出走 stdout，直接流式拉回会污染产物），
+            # 先落盘到临时文件再 cat 回传；gs_dump 自身的 stdout（进度）丢弃
+            tmpf = f"/tmp/.aidbm_ogdump_{os.getpid()}_{int(time.time())}"
+            shell = (
+                f"set -o pipefail; {_tool_path_export(tp)}{env} "
+                f"{dump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt_flag} "
+                f"-f {tmpf} {target_args}{extra_args} > /dev/null && "
+                f"cat {tmpf}; RC=$?; rm -f {tmpf}; exit $RC"
+            )
+        else:
+            shell = f"{base} {target_args}{extra_args}"
     # 压缩策略：-Fc 自带 zlib 压缩，不外挂 gzip/zstd 以免双重压缩；
     # compress 时落盘 .dump，恢复端用 pg_restore/sys_restore。
     wrapped = _wrap_login(shell)
@@ -2341,6 +2386,7 @@ def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
     user = task.get("username") or default_user
     pw = db.decrypt_secret(task.get("password") or "")
 
+    wpass = (" -W " + shlex.quote(pw)) if (task.get("db_type") or "").lower() == "opengauss" and pw else ""
     client = _connect(ssh_host)
     resolved = resolve_remote_tool(ssh_host, tool, check_user=check_user)
     if not resolved:
@@ -2403,7 +2449,7 @@ def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
             f"export PGPASSWORD={shlex.quote(pw)}; "
             f"export KINGBASE_PASSWORD={shlex.quote(pw)};"
             f"{env_extra} "
-            f"{resolved} -h {shlex.quote(db_host)} -p {port} -U {shlex.quote(user)} "
+            f"{resolved} -h {shlex.quote(db_host)} -p {port} -U {shlex.quote(user)}{wpass} "
             f"-D {remote_tmp} {flags}"
         )
         if extra:
@@ -2558,9 +2604,10 @@ def _remote_list_pg_databases(task: dict, ssh_host: dict, db_type: str = "postgr
     port = task.get("port") or cfg["default_port"]
     maint = "postgres"
     env = _pg_family_env_exports(cfg, pw, bin_path=pg_bin)
+    wpass = _pg_w_pass(cfg, pw)
     shell = (
         f"set -o pipefail; {env} "
-        f"{pg_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d {maint} -tA -c "
+        f"{pg_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} -d {maint} -tA -c "
         f'"SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY datname"'
     )
     wrapped = _wrap_login(shell)
@@ -2831,11 +2878,12 @@ def _pg_family_detect_maint_db(client, cfg: dict, query_bin: str,
     """
     from core.engines.file import _ssh_exec_pipe
     env = _pg_family_env_exports(cfg, pw, bin_path=query_bin)
+    wpass = _pg_w_pass(cfg, pw)
     catalogs = cfg.get("catalog_candidates") or (cfg["catalog_table"],)
     for mdb in cfg["maint_candidates"]:
         probe = (
             f"{env} {query_bin} -h 127.0.0.1 -p {int(port)} "
-            f"-U {shlex.quote(user)} -d {shlex.quote(mdb)} -t -A "
+            f"-U {shlex.quote(user)}{wpass} -d {shlex.quote(mdb)} -t -A "
             f"-c 'SELECT 1' 2>/dev/null"
         )
         _out, _err, rc = _ssh_exec_pipe(client, _wrap_login(probe), timeout=30)
@@ -2863,6 +2911,7 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
     # SQL 客户端提前解析：openGauss 需按工具路径反推 GAUSSHOME（LD_LIBRARY_PATH）
     query_bin_probe = _pg_family_resolve_query_bin(client, cfg)
     env = _pg_family_env_exports(cfg, pw, bin_path=query_bin_probe)
+    wpass = _pg_w_pass(cfg, pw)
 
     # 0) 远程先 DROP+CREATE 目标库，保证干净恢复。
     #    pg_restore 的 "-C" 在目标库同名已存在时会因 "cannot drop the
@@ -2879,15 +2928,15 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
         # 老版本先杀连接再 DROP（pg_terminate_backend 在 openGauss 同样可用）
         prep = (
             f"set -o pipefail; {env} "
-            f"{psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d {shlex.quote(maint)} "
+            f"{psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} -d {shlex.quote(maint)} "
             f"-c 'DROP DATABASE IF EXISTS \"{safe_db}\" WITH (FORCE);' "
-            f"|| {{ {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d {shlex.quote(maint)} "
+            f"|| {{ {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} -d {shlex.quote(maint)} "
             f"-c \"SELECT sys_terminate_backend(pid) FROM sys_stat_activity WHERE datname = '{db_name}';\" "
-            f"|| {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d {shlex.quote(maint)} "
+            f"|| {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} -d {shlex.quote(maint)} "
             f"-c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db_name}';\" ; "
-            f"{psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d {shlex.quote(maint)} "
+            f"{psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} -d {shlex.quote(maint)} "
             f"-c 'DROP DATABASE IF EXISTS \"{safe_db}\";' ; }} "
-            f"&& {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} -d {shlex.quote(maint)} "
+            f"&& {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} -d {shlex.quote(maint)} "
             f"-c 'CREATE DATABASE \"{safe_db}\";'"
         )
         _out, perr, prc = _ssh_exec_pipe(
@@ -2904,7 +2953,7 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
                 f"远端主机未找到 SQL 客户端（{'/'.join(cfg['query_candidates'])}），无法恢复。")
     shell = (
         f"set -o pipefail; {env} "
-        f"{tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} "
+        f"{tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} "
         f"-d {shlex.quote(db_name)}"
     )
     wrapped = _wrap_login(shell)
@@ -2929,6 +2978,9 @@ def _pg_family_tar_restore_script(cfg: dict, restore_bin: str, query_bin: str,
         f"PKG={shlex.quote(pkg_path)}",
         f"PORT={int(port)}",
         f"USERQ={shlex.quote(user)}",
+        # openGauss：-W 密码参数
+        f"WARG={shlex.quote(_pg_w_pass(cfg, pw).strip())}",
+        # openGauss：-W 密码参数（sha256 认证不读 PGPASSWORD）
         'WORK=$(mktemp -d /tmp/bp_restore.XXXXXX)',
         "trap 'rm -rf \"$WORK\" \"$PKG\"' EXIT",
         'tar -xzf "$PKG" -C "$WORK"',
@@ -2940,7 +2992,7 @@ def _pg_family_tar_restore_script(cfg: dict, restore_bin: str, query_bin: str,
         'DBS_EXIST=""',
         "for MDB in " + maints + "; do",
         '  for CAT in $CATALOGS; do',
-        '    if DBS_EXIST=$("$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -d "$MDB" -t -A '
+        '    if DBS_EXIST=$("$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" $WARG -d "$MDB" -t -A '
         '        -c "SELECT datname FROM $CAT WHERE NOT datistemplate" 2>/dev/null) '
         '&& [ -n "$DBS_EXIST" ]; then MAINT="$MDB"; break 2; fi',
         "  done",
@@ -2948,7 +3000,7 @@ def _pg_family_tar_restore_script(cfg: dict, restore_bin: str, query_bin: str,
         '[ -n "${MAINT:-}" ] || { echo "cannot connect instance to restore" >&2; exit 51; }',
         # 全局对象（角色/表空间）：失败不阻塞（可能已存在）
         'if [ -s "$WORK/globals.sql" ]; then',
-        '  "$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -d "$MAINT" '
+        '  "$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" $WARG -d "$MAINT" '
         '-f "$WORK/globals.sql" >/dev/null 2>&1 \\',
         '    || echo "WARN: globals restore failed (may already exist)" >&2',
         "fi",
@@ -2957,10 +3009,10 @@ def _pg_family_tar_restore_script(cfg: dict, restore_bin: str, query_bin: str,
         '  [ -e "$f" ] || continue',
         '  d=$(basename "$f" .dump)',
         '  if ! printf \'%s\\n\' "$DBS_EXIST" | grep -qxF "$d"; then',
-        '    "$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" -d "$MAINT" '
+        '    "$QUERY_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" $WARG -d "$MAINT" '
         '-c "CREATE DATABASE \\"$d\\"" >/dev/null 2>&1 || true',
         "  fi",
-        '  "$RESTORE_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" --dbname "$d" '
+        '  "$RESTORE_BIN" -h 127.0.0.1 -p $PORT -U "$USERQ" $WARG --dbname "$d" '
         '--clean $IFEX "$f" || { echo "restore failed for db $d" >&2; exit 52; }',
         '  RESTORED="$RESTORED $d"',
         "done",

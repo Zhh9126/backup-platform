@@ -179,6 +179,11 @@ def cross_host_restore(db_type: str, backup_path: str, target_host_info: dict,
             extra = dict(extra)
             extra["_pg_psql_bin"] = _resolve_remote_bin(client, "psql") or "psql"
             extra["_pg_restore_bin"] = _resolve_remote_bin(client, "pg_restore") or "pg_restore"
+        if db_type == "opengauss":
+            from core.remote_dump import _resolve_remote_bin
+            extra = dict(extra)
+            extra["_og_restore_bin"] = _resolve_remote_bin(client, "gs_restore") or "gs_restore"
+            extra["_og_gsql_bin"] = _resolve_remote_bin(client, "gsql") or "gsql"
         if db_type == "kingbase":
             # 金仓客户端工具通常不在 root PATH（Server/ClientTools 专用目录），
             # 必须动态解析绝对路径，否则 rc=127 command not found
@@ -189,7 +194,7 @@ def cross_host_restore(db_type: str, backup_path: str, target_host_info: dict,
         # 全实例 tar.gz：解包后逐库恢复（结构按源端、库名沿用 manifest）
         if os.path.basename(remote).lower().endswith(
                 (".tar.gz", ".tgz")) and db_type in (
-                "mysql", "mariadb", "postgresql", "kingbase"):
+                "mysql", "mariadb", "postgresql", "kingbase", "opengauss"):
             cmd = _build_full_instance_restore_cmd(db_type, remote, extra)
             # 任务级自定义环境变量前缀（contextvar，由 scheduler 设置）
             from core.remote_dump import current_task_env_export
@@ -303,7 +308,22 @@ echo "RESTORE_SUMMARY ok=$OK fail=$FAIL"
                f"export KINGBASE_PASSWORD='{pw}';")
         loop_restore = restore_bin
         create_via = psql_bin
+        wflag = ""
         global_apply = f'[ -f "$WORK/globals.sql" ] && {psql_bin} -h {host} -p {port} -U {user} -d {maint} -f "$WORK/globals.sql" || echo "[SKIP] globals"'
+    elif db_type == "opengauss":
+        # sha256 认证不读 PGPASSWORD：全部命令带 -W；gs_* 需 GAUSSHOME/lib
+        port = extra.get("source_port") or 26000
+        user = extra.get("source_username") or "gaussadmin"
+        pw = extra.get("source_password") or ""
+        psql_bin = extra.get("_og_gsql_bin") or "gsql"
+        restore_bin = extra.get("_og_restore_bin") or "gs_restore"
+        maint = "postgres"
+        env = (f"export GAUSSHOME=$(dirname $(dirname {psql_bin}));"
+               f"export LD_LIBRARY_PATH=$GAUSSHOME/lib:${{LD_LIBRARY_PATH:-}};")
+        loop_restore = restore_bin
+        create_via = psql_bin
+        wflag = f"-W '{pw}'"
+        global_apply = f'[ -f "$WORK/globals.sql" ] && {psql_bin} -h {host} -p {port} -U {user} {wflag} -d {maint} -f "$WORK/globals.sql" || echo "[SKIP] globals"'
     else:
         return f"echo '[ERROR] db_type {db_type} 不支持全实例跨主机恢复'; exit 1"
 
@@ -316,11 +336,11 @@ OK=0; FAIL=0
 for f in "$WORK"/dbs/*.dump; do
   [ -e "$f" ] || continue
   db=$(basename "$f" .dump)
-  EXISTS=$({create_via} -h {host} -p {port} -U {user} -d {maint} -tAc \\
+  EXISTS=$({create_via} -h {host} -p {port} -U {user} {wflag} -d {maint} -tAc \\
     "SELECT 1 FROM pg_database WHERE datname='$db'" 2>/dev/null || true)
-  [ "$EXISTS" = "1" ] || {create_via} -h {host} -p {port} -U {user} -d {maint} \\
+  [ "$EXISTS" = "1" ] || {create_via} -h {host} -p {port} -U {user} {wflag} -d {maint} \\
     -c "CREATE DATABASE \\"$db\\"" || {{ echo "[FAIL] $db (createdb)"; FAIL=$((FAIL+1)); continue; }}
-  if {loop_restore} -h {host} -p {port} -U {user} -d "$db" --no-owner "$f"; then
+  if {loop_restore} -h {host} -p {port} -U {user} {wflag} -d "$db" --no-owner "$f"; then
     echo "[OK] $db"; OK=$((OK+1))
   else
     echo "[FAIL] $db (restore)"; FAIL=$((FAIL+1))
@@ -484,6 +504,38 @@ exit $RC
             return f"{env} {pre}{restore_bin} -h {host} -p {port} -U {user} -d '{target_db or 'kingbase'}' '{actual}'"
         target = f"-d '{target_db}'" if target_db else ""
         return f"{env} {pre}{ksql_bin} -h {host} -p {port} -U {user} {target} -f '{actual}'"
+
+    elif db_type == "opengauss":
+        # openGauss 单库跨主机恢复：sha256 认证不读 PGPASSWORD，全部命令 -W；
+        # 目标库不存在时自动创建；gs_* 需 GAUSSHOME/lib（按解析出的绝对路径反推）
+        host = "127.0.0.1"
+        port = extra.get("source_port") or 26000
+        user = extra.get("source_username") or "gaussadmin"
+        pw = extra.get("source_password") or ""
+        restore_bin = extra.get("_og_restore_bin") or "gs_restore"
+        gsql_bin = extra.get("_og_gsql_bin") or "gsql"
+        pre_env = (f"export GAUSSHOME=$(dirname $(dirname {restore_bin}));"
+                   f"export LD_LIBRARY_PATH=$GAUSSHOME/lib:${{LD_LIBRARY_PATH:-}};")
+        wflag = f"-W '{pw}'"
+        actual = remote_pkg
+        if remote_pkg.endswith(".gz"):
+            actual = remote_pkg[:-3]
+            pre = f"gunzip -c '{remote_pkg}' > '{actual}' && "
+        else:
+            pre = ""
+        tdb = target_db or "postgres"
+        # 目标库缺失自动创建（单库 dump 不含 CREATE DATABASE）
+        createdb = (f"{gsql_bin} -h {host} -p {port} -U {user} {wflag} -d postgres -tAc "
+                    f"\"SELECT 1 FROM pg_database WHERE datname='{tdb}'\" | grep -q 1 || "
+                    f"{gsql_bin} -h {host} -p {port} -U {user} {wflag} -d postgres "
+                    f"-c 'CREATE DATABASE \"{tdb}\"' || true; ")
+        if remote_pkg.endswith(".dump"):
+            return (f"{pre_env} {pre}{createdb}"
+                    f"{restore_bin} -h {host} -p {port} -U {user} {wflag} "
+                    f"-d '{tdb}' '{actual}'")
+        target = f"-d '{tdb}'" if tdb else ""
+        return (f"{pre_env} {pre}{createdb}"
+                f"{gsql_bin} -h {host} -p {port} -U {user} {wflag} {target} -f '{actual}'")
 
     elif db_type == "redis":
         # 上传 .rdb / .tar.gz

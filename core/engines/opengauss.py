@@ -44,6 +44,12 @@ class OpenGaussEngine(PostgreSQLEngine):
     _phys_default_port = 26000
     _phys_default_user = "omm"
     _phys_label = "gs_basebackup"
+    # remote_dump 分发 / dump_format 解析 / logical_full 全实例均按 opengauss 走 gs_* 工具族
+    _dump_db_type = "opengauss"
+    # gs_dump 不支持 -d 短选项（PG 写法），库名为位置参数（本机通道）
+    _dump_dbname_positional = True
+    # sha256 认证不读 PGPASSWORD，本机/远端命令一律 -W 显式传密码
+    _pass_via_w = True
 
     # ------------------------------------------------------------------
     # 工具解析：把 PG 生态工具名翻译为 openGauss 工具名后走统一解析器
@@ -60,6 +66,7 @@ class OpenGaussEngine(PostgreSQLEngine):
             tool=self._phys_tool, default_port=self._phys_default_port,
             default_user=self._phys_default_user,
             extra_args_key="pg_basebackup_extra_args", tool_label=self._phys_label,
-            base_flags=["-Ft", "-z", "-X", "stream", "-w"],
+            # openGauss：-X stream 仅支持 plain 模式，-Ft 打包用 fetch 拉取 WAL
+            base_flags=["-Ft", "-z", "-X", "fetch", "-w"],
             check_user="omm",
         )

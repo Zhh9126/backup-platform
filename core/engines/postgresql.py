@@ -29,6 +29,12 @@ class PostgreSQLEngine(BackupEngine):
     """PostgreSQL 备份引擎，封装 pg_dump / pg_restore / psql。"""
 
     db_type = "postgresql"
+    # openGauss 子类置 True：sha256 认证不读 PGPASSWORD，需 -W 显式传密码
+    _pass_via_w = False
+
+    def _w_pass_args(self, pw: str):
+        """openGauss sha256 认证不读 PGPASSWORD/PGPASSFILE，必须 -W 显式传密码。"""
+        return ["-W", pw] if getattr(self, "_pass_via_w", False) and pw else []
     display_name = "PostgreSQL"
     # 该引擎依赖的客户端可执行文件名（用于 PATH 探测）
     required_clients = ["pg_dump", "pg_restore", "psql"]
@@ -39,6 +45,8 @@ class PostgreSQLEngine(BackupEngine):
     _phys_default_port = 5432
     _phys_default_user = "postgres"
     _phys_label = "pg_basebackup"
+    # remote_dump 分发与格式解析所用的 db_type 标识（openGauss 子类覆写）
+    _dump_db_type = "postgresql"
 
     # ------------------------- 备份 -------------------------
     def backup(self, backup_type: BackupType) -> BackupResult:
@@ -147,27 +155,37 @@ class PostgreSQLEngine(BackupEngine):
     def _backup_logical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
         """在 SSH 备份机/数据库服务器上执行 pg_dump，把流拉回到本地落盘。"""
         from core import remote_dump
+        # 增量/差异透明回退：PG 系逻辑备份无真正增量，按 full 执行并如实注明
+        # （与本地分支 _backup_logical_local 的行为对齐，此前远端分支静默按全量跑）
+        fb_note = ""
+        if backup_type in (BackupType.INCREMENTAL, BackupType.DIFFERENTIAL):
+            fb_note = ("（incremental/differential 逻辑备份无真正增量，本次按 full 执行；"
+                       "建议改用 WAL 归档 + gs_basebackup 物理链路实现增量）")
+        def _with_note(res):
+            if fb_note and res is not None and res.message:
+                res.message = res.message + " " + fb_note
+            return res
         comp = int(self.task.get("compress") or 0)
-        data, compressed, fmt = remote_dump.remote_db_dump(self.task, ssh_host, "postgresql", comp)
+        data, compressed, fmt = remote_dump.remote_db_dump(self.task, ssh_host, self._dump_db_type, comp)
         if fmt == "multi-db-tar":
             # 全实例：逐库 tar.gz（远端已 gzip，manifest.json 标注库清单）
             res = self._write_dump_file(data, backup_type, ssh_host, ".tar.gz", "pg_dump")
             res.compress_algo = "gzip"
-            return res
+            return _with_note(res)
         if fmt == "dumpall":
             res = self._write_dump_file(data, backup_type, ssh_host, ".sql", "pg_dumpall")
             res.compress_algo = "none"
-            return res
+            return _with_note(res)
         # 单库：落盘后缀由任务「备份文件格式」(extra_options.dump_format) 决定
         # （远端 -Fc 自带压缩，不再外挂 gzip；directory 由远端直接打成 tar.gz 流）
         from core import dump_format as _dfmt
-        spec = _dfmt.resolve("postgresql", self._extra_dict(), compress=bool(comp))
+        spec = _dfmt.resolve(self._dump_db_type, self._extra_dict(), compress=bool(comp))
         ext = spec.get("ext") or (".dump" if compressed else ".sql")
         if spec.get("dir"):
             ext = ".dir.tar.gz"
         res = self._write_dump_file(data, backup_type, ssh_host, ext, "pg_dump")
         res.compress_algo = "zlib" if compressed else "none"
-        return res
+        return _with_note(res)
 
     def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:
         """本机 pg_dump 真实备份。"""
@@ -206,7 +224,7 @@ class PostgreSQLEngine(BackupEngine):
         #    - custom/plain/tar：对应 -Fc / -Fp / -Ft
         #    - directory：-Fd 目录归档，落盘前打包为 .dir.tar.gz
         from core import dump_format as _dfmt
-        fmt = _dfmt.resolve("postgresql", extra_eo, compress=bool(compress))
+        fmt = _dfmt.resolve(self._dump_db_type, extra_eo, compress=bool(compress))
         fmt_flag = fmt.get("flag") or ("-Fc" if compress else "-Fp")
         if fmt.get("dir"):
             out_path = os.path.join(out_dir, f"{ts}.dir.tar.gz")
@@ -228,10 +246,15 @@ class PostgreSQLEngine(BackupEngine):
             "--host", str(host),
             "--port", str(port),
             "--username", str(user),
-            "-d", str(db_name),
-            fmt_flag,
-            "-f", dump_out,
         ]
+        # 库名传法：PG/金仓兼容 -d；openGauss gs_dump 不支持 -d，为位置参数
+        # （openGauss 已移除 pg_dump 的 -d 短选项，传了直接 invalid option）
+        if getattr(self, "_dump_dbname_positional", False):
+            cmd += [fmt_flag, "-f", dump_out, str(db_name)]
+        else:
+            cmd += ["-d", str(db_name), fmt_flag, "-f", dump_out]
+        # openGauss：-W 显式密码（sha256 认证不读 PGPASSWORD）
+        cmd += self._w_pass_args(pw)
         # 追加用户自定义扩展选项（extra_options 为 JSON 字符串）
         extra = self._parse_extra_options()
         if extra:
@@ -306,7 +329,7 @@ class PostgreSQLEngine(BackupEngine):
         dumpall_tool = self._resolve_local_tool("pg_dumpall")
         try:
             manifest = logical_full.backup_full_instance(
-                "postgresql",
+                self._dump_db_type,
                 host=self.task.get("host"), port=self.task.get("port"),
                 user=self.task.get("username"),
                 password=db.decrypt_secret(self.task.get("password") or ""),
@@ -358,6 +381,8 @@ class PostgreSQLEngine(BackupEngine):
                 "--dbname", str(target_db),
                 "-Fd", arc_dir,
             ]
+            cmd += self._w_pass_args(
+                db.decrypt_secret(self.task.get("password") or ""))
             start = time.time()
             ret = self._run(cmd, env_extra=env_extra, timeout=3600)
             duration = time.time() - start
@@ -381,7 +406,7 @@ class PostgreSQLEngine(BackupEngine):
         query_tool = self._resolve_local_tool("psql")
         try:
             result = logical_full.restore_full_instance(
-                "postgresql",
+                self._dump_db_type,
                 host=self.task.get("host"), port=self.task.get("port"),
                 user=self.task.get("username"),
                 password=db.decrypt_secret(self.task.get("password") or ""),
@@ -445,7 +470,7 @@ class PostgreSQLEngine(BackupEngine):
                 # -Fc 自定义格式与 -Ft tar 归档都走 pg_restore；-Fp 纯文本走 psql
                 is_custom = backup_path.endswith((".dump", ".tar"))
                 remote_dump.remote_db_restore(
-                    self.task, ssh_host, "postgresql", dump_bytes, is_custom=is_custom)
+                    self.task, ssh_host, self._dump_db_type, dump_bytes, is_custom=is_custom)
                 # SSH 兜底通道恢复到任务原库（暂不支持指定新目标库名），如实提示
                 actual_db = self.task.get("db_name")
                 return BackupResult(
@@ -510,7 +535,8 @@ class PostgreSQLEngine(BackupEngine):
             chk = self._run(
                 [self._resolve_local_tool("psql"), "--host", str(host), "--port", str(port),
                  "--username", str(user), "-d", "postgres",
-                 "-c", f'CREATE DATABASE "{safe_db}"'],
+                 "-c", f'CREATE DATABASE "{safe_db}"']
+                + self._w_pass_args(pw),
                 env_extra=env_extra, timeout=180)
             if chk["returncode"] != 0:
                 return BackupResult(
@@ -523,7 +549,8 @@ class PostgreSQLEngine(BackupEngine):
             chk = self._run(
                 [self._resolve_local_tool("psql"), "--host", str(host), "--port", str(port),
                  "--username", str(user), "-d", "postgres",
-                 "-c", f'DROP DATABASE IF EXISTS "{safe_db}" WITH (FORCE)'],
+                 "-c", f'DROP DATABASE IF EXISTS "{safe_db}" WITH (FORCE)']
+                + self._w_pass_args(pw),
                 env_extra=env_extra, timeout=180)
             if chk["returncode"] != 0:
                 return BackupResult(
@@ -534,7 +561,8 @@ class PostgreSQLEngine(BackupEngine):
             chk = self._run(
                 [self._resolve_local_tool("psql"), "--host", str(host), "--port", str(port),
                  "--username", str(user), "-d", "postgres",
-                 "-c", f'CREATE DATABASE "{safe_db}"'],
+                 "-c", f'CREATE DATABASE "{safe_db}"']
+                + self._w_pass_args(pw),
                 env_extra=env_extra, timeout=180)
             if chk["returncode"] != 0:
                 return BackupResult(
@@ -559,6 +587,7 @@ class PostgreSQLEngine(BackupEngine):
             for tb in sel_tables:
                 cmd += ["--table", str(tb).strip().strip('"')]
             cmd.append(backup_path)
+            cmd += self._w_pass_args(pw)
         elif backup_path.endswith(".sql"):
             # 纯文本格式用 psql 执行 SQL 脚本
             cmd = [
@@ -569,6 +598,7 @@ class PostgreSQLEngine(BackupEngine):
                 "-d", str(target_db),
                 "-f", backup_path,
             ]
+            cmd += self._w_pass_args(pw)
         else:
             return BackupResult(
                 success=False,
@@ -713,7 +743,7 @@ class PostgreSQLEngine(BackupEngine):
         # 1) 尝试 SSH 远程
         try:
             from core import remote_dump
-            dbs = remote_dump.remote_list_databases(self.task, "postgresql")
+            dbs = remote_dump.remote_list_databases(self.task, self._dump_db_type)
             if dbs:
                 skip = {"template0", "template1"}
                 return [d for d in dbs if d not in skip]

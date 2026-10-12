@@ -90,6 +90,11 @@ TOOLING = {
 }
 
 
+def _pg_w_pass(db_type: str, password: str):
+    """openGauss sha256 认证不读 PGPASSWORD，原生客户端必须 -W 显式传密码。"""
+    return ["-W", password] if db_type == "opengauss" and password else []
+
+
 def _build_env(db_type: str, password: str) -> dict:
     env = os.environ.copy()
     if password:
@@ -463,7 +468,7 @@ def backup_full_instance(db_type: str, *, host, port, user, password,
                 rc, _o, err = _run([
                     dump_tool, "-h", str(host), "-p", str(port), "-U", user,
                     "-Fc", "-f", os.path.join(dbs_dir, f"{d}.dump"), d,
-                ], env, timeout=7200)
+                ] + _pg_w_pass(db_type, password), env, timeout=7200)
             else:
                 # MySQL 系：逐库 .sql（--databases 保证含 CREATE DATABASE/USE）
                 # --no-defaults 见 enumerate_databases 处说明：必须用任务配置的凭据
@@ -592,7 +597,7 @@ def restore_full_instance(db_type: str, *, host, port, user, password,
                 rc, _o, _e = _run([
                     query_tool, "-h", str(host), "-p", str(port), "-U", user,
                     "-d", maint, "-f", gpath,
-                ], env, timeout=1800)
+                ] + _pg_w_pass(db_type, password), env, timeout=1800)
                 globals_ok = rc == 0  # 失败多为对象已存在，不阻塞逐库恢复
             # pg_restore/sys_restore 低版本可能无 --if-exists，探测后再用
             rc, out, _e = _run([restore_tool, "--help"], env)

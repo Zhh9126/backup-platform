@@ -942,6 +942,8 @@ echo "DEPLOY_OK"
         og_os_user = params.get("og_os_user", "omm")
         og_app_user = params.get("og_app_user", "gaussadmin")
         og_init_pwd = params.get("og_init_pwd", "Gauss@123")
+        og_max_mem = params.get("og_max_mem", "2GB")
+        og_shared_buf = params.get("og_shared_buf", "256MB")
 
         return f"""#!/bin/bash
 # AIDBM openGauss 单机自包含部署（多 OS 兼容：openEuler/CentOS/RHEL/Ubuntu/Kylin/UOS）
@@ -1003,7 +1005,9 @@ mkdir -p /tmp/aidbm_gauss_probe
 if tar -xf "$TARBALL" -C /tmp/aidbm_gauss_probe 2>/dev/null; then
     PROBE_BIN=$(find /tmp/aidbm_gauss_probe -name gs_ctl -type f 2>/dev/null | head -1)
     if [ -n "$PROBE_BIN" ]; then
-        MISS=$(ldd "$PROBE_BIN" 2>&1 | grep -E "version .GLIBC_" | head -3)
+        # 用包自带 lib 隔离解析，避免主机上残留的同名旧库（如上次失败部署遗留）污染探测结果
+        PROBE_LIB=$(dirname "$(dirname "$PROBE_BIN")")/lib
+        MISS=$(LD_LIBRARY_PATH="$PROBE_LIB" ldd "$PROBE_BIN" 2>&1 | grep -E "version .GLIBC_" | head -3)
         if [ -n "$MISS" ]; then
             echo "[deploy] ERROR: 安装包与目标系统 glibc 不兼容（致命，无法通过推补依赖库解决）："
             echo "$MISS"
@@ -1022,10 +1026,21 @@ pkill -9 -f "$INSTALL_DIR/bin/gs_ctl" 2>/dev/null
 ipcs -m | awk '$2 ~ /^[0-9]+$/ {{print $2}}' | xargs -r ipcrm -m 2>/dev/null
 rm -rf "$INSTALL_DIR" "$DATA_DIR" /tmp/aidbm_gauss_src
 rm -rf "/home/$DB_OS_USER/.bash_profile" 2>/dev/null
+# 上次失败部署可能遗留的 ldconfig 指向，会污染后续 glibc 预检与运行时库解析，必须一并清理
+rm -f /etc/ld.so.conf.d/gaussdb.conf
+ldconfig 2>/dev/null
 
 echo "[deploy] 6. 创建系统用户与组..."
 id -u "$DB_OS_USER" >/dev/null 2>&1 || useradd -m -s /bin/bash "$DB_OS_USER"
 groupadd -f dbgroup && usermod -a -G dbgroup "$DB_OS_USER"
+# 历史残留用户可能家目录缺失（如被 userdel -r 清理过），必须补建，否则后续写 profile 与 su - 全部静默失败
+if [ ! -d "/home/$DB_OS_USER" ]; then
+    mkdir -p "/home/$DB_OS_USER"
+    cp -a /etc/skel/. "/home/$DB_OS_USER"/ 2>/dev/null
+    chown -R "$DB_OS_USER":dbgroup "/home/$DB_OS_USER"
+    usermod -d "/home/$DB_OS_USER" "$DB_OS_USER" 2>/dev/null
+    echo "[deploy] 已补建家目录 /home/$DB_OS_USER"
+fi
 
 echo "[deploy] 7. 解压并部署二进制文件..."
 mkdir -p /tmp/aidbm_gauss_src
@@ -1064,6 +1079,9 @@ export GAUSSHOME="{base}"
 export PATH=$GAUSSHOME/bin:$PATH
 export LD_LIBRARY_PATH=$GAUSSHOME/lib:$LD_LIBRARY_PATH
 PROFILEEOF
+if [ ! -s "/home/$DB_OS_USER/.bash_profile" ]; then
+    echo "[deploy] ERROR: 环境变量文件写入失败（/home/$DB_OS_USER/.bash_profile）"; exit 1
+fi
 chown "$DB_OS_USER":dbgroup "/home/$DB_OS_USER/.bash_profile"
 
 echo "[deploy] 10. 初始化数据库 (gs_initdb)..."
@@ -1077,14 +1095,25 @@ cat >> "$DATA_DIR/postgresql.conf" <<CONFEOF
 listen_addresses = '*'
 password_encryption_type = 0
 port = {port}
-max_process_memory = 2GB
-shared_buffers = 256MB
+max_process_memory = {og_max_mem}
+shared_buffers = {og_shared_buf}
 CONFEOF
 cat >> "$DATA_DIR/pg_hba.conf" <<HBAEOF
 host    all             all             0.0.0.0/0               md5
 host    replication     all             0.0.0.0/0               md5
 HBAEOF
 chown -R "$DB_OS_USER":dbgroup "$DATA_DIR"
+
+echo "[deploy] 11.5 内核共享内存参数检查 (openGauss 需要 SHMMAX >= 1GB)..."
+CUR_SHMMAX=$(cat /proc/sys/kernel/shmmax 2>/dev/null || echo 0)
+if [ "$CUR_SHMMAX" -lt 1073741824 ]; then
+    MEM_BYTES=$(free -b | awk '/Mem:/{{print $2}}')
+    sysctl -w kernel.shmmax=1073741824 >/dev/null 2>&1
+    sysctl -w kernel.shmall=$((MEM_BYTES / 4096)) >/dev/null 2>&1
+    echo "kernel.shmmax = 1073741824" > /etc/sysctl.d/99-aidbm-gaussdb.conf
+    echo "kernel.shmall = $((MEM_BYTES / 4096))" >> /etc/sysctl.d/99-aidbm-gaussdb.conf
+    echo "[deploy] 已调大 kernel.shmmax -> 1GB (原 $CUR_SHMMAX)"
+fi
 
 echo "[deploy] 12. 启动数据库并创建业务账号..."
 su - "$DB_OS_USER" -c "source ~/.bash_profile; gs_ctl start -D '$DATA_DIR' -Z single_node -l '$DATA_DIR/start.log'"

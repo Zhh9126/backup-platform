@@ -353,3 +353,77 @@ def _ts_diff_sec(ts1: str, ts2: str) -> int:
         return int(abs((t1 - t2).total_seconds()))
     except Exception:
         return 10 ** 9
+
+
+# ====================== 不可变备份 / 保留锁定（G13） ======================
+
+def _operator_name() -> str:
+    from auth import _current_user_dict
+    u = _current_user_dict()
+    return u.get("username") or u.get("display_name") or "unknown"
+
+
+@api_bp.route("/records/<int:record_id>/lock", methods=["POST"])
+@login_required
+def api_lock_record(record_id):
+    """施加保留锁定（WORM）。body: {days: int(0=永久), reason?: str}"""
+    from core import immutability
+    body = request.get_json(silent=True) or {}
+    try:
+        res = immutability.lock_record(
+            record_id, days=body.get("days") or 0,
+            operator=_operator_name(), reason=body.get("reason") or "")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"锁定失败: {e}"}), 500
+    return jsonify({"ok": True, **res})
+
+
+@api_bp.route("/records/<int:record_id>/unlock", methods=["POST"])
+@login_required
+def api_unlock_record(record_id):
+    """解除保留锁定。body: {reason: str 必填}（解锁强制审计）"""
+    from core import immutability
+    body = request.get_json(silent=True) or {}
+    try:
+        res = immutability.unlock_record(
+            record_id, operator=_operator_name(),
+            reason=body.get("reason") or "")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"解锁失败: {e}"}), 500
+    return jsonify({"ok": True, **res})
+
+
+@api_bp.route("/records/<int:record_id>/verify-integrity", methods=["POST"])
+@login_required
+def api_verify_record_integrity(record_id):
+    """完整性复检：重算产物 sha256 与基线比对（篡改/损坏早期发现）。"""
+    from core import immutability
+    try:
+        res = immutability.verify_integrity(record_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": f"复检失败: {e}"}), 500
+    return jsonify(res)
+
+
+@api_bp.route("/records/locked", methods=["GET"])
+@login_required
+def api_list_locked_records():
+    """当前处于保留锁保护期的备份记录清单。"""
+    rows = db.query(
+        "SELECT id, task_id, db_type, backup_type, finished_at, size_bytes, "
+        "status, locked, locked_at, retention_until, write_protected, "
+        "checksum_ok, checksum_verified_at, lock_note, backup_path "
+        "FROM backup_records WHERE locked=1 ORDER BY id DESC")
+    from core.immutability import is_active
+    out = []
+    for r in rows:
+        r = dict(r)
+        r["lock_active"] = is_active(r)
+        out.append(r)
+    return jsonify(out)

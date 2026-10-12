@@ -152,9 +152,22 @@ def apply_gfs(task_id: int = None, dry_run: bool = False) -> dict:
                 (rid,))
             if refs and refs[0]["c"] > 0:
                 mark_ids.discard(rid)
+        # 护栏2.5：保留锁（G13 不可变备份）保护期内一律不标记不删——
+        # 锁定备份不受 GFS 策略影响，到期后自然回到策略视野
+        _lock_guard_failed = False
+        try:
+            from core.immutability import is_active
+            for rid in list(mark_ids):
+                rec = db.query_one(
+                    "SELECT * FROM backup_records WHERE id=?", (rid,))
+                if rec and is_active(rec):
+                    mark_ids.discard(rid)
+        except Exception:  # noqa: BLE001 - 守卫异常时不放行物理删除
+            _lock_guard_failed = True
         # 护栏3：物理删除默认关闭，须策略显式 delete_files=true；
-        #        全局默认策略（非任务级）永不物理删除
-        allow_del = bool(pol.get("delete_files")) and task_id is not None
+        #        全局默认策略（非任务级）永不物理删除；锁守卫异常时禁删
+        allow_del = (bool(pol.get("delete_files")) and task_id is not None
+                     and not _lock_guard_failed)
         deleted_files = 0
         if mark_ids and not dry_run:
             for rid in mark_ids:

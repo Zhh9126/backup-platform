@@ -89,7 +89,17 @@ class StorageManager:
                         to_delete.append(p)
                 except OSError:
                     continue
+        # 保留锁守卫（G13 不可变备份）：锁保护期内的产物禁止按保留策略删除
+        try:
+            from core.immutability import locked_paths
+            locked = locked_paths()
+        except Exception:  # noqa: BLE001
+            locked = set()
         for p in to_delete:
+            if p in locked:
+                self.logger.warning(
+                    "保留策略跳过 %s：产物处于保留锁保护期（不可变备份）", p)
+                continue
             try:
                 os.remove(p)
                 self.logger.info("保留策略清理: 删除 %s", p)

@@ -198,7 +198,8 @@ def _size_of(rec: dict) -> int:
 # ---------------------------- 扫描 / 预览 ----------------------------
 def _task_rows(task_id: int):
     return db.query(
-        "SELECT id, task_id, backup_path, size_bytes, finished_at, started_at, status "
+        "SELECT id, task_id, backup_path, size_bytes, finished_at, started_at, "
+        "status, locked, retention_until "
         "FROM backup_records WHERE task_id=? AND status='success' "
         "ORDER BY COALESCE(finished_at, started_at) DESC, id DESC", (task_id,))
 
@@ -228,6 +229,7 @@ def build_plan(task_id: int = None, keep_min: int = None) -> list:
         if not rows:
             continue
         items = []
+        task_locked = 0
         for idx, r in enumerate(rows):
             ts = _parse_ts(r.get("finished_at") or r.get("started_at"))
             age_days = (now - ts).days if ts else None
@@ -241,6 +243,13 @@ def build_plan(task_id: int = None, keep_min: int = None) -> list:
             # 护栏1：最近 keep_min 份无条件保留
             if idx < km:
                 continue
+            # 护栏4：保留锁（G13 不可变备份）保护期内一律不清理——
+            # 锁定期长于保留策略时锁优先，绝不因策略过期而删掉受保护备份
+            if r.get("locked"):
+                from core.immutability import is_active
+                if is_active(r):
+                    task_locked += 1
+                    continue
             path = r.get("backup_path") or ""
             items.append({
                 "record_id": r["id"],
@@ -268,6 +277,7 @@ def build_plan(task_id: int = None, keep_min: int = None) -> list:
             # 单独计入 ghost_bytes，避免预览里虚报容量。
             "free_bytes": sum(i["size_bytes"] for i in items if i["has_file"]),
             "ghost_bytes": sum(i["size_bytes"] for i in items if not i["has_file"]),
+            "skipped_locked": task_locked,
             "items": items,
         })
     return plans
@@ -285,6 +295,15 @@ def summary_of(plans: list) -> dict:
 
 
 # ---------------------------- 执行 ----------------------------
+def _locked_paths_safe() -> set:
+    """当前保留锁保护期内的产物路径（不可变备份护栏，异常时返回空集不阻断）。"""
+    try:
+        from core.immutability import locked_paths
+        return locked_paths()
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def run_cleanup(task_id: int = None, dry_run: bool = False,
                 keep_min: int = None, purge_records: bool = None) -> dict:
     """执行清理。dry_run=True 只返回计划，不做任何删除。"""
@@ -299,6 +318,7 @@ def run_cleanup(task_id: int = None, dry_run: bool = False,
         "freed_bytes": 0,
         "missing_files": 0,
         "skipped_outside": 0,
+        "skipped_locked": 0,
         "failed": 0,
         "purge_records": bool(do_purge),
         "details": [],
@@ -309,6 +329,12 @@ def run_cleanup(task_id: int = None, dry_run: bool = False,
                   "freed_bytes": 0, "failed": []}
         for item in p["items"]:
             path = item["backup_path"]
+            # 第二道硬护栏：执行时再查一次锁（防计划与执行之间新加的锁）
+            if path and path in _locked_paths_safe():
+                report["skipped_locked"] += 1
+                detail["failed"].append("#%s 产物处于保留锁保护期，已跳过删除"
+                                        % item["record_id"])
+                continue
             if dry_run:
                 if item["has_file"]:
                     detail["deleted"] += 1

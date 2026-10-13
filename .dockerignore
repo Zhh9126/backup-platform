@@ -2,6 +2,7 @@
 .git
 .github
 .gitignore
+.venv/
 
 # 运行时数据与敏感信息（绝不入镜像）
 instance/

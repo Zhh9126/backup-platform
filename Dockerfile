@@ -18,15 +18,20 @@
 #   - MariaDB Backup      → /opt/mariabackup/usr/bin/mariabackup（MariaDB 10.x）
 #   - 上述 CentOS7 编译二进制依赖的旧版动态库 → /opt/toolpack-libs64/
 #     （libssl.so.10 等 Debian 镜像缺失，经 LD_LIBRARY_PATH 注入）
-# 其余数据库类型（PG/金仓/Oracle/达梦/MSSQL 等）经 SSH 通道使用 DBMS 自带
-# 工具执行备份（远端零安装），无需镜像内再打包对应客户端。
+# 其余数据库类型（金仓/Oracle/MSSQL 等）经 SSH 通道使用 DBMS 自带工具执行
+# 备份（远端零安装）；PG 客户端（pg_dump/pg_restore/psql/pg_basebackup）随
+# 镜像烘焙——覆盖「PG 与平台同机（容器部署）」场景，Debian bookworm 默认
+# PG 15 客户端可操作 PG 14/15 服务器。
+# 达梦原生驱动 dmPython（cp311 预编译 C 扩展 + libdmdpi 动态库）随镜像烘焙
+# （dm-driver/，离线零安装；直连探测/恢复硬核对通道），v1.4.17 容器实测补齐。
 # 未运行 docker_prep_tools.sh 时 .docker-bake 仅含 .keep，仍可构建
 # “纯应用”镜像（CI 场景），备份工具相关功能按既有提示走。
 
-# 3.12 而非 3.14：oracledb 等 C 扩展依赖尚无 cp314 预编译 wheel，
-# 3.14 基础镜像下 pip 报 "Could not find a version ... (from versions: none)"
+# 3.11 而非 3.12/3.14：dmPython 只有 cp311 预编译 C 扩展（达梦本地编译，
+# 非 PyPI 包），3.12 镜像无法加载；oracledb 等在 3.11 均有预编译 wheel。
+# （3.14 基础镜像下 pip 报 "Could not find a version ... (from versions: none)"
 # 导致镜像构建失败（本地与 GitHub Actions 同样复现）
-FROM python:3.12-slim-bookworm
+FROM python:3.11-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -55,7 +60,11 @@ ENV PYTHONUNBUFFERED=1 \
 # 日志目录不可写时会自动降级到用户目录/临时目录，并在启动横幅与页面标出真实路径。
 
 # tzdata 供时区；default-jre-headless（OpenJDK 17）仅供 JDBC 可选兜底通道；
-# gzip/zstd 供备份产物压缩 CLI；libaio1/libnuma1 供烘焙的 mysqld 临时校验实例
+# gzip/zstd 供备份产物压缩 CLI；libaio1/libnuma1 供烘焙的 mysqld 临时校验实例；
+# perl 供烘焙的 xtrabackup 2.4/8.0 包装脚本（slim 镜像 perl-base 缺 English.pm，
+# 容器实测报 "Can't locate English.pm in @INC"）；libdbd-mysql-perl/libdbi-perl
+# 供 xtrabackup 2.4 连接 MySQL（容器实测报 "DBD::mysql module is not installed"）；
+# postgresql-client 供 PG 与平台同机（容器部署）场景的本机备份/恢复
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        default-jre-headless \
@@ -64,6 +73,10 @@ RUN apt-get update \
        zstd \
        libaio1 \
        libnuma1 \
+       perl \
+       libdbi-perl \
+       libdbd-mysql-perl \
+       postgresql-client \
     && ln -fs /usr/share/zoneinfo/$TZ /etc/localtime \
     && rm -rf /var/lib/apt/lists/*
 
@@ -85,6 +98,11 @@ COPY tools/xtrabackup_libs/ /opt/xtrabackup_libs/
 COPY skills/ ./skills/
 COPY tools/ ./tools/
 
+# 达梦原生驱动 dmPython（cp311 C 扩展）+ libdmdpi 运行库：离线零安装直连通道。
+# 布局与宿主机一致（lib 在 /app/lib，libdmdpi 按 ./lib 相对路径找 libcrypto）
+COPY dm-driver/lib/ /app/lib/
+COPY dm-driver/dmPython/ /opt/dm_pyext/
+
 RUN chmod +x start.sh \
     # 运行时持久化目录（挂载卷）
     && mkdir -p /data/backups /data/instance /data/logs
@@ -94,9 +112,11 @@ RUN chmod +x start.sh \
 COPY .docker-bake/ /
 
 # 工具注入 PATH；CentOS7 旧版动态库经 LD_LIBRARY_PATH 提供给烘焙二进制；
+# /app/lib 供 libdmdpi（dmPython）；/opt/dm_pyext 供 dmPython 模块导入；
 # XTRABACKUP/MARIABACKUP 路径显式化（与 config.py 默认值一致）
 ENV PATH="/opt/mysql840b/bin:${PATH}" \
-    LD_LIBRARY_PATH="/opt/toolpack-libs64" \
+    LD_LIBRARY_PATH="/app/lib:/opt/toolpack-libs64" \
+    PYTHONPATH="/opt/dm_pyext" \
     XTRABACKUP_8_PATH=/usr/bin/xtrabackup \
     XTRABACKUP_24_PATH=/opt/xtrabackup24/usr/bin/xtrabackup \
     MARIABACKUP_PATH=/opt/mariabackup/usr/bin/mariabackup

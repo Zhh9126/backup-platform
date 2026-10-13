@@ -102,6 +102,12 @@ def _local_failure_hint(err) -> str:
     SSH，也不需要装客户端。这里按真实错误分类，只给对得上的那一条建议。
     """
     e = str(err or "").lower()
+    if any(m in e for m in ("cannot my_setwd", "can't change dir to",
+                            "can't open dir", "os error 2 - no such file")):
+        return ("物理备份需要直接读取数据库数据目录，而当前执行环境访问不到该目录"
+                "（典型为 Docker 容器部署且数据库运行在宿主机/另一台机）。物理备份"
+                "必须在能直接读取数据目录的主机上执行：请纳管数据库服务器 SSH"
+                "（平台会把 xtrabackup 推送到远端执行，免安装）后重试。")
     if any(m in e for m in ("errno 28", "no space left", "disk full", "enospc",
                             "quota exceeded", "not enough space", "空间不足")):
         return ("原因是磁盘空间不足（ENOSPC）。请清理对应分区，或把任务「产物根目录」"

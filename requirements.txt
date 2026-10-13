@@ -10,6 +10,7 @@ PyYAML>=6.0                # 支持 config.yaml 配置（当前以 config.json/�
 pymysql>=1.1               # MySQL / MariaDB 直连（纯 Python）
 psycopg2-binary>=2.9       # PostgreSQL 直连；KingbaseES 协议兼容，同一驱动可用
 oracledb>=2.0              # Oracle 瘦客户端直连（纯 Python，免装 Instant Client；12.1+）
+zstandard>=0.22            # zstd 产物校验/解压（备份后自动校验 L2 读产物头；纯 Python 回退不可用时必需）
 
 # ---------- 准 CDP 实时备份（可选加速依赖）----------
 watchdog>=4.0              # 文件事件驱动加速：Linux=inotify / Windows=ReadDirectoryChangesW

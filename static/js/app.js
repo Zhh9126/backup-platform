@@ -1441,6 +1441,7 @@
     if ($("t_ssh_state")) $("t_ssh_state").textContent = "";
     if ($("t_tool_path")) $("t_tool_path").value = "";
     if ($("t_db_os_user")) $("t_db_os_user").value = "";
+    if ($("t_auto_discover")) $("t_auto_discover").checked = false;
     toggleSshFields();
   }
 
@@ -1454,6 +1455,7 @@
     } catch (e) { eo = {}; }
     if ($("t_tool_path")) $("t_tool_path").value = eo.tool_path || "";
     if ($("t_db_os_user")) $("t_db_os_user").value = eo.db_os_user || "";
+    if ($("t_auto_discover")) $("t_auto_discover").checked = !!eo.auto_discover_new_dbs;
   }
 
   // 备份产物导出格式：保存收集（写入 extra_options.dump_format）
@@ -1485,6 +1487,9 @@
     const u = ($("t_db_os_user") && $("t_db_os_user").value.trim()) || "";
     if (u) eo.db_os_user = u;
     else delete eo.db_os_user;
+    // 新建库自动纳管（备新建库）
+    if ($("t_auto_discover") && $("t_auto_discover").checked) eo.auto_discover_new_dbs = true;
+    else delete eo.auto_discover_new_dbs;
   }
 
   function fillSshCred(sc, task) {
@@ -3113,6 +3118,7 @@
       $("f_target_type").value = extra.target_type || "local";
       $("f_target_path").value = cleanFilePath(extra.target_path || "");
       $("f_exclude_patterns").value = (extra.exclude_patterns || []).join("\n");
+      if ($("f_mirror_mode")) $("f_mirror_mode").checked = !!extra.file_mirror;
       // 按天调度回填：单任务主 schedule 映射到对应子区；mixed 同时回填两套
       const bt = task.backup_type || "full";
       if (bt === "full") {
@@ -3185,6 +3191,7 @@
       target_host: targetType === "remote" ? $("f_target_host").value : "",
       target_path: cleanFilePath($("f_target_path").value),
       exclude_patterns: $("f_exclude_patterns").value.split("\n").map((s) => s.trim()).filter(Boolean),
+      file_mirror: !!($("f_mirror_mode") && $("f_mirror_mode").checked),
       follow_symlinks: false,
       encrypt_pool: !!($("f_encrypt_pool")?.checked),
     };

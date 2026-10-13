@@ -906,8 +906,108 @@ class FileBackupEngine(BackupEngine):
 
         duration = round(time.time() - t0, 2)
         result.duration_sec = duration
+
+        # 镜像备份模式（对标 AXUS「镜像备份/快速恢复/紧急使用」）：
+        # 在既有打包+快照链路之上，把产物解包为与源一致的目录树，并合并到
+        # mirror_latest 视图（可直接复制/挂载即恢复）。开关失败安全。
+        if (self.extra.get("file_mirror") and result.success
+                and getattr(result, "backup_path", None)
+                and os.path.isfile(result.backup_path)):
+            try:
+                _dst = self._parse_target()
+                _out_dir = (_dst.get("path")
+                            if _dst.get("type") == "local" and _dst.get("path")
+                            else self._output_dir())
+                result = self._mirror_postprocess(result, _out_dir, backup_type)
+            except Exception as me:  # noqa: BLE001 —— 镜像化失败保留原 tar 产物
+                self.logger.warning("[%s] 镜像化失败(保留 tar 产物): %s",
+                                    self.task_name, me)
+
         # 落盘后统一后处理：存储池加密(§2.6) + 全局重删(§2.4)，均失败安全
         self._post_process(result)
+        return result
+
+    def _mirror_postprocess(self, result: BackupResult, out_dir: str,
+                            backup_type: BackupType) -> BackupResult:
+        """把 tar 产物镜像化为目录树（源结构一致）并合并 mirror_latest。
+
+        - 全量：解包到 mirror_full_<ts>/；增量：解包到 mirror_inc_<ts>/
+          （仅变化文件，相对路径与源一致——复制该目录覆盖回源即增量恢复）；
+        - mirror_latest/：始终维护与源一致的最新视图（增量应用 .deleted.txt），
+          供「紧急挂载直接使用」；
+        - 产物 backup_path 改指本次镜像目录；message 附 latest 路径。
+        """
+        kind = "full" if backup_type != BackupType.INCREMENTAL else "inc"
+        ts = self._timestamp()
+        out_dir = out_dir or self._output_dir()
+        mirror_dir = os.path.join(out_dir, f"mirror_{kind}_{ts}")
+        os.makedirs(mirror_dir, exist_ok=True)
+        # 产物可能已被二次压缩（.tar.gz.zst，zstd 管道压缩），先还原为 tar
+        src_arch = result.backup_path
+        tmp_tar = None
+        try:
+            if src_arch.endswith(".zst"):
+                import zstandard
+                tmp_tar = src_arch + ".tmp.tar"
+                dctx = zstandard.ZstdDecompressor()
+                with open(src_arch, "rb") as fi, open(tmp_tar, "wb") as fo:
+                    dctx.copy_stream(fi, fo)
+                src_arch = tmp_tar
+            with tarfile.open(src_arch, "r:*") as tf:
+                tf.extractall(mirror_dir)  # noqa: S202 —— 平台自产归档，非不可信输入
+        finally:
+            if tmp_tar and os.path.exists(tmp_tar):
+                try:
+                    os.remove(tmp_tar)
+                except OSError:
+                    pass
+        # 计算镜像树大小与文件数
+        n_files, total = 0, 0
+        for root, _dirs, files in os.walk(mirror_dir):
+            for f in files:
+                p = os.path.join(root, f)
+                try:
+                    total += os.path.getsize(p)
+                    n_files += 1
+                except OSError:
+                    pass
+
+        # 合并到 latest 视图
+        latest = os.path.join(out_dir, "mirror_latest")
+        os.makedirs(latest, exist_ok=True)
+        for root, _dirs, files in os.walk(mirror_dir):
+            rel = os.path.relpath(root, mirror_dir)
+            dst_root = latest if rel == "." else os.path.join(latest, rel)
+            os.makedirs(dst_root, exist_ok=True)
+            for f in files:
+                if f == ".deleted.txt":
+                    continue
+                srcp = os.path.join(root, f)
+                shutil.copy2(srcp, os.path.join(dst_root, f))
+        # 增量：应用删除清单，保持 latest 与源一致
+        del_man = os.path.join(mirror_dir, ".deleted.txt")
+        if os.path.isfile(del_man):
+            with open(del_man, encoding="utf-8", errors="replace") as df:
+                for line in df:
+                    relp = line.strip().lstrip("/")
+                    if not relp:
+                        continue
+                    victim = os.path.join(latest, relp)
+                    if os.path.isfile(victim):
+                        try:
+                            os.remove(victim)
+                        except OSError:
+                            pass
+
+        result.backup_path = mirror_dir
+        result.size_bytes = total
+        result.checksum = ""
+        base_msg = (result.message or "").split(" | ")[0]
+        result.message = (f"{base_msg} | 镜像模式: {n_files} 文件 "
+                          f"{db.human_size(total)}（目录树与源一致，可复制/挂载即恢复）"
+                          f" | 最新视图: {latest}")
+        self.logger.info("[%s] 镜像化完成: %s（latest=%s）",
+                         self.task_name, mirror_dir, latest)
         return result
 
     def _post_process(self, result: BackupResult) -> None:
@@ -1867,6 +1967,36 @@ class FileBackupEngine(BackupEngine):
                 success=False, status=BackupStatus.FAILED,
                 message="恢复失败：未指定目标目录（使用 target_db 字段）",
             )
+
+        # 0.5) 镜像备份目录产物：树结构与源一致 → 直接复制回目标即恢复
+        #      （AXUS「快速恢复：复制文件夹即恢复」语义；latest 视图亦可整体复制）
+        if os.path.isdir(backup_path):
+            try:
+                os.makedirs(target, exist_ok=True)
+                n = 0
+                for root, _dirs, files in os.walk(backup_path):
+                    rel = os.path.relpath(root, backup_path)
+                    dst_root = target if rel == "." else os.path.join(target, rel)
+                    os.makedirs(dst_root, exist_ok=True)
+                    for f in files:
+                        if f == ".deleted.txt":
+                            continue
+                        shutil.copy2(os.path.join(root, f),
+                                     os.path.join(dst_root, f))
+                        n += 1
+                self.logger.info("[%s] 镜像恢复完成: %s → %s（%d 文件）",
+                                 self.task_name, backup_path, target, n)
+                return BackupResult(
+                    success=True, status=BackupStatus.SUCCESS,
+                    backup_path=backup_path,
+                    message=f"镜像恢复完成: {n} 个文件已复制到 {target}"
+                            f"（目录结构与源一致）",
+                )
+            except Exception as e:  # noqa: BLE001
+                self.logger.error("[%s] 镜像恢复失败: %s", self.task_name, e)
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    message=f"镜像恢复失败: {str(e) or type(e).__name__}")
 
         # 1) 构建恢复链：增量恢复必须先回全量，再按时间顺序应用增量
         #    PITR 场景由 PITRRestore 传入 chain_override（journal 精确解析结果），

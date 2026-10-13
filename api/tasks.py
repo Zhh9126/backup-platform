@@ -311,6 +311,16 @@ def run_task(task_id):
     return jsonify(record)
 
 
+@api_bp.route("/tasks/<int:task_id>/discover", methods=["POST"])
+@login_required
+def discover_task_databases(task_id):
+    """新建库自动发现（对标 AXUS「备新建库」）：手动触发一次源实例新库扫描。"""
+    from core import auto_discover
+    data = request.get_json(force=True, silent=True) or {}
+    r = auto_discover.discover_for_task(task_id, operator=data.get("operator") or "")
+    return jsonify(r), (200 if r.get("ok") else 400)
+
+
 # ------------------------- 模板下载 -------------------------
 @api_bp.route("/tasks/template", methods=["GET"])
 @login_required

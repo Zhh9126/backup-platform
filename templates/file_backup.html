@@ -107,6 +107,14 @@
               <label class="form-label">排除规则（每行一个，支持通配符）</label>
               <textarea class="form-control" id="f_exclude_patterns" rows="2" placeholder="*.tmp&#10;*.log&#10;__pycache__"></textarea>
             </div>
+            <div class="col-12">
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="f_mirror_mode">
+                <label class="form-check-label" for="f_mirror_mode">
+                  镜像备份模式（备份目录与源服务器完全一致，复制文件夹即可恢复；另维护 mirror_latest 最新视图可直接挂载使用）
+                </label>
+              </div>
+            </div>
 
             <div class="col-md-4">
               <label class="form-label">保留天数</label>

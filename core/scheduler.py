@@ -233,6 +233,26 @@ def run_task_now(task_id: int, backup_type: str = None,
         _logger.warning("任务不存在: %s", task_id)
         return None
 
+    # 新建库自动纳管（对标 AXUS「备新建库」）：任务开启后每次执行前发现新库，
+    # 单库任务自动克隆新任务；失败安全，不影响本次备份
+    try:
+        _eo = task.get("extra_options") or {}
+        if isinstance(_eo, str):
+            import json as _json
+            try:
+                _eo = _json.loads(_eo)
+            except Exception:
+                _eo = {}
+        if _eo.get("auto_discover_new_dbs"):
+            from core import auto_discover
+            dr = auto_discover.discover_for_task(task_id, operator=operator or "")
+            if dr.get("discovered"):
+                _logger.info("[auto_discover] 任务 #%s: %s", task_id,
+                             dr.get("message", ""))
+    except Exception as _dexc:  # noqa: BLE001 —— 发现失败绝不阻断备份
+        _logger.warning("[auto_discover] 任务 #%s 发现失败(不阻断): %s",
+                        task_id, _dexc)
+
     # 文件/目录备份可能耗时很长(SSH传输大目录)，放入后台线程
     if task.get("db_type") == "file":
         t = threading.Thread(target=_bg_execute_backup,

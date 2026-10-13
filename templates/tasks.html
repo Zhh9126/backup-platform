@@ -317,6 +317,18 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
                     若实际安装用户与默认不同，在此填写（优先级：本任务 &gt; 纳管主机 &gt; 库型默认）。
                   </div>
                 </div>
+                <div class="col-12 mt-2">
+                  <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="t_auto_discover">
+                    <label class="form-check-label" for="t_auto_discover">
+                      新建库自动纳管（防止管理软件新建库后忘记加入备份计划）
+                    </label>
+                    <div class="small text-muted">
+                      每次备份前自动扫描源实例：发现新建数据库时自动为其创建同配置备份任务并通知；
+                      全实例备份任务的新库天然包含在内，仅提示不重复建任务。
+                    </div>
+                  </div>
+                </div>
               </div>
               <div class="row g-3">
                 <div class="col-md-4">

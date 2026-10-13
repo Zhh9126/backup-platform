@@ -143,10 +143,12 @@ class OracleEngine(BackupEngine):
                     sftp.chmod(remote_sql, 0o644)
                 except Exception:
                     pass
-                # oracle 用户执行；连接串以环境变量 DP_CONN 传入避免引号
+                # 数据库 OS 用户执行（标准变量，可按任务/主机覆盖）；
+                # 连接串以环境变量 DP_CONN 传入避免引号
                 inner = (f"export DP_CONN={shlex.quote(login)}; "
                          f"sqlplus -s $DP_CONN @{remote_sql}")
-                shell = remote_dump._wrap_login(f"su - oracle -c {shlex.quote(inner)}")
+                shell = remote_dump._wrap_login(
+                    f"su - {self._resolve_check_user()} -c {shlex.quote(inner)}")
                 out, _err, rc = _ssh_exec_pipe(client, shell, timeout=60)
                 text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
                 for line in text.splitlines():
@@ -256,7 +258,8 @@ class OracleEngine(BackupEngine):
                      f"DUMPFILE=platform_verify_{ts}.dmp SQLFILE={sqlfile} "
                      # DIRECTORY 为必填：缺省时报 ORA-39145（目录对象不能为空）
                      f"DIRECTORY=DATA_PUMP_DIR NOLOGFILE=Y {mode_args}")
-            shell = f"su - oracle -c {shlex.quote(inner)}"
+            shell = (f"su - {self._resolve_check_user(ssh_host)} -c "
+                     f"{shlex.quote(inner)}")
             start = _time.time()
             out, err, rc = _ssh_exec_pipe(
                 client, remote_dump._wrap_login(shell),
@@ -324,7 +327,8 @@ class OracleEngine(BackupEngine):
             with sftp.open("/tmp/platform_verify_df.sql", "w") as f:
                 f.write(sql)
             shell = remote_dump._wrap_login(
-                f"su - oracle -c {shlex.quote('sqlplus -s / as sysdba @/tmp/platform_verify_df.sql')}")
+                f"su - {self._resolve_check_user(ssh_host)} -c "
+                f"{shlex.quote('sqlplus -s / as sysdba @/tmp/platform_verify_df.sql')}")
             out, _err, rc = _ssh_exec_pipe(client, shell, timeout=60)
             text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
             df_no = None
@@ -391,7 +395,8 @@ class OracleEngine(BackupEngine):
             with sftp.open("/tmp/platform_verify_rman.cmd", "w") as f:
                 f.write(f"RUN {{\n{catalog_line}  RESTORE DATABASE VALIDATE;\n}}\nEXIT;\n")
             shell = remote_dump._wrap_login(
-                f"su - oracle -c {shlex.quote(f'{shlex.quote(rman_bin)} target / @/tmp/platform_verify_rman.cmd')}")
+                f"su - {self._resolve_check_user(ssh_host)} -c "
+                f"{shlex.quote(f'{shlex.quote(rman_bin)} target / @/tmp/platform_verify_rman.cmd')}")
             start = _time.time()
             out, err, rc = _ssh_exec_pipe(client, shell, timeout=7200)
             duration = round(_time.time() - start, 3)
@@ -412,7 +417,8 @@ class OracleEngine(BackupEngine):
                             f"  RESTORE DATAFILE {df_no};\n"
                             f"}}\nEXIT;\n")
                 shell = remote_dump._wrap_login(
-                    f"su - oracle -c {shlex.quote(f'{shlex.quote(rman_bin)} target / @/tmp/platform_verify_df2.cmd')}")
+                    f"su - {self._resolve_check_user(ssh_host)} -c "
+                    f"{shlex.quote(f'{shlex.quote(rman_bin)} target / @/tmp/platform_verify_df2.cmd')}")
                 out2, _err, rc2 = _ssh_exec_pipe(client, shell, timeout=3600)
                 out2_text = out2.decode("utf-8", "replace") if isinstance(out2, bytes) else (out2 or "")
                 # 确认真实文件落盘
@@ -493,7 +499,8 @@ class OracleEngine(BackupEngine):
                 except Exception:
                     pass
                 shell = remote_dump._wrap_login(
-                    f"su - oracle -c {shlex.quote('sqlplus -s / as sysdba @' + remote_sql)}")
+                    f"su - {self._resolve_check_user()} -c "
+                    f"{shlex.quote('sqlplus -s / as sysdba @' + remote_sql)}")
                 out, _err, rc = _ssh_exec_pipe(client, shell, timeout=90)
                 text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
                 return text.strip()
@@ -698,7 +705,8 @@ class OracleEngine(BackupEngine):
         并用 SFTP 把生成的备份片拉回本机落盘。
 
         关键约束（基于对 192.168.220.129 的真实探测）：
-        - Oracle 工具链仅在 oracle 用户 profile 中可用，必须用 `su - oracle -c`
+        - Oracle 工具链仅在数据库 OS 用户（默认 oracle，可用 db_os_user
+          标准变量覆盖）profile 中可用，必须以 `su - <用户> -c`
           执行，不能以 root 直接跑 rman；
         - db_recovery_file_dest 未配置(size=0) → 必须显式 FORMAT 指定备份路径，
           否则 ORA-19801；
@@ -788,7 +796,8 @@ class OracleEngine(BackupEngine):
                 # 3) 远端执行：mkdir 备份目录 + rman target / @script（以 oracle 用户）
                 inner = (f"mkdir -p {remote_dir} && "
                          f"{shlex.quote(rman_bin)} target / @{remote_cmd_file}")
-                shell = f"su - oracle -c {shlex.quote(inner)}"
+                shell = (f"su - {self._resolve_check_user(ssh_host)} -c "
+                         f"{shlex.quote(inner)}")
                 wrapped = remote_dump._wrap_login(shell)
                 start = time.time()
                 out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=7200)
@@ -1008,7 +1017,8 @@ class OracleEngine(BackupEngine):
                 err_text, rc, duration = "", 0, 0.0
             else:
                 inner = f"bash {remote_sh}"
-                shell = f"su - oracle -c {shlex.quote(inner)}"
+                shell = (f"su - {self._resolve_check_user(ssh_host)} -c "
+                         f"{shlex.quote(inner)}")
                 wrapped = remote_dump._wrap_login(shell)
                 start = time.time()
                 out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=7200)
@@ -1186,7 +1196,8 @@ class OracleEngine(BackupEngine):
                          f"DUMPFILE={dmp_name} LOGFILE={log_name} "
                          f"DIRECTORY=DATA_PUMP_DIR "
                          f"TABLE_EXISTS_ACTION=REPLACE {mode_args}")
-                shell = f"su - oracle -c {shlex.quote(inner)}"
+                shell = (f"su - {self._resolve_check_user(target_host_info)} -c "
+                         f"{shlex.quote(inner)}")
                 start = time.time()
                 out, err, rc = _ssh_exec_pipe(
                     client, remote_dump._wrap_login(shell),

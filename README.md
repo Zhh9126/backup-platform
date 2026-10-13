@@ -10,11 +10,11 @@
 解决**人工运维效率低、备份失效难发现、故障排查慢、异构数据适配难**等行业痛点，
 真正实现数据灾备的**智能化、自动化、安全化、全域化**。
 
-Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦） · SQL Server · Redis · MongoDB · Neo4j · 文件
+Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦） · SQL Server · openGauss · Redis · MongoDB · Neo4j · 文件
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 预校验 · 克隆 · 演练 · 巡检 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v1.4.14-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v1.4.16-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -50,7 +50,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 | 能力 | 说明 |
 |---|---|
-| 10 个数据库备份引擎 + 文件备份 | MySQL / MariaDB / PostgreSQL / Kingbase / DM / SQL Server / Oracle / Redis / MongoDB / Neo4j + 文件（本地 + 远程 SSH 无 Agent）|
+| 11 个数据库备份引擎 + 文件备份 | MySQL / MariaDB / PostgreSQL / Kingbase / DM / SQL Server / Oracle / openGauss / Redis / MongoDB / Neo4j + 文件（本地 + 远程 SSH 无 Agent）|
 | 备份类型 | 全量 / 增量 / 差异（SQL Server）/ 快照 / 合成全量 / 组合（全量+增量双调度）|
 | MySQL 物理增量备份与增量链恢复 | XtraBackup 增量备份；恢复时基备 prepare → 逐层合并增量 → 临时实例校验，自动处理压缩产物与增量链 |
 | 达梦物理增量备份 | 联机 `BACKUP INCREMENT BACKUPSET`，增量备份集自动拉回 |
@@ -166,7 +166,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 | 能力 | 说明 |
 |---|---|
-| 支持部署 | MySQL 8.0 / PostgreSQL / MongoDB（副本集+认证）/ Kingbase / Redis / DM / Oracle |
+| 支持部署 | MySQL 8.0 / PostgreSQL / MongoDB（副本集+认证）/ Kingbase / Redis / DM / Oracle / openGauss |
 | 部署流程 | 上传安装包 → 创建部署任务 → 异步执行（SFTP 推送 + 远程脚本）→ 实时日志 |
 | Redis 部署 | 源码编译安装，启动脚本含 --daemonize，环境变量写入 profile.d |
 | Kingbase 静默安装 | ISO 挂载 → InstallAnywhere 静默安装（自动处理临时目录/非 root/授权文件/家目录空间检查）|
@@ -330,8 +330,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v1.4.14   # 固定版本（可回滚）
-# 当前最新版本：v1.4.14（2026-09-24）
+docker pull ghcr.io/zhh9126/backup-platform:v1.4.16   # 固定版本（可回滚）
+# 当前最新版本：v1.4.16（2026-09-24）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -355,9 +355,9 @@ python tools/check_env.py
 
 ```bash
 # 有网机器导出
-docker save ghcr.io/zhh9126/backup-platform:v1.4.14 -o aidbm-v1.4.14.tar
+docker save ghcr.io/zhh9126/backup-platform:v1.4.16 -o aidbm-v1.4.16.tar
 # 内网机器导入
-docker load -i aidbm-v1.4.14.tar
+docker load -i aidbm-v1.4.16.tar
 ```
 
 ### 运行
@@ -379,17 +379,17 @@ docker run -d --name backup-platform \
 
 ```bash
 # 1. 导入新版本镜像（离线环境在有网机器 docker save 后拷入）
-docker load -i aidbm-v1.4.14.tar
+docker load -i aidbm-v1.4.16.tar
 
 # 2. 停止并删除旧容器（备份数据在 backup-data 卷中，不受影响）
 docker stop backup-platform
 docker rm backup-platform
 
 # 3. 用新版本镜像启动（命令与首次部署完全一致，仅换镜像 tag）
-docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v1.4.14
+docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v1.4.16
 
 # 4.（可选）删除旧版本镜像释放空间
-docker rmi ghcr.io/zhh9126/backup-platform:v1.4.13
+docker rmi ghcr.io/zhh9126/backup-platform:v1.4.15
 ```
 
 > 升级不丢数据：元数据库、备份产物、日志都在 `backup-data` 卷（`/data`），
@@ -404,7 +404,7 @@ docker stop backup-platform
 docker rm backup-platform
 
 # 2. 删除镜像
-docker rmi ghcr.io/zhh9126/backup-platform:v1.4.14
+docker rmi ghcr.io/zhh9126/backup-platform:v1.4.16
 
 # 3.（谨慎）删除数据卷 —— 会清掉全部备份产物与元数据，操作前务必
 #    先把备份文件拷贝转移！
@@ -459,6 +459,7 @@ docker build -t backup-platform:local .
 | PostgreSQL | pg_dump、pg_basebackup | pg_restore / psql | PGPASSWORD 环境变量传密码 |
 | Oracle | expdp / RMAN | impdp / RMAN | 数据泵 DIRECTORY；RMAN 支持增量 |
 | Kingbase 金仓 | sys_dump、sys_basebackup | sys_restore / ksql | 兼容 PG 协议，默认端口 54321 |
+| openGauss / 磐维 | gs_dump、gs_basebackup | gs_restore / gsql | 兼容 PG 协议族，默认端口 26000（磐维 12800）；sha256 认证须 `-W` 显式传密，`gs_dump` 进度输出走落盘文件防污染 |
 | DM 达梦 | dexp、disql(联机 BACKUP) | dimp、dmrman(PITR) | 原生驱动缺失时自动降级 JDBC 通道（驱动随包） |
 | SQL Server | sqlcmd | sqlcmd | BACKUP/RESTORE DATABASE；SQLCMDPASSWORD 注入 |
 | Redis | redis-cli --rdb | （替换 rdb + 自动重启） | REDISCLI_AUTH 传密码 |
@@ -484,13 +485,12 @@ docker build -t backup-platform:local .
 
 ## 使用说明（导航结构）
 
-- **概览**：仪表盘（任务数、累计备份体积、成功失败统计）
-- **备份管理**：数据库备份、文件备份、存储管理（三级存储 + 合成全量）、保护策略、备份插件、**数据库类型（可插拔）**
-- **记录**：备份记录、恢复记录、恢复校验
-- **数据恢复管理**：数据恢复、数据库部署
-- **灾备管理**：数据迁移、数据同步、数据对比、容灾链路、克隆服务、恢复演练
-- **实时管控**：实时管控时间线（RT / CDP / PITR）
-- **运维**：巡检、智能告警、数据价值挖掘、智能体、**系统设置、用户管理（RBAC）**
+- **概览**：仪表盘（任务数、累计备份体积、成功失败统计、四维健康度、近 7 天趋势）
+- **备份管理**：数据库备份、文件备份、对象存储备份（MinIO / OSS / COS / S3 兼容）、存储管理（三级存储 + 合成全量）、备份策略、无 Agent、备份插件、实时备份（CDC / PITR）
+- **数据恢复管理**：数据恢复、恢复校验、数据对比、数据库部署
+- **记录**：备份记录、恢复记录
+- **灾备管理**：数据迁移、数据同步、容灾链路、克隆服务、虚拟机备份
+- **运维**：运维运营分析、巡检、AI 智能助手、智能告警、数据价值挖掘、系统日志、系统设置、用户管理（RBAC）
 
 > 菜单按当前账号权限自动收敛：`viewer` 仅见只读入口，`operator` 不见系统设置 / 用户管理 / 数据库类型，`admin` 全量可见。
 
@@ -528,6 +528,33 @@ docker build -t backup-platform:local .
 - 默认账号请立即修改（首登会标记 `must_change_password`）；生产环境建议限制来源 IP
 
 ## 更新日志
+
+### 未发布（main 已合入，待打 tag 发版）
+
+以下内容已提交到 main 分支，但尚未随版本 tag 与镜像发布：
+
+- **openGauss 备份/恢复引擎接入（第 12 个数据库引擎）+ 单机部署**：复用 PostgreSQL 引擎链路（gs_dump / gs_restore / gsql / gs_basebackup 工具映射），经真实环境全矩阵端到端验证（逻辑 -Fc/-Fp/-Fd、全实例逐库、dumpall、物理 gs_basebackup、跨主机恢复、恢复校验）。修复的实战缺陷：sha256 认证不读 PGPASSWORD（必须 `-W` 显式传密）、gs_dump 进度输出走 stdout 污染产物流（改 `-f` 落盘）、`-Fd` 目录格式与 `-X stream` 限制、跨主机恢复、部署 glibc 预检加固。磐维 PanWeiDB 引擎（继承 openGauss，工具链同名同用法）工作区开发中。
+- **不可变备份四层防护（G13 闭环）**：备份记录保留锁定（只许延长不许缩短，强制审计原因）→ 产物写保护（chmod 去写位）→ 完整性基线 + 每日 sha256 复检（任务 `backup_integrity_check`，默认 04:40）→ 删除路径四路拦截（定期清理 / GFS / 分层生命周期 / 任务删除全部跳过锁定记录）。API：`POST /api/records/<id>/lock` / `/unlock` / `/verify-integrity`。
+- **数据同步 / 迁移可靠性（"不重不丢不错"）**：轮询实时同步水位持久化到 `sync_tasks.realtime_watermark`（重启续传不再重做全量快照）、时间戳回看窗口 `poll_overlap_seconds`、周期对账 `reconcile_every_polls`（检测轮询漏 DELETE）、批次写入失败回滚重试与错误明细、迁移 dry-run 预演 / 逐表 manifest / 断点续跑 / 行数 + 抽样内容双校验、MySQL→达梦兼容顾问补齐（静态 SQL 清单、列级保留字、迁移后自动 `SP_TAB_STAT_INIT`）。
+- **i18n 中英文切换 v2/v3**：模板 935 条 + JS 高频串 + 正则动态串全量覆盖。
+
+### v1.4.16（2026-09-24）
+
+- **openEuler 物理备份兼容（现场反馈修复）**：根因是平台推送的 xtrabackup（CentOS7 构建）依赖 `libssl.so.10` 而 openEuler 缺失，且其报错格式 `version 'xxx' not found`（不带 `=>`）被旧 ldd 分类器漏判。修复：① 28 个非 glibc 依赖库打包进镜像 `/opt/xtrabackup_libs`（`XB_BUNDLED_LIB_DIR` 可覆盖）；② ldd 分类器泛化——GLIBC_/GCC_/CXXABI_/LIBC_ 版本缺失判致命，其余 soname 缺失可推补；③ 推送前 ELF 架构预检。
+- **页面"改了没变化"根因修复**：`base.html` 静态资源缓存版本号未升级导致浏览器拿旧 JS/CSS；此后改前端资源必同步升缓存戳。顺带修复空状态 `${T(...)}` 原文显示与弹窗标题冗余记录号。
+
+### v1.4.15（2026-09-24）
+
+- **科技感视觉层 v2**：teal 光晕背景、统计卡、卡片品牌渐变线、主按钮渐变、表头吸顶、状态徽章 pill 化与运行中呼吸动画。
+- **i18n 中英文切换 v1**：右上角切换按钮 + 侧边栏/页面文案/状态徽章自动翻译，`localStorage` 记忆语言。
+
+### v1.4.14（2026-09-24）
+
+- **元数据库可插拔后端**：系统设置「元数据库」面板填 PG/MySQL 账号密码即可从 SQLite 无缝切换（`core/db.py` 适配层 + 方言翻译 + `core/meta_migrate.py` 迁移引擎 + 行数校验/序列归位），PG 14 全生命周期实测通过；回切携带数据。
+- **迁移兼容性顾问（达梦七坑内置）**：`core/sync/compat_advisor.py`——达梦 VARCHAR 字节语义自动放大（UTF-8 ×3）、零日期消毒、无符号整型升位、NLS/大小写/兼容模式预检探测；非 MySQL 目标整型升位误判修复。
+- **MySQL 物理备份远端推送三修复**：远端 glibc 过低误判为缺库、版本不匹配的旧工具误用（三级版本探测：端口横幅 → 服务二进制 → 平台客户端查 VERSION）、多服务机器版本误判；ELF 架构预检。**Docker 路径透明化**：容器内备份的宿主机映射在日志弹窗与存储页明示。全实例无业务库自动兜底含系统库。
+- **插件内置守卫 + 离线包源**：镜像内置插件（xtrabackup 2.4/8.0 等）标记 builtin 不可卸载；插件市场支持 `core/plugins/offline_packages/` 离线包安装（完全离线环境可用）。
+- **交付物治理**：`.dockerignore`/`.gitignore` 排除 `packages/`；前端设计约束文档与视觉现代化层第一版。
 
 ### v1.4.13（2026-09-22）
 

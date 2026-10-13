@@ -179,7 +179,7 @@ def cross_host_restore(db_type: str, backup_path: str, target_host_info: dict,
             extra = dict(extra)
             extra["_pg_psql_bin"] = _resolve_remote_bin(client, "psql") or "psql"
             extra["_pg_restore_bin"] = _resolve_remote_bin(client, "pg_restore") or "pg_restore"
-        if db_type == "opengauss":
+        if db_type in ("opengauss", "panwei"):
             from core.remote_dump import _resolve_remote_bin
             extra = dict(extra)
             extra["_og_restore_bin"] = _resolve_remote_bin(client, "gs_restore") or "gs_restore"
@@ -194,7 +194,7 @@ def cross_host_restore(db_type: str, backup_path: str, target_host_info: dict,
         # 全实例 tar.gz：解包后逐库恢复（结构按源端、库名沿用 manifest）
         if os.path.basename(remote).lower().endswith(
                 (".tar.gz", ".tgz")) and db_type in (
-                "mysql", "mariadb", "postgresql", "kingbase", "opengauss"):
+                "mysql", "mariadb", "postgresql", "kingbase", "opengauss", "panwei"):
             cmd = _build_full_instance_restore_cmd(db_type, remote, extra)
             # 任务级自定义环境变量前缀（contextvar，由 scheduler 设置）
             from core.remote_dump import current_task_env_export
@@ -310,10 +310,11 @@ echo "RESTORE_SUMMARY ok=$OK fail=$FAIL"
         create_via = psql_bin
         wflag = ""
         global_apply = f'[ -f "$WORK/globals.sql" ] && {psql_bin} -h {host} -p {port} -U {user} -d {maint} -f "$WORK/globals.sql" || echo "[SKIP] globals"'
-    elif db_type == "opengauss":
+    elif db_type in ("opengauss", "panwei"):
         # sha256 认证不读 PGPASSWORD：全部命令带 -W；gs_* 需 GAUSSHOME/lib
-        port = extra.get("source_port") or 26000
-        user = extra.get("source_username") or "gaussadmin"
+        # （openGauss 默认 26000/gaussadmin；磐维默认 12800/omm）
+        port = extra.get("source_port") or (12800 if db_type == "panwei" else 26000)
+        user = extra.get("source_username") or ("omm" if db_type == "panwei" else "gaussadmin")
         pw = extra.get("source_password") or ""
         psql_bin = extra.get("_og_gsql_bin") or "gsql"
         restore_bin = extra.get("_og_restore_bin") or "gs_restore"
@@ -355,6 +356,10 @@ def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
                        extra: dict, target_host_info: dict) -> str:
     """构造各 DB 跨主机恢复命令（目标主机上执行）。"""
     base = extra.get("base_dir") or ""
+    # 数据库 OS 用户（标准变量：主机级 db_os_user > 库型默认），
+    # Oracle/DM 等工具链仅在其属主用户 profile 中可用
+    from core.remote_dump import resolve_db_os_user
+    os_user = resolve_db_os_user(None, target_host_info, db_type=db_type)
     # 跨主机恢复统一在目标主机本机执行（127.0.0.1），而不是连接源库地址。
     # 端口默认取源任务端口（假设目标机运行同端口实例），可由 target_port 覆盖。
     if db_type == "mysql":
@@ -451,16 +456,16 @@ def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
         conn = f"{user}/{pw}@//127.0.0.1:{port}/{svc}"
         script = f"""#!/bin/bash
 set -u
-IMPDP=$(su - oracle -c 'command -v impdp' 2>/dev/null | head -1)
+IMPDP=$(su - {os_user} -c 'command -v impdp' 2>/dev/null | head -1)
 if [ -z "$IMPDP" ]; then
   IMPDP=$(find /u01/app/oracle/product/*/*/bin /u01/app/oracle/*/bin -maxdepth 1 -name impdp -type f 2>/dev/null | head -1)
 fi
 if [ -z "$IMPDP" ]; then
-  echo "[ERROR] 目标主机未找到 impdp（oracle 用户 PATH 与常见 ORACLE_HOME 目录均无）"
+  echo "[ERROR] 目标主机未找到 impdp（{os_user} 用户 PATH 与常见 ORACLE_HOME 目录均无）"
   exit 127
 fi
 echo "IMPDP=$IMPDP"
-DP=$(su - oracle -c "sqlplus -s / as sysdba" <<'EOSQL' 2>/dev/null | grep '^/' | head -1
+DP=$(su - {os_user} -c "sqlplus -s / as sysdba" <<'EOSQL' 2>/dev/null | grep '^/' | head -1
 SET HEADING OFF
 SET PAGESIZE 0
 SET FEEDBACK OFF
@@ -474,8 +479,8 @@ if [ -z "$DP" ]; then
 fi
 echo "DP=$DP"
 cp '{remote_pkg}' "$DP/platform_restore.dmp" || exit 1
-chown oracle:oinstall "$DP/platform_restore.dmp" 2>/dev/null
-su - oracle -c "$IMPDP '{conn}' DIRECTORY=DATA_PUMP_DIR DUMPFILE=platform_restore.dmp LOGFILE=platform_restore.log TABLE_EXISTS_ACTION=REPLACE"
+chown {os_user} "$DP/platform_restore.dmp" 2>/dev/null
+su - {os_user} -c "$IMPDP '{conn}' DIRECTORY=DATA_PUMP_DIR DUMPFILE=platform_restore.dmp LOGFILE=platform_restore.log TABLE_EXISTS_ACTION=REPLACE"
 RC=$?
 tail -30 "$DP/platform_restore.log" 2>/dev/null
 exit $RC
@@ -505,12 +510,12 @@ exit $RC
         target = f"-d '{target_db}'" if target_db else ""
         return f"{env} {pre}{ksql_bin} -h {host} -p {port} -U {user} {target} -f '{actual}'"
 
-    elif db_type == "opengauss":
-        # openGauss 单库跨主机恢复：sha256 认证不读 PGPASSWORD，全部命令 -W；
+    elif db_type in ("opengauss", "panwei"):
+        # openGauss/磐维单库跨主机恢复：sha256 认证不读 PGPASSWORD，全部命令 -W；
         # 目标库不存在时自动创建；gs_* 需 GAUSSHOME/lib（按解析出的绝对路径反推）
         host = "127.0.0.1"
-        port = extra.get("source_port") or 26000
-        user = extra.get("source_username") or "gaussadmin"
+        port = extra.get("source_port") or (12800 if db_type == "panwei" else 26000)
+        user = extra.get("source_username") or ("omm" if db_type == "panwei" else "gaussadmin")
         pw = extra.get("source_password") or ""
         restore_bin = extra.get("_og_restore_bin") or "gs_restore"
         gsql_bin = extra.get("_og_gsql_bin") or "gsql"
@@ -563,18 +568,18 @@ exit $RC
         dm_port = extra.get("source_port") or 5236
         script = f"""#!/bin/bash
 set -u
-DIMP=$(su - dmdba -c 'command -v dimp' 2>/dev/null | head -1)
+DIMP=$(su - {os_user} -c 'command -v dimp' 2>/dev/null | head -1)
 if [ -z "$DIMP" ]; then
   DIMP=$(find /dm8/bin /opt/dmdbms/bin /home/dmdba/dmdbms/bin /opt/dm*/bin /dm*/bin -maxdepth 2 -name dimp -type f 2>/dev/null | head -1)
 fi
 if [ -z "$DIMP" ]; then
-  echo "[ERROR] 目标主机未找到 dimp（dmdba 用户 PATH 与常见安装目录均无）"
+  echo "[ERROR] 目标主机未找到 dimp（{os_user} 用户 PATH 与常见安装目录均无）"
   exit 127
 fi
 echo "DIMP=$DIMP"
 DM_FDIR=$(dirname '{remote_pkg}')
 DM_FBASE=$(basename '{remote_pkg}')
-"$DIMP" SYSDBA/'{dm_pwd}'@localhost:{dm_port} FILE="$DM_FBASE" DIRECTORY="$DM_FDIR" LOG=/tmp/dm_restore_{int(time.time())}.log
+"$DIMP" SYSDBA/'{dm_pwd}'@localhost:{dm_port} FILE="$DM_FBASE" DIRECTORY="$DM_FDIR" LOG=/tmp/dm_restore_{int(time.time())}.log TABLE_EXISTS_ACTION=REPLACE
 exit $?
 """
         import base64

@@ -31,7 +31,7 @@ import config
 logger = logging.getLogger(__name__)
 
 # PG 协议系（逐库 dump + globals 语义一致），新增同源库时加入此元组即可
-PG_FAMILY = ("postgresql", "kingbase", "opengauss")
+PG_FAMILY = ("postgresql", "kingbase", "opengauss", "panwei")
 
 # 各库类型的系统库清单（全实例默认排除，业务库优先）
 SYSTEM_DBS = {
@@ -41,6 +41,8 @@ SYSTEM_DBS = {
     "kingbase": ("template0", "template1", "template2", "security", "test"),
     # openGauss 默认库：postgres（维护库）+ 两个模板库
     "opengauss": ("postgres", "template0", "template1"),
+    # 磐维（openGauss 系）同款默认库
+    "panwei": ("postgres", "template0", "template1"),
 }
 
 # 各库类型差异点
@@ -75,6 +77,16 @@ TOOLING = {
         "default_query": "gsql",
         "default_dumpall": "gs_dumpall",
     },
+    # 磐维：gsql/gs_dump/gs_dumpall（工具随 GAUSSHOME/bin 提供，与 openGauss 一致）
+    "panwei": {
+        "catalog_sqls": (
+            "SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY 1",
+        ),
+        "maint_candidates": ("postgres", "template1"),
+        "env_exports": ("PGPASSWORD",),
+        "default_query": "gsql",
+        "default_dumpall": "gs_dumpall",
+    },
     "mysql": {
         "catalog_sqls": ("SHOW DATABASES",),
         "maint_candidates": ("mysql",),
@@ -91,8 +103,8 @@ TOOLING = {
 
 
 def _pg_w_pass(db_type: str, password: str):
-    """openGauss sha256 认证不读 PGPASSWORD，原生客户端必须 -W 显式传密码。"""
-    return ["-W", password] if db_type == "opengauss" and password else []
+    """openGauss/磐维 sha256 认证不读 PGPASSWORD，原生客户端必须 -W 显式传密码。"""
+    return ["-W", password] if db_type in ("opengauss", "panwei") and password else []
 
 
 def _build_env(db_type: str, password: str) -> dict:

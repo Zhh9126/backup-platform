@@ -237,9 +237,12 @@ DUMP_FORMATS = {
     ],
 }
 
-# PG 系（postgresql / kingbase / opengauss）在 dump_format=auto 时的行为：按压缩开关决定
+# 磐维（openGauss 系）：gs_dump/gs_restore/gsql 工具链与 openGauss 完全一致，复用同一组格式
+DUMP_FORMATS["panwei"] = DUMP_FORMATS["opengauss"]
+
+# PG 系（postgresql / kingbase / opengauss / panwei）在 dump_format=auto 时的行为：按压缩开关决定
 _PG_AUTO = {True: "custom", False: "plain"}
-_PG_FAMILY = ("postgresql", "kingbase", "opengauss")
+_PG_FAMILY = ("postgresql", "kingbase", "opengauss", "panwei")
 
 
 def supported_formats(db_type: str) -> list:

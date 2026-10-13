@@ -23,7 +23,7 @@ else:
 # ---------- 产品标识 ----------
 # 产品正式名称与版本（对外 API 文档、健康检查、报告落款统一取这里，避免各处硬编码）。
 PLATFORM_NAME = os.environ.get("AIDBM_NAME", "AIDBM")
-PLATFORM_VERSION = os.environ.get("AIDBM_VERSION", "1.4.16")
+PLATFORM_VERSION = os.environ.get("AIDBM_VERSION", "1.4.17")
 
 # ---------- 路径 ----------
 BACKUP_ROOT = os.environ.get("BACKUP_ROOT", str(BASE_DIR / "backups"))
@@ -167,6 +167,7 @@ SUPPORTED_DB_TYPES = [
 DEFAULT_PORTS = {
     "mysql": 3306, "mariadb": 3306, "postgresql": 5432, "oracle": 1521, "kingbase": 54321,
     "opengauss": 26000,
+    "panwei": 12800,  # 磐维集中式常用默认端口，任务中可改（分布式以实际 CN 端口为准）
     "dameng": 5236, "sqlserver": 1433, "redis": 6379, "mongodb": 27017,
     "neo4j": 7687, "object_storage": 9000,
 }
@@ -175,6 +176,7 @@ DEFAULT_PORTS = {
 DB_DISPLAY_NAMES = {
     "mysql": "MySQL", "mariadb": "MariaDB", "postgresql": "PostgreSQL",
     "oracle": "Oracle", "kingbase": "KingBase", "opengauss": "openGauss",
+    "panwei": "PanWeiDB（磐维）",
     "dameng": "DM 达梦", "sqlserver": "SQL Server",
     "redis": "Redis", "mongodb": "MongoDB", "file": "文件",
     "neo4j": "Neo4j", "vm": "虚拟机", "object_storage": "对象存储",

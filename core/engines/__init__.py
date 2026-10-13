@@ -21,6 +21,7 @@ from core.engines.mysql import MySQLEngine
 from core.engines.mariadb import MariaDBEngine
 from core.engines.postgresql import PostgreSQLEngine
 from core.engines.opengauss import OpenGaussEngine
+from core.engines.panwei import PanweiEngine
 from core.engines.oracle import OracleEngine
 from core.engines.kingbase import KingbaseEngine
 from core.engines.dameng import DamengEngine
@@ -58,6 +59,7 @@ ENGINE_REGISTRY = {
     "oracle": OracleEngine,
     "kingbase": KingbaseEngine,
     "opengauss": OpenGaussEngine,
+    "panwei": PanweiEngine,
     "dameng": DamengEngine,
     "sqlserver": SQLServerEngine,
     "redis": RedisEngine,
@@ -117,6 +119,15 @@ def supported_types() -> list:
 # 部分引擎并不支持物理备份/全实例/同步，这里按各引擎**真实能力**逐项声明，
 # 供前端下拉与能力提示诚实展示（新增类型时请同步登记）。
 _ENGINE_META_OVERRIDE = {
+    "panwei": {
+        "icon": "bi-hdd-network",
+        "description": "磐维 PanWeiDB（openGauss 系，中国移动 × 华为）：gs_dump/gs_restore/gsql/gs_basebackup；"
+                       "集中式与分布式均适用（分布式经 CN 协调器导出）；暂不支持数据同步",
+        "backup_modes": ["logical", "physical"],
+        "supports_incremental": True,
+        "supports_full_instance": True,
+        "supports_sync": False,
+    },
     "neo4j": {
         "icon": "bi-diagram-3",
         "description": "图数据库：离线 dump / 企业版在线 backup / APOC 在线导出 三通道",

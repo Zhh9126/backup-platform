@@ -239,6 +239,10 @@
                 <option value="key">私钥</option>
               </select>
             </div>
+            <div class="col-md-6">
+              <label class="form-label" title="数据库软件的安装属主用户（如 oracle / dmdba / omm / kingbase / postgres）；留空则按数据库类型用默认用户。Oracle、达梦、openGauss、金仓等工具链仅在该用户 profile 中可见，若安装用户与默认不同必须在此填写">数据库 OS 用户</label>
+              <input class="form-control" id="h_db_os_user" placeholder="留空 = 按数据库类型默认（oracle/dmdba/omm…）">
+            </div>
             <div class="col-md-6 h-pwd-only">
               <label class="form-label">密码</label>
               <input class="form-control" id="h_password" type="password" placeholder="留空表示不修改">

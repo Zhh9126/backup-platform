@@ -88,7 +88,8 @@ class DamengEngine(BackupEngine):
             user=user, pw=pw, host=host, port=port
         )
 
-    def _scope_args(self, extra: dict, target_db: str = None) -> list:
+    def _scope_args(self, extra: dict, target_db: str = None,
+                  include_tables: bool = True) -> list:
         """根据范围参数生成 dexp/dimp 的限定参数。
 
         优先级:
@@ -113,6 +114,22 @@ class DamengEngine(BackupEngine):
         owner = extra.get("owner")
         if owner:
             return ["OWNER={0}".format(owner)]
+
+        # 单表导出（dexp TABLES=表1,表2；配合 SCHEMAS 限定模式）。
+        # 恢复路径（dimp）单独用 kwargs.tables 处理，避免重复参数
+        tables = extra.get("tables")
+        if include_tables and tables:
+            if isinstance(tables, (list, tuple)):
+                names = ",".join(str(x).strip() for x in tables if str(x).strip())
+            else:
+                names = str(tables)
+            if names:
+                args = []
+                if extra.get("schema") or extra.get("db_name"):
+                    sc = extra.get("schema") or extra.get("db_name")
+                    args.append("SCHEMAS={0}".format(sc))
+                args.append("TABLES={0}".format(names))
+                return args
 
         return ["FULL=Y"]
 
@@ -180,7 +197,8 @@ class DamengEngine(BackupEngine):
         # 固定产物形态：远端路径**确定性**（按任务固定，不含随机时间戳），
         # 备份成功后写完成标记 → 拉回中断时重试直接续传，**不重跑 DM 备份**。
         tid = int(self.task.get("id") or 0)
-        remote_dir = f"/home/dmdba/dm_bkp_t{tid}"
+        _dm_os_user = self._resolve_check_user(ssh_host)
+        remote_dir = f"/home/{_dm_os_user}/dm_bkp_t{tid}"
         remote_tar = f"{remote_dir}.tar.gz"
 
         try:
@@ -192,16 +210,16 @@ class DamengEngine(BackupEngine):
                                  self.task_name, remote_tar,
                                  db.human_size(ready["size"]))
 
-            # 1) 建备份目录并 chown 给 dmdba（dmserver 以 dmdba 运行，备份集由
-            #    服务端进程写入，必须可写）；非复用路径清空上次残留
+            # 1) 建备份目录并 chown 给数据库 OS 用户（dmserver 以该用户运行，
+            #    备份集由服务端进程写入，必须可写）；非复用路径清空上次残留
             if not reuse:
                 prep = (f"rm -rf {remote_dir} {remote_tar} && mkdir -p {remote_dir} "
-                        f"&& chown dmdba {remote_dir} && chmod 755 {remote_dir}")
+                        f"&& chown {_dm_os_user} {remote_dir} && chmod 755 {remote_dir}")
                 _ssh_exec_pipe(client, remote_dump._wrap_login(prep), timeout=60)
 
             # 2) 联机备份：disql 执行 BACKUP DATABASE（SQL 写文件执行，避免引号嵌套）
             disql_bin = remote_dump.resolve_remote_tool(ssh_host, "disql",
-                                                        check_user="dmdba")
+                                                        check_user=_dm_os_user)
             online_out = ""
             online_ok = bool(reuse)      # 复用时视作已成功，跳过全部备份执行
             if disql_bin and not reuse:
@@ -256,21 +274,22 @@ class DamengEngine(BackupEngine):
                     last_err = ""
             else:
                 duration = 0
-                last_err = "远端主机未找到 disql（dmdba 用户 PATH 与常见安装目录均无）"
+                last_err = f"远端主机未找到 disql（{_dm_os_user} 用户 PATH 与常见安装目录均无）"
 
             # 3) dmrman 离线兜底（实例关闭时才可用；联机已成功则跳过）
             if not online_ok:
                 dmrman_bin = remote_dump.resolve_remote_tool(ssh_host, "dmrman",
-                                                             check_user="dmdba")
+                                                             check_user=_dm_os_user)
                 if dmrman_bin:
-                    remote_script = f"/home/dmdba/dmrman_{ts}.cmd"
+                    user = _dm_os_user
+                    remote_script = f"/tmp/dmrman_{ts}.cmd"
                     with sftp.open(remote_script, "w") as f:
                         f.write(f"BACKUP DATABASE FULL TO '{remote_dir}';\nexit;\n")
                     try:
                         sftp.chmod(remote_script, 0o644)
                     except Exception:
                         pass
-                    shell = f"su - dmdba -c {shlex.quote(dmrman_bin + ' CTLFILE=' + remote_script)}"
+                    shell = f"su - {user} -c {shlex.quote(dmrman_bin + ' CTLFILE=' + remote_script)}"
                     out, err, rc = _ssh_exec_pipe(
                         client, remote_dump._wrap_login(shell), timeout=7200)
                     online_out = (out.decode("utf-8", "replace")
@@ -284,7 +303,7 @@ class DamengEngine(BackupEngine):
                     if not online_ok:
                         last_err = (last_err or "") + "；dmrman 兜底也失败: " + online_out[-400:]
                 elif not last_err:
-                    last_err = "远端主机未找到 dmrman（dmdba 用户 PATH 与常见安装目录均无）"
+                    last_err = f"远端主机未找到 dmrman（{_dm_os_user} 用户 PATH 与常见安装目录均无）"
 
             if not online_ok:
                 return BackupResult(
@@ -338,7 +357,7 @@ class DamengEngine(BackupEngine):
                 if _p and not _p.isalnum():
                     _p = '"{0}"'.format(_p)
                 _disql = remote_dump.resolve_remote_tool(ssh_host, "disql",
-                                                         check_user="dmdba") \
+                                                         check_user=_dm_os_user) \
                          or "disql"
                 lsn_out, _e, _rc = _ssh_exec_pipe(
                     client, remote_dump._wrap_login(
@@ -391,12 +410,13 @@ class DamengEngine(BackupEngine):
         userid = self._connect_userid()
         extra = self._parse_extra()
         scope = " ".join(self._scope_args(extra))
+        _dm_os_user = self._resolve_check_user(ssh_host)
         dexp_bin = remote_dump.resolve_remote_tool(ssh_host, "dexp",
-                                                   check_user="dmdba")
+                                                   check_user=_dm_os_user)
         if not dexp_bin:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,
-                message=("远端主机未找到 dexp（dmdba 用户 PATH 与常见安装目录均无），"
+                message=(f"远端主机未找到 dexp（{_dm_os_user} 用户 PATH 与常见安装目录均无），"
                          "无法执行达梦逻辑备份。"))
         remote_tmp = f"/tmp/dm_bkp_{ts}"
         remote_dmp = f"{remote_tmp}/{ts}.dmp"
@@ -543,14 +563,16 @@ class DamengEngine(BackupEngine):
 
         ts = self._timestamp()
         target_time = (kwargs.get("target_time") or "").strip()
-        restore_dir = (kwargs.get("pitr_restore_dir")
-                       or f"/home/dmdba/pitr_restore_{ts}").rstrip("/")
 
         # 1) SSH 目标
         ssh_host = kwargs.get("target_host_info")
         if not ssh_host:
             from core import remote_dump as _rd
             ssh_host = _rd.resolve_ssh_host(self.task)
+        # 数据库 OS 用户（标准变量：任务 > 主机 > 引擎默认 dmdba）
+        _dm_os_user = self._resolve_check_user(ssh_host)
+        restore_dir = (kwargs.get("pitr_restore_dir")
+                       or f"/home/{_dm_os_user}/pitr_restore_{ts}").rstrip("/")
         if not ssh_host:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED, backup_path=backup_path,
@@ -565,12 +587,12 @@ class DamengEngine(BackupEngine):
         logs = []
         try:
             remote_pkg = f"/tmp/dm_pitr_{ts}.tar.gz"
-            bset_dir = f"/home/dmdba/dm_pitr_bset_{ts}"
+            bset_dir = f"/home/{_dm_os_user}/dm_pitr_bset_{ts}"
             # 2) 推送并解包备份集
             logs.append(f"[PITR] 推送备份集: {os.path.basename(backup_path)}")
             sftp.put(backup_path, remote_pkg)
             out, err, rc = _ssh_exec_pipe(client, remote_dump._wrap_login(
-                f"mkdir -p {bset_dir} {restore_dir} && chown -R dmdba {bset_dir} "
+                f"mkdir -p {bset_dir} {restore_dir} && chown -R {_dm_os_user} {bset_dir} "
                 f"{restore_dir} && tar xzf {remote_pkg} -C {bset_dir} && "
                 f"find {bset_dir} -type f | head -3"), timeout=300)
             if rc != 0:
@@ -604,11 +626,11 @@ class DamengEngine(BackupEngine):
             logs.append(f"[PITR] 源 dm.ini={src_ini} 归档目录={arch_dir or '未配置'}")
 
             dmrman_bin = remote_dump.resolve_remote_tool(ssh_host, "dmrman",
-                                                         check_user="dmdba")
+                                                         check_user=_dm_os_user)
             if not dmrman_bin:
                 return BackupResult(
                     success=False, status=BackupStatus.FAILED, backup_path=backup_path,
-                    message="目标机未找到 dmrman（dmdba 用户）")
+                    message=f"目标机未找到 dmrman（{_dm_os_user} 用户）")
 
             # 3.5) dminit 初始化新实例骨架（官方"还原到指定目录"做法）：
             #      新 dm.ini 必须存在且 SYSTEM_PATH 指向新目录，否则
@@ -616,11 +638,11 @@ class DamengEngine(BackupEngine):
             inst_name = os.path.basename(data_dir) or "DAMENG"
             new_ini = os.path.join(restore_dir, inst_name, "dm.ini")
             dminit_bin = remote_dump.resolve_remote_tool(ssh_host, "dminit",
-                                                         check_user="dmdba")
+                                                         check_user=_dm_os_user)
             if not dminit_bin:
                 return BackupResult(
                     success=False, status=BackupStatus.FAILED, backup_path=backup_path,
-                    message="目标机未找到 dminit（dmdba 用户，用于初始化还原目录）")
+                    message=f"目标机未找到 dminit（{_dm_os_user} 用户，用于初始化还原目录）")
             # 还原副本用独立端口，避免与运行中的源实例冲突；
             # SYSDBA_PWD 必须显式给（达梦新安全策略要求复杂密码，缺省会 init 失败）
             replica_port = int(self.task.get("port") or 5236) + 100
@@ -657,7 +679,7 @@ class DamengEngine(BackupEngine):
                            " EXTENT_SIZE=" + str(extent_size) +
                            " SYSDBA_PWD=" + src_pwd +
                            " SYSAUDITOR_PWD=" + src_pwd)
-            init_shell = "su - dmdba -c " + shlex.quote(dminit_args)
+            init_shell = f"su - {_dm_os_user} -c " + shlex.quote(dminit_args)
             out, _e, _rc = _ssh_exec_pipe(
                 client, remote_dump._wrap_login(init_shell) + " 2>&1 | tail -3",
                 timeout=300)
@@ -681,9 +703,9 @@ class DamengEngine(BackupEngine):
                 """写 dmrman 脚本（.txt，官方 CTLFILE 示例后缀；.cmd/.sql 会报
                 -2423 postfix invalid）并执行。
                 两个真机踩坑（137 PROD 实例验证）：
-                - 脚本 owner 必须为 dmdba，否则 -8291 failed to open ctl file
+                - 脚本 owner 必须为数据库 OS 用户，否则 -8291 failed to open ctl file
                 - 脚本内不能写 exit;（dmrman 无此语句，报 -2007 语法错误）"""
-                script_path = f"/home/dmdba/dmrman_pitr_{ts}.txt"
+                script_path = f"/home/{_dm_os_user}/dmrman_pitr_{ts}.txt"
                 with sftp.open(script_path, "w") as f:
                     f.write(stmt + "\n")
                 try:
@@ -692,8 +714,8 @@ class DamengEngine(BackupEngine):
                     pass
                 # chown 与 dmrman 串在同一条 shell 原子执行（分开两次 exec
                 # 时 chown 竞态不生效，dmrman 会报 -8291）
-                shell = (f"chown dmdba:dinstall {script_path} && "
-                         f"su - dmdba -c {shlex.quote(dmrman_bin + ' CTLFILE=' + script_path)}")
+                shell = (f"chown {_dm_os_user} {script_path} && "
+                         f"su - {_dm_os_user} -c {shlex.quote(dmrman_bin + ' CTLFILE=' + script_path)}")
                 o, e, rc = _ssh_exec_pipe(client, remote_dump._wrap_login(shell),
                                           timeout=timeout)
                 text = (o.decode("utf-8", "replace") if isinstance(o, bytes) else o) or ""
@@ -786,6 +808,12 @@ class DamengEngine(BackupEngine):
         # 客户端探测
         ok, detail = self.check_client()
         if not ok:
+            # 平台机无 dexp/dimp（零安装原则）→ 走 SSH 远端 dimp（与备份通道对称）
+            from core import remote_dump as _rd
+            _ssh = _rd.resolve_ssh_host(self.task)
+            if _ssh and backup_path and os.path.exists(backup_path):
+                self.logger.info("[%s] 本机无 dimp 客户端，改走 SSH 远端恢复", self.task_name)
+                return self._restore_logical_remote(_ssh, backup_path, **kwargs)
             self.logger.error("[%s] 客户端不可用，无法执行真实恢复: %s",
                               self.task_name, detail)
             return BackupResult(
@@ -829,8 +857,12 @@ class DamengEngine(BackupEngine):
             "FILE={0}".format(dmp_base),
             "DIRECTORY={0}".format(dmp_dir),
             "LOG={0}.log".format(ts),
+            # 恢复语义=覆盖既有对象（与远端 dimp 分支、Oracle impdp 对齐；
+            # 不加 IGNORE=Y——会跳过重建直接插数据触发 -6602，与 REPLACE 互斥）
+            "TABLE_EXISTS_ACTION=REPLACE",
         ]
-        cmd.extend(self._scope_args(extra, target_db=target_db))
+        cmd.extend(self._scope_args(extra, target_db=target_db,
+                                    include_tables=False))
 
         # 表级恢复：tables 参数 → dimpr TABLES=表1,表2
         sel_tables = kwargs.get("tables") or []
@@ -872,6 +904,87 @@ class DamengEngine(BackupEngine):
             checksum=db.sha256_file(backup_path),
             message="dimp 逻辑恢复成功{0}{1}".format(conn_note, target_note),
         )
+
+    def _restore_logical_remote(self, ssh_host: dict, backup_path: str,
+                                **kwargs) -> BackupResult:
+        """SSH 远端 dimp 逻辑恢复（平台机零安装：SFTP 推 .dmp → 远端 dimp 导入）。"""
+        from core import remote_dump
+        import time as _time
+        ts = self._timestamp()
+        dimp_bin = remote_dump.resolve_remote_tool(ssh_host, "dimp",
+                                                   check_user=self._resolve_check_user(ssh_host))
+        if not dimp_bin:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED, backup_path=backup_path,
+                message=(f"远端主机未找到 dimp（{self._resolve_check_user(ssh_host)} "
+                         "用户 PATH 与常见安装目录均无），无法执行达梦逻辑恢复。"))
+        extra = self._parse_extra()
+        userid = self._connect_userid()
+        target_db = kwargs.get("target_db")
+        remote_tmp = "/tmp/dm_rst_{0}".format(ts)
+        remote_dmp = "{0}/{1}.dmp".format(remote_tmp, ts)
+        try:
+            client = remote_dump._connect(ssh_host)
+            # 先建远端目录再 SFTP 推送（put 不自动建目录）
+            from core.engines.file import _ssh_exec_pipe as _sep
+            _sep(client, remote_dump._wrap_login(
+                "mkdir -p {0}".format(remote_tmp)), timeout=60)
+            sftp = client.open_sftp()
+            sftp.put(backup_path, remote_dmp)
+            sftp.close()
+        except Exception as e:  # noqa: BLE001
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                backup_path=backup_path,
+                                message="恢复产物推送远端失败: " + str(e)[:200])
+        scope = " ".join(self._scope_args(extra, target_db=target_db,
+                                          include_tables=False))
+        # dimp 必须用解析出的绝对路径：root 登录 shell 的 PATH 通常没有
+        # dimp（裸命令 rc=127，137 实测），dimp_bin 已在方法头解析
+        cmd_parts = [dimp_bin or "dimp", "USERID={0}".format(userid),
+                     "FILE={0}.dmp".format(ts),
+                     "DIRECTORY={0}".format(remote_tmp),
+                     "LOG={0}.log".format(ts),
+                     # 恢复语义=以备份为准覆盖既有对象：目标 schema 已存在
+                     # 同名表时 dimp 默认整表 fail（rc=2，137 实测：SYSDBA
+                     # 存量测试表导致恢复失败）。REPLACE=drop+重建后重导。
+                     # 注意不能加 IGNORE=Y：它会让 dimp 在表已存在时跳过
+                     # 重建直接插数据，触发 -6602 唯一约束冲突（137 实测），
+                     # 与 REPLACE 语义互斥。
+                     "TABLE_EXISTS_ACTION=REPLACE"]
+        if scope:
+            cmd_parts.append(scope)
+        sel_tables = kwargs.get("tables") or []
+        if sel_tables:
+            names = ",".join(str(x).strip().strip('"') for x in sel_tables)
+            if names:
+                cmd_parts.append("TABLES=" + names)
+        import shlex as _shlex
+        from core.engines.file import _ssh_exec_pipe as _sep
+        remote_cmd = " ".join(_shlex.quote(p) for p in cmd_parts)
+        remote_cmd = "mkdir -p {0} && {1}".format(_shlex.quote(remote_tmp), remote_cmd)
+        start = _time.time()
+        out, err, rc = _sep(
+            client, remote_dump._wrap_login(remote_cmd), timeout=3600)
+        duration = round(_time.time() - start, 3)
+        otext = out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
+        etext = err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err)
+        try:
+            remote_dump.cleanup_remote_artifacts(client, [], dirs=[remote_tmp])
+        except Exception:  # noqa: BLE001
+            pass
+        conn_note = "（达梦 dimp 将密码写入 USERID 参数，属官方语法惯例）"
+        target_note = " 目标库/模式={0}".format(target_db) if target_db else ""
+        if rc != 0:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED, backup_path=backup_path,
+                duration_sec=duration, stdout=otext, stderr=etext,
+                message="远端 dimp 恢复失败(returncode={0}){1}{2}: {3}".format(
+                    rc, conn_note, target_note, (otext + etext)[-500:]))
+        return BackupResult(
+            success=True, status=BackupStatus.SUCCESS, backup_path=backup_path,
+            duration_sec=duration, stdout=otext, stderr=etext,
+            checksum=db.sha256_file(backup_path),
+            message="达梦 远程 dimp 逻辑恢复成功{0}{1}".format(conn_note, target_note))
 
     # ---------------- 列出数据库 ----------------
     def list_databases(self) -> list:

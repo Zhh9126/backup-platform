@@ -71,6 +71,11 @@ class PostgreSQLEngine(BackupEngine):
         )
 
     # ------------------ 物理备份 (pg_basebackup) ------------------
+    # 本机通道 basebackup 参数（openGauss 覆写：-Ft 产出非 tar 的裸流，须 plain+打包）
+    _local_base_flags = ["-Ft", "-z"]
+    # 目录模式（无 -Ft）时备份完成后把数据目录打包为 .tar.gz 供拉回/校验
+    _local_pack_dir = False
+
     def _backup_physical(self, backup_type: BackupType) -> BackupResult:
         host = self.task.get("host") or "127.0.0.1"
         port = self.task.get("port") or 5432
@@ -83,8 +88,9 @@ class PostgreSQLEngine(BackupEngine):
         os.makedirs(target, exist_ok=True)
         # 版本择优解析（/usr/bin 下 9.2 老客户端无法 backup 14 服务器）
         bkb = self._resolve_local_tool("pg_basebackup")
-        cmd = [bkb, "-h", host, "-p", str(port), "-U", user, "-D", target, "-Ft", "-z",
-               "--checkpoint=fast", "--no-password"]
+        cmd = [bkb, "-h", host, "-p", str(port), "-U", user, "-D", target]
+        cmd.extend(self._local_base_flags)
+        cmd.extend(["--checkpoint=fast", "--no-password"])
         cmd.extend(self._pg_basebackup_extra_args())
         env = {"PGPASSWORD": pw} if pw else None
         start = time.time()
@@ -93,6 +99,17 @@ class PostgreSQLEngine(BackupEngine):
         if ret.returncode != 0:
             return BackupResult(success=False, status=BackupStatus.FAILED,
                                 message=f"pg_basebackup 失败: {ret.stderr[:500]}")
+        if self._local_pack_dir:
+            # openGauss gs_basebackup 仅 plain 模式：把数据目录打包为 tar.gz
+            tar_path = target + ".tar.gz"
+            import tarfile
+            with tarfile.open(tar_path, "w:gz") as tf:
+                for root, _dirs, files in os.walk(target):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        tf.add(fp, arcname=os.path.relpath(fp, target))
+            shutil.rmtree(target, ignore_errors=True)
+            target = tar_path
         return BackupResult(success=True, status=BackupStatus.SUCCESS,
                             backup_path=target, duration_sec=dur, stdout=ret.stdout,
                             message=f"PostgreSQL 物理备份(pg_basebackup)成功")
@@ -469,14 +486,17 @@ class PostgreSQLEngine(BackupEngine):
                     dump_bytes = f.read()
                 # -Fc 自定义格式与 -Ft tar 归档都走 pg_restore；-Fp 纯文本走 psql
                 is_custom = backup_path.endswith((".dump", ".tar"))
+                tgt_db = kwargs.get("target_db") or ""
                 remote_dump.remote_db_restore(
-                    self.task, ssh_host, self._dump_db_type, dump_bytes, is_custom=is_custom)
-                # SSH 兜底通道恢复到任务原库（暂不支持指定新目标库名），如实提示
-                actual_db = self.task.get("db_name")
+                    self.task, ssh_host, self._dump_db_type, dump_bytes, is_custom=is_custom,
+                    target_db=tgt_db)
+                # SSH 兜底通道：target_db 非空时恢复到指定新库（prep 自动 DROP+CREATE），
+                # 否则恢复到任务原库
+                actual_db = tgt_db or self.task.get("db_name")
                 return BackupResult(
                     success=True, status=BackupStatus.SUCCESS,
                     backup_path=backup_path,
-                    message="通过 SSH 在数据库服务器恢复成功（恢复到任务原库 "
+                    message="通过 SSH 在数据库服务器恢复成功（恢复到库 "
                             + str(actual_db or "") + "）")
             except Exception as e:
                 self.logger.error("[%s] 远程恢复也失败: %s", self.task_name, e)
@@ -662,6 +682,22 @@ class PostgreSQLEngine(BackupEngine):
         if mode == BackupMode.PHYSICAL:
             # 物理备份通常是一个目录，检查 PG_VERSION / base / global
             target = backup_path
+            if os.path.isdir(backup_path):
+                # -Ft 模式产物：目录内是 base.tar.gz（+ WAL tar）→ 按文件分支校验
+                inner = os.path.join(backup_path, "base.tar.gz")
+                if os.path.isfile(inner):
+                    new_rec = dict(record)
+                    new_rec["backup_path"] = inner
+                    return self.verify_record(new_rec, options)
+                # plain 目录型产物：直接检查数据目录结构
+                if (os.path.isfile(os.path.join(backup_path, "PG_VERSION"))
+                        and os.path.isdir(os.path.join(backup_path, "base"))
+                        and os.path.isdir(os.path.join(backup_path, "global"))):
+                    return BackupResult(success=True, status=BackupStatus.SUCCESS,
+                                        message="pg-family: base backup directory structure OK",
+                                        verified=True, size_bytes=size)
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                    message="pg-family: base backup directory structure invalid")
             if os.path.isfile(backup_path):
                 # 尝试解压到临时目录
                 import tempfile
@@ -819,6 +855,11 @@ class PostgreSQLEngine(BackupEngine):
                 "all_db_mode", "include_system_dbs", "pg_basebackup_extra_args",
                 # 备份文件格式（由引擎内部消费，绝不能当 CLI 参数拼进命令行）
                 "dump_format",
+                # gs_probackup 物理（全量+增量）链路（openGauss/磐维，引擎内部消费）
+                "physical_tool", "probackup_mode", "probackup_dir",
+                "probackup_pgdata", "probackup_instance",
+                "probackup_restore_pgdata", "probackup_recovery_target_time",
+                "probackup_force_restore",
             }
             args = []
             for k, v in data.items():

@@ -28,7 +28,7 @@ _ZERO_DATE_PREFIX = "0000-00-00"
 
 # 源端 VARCHAR(N) 以「字符」计长的数据库（MySQL/PG/SQLServer/Kingbase/达梦LENGTH_IN_CHAR=1）
 _CHAR_SEMANTIC_SOURCES = {"mysql", "mariadb", "postgresql", "kingbase",
-                          "sqlserver", "sqlite", "opengauss"}
+                          "sqlserver", "sqlite", "opengauss", "panwei"}
 
 # 达梦保留字兜底清单（V$RESERVED_WORDS 不可读时使用；引擎已全部双引号引用，
 # 此清单用于预检提示应用层 SQL 风险）
@@ -332,7 +332,7 @@ def run_compat_advisory(cfg, tgt_conn, tables: Optional[List[str]] = None
             out.extend(app_sql_checklist_dm8(cfg))
         elif tgt == "oracle":
             out = _oracle_findings(tgt_conn, cfg, tables)
-        elif tgt in ("postgresql", "kingbase", "opengauss"):
+        elif tgt in ("postgresql", "kingbase", "opengauss", "panwei"):
             out = _pg_findings(tgt_conn, cfg, tables)
         elif tgt in ("mysql", "mariadb"):
             out = _mysql_findings(tgt_conn, cfg, tables)

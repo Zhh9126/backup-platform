@@ -398,7 +398,7 @@ class KingbaseEngine(BackupEngine):
                 is_custom = backup_path.endswith((".dump", ".tar"))
                 remote_dump.remote_db_restore(
                     self.task, ssh_host, "kingbase", dump_bytes,
-                    is_custom=is_custom)
+                    is_custom=is_custom, target_db=kwargs.get("target_db") or "")
                 hk = ssh_host.get("host_key", "remote")
                 target_db = kwargs.get("target_db") or self._db_name()
                 return BackupResult(

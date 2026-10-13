@@ -308,6 +308,15 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
                     仅当探测不到时在此填写 bin 目录，将作为 PATH 前缀注入远程与本机执行。
                   </div>
                 </div>
+                <div class="col-12 mt-2">
+                  <label class="form-label">数据库 OS 用户（可选，环境适配）</label>
+                  <input class="form-control form-control-sm" id="t_db_os_user"
+                         placeholder="留空 = 按纳管主机或数据库类型默认（oracle / dmdba / omm / kingbase / postgres）">
+                  <div class="small text-muted">
+                    Oracle、达梦、openGauss、金仓等工具链仅在数据库软件属主用户的 profile 中可见；
+                    若实际安装用户与默认不同，在此填写（优先级：本任务 &gt; 纳管主机 &gt; 库型默认）。
+                  </div>
+                </div>
               </div>
               <div class="row g-3">
                 <div class="col-md-4">
@@ -448,6 +457,32 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
                 <div class="form-check form-check-inline">
                   <input class="form-check-input" type="checkbox" id="t_include_sys">
                   <label class="form-check-label">全实例时包含系统库（默认仅业务库）</label>
+                </div>
+                <div class="mt-2 row g-2" id="t_probackup_row" style="display:none">
+                  <div class="col-md-4">
+                    <label class="form-label" for="t_physical_tool">物理备份工具（openGauss/磐维）</label>
+                    <select class="form-select form-select-sm" id="t_physical_tool">
+                      <option value="">默认（gs_basebackup，仅全量）</option>
+                      <option value="gs_probackup">gs_probackup（全量+增量）</option>
+                    </select>
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label" for="t_probackup_dir">probackup 目录（数据库服务器侧）</label>
+                    <input class="form-control form-control-sm font-monospace" id="t_probackup_dir"
+                           placeholder="/data/gs_probackup（留空=默认）">
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label" for="t_probackup_pgdata">数据目录 PGDATA（可留空自动发现）</label>
+                    <input class="form-control form-control-sm font-monospace" id="t_probackup_pgdata"
+                           placeholder="多实例主机必须显式指定">
+                  </div>
+                  <div class="col-12 small text-muted">
+                    增量说明：gs_probackup 增量（-b delta）需在数据库侧开启
+                    <code>enable_cbm_tracking=on</code>（omm 执行
+                    <code>gs_guc reload -D &lt;PGDATA&gt; -c "enable_cbm_tracking=on"</code>）；
+                    增量链保留在上述目录中，<b>请勿手工清理</b>。PITR：恢复时传
+                    <code>{"probackup_recovery_target_time": "YYYY-MM-DD HH:MM:SS"}</code>。
+                  </div>
                 </div>
                 <div class="mt-1 small text-muted">
                   提示：MySQL/MariaDB 单库 = <code>mysqldump &lt;db&gt;</code>，全实例 = <code>--all-databases</code>；

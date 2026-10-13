@@ -35,6 +35,7 @@ DEFAULT_PORTS = {
     "postgresql": 5432,
     "kingbase": 54321,
     "opengauss": 26000,
+    "panwei": 12800,
     "oracle": 1521,
     "dameng": 5236,
 }
@@ -66,6 +67,12 @@ NATIVE_CONFIG = {
         "default_db": "test",
     },
     "opengauss": {
+        "probe": "SELECT 1",
+        "list_sql": "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY 1",
+        "filter": (),
+        "default_db": "postgres",
+    },
+    "panwei": {
         "probe": "SELECT 1",
         "list_sql": "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY 1",
         "filter": (),
@@ -141,8 +148,8 @@ def _import_driver(db_type: str):
         except ImportError:
             import psycopg2
             return psycopg2
-    if db_type == "opengauss":
-        # openGauss 协议兼容 PG，psycopg2 直连（部分版本服务端需关闭 SSL 强制）
+    if db_type in ("opengauss", "panwei"):
+        # openGauss/磐维协议兼容 PG，psycopg2 直连（部分版本服务端需关闭 SSL 强制）
         import psycopg2
         return psycopg2
     if db_type == "oracle":
@@ -190,7 +197,7 @@ def connect(db_type, host, port, db, user, password, timeout=10):
         except Exception as e:
             last_err = e
 
-    elif db_type in ("postgresql", "kingbase", "opengauss"):
+    elif db_type in ("postgresql", "kingbase", "opengauss", "panwei"):
         dbname = db or NATIVE_CONFIG[db_type]["default_db"] or "postgres"
         try:
             conn = mod.connect(

@@ -564,6 +564,7 @@ CREATE TABLE IF NOT EXISTS ssh_hosts (
     auth_type   TEXT DEFAULT 'password',
     private_key TEXT,
     os_type     TEXT DEFAULT 'linux',
+    db_os_user  TEXT,                     -- 数据库软件的 OS 用户（oracle/dmdba/omm/kingbase 等）；空=按库型默认
     remark      TEXT,
     last_status TEXT,
     last_check_at TEXT,
@@ -1292,7 +1293,8 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
             except Exception:
                 pass  # 列已存在，忽略
             # 迁移：ssh_hosts 状态列
-            for col, typedef in [("last_status", "TEXT"), ("last_check_at", "TEXT")]:
+            for col, typedef in [("last_status", "TEXT"), ("last_check_at", "TEXT"),
+                                 ("db_os_user", "TEXT")]:
                 try:
                     conn.execute(f"ALTER TABLE ssh_hosts ADD COLUMN {col} {typedef}")
                 except Exception:

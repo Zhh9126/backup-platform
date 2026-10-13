@@ -16,7 +16,7 @@ _logger = logging.getLogger("ssh_hosts")
 
 HOST_FIELDS = [
     "name", "host_key", "hostname", "port", "username",
-    "password", "auth_type", "private_key", "os_type", "remark",
+    "password", "auth_type", "private_key", "os_type", "db_os_user", "remark",
 ]
 
 

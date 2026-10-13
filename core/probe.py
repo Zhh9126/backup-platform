@@ -273,6 +273,33 @@ def _probe_kingbase(h, p, u, pw, db_name, t):
     return False, ((out + err).strip()[:200] or "连接失败")
 
 
+def _probe_panwei(h, p, u, pw, db_name, t):
+    """磐维 PanWeiDB 连通性：PG 协议兼容，psycopg2 驱动优先，回退 gsql。"""
+    module, reason = _try_import("psycopg2")
+    if module is not None:
+        ok, msg = _probe_via_driver(
+            module,
+            lambda: module.connect(host=h, port=int(p or 12800), user=u,
+                                   password=pw, dbname=db_name or "postgres",
+                                   connect_timeout=max(3, int(t))),
+            "SELECT 1", "磐维 PanWeiDB 连接正常（psycopg2）")
+        if ok is not None:
+            return ok, msg
+
+    client = _first_client("gsql", "psql")
+    if not client:
+        return False, (reason or "未找到 psycopg2 驱动，且服务器上无 gsql 客户端")
+    env = os.environ.copy()
+    if pw:
+        env["PGPASSWORD"] = pw
+    rc, out, err = _run(
+        [client, "-h", h, "-p", str(p or 12800), "-U", u,
+         "-d", db_name or "postgres", "-tAc", "SELECT 1"], env, t + 5)
+    if rc == 0 and "1" in (out or ""):
+        return True, f"磐维 PanWeiDB 连接正常（{client}）"
+    return False, ((out + err).strip()[:200] or "连接失败")
+
+
 def _probe_dameng(h, p, u, pw, db_name, t):
     """达梦 连通性（T06）：dmPython 驱动优先，回退 disql。"""
     port = p or 5236
@@ -418,6 +445,7 @@ _PROBES = {
     "mongodb": ([], _probe_mongodb),
     "oracle": ([], _probe_oracle),
     "kingbase": ([], _probe_kingbase),
+    "panwei": ([], _probe_panwei),
     "dameng": ([], _probe_dameng),
     "neo4j": ([], _probe_neo4j),
     "object_storage": ([], _probe_object_storage),

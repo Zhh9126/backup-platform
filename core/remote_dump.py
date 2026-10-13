@@ -121,6 +121,67 @@ def task_tool_path(task: dict) -> str:
     return ":".join(parts)
 
 
+# ------------------------- 标准变量：数据库软件 OS 用户 -------------------------
+# 各库型数据库服务器上软件属主的默认 OS 用户（仅作为兜底默认值；
+# 客户环境可能用其他用户安装，须可被主机级 / 任务级变量覆盖）。
+DB_OS_USER_DEFAULTS = {
+    "oracle": "oracle",
+    "dameng": "dmdba",
+    "opengauss": "omm",
+    "panwei": "omm",
+    "kingbase": "kingbase",
+    "postgresql": "postgres",
+    "mysql": "mysql",
+    "mariadb": "mysql",
+}
+
+
+def resolve_db_os_user(task: dict, ssh_host: dict = None,
+                       db_type: str = None, engine=None) -> str:
+    """解析「数据库软件 OS 用户」标准变量（环境差异收敛为变量，不写死）。
+
+    优先级（高 → 低）：
+      1. 任务级：task.extra_options.db_os_user；
+      2. 主机级：ssh_hosts.db_os_user（纳管主机时按实际安装用户填写）；
+      3. 引擎级：engine.tool_check_user（各引擎声明的默认探测用户）；
+      4. 库型默认：DB_OS_USER_DEFAULTS[db_type]。
+    全部无果返回 "root"（MySQL/MariaDB/PG 系等以 root 直接执行也可用的场景）。
+    """
+    def _from_extra(raw):
+        extra = {}
+        if isinstance(raw, dict):
+            extra = raw
+        elif isinstance(raw, str) and raw.strip():
+            try:
+                extra = json.loads(raw)
+            except Exception:
+                extra = {}
+        return str(extra.get("db_os_user") or "").strip()
+
+    # 1) 任务级
+    if task:
+        u = _from_extra(task.get("extra_options"))
+        if u:
+            return u
+        # 兼容任务里直接带 db_type 的场景
+        db_type = db_type or task.get("db_type") or ""
+
+    # 2) 主机级
+    if ssh_host:
+        u = str(ssh_host.get("db_os_user") or "").strip()
+        if u:
+            return u
+
+    # 3) 引擎级声明
+    if engine is not None:
+        u = str(getattr(engine, "tool_check_user", "") or "").strip()
+        if u:
+            return u
+
+    # 4) 库型默认
+    return DB_OS_USER_DEFAULTS.get((db_type or "").lower(), "root")
+
+
 def _tool_path_export(tool_path: str) -> str:
     """生成注入 PATH 的 export 语句（远端脚本首行用），空则空串。"""
     if not tool_path:
@@ -225,7 +286,15 @@ def remote_has_tool(ssh_host: dict, tool: str, check_user: str = None,
             shell = _wrap_login(probe)
             from core.engines.file import _ssh_exec_pipe
             _out, _err, rc = _ssh_exec_pipe(client, shell, timeout=30)
-            return rc == 0
+            if rc == 0:
+                return True
+            # su 探测失败不等于工具不存在：该用户 profile 可能没配 PATH。
+            # 复用 resolve_remote_tool 的完整三级解析（进程定位 / glob 枚举 /
+            # find 兜底，含缓存），修复金仓等工具不在属主用户 PATH 时
+            # 预检误报"缺少客户端工具"（137 实测：kingbase 用户无 PATH，
+            # sys_dump 实际在 KESRealPro/<版本>/Server/bin）。
+            return bool(resolve_remote_tool(
+                ssh_host, tool, check_user=check_user, extra_paths=extra_paths))
         if tp_export:
             shell = _wrap_login(tp_export + f"command -v {shlex.quote(tool)} >/dev/null 2>&1")
             from core.engines.file import _ssh_exec_pipe
@@ -428,6 +497,10 @@ def _resolve_remote_bin(client, tool: str, extra_paths: str = None) -> str | Non
         "/usr/local/opengauss/bin /usr/local/openGauss/bin "
         "/opt/huawei/install/app/bin /opt/huawei/*/bin /opt/gauss/*/bin "
         "/gauss/*/bin /gaussdb/*/bin /opt/gaussdb/*/bin /home/omm/*/bin "
+        # 磐维 PanWeiDB（openGauss 系，工具同名 gs_*；常见安装布局 panweidb/panwei）
+        "/opt/panwei/*/bin /opt/panweidb/*/bin /opt/panwei*/app/bin "
+        "/usr/local/panwei/bin /usr/local/panweidb/bin "
+        "/data/panwei/*/bin /data/panweidb/*/bin /home/panwei/*/bin "
         # Redis / MongoDB
         "/usr/local/redis*/bin /usr/local/redis/bin /opt/redis*/bin "
         "/usr/local/mongodb*/bin /opt/mongodb*/bin /usr/local/mongodb/bin "
@@ -949,14 +1022,15 @@ def _remote_kingbase_dump(task: dict, ssh_host: dict, compress: int) -> tuple:
     return _pg_family_dump(task, ssh_host, "kingbase", compress)
 
 
-def _remote_opengauss_dump(task: dict, ssh_host: dict, compress: int) -> tuple:
+def _remote_opengauss_dump(task: dict, ssh_host: dict, compress: int,
+                           db_type: str = "opengauss") -> tuple:
     """在远端数据库服务器以 gs_dump 导出，返回 (原始字节, 产物格式)。
 
-    openGauss 客户端工具通常只对 omm 用户可见（GAUSSHOME/bin），工具解析走
+    openGauss/磐维客户端工具通常只对 omm 用户可见（GAUSSHOME/bin），工具解析走
     resolve_remote_tool(check_user=omm)；gs_* 动态库依赖由 LD_LIBRARY_PATH 兜底。
-    全实例语义见 _pg_family_dump（openGauss 无 --all-databases，逐库 tar.gz）。
+    全实例语义见 _pg_family_dump（openGauss/磐维无 --all-databases，逐库 tar.gz）。
     """
-    return _pg_family_dump(task, ssh_host, "opengauss", compress)
+    return _pg_family_dump(task, ssh_host, db_type, compress)
 
 
 # 旧实现占位（由下方 PG 系共用实现整体接管）：
@@ -1023,6 +1097,27 @@ _PG_FAMILY_TOOLING = {
         "check_user": "omm",
         "env_exports": ("PGPASSWORD",),
         "db_type": "opengauss",
+        "set_lib_path": True,
+    },
+    # 磐维 PanWeiDB（openGauss 系商业发行版，中国移动 × 华为）：
+    # 工具族与 openGauss 完全同名同用法（gs_dump/gs_restore/gsql/gs_dumpall/
+    # gs_basebackup），GAUSSHOME/LD_LIBRARY_PATH 环境约定一致；集中式与分布式
+    # 均经 CN/实例以同套参数导出。sha256 认证同样不读 PGPASSWORD → -W 显式传密码。
+    "panwei": {
+        "label": "PanWeiDB（磐维）",
+        "dump_tool": "gs_dump",
+        "restore_candidates": ("gs_restore",),
+        "query_candidates": ("gsql", "psql"),
+        "dumpall_candidates": ("gs_dumpall", "pg_dumpall"),
+        "catalog_table": "pg_database",
+        "dbname_positional": True,
+        "use_w_password": True,
+        "maint_candidates": ("postgres", "template1"),
+        "default_port": 12800,
+        "default_user": "omm",
+        "check_user": "omm",
+        "env_exports": ("PGPASSWORD",),
+        "db_type": "panwei",
         "set_lib_path": True,
     },
 }
@@ -2322,9 +2417,9 @@ def remote_db_dump(task: dict, ssh_host: dict, db_type: str, compress: int = 0,
     if db_type == "kingbase":
         data, fmt = _remote_kingbase_dump(task, ssh_host, compress)
         return data, bool(compress) and fmt == "single", fmt
-    if db_type == "opengauss":
-        # openGauss 与 PG 同源（gs_dump），复用 PG 系 dump 通道（含全实例逐库 tar）
-        data, fmt = _remote_opengauss_dump(task, ssh_host, compress)
+    if db_type in ("opengauss", "panwei"):
+        # openGauss/磐维与 PG 同源（gs_dump），复用 PG 系 dump 通道（含全实例逐库 tar）
+        data, fmt = _remote_opengauss_dump(task, ssh_host, compress, db_type=db_type)
         return data, bool(compress) and fmt == "single", fmt
     if db_type == "redis":
         return _remote_redis_dump(task, ssh_host), False, "single"
@@ -2348,7 +2443,8 @@ def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
                            extra_args_key: str = "pg_basebackup_extra_args",
                            tool_label: str = None, check_user: str = None,
                            base_flags: list = None,
-                           extra_env: dict = None) -> dict:
+                           extra_env: dict = None,
+                           pack_after: bool = False) -> dict:
     """在远端数据库服务器执行流式物理备份（pg_basebackup / sys_basebackup / gs_basebackup）。
 
     base_flags: 覆盖默认的基础参数（默认 -Ft -z --checkpoint=fast --no-password）。
@@ -2386,7 +2482,7 @@ def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
     user = task.get("username") or default_user
     pw = db.decrypt_secret(task.get("password") or "")
 
-    wpass = (" -W " + shlex.quote(pw)) if (task.get("db_type") or "").lower() == "opengauss" and pw else ""
+    wpass = (" -W " + shlex.quote(pw)) if (task.get("db_type") or "").lower() in ("opengauss", "panwei") and pw else ""
     client = _connect(ssh_host)
     resolved = resolve_remote_tool(ssh_host, tool, check_user=check_user)
     if not resolved:
@@ -2476,6 +2572,25 @@ def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
             "message": f"远端 {tool_label} 物理备份失败(rc={rc}): {snippet}{hint}",
         }
 
+    # 目录模式（pack_after）：openGauss gs_basebackup 的 -Ft 产出非 tar 的裸 gzip
+    # 数据流，必须 plain 目录备份后在远端打成真 tar.gz 供拉回/校验/恢复
+    if pack_after and not reuse:
+        # 运行中实例的目录可能有 pg_stat 等瞬时抖动：GNU tar 对
+        # "file changed as we read it" 返回 rc=1，属可接受（产物完整）
+        pack_cmd = (f"tar -C {remote_tmp} --exclude='./base.tar.gz' -czf "
+                    f"{remote_tmp}/base.tar.gz .; rc=$?; "
+                    f"[ $rc -eq 0 ] || [ $rc -eq 1 ] || exit $rc; "
+                    f"test -s {remote_tmp}/base.tar.gz")
+        _out2, _err2, pack_rc = _ssh_exec_pipe(client, _wrap_login(pack_cmd), timeout=3600)
+        if pack_rc != 0:
+            ptext = (_out2.decode("utf-8", "replace") if isinstance(_out2, bytes) else str(_out2)) + \
+                    (_err2.decode("utf-8", "replace") if isinstance(_err2, bytes) else str(_err2))
+            return {
+                "ok": False, "rc": pack_rc, "stdout": ptext, "stderr": str(_err2),
+                "remote_dir": remote_tmp,
+                "message": f"物理备份完成但远端打包失败(rc={pack_rc}): {ptext[-500:]}",
+            }
+
     # 写远端完成标记：下一次重试据此复用产物，**不重跑 basebackup**
     if not reuse:
         try:
@@ -2491,6 +2606,264 @@ def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
                     f"{'复用上次产物（未重跑备份）' if reuse else '执行成功(rc=0)'}"
                     f"，产物在 {remote_tmp}"),
     }
+
+
+# ---------------------------------------------------------------------------
+# gs_probackup 物理（全量+增量）备份 —— openGauss / 磐维 专用
+# ---------------------------------------------------------------------------
+# 与 gs_basebackup（仅全量）不同，gs_probackup 支持全量+增量（-b delta/page，
+# 依赖服务端 enable_cbm_tracking=on 的 CBM 变更块跟踪）。四步流程：
+# init → add-instance → backup → validate/show；增量链必须保留在数据库服务器的
+# 备份目录中（后续增量以全量为基线），因此**绝不清理** probackup 目录。
+# 恢复用 restore -D <目标数据目录>（可带 --recovery-target-time 做 PITR）。
+
+_PROBACKUP_CBM_SQL = ("SELECT setting FROM pg_settings WHERE name='enable_cbm_tracking'")
+
+
+def _probackup_env_prefix(resolved_bin: str, pw: str) -> str:
+    """GAUSSHOME/LD_LIBRARY_PATH + 密码环境变量前缀（gs_probackup 基于 libpq，
+    读 PGPASSWORD；同时兼容磐维/openGauss 的 GAUSSHOME 依赖布局）。"""
+    home = "$(dirname $(dirname %s))" % shlex.quote(resolved_bin)
+    return (f"export GAUSSHOME={home}; "
+            f"export LD_LIBRARY_PATH=$GAUSSHOME/lib:${{LD_LIBRARY_PATH:-}}; "
+            f"export PGPASSWORD={shlex.quote(pw)}; ")
+
+
+def remote_probackup_backup(task: dict, ssh_host: dict, *, mode: str = "full",
+                            default_port: int = 26000, default_user: str = "omm",
+                            check_user: str = "omm",
+                            label: str = "gs_probackup") -> dict:
+    """在远端数据库服务器执行 gs_probackup 物理（全量/增量）备份。
+
+    流程：解析工具 → init(幂等) → add-instance(幂等，PGDATA 自动发现/显式指定)
+    → 增量模式预检 enable_cbm_tracking → backup -b <mode> → validate → show 取备份ID
+    → 打包该备份ID目录（含 pg_probackup.conf）供平台拉回。
+    增量链（backups/<instance> 整目录）保留在远端，不清理。
+
+    返回 dict: {ok, rc, stdout, stderr, remote_dir(拉回用 tar 目录),
+                backup_id, mode, catalog_dir, message}
+    """
+    from core.engines.file import _ssh_exec_pipe
+
+    log = logging.getLogger(__name__)
+    client = _connect(ssh_host)
+    resolved = resolve_remote_tool(ssh_host, "gs_probackup", check_user=check_user)
+    if not resolved:
+        return {
+            "ok": False, "rc": 127, "stdout": "", "stderr": "", "remote_dir": "",
+            "message": ("远端主机未找到 gs_probackup（openGauss/磐维安装目录的 bin 下，"
+                        "如 /opt/gaussdb*/bin、/opt/panwei*/bin；随 GAUSSHOME 提供）。"
+                        "若仅需全量物理备份，可不选 gs_probackup 改用 gs_basebackup。"),
+        }
+
+    eo = {}
+    try:
+        raw = task.get("extra_options")
+        if isinstance(raw, str) and raw:
+            eo = json.loads(raw)
+        elif isinstance(raw, dict):
+            eo = raw
+    except Exception:
+        eo = {}
+    port = int(task.get("port") or default_port)
+    user = task.get("username") or default_user
+    pw = db.decrypt_secret(task.get("password") or "")
+    dbname = task.get("db_name") or "postgres"
+    catalog = str(eo.get("probackup_dir") or "/data/gs_probackup")
+    instance = str(eo.get("probackup_instance") or f"bp_{port}")
+    pgdata = str(eo.get("probackup_pgdata") or "")
+
+    envpfx = _probackup_env_prefix(resolved, pw)
+    run = lambda cmd, timeout=300: _ssh_exec_pipe(  # noqa: E731
+        client, _wrap_login(envpfx + cmd), timeout=timeout)
+
+    # ① init（幂等：backups/ 已存在则跳过；目录属主须为数据库 OS 用户可写）
+    rc_init = 0
+    out, err, rc_init = run(f"mkdir -p {shlex.quote(catalog)} && "
+                            f"test -d {shlex.quote(catalog + '/backups')} || "
+                            f"{resolved} init -B {shlex.quote(catalog)}", timeout=120)
+    if rc_init != 0:
+        snippet = (out + err).decode("utf-8", "replace")[-800:] if isinstance(out, bytes) else (out + err)[-800:]
+        return {"ok": False, "rc": rc_init, "stdout": str(out), "stderr": str(err), "remote_dir": "",
+                "message": f"gs_probackup init 失败(rc={rc_init})，目录 {catalog} 不可写或权限不足: {snippet}"}
+
+    # ② add-instance（幂等；PGDATA 未指定时从运行中的 gaussdb 进程自动发现）
+    if pgdata:
+        disc = ("", 0)
+    else:
+        pd_out, pd_err, pd_rc = run(
+            "ps -eo args | grep '[g]aussdb' | grep -o '\\-D[ =][^ ]*' | head -1 | "
+            "sed 's/^-D[ =]//' || true", timeout=60)
+        pgdata = (pd_out.decode("utf-8", "replace").strip() if isinstance(pd_out, bytes)
+                  else str(pd_out).strip())
+        if not pgdata:
+            return {"ok": False, "rc": 1, "stdout": "", "stderr": "", "remote_dir": "",
+                    "message": ("未能自动发现远端 gaussdb 数据目录(PGDATA)。请在任务高级参数中"
+                                "指定 {\"probackup_pgdata\": \"/数据目录\"} 后重试"
+                                "（多实例主机必须显式指定）。")}
+    out, err, rc_inst = run(
+        f"test -f {shlex.quote(f'{catalog}/backups/{instance}/pg_probackup.conf')} || "
+        f"{resolved} add-instance -B {shlex.quote(catalog)} -D {shlex.quote(pgdata)} "
+        f"--instance {shlex.quote(instance)}", timeout=180)
+    if rc_inst != 0:
+        text = (out.decode("utf-8", "replace") + err.decode("utf-8", "replace"))[-800:] \
+            if isinstance(out, bytes) else (str(out) + str(err))[-800:]
+        return {"ok": False, "rc": rc_inst, "stdout": str(out), "stderr": str(err), "remote_dir": "",
+                "message": (f"gs_probackup add-instance 失败(rc={rc_inst})：{text}"
+                            f"（常见原因：PGDATA 不正确、与已注册实例的数据目录不一致）")}
+
+    # ③ 增量模式预检：enable_cbm_tracking（openGauss/磐维 CBM 变更块跟踪）
+    if mode in ("delta", "page", "ptrack"):
+        gsql = _resolve_remote_bin(client, "gsql")
+        if not gsql:
+            return {"ok": False, "rc": 127, "stdout": "", "stderr": "", "remote_dir": "",
+                    "message": "增量预检需要远端 gsql 客户端，未找到；请确认安装目录或改用全量。"}
+        hk = ssh_host.get("host_key", "")
+        ssh_ip = hk.rsplit("@", 1)[-1].split(":")[0] if "@" in hk else ""
+        db_host = "127.0.0.1" if (ssh_ip and ssh_ip == str(task.get("host") or "")) \
+            else str(task.get("host") or "127.0.0.1")
+        q = (f"{shlex.quote(gsql)} -h {shlex.quote(db_host)} -p {port} -U {shlex.quote(user)} "
+             f"-d {shlex.quote(dbname)} -tAc \"{_PROBACKUP_CBM_SQL}\"")
+        qout, qerr, qrc = _ssh_exec_pipe(client, _wrap_login(
+            _probackup_env_prefix(gsql, pw) + q), timeout=60)
+        cbm = (qout.decode("utf-8", "replace") if isinstance(qout, bytes) else str(qout)).strip()
+        if qrc != 0 or cbm.lower() not in ("on", "t", "true"):
+            return {"ok": False, "rc": 1, "stdout": str(qout), "stderr": str(qerr), "remote_dir": "",
+                    "message": ("增量备份前置条件不满足：服务端 enable_cbm_tracking 未开启"
+                                f"（当前值: {cbm or '查询失败'}）。请在数据库服务器以 omm 执行："
+                                "gs_guc reload -D <PGDATA> -c \"enable_cbm_tracking=on\" 后重试；"
+                                "或改用全量（-b full）。")}
+
+    # ④ backup
+    inner = (f"{resolved} backup -B {shlex.quote(catalog)} --instance {shlex.quote(instance)} "
+             f"-b {shlex.quote(mode)} -d {shlex.quote(dbname)} -p {port} -U {shlex.quote(user)}")
+    out, err, rc_bk = run(inner, timeout=21600)
+    text = (out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)) + \
+           (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))
+    if rc_bk != 0:
+        return {"ok": False, "rc": rc_bk, "stdout": str(out), "stderr": str(err), "remote_dir": "",
+                "message": f"gs_probackup backup(-b {mode}) 失败(rc={rc_bk}): {text[-1000:]}",
+                "catalog_dir": catalog, "backup_id": "", "mode": mode}
+
+    # ⑤ show 取备份 ID（JSON 优先，失败回退文本解析）
+    sout, serr, s_rc = run(f"{resolved} show -B {shlex.quote(catalog)} "
+                           f"--instance {shlex.quote(instance)} --format=json", timeout=120)
+    sid = ""
+    stext = sout.decode("utf-8", "replace") if isinstance(sout, bytes) else str(sout)
+    try:
+        arr = json.loads(stext)
+        if isinstance(arr, list) and arr:
+            sid = str(arr[0].get("ID") or arr[0].get("id") or "")
+    except Exception:
+        pass
+    if not sid:
+        m = re.search(r"\b([A-Z0-9]{6})\b", stext)
+        sid = m.group(1) if m else ""
+    if not sid:
+        return {"ok": False, "rc": 1, "stdout": stext, "stderr": str(serr), "remote_dir": "",
+                "message": "备份已完成但未能从 show 输出解析备份 ID（请检查远端 gs_probackup 版本）",
+                "catalog_dir": catalog, "mode": mode}
+
+    # ⑥ validate（完整性自检）
+    vout, verr, v_rc = run(f"{resolved} validate -B {shlex.quote(catalog)} "
+                           f"--instance {shlex.quote(instance)} -i {shlex.quote(sid)}", timeout=1800)
+    vtext = (vout.decode("utf-8", "replace") if isinstance(vout, bytes) else str(vout)) + \
+            (verr.decode("utf-8", "replace") if isinstance(verr, bytes) else str(verr))
+    if v_rc != 0:
+        return {"ok": False, "rc": v_rc, "stdout": str(vout), "stderr": str(verr), "remote_dir": "",
+                "message": f"备份完成但 validate 校验失败(ID={sid}, rc={v_rc}): {vtext[-800:]}",
+                "catalog_dir": catalog, "backup_id": sid, "mode": mode}
+
+    # ⑦ 打包拉回用 tar（仅该备份ID目录 + 实例配置）；增量链保留远端不清理
+    remote_tmp = fixed_remote_path(task, f"probackup_{mode}", "d")
+    _ssh_exec_pipe(client, _wrap_login(f"rm -rf {remote_tmp} && mkdir -p {remote_tmp}"), timeout=60)
+    # 仅打包该 ID 目录 + 实例配置（避免把整条增量链重复拉回）
+    tar_cmd = (f"tar -C {shlex.quote(catalog + '/backups/' + instance)} -czf "
+               f"{shlex.quote(remote_tmp + '/probackup.tar.gz')} "
+               f"{shlex.quote(sid)} pg_probackup.conf")
+    tout, terr, t_rc = _ssh_exec_pipe(client, _wrap_login(tar_cmd), timeout=3600)
+    if t_rc != 0:
+        return {"ok": False, "rc": t_rc, "stdout": str(tout), "stderr": str(terr), "remote_dir": "",
+                "message": "备份完成但拉回用 tar 打包失败", "catalog_dir": catalog,
+                "backup_id": sid, "mode": mode}
+    log.info("[remote_dump] gs_probackup %s 完成 instance=%s id=%s catalog=%s",
+             mode, instance, sid, catalog)
+    return {
+        "ok": True, "rc": 0, "stdout": text, "stderr": str(err),
+        "remote_dir": remote_tmp,
+        "backup_id": sid, "mode": mode, "catalog_dir": catalog,
+        "message": (f"gs_probackup {mode} 备份成功(ID={sid})，备份链保留在远端 {catalog}"
+                    f"（增量模式请勿清理该目录）"),
+    }
+
+
+def remote_probackup_restore(task: dict, ssh_host: dict, *, backup_id: str,
+                             instance: str = "", target_pgdata: str,
+                             recovery_target_time: str = "",
+                             default_port: int = 26000, default_user: str = "omm",
+                             check_user: str = "omm") -> dict:
+    """远端 gs_probackup restore：把备份恢复到指定数据目录（可带 PITR 目标时间）。
+
+    安全护栏：目标目录非空且包含 postgresql.conf/gaussdb.conf 时拒绝覆盖
+    （除非 extra_options.probackup_force_restore=true）。
+    """
+    from core.engines.file import _ssh_exec_pipe
+
+    client = _connect(ssh_host)
+    resolved = resolve_remote_tool(ssh_host, "gs_probackup", check_user=check_user)
+    if not resolved:
+        return {"ok": False, "rc": 127, "stdout": "", "stderr": "",
+                "message": "远端主机未找到 gs_probackup（同备份时的解析路径）"}
+    eo = {}
+    try:
+        raw = task.get("extra_options")
+        if isinstance(raw, str) and raw:
+            eo = json.loads(raw)
+        elif isinstance(raw, dict):
+            eo = raw
+    except Exception:
+        eo = {}
+    port = int(task.get("port") or default_port)
+    user = task.get("username") or default_user
+    pw = db.decrypt_secret(task.get("password") or "")
+    dbname = task.get("db_name") or "postgres"
+    catalog = str(eo.get("probackup_dir") or "/data/gs_probackup")
+    instance = instance or str(eo.get("probackup_instance") or f"bp_{port}")
+    envpfx = _probackup_env_prefix(resolved, pw)
+    run = lambda cmd, timeout=300: _ssh_exec_pipe(  # noqa: E731
+        client, _wrap_login(envpfx + cmd), timeout=timeout)
+
+    # 护栏：目标目录非空且像实例目录 → 拒绝（除非显式 force）
+    force = str(eo.get("probackup_force_restore") or "").lower() in ("1", "true", "yes")
+    gout, gerr, grc = run(
+        f"if [ -d {shlex.quote(target_pgdata)} ] && [ -n \"$(ls -A {shlex.quote(target_pgdata)} 2>/dev/null)\" ] "
+        f"&& [ -e {shlex.quote(target_pgdata + '/postgresql.conf')} -o "
+        f"-e {shlex.quote(target_pgdata + '/gaussdb.conf')} ]; then echo OVERWRITE_RISK; fi", timeout=60)
+    gtext = gout.decode("utf-8", "replace") if isinstance(gout, bytes) else str(gout)
+    if "OVERWRITE_RISK" in gtext and not force:
+        return {"ok": False, "rc": 1, "stdout": gtext, "stderr": str(gerr),
+                "message": (f"拒绝恢复：目标数据目录 {target_pgdata} 非空且像运行中的实例目录。"
+                            "请改用一个空目录（或先停实例并确认后，在高级参数加 "
+                            '{"probackup_force_restore": true}）。')}
+
+    pitr = ""
+    if recovery_target_time:
+        pitr = f" --recovery-target-time={shlex.quote(recovery_target_time)}"
+    inner = (f"{resolved} restore -B {shlex.quote(catalog)} --instance {shlex.quote(instance)} "
+             f"-D {shlex.quote(target_pgdata)} -i {shlex.quote(backup_id)}"
+             f"{pitr}")
+    out, err, rc = run(inner, timeout=21600)
+    text = (out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)) + \
+           (err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err))
+    if rc != 0:
+        return {"ok": False, "rc": rc, "stdout": str(out), "stderr": str(err),
+                "message": f"gs_probackup restore 失败(rc={rc}): {text[-1000:]}"}
+    note = ""
+    if recovery_target_time:
+        note = ("；PITR：目标时间已设置，首次以 omm 启动该数据目录实例时将自动回放 WAL 到目标时间"
+                "（恢复到一致性点后自动暂停，确认后执行 pg_xlog_replay_resume 恢复对外服务）")
+    return {"ok": True, "rc": 0, "stdout": text, "stderr": str(err),
+            "message": (f"gs_probackup restore 成功：备份 {backup_id} → {target_pgdata}{note}")}
 
 
 def _pull_remote_tars(client, remote_dir: str, out_dir: str, *,
@@ -2641,7 +3014,7 @@ def remote_list_databases(task: dict, db_type: str) -> list:
         )
     if db_type in ("mysql", "mariadb"):
         return _remote_list_mysql_databases(task, ssh_host)
-    if db_type in ("postgresql", "kingbase", "opengauss"):
+    if db_type in ("postgresql", "kingbase", "opengauss", "panwei"):
         return _remote_list_pg_databases(task, ssh_host, db_type)
     raise RuntimeError(f"暂不支持为 {db_type} 拉取库/schema 列表")
 
@@ -2895,15 +3268,16 @@ def _pg_family_detect_maint_db(client, cfg: dict, query_bin: str,
 
 
 def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
-                       is_custom: bool, db_type: str = "postgresql") -> None:
+                       is_custom: bool, db_type: str = "postgresql",
+                       target_db: str = "") -> None:
     """单库 dump 恢复（PG 系通用：postgresql=psql/pg_restore，kingbase=ksql/sys_restore，
-    openGauss=gsql/gs_restore）。"""
+    openGauss=gsql/gs_restore）。target_db 指定恢复目标库名（空 = 任务原库）。"""
     cfg = _PG_FAMILY_TOOLING[db_type]
     # 还原工具按类型候选解析（sys_restore/gs_restore/pg_restore 命名不同）
     restore_tool = (cfg.get("restore_candidates") or ("pg_restore",))[0]
     user = task.get("username") or cfg["default_user"]
     pw = db.decrypt_secret(task.get("password") or "")
-    db_name = task.get("db_name") or ""
+    db_name = target_db or task.get("db_name") or ""
     port = int(task.get("port") or cfg["default_port"])
     # 探测工具路径
     client = _connect(ssh_host)
@@ -2951,6 +3325,48 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
         if not tool:
             raise RuntimeError(
                 f"远端主机未找到 SQL 客户端（{'/'.join(cfg['query_candidates'])}），无法恢复。")
+    if db_type == "kingbase":
+        # 金仓 ksql 对 stdin 的 COPY FROM stdin 有内部 \copy 数据大小上限
+        # （实测 KB 级即报 "The data file size exceeds the limit for \copy
+        # command processing"，数据被静默丢弃且 rc=0 假成功）——必须把 dump
+        # 落远端文件后 -f 灌入，绕开该限制
+        tmp_sql = "/tmp/bp_rst_{0}.sql".format(int(time.time() * 1000))
+        sftp = client.open_sftp()
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".sql", delete=False) as tf:
+                tf.write(dump_bytes)
+                local_tmp = tf.name
+            try:
+                sftp.put(local_tmp, tmp_sql)
+            finally:
+                try:
+                    os.unlink(local_tmp)
+                except OSError:
+                    pass
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        shell = (
+            f"set -o pipefail; {env} "
+            f"{tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} "
+            f"-d {shlex.quote(db_name)} -f {shlex.quote(tmp_sql)}; "
+            f"rc=$?; rm -f {shlex.quote(tmp_sql)}; exit $rc"
+        )
+        wrapped = _wrap_login(shell)
+        _out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=3600)
+        otext = _out.decode("utf-8", "replace") if isinstance(_out, bytes) else str(_out)
+        if rc != 0:
+            raise RuntimeError(f"远程恢复失败(rc={rc}): {err[:600]}")
+        # ksql 无 ON_ERROR_STOP 时 SQL 错误不改变 rc：显式检查 COPY 之外的关键错误
+        errors = [ln for ln in otext.splitlines()
+                  if ln.strip().startswith("ERROR:") and "already exists" not in ln]
+        if errors:
+            raise RuntimeError(
+                "远程恢复 SQL 错误（{0} 条）: {1}".format(len(errors), errors[:5]))
+        return
+
     shell = (
         f"set -o pipefail; {env} "
         f"{tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} "
@@ -3070,8 +3486,15 @@ def _remote_pg_family_restore_tar(task: dict, ssh_host: dict, db_type: str,
     script = _pg_family_tar_restore_script(
         cfg, restore_bin, query_bin, pkg_path, user, pw, port)
     out, err, rc = _ssh_exec_pipe(client, _wrap_login(script), timeout=7200)
+    otext = out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out)
     if rc != 0:
         raise RuntimeError(f"远程全实例恢复失败(rc={rc}): {err[:800]}")
+    # 逐库失败不改变脚本 rc：必须显式检查 [FAIL] 标记，杜绝假成功
+    fails = [ln.strip() for ln in otext.splitlines() if ln.strip().startswith("[FAIL]")]
+    if fails:
+        raise RuntimeError(
+            "远程全实例恢复部分库失败（{0} 个）: {1} | 输出尾部: {2}".format(
+                len(fails), " | ".join(fails[:8]), otext[-400:]))
 
 
 def _looks_like_full_instance_tar(dump_bytes: bytes) -> bool:
@@ -3089,12 +3512,14 @@ def _looks_like_full_instance_tar(dump_bytes: bytes) -> bool:
 
 
 def remote_db_restore(task: dict, ssh_host: dict, db_type: str,
-                      dump_bytes: bytes, is_custom: bool = False) -> None:
+                      dump_bytes: bytes, is_custom: bool = False,
+                      target_db: str = "") -> None:
     """统一入口：将本地 dump 字节流经 SSH 灌入数据库服务器。
 
     自动识别 multi-db-tar（全实例逐库 tar.gz）产物并走整实例恢复分支。
+    target_db: 指定恢复目标库名（单库 dump；空 = 任务原库）。
     """
-    if db_type in ("postgresql", "kingbase", "opengauss") and _looks_like_full_instance_tar(dump_bytes):
+    if db_type in ("postgresql", "kingbase", "opengauss", "panwei") and _looks_like_full_instance_tar(dump_bytes):
         _remote_pg_family_restore_tar(task, ssh_host, db_type, dump_bytes)
         return
     if db_type in ("mysql", "mariadb") and _looks_like_full_instance_tar(dump_bytes):
@@ -3102,7 +3527,8 @@ def remote_db_restore(task: dict, ssh_host: dict, db_type: str,
         return
     if db_type == "mysql":
         _remote_mysql_restore(task, ssh_host, dump_bytes)
-    elif db_type in ("postgresql", "kingbase", "opengauss"):
-        _remote_pg_restore(task, ssh_host, dump_bytes, is_custom, db_type=db_type)
+    elif db_type in ("postgresql", "kingbase", "opengauss", "panwei"):
+        _remote_pg_restore(task, ssh_host, dump_bytes, is_custom,
+                           db_type=db_type, target_db=target_db)
     else:
         raise RuntimeError(f"不支持的远程恢复类型: {db_type}")

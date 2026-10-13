@@ -164,18 +164,21 @@ def oracle_schema_clone(src_schema: str, clone_schema: str,
 
     conn = f"{user}/{password}@//127.0.0.1:{port}/{service}"
     ts = time.strftime("%Y%m%d_%H%M%S")
+    # 数据库 OS 用户（标准变量：主机级 db_os_user > 库型默认 oracle）
+    from core.remote_dump import resolve_db_os_user
+    os_user = resolve_db_os_user(None, ssh_host, db_type="oracle")
     out = run(
-        "su - oracle -c \"expdp %s SCHEMAS=%s DIRECTORY=DATA_PUMP_DIR "
+        "su - %s -c \"expdp %s SCHEMAS=%s DIRECTORY=DATA_PUMP_DIR "
         "DUMPFILE=clone_%s.dmp LOGFILE=clone_%s.log REUSE_DUMPFILES=Y\""
-        % (conn, src_schema, ts, ts))
+        % (os_user, conn, src_schema, ts, ts))
     if "successfully completed" not in out and "RC=0" not in out:
         client.close()
         return {"ok": False,
                 "message": f"在线 expdp 导出源 schema 失败: {out[-300:]}"}
     imp = run(
-        "su - oracle -c \"impdp %s DUMPFILE=clone_%s.dmp REMAP_SCHEMA=%s:%s "
+        "su - %s -c \"impdp %s DUMPFILE=clone_%s.dmp REMAP_SCHEMA=%s:%s "
         "TRANSFORM=SEGMENT_ATTRIBUTES:N\""
-        % (conn, ts, src_schema, clone_schema))
+        % (os_user, conn, ts, src_schema, clone_schema))
     ok = "RC=0" in imp or "completed" in imp.lower()
     client.close()
     if not ok:

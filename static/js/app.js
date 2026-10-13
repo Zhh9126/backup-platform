@@ -160,6 +160,20 @@
       const collapsed = layout.classList.toggle("sidebar-collapsed");
       localStorage.setItem("sidebar-collapsed", collapsed ? "1" : "0");
     };
+
+    // 页面加载后把当前激活菜单项滚到可视区（侧边栏是独立滚动容器，
+    // 跳转新页面时滚动位置会重置到顶部，导致下方菜单高亮项看不到）
+    try {
+      const sidebar = document.querySelector(".sidebar");
+      const active = sidebar && sidebar.querySelector(".nav-link.active");
+      if (sidebar && active) {
+        const top = active.offsetTop; // offsetParent 即 .sidebar（fixed 定位）
+        const bottom = top + active.offsetHeight;
+        if (top < sidebar.scrollTop || bottom > sidebar.scrollTop + sidebar.clientHeight) {
+          sidebar.scrollTop = Math.max(0, top - sidebar.clientHeight / 2 + active.offsetHeight / 2);
+        }
+      }
+    } catch (e) { /* 不影响主流程 */ }
   }
 
   // ------------------------- 仪表盘 -------------------------
@@ -961,11 +975,19 @@
     if (p && $("t_port")) $("t_port").value = p;
   }
 
+  /** openGauss/磐维：物理备份工具（gs_probackup）选项区可见性。 */
+  function refreshProbackupVisibility() {
+    const t = $("t_db_type")?.value;
+    const row = $("t_probackup_row");
+    if (row) row.style.display = (t === "opengauss" || t === "panwei") ? "" : "none";
+  }
+
   /** 逻辑-only 类型（Neo4j）禁用「物理备份」，避免选中不支持的备份方式。 */
   function refreshBackupModeOptions() {
     const sel = $("t_backup_mode");
     if (!sel) return;
     const t = $("t_db_type")?.value;
+    refreshProbackupVisibility();
     const phys = Array.prototype.find.call(sel.options, (o) => o.value === "physical");
     if (!phys) return;
     phys.disabled = LOGICAL_ONLY_TYPES.includes(t);
@@ -1006,6 +1028,10 @@
     $("t_schema_only").checked = !!eo.schema_only;
     $("t_data_only").checked = !!eo.data_only;
     if ($("t_include_sys")) $("t_include_sys").checked = !!eo.include_system_dbs;
+    // openGauss/磐维：gs_probackup 物理备份工具回填
+    if ($("t_physical_tool")) $("t_physical_tool").value = eo.physical_tool || "";
+    if ($("t_probackup_dir")) $("t_probackup_dir").value = eo.probackup_dir || "";
+    if ($("t_probackup_pgdata")) $("t_probackup_pgdata").value = eo.probackup_pgdata || "";
   }
 
   // 拉取数据库列表
@@ -1101,6 +1127,13 @@
     if ($("t_data_only").checked) eo.data_only = true; else delete eo.data_only;
     if ($("t_include_sys") && $("t_include_sys").checked) eo.include_system_dbs = true;
     else delete eo.include_system_dbs;
+    // openGauss/磐维：gs_probackup 物理备份工具（空值清理，保持 JSON 干净）
+    const pt = $("t_physical_tool");
+    if (pt && pt.value) eo.physical_tool = pt.value; else delete eo.physical_tool;
+    const pdir = $("t_probackup_dir");
+    if (pdir && pdir.value.trim()) eo.probackup_dir = pdir.value.trim(); else delete eo.probackup_dir;
+    const ppd = $("t_probackup_pgdata");
+    if (ppd && ppd.value.trim()) eo.probackup_pgdata = ppd.value.trim(); else delete eo.probackup_pgdata;
     if (mode === "schemas" && selected.length) eo.schemas = selected;
     else if (mode === "tables" && selected.length) eo.tables = selected;
     else if (mode === "all") eo.use_all_db = true;
@@ -1407,6 +1440,7 @@
     if ($("t_ssh_pwd")) $("t_ssh_pwd").value = "";
     if ($("t_ssh_state")) $("t_ssh_state").textContent = "";
     if ($("t_tool_path")) $("t_tool_path").value = "";
+    if ($("t_db_os_user")) $("t_db_os_user").value = "";
     toggleSshFields();
   }
 
@@ -1419,6 +1453,7 @@
         : (extraOptionsStr || {});
     } catch (e) { eo = {}; }
     if ($("t_tool_path")) $("t_tool_path").value = eo.tool_path || "";
+    if ($("t_db_os_user")) $("t_db_os_user").value = eo.db_os_user || "";
   }
 
   // 备份产物导出格式：保存收集（写入 extra_options.dump_format）
@@ -1430,11 +1465,26 @@
     else delete eo.dump_format;
   }
 
+  // openGauss/磐维：gs_probackup 物理备份工具（保存收集；控件不存在时不动 JSON）
+  function collectProbackup(eo) {
+    const pt = $("t_physical_tool");
+    if (!pt) return;
+    if (pt.value) eo.physical_tool = pt.value; else delete eo.physical_tool;
+    const pdir = $("t_probackup_dir");
+    if (pdir && pdir.value.trim()) eo.probackup_dir = pdir.value.trim(); else delete eo.probackup_dir;
+    const ppd = $("t_probackup_pgdata");
+    if (ppd && ppd.value.trim()) eo.probackup_pgdata = ppd.value.trim(); else delete eo.probackup_pgdata;
+  }
+
   // 任务级工具路径：保存收集（填写则写入 extra_options.tool_path）
   function collectToolPath(eo) {
     const v = ($("t_tool_path") && $("t_tool_path").value.trim()) || "";
     if (v) eo.tool_path = v;
     else delete eo.tool_path;
+    // 数据库 OS 用户（标准变量：任务 > 纳管主机 > 库型默认）
+    const u = ($("t_db_os_user") && $("t_db_os_user").value.trim()) || "";
+    if (u) eo.db_os_user = u;
+    else delete eo.db_os_user;
   }
 
   function fillSshCred(sc, task) {
@@ -1517,6 +1567,7 @@
       collectSshCred(eo, { val: val, num: num });
       collectToolPath(eo);
       collectDumpFormat(eo);
+      collectProbackup(eo);
       const sshId = val("t_ssh_host");
       if (sshId) eo.ssh_host_id = Number(sshId); else delete eo.ssh_host_id;
       if (chk("t_encrypt_pool")) eo.encrypt_pool = true; else delete eo.encrypt_pool;
@@ -3299,6 +3350,7 @@
       $("h_auth_type").value = host.auth_type || "password";
       $("h_password").value = "";
       $("h_private_key").value = "";
+      $("h_db_os_user").value = host.db_os_user || "";
       $("h_remark").value = host.remark || "";
     } else {
       $("hostModalTitle").textContent = "纳管主机";
@@ -3323,6 +3375,7 @@
       auth_type: $("h_auth_type").value,
       password: $("h_password").value,
       private_key: $("h_private_key").value,
+      db_os_user: ($("h_db_os_user").value || "").trim(),
       remark: $("h_remark").value,
     };
     if (!data.name) { toast("请填写主机名称", "danger"); return; }

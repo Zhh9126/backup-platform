@@ -497,7 +497,20 @@ class BackupEngine:
                     hit_notes.append(f"{c}@{d}")
                     break
             else:
-                still.append(c)
+                # 终极兜底：复用 _resolve_local_tool（任务 tool_path → PATH →
+                # _COMMON_TOOL_DIR_GLOBS 宽目录枚举 + --version 版本择优）。
+                # 修复：_LOCAL_TOOL_FALLBACK_GLOBS 只扫 /opt 两级，漏掉
+                # /pgdb/pgsql/bin 等自定义根目录，导致本机物理备份预检误报
+                # "缺少 pg_basebackup"（实际 v1.4.9 的解析器能找到）。
+                p = self._resolve_local_tool(c)
+                if p and os.sep in p and os.path.isfile(p) and os.access(p, os.X_OK):
+                    d = os.path.dirname(p)
+                    cur = os.environ.get("PATH", "")
+                    if d not in cur.split(os.pathsep):
+                        os.environ["PATH"] = d + os.pathsep + cur
+                    hit_notes.append(f"{c}@{d}")
+                else:
+                    still.append(c)
         return still, hit_notes
 
     def check_client(self) -> (bool, str):
@@ -510,6 +523,19 @@ class BackupEngine:
         if hits:
             return True, "ok（客户端工具已自动注入 PATH: " + ", ".join(hits) + "）"
         return True, "ok"
+
+    def _resolve_check_user(self, ssh_host: dict = None):
+        """解析远端工具探测 / su 执行用的数据库 OS 用户（标准变量，不写死）。
+
+        优先级：任务 extra_options.db_os_user > ssh_hosts.db_os_user >
+        引擎 tool_check_user 声明 > 库型默认。详见 remote_dump.resolve_db_os_user。
+        """
+        try:
+            from core import remote_dump
+            return remote_dump.resolve_db_os_user(
+                getattr(self, "task", None), ssh_host, engine=self)
+        except Exception:
+            return getattr(self, "tool_check_user", None)
 
     def _preflight_remote_physical(self, ssh_host: dict) -> (bool, str):
         """物理备份远端前置检查：在 SSH 远端主机上探测工具是否就绪。
@@ -526,7 +552,7 @@ class BackupEngine:
 
         # 1. 自带工具（若引擎声明了服务运行用户如 oracle，先以该用户探测——
         #    工具往往只在其 profile PATH 中可见，root 探测会误报缺失）
-        check_user = getattr(self, "tool_check_user", None)
+        check_user = self._resolve_check_user(ssh_host)
         tool_path = None
         try:
             from core import remote_dump as _rd
@@ -582,7 +608,7 @@ class BackupEngine:
         from core import remote_dump
         if not self.required_clients:
             return True, "ok"
-        check_user = getattr(self, "tool_check_user", None)
+        check_user = self._resolve_check_user(ssh_host)
         tool_path = None
         try:
             tool_path = remote_dump.task_tool_path(self.task) or None

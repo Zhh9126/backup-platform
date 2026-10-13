@@ -630,8 +630,30 @@ def _connect_isolated(ssh_host: dict):
         host, port, user = _hostname, _port, _user
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(host, port=port, username=user, password=pw, timeout=15,
-                   allow_agent=False, look_for_keys=False)
+    # 握手抖动重试（与 file._get_ssh_client 同款）：本函数被工具探测
+    # （resolve_remote_tool / remote_has_tool）高频调用、每次独立建连，
+    # 连续建连极易撞上 sshd MaxStartups 瞬时限流（表现为 banner EOF /
+    # SSHException），168 Oracle 11g 容器 E2E 实测触发。短暂退避重试。
+    _ssh_exc = paramiko.ssh_exception.SSHException
+    _auth_exc = paramiko.ssh_exception.AuthenticationException
+    last_exc = None
+    for _attempt in (1, 2, 3):
+        try:
+            client.connect(host, port=port, username=user, password=pw,
+                           timeout=15, allow_agent=False, look_for_keys=False)
+            last_exc = None
+            break
+        except _auth_exc:
+            raise
+        except (_ssh_exc, OSError, EOFError) as _exc:
+            last_exc = _exc
+            try:
+                client.close()
+            except Exception:
+                pass
+            time.sleep(1.5 * _attempt)
+    if last_exc is not None:
+        raise last_exc
     try:
         t = client.get_transport()
         if t is not None:

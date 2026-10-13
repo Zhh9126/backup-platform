@@ -405,8 +405,33 @@ def _ssh_exec_stream(client, cmd: str, *, out_file=None, timeout: int = 0,
             input_data = input_data.encode("utf-8")
         in_len = len(input_data)
     t0 = _remote_log_start(cmd, timeout, note=note, input_len=in_len)
-    sess = t.open_session()
-    sess.exec_command(cmd)
+    try:
+        sess = t.open_session()
+        sess.exec_command(cmd)
+    except Exception as exc:
+        # channel open 被远端拒绝（SSHException "Failure"）：sshd 对同一连接的
+        # 并发/累积会话或 MaxStartups 瞬时限流。池化长连接上高频工具探测 +
+        # 大流程多组件并发建连时实测触发（168 Oracle 11g E2E）。按对象身份
+        # 反查池内 host_key，丢弃旧连接重建后**重试一次**；重试仍失败才抛出。
+        if "Failure" not in str(exc):
+            raise
+        with _ssh_lock:
+            _hk = next((k for k, v in _ssh_pool.items() if v is client), None)
+            if _hk:
+                _ssh_pool.pop(_hk, None)
+        try:
+            client.close()
+        except Exception:
+            pass
+        if not _hk:
+            raise
+        client2 = _get_ssh_client(_hk)
+        t2 = client2.get_transport()
+        if not t2 or not t2.is_active():
+            raise
+        _tune_ssh_transport(client2)
+        sess = t2.open_session()
+        sess.exec_command(cmd)
     if input_data:
         sess.sendall(input_data)
         sess.shutdown_write()

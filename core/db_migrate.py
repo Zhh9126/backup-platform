@@ -299,10 +299,20 @@ class DbMigrationEngine:
         if not ok:
             return result
         # 目标连通性（不指定库，仅实例可达性由后续建库探测覆盖；这里按库探测）
-        ok2, msg2 = probe.probe_db_connection(
-            plan["tgt_db_type"], plan["tgt_host"], plan["tgt_port"],
-            plan["tgt_username"], plan["tgt_password"], plan["tgt_db_name"])
-        target_db_ready = bool(ok2)
+        # 达梦/Oracle 的 tgt_db_name 实为 schema：不能按"库名"探测（实测 137
+        # 达梦以 SYSDBA 为库名连接失败 → 误判目标不存在 → 误报"不支持自动
+        # 建库"）。改为实例连通 + schema 存在性检查 + 自动建 schema。
+        if plan["tgt_db_type"] in ("dameng", "oracle"):
+            ok2, msg2, target_db_ready = self._check_schema_target(plan)
+            result["checks"].append({"item": "目标 schema 检查", "ok": bool(target_db_ready),
+                                     "message": msg2})
+            if not target_db_ready:
+                return result
+        else:
+            ok2, msg2 = probe.probe_db_connection(
+                plan["tgt_db_type"], plan["tgt_host"], plan["tgt_port"],
+                plan["tgt_username"], plan["tgt_password"], plan["tgt_db_name"])
+            target_db_ready = bool(ok2)
         if not target_db_ready:
             # 目标库不存在 → MySQL 目标自动创建
             created, create_msg = self._ensure_target_db(plan)
@@ -341,6 +351,67 @@ class DbMigrationEngine:
                 result["message"] = "源库没有可迁移的业务表"
         result["finished_at"] = db.now_iso()
         return result
+
+    def _check_schema_target(self, plan: dict) -> tuple:
+        """schema 语义目标（达梦/Oracle）的存在性检查与自动创建。
+
+        返回 (ok, message, ready)。达梦：默认库连接 + dba_users 查属主，
+        schema 缺失时 CREATE SCHEMA AUTHORIZATION <登录用户>；Oracle：缺
+        schema（用户）时 CREATE USER + GRANT（resource）。
+        """
+        dbtype = plan["tgt_db_type"]
+        schema_name = (plan["tgt_db_name"] or "").strip()
+        host = plan["tgt_host"]
+        port = plan["tgt_port"]
+        user = plan["tgt_username"]
+        pwd = _dec_secret(plan["tgt_password"] or "")
+
+        conn = None
+        try:
+            if dbtype == "dameng":
+                import dmPython
+                conn = dmPython.connect(user=user, password=pwd,
+                                        server=host, port=int(port or 5236))
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM dba_users WHERE username=?",
+                            (schema_name.upper(),))
+                exists = (cur.fetchone() or [0])[0] > 0
+                if exists:
+                    return True, f"目标 schema {schema_name} 已存在（达梦实例连通）", True
+                cur.execute('CREATE SCHEMA "{}" AUTHORIZATION "{}"'.format(
+                    schema_name.upper(), (user or "SYSDBA").upper()))
+                conn.commit()
+                return True, f"目标 schema {schema_name} 不存在，已自动创建（达梦）", True
+            else:  # oracle
+                import oracledb
+                conn = oracledb.connect(user=user, password=pwd,
+                                        host=host, port=int(port or 1521),
+                                        service_name=schema_name or "orcl")
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM all_users WHERE username=:u",
+                            u=schema_name.upper())
+                exists = (cur.fetchone() or [0])[0] > 0
+                if exists:
+                    return True, f"目标 schema {schema_name} 已存在（Oracle 实例连通）", True
+                cur.execute('CREATE USER "{}" IDENTIFIED BY "{}"'.format(
+                    schema_name.upper(), f"Aidbm#{int(time.time())}"))
+                cur.execute('GRANT CONNECT, RESOURCE TO "{}"'.format(schema_name.upper()))
+                conn.commit()
+                return True, f"目标 schema {schema_name} 不存在，已自动创建（Oracle，初始密码见日志）", True
+        except Exception as exc:
+            detail = str(exc)[:200]
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+            return False, f"{dbtype} 目标 schema 检查失败: {detail}", False
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
 
     def _ensure_target_db(self, plan: dict) -> tuple:
         """目标库不存在时自动创建。

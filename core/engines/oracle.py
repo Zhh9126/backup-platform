@@ -943,8 +943,26 @@ class OracleEngine(BackupEngine):
         except Exception as e:
             self.logger.warning("[%s] 动态查询 DATA_PUMP_DIR 异常: %s", self.task_name, e)
         if not dp_dir:
-            # 兜底：若远端 profile 未就绪等场景，用 11g/19c 常见路径依次探测
-            dp_dir = "/u01/app/oracle/admin/orcl19c/dpdump"
+            # 兜底：动态查询失败时按实例名与版本常见路径依次远端探测
+            # （回退值曾写死 orcl19c，168 11g 实测解析到不存在的目录导致
+            # impdp 日志拉不到、恢复收尾判定失效）
+            sid = (self.task.get("db_name") or "orcl").strip()
+            for cand in (
+                f"/u01/app/oracle/admin/{sid}/dpdump",
+                f"/u01/app/oracle/admin/{sid.lower()}/dpdump",
+                "/u01/app/oracle/admin/orcl11g/dpdump",
+                "/u01/app/oracle/admin/orcl/dpdump",
+                "/u01/app/oracle/admin/orcl19c/dpdump",
+            ):
+                from core.engines.file import _ssh_exec_pipe as _sep_probe
+                _po, _pe, _prc = _sep_probe(
+                    client, remote_dump._wrap_login(
+                        f"test -d {shlex.quote(cand)} && echo Y"), timeout=10)
+                _pt = _po.decode("utf-8", "replace") if isinstance(_po, bytes) else str(_po)
+                if "Y" in _pt:
+                    dp_dir = cand
+                    break
+            dp_dir = dp_dir or f"/u01/app/oracle/admin/{sid or 'orcl'}/dpdump"
         self.logger.info("[%s] 远端 DATA_PUMP_DIR=%s", self.task_name, dp_dir)
         # 固定产物形态：dmp/log 文件名**确定性**（按任务固定，不含随机时间戳），
         # 成功后写完成标记 → 拉回中断时重试直接续传，**不重跑 expdp**。
@@ -1203,7 +1221,20 @@ class OracleEngine(BackupEngine):
                     client, remote_dump._wrap_login(shell),
                     timeout=config.BACKUP_TIMEOUT if hasattr(config, "BACKUP_TIMEOUT") else 3600)
                 duration = round(time.time() - start, 3)
-                out_text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+
+                def _dec_impdp_bytes(b):
+                    """impdp 输出/日志解码：远端 locale 为 zh_GBK 时是 GBK 编码，
+                    utf-8 replace 会把收尾行打成 \ufffd（不可逆），导致
+                    "successfully completed at" 收尾判定失效——严格 utf-8 失败
+                    时回退 GBK。"""
+                    if not isinstance(b, bytes):
+                        return b or ""
+                    try:
+                        return b.decode("utf-8")
+                    except UnicodeDecodeError:
+                        return b.decode("gbk", "replace")
+
+                out_text = _dec_impdp_bytes(out)
                 self.logger.info("[%s] 远端 impdp 返回 rc=%s", self.task_name, rc)
 
                 # 拉回导入日志便于排查
@@ -1211,23 +1242,43 @@ class OracleEngine(BackupEngine):
                 log_tail = ""
                 try:
                     with sftp.open(remote_log, "r") as lf:
-                        log_tail = lf.read().decode("utf-8", "replace")[-1500:]
+                        log_tail = _dec_impdp_bytes(lf.read())[-1500:]
                 except Exception:
                     pass
 
-                # 成功判定：rc==0；或 rc 非 0 但日志里数据对象已导入且仅有
-                # ORA-31684(对象已存在)/ORA-39082(类型冲突) 等非致命提示。
-                # 常见的"USER 已存在"会导致 rc 非 0，但表/数据已正确导入，应视为成功。
+                # 成功判定：rc==0；或 rc 非 0 但日志里 impdp 正常收尾且仅有
+                # 非致命提示。168 真机实测（11g 全库 dmp 恢复同实例，rc=5）：
+                # ORA-31684(对象已存在) 3149 次、ORA-39111(跳过从属对象) 2892 次、
+                # ORA-39112/ORA-39083(跳过组件) 数百次——业务数据实际导入成功，
+                # 以往按 rc 判失败属误报。另注意远端 locale 为 zh_GBK 时日志是
+                # GBK 编码（上方 _dec_impdp_bytes 已做双解码），否则收尾判定失效。
                 fatal = False
                 if rc != 0:
                     combined = (out_text or "") + "\n" + (log_tail or "")
-                    non_fatal = (
-                        "ORA-31684" in combined      # USER/对象已存在
-                        or "ORA-39082" in combined   # 对象类型冲突（可忽略）
+                    fatal_patterns = (
+                        "ORA-00600", "ORA-07445", "ORA-01017", "ORA-39097",
+                        "ORA-39001", "UDE-000", "ORA-01157",
                     )
-                    # 已成功导入数据对象才放行；否则视为失败
-                    fatal = not non_fatal or ("imported" not in combined
-                                              and "Import completed" not in combined)
+                    if any(p in combined for p in fatal_patterns):
+                        fatal = True
+                    else:
+                        non_fatal = any(m in combined for m in (
+                            "ORA-31684",   # USER/对象已存在
+                            "ORA-39082",   # 对象类型冲突（可忽略）
+                            "ORA-39111",   # 跳过从属对象类型（基本对象已存在）
+                            "ORA-39112",   # 跳过部分组件
+                            "ORA-39083",   # SQL 创建失败但继续（对象已存在场景）
+                        ))
+                        # impdp 正常收尾（哪怕 rc=5 = completed with errors），
+                        # 且无非致命以外问题 → 数据已导入。中文版 impdp（168
+                        # zh_GBK locale 实测）收尾为「作业 ... 已经完成」。
+                        finished = any(m in combined for m in (
+                            "successfully completed at",
+                            "已经完成",
+                            "imported",
+                            "Import completed",
+                        ))
+                        fatal = not (non_fatal and finished)
 
                 if rc != 0 and fatal:
                     snippet = (out_text or log_tail)[-1200:]

@@ -1670,6 +1670,9 @@ class MySQLEngine(BackupEngine):
         """用恢复出来的数据目录起临时实例后，校验数据是否真的可读。
 
         返回 (label, verify_out)；读不到业务数据时抛 RuntimeError 如实失败。
+        增强整实例级校验：对**备份内源库**（任务 db_name，与 target_db 不同名时）
+        逐表精确抽查行数写进校验消息——增量链合并正确性可从行数直接核对
+        （如 全量 3 行 + 增量 2 行 → 恢复后 t1=5）。
         """
         r = subprocess.run(
             [mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}", "-N",
@@ -1678,7 +1681,36 @@ class MySQLEngine(BackupEngine):
             env=self._tool_env(mysql_cli))
         if r.returncode != 0:
             raise RuntimeError(f"校验查询失败: {(r.stderr or '')[:300]}")
-        return self._parse_physical_verify(r.stdout, target_db, logs)
+        label, verify_out = self._parse_physical_verify(r.stdout, target_db, logs)
+
+        # ---- 源库逐表抽查（精确行数，最多 5 张表）----
+        try:
+            src_db = (self.task.get("db_name") or "").replace("'", "").strip()
+            if src_db and src_db != (target_db or "").strip():
+                env = self._tool_env(mysql_cli)
+                r2 = subprocess.run(
+                    [mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}", "-N",
+                     "-e", f"SELECT table_name FROM information_schema.tables "
+                           f"WHERE table_schema='{src_db}' ORDER BY table_name LIMIT 5"],
+                    capture_output=True, text=True, timeout=30, env=env)
+                if r2.returncode == 0 and r2.stdout.strip():
+                    parts = []
+                    for tbn in [ln.strip() for ln in r2.stdout.splitlines() if ln.strip()]:
+                        r3 = subprocess.run(
+                            [mysql_cli, "--no-defaults", "-uroot", f"--socket={sock}", "-N",
+                             "-e", f"SELECT COUNT(*) FROM `{src_db}`.`{tbn}`"],
+                            capture_output=True, text=True, timeout=30, env=env)
+                        if r3.returncode == 0:
+                            parts.append(f"{tbn}={r3.stdout.strip()}")
+                    if parts:
+                        verify_out += f"; 源库 {src_db} 抽查 " + ", ".join(parts)
+                        if isinstance(logs, list):
+                            logs.append(f"[物理恢复] 源库 {src_db} 数据抽查: "
+                                        + ", ".join(parts))
+        except Exception as exc:  # noqa: BLE001 —— 抽查失败不推翻主校验结论
+            if isinstance(logs, list):
+                logs.append(f"[物理恢复] 源库抽查跳过: {str(exc)[:120]}")
+        return label, verify_out
 
     def _verify_prepared_remote(self, ssh_host: dict, work_dir: str,
                                 target_db: str, logs: list) -> tuple:

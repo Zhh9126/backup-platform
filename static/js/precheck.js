@@ -16,6 +16,22 @@
     skip:   '<span class="badge bg-secondary">跳过</span>',
     unknown:'<span class="badge bg-secondary">未知</span>',
   };
+  const ITEM_NAMES = {
+    task_config: "任务配置",
+    ssh_channel: "SSH 通道",
+    source_connectivity: "源库连通",
+    backup_tools: "备份工具",
+    physical_note: "物理模式提示",
+    disk_space: "存储空间",
+    artifact: "备份产物",
+    integrity: "完整性校验",
+    structure: "结构探测",
+    target_channel: "恢复目标",
+    restore_tools: "恢复工具",
+    target_db: "目标库连通",
+    restore_space: "恢复空间",
+  };
+
   const HEAD_BADGE = {
     pass:   '<span class="badge bg-success fs-6">可以执行</span>',
     warn:   '<span class="badge bg-warning text-dark fs-6">有风险，可尝试执行</span>',
@@ -50,8 +66,9 @@
     const head = HEAD_BADGE[res.level] || esc(res.level || "");
     const rows = (res.items || []).map((it) => {
       const b = LEVEL_BADGE[it.level] || esc(it.level);
+      const name = ITEM_NAMES[it.item] || it.item;
       return `<tr>
-        <td class="text-nowrap">${esc(it.item)}</td>
+        <td class="text-nowrap">${esc(name)}</td>
         <td class="text-nowrap">${b}</td>
         <td class="small">${esc(it.message)}</td>
       </tr>`;
@@ -78,7 +95,7 @@
     }
     const modal = ensureModal();
     document.getElementById("precheckTitle").innerHTML =
-      `备份预检 #${esc(String(taskId))} ${HEAD_BADGE[res.level] || ""}`;
+      `备份预检 · ${esc(res.task_name || String(taskId))} ${HEAD_BADGE[res.level] || ""}`;
     document.getElementById("precheckBody").innerHTML = renderBody(res);
     const go = document.getElementById("precheckGo");
     go.classList.toggle("d-none", !res.ok);
@@ -102,7 +119,7 @@
     }
     const modal = ensureModal();
     document.getElementById("precheckTitle").innerHTML =
-      `恢复预检 #${esc(String(recordId))} ${HEAD_BADGE[res.level] || ""}`;
+      `恢复预检 · ${esc(res.biz_label || String(recordId))} ${HEAD_BADGE[res.level] || ""}`;
     document.getElementById("precheckBody").innerHTML = renderBody(res);
     const go = document.getElementById("precheckGo");
     go.classList.toggle("d-none", !res.ok);

@@ -7629,7 +7629,8 @@
     if (!rows.length) {
       tbody.innerHTML = '<tr><td colspan="' + COLSPAN + '" class="text-muted text-center">暂无预测记录</td></tr>';
     } else {
-      tbody.innerHTML = rows.map(function (p, idx) {
+      const pgPred = Pager.slice("preds", rows);
+      tbody.innerHTML = pgPred.list.map(function (p, idx) {
         const pc = p.predicted_content || "";
         const basis = Array.isArray(p.basis) ? p.basis : [];
         const basisPreview = basis.length > 0
@@ -7675,6 +7676,7 @@
         '</tr>';
         return hasDetail ? (mainRow + predDetailRowHtml(p, idx, COLSPAN)) : mainRow;
       }).join("");
+      Pager.attach("preds", tbody, pgPred.page, pgPred.pages, pgPred.total, window.loadAlerts);
     }
     // 保存当前 predictions 以供模态框使用
     window._currentPreds = rows;

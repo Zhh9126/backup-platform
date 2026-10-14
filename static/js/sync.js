@@ -98,7 +98,8 @@
       tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">暂无同步任务</td></tr>';
       return;
     }
-    tbody.innerHTML = tasks.map(function (t) {
+    const pg = Pager.slice("syncPage", tasks);
+    tbody.innerHTML = pg.list.map(function (t) {
       return `<tr>
         <td>${t.id}</td>
         <td>${esc(t.name)}</td>
@@ -117,6 +118,7 @@
         </td>
       </tr>`;
     }).join("");
+    Pager.attach("syncPage", tbody, pg.page, pg.pages, pg.total, renderTasks);
     // 运行态任务自动轮询：实时/长任务的状态与进度需要及时反映（3s）
     clearTimeout(runningTimer);
     if (tasks.some(function (t) {

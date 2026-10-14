@@ -1298,6 +1298,13 @@ class OracleEngine(BackupEngine):
                             "ORA-39112",   # 跳过部分组件
                             "ORA-39083",   # SQL 创建失败但继续（对象已存在场景）
                         ))
+                        # 修复（129 实测 rc=5）：数据行已导入（. imported "SCHEMA".
+                        # "TABLE"）但非致命 ORA 提示出现在日志前部、被 log_tail
+                        # 截尾后 non_fatal 漏判 → 误报失败。无致命错误且数据行
+                        # 已出现导入明细即视为成功。
+                        data_imported = '. imported "' in combined or '.imported "' in combined
+                        if data_imported:
+                            non_fatal = True
                         # impdp 正常收尾（哪怕 rc=5 = completed with errors），
                         # 且无非致命以外问题 → 数据已导入。中文版 impdp（168
                         # zh_GBK locale 实测）收尾为「作业 ... 已经完成」。

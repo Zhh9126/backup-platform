@@ -467,17 +467,21 @@
          </a>`
       : "");
 
-    // ---- 需要关注 ----
-    const $att = $("attentionList");
-    if ($att) {
-      $att.innerHTML = _attentionList(att);
+    // ---- 需要关注（每页 3 条分页，避免长列表挤压首页版面） ----
+    window.renderAttention = function () {
+      const $att = $("attentionList");
+      if (!$att) return;
+      const pgAtt = Pager.slice("attention", att, 3);
+      $att.innerHTML = _attentionList(pgAtt.list);
+      Pager.attach("attention", $att, pgAtt.page, pgAtt.pages, pgAtt.total, window.renderAttention);
       $att.querySelectorAll("[data-goto-task]").forEach((el) => {
         el.addEventListener("click", () => {
           const tid = el.getAttribute("data-goto-task");
           if (tid) location.href = `/tasks?focus=${encodeURIComponent(tid)}`;
         });
       });
-    }
+    };
+    window.renderAttention();
 
     // ---- 容量 / 实时 / 即将执行 ----
     setHtml("capacityBox", _capacityHtml(d.capacity));

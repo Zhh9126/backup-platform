@@ -9,19 +9,20 @@
   const state = {}; // key -> {page}
 
   // 取某列表当前页：返回 {list, page, pages, total}；翻页后自动回调 rerender
-  function slice(key, arr) {
+  function slice(key, arr, size) {
+    const ps = Number(size) > 0 ? Number(size) : PAGE_SIZE;
     const total = (arr || []).length;
-    const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    const pages = Math.max(1, Math.ceil(total / ps));
     const st = state[key] || (state[key] = { page: 1 });
     if (st.page > pages) st.page = pages;
     if (st.page < 1) st.page = 1;
-    const start = (st.page - 1) * PAGE_SIZE;
+    const start = (st.page - 1) * ps;
     return {
-      list: (arr || []).slice(start, start + PAGE_SIZE),
+      list: (arr || []).slice(start, start + ps),
       page: st.page,
       pages,
       total,
-      pageSize: PAGE_SIZE,
+      pageSize: ps,
     };
   }
 

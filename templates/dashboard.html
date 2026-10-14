@@ -320,7 +320,7 @@
 <!-- 保护态势 & RPO 合规（对标业界 SLA 视图：保护覆盖率 / RPO 达标率 / 待处理风险 / 恢复点） -->
 <div class="row g-3 mb-4">
   <div class="col-md-3">
-    <div class="card-stat">
+    <div class="card-stat" style="cursor:pointer" title="点击查看任务列表" onclick="location.href='/tasks'">
       <div class="stat-icon"><i class="bi bi-shield-check"></i></div>
       <div class="stat-num" id="st_protected">-</div>
       <div class="stat-label">已保护 / 启用任务</div>
@@ -328,7 +328,7 @@
     </div>
   </div>
   <div class="col-md-3">
-    <div class="card-stat">
+    <div class="card-stat" style="cursor:pointer" title="超 RPO 任务见下方「需要关注」" onclick="document.getElementById('attentionCard')?.scrollIntoView({behavior:'smooth'})">
       <div class="stat-icon"><i class="bi bi-stopwatch"></i></div>
       <div class="stat-num" id="st_rpo_rate">-</div>
       <div class="stat-label">RPO 合规率</div>
@@ -336,7 +336,7 @@
     </div>
   </div>
   <div class="col-md-3">
-    <div class="card-stat">
+    <div class="card-stat" style="cursor:pointer" title="点击查看待处理事项" onclick="document.getElementById('attentionCard')?.scrollIntoView({behavior:'smooth'})">
       <div class="stat-icon"><i class="bi bi-exclamation-octagon"></i></div>
       <div class="stat-num" id="st_risk">-</div>
       <div class="stat-label">待处理风险</div>
@@ -344,7 +344,7 @@
     </div>
   </div>
   <div class="col-md-3">
-    <div class="card-stat">
+    <div class="card-stat" style="cursor:pointer" title="点击查看恢复记录明细" onclick="location.href='/restore_records'">
       <div class="stat-icon"><i class="bi bi-clock-history"></i></div>
       <div class="stat-num" id="st_recovery">-</div>
       <div class="stat-label">可用恢复点</div>
@@ -402,32 +402,6 @@
   </div>
 </div>
 
-<!-- 重删 & 存储池统计（参照白皮书 §2.4 全局重删） -->
-<div class="row g-3 mb-4">
-  <div class="col-md-4">
-    <div class="card-stat">
-      <div class="stat-icon"><i class="bi bi-diagram-3"></i></div>
-      <div class="stat-num" id="st_dedup_ratio">-</div>
-      <div class="stat-label">存储节省率（压缩+重删）</div>
-      <div class="stat-sub" id="st_dedup_tail">-</div>
-    </div>
-  </div>
-  <div class="col-md-4">
-    <div class="card-stat">
-      <div class="stat-icon"><i class="bi bi-piggy-bank"></i></div>
-      <div class="stat-num" id="st_dedup_saved">-</div>
-      <div class="stat-label">累计节省空间</div>
-    </div>
-  </div>
-  <div class="col-md-4">
-    <div class="card-stat">
-      <div class="stat-icon"><i class="bi bi-shield-lock"></i></div>
-      <div class="stat-num" id="st_encrypt_enabled">-</div>
-      <div class="stat-label">存储池加密任务</div>
-    </div>
-  </div>
-</div>
-
 <!-- 近 7 天趋势 + 需要关注 -->
 <div class="row g-3 mb-4">
   <div class="col-md-8">
@@ -442,7 +416,7 @@
   <div class="col-md-4">
     <div class="card p-3 h-100">
       <div class="d-flex align-items-center justify-content-between mb-2">
-        <h6 class="mb-0"><i class="bi bi-exclamation-triangle"></i> 需要关注</h6>
+        <h6 class="mb-0" id="attentionCard"><i class="bi bi-exclamation-triangle"></i> 需要关注</h6>
         <div class="d-flex align-items-center gap-2">
           <span id="alertSummary"></span>
           <a href="/tasks" class="small text-decoration-none">任务管理 <i class="bi bi-arrow-right-short"></i></a>

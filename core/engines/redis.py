@@ -33,6 +33,34 @@ class RedisEngine(BackupEngine):
     # 物理备份：外部插件 redis-tools
     physical_external_plugins = ["redis-tools"]
 
+    _cli_major_cache = None
+
+    def _redis_cli_major(self):
+        """探测 redis-cli 主版本（缓存）。探测失败按 0 处理 → 走 -a 参数。"""
+        if self._cli_major_cache is not None:
+            return self._cli_major_cache
+        major = 0
+        try:
+            import re as _re
+            import subprocess as _sp
+            cli = "redis-cli"
+            tp = None
+            try:
+                from core import remote_dump as _rd
+                tp = _rd.task_tool_path(self.task) or None
+            except Exception:
+                pass
+            probe = tp.split(":")[0] + "/redis-cli" if tp else cli
+            out = _sp.run([probe, "--version"], capture_output=True,
+                          text=True, timeout=10).stdout or ""
+            m = _re.search(r"redis-cli (?:v?)(\d+)\.", out)
+            if m:
+                major = int(m.group(1))
+        except Exception:
+            major = 0
+        self._cli_major_cache = major
+        return major
+
     def _redis_cli_args(self):
         """构造 redis-cli 连接基础参数（不含密码，密码走环境变量）。"""
         host = self.task.get("host") or "127.0.0.1"
@@ -98,8 +126,19 @@ class RedisEngine(BackupEngine):
             backup_type = BackupType.SNAPSHOT
         rdb_path = os.path.join(out_dir, "%s.rdb" % ts)
 
-        cmd = self._redis_cli_args() + ["--rdb", rdb_path]
-        env_extra = {"REDISCLI_AUTH": self.task.get("password") or ""}
+        cmd = list(self._redis_cli_args())
+        env_extra = {}
+        # 密码传递兼容性：REDISCLI_AUTH 仅 redis-cli >= 6 支持；老版本
+        # （如 epel redis-3.2.12，CentOS7 EOL 环境唯一可得的客户端）会
+        # 直接忽略该变量导致 NOAUTH rc=1（实测暴露）。按版本分流：
+        # >=6 走环境变量（避免密码出现在进程命令行），<6 回退 -a 参数。
+        pw = self.task.get("password") or ""
+        if pw:
+            if self._redis_cli_major() >= 6:
+                env_extra = {"REDISCLI_AUTH": pw}
+            else:
+                cmd += ["-a", pw]
+        cmd += ["--rdb", rdb_path]
 
         t0 = __import__("time").time()
         res = self._run(cmd, env_extra=env_extra, timeout=3600)

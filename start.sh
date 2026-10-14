@@ -4,6 +4,10 @@ cd /root/CodeBuddy/20260826095855/backup-platform
 [ -d /usr/lib/jvm/java-11-openjdk-11.0.23.0.9-2.el7_9.x86_64 ] && \
     export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-11.0.23.0.9-2.el7_9.x86_64
 export PATH="/opt/database/bin:$PATH"
+# 内置轻量客户端工具（redis-cli 等）与配套动态库：
+# 平台机缺包管理源（CentOS7 EOL）时随仓库 tools/ 目录交付
+export PATH="$PWD/tools:$PATH"
+export LD_LIBRARY_PATH="$PWD/tools:${LD_LIBRARY_PATH:-}"
 # 规避 CodeBuddy/工作台环境的 safe-delete 拦截钩子（PYTHONPATH sitecustomize）：
 # 该钩子会在平台清理过期备份等删除操作时因状态文件损坏抛 SystemExit(1) 杀死服务；
 # 非该环境下此变量无任何副作用。

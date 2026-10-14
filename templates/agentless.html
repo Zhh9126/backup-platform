@@ -88,6 +88,7 @@
           <th>本次通道</th>
           <th style="width:120px">最高等级</th>
           <th>目标端前置配置</th>
+          <th style="width:110px" class="text-end">操作</th>
         </tr>
       </thead>
       <tbody id="tb"></tbody>
@@ -163,7 +164,8 @@
   window.render = function () {
     const kw = (document.getElementById("kw").value || "").toLowerCase();
     const rows = ROWS.filter((r) => !kw || ((r.task_name || "") + " " + (r.db_type || "")).toLowerCase().includes(kw));
-    document.getElementById("tb").innerHTML = rows.map((r) => {
+    const pg = Pager.slice("agentlessTasks", rows);
+    document.getElementById("tb").innerHTML = pg.list.map((r) => {
       const chans = (r.channels || []).map((c) =>
         '<span class="badge bg-light text-dark border me-1" title="' + esc(c.reason || "") + '">' + esc(c.name) + " · " + esc(c.invasiveness) + "</span>").join("");
       const reqs = (r.requires_target_config || []).map((x) => esc(x.item)).join("；") || (r.realtime ? "（实时链路已启用，见该库型 CDC 前置要求）" : "无");
@@ -173,8 +175,10 @@
         "<td>" + (chans || '<span class="text-muted">-</span>') + "</td>" +
         '<td><span class="badge ' + (LEVEL_CLASS[r.max_level] || "bg-secondary") + '">' + esc(r.max_level) + "</span>" +
         (r.temp_binary ? '<div class="small text-warning">临时二进制</div>' : "") + "</td>" +
-        '<td class="small">' + reqs + "</td></tr>";
+        '<td class="small">' + reqs + "</td>" +
+        '<td class="text-end text-nowrap"><button class="btn btn-sm btn-outline-info" onclick="BKP.runBackupPrecheck(' + esc(r.task_id) + ')" title="备份预检：先探测该任务能否成功备份"><i class="bi bi-clipboard-check"></i> 预检</button></td></tr>';
     }).join("");
+    Pager.attach("agentlessTasks", document.getElementById("tb"), pg.page, pg.pages, pg.total, window.render);
     document.getElementById("empty_hint").textContent = rows.length ? ("共 " + rows.length + " 个任务（等级为本次执行通道推导值，目标端残留以取证为准）") : "无匹配任务";
   };
 

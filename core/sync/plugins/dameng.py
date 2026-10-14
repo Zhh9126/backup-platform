@@ -129,12 +129,17 @@ def _dict_rows(cur, variants, allow_user_view: bool = True):
 
 def _connect_dameng(host: str, port: int, user: str, password: str,
                     database: str = ""):
-    """统一连接入口：优先 dmPython，不可用自动降级 JDBC。"""
+    """统一连接入口：优先 dmPython，不可用自动降级 JDBC。
+
+    注意：dmPython.connect 只认 server/port/user/password（等）关键字，
+    不支持 database/loginTimeout（137 实测：传 database 直接抛
+    "'database' is an invalid keyword argument"，目标库连接检查误失败）。
+    达梦是实例级连接，schema 由后续 SQL 定位，database 参数仅保留签名兼容。
+    """
     try:
         dm = _import_dmpython()
         return dm.connect(host=host, port=port, user=user,
-                          password=password, database=database,
-                          loginTimeout=15)
+                          password=password)
     except RuntimeError:
         logger.info("[dameng-plugin] dmPython 不可用，降级 JDBC 通道")
         return _jdbc_connect(host, port, user, password, database)

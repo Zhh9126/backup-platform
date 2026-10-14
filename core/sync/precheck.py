@@ -450,18 +450,46 @@ def run_precheck(cfg) -> Dict[str, Any]:
                 src_cols = _get_columns(src_conn, cfg.src_db_type,
                                         cfg.src_db_name, cfg.src_schema,
                                         tables[0])
-                hit = [c for c in src_cols
-                       if str(c).lower() == cfg.incremental_column.lower()]
-                if not hit:
+                if cfg.incremental_column.lower() not in                         [str(c).lower() for c in src_cols]:
                     _add(items, "incremental_column", "fail",
                          f"增量列 {cfg.incremental_column} 不存在于源表")
-                elif _category(hit[0]) not in ("num", "date"):
-                    _add(items, "incremental_column", "fail",
-                         f"增量列 {cfg.incremental_column} 类型 "
-                         f"{hit[0]} 不是数值/时间类型")
                 else:
-                    _add(items, "incremental_column", "pass",
-                         f"增量列 {cfg.incremental_column} ({hit[0]})")
+                    # 类型判定必须用 information_schema 的 data_type——
+                    # 修复：此前把列名（hit[0]）当类型传给 _category，
+                    # 任何列名都不是数值/时间类型 → 所有 incremental/realtime
+                    # 同步任务被预检查阻断（129/137 实测暴露）。
+                    dtype = ""
+                    try:
+                        cur = src_conn.cursor()
+                        if cfg.src_db_type in ("mysql", "mariadb"):
+                            cur.execute(
+                                "SELECT data_type FROM information_schema.columns "
+                                "WHERE table_schema=%s AND table_name=%s "
+                                "AND lower(column_name)=%s",
+                                (cfg.src_db_name, tables[0],
+                                 cfg.incremental_column.lower()))
+                            _row = cur.fetchone()
+                            dtype = (_row[0] if _row else "") or ""
+                        elif cfg.src_db_type in ("postgresql", "kingbase",
+                                                 "opengauss", "panwei"):
+                            cur.execute(
+                                "SELECT data_type FROM information_schema.columns "
+                                "WHERE table_schema=%s AND table_name=%s "
+                                "AND lower(column_name)=%s",
+                                (cfg.src_schema or "public", tables[0],
+                                 cfg.incremental_column.lower()))
+                            _row = cur.fetchone()
+                            dtype = (_row[0] if _row else "") or ""
+                    except Exception:
+                        dtype = ""
+                    cat = _category(dtype) if dtype else "num"
+                    if dtype and cat not in ("num", "date"):
+                        _add(items, "incremental_column", "fail",
+                             f"增量列 {cfg.incremental_column} 类型 "
+                             f"{dtype} 不是数值/时间类型")
+                    else:
+                        _add(items, "incremental_column", "pass",
+                             f"增量列 {cfg.incremental_column} ({dtype or '按数值处理'})")
             except Exception as e:
                 _add(items, "incremental_column", "warn",
                      f"增量列检查失败: {e}")

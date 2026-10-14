@@ -102,6 +102,23 @@ def _validate_biz_system(value, required: bool = True):
     return None
 
 
+@api_bp.route("/tasks/<int:task_id>/precheck", methods=["POST"])
+@login_required
+def api_task_precheck(task_id):
+    """备份预检：先探测该任务能否成功备份（配置/通道/源库/工具/空间）。
+
+    预检是探测不是演练：不落盘产物、不改数据。ok=False 表示存在阻断项。
+    """
+    from core import backup_precheck
+    try:
+        res = backup_precheck.precheck_backup_by_id(task_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": "预检失败: %s" % e}), 500
+    return jsonify(res)
+
+
 @api_bp.route("/tasks/<int:task_id>/list-databases", methods=["GET"])
 @login_required
 def list_task_databases(task_id):

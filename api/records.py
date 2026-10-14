@@ -411,6 +411,28 @@ def api_verify_record_integrity(record_id):
     return jsonify(res)
 
 
+@api_bp.route("/records/<int:record_id>/restore-precheck", methods=["POST"])
+@login_required
+def api_restore_precheck(record_id):
+    """恢复预检：先探测该记录能否成功恢复（产物/完整性/结构/目标端/工具/空间）。
+
+    可选 JSON：target_host_id（恢复目标纳管主机）、target_db（目标库名）。
+    预检只探测不写数据。
+    """
+    from core import backup_precheck
+    data = request.get_json(silent=True) or {}
+    try:
+        res = backup_precheck.precheck_restore_by_id(
+            record_id,
+            target_host_id=data.get("target_host_id"),
+            target_db=(data.get("target_db") or "").strip() or None)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": "恢复预检失败: %s" % e}), 500
+    return jsonify(res)
+
+
 @api_bp.route("/records/<int:record_id>/security-check", methods=["POST"])
 @login_required
 def api_security_check_record(record_id):

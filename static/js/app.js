@@ -1700,6 +1700,7 @@
         <td>${fmtTime(t.last_run_at) || "-"}</td>
         <td class="text-end" style="white-space:nowrap">
           <button class="btn-row btn-row-primary" onclick="runTask(${t.id})" title="${T("立即备份")}"><i class="bi bi-play-circle"></i> ${T("立即备份")}</button>
+          <button class="btn-row" onclick="BKP.runBackupPrecheck(${t.id})" title="备份预检：先探测配置/通道/源库/工具/空间能否支持本次备份"><i class="bi bi-clipboard-check"></i> ${T("预检")}</button>
           <button class="btn-row" onclick="editTask(${t.id})" title="${T("编辑")}"><i class="bi bi-pencil"></i> ${T("编辑")}</button>
           <button class="btn-row btn-row-danger" onclick="delTask(${t.id})" title="${T("删除")}"><i class="bi bi-trash"></i> ${T("删除")}</button>
         </td>
@@ -1992,6 +1993,7 @@
       }
       if (canRestore) {
         actions.push(`<button class="btn btn-sm btn-outline-warning" onclick="runSecurityCheck(${r.id})" title="恢复点安全检测（体积突变/熵值/结构嗅探，启发式，非病毒查杀）"><i class="bi bi-shield-check"></i></button>`);
+        actions.push(`<button class="btn btn-sm btn-outline-info" onclick="BKP.runRestorePrecheck(${r.id})" title="恢复预检：先探测产物/完整性/目标端/工具/空间能否支持恢复"><i class="bi bi-clipboard2-check"></i></button>`);
       }
       if (actions.length === 0) actions.push('<span class="text-muted">-</span>');
       if (canRestore && isMysqlFamily) {

@@ -920,12 +920,16 @@ body {
   color: #fff;
 }
 
-/* ---- 页面卡片：顶部品牌渐变线 + 悬浮抬升 ---- */
-.page-card { position: relative; overflow: hidden; transition: box-shadow .2s ease, transform .2s ease; }
+/* ---- 页面卡片：顶部品牌渐变线 + 悬浮抬升 ----
+   注意：不可用 overflow:hidden——flex 列布局下卡片会被压缩（flex-shrink 默认 1），
+   长表单页（如数据恢复）下半段内容被整体裁掉（2026-10-14 用户实测）。
+   渐变线用 ::before 自带上圆角替代裁切；并禁止 flex 压缩卡片。 */
+.page-card { position: relative; flex-shrink: 0; transition: box-shadow .2s ease, transform .2s ease; }
 .page-card::before {
   content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
   background: linear-gradient(90deg, var(--primary), rgba(13, 148, 136, .08));
   opacity: .8;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
 }
 .page-card:hover { box-shadow: 0 6px 20px rgba(15, 23, 42, .08); transform: translateY(-1px); }
 

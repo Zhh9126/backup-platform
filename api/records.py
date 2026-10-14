@@ -411,6 +411,23 @@ def api_verify_record_integrity(record_id):
     return jsonify(res)
 
 
+@api_bp.route("/records/<int:record_id>/security-check", methods=["POST"])
+@login_required
+def api_security_check_record(record_id):
+    """恢复点安全检测（启发式：体积突变/熵值/结构嗅探）。
+
+    离线无病毒库，不做病毒查杀；suspect 仅提示与审计，不拦截恢复。
+    """
+    from core import backup_anomaly
+    try:
+        res = backup_anomaly.check_record_by_id(record_id)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": f"检测失败: {e}"}), 500
+    return jsonify(res)
+
+
 @api_bp.route("/records/locked", methods=["GET"])
 @login_required
 def api_list_locked_records():

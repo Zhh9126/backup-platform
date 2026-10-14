@@ -184,6 +184,12 @@ class PostgreSQLEngine(BackupEngine):
             return res
         comp = int(self.task.get("compress") or 0)
         data, compressed, fmt = remote_dump.remote_db_dump(self.task, ssh_host, self._dump_db_type, comp)
+        if not data:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path="",
+                message=("远端 pg_dump 输出为空（rc=0 但无数据）——疑似认证失败"
+                         "或连接异常，请检查任务凭据与数据库服务器日志"))
         if fmt == "multi-db-tar":
             # 全实例：逐库 tar.gz（远端已 gzip，manifest.json 标注库清单）
             res = self._write_dump_file(data, backup_type, ssh_host, ".tar.gz", "pg_dump")

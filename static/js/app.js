@@ -1987,6 +1987,9 @@
       } else if (r.message && r.message.length > 0) {
         actions.unshift(`<button class="btn btn-sm btn-outline-secondary" onclick="viewRecordLog(${r.id})" title="查看详细日志"><i class="bi bi-file-text"></i></button>`);
       }
+      if (canRestore) {
+        actions.push(`<button class="btn btn-sm btn-outline-warning" onclick="runSecurityCheck(${r.id})" title="恢复点安全检测（体积突变/熵值/结构嗅探，启发式，非病毒查杀）"><i class="bi bi-shield-check"></i></button>`);
+      }
       if (actions.length === 0) actions.push('<span class="text-muted">-</span>');
       if (canRestore && isMysqlFamily) {
         actions.push(`<button class="btn btn-sm btn-outline-primary" onclick="openPitrModal(${r.id})" title="任意时间点恢复">PITR</button>`);
@@ -2067,6 +2070,57 @@
     } catch (e) {
       toast("加载日志失败: " + e.message, "danger");
     }
+  };
+
+  // ---- 恢复点安全检测（启发式：体积/熵值/结构，非病毒查杀）----
+  let secModal;
+  window.runSecurityCheck = async (id) => {
+    toast("安全检测中…", "secondary");
+    let res;
+    try {
+      res = await api("POST", `/api/records/${id}/security-check`);
+    } catch (e) {
+      toast("安全检测失败: " + e.message, "danger");
+      return;
+    }
+    const badge = {
+      clean: '<span class="badge bg-success">未发现异常</span>',
+      suspect: '<span class="badge bg-danger">发现可疑特征</span>',
+      unknown: '<span class="badge bg-secondary">无法判定</span>',
+    }[res.level] || esc(res.level);
+    const rows = (res.checks || []).map((c) => {
+      const b = {
+        clean: '<span class="badge bg-success">正常</span>',
+        suspect: '<span class="badge bg-danger">可疑</span>',
+        unknown: '<span class="badge bg-secondary">不判定</span>',
+      }[c.level] || esc(c.level);
+      return `<tr><td>${esc(c.item)}</td><td>${b}</td><td class="small">${esc(c.message)}</td></tr>`;
+    }).join("");
+    const html = `
+      <div class="modal fade" id="secCheckModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+          <div class="modal-content">
+            <div class="modal-header py-2">
+              <h6 class="modal-title">恢复点安全检测 #${id} ${badge}</h6>
+              <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+              <div class="alert alert-warning small mb-2 py-2">
+                启发式检测（体积突变 / 熵值 / 结构嗅探）。离线环境无病毒库，<b>不做病毒查杀</b>；
+                「可疑」仅提示风险并留审计日志，不拦截恢复——是否信任该恢复点请结合业务判断。
+              </div>
+              <table class="table table-sm small mb-0">
+                <thead><tr><th>检测项</th><th>结果</th><th>说明</th></tr></thead>
+                <tbody>${rows}</tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    document.getElementById("secCheckModal")?.remove();
+    document.body.insertAdjacentHTML("beforeend", html);
+    secModal = new bootstrap.Modal(document.getElementById("secCheckModal"));
+    secModal.show();
   };
 
   // ---- PITR / 对象级 / 克隆 模态框 ----

@@ -87,6 +87,18 @@ class OracleEngine(BackupEngine):
             return pw
         return f'"{pw}"'
 
+    def _db_host_for_remote(self, ssh_host: dict = None) -> str:
+        """远端执行 expdp/impdp 时连接数据库所用主机名。
+
+        默认 127.0.0.1（监听绑回环最常见，129 实测最稳）；但部分环境监听
+        只绑定内网 IP（167 openEuler 11g 实测：127.0.0.1:1521 拒连 →
+        TNS-12541），此时改用任务配置的数据库地址（与远端同机，内网可达）。
+        """
+        host = (self.task.get("host") or "").strip()
+        if host in ("", "127.0.0.1", "localhost", "::1", "0.0.0.0"):
+            return "127.0.0.1"
+        return host
+
     def _conn_string(self, service: str) -> str:
         """构造 Oracle 连接串：user/password@//host:port/service_name。
 
@@ -252,7 +264,7 @@ class OracleEngine(BackupEngine):
                 return BackupResult(success=False, status=BackupStatus.FAILED,
                                     message="远端未找到 impdp，无法执行 SQLFILE 校验")
             mode_args = f"SCHEMAS={schemas_arg}" if schemas_arg else ""
-            verify_conn = f"{username}/{self._quote_password(pw)}@//127.0.0.1:{port}/{service}"
+            verify_conn = f"{username}/{self._quote_password(pw)}@//{self._db_host_for_remote(ssh_host)}:{port}/{service}"
             inner = (f"export PATH=$ORACLE_HOME/bin:$PATH; "
                      f"{shlex.quote(impdp_bin)} {shlex.quote(verify_conn)} "
                      f"DUMPFILE=platform_verify_{ts}.dmp SQLFILE={sqlfile} "
@@ -1186,7 +1198,7 @@ class OracleEngine(BackupEngine):
 
         client = remote_dump._connect(target_host_info)
         try:
-            restore_conn = f"{username}/{self._quote_password(pw)}@//127.0.0.1:{port}/{service}"
+            restore_conn = f"{username}/{self._quote_password(pw)}@//{self._db_host_for_remote(target_host_info)}:{port}/{service}"
             dp_dir = self._query_dp_dir(client, restore_conn) or self._query_dp_dir(client)
             if not dp_dir:
                 return BackupResult(
@@ -1220,6 +1232,23 @@ class OracleEngine(BackupEngine):
                 out, err, rc = _ssh_exec_pipe(
                     client, remote_dump._wrap_login(shell),
                     timeout=config.BACKUP_TIMEOUT if hasattr(config, "BACKUP_TIMEOUT") else 3600)
+                # 瞬时监听抖动自动重试（129 实测：UDI-12514/ORA-12514 偶发，
+                # 同参数立即重跑即成功；内存 61311831 有该机网络抖动记录）
+                transient = ("12514", "12541", "12170", "U DI-12514", "UDI-12514")
+                _retry = 0
+                while rc != 0 and _retry < 2:
+                    _combined_probe = (out.decode("utf-8", "replace") if isinstance(out, bytes)
+                                       else (out or "")) + (err or "")
+                    if not any(p in _combined_probe for p in transient):
+                        break
+                    _retry += 1
+                    self.logger.warning(
+                        "[%s] impdp 遇监听瞬时抖动(12514/12541/12170)，%ds 后重试(%d/2)",
+                        self.task_name, 5 * _retry, _retry)
+                    time.sleep(5 * _retry)
+                    out, err, rc = _ssh_exec_pipe(
+                        client, remote_dump._wrap_login(shell),
+                        timeout=config.BACKUP_TIMEOUT if hasattr(config, "BACKUP_TIMEOUT") else 3600)
                 duration = round(time.time() - start, 3)
 
                 def _dec_impdp_bytes(b):
@@ -1282,10 +1311,19 @@ class OracleEngine(BackupEngine):
 
                 if rc != 0 and fatal:
                     snippet = (out_text or log_tail)[-1200:]
+                    hints = []
+                    if "12514" in snippet or "12541" in snippet:
+                        hints.append(
+                            f"监听不认识服务 {service}：请在数据库服务器执行 "
+                            f"lsnrctl status 查看实际 Service 名，恢复表单"
+                            f"「目标库/实例」应填该服务名（如 orcl11g/orcl）")
+                    if "ORA-01017" in snippet:
+                        hints.append("认证失败：请核对数据库用户名/口令")
+                    hint_txt = ("；" + "；".join(hints)) if hints else ""
                     return BackupResult(
                         success=False, status=BackupStatus.FAILED,
                         duration_sec=duration, stdout=out_text,
-                        message=f"远端 impdp 恢复失败(rc={rc}): {snippet}")
+                        message=f"远端 impdp 恢复失败(rc={rc}): {snippet}{hint_txt}")
 
                 note = ""
                 if rc != 0:

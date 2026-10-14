@@ -619,6 +619,7 @@ def list_restores(limit: int = 100, keyword: str = None) -> list:
         "SELECT rr.*, "
         "br.db_type AS db_type, br.backup_type AS backup_type, "
         "br.started_at AS backup_started_at, "
+        "br.size_bytes AS restore_size_bytes, "
         "bt.name AS task_name, bt.host AS host_raw, "
         "bt.biz_system AS biz_system "
         "FROM restore_records rr "
@@ -643,6 +644,13 @@ def list_restores(limit: int = 100, keyword: str = None) -> list:
         r["task_name"] = r.get("task_name") or "-"
         r["db_type_display"] = _db_type_display(r.get("db_type"))
         r["backup_type_display"] = _backup_type_display(r.get("backup_type"))
+        # 恢复数据量：以备份产物体积为准，统一换算为 GB 展示（恢复记录列）
+        try:
+            _sz = float(r.get("restore_size_bytes") or 0)
+        except Exception:
+            _sz = 0.0
+        r["restore_size_gb"] = round(_sz / (1024 ** 3), 3)
+        r["restore_size_human"] = db.human_size(int(_sz)) if _sz else "-"
     return rows
 
 

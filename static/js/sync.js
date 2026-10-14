@@ -95,7 +95,7 @@
   function renderTasks() {
     const tbody = $("taskTableBody");
     if (!tasks.length) {
-      tbody.innerHTML = '<tr><td colspan="9" class="text-center text-muted">暂无同步任务</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted">暂无同步任务</td></tr>';
       return;
     }
     const pg = Pager.slice("syncPage", tasks);
@@ -107,7 +107,8 @@
         <td>${esc(t.source_table || "-")} <i class="bi bi-arrow-right"></i> ${esc(t.target_table || "-")}</td>
         <td>${(t.sync_mode === "full") ? "迁移·一次性" : "同步·持续"} / ${esc(t.save_mode || "append")}</td>
         <td>${statusBadge(t.status === "running" ? "running" : (t.last_status || t.status))}</td>
-        <td>${fmtTime(t.last_run_at)}</td>
+        <td class="small text-nowrap">${fmtTime(t.created_at) || "-"}</td>
+        <td class="small text-nowrap">${fmtTime(t.last_run_at) || "-"}</td>
         <td>${esc(t.message || "")}</td>
         <td>
           <button class="btn btn-sm btn-primary" onclick="SYNC.editTask(${t.id})">编辑</button>

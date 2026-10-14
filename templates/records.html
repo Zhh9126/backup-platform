@@ -16,6 +16,12 @@
     <select class="form-select d-inline-block w-auto" id="filterTask">
       <option value="">全部任务</option>
     </select>
+    <select class="form-select d-inline-block w-auto" id="recordStatusFilter">
+      <option value="">全部状态</option>
+      <option value="success">仅成功</option>
+      <option value="failed">仅失败</option>
+    </select>
+    <span class="text-muted small" id="recordSelCount">已选 0 项</span>
   </div>
 </div>
 <div id="policyFilterBar" class="alert alert-info py-2 mb-3 d-flex justify-content-between align-items-center d-none">
@@ -62,6 +68,7 @@
   <div class="table-responsive" style="flex:1">
     <table class="table table-hover align-middle mb-0">
       <thead><tr>
+        <th style="width:36px"><input type="checkbox" class="form-check-input" id="recordSelAll" title="全选/全不选（当前页）"></th>
         <th>ID</th><th>业务系统</th><th>备份 IP</th><th>备份类型</th><th>备份时间</th><th>耗时</th>
         <th>状态</th><th>大小</th>
         <th title="备份完成后自动执行的产物级校验：L1 校验和完整性与历史比对 + L2 产物格式头探测（详见表格上方说明）">

@@ -1965,7 +1965,10 @@
     if (kw) q.push("keyword=" + encodeURIComponent(kw));
     if (pid) q.push("policy_id=" + encodeURIComponent(pid));
     const url = "/api/records" + (q.length ? "?" + q.join("&") : "");
-    const recs = await api("GET", url);
+    const recs0 = await api("GET", url);
+    const stFilter = ($("recordStatusFilter")?.value || "");
+    const recs = stFilter ? recs0.filter((r) => r.status === stFilter) : recs0;
+    window.recordSel = window.recordSel || new Set();
     const pg = Pager.slice("records", recs);
     $("recordTable").innerHTML = pg.list.map((r) => {
       // CDC 基线（binlog / wal_lsn）
@@ -2000,7 +2003,9 @@
         actions.push(`<button class="btn btn-sm btn-outline-primary" onclick="openPitrModal(${r.id})" title="任意时间点恢复">PITR</button>`);
         actions.push(`<button class="btn btn-sm btn-outline-info" onclick="openObjectModal(${r.id})" title="对象级精准恢复">对象</button>`);
       }
+      const checked = window.recordSel.has(r.id) ? " checked" : "";
       return `<tr>
+        <td><input type="checkbox" class="form-check-input rec-sel" data-id="${r.id}"${checked}></td>
         <td>${r.id}</td>
         <td>${fmtBizCell(r)}</td>
         <td><code>${esc(r.host_ip || "-")}</code></td>
@@ -2014,8 +2019,40 @@
         <td class="text-end">${actions.join(' ')}</td>
       </tr>`;
     }).join("") ||
-      '<tr><td colspan="10" class="text-muted text-center">暂无记录</td></tr>';
+      '<tr><td colspan="11" class="text-muted text-center">暂无记录</td></tr>';
     Pager.attach("records", $("recordTable"), pg.page, pg.pages, pg.total, loadRecords);
+    const rcnt = $("recordSelCount");
+    if (rcnt) rcnt.textContent = "已选 " + window.recordSel.size + " 项";
+    const rtb = $("recordTable");
+    if (rtb && !rtb._selWired) {
+      rtb._selWired = true;
+      rtb.addEventListener("change", (ev) => {
+        const cb = ev.target.closest(".rec-sel");
+        if (!cb) return;
+        const id = Number(cb.dataset.id);
+        if (cb.checked) window.recordSel.add(id);
+        else window.recordSel.delete(id);
+        if (rcnt) rcnt.textContent = "已选 " + window.recordSel.size + " 项";
+      });
+    }
+    const rhead = $("recordSelAll");
+    if (rhead && !rhead._wired) {
+      rhead._wired = true;
+      rhead.addEventListener("change", () => {
+        document.querySelectorAll("#recordTable .rec-sel").forEach((cb) => {
+          const id = Number(cb.dataset.id);
+          if (rhead.checked) window.recordSel.add(id);
+          else window.recordSel.delete(id);
+          cb.checked = rhead.checked;
+        });
+        if (rcnt) rcnt.textContent = "已选 " + window.recordSel.size + " 项";
+      });
+    }
+    const rsf = $("recordStatusFilter");
+    if (rsf && !rsf._wired) {
+      rsf._wired = true;
+      rsf.addEventListener("change", loadRecords);
+    }
   }
 
   // ===== 备份日志查看 =====
@@ -3724,27 +3761,34 @@
   }
 
   // ------------------------- 恢复记录 -------------------------
+  window.restoreSel = window.restoreSel || new Set();
   async function initRestoreRecords() {
     const kw = ($("restoreRecordSearch")?.value || "").trim();
-    const url = kw ? "/api/restores?keyword=" + encodeURIComponent(kw) : "/api/restores";
-    const rs = await api("GET", url);
-    // 保存到全局，方便“查看日志”按钮快速读取
+    const st = ($("restoreStatusFilter")?.value || "");
+    let url = kw ? "/api/restores?keyword=" + encodeURIComponent(kw) : "/api/restores";
+    const rs0 = await api("GET", url);
+    // 状态筛选（成功/失败）+ 保存到全局，方便“查看日志”按钮快速读取
+    const rs = st ? rs0.filter((r) => r.status === st) : rs0;
     window.RESTORE_RECORD_ROWS = rs;
     const pg = Pager.slice("restores", rs);
     $("restoreRecordsTable").innerHTML = pg.list.map((r) => {
       // 收编为统一 fmtBizCell（原为内联拼装，缺 #id 且不走 R2）
-      return `<tr><td>${r.id}</td><td>${r.record_id}</td>
+      const checked = window.restoreSel.has(r.id) ? " checked" : "";
+      return `<tr><td><input type="checkbox" class="form-check-input rs-sel" data-id="${r.id}"${checked}></td><td>${r.id}</td><td>${r.record_id}</td>
        <td>${fmtBizCell(r)}</td>
        <td><code>${esc(r.host_ip || "-")}</code></td>
        <td>${esc(r.db_type_display || r.db_type || "-")}</td>
        <td>${fmtTime(r.backup_started_at)}</td>
+       <td>${esc(r.restore_size_human || "-")}</td>
        <td>${esc(r.target_host || "-")}</td><td>${esc(r.target_db || "-")}</td>
        <td>${fmtTime(r.started_at)}</td><td>${statusBadge(r.status)}</td>
        <td>${esc(r.operator || "-")}</td><td>${esc(r.message || "")}</td>
        <td><button class="btn btn-sm btn-outline-primary" onclick="showRestoreLog(${r.id})">查看</button></td></tr>`;
     }).join("") ||
-      '<tr><td colspan="13" class="text-muted text-center">暂无恢复记录</td></tr>';
+      '<tr><td colspan="15" class="text-muted text-center">暂无恢复记录</td></tr>';
     Pager.attach("restores", $("restoreRecordsTable"), pg.page, pg.pages, pg.total, initRestoreRecords);
+    const cnt = $("restoreSelCount");
+    if (cnt) cnt.textContent = "已选 " + window.restoreSel.size + " 项";
 
     const sb = $("restoreRecordSearch");
     if (sb && !sb._wired) {
@@ -3752,6 +3796,42 @@
       sb.addEventListener("input", () => {
         clearTimeout(window._rrSearchTimer);
         window._rrSearchTimer = setTimeout(initRestoreRecords, 300);
+      });
+    }
+    // 状态筛选
+    const sf = $("restoreStatusFilter");
+    if (sf && !sf._wired) {
+      sf._wired = true;
+      sf.addEventListener("change", initRestoreRecords);
+    }
+    // 行选择（事件委托，翻页后仍有效）
+    const tb = $("restoreRecordsTable");
+    if (tb && !tb._selWired) {
+      tb._selWired = true;
+      tb.addEventListener("change", (ev) => {
+        const cb = ev.target.closest(".rs-sel");
+        if (!cb) return;
+        const id = Number(cb.dataset.id);
+        if (cb.checked) window.restoreSel.add(id);
+        else window.restoreSel.delete(id);
+        const cnt = $("restoreSelCount");
+        if (cnt) cnt.textContent = "已选 " + window.restoreSel.size + " 项";
+      });
+    }
+    // 全选/全不选（只作用于当前页展示的行）
+    const head = $("restoreSelAll");
+    if (head && !head._wired) {
+      head._wired = true;
+      head.addEventListener("change", () => {
+        const boxes = document.querySelectorAll("#restoreRecordsTable .rs-sel");
+        boxes.forEach((cb) => {
+          const id = Number(cb.dataset.id);
+          if (head.checked) window.restoreSel.add(id);
+          else window.restoreSel.delete(id);
+          cb.checked = head.checked;
+        });
+        const cnt = $("restoreSelCount");
+        if (cnt) cnt.textContent = "已选 " + window.restoreSel.size + " 项";
       });
     }
   }
@@ -6616,10 +6696,12 @@
           '<td>' + esc(types) + '</td>' +
           '<td>' + statusBadgeDbMigrate(p.status) + '</td>' +
           '<td>' + esc(p.current_phase || '-') + '</td>' +
+          '<td class="small text-nowrap">' + (fmtTime(p.created_at) || '-') + '</td>' +
+          '<td class="small text-nowrap">' + (fmtTime(p.finished_at) || '-') + '</td>' +
           '<td>' + phaseChips(p.phases_json, p.migrate_types) + '</td>' +
           '<td class="text-end">' + detail + rerun + del + '</td>' +
         '</tr>';
-      }).join("") || '<tr><td colspan="8" class="text-muted text-center">暂无迁移计划</td></tr>';
+      }).join("") || '<tr><td colspan="10" class="text-muted text-center">暂无迁移计划</td></tr>';
       Pager.attach("dbMigrations", $("dbMigrateTable"), pg.page, pg.pages, pg.total, window.loadDbMigrations);
       if (running) {
         clearTimeout(loadDbMigrations._timer);

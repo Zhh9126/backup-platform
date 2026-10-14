@@ -7,14 +7,21 @@
   </div>
   <div>
     <input type="text" class="form-control d-inline-block w-auto" id="restoreRecordSearch" placeholder="搜索业务系统 / IP…">
+    <select class="form-select d-inline-block w-auto" id="restoreStatusFilter">
+      <option value="">全部状态</option>
+      <option value="success">仅成功</option>
+      <option value="failed">仅失败</option>
+    </select>
+    <span class="text-muted small ms-2" id="restoreSelCount">已选 0 项</span>
   </div>
 </div>
 <div class="page-card">
   <div class="table-responsive" style="flex:1">
     <table class="table table-hover align-middle mb-0">
       <thead><tr>
+        <th style="width:36px"><input type="checkbox" class="form-check-input" id="restoreSelAll" title="全选/全不选（当前页）"></th>
         <th>ID</th><th>备份记录</th><th>业务系统</th><th>备份 IP</th><th>备份类型</th><th>备份时间</th>
-        <th>目标主机</th><th>目标库</th><th>恢复开始</th><th>状态</th><th>操作人</th><th>说明</th><th>详细日志</th>
+        <th>恢复数据量</th><th>目标主机</th><th>目标库</th><th>恢复开始</th><th>状态</th><th>操作人</th><th>说明</th><th>详细日志</th>
       </tr></thead>
       <tbody id="restoreRecordsTable"></tbody>
     </table>

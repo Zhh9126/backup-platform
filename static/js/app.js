@@ -473,7 +473,8 @@
       if (!$att) return;
       const pgAtt = Pager.slice("attention", att, 3);
       $att.innerHTML = _attentionList(pgAtt.list);
-      Pager.attach("attention", $att, pgAtt.page, pgAtt.pages, pgAtt.total, window.renderAttention);
+      // 分页条挂独立容器（卡内列表下方），与列表内容分离，杜绝溢出遮挡
+      Pager.attach("attention", $("attentionPager"), pgAtt.page, pgAtt.pages, pgAtt.total, window.renderAttention);
       $att.querySelectorAll("[data-goto-task]").forEach((el) => {
         el.addEventListener("click", () => {
           const tid = el.getAttribute("data-goto-task");

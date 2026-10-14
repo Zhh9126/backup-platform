@@ -259,28 +259,36 @@
 
 <!-- 顶部 4 张统计卡 -->
 <div class="row g-3 mb-4">
-  <div class="col-md-3">
-    <div class="card-stat">
+  <div class="col">
+    <div class="card-stat" style="cursor:pointer" title="点击查看任务列表" onclick="location.href='/tasks'">
       <div class="stat-icon"><i class="bi bi-database"></i></div>
       <div class="stat-num" id="st_db_tasks">-</div>
       <div class="stat-label">数据库备份任务</div>
     </div>
   </div>
-  <div class="col-md-3">
+  <div class="col">
     <div class="card-stat">
       <div class="stat-icon"><i class="bi bi-folder2-open"></i></div>
       <div class="stat-num" id="st_file_tasks">-</div>
       <div class="stat-label">文件备份任务</div>
     </div>
   </div>
-  <div class="col-md-3">
+  <div class="col">
     <div class="card-stat">
       <div class="stat-icon"><i class="bi bi-hdd-stack"></i></div>
       <div class="stat-num" id="st_size">-</div>
       <div class="stat-label">累计备份体积</div>
     </div>
   </div>
-  <div class="col-md-3">
+  <div class="col">
+    <div class="card-stat" id="card_success_rate" style="cursor:pointer" title="点击查看备份记录明细（默认筛选失败）" onclick="location.href='/records?status=failed'">
+      <div class="stat-icon"><i class="bi bi-check2-square"></i></div>
+      <div class="stat-num" id="st_success_rate">-</div>
+      <div class="stat-label">近 24h 备份成功率</div>
+      <div class="stat-sub" id="st_success_detail">-</div>
+    </div>
+  </div>
+  <div class="col">
     <div class="card-stat">
       <div class="stat-icon"><i class="bi bi-heart-pulse"></i></div>
       <div class="stat-num" id="st_health">-</div>

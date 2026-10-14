@@ -216,10 +216,13 @@
       </div>`;
   }
 
-  function _distRow(name, value, total, color) {
+  function _distRow(name, value, total, color, href) {
     const pct = total > 0 ? Math.round((value / total) * 100) : 0;
+    const click = href
+      ? ` style="cursor:pointer" title="点击查看明细" onclick="location.href='${href}'"`
+      : "";
     return `
-      <div class="dist-row">
+      <div class="dist-row"${click}>
         <span class="dr-name">${esc(name)}</span>
         <div class="dr-bar"><span style="width:${pct}%; background:${color}"></span></div>
         <span class="dr-val"><b>${value}</b> <span class="text-muted">(${pct}%)</span></span>
@@ -247,6 +250,12 @@
       }
       if (!b.total) {
         bars += `<rect x="${x.toFixed(2)}" y="${H - 2}" width="${bw.toFixed(2)}" height="2" fill="#e2e8f0" rx="1"><title>${esc(b.date)} 无备份</title></rect>`;
+      }
+      // 柱顶数值：让人不用悬停就能看到当天总量（成功/失败分色标注）
+      if (b.total) {
+        const txtY = Math.max(4, H - okH - badH - 1.5);
+        const col = (b.failed || 0) > (b.success || 0) ? "#ef4444" : "#0f766e";
+        bars += `<text x="${(x + bw / 2).toFixed(2)}" y="${txtY.toFixed(2)}" font-size="3.4" fill="${col}" text-anchor="middle">${b.total}</text>`;
       }
     });
     const labels = trend.map((b) => `<span>${esc(String(b.date).slice(5))}</span>`).join("");
@@ -332,6 +341,11 @@
 
     // 顶部 4 卡
     $("st_db_tasks").textContent = d.db_task_count ?? 0;
+    const sr = d.success_rate_24h || {};
+    $("st_success_rate").textContent = sr.rate == null ? "-" : sr.rate + "%";
+    $("st_success_detail").textContent = sr.total
+      ? `成功 ${sr.success} / 共 ${sr.total} 次（失败 ${sr.failed}）`
+      : "近 24h 无备份执行";
     $("st_file_tasks").textContent = d.file_task_count ?? 0;
     $("st_size").textContent = (d.total_size_human && d.total_size_human !== "0 B")
       ? d.total_size_human
@@ -401,7 +415,8 @@
     const dbTotal = Object.values(d.db_counter || {}).reduce((a, b) => a + b, 0) || 1;
     const dbEntries = Object.entries(dbMap);
     $("dbDist").innerHTML = dbEntries.length
-      ? dbEntries.map(([k, v]) => _distRow(v, d.db_counter[k], dbTotal, "#3b82f6")).join("")
+      ? dbEntries.map(([k, v]) => _distRow(v, d.db_counter[k], dbTotal, "#3b82f6",
+          "/tasks?db_type=" + encodeURIComponent(k))).join("")
       : '<div class="dist-empty">暂无数据</div>';
 
     // 备份状态分布（中文名 + 颜色按状态）
@@ -411,7 +426,8 @@
     $("statusDist").innerHTML = stEntries.length
       ? stEntries.map(([k, v]) => {
           // v 是中文展示名；原值在 d.status_counter[k]
-          return _distRow(v, d.status_counter[k], stTotal, STATUS_COLOR[k] || "#94a3b8");
+          return _distRow(v, d.status_counter[k], stTotal, STATUS_COLOR[k] || "#94a3b8",
+            "/records?status=" + encodeURIComponent(k));
         }).join("")
       : '<div class="dist-empty">暂无数据</div>';
 
@@ -1683,7 +1699,12 @@
   }
 
   async function loadTasks() {
-    const tasks = (await api("GET", "/api/tasks?db_type_exclude=file")) || [];
+    // 下钻支持：/tasks?db_type=mysql 只看该类型任务
+    const qDbType = new URLSearchParams(location.search).get("db_type");
+    const url = qDbType
+      ? "/api/tasks?db_type=" + encodeURIComponent(qDbType)
+      : "/api/tasks?db_type_exclude=file";
+    const tasks = (await api("GET", url)) || [];
     const pg = Pager.slice("tasks", tasks);
     $("taskTable").innerHTML = pg.list.map((t) =>
       `<tr data-task-id="${t.id}">
@@ -1960,6 +1981,11 @@
     const kw = ($("recordSearch")?.value || "").trim();
     const urlParams = new URLSearchParams(location.search);
     const pid = urlParams.get("policy_id");
+    // 下钻支持：/records?status=failed 直接预置状态筛选
+    const qStatus = urlParams.get("status");
+    if (qStatus != null && $("recordStatusFilter")) {
+      $("recordStatusFilter").value = qStatus;
+    }
     const q = [];
     if (tid) q.push("task_id=" + encodeURIComponent(tid));
     if (kw) q.push("keyword=" + encodeURIComponent(kw));

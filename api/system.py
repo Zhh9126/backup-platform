@@ -85,6 +85,35 @@ def path_info():
     return jsonify({"success": True, **info})
 
 
+def _success_rate_24h(records: list) -> dict:
+    """近 24 小时备份成功率（供首页卡片展示与下钻）。
+
+    records 为 list_records 最新在前；按 started_at 解析过滤 24h 窗口。
+    """
+    from datetime import datetime, timedelta
+    cutoff = datetime.now() - timedelta(hours=24)
+    total = success = failed = 0
+    for r in records:
+        raw = r.get("started_at") or ""
+        try:
+            dt = datetime.fromisoformat(raw)
+        except Exception:
+            continue
+        # started_at 带时区（+08:00），cutoff 为 naive——统一去 tzinfo 再比较
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        if dt < cutoff:
+            continue
+        total += 1
+        st = r.get("status")
+        if st == "success":
+            success += 1
+        elif st in ("failed", "error"):
+            failed += 1
+    rate = round(success / total * 100, 1) if total else None
+    return {"total": total, "success": success, "failed": failed, "rate": rate}
+
+
 @api_bp.route("/dashboard", methods=["GET"])
 @login_required
 def dashboard():
@@ -155,6 +184,8 @@ def dashboard():
         "db_task_count": db_task_count,
         "file_task_count": file_task_count,
         "record_count": len(records),
+        # ---- 备份任务成功率（近 24h，页面卡片可下钻到记录明细） ----
+        "success_rate_24h": _success_rate_24h(records),
         "status_counter": {
             k: v for k, v in dict(status_counter).items()
         },

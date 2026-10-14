@@ -13,7 +13,8 @@
     const ps = Number(size) > 0 ? Number(size) : PAGE_SIZE;
     const total = (arr || []).length;
     const pages = Math.max(1, Math.ceil(total / ps));
-    const st = state[key] || (state[key] = { page: 1 });
+    const st = state[key] || (state[key] = { page: 1, pageSize: ps });
+    st.pageSize = ps;
     if (st.page > pages) st.page = pages;
     if (st.page < 1) st.page = 1;
     const start = (st.page - 1) * ps;
@@ -66,7 +67,9 @@
       st.page = p;
       if (typeof onChange === "function") onChange();
     };
-    let html = `<span class="text-muted small">共 ${total} 条 · 第 ${page}/${pages} 页 · 每页 ${pageSize} 条</span>`;
+    const stInfo = state[key] || {};
+    const psLabel = stInfo.pageSize || 10;
+    let html = `<span class="text-muted small">共 ${total} 条 · 第 ${page}/${pages} 页 · 每页 ${psLabel} 条</span>`;
     if (pages > 1) {
       html += `<div class="btn-group btn-group-sm" role="group">`;
       html += `<button class="btn btn-outline-secondary" ${page <= 1 ? "disabled" : ""} data-p="${page - 1}">‹ 上一页</button>`;

@@ -346,6 +346,14 @@
     $("st_success_detail").textContent = sr.total
       ? `成功 ${sr.success} / 共 ${sr.total} 次（失败 ${sr.failed}）`
       : "近 24h 无备份执行";
+    // 备份对象全景（对象存储 / 虚拟机）
+    setTxt("st_os_tasks", d.os_task_count ?? 0);
+    setTxt("st_os_sub", "MinIO / OSS / COS / S3 兼容 · 点击配置任务");
+    const vm = d.vm_summary || {};
+    setTxt("st_vm_protected", vm.protected ?? 0);
+    setTxt("st_vm_sub", vm.protected
+      ? `已纳管平台 ${vm.hypervisors ?? 0} · 恢复点 ${vm.recovery_points ?? 0}`
+      : "尚未纳管虚拟化平台 · 点击配置");
     $("st_file_tasks").textContent = d.file_task_count ?? 0;
     $("st_size").textContent = (d.total_size_human && d.total_size_human !== "0 B")
       ? d.total_size_human

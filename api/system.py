@@ -85,6 +85,18 @@ def path_info():
     return jsonify({"success": True, **info})
 
 
+def _vm_summary() -> dict:
+    """虚拟机备份概览（受保护台数 / 恢复点数 / 已纳管平台数）。"""
+    try:
+        hv = db.query_one("SELECT COUNT(*) AS n FROM vm_hypervisors") or {}
+        prot = db.query_one("SELECT COUNT(*) AS n FROM vm_protected") or {}
+        rp = db.query_one("SELECT COUNT(*) AS n FROM vm_recovery_points") or {}
+        return {"hypervisors": hv.get("n", 0), "protected": prot.get("n", 0),
+                "recovery_points": rp.get("n", 0)}
+    except Exception:
+        return {"hypervisors": 0, "protected": 0, "recovery_points": 0}
+
+
 def _success_rate_24h(records: list) -> dict:
     """近 24 小时备份成功率（供首页卡片展示与下钻）。
 
@@ -186,6 +198,9 @@ def dashboard():
         "record_count": len(records),
         # ---- 备份任务成功率（近 24h，页面卡片可下钻到记录明细） ----
         "success_rate_24h": _success_rate_24h(records),
+        # ---- 备份对象全景（对象存储 / 虚拟机，卡片可下钻） ----
+        "os_task_count": sum(1 for t in tasks if t.get("db_type") == "object_storage"),
+        "vm_summary": _vm_summary(),
         "status_counter": {
             k: v for k, v in dict(status_counter).items()
         },

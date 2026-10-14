@@ -496,7 +496,8 @@
       $("osTaskSummary").textContent = "共 0 个任务";
       return;
     }
-    tb.innerHTML = TASKS.map((t) => {
+    const pgT = Pager.slice("osTasks", TASKS);
+    tb.innerHTML = pgT.list.map((t) => {
       const ex = taskExtra(t);
       const prefix = ex.os_prefix || "";
       const bucketCell = esc(t.db_name || "-") +
@@ -526,6 +527,7 @@
         '<button class="btn btn-sm btn-outline-danger" data-os-del="' + t.id + '" title="删除"><i class="bi bi-trash"></i></button>' +
         "</td></tr>";
     }).join("");
+    Pager.attach("osTasks", tb, pgT.page, pgT.pages, pgT.total, renderTaskTable);
     $("osTaskSummary").textContent = "共 " + TASKS.length + " 个任务，启用 " +
       TASKS.filter((t) => t.enabled).length + " 个";
   }

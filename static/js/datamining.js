@@ -159,7 +159,8 @@ window.DataminingPage = (function () {
       return (a.name + " " + a.instance + " " + (a.biz_system || "") + " " + a.db_type)
         .toLowerCase().indexOf(kw) >= 0;
     });
-    setHtml("dmAssetTable", rows.length ? rows.map(function (a) {
+    var pgA = Pager.slice("dmAssets", rows);
+    setHtml("dmAssetTable", pgA.list.length ? pgA.list.map(function (a) {
       return "<tr>" +
         "<td><b>" + esc(a.name) + "</b>" +
         (a.biz_system ? '<div class="dm-sub">' + esc(a.biz_system) + "</div>" : "") + "</td>" +
@@ -177,6 +178,7 @@ window.DataminingPage = (function () {
         '<i class="bi bi-shield-check"></i> 扫描</button></td>' +
         "</tr>";
     }).join("") : '<tr><td colspan="10" class="text-center text-secondary py-3">暂无资产数据</td></tr>');
+    Pager.attach("dmAssets", document.getElementById("dmAssetTable"), pgA.page, pgA.pages, pgA.total, loadInventory);
   }
 
   // ------------------------------------------------------------------ 价值评估
@@ -207,7 +209,8 @@ window.DataminingPage = (function () {
 
     // 价值明细
     var rows = (inv.assets || []).slice().sort(function (a, b) { return b.value_score - a.value_score; });
-    setHtml("dmValueTable", rows.length ? rows.map(function (a) {
+    var pgV = Pager.slice("dmValue", rows);
+    setHtml("dmValueTable", pgV.list.length ? pgV.list.map(function (a) {
       var d = a.dims || {};
       var dims = [
         ["活跃", d.activity, 25], ["保护", d.protection, 20], ["规模", d.scale, 15],
@@ -219,6 +222,7 @@ window.DataminingPage = (function () {
           '<span class="dm-dim-fill" style="width:' + w + '%"></span>' +
           '<span class="dm-dim-t">' + x[0] + "</span></span>";
       }).join("") + "</div>";
+    Pager.attach("dmValue", document.getElementById("dmValueTable"), pgV.page, pgV.pages, pgV.total, renderValue);
       var advice = [];
       if (a.cold_level === "frozen") advice.push("建议归档或清理");
       else if (a.cold_level === "cold") advice.push("可降级冷存储");
@@ -327,7 +331,8 @@ window.DataminingPage = (function () {
 
   async function loadScans() {
     var rows = await api("GET", "/api/datamining/scans");
-    setHtml("dmScanHistory", rows.length ? rows.map(function (r) {
+    var pgS = Pager.slice("dmScans", rows);
+    setHtml("dmScanHistory", pgS.list.length ? pgS.list.map(function (r) {
       return "<tr><td>" + esc(BKP.fmtTime(r.scanned_at)) + "</td>" +
         "<td>" + esc(state.taskNames[r.task_id] || ("#" + (r.task_id || "—"))) + "</td>" +
         "<td class='dm-mono small'>" + esc((r.path || "").split("/").pop()) + "</td>" +
@@ -339,6 +344,7 @@ window.DataminingPage = (function () {
         "</tr>";
     }).join("") : '<tr><td colspan="8" class="text-center text-secondary py-3">' +
       "尚无扫描记录，可在右侧选择资产执行敏感发现</td></tr>");
+    Pager.attach("dmScans", document.getElementById("dmScanHistory"), pgS.page, pgS.pages, pgS.total, loadScans);
   }
 
   // ------------------------------------------------------------------ 合规概览

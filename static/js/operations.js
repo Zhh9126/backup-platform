@@ -94,7 +94,8 @@
       tb.innerHTML = `<tr><td colspan="9" class="text-center text-muted py-3">暂无超长备份记录</td></tr>`;
       return;
     }
-    tb.innerHTML = rows.map(r => `
+    const pgLongRunning = Pager.slice("opsLongRunning", rows);
+    tb.innerHTML = pgLongRunning.list.map(r => `
       <tr>
         <td>${esc(r.id)}</td>
         <td>${fmtTime(r.started_at)}</td>
@@ -106,6 +107,7 @@
         <td>${esc(r.reason || "—")}</td>
         <td>${window.BKP.statusBadge ? window.BKP.statusBadge(r.status) : esc(r.status || "")}</td>
       </tr>`).join("");
+    Pager.attach("opsLongRunning", tb, pgLongRunning.page, pgLongRunning.pages, pgLongRunning.total, null);
   }
 
   function renderFrequency(rows) {
@@ -114,7 +116,8 @@
       tb.innerHTML = `<tr><td colspan="6" class="text-center text-muted py-3">暂无超频备份记录</td></tr>`;
       return;
     }
-    tb.innerHTML = rows.map(g => `
+    const pgFrequency = Pager.slice("opsFrequency", rows);
+    tb.innerHTML = pgFrequency.list.map(g => `
       <tr>
         <td>${esc(g.task_name || g.task_id || "—")}</td>
         <td>${esc(dbTypeLabel(g.db_type))}</td>
@@ -123,6 +126,7 @@
         <td>${fmtTime(g.window_end)}</td>
         <td>${esc((g.record_ids || []).join(", "))}</td>
       </tr>`).join("");
+    Pager.attach("opsFrequency", tb, pgFrequency.page, pgFrequency.pages, pgFrequency.total, null);
   }
 
   /* ---------- 阈值 modal ---------- */

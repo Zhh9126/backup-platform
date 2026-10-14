@@ -66,8 +66,8 @@
         tb.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-3">暂无恢复校验策略，点击右上角新建</td></tr>';
         return;
       }
-      tb.innerHTML = res.data.map((p) => {
-        const inst = p.instance_name || p.task_name || "任务 " + p.task_id;
+      const pgP = Pager.slice("rvPolicies", res.data);
+      tb.innerHTML = pgP.list.map((p) => {        const inst = p.instance_name || p.task_name || "任务 " + p.task_id;
         return '<tr>' +
           '<td><div class="fw-bold">' + esc(inst) + '</div>' +
           '<div class="small text-muted">' + esc(p.db_type || "-") + '</div></td>' +
@@ -82,6 +82,7 @@
             '<button class="btn btn-sm btn-outline-danger" onclick="deletePolicy(' + p.id + ')"><i class="bi bi-trash"></i></button>' +
           '</td></tr>';
       }).join("");
+      Pager.attach("rvPolicies", tb, pgP.page, pgP.pages, pgP.total, loadPolicies);
     });
   }
 
@@ -92,8 +93,8 @@
         tb.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3">暂无恢复测试报告</td></tr>';
         return;
       }
-      tb.innerHTML = res.data.map((r) => {
-        const inst = r.instance_name || r.task_name || "任务 " + r.task_id;
+      const pgR = Pager.slice("rvReports", res.data);
+      tb.innerHTML = pgR.list.map((r) => {        const inst = r.instance_name || r.task_name || "任务 " + r.task_id;
         return '<tr>' +
           '<td><div class="fw-bold">' + esc(inst) + '</div>' +
           '<div class="small text-muted">' + esc(r.policy_name || "-") + '</div></td>' +
@@ -105,6 +106,7 @@
             (r.cleaned ? "" : ' <button class="btn btn-sm btn-link p-0" onclick="cleanReport(' + r.id + ')">标记清理</button>') +
           '</td></tr>';
       }).join("");
+      Pager.attach("rvReports", tb, pgR.page, pgR.pages, pgR.total, loadReports);
     });
   }
 

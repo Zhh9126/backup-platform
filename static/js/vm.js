@@ -53,7 +53,8 @@
   async function vmLoadHv() {
     try {
       const rows = await window.BKP.api("GET", "/api/vm/hypervisors");
-      $("hvTable").innerHTML = (rows || []).map((r) => `
+      const pg = Pager.slice("vmHv", rows);
+      $("hvTable").innerHTML = pg.list.map((r) => `
         <tr>
           <td>${r.id}</td>
           <td>${esc(r.name)}</td>
@@ -69,6 +70,7 @@
               <i class="bi bi-trash3"></i></button>
           </td>
         </tr>`).join("") || '<tr><td colspan="8" class="text-center text-muted py-3">尚未纳管虚拟化平台</td></tr>';
+      Pager.attach("vmHv", $("hvTable"), pg.page, pg.pages, pg.total, vmLoadHv);
       const sel = $("rpVmFilter");
       sel.innerHTML = '<option value="">全部虚拟机</option>';
       const vms = await window.BKP.api("GET", "/api/vm/protected");
@@ -146,7 +148,8 @@
   async function vmLoadProtected() {
     try {
       const rows = await window.BKP.api("GET", "/api/vm/protected");
-      $("vmTable").innerHTML = (rows || []).map((v) => `
+      const pg = Pager.slice("vmProtected", rows);
+      $("vmTable").innerHTML = pg.list.map((v) => `
         <tr>
           <td>${v.id}</td>
           <td>${esc(v.vm_name || v.vm_ref)}<div class="small text-muted">${esc(v.guest_os || "")}</div></td>
@@ -167,6 +170,7 @@
               <i class="bi bi-x-lg"></i></button>
           </td>
         </tr>`).join("") || '<tr><td colspan="11" class="text-center text-muted py-3">尚无受保护的虚拟机</td></tr>';
+      Pager.attach("vmProtected", $("vmTable"), pg.page, pg.pages, pg.total, vmLoadProtected);
     } catch (e) {
       window.BKP.toast("加载受保护虚拟机失败: " + e.message, "danger");
     }
@@ -199,7 +203,8 @@
     const url = "/api/vm/recovery-points" + (vmId ? ("?vm_id=" + vmId) : "");
     try {
       const rows = await window.BKP.api("GET", url);
-      $("rpTable").innerHTML = (rows || []).map((r) => `
+      const pg = Pager.slice("vmRps", rows);
+      $("rpTable").innerHTML = pg.list.map((r) => `
         <tr>
           <td>${r.id}</td>
           <td>${esc(r.vm_name || ("VM#" + r.vm_id))}</td>
@@ -222,6 +227,7 @@
               <i class="bi bi-trash3"></i></button>
           </td>
         </tr>`).join("") || '<tr><td colspan="9" class="text-center text-muted py-3">暂无恢复点</td></tr>';
+      Pager.attach("vmRps", $("rpTable"), pg.page, pg.pages, pg.total, vmLoadRps);
     } catch (e) {
       window.BKP.toast("加载恢复点失败: " + e.message, "danger");
     }
@@ -288,7 +294,8 @@
       const modeName = {
         restore_in_place: "原位还原", clone: "克隆新 VM", verify: "恢复验证", delete: "销毁"
       };
-      $("jobTable").innerHTML = (rows || []).map((j) => `
+      const pg = Pager.slice("vmJobs", rows);
+      $("jobTable").innerHTML = pg.list.map((j) => `
         <tr>
           <td>${j.id}</td>
           <td>${esc(j.vm_name || ("VM#" + j.vm_id))}</td>
@@ -305,6 +312,7 @@
                  <i class="bi bi-trash3"></i> 销毁目标 VM</button>` : ""}
           </td>
         </tr>`).join("") || '<tr><td colspan="9" class="text-center text-muted py-3">暂无作业</td></tr>';
+      Pager.attach("vmJobs", $("jobTable"), pg.page, pg.pages, pg.total, vmLoadJobs);
 
       const running = (rows || []).some((j) => j.status === "running");
       if (!running && _poller) { clearInterval(_poller); _poller = null; }

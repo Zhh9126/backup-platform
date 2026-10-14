@@ -1684,7 +1684,8 @@
 
   async function loadTasks() {
     const tasks = (await api("GET", "/api/tasks?db_type_exclude=file")) || [];
-    $("taskTable").innerHTML = tasks.map((t) =>
+    const pg = Pager.slice("tasks", tasks);
+    $("taskTable").innerHTML = pg.list.map((t) =>
       `<tr data-task-id="${t.id}">
         <td>${t.id}</td>
         <td>${esc(t.biz_label || "-")}</td>
@@ -1707,6 +1708,7 @@
       + '<div class="empty-title">' + T("还没有备份任务") + '</div>'
       + T('点击右上角「新建任务」，一分钟配置第一个数据库备份') + '</div></td></tr>';
     renderTaskKpi(tasks);
+    Pager.attach("tasks", $("taskTable"), pg.page, pg.pages, pg.total, loadTasks);
     _focusTaskRow();
   }
 
@@ -1963,7 +1965,8 @@
     if (pid) q.push("policy_id=" + encodeURIComponent(pid));
     const url = "/api/records" + (q.length ? "?" + q.join("&") : "");
     const recs = await api("GET", url);
-    $("recordTable").innerHTML = recs.map((r) => {
+    const pg = Pager.slice("records", recs);
+    $("recordTable").innerHTML = pg.list.map((r) => {
       // CDC 基线（binlog / wal_lsn）
       let cdc = '-';
       if (r.binlog_file && r.binlog_pos) cdc = `<code class="small">${esc(r.binlog_file)}:${r.binlog_pos}</code>`;
@@ -2010,6 +2013,7 @@
       </tr>`;
     }).join("") ||
       '<tr><td colspan="10" class="text-muted text-center">暂无记录</td></tr>';
+    Pager.attach("records", $("recordTable"), pg.page, pg.pages, pg.total, loadRecords);
   }
 
   // ===== 备份日志查看 =====
@@ -2291,7 +2295,8 @@
   async function loadRestores(highlightId) {
     const rs = await api("GET", "/api/restores");
     const hl = Number(highlightId || 0);
-    $("restoreTable").innerHTML = rs.map((r) => {
+    const pg = Pager.slice("restoreList", rs);
+    $("restoreTable").innerHTML = pg.list.map((r) => {
       const cls = (hl && Number(r.id) === hl) ? ' class="restore-row-new"' : "";
       // 收编为统一 fmtBizCell：R2 回退与 #id 语义只维护一处；
       // 同时修复此处原内联拼装把 #id 渲染成「恢复记录 ID」的历史缺陷（现为任务 ID）
@@ -2306,12 +2311,14 @@
       </tr>`;
     }).join("") ||
       '<tr><td colspan="12" class="text-muted text-center">暂无恢复记录</td></tr>';
+    Pager.attach("restoreList", $("restoreTable"), pg.page, pg.pages, pg.total, () => loadRestores(highlightId));
   }
 
   // ------------------------- VDB 测试库管理 -------------------------
   async function loadVdbs() {
     const vdbs = await api("GET", "/api/vdb");
-    $("vdbTable").innerHTML = vdbs.map((v) => {
+    const pgv = Pager.slice("vdbs", vdbs);
+    $("vdbTable").innerHTML = pgv.list.map((v) => {
       const conn = `${v.username || 'root'}@${v.host || '127.0.0.1'}:${v.port || 3306}/${v.database_name || ''}`;
       const expiresIn = v.expires_at ? Math.max(0, Math.floor((new Date(v.expires_at) - new Date()) / 1000 / 3600)) : null;
       const expiresBadge = expiresIn === null ? '-' :
@@ -2337,6 +2344,7 @@
         </td>
       </tr>`;
     }).join("") || '<tr><td colspan="10" class="text-muted text-center">暂无 VDB，请到【备份记录】页克隆</td></tr>';
+    Pager.attach("vdbs", $("vdbTable"), pgv.page, pgv.pages, pgv.total, loadVdbs);
   }
 
   window.dropVdb = async (id) => {
@@ -3303,7 +3311,8 @@
 
   async function loadFileTasks() {
     const tasks = await api("GET", "/api/tasks?db_type=file");
-    $("fileTaskTable").innerHTML = tasks.map((t) => {
+    const pg = Pager.slice("fileTasks", tasks);
+    $("fileTaskTable").innerHTML = pg.list.map((t) => {
       let extra = {};
       try { extra = JSON.parse(t.extra_options || "{}"); } catch (e) { extra = {}; }
       const src = extra.source_type === "remote"
@@ -3330,6 +3339,7 @@
       </tr>`;
     }).join("") ||
       '<tr><td colspan="9" class="text-muted text-center">暂无文件备份任务，点击右上角“新建任务”</td></tr>';
+    Pager.attach("fileTasks", $("fileTaskTable"), pg.page, pg.pages, pg.total, loadFileTasks);
   }
 
   window.runFileTask = async (id) => {
@@ -3452,7 +3462,8 @@
 
   async function loadHosts() {
     FILE_HOSTS = await api("GET", "/api/hosts");
-    $("hostTable").innerHTML = FILE_HOSTS.map((h) => {
+    const pgh = Pager.slice("hosts", FILE_HOSTS);
+    $("hostTable").innerHTML = pgh.list.map((h) => {
       const status = h.last_status || "unknown";
       const dotCls = status === "ok" ? "ok" : (status === "failed" ? "fail" : "unknown");
       const statusText = status === "ok" ? "正常" : (status === "failed" ? "失败" : "未探测");
@@ -3477,6 +3488,7 @@
       </tr>`;
     }).join("") ||
       '<tr><td colspan="7" class="text-muted text-center">暂无纳管主机，点击右上角"纳管主机"</td></tr>';
+    Pager.attach("hosts", $("hostTable"), pgh.page, pgh.pages, pgh.total, loadHosts);
   }
 
   window.testHost = async (id) => {
@@ -3542,7 +3554,8 @@
 
   async function loadSyncTasks() {
     const tasks = await api("GET", "/api/sync/tasks");
-    $("syncTaskTable").innerHTML = tasks.map((t) => {
+    const pg = Pager.slice("syncTasks", tasks);
+    $("syncTaskTable").innerHTML = pg.list.map((t) => {
       const src = t.source_type === "managed"
         ? `托管任务：${esc(t.source_task_name || ("#" + t.source_task_id))}`
         : `${esc(t.src_db_display || t.src_db_type)} : ${esc(t.src_host || "")}`;
@@ -3562,15 +3575,18 @@
       </tr>`;
     }).join("") ||
       '<tr><td colspan="8" class="text-muted text-center">暂无同步任务，点击右上角“新建同步任务”</td></tr>';
+    Pager.attach("syncTasks", $("syncTaskTable"), pg.page, pg.pages, pg.total, loadSyncTasks);
   }
 
   async function loadSyncRecords() {
     const recs = await api("GET", "/api/sync/records");
-    $("syncRecordTable").innerHTML = recs.map((r) =>
+    const pg = Pager.slice("syncRecords", recs);
+    $("syncRecordTable").innerHTML = pg.list.map((r) =>
       `<tr><td>${r.id}</td><td>${esc(r.sync_name || r.sync_task_id)}</td>
        <td>${fmtTime(r.started_at)}</td><td>${fmtTime(r.finished_at)}</td>
        <td>${statusBadge(r.status)}</td><td>${esc(r.message || "")}</td></tr>`).join("") ||
       '<tr><td colspan="6" class="text-muted text-center">暂无同步记录</td></tr>';
+    Pager.attach("syncRecords", $("syncRecordTable"), pg.page, pg.pages, pg.total, loadSyncRecords);
   }
 
   function bindSyncFormEvents() {
@@ -3712,7 +3728,8 @@
     const rs = await api("GET", url);
     // 保存到全局，方便“查看日志”按钮快速读取
     window.RESTORE_RECORD_ROWS = rs;
-    $("restoreRecordsTable").innerHTML = rs.map((r) => {
+    const pg = Pager.slice("restores", rs);
+    $("restoreRecordsTable").innerHTML = pg.list.map((r) => {
       // 收编为统一 fmtBizCell（原为内联拼装，缺 #id 且不走 R2）
       return `<tr><td>${r.id}</td><td>${r.record_id}</td>
        <td>${fmtBizCell(r)}</td>
@@ -3725,6 +3742,7 @@
        <td><button class="btn btn-sm btn-outline-primary" onclick="showRestoreLog(${r.id})">查看</button></td></tr>`;
     }).join("") ||
       '<tr><td colspan="13" class="text-muted text-center">暂无恢复记录</td></tr>';
+    Pager.attach("restores", $("restoreRecordsTable"), pg.page, pg.pages, pg.total, initRestoreRecords);
 
     const sb = $("restoreRecordSearch");
     if (sb && !sb._wired) {
@@ -3758,7 +3776,8 @@
 
   async function loadInspections() {
     const rs = await api("GET", "/api/inspection/records");
-    $("inspectionTable").innerHTML = rs.map((r) => {
+    const pg = Pager.slice("inspections", rs);
+    $("inspectionTable").innerHTML = pg.list.map((r) => {
       const trig = r.triggered_by || "-";
       const trigBadge = trig === "schedule"
         ? '<span class="badge bg-info">定时</span>'
@@ -3769,6 +3788,7 @@
        <td>${trigBadge}</td><td>${fmtTime(r.started_at)}</td></tr>`;
     }).join("") ||
       '<tr><td colspan="7" class="text-muted text-center">暂无巡检记录，点击右上角"立即巡检"</td></tr>';
+    Pager.attach("inspections", $("inspectionTable"), pg.page, pg.pages, pg.total, loadInspections);
   }
 
   window.runInspection = async () => {
@@ -3822,7 +3842,8 @@
 
   async function loadDeployments() {
     const deps = await api("GET", "/api/deploy");
-    $("deployTable").innerHTML = deps.map((d) =>
+    const pg = Pager.slice("deploys", deps);
+    $("deployTable").innerHTML = pg.list.map((d) =>
       `<tr>
         <td>${d.id}</td><td>${esc(d.name)}</td><td>${esc(d.db_type)}</td>
         <td>${esc(d.host_display || (d.host_id ? '#'+d.host_id : d.direct_host) || '-')}</td>
@@ -3838,6 +3859,7 @@
         </td>
       </tr>`).join("") ||
       '<tr><td colspan="10" class="text-muted text-center">暂无部署，点击右上角"新建部署"</td></tr>';
+    Pager.attach("deploys", $("deployTable"), pg.page, pg.pages, pg.total, loadDeployments);
   }
   window.loadDeployments = loadDeployments;
 
@@ -4788,8 +4810,8 @@
         '<tr><td colspan="6" class="text-center text-muted py-4">该时间范围内没有恢复点</td></tr>';
       return;
     }
-    $("rtPointTable").innerHTML = rows.map((p) => {
-      const badge = '<span class="rt-chip">' + rtKindLabel(p.rp_kind) + "</span>";
+    const pgRT = Pager.slice("rtPoints", rows);
+    $("rtPointTable").innerHTML = pgRT.list.map((p) => {      const badge = '<span class="rt-chip">' + rtKindLabel(p.rp_kind) + "</span>";
       const sim = p.is_simulated ? ' <span class="rt-chip warn">仿真</span>' : "";
       const verify = p.verified
         ? '<span class="rt-chip">已校验</span>'
@@ -4804,6 +4826,7 @@
         esc(p.pit_at) + '" type="button">选此点</button></td>' +
         "</tr>";
     }).join("");
+    Pager.attach("rtPoints", $("rtPointTable"), pgRT.page, pgRT.pages, pgRT.total, () => rtLoadTimeline());
     const btns = $("rtPointTable").querySelectorAll("button[data-ts]");
     Array.prototype.forEach.call(btns, (b) => {
       b.addEventListener("click", () => {
@@ -5104,7 +5127,8 @@
   // =======================  (V) =======================
   window.loadDrills = async () => {
     const d = await api("GET", "/api/drills");
-    $("drillTable").innerHTML = d.map(dr => {
+    const pg = Pager.slice("drills", d);
+    $("drillTable").innerHTML = pg.list.map(dr => {
       const scoreBadge = dr.score >= 90 ? '<span class="badge bg-success">' + dr.score + '</span>'
                        : dr.score >= 60 ? '<span class="badge bg-warning text-dark">' + dr.score + '</span>'
                        : dr.score > 0 ? '<span class="badge bg-danger">' + dr.score + '</span>'
@@ -5125,6 +5149,7 @@
           '<button class="btn btn-sm btn-outline-danger" onclick="delDrill(' + dr.id + ')">...</button>' +
         '</td></tr>';
     }).join("") || '<tr><td colspan="10" class="text-muted text-center">...</td></tr>';
+    Pager.attach("drills", $("drillTable"), pg.page, pg.pages, pg.total, window.loadDrills);
   };
 
   window.runDrill = async (id) => {
@@ -6409,7 +6434,8 @@
 
     window.loadMigrations = async function () {
       const rows = await api("GET", "/api/migration");
-      $("migrationTable").innerHTML = (rows || []).map(function (p) {
+      const pg = Pager.slice("migrations", rows);
+      $("migrationTable").innerHTML = pg.list.map(function (p) {
         const verified = p.verified
           ? '<span class="badge badge-ok">已校验</span>'
           : '<span class="badge bg-secondary">未校验</span>';
@@ -6430,6 +6456,7 @@
           '</td>' +
         '</tr>';
       }).join("") || '<tr><td colspan="9" class="text-muted text-center">暂无迁移计划</td></tr>';
+    Pager.attach("migrations", $("migrationTable"), pg.page, pg.pages, pg.total, window.loadMigrations);
     };
 
     window.verifyMigration = async function (id) {
@@ -6563,7 +6590,8 @@
     window.loadDbMigrations = async function () {
       const rows = await api("GET", "/api/db-migrate");
       let running = false;
-      $("dbMigrateTable").innerHTML = (rows || []).map(function (p) {
+      const pg = Pager.slice("dbMigrations", rows);
+      $("dbMigrateTable").innerHTML = pg.list.map(function (p) {
         if (["checking", "migrating", "verifying"].indexOf(p.status) >= 0) running = true;
         const link = '<span class="badge bg-info">' + esc(p.src_db_type) + '</span> ' +
           esc(p.src_host + ':' + (p.src_port || '-') + '/' + p.src_db_name) +
@@ -6590,6 +6618,7 @@
           '<td class="text-end">' + detail + rerun + del + '</td>' +
         '</tr>';
       }).join("") || '<tr><td colspan="8" class="text-muted text-center">暂无迁移计划</td></tr>';
+      Pager.attach("dbMigrations", $("dbMigrateTable"), pg.page, pg.pages, pg.total, window.loadDbMigrations);
       if (running) {
         clearTimeout(loadDbMigrations._timer);
         loadDbMigrations._timer = setTimeout(function () {
@@ -6806,7 +6835,8 @@
     window.loadClones = async function () {
       const rows = await api("GET", "/api/clone");
       let provisioning = false;
-      $("cloneTable").innerHTML = (rows || []).map(function (c) {
+      const pg = Pager.slice("clones", rows);
+      $("cloneTable").innerHTML = pg.list.map(function (c) {
         // VDB 连接信息：就绪时展示可直接使用的连接串
         let vdb = '-';
         if (c.status === 'ready' && c.vdb_dbname) {
@@ -6852,6 +6882,7 @@
           '<td class="text-end">' + (actions.join(' ') || '-') + '</td>' +
         '</tr>';
       }).join("") || '<tr><td colspan="10" class="text-muted text-center">暂无克隆请求</td></tr>';
+      Pager.attach("clones", $("cloneTable"), pg.page, pg.pages, pg.total, window.loadClones);
       // 有克隆正在拉起时每 3 秒自动刷新，直到终态
       if (provisioning) {
         clearTimeout(loadClones._timer);

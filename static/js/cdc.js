@@ -45,7 +45,8 @@
   // ---------------- 流列表 ----------------
   function loadStreams() {
     api('GET', '/cdc/streams').then(function (rows) {
-      $('streamBody').innerHTML = (rows || []).map(function (r) {
+      const pg = Pager.slice('cdcStreams', rows);
+      $('streamBody').innerHTML = pg.list.map(function (r) {
         return '<tr>' +
           '<td><b>' + BKP.esc(r.name) + '</b><div class="text-muted small">#' + r.id + ' · ' + BKP.esc(r.purpose || 'cdp') + '</div></td>' +
           '<td>' + BKP.esc((BKP.META.display_names[r.db_type] || r.db_type)) + '</td>' +
@@ -63,6 +64,7 @@
           '<button class="btn btn-sm btn-outline-danger btn-del" data-id="' + r.id + '"><i class="bi bi-trash"></i></button>' +
           '</td></tr>';
       }).join('') || '<tr><td colspan="9" class="text-center text-muted py-3">暂无捕获流</td></tr>';
+      Pager.attach('cdcStreams', $('streamBody'), pg.page, pg.pages, pg.total, loadStreams);
 
       Array.prototype.forEach.call(document.querySelectorAll('#streamBody .btn-start'), function (b) {
         b.onclick = function () { act(b.dataset.id, 'start'); };
@@ -97,7 +99,8 @@
     var qs = '?limit=100&op=' + encodeURIComponent($('fOp').value) +
       '&table=' + encodeURIComponent($('fTable').value);
     api('GET', '/cdc/streams/' + curStream + '/events' + qs).then(function (r) {
-      $('evtBody').innerHTML = ((r && r.events) || []).map(function (e) {
+      const pg = Pager.slice('cdcEvents', (r && r.events) || []);
+      $('evtBody').innerHTML = pg.list.map(function (e) {
         return '<tr>' +
           '<td class="small text-nowrap">' + BKP.esc(e.event_time || '') + '</td>' +
           '<td>' + opBadge(e.op) + '</td>' +
@@ -107,6 +110,7 @@
           '<td>' + jsonCell(e.after) + '</td>' +
           '<td class="small text-muted">' + BKP.esc(e.position || '') + '</td></tr>';
       }).join('') || '<tr><td colspan="7" class="text-center text-muted py-3">暂无事件（确认流已启动且在源库执行了写操作）</td></tr>';
+      Pager.attach('cdcEvents', $('evtBody'), pg.page, pg.pages, pg.total, loadEvents);
     }).catch(function (e) { BKP.toast('事件加载失败: ' + e.message, 'danger'); });
   }
 

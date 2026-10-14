@@ -14,7 +14,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 预校验 · 克隆 · 演练 · 巡检 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v1.4.16-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v1.4.17-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -330,8 +330,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v1.4.16   # 固定版本（可回滚）
-# 当前最新版本：v1.4.16（2026-09-24）
+docker pull ghcr.io/zhh9126/backup-platform:v1.4.17   # 固定版本（可回滚）
+# 当前最新版本：v1.4.17（2026-10-14）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -355,9 +355,9 @@ python tools/check_env.py
 
 ```bash
 # 有网机器导出
-docker save ghcr.io/zhh9126/backup-platform:v1.4.16 -o aidbm-v1.4.16.tar
+docker save ghcr.io/zhh9126/backup-platform:v1.4.17 -o aidbm-v1.4.17.tar
 # 内网机器导入
-docker load -i aidbm-v1.4.16.tar
+docker load -i aidbm-v1.4.17.tar
 ```
 
 ### 运行
@@ -379,14 +379,14 @@ docker run -d --name backup-platform \
 
 ```bash
 # 1. 导入新版本镜像（离线环境在有网机器 docker save 后拷入）
-docker load -i aidbm-v1.4.16.tar
+docker load -i aidbm-v1.4.17.tar
 
 # 2. 停止并删除旧容器（备份数据在 backup-data 卷中，不受影响）
 docker stop backup-platform
 docker rm backup-platform
 
 # 3. 用新版本镜像启动（命令与首次部署完全一致，仅换镜像 tag）
-docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v1.4.16
+docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v1.4.17
 
 # 4.（可选）删除旧版本镜像释放空间
 docker rmi ghcr.io/zhh9126/backup-platform:v1.4.15
@@ -404,7 +404,7 @@ docker stop backup-platform
 docker rm backup-platform
 
 # 2. 删除镜像
-docker rmi ghcr.io/zhh9126/backup-platform:v1.4.16
+docker rmi ghcr.io/zhh9126/backup-platform:v1.4.17
 
 # 3.（谨慎）删除数据卷 —— 会清掉全部备份产物与元数据，操作前务必
 #    先把备份文件拷贝转移！
@@ -528,6 +528,17 @@ docker build -t backup-platform:local .
 - 默认账号请立即修改（首登会标记 `must_change_password`）；生产环境建议限制来源 IP
 
 ## 更新日志
+
+### v1.4.17（2026-10-14）
+
+- **标准化分页体系**：全站 25+ 列表统一分页组件（任务/记录/日志/迁移/同步/克隆/巡检/对象存储/虚拟机/恢复校验等，每页 10 条），需要关注 3 条/页；分页条防遮挡。
+- **备份/恢复预检测（Precheck）**：任务级备份预检（配置/SSH 通道/源库连通/工具/空间）与记录级恢复预检（产物/完整性/结构/目标端/恢复工具/空间），逐项通过/警告/阻断；诚实边界=探测非演练。
+- **恢复点安全检测**：体积突变 / 熵值（勒索二次加密启发式）/ 结构嗅探；suspect 仅提示+审计不拦截。
+- **数据库 OS 用户标准变量**：任务 > 纳管主机 > 库型默认 三级覆盖链（oracle/dmdba/omm/kingbase/postgres…），Oracle/达梦/openGauss/金仓 等工具链用户不再写死。
+- **首页信息架构重构**：24h 备份成功率卡片、全量数据下钻（状态分布/类型分布/对象全景）、趋势图数值标签、需要关注分页；裁剪低频指标排。
+- **记录页增强**：恢复数据量列（GB）、成功/失败筛选、全选与已选计数；迁移/同步列表时间列。
+- **兼容性修复**：sync 达梦插件 dmPython 连接参数（database=/loginTimeout= 不支持）；precheck 增量列类型判定阻断所有增量同步；达梦 dimp 恢复 TABLE_EXISTS_ACTION=REPLACE 语义；Oracle impdp rc=5（completed with errors）误判；本机/远端工具解析兜底（宽目录+进程定位）；远端空产物守卫。
+- **深度实测背书**：MySQL/PG/达梦/金仓/Oracle 五库型在线备份+恢复 E2E 全通（含真机硬核对）；迁移/同步/自定义脚本/容器镜像内全矩阵。
 
 ### 未发布（main 已合入，待打 tag 发版）
 

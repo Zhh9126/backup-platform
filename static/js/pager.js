@@ -54,6 +54,10 @@
       bar = document.createElement("div");
       bar.id = "pager-" + key;
       bar.className = "d-flex align-items-center justify-content-between flex-wrap gap-2 px-3 py-2 border-top";
+      // 防遮挡：分页条相对定位置顶背景，避免被后续兄弟元素盖住下半（首页关注卡实测）
+      bar.style.position = "relative";
+      bar.style.zIndex = "1";
+      bar.style.background = "var(--card-bg, #fff)";
       // 插到表格宿主的末尾（表格与分页条同属一个卡片容器）
       container.appendChild(bar);
     }
@@ -62,7 +66,7 @@
       st.page = p;
       if (typeof onChange === "function") onChange();
     };
-    let html = `<span class="text-muted small">共 ${total} 条 · 第 ${page}/${pages} 页 · 每页 10 条</span>`;
+    let html = `<span class="text-muted small">共 ${total} 条 · 第 ${page}/${pages} 页 · 每页 ${pageSize} 条</span>`;
     if (pages > 1) {
       html += `<div class="btn-group btn-group-sm" role="group">`;
       html += `<button class="btn btn-outline-secondary" ${page <= 1 ? "disabled" : ""} data-p="${page - 1}">‹ 上一页</button>`;

@@ -110,14 +110,37 @@ i.bi { line-height: 1; }
   align-items: center;
   gap: var(--space-sm);
   color: var(--text-on-dark);
-  font-weight: var(--weight-semibold);
-  font-size: var(--font-size-md);
-  padding: var(--space-sm) var(--space-sm) var(--space-lg);
+  padding: var(--space-md) var(--space-sm) var(--space-lg);
   white-space: nowrap;
+  border-bottom: 1px solid rgba(255, 255, 255, .06);
+  margin-bottom: var(--space-xs);
 }
-.brand .brand-logo { font-size: 20px; color: var(--primary-light); flex: 0 0 auto; }
-.brand .brand-text { transition: opacity .15s ease; }
+/* 品牌徽标：圆角渐变底 + 主色描边，层次感优于裸图标 */
+.brand .brand-logo {
+  flex: 0 0 auto;
+  width: 36px; height: 36px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 19px; color: #fff;
+  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-light) 100%);
+  border-radius: 10px;
+  box-shadow: 0 2px 8px rgba(13, 148, 136, .35);
+}
+.brand .brand-text {
+  display: flex; flex-direction: column; line-height: 1.25;
+  transition: opacity .15s ease; min-width: 0;
+}
+.brand .brand-name {
+  font-weight: var(--weight-bold);
+  font-size: 15px;
+  letter-spacing: .04em;
+}
+.brand .brand-sub {
+  font-size: 11px;
+  color: var(--sidebar-text-muted);
+  letter-spacing: .02em;
+}
 .layout.sidebar-collapsed .brand .brand-text { opacity: 0; width: 0; overflow: hidden; }
+.layout.sidebar-collapsed .brand .brand-logo { width: 32px; height: 32px; font-size: 17px; }
 
 /* 折叠按钮 */
 .sidebar-toggle {

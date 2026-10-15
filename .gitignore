@@ -49,3 +49,12 @@ core/plugins/state/
 .coverage
 artifacts/
 packages/
+
+# ---- AI 智能助手（可选收费功能，不上传开源仓库；镜像/离线包包含） ----
+api/ai_agent.py
+core/ai_agent/
+docs/ai-agent-design.md
+docs/ai-agent-prd.md
+tests/test_ai_agent.py
+templates/agent.html
+static/js/ai-agent.js

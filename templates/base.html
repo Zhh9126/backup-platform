@@ -58,7 +58,9 @@
         <div class="nav-group-label">运维</div>
         <a class="nav-link {% if page=='operations' %}active{% endif %}" href="/operations" title="运维运营分析（超长 / 超频备份统计与阈值配置）" data-perm="operations.view"><i class="bi bi-graph-up-arrow"></i> <span class="nav-label">运维运营分析</span></a>
         <a class="nav-link {% if page=='inspection' %}active{% endif %}" href="/inspection" title="巡检" data-perm="inspection.manage"><i class="bi bi-shield-check"></i> <span class="nav-label">巡检</span></a>
-        <a class="nav-link {% if page=='agent' %}active{% endif %}" href="/agent" title="AI 智能助手" data-perm="agent.use"><i class="bi bi-robot"></i> <span class="nav-label">AI 智能助手</span></a>
+        {% if has_ai_agent %}
+                <a class="nav-link {% if page=='agent' %}active{% endif %}" href="/agent" title="AI 智能助手" data-perm="agent.use"><i class="bi bi-robot"></i> <span class="nav-label">AI 智能助手</span></a>
+        {% endif %}
         <a class="nav-link {% if page=='alert' %}active{% endif %}" href="/alert" title="智能告警" data-perm="alert.manage"><i class="bi bi-bell"></i> <span class="nav-label">智能告警</span></a>
         <a class="nav-link {% if page=='datamining' %}active{% endif %}" href="/datamining" title="数据价值挖掘" data-perm="alert.manage"><i class="bi bi-database-check"></i> <span class="nav-label">数据价值挖掘</span></a>
         <a class="nav-link {% if page=='logs' %}active{% endif %}" href="/logs" title="系统日志" data-perm="logs.view"><i class="bi bi-journal-text"></i> <span class="nav-label">系统日志</span></a>
@@ -103,6 +105,7 @@
   <script src="/static/js/pager.js?v=2026101403"></script>
   <script src="/static/js/precheck.js?v=2026101402"></script>
   <script src="/static/js/app.js?v=2026101501"></script>
+  {% if has_ai_agent %}<script src="/static/js/ai-agent.js?v=2026101501"></script>{% endif %}
   <script>
     // 按权限隐藏菜单（每个 <a class="nav-link" data-perm="..."> 命中则可见）
     document.addEventListener("DOMContentLoaded", function () {

@@ -91,16 +91,24 @@ def create_app() -> Flask:
     # BKP.fillDbTypeSelect）拿到空数组，导致「数据同步」的类型下拉常年为空、
     # 「数据迁移」只能硬编码两个类型。渲染期注入后首屏即可用，且与接口同源
     # （都走 api.system.build_meta，不会两处漂移）。
+    def _has_ai_agent():
+        """AI 智能助手为可选交付：模块/页面文件任一缺失即视为未交付。"""
+        import os as _os
+        return (_os.path.exists(_os.path.join(app.root_path, "api", "ai_agent.py"))
+                and _os.path.exists(_os.path.join(app.root_path, "templates", "agent.html")))
+
     @app.context_processor
     def _inject_bkp_meta():
         try:
             from api.system import build_meta
             return {"bkp_meta": build_meta(),
-                    "platform_version": config.PLATFORM_VERSION}
+                    "platform_version": config.PLATFORM_VERSION,
+                    "has_ai_agent": _has_ai_agent()}
         except Exception as e:  # noqa: BLE001 - 注入失败不能影响页面渲染
             print(f"[startup] bkp_meta 注入失败（前端将回退到 /api/meta）: {e}")
             return {"bkp_meta": {},
-                    "platform_version": config.PLATFORM_VERSION}
+                    "platform_version": config.PLATFORM_VERSION,
+                    "has_ai_agent": _has_ai_agent()}
 
     app.config["BACKUP_ROOT"] = str(config.get_backup_root())
     _root_info = config.backup_root_info()
@@ -348,6 +356,10 @@ def create_app() -> Flask:
     @app.route("/agent")
     @login_required
     def agent_page():
+        import os as _os
+        if not _os.path.exists(_os.path.join(app.root_path, "templates", "agent.html")):
+            from flask import abort
+            abort(404)
         return render_template("agent.html", page="agent")
 
     @app.route("/agentless")

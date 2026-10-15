@@ -135,6 +135,10 @@ def _get_ssh_client_from_dep(dep: dict):
     if not direct_host:
         raise RuntimeError("目标主机未配置：请选择已纳管主机或直接输入 IP/账号/密码")
     import paramiko
+    # 本机目标（127.0.0.1/localhost/本机 IP）无需 SSH——部署脚本在本机
+    # 直接执行（dnsmasq 等 DNS 部署典型场景：DNS 就在平台机上）。
+    if _is_local_target(direct_host):
+        return None, None
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     port = int(dep.get("direct_port") or cfg.get("direct_port") or 22)
@@ -1160,6 +1164,78 @@ else
 fi
 
 """
+    elif db_type == "dnsmasq":
+        # DNS 服务器部署（容灾切换的流量牵引底座，对标政务云方案 §4.1.4
+        # 「部署 DNS 服务器」：主备中心各一台，业务通过域名访问实现 IP 解耦）
+        dns_domain = params.get("dns_domain", "")
+        dns_records = params.get("dns_records") or []
+        install_mode = params.get("dns_install_mode", "auto")  # auto|yum|docker
+        record_lines = "\n".join(
+            "address=/%s/%s" % (r.get("domain", dns_domain), r.get("ip", ""))
+            for r in dns_records if r.get("domain"))
+        return f"""#!/bin/bash
+# dnsmasq DNS 服务器部署（容灾切换流量牵引）
+set +e
+echo "[deploy] ====== dnsmasq DNS 部署开始 ======"
+DNS_CONF={base}/dnsmasq.conf
+mkdir -p {base}
+
+# 安装方式自动选择：优先 yum（CentOS base 源自带 dnsmasq），无源则 docker
+if [ "{install_mode}" = "docker" ] || ! command -v dnsmasq >/dev/null 2>&1 && ! yum install -y dnsmasq >/dev/null 2>&1; then
+    if command -v docker >/dev/null 2>&1; then
+        echo "[deploy] yum 不可用，改用 docker 方式"
+        docker rm -f dnsmasq-dr >/dev/null 2>&1
+        mkdir -p {base}
+        cat > $DNS_CONF << 'DNSEOF'
+# A 记录（容灾切换：域名 → IP）
+{record_lines}
+DNSEOF
+        docker run -d --name dnsmasq-dr --restart unless-stopped \
+            -p 53:53/udp -p 53:53/tcp \
+            -v $DNS_CONF:/etc/dnsmasq.conf jpillora/dnsmasq >/dev/null
+        sleep 2
+        if docker ps --format '{{{{.Names}}}}' | grep -q dnsmasq-dr; then
+            echo "[deploy] dnsmasq 容器已启动（53 端口）"
+        else
+            echo "[deploy] ERROR: dnsmasq 容器启动失败"
+            exit 1
+        fi
+        echo "[deploy] DNS 记录:"
+        cat $DNS_CONF
+        echo "[deploy] 提示：客户端 /etc/resolv.conf 首行添加 nameserver $(hostname -I | awk '{{print $1}}')"
+        echo "DEPLOY_OK"
+        exit 0
+    fi
+    echo "[deploy] ERROR: yum 与 docker 均不可用，无法安装 dnsmasq"
+    exit 1
+fi
+
+# yum 方式（systemd 管理）
+mkdir -p {base}
+cat > $DNS_CONF << 'DNSEOF'
+# A 记录（容灾切换：域名 → IP）
+{record_lines}
+DNSEOF
+cat > /etc/dnsmasq.d/dr.conf << 'DNSEOF2'
+{record_lines}
+DNSEOF2
+systemctl enable dnsmasq >/dev/null 2>&1
+systemctl restart dnsmasq
+sleep 1
+if systemctl is-active dnsmasq >/dev/null 2>&1; then
+    echo "[deploy] dnsmasq 服务已启动（53 端口，systemd 管理）"
+else
+    echo "[deploy] ERROR: dnsmasq 服务启动失败"
+    journalctl -u dnsmasq -n 10
+    exit 1
+fi
+ss -uln | grep -q ":53 " && echo "[deploy] 53 端口监听正常"
+echo "[deploy] DNS 记录:"
+cat /etc/dnsmasq.d/dr.conf 2>/dev/null || cat $DNS_CONF
+echo "[deploy] 提示：客户端 /etc/resolv.conf 首行添加 nameserver $(hostname -I | awk '{{print $1}}')"
+echo "DEPLOY_OK"
+
+"""
     else:
         raise RuntimeError(f"不支持的数据库类型: {db_type}")
 
@@ -1187,12 +1263,24 @@ def run_deployment(dep_id: int) -> None:
     try:
         log(f"连接部署目标...")
         client, h = _get_ssh_client_from_dep(dep)
-        log(f"已连接: {h.get('hostname') or h.get('host')}")
+        is_local = client is None
+        if is_local:
+            log("目标为平台本机，部署脚本将本地直接执行（无 SSH）")
+        else:
+            log(f"已连接: {h.get('hostname') or h.get('host')}")
 
-        # 上传安装包（如果提供了本地路径）
+        # 上传安装包（如果提供了本地路径）——仅远程目标需要（本机包路径直接使用）
         pkg_path = (dep.get("package_path") or "").strip()
         log(f"部署包路径: {pkg_path}")
-        if pkg_path:
+        # 本机部署：安装包/依赖包已在目标机（=平台机），直接用平台侧路径，
+        # 跳过全部 SFTP 上传；远程部署才走上传流程
+        if is_local:
+            pkg_path = (dep.get("package_path") or "").strip()
+            if pkg_path and not os.path.isfile(pkg_path):
+                raise RuntimeError(f"安装包在平台机上不存在: {pkg_path}")
+            dep_pkg_remote = (dep.get("dependency_path") or "NONE")
+            log(f"本机部署：安装包 {pkg_path} 直接使用，无需上传")
+        elif pkg_path:
             if os.path.isfile(pkg_path):
                 remote_pkg = "/tmp/" + os.path.basename(pkg_path)
                 # 本机部署防自毁：仅当目标主机确为平台本机且 remote_pkg 与
@@ -1260,6 +1348,37 @@ def run_deployment(dep_id: int) -> None:
         params["password"] = dep.get("password") or params.get("password", "")
 
         script = _build_install_script(dep.get("db_type"), params)
+        # ---- 本机部署分支：目标为平台机自身时无需 SSH，脚本直接本机执行 ----
+        if client is None and h is None:
+            import subprocess as _sp
+            log("目标为平台本机，直接本地执行部署脚本（无 SSH）")
+            local_script = "/tmp/aidbm_deploy_%d.sh" % dep_id
+            with open(local_script, "w", encoding="utf-8") as f:
+                f.write(script)
+            os.chmod(local_script, 0o755)
+            models.update_deployment(dep_id, {"progress_pct": 50})
+            proc = _sp.Popen(["bash", local_script], stdout=_sp.PIPE,
+                             stderr=_sp.STDOUT, text=True)
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if line.strip():
+                    log(line.strip())
+                    if line.strip() == "DEPLOY_OK":
+                        pass
+            rc = proc.wait()
+            os.unlink(local_script)
+            finished = db.now_iso()
+            if rc == 0:
+                models.update_deployment(dep_id, {
+                    "status": "success", "progress_pct": 100,
+                    "finished_at": finished})
+                log("部署完成（本机执行）")
+            else:
+                models.update_deployment(dep_id, {
+                    "status": "failed", "progress_pct": 100,
+                    "finished_at": finished})
+                log("部署失败（本机执行，rc=%d）" % rc)
+            return
         remote_script = "/tmp/deploy_install.sh"
         log("上传安装脚本...")
         # 通过 echo 写入脚本到远程（多行处理）

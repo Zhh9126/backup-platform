@@ -58,6 +58,31 @@
   <p class="text-muted mb-0">双运营商专线智能选路 · 日志间隙自动填补 · 备端只读一致性校验</p>
 </div>
 
+<!-- DNS 记录管理（容灾切换的流量牵引底座） -->
+<div class="page-card mb-3">
+  <div class="d-flex justify-content-between align-items-center mb-2 flex-wrap gap-2">
+    <h6 class="mb-0"><i class="bi bi-globe2 me-1"></i>DNS 记录管理
+      <span class="text-muted small ms-2" id="dnsConfPath"></span></h6>
+    <div class="d-flex gap-2 align-items-center">
+      <button class="btn btn-sm btn-primary" onclick="dnsShowAdd()"><i class="bi bi-plus-lg me-1"></i>新增记录</button>
+      <button class="btn btn-sm btn-outline-secondary" onclick="dnsLoad()"><i class="bi bi-arrow-clockwise me-1"></i>刷新</button>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead><tr>
+        <th>域名</th><th>指向 IP</th><th>实时解析</th><th>状态</th><th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="dnsRecordsTb"><tr><td colspan="5" class="text-center text-muted py-3">加载中…</td></tr></tbody>
+    </table>
+  </div>
+  <div class="small text-muted mt-2">
+    <i class="bi bi-info-circle me-1"></i>
+    容灾切换时平台自动改写此处 A 记录完成流量牵引（对标政务云方案 §4.1.4：业务走域名访问，IP 解耦）。
+    客户端 /etc/resolv.conf 需指向本 DNS 服务器。支持 dnsmasq（容器 / systemd）。
+  </div>
+</div>
+
 <!-- 操作栏 -->
 <div class="page-card mb-3">
   <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">

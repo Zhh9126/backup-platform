@@ -7363,6 +7363,59 @@
     await loadLinks();
   };
 
+  // ---------------- DNS 记录管理（容灾流量牵引底座） ----------------
+  window.dnsLoad = async function () {
+    const tb = $("dnsRecordsTb");
+    if (!tb) return;
+    try {
+      const res = await api("GET", "/api/dr-dns/records");
+      if (!res.ok) throw new Error(res.error || "加载失败");
+      $("dnsConfPath").textContent = "配置: " + (res.conf_path || "-");
+      if (!res.records.length) {
+        tb.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-3">暂无 A 记录，点击「新增记录」添加容灾域名</td></tr>';
+        return;
+      }
+      tb.innerHTML = res.records.map(function (r) {
+        const st = r.in_sync === true
+          ? '<span class="badge bg-success">解析一致</span>'
+          : r.in_sync === false
+            ? '<span class="badge bg-danger">解析不一致</span>'
+            : '<span class="badge bg-secondary">无法解析</span>';
+        return '<tr><td><code>' + esc(r.domain) + '</code></td>' +
+          '<td><code>' + esc(r.ip) + '</code></td>' +
+          '<td><code class="small">' + esc(r.resolved_ip || "-") + '</code></td>' +
+          '<td>' + st + '</td>' +
+          '<td class="text-end"><button class="btn btn-sm btn-outline-danger" onclick="dnsDel(\'' + esc(r.domain) + '\')">删除</button></td></tr>';
+      }).join("");
+    } catch (e) {
+      tb.innerHTML = '<tr><td colspan="5" class="text-center text-danger py-3">加载失败: ' + esc(e.message) + '</td></tr>';
+    }
+  };
+  window.dnsShowAdd = function () {
+    const domain = window.prompt("新增/更新 A 记录\n域名（如 dr-mysql.test）：", "dr-mysql.test");
+    if (!domain) return;
+    const ip = window.prompt("指向 IP（容灾切换时由平台自动改写此记录）：", "192.168.220.140");
+    if (!ip) return;
+    window.dnsSave(domain.trim(), ip.trim());
+  };
+  window.dnsSave = async function (domain, ip) {
+    try {
+      const res = await api("POST", "/api/dr-dns/records", { domain: domain, ip: ip });
+      if (!res.ok) throw new Error(res.error || "保存失败");
+      toast("已保存 ✓ 解析验证: " + (res.resolved || "-") + (res.verified ? "（一致）" : "（不一致，请检查）"),
+            res.verified ? "success" : "warning");
+      await window.dnsLoad();
+    } catch (e) { toast("保存失败: " + e.message, "danger"); }
+  };
+  window.dnsDel = async function (domain) {
+    if (!window.confirm("确认删除记录 " + domain + "？（该域名将不再解析）")) return;
+    try {
+      await api("DELETE", "/api/dr-dns/records/" + encodeURIComponent(domain));
+      toast("已删除", "success");
+      await window.dnsLoad();
+    } catch (e) { toast("删除失败: " + e.message, "danger"); }
+  };
+
   async function loadLinks() {
     // 数据源缓存供卡片展示源名 / 状态 / 差异检测使用；失败不阻塞链路列表渲染
     try { await loadLinkSources(); } catch (e) { LINK_SOURCES = []; }
@@ -7428,6 +7481,7 @@
   }
 
   async function initDrLink() {
+    await window.dnsLoad();
     const el = document.getElementById("linkModal");
     if (el) linkModalInst = new bootstrap.Modal(el);
 

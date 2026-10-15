@@ -75,7 +75,7 @@ def safe_download_path(path: str):
 
 from . import (tasks, records, restore, system, hosts, sync, inspection, deploy,
                 restore_extras_api, drills, storage, policy, lifecycle, migration,
-                clone, itsm, link, ai_alert, datamining, rt, plugins,
+                clone, itsm, link, dr_dns, ai_alert, datamining, rt, plugins,
                 restore_verify, synthesize, dedup, jdbc, data_compare,
                 tape, logs, db_adapters, rbac, cdc, vm, openapi,
                 agentless, object_storage, backup_cleanup, meta_db)  # noqa: E402,F401

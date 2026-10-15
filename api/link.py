@@ -352,3 +352,36 @@ def api_check_consistency(link_id):
     if not result.get("ok") and result.get("simulated") is not True:
         return jsonify(result), 400
     return jsonify(result)
+
+# ------------------------- 容灾切换引擎（failover / failback） -------------------------
+
+@api_bp.route("/disaster-links/<int:link_id>/failover", methods=["POST"])
+@login_required
+def api_link_failover(link_id):
+    """一键容灾切换：主库故障探测 → 备库提升 → DNS 切换 → 新主验证（RTO 计时）。
+
+    请求体（可选）：{"force": true} 主库仍可达时强制切换（防误操作默认拒绝）。
+    """
+    from core import dr_failover
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        res = dr_failover.run_failover(link_id, force=bool(data.get("force")))
+    except dr_failover.FailoverError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": "切换失败: %s" % e}), 500
+    return jsonify({"ok": True, "result": res})
+
+
+@api_bp.route("/disaster-links/<int:link_id>/failback", methods=["POST"])
+@login_required
+def api_link_failback(link_id):
+    """一键回切：旧主追平增量 → 提升 → 现主降级为从 → DNS 切回（RTO 计时）。"""
+    from core import dr_failover
+    try:
+        res = dr_failover.run_failback(link_id)
+    except dr_failover.FailoverError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": "回切失败: %s" % e}), 500
+    return jsonify({"ok": True, "result": res})

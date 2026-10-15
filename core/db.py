@@ -1299,6 +1299,12 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                     conn.execute(f"ALTER TABLE ssh_hosts ADD COLUMN {col} {typedef}")
                 except Exception:
                     pass
+            # 迁移：容灾链路切换配置与切换历史（failover/failback 引擎）
+            for col, typedef in [("failover_config", "TEXT"), ("failover_history", "TEXT")]:
+                try:
+                    conn.execute(f"ALTER TABLE disaster_links ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass
             # 迁移：恢复记录详细日志列
             try:
                 conn.execute("ALTER TABLE restore_records ADD COLUMN detail_log TEXT")

@@ -7331,6 +7331,38 @@
     }
   };
 
+  // 一键容灾切换 / 回切（核心切换引擎 core/dr_failover.py）
+  window.runFailover = async function (id) {
+    if (!window.confirm("确认执行容灾切换？\n流程：主库故障探测 → 备库提升为主 → DNS 切换 → 新主验证。\n主库仍可达时将被拒绝（防误操作，需强制请在确认后再次点击并允许 force）。")) return;
+    toast("容灾切换执行中…", "warning");
+    try {
+      const res = await api("POST", "/api/disaster-links/" + id + "/failover", {});
+      const r = res.result || {};
+      toast("切换成功 ✓ RTO " + r.rto_sec + "s，已切换到 " + (r.to || "-") + "（" + (r.steps || []).length + " 步）", "success");
+    } catch (e) {
+      if (e.message && e.message.indexOf("仍可达") >= 0) {
+        if (window.confirm("主库仍可达！确认要强制切换吗？（可能造成双主/数据分歧）")) {
+          try {
+            const res = await api("POST", "/api/disaster-links/" + id + "/failover", { force: true });
+            toast("强制切换成功 ✓ RTO " + (res.result || {}).rto_sec + "s", "success");
+          } catch (e2) { toast("强制切换失败: " + e2.message, "danger"); }
+        }
+        return;
+      }
+      toast("切换失败: " + e.message, "danger");
+    }
+    await loadLinks();
+  };
+  window.runFailback = async function (id) {
+    if (!window.confirm("确认执行回切？\n流程：旧主追平增量 → 提升为主 → 现主转从 → DNS 切回。")) return;
+    toast("回切执行中…", "warning");
+    try {
+      const res = await api("POST", "/api/disaster-links/" + id + "/failback", {});
+      toast("回切成功 ✓ RTO " + (res.result || {}).rto_sec + "s，已切回 " + (res.result || {}).to, "success");
+    } catch (e) { toast("回切失败: " + e.message, "danger"); }
+    await loadLinks();
+  };
+
   async function loadLinks() {
     // 数据源缓存供卡片展示源名 / 状态 / 差异检测使用；失败不阻塞链路列表渲染
     try { await loadLinkSources(); } catch (e) { LINK_SOURCES = []; }
@@ -7378,6 +7410,8 @@
               '</table>' +
             '</div>' +
             '<div class="link-actions">' +
+              '<button class="btn btn-sm btn-outline-warning" onclick="runFailover(' + l.id + ')" title="一键容灾切换：主库故障探测→备库提升→DNS切换→新主验证（RTO 计时）"><i class="bi bi-arrow-left-right me-1"></i>切换</button>' +
+              '<button class="btn btn-sm btn-outline-success" onclick="runFailback(' + l.id + ')" title="一键回切：旧主追平→提升→现主转从→DNS 切回"><i class="bi bi-arrow-counterclockwise me-1"></i>回切</button>' +
               '<button class="btn btn-sm btn-outline-primary" onclick="selectRoute(' + l.id + ')"><i class="bi bi-signpost-split me-1"></i>选路</button>' +
               '<button class="btn btn-sm btn-outline-info" onclick="fillGap(' + l.id + ')"><i class="bi bi-arrow-down-up me-1"></i>填补</button>' +
               '<button class="btn btn-sm btn-outline-secondary" onclick="checkConsistency(' + l.id + ')"><i class="bi bi-shield-check me-1"></i>校验</button>' +

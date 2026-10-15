@@ -239,13 +239,16 @@ def _checksum_sql(db_type: str, ref: str, cols: list):
         sql = ("SELECT COUNT(*), COALESCE(SUM(ORA_HASH({e})), 0) "
                "FROM {r}").format(e=expr, r=ref)
     elif db_type == "dameng":
-        # 达梦兼容 Oracle 语法（ORA_HASH 可用）
+        # 达梦：MD5 前 8 位转数值求和——修复：ORA_HASH 在达梦
+        # （COMPATIBLE_MODE 非 Oracle 实例，137 实测 CODE:-2207
+        # Member access [ORA_HASH] unresolved）不可用，曾导致
+        # 达梦表 checksum 对比直接 failed。
         def nvl_dm(col: str) -> str:
             return "NVL(TO_CHAR(\"{}\"), '{}')".format(
                 col.replace('"', '""'), _NULL_MARK)
         expr = " || '#' || ".join(nvl_dm(c) for c in cols)
-        sql = ("SELECT COUNT(*), COALESCE(SUM(ORA_HASH({e})), 0) "
-               "FROM {r}").format(e=expr, r=ref)
+        sql = ("SELECT COUNT(*), COALESCE(SUM(CAST(SUBSTR(MD5({e}), 1, 8) "
+               "AS BIGINT)), 0) FROM {r}").format(e=expr, r=ref)
     elif db_type in ("sqlserver", "mssql"):
         # SQL Server：CHECKSUM_AGG(BINARY_CHECKSUM(*)) 原生聚合
         sql = ("SELECT COUNT(*), COALESCE(CHECKSUM_AGG(BINARY_CHECKSUM(*)), 0) "
@@ -276,9 +279,23 @@ def _norm_val(v) -> str:
     if isinstance(v, bytes):
         return "0x" + v[:32].hex() + ("…" if len(v) > 32 else "")
     if hasattr(v, "isoformat"):           # datetime.date / datetime / time
-        return v.isoformat(sep="T") if hasattr(v, "hour") else v.isoformat()
+        # datetime 统一为 "YYYY-MM-DD HH:MM:SS[.ffffff]"（空格分隔）——
+        # 修复：此前 isoformat(sep="T")，与部分驱动/表结构返回的字符串
+        # 形式（空格分隔）不一致，异构对比（MySQL↔金仓/达梦）时间列
+        # 全部误报差异（实测 sample_diffs 源 'T' 目标 ' '）。
+        if hasattr(v, "hour"):
+            s = v.strftime("%Y-%m-%d %H:%M:%S")
+            if getattr(v, "microsecond", 0):
+                s += ".%06d" % v.microsecond
+            return s
+        return v.isoformat()
     if isinstance(v, float):
         return repr(round(v, 6))
+    if isinstance(v, str):
+        # 字符串形式的时间戳统一 T→空格（两侧驱动行为不一致时防误报）
+        if len(v) == 19 and v[10] == "T" and v[4] == "-" and v[13] == ":":
+            return v[:10] + " " + v[11:]
+        return v
     return str(v)
 
 
@@ -543,8 +560,10 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
             return out
         out["mode"] = "checksum_sample"
 
-        # 校验和（可选）
-        if enable_checksum:
+        # 校验和（可选）——仅同库型比较：各库型哈希算法不同
+        # （CRC32/hashtext/ORA_HASH/MD5），异构直接比数值必然不等，
+        # 异构一致性由行数 + 抽样/主键归并判定。
+        if enable_checksum and src_type == dst_type:
             cols_s = _get_columns(src, src_type, src_db, src_schema, table)
             if not cols_s:
                 out["message"] = "源表无列可校验"

@@ -471,6 +471,9 @@ CREATE TABLE IF NOT EXISTS data_compare_tasks (
     tables          TEXT DEFAULT '[]',                    -- JSON 数组；空 = 两端交集
     enable_checksum INTEGER DEFAULT 0,                    -- 全表校验和（大表慎用）
     sample_rows     INTEGER DEFAULT 100,                  -- 抽样行数
+    force_pk_compare INTEGER DEFAULT 0,               -- 1=强制 PK 逐行比对数
+    chunk_rows      INTEGER DEFAULT 500,                  -- PK 分块行数数
+    chunk_threshold INTEGER DEFAULT 5000,                 -- 超过该行数走分块数
     schedule_type   TEXT DEFAULT 'manual',                -- none | cron | interval | manual
     cron_expr       TEXT,
     interval_minutes INTEGER,
@@ -1344,6 +1347,14 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                 conn.execute("ALTER TABLE backup_records ADD COLUMN storage_tier TEXT DEFAULT 'local'")
             except Exception:
                 pass
+            # 迁移：data_compare_tasks 分块/强制 PK 列（models 字段同步）
+            for col, typedef in [("force_pk_compare", "INTEGER DEFAULT 0"),
+                                 ("chunk_rows", "INTEGER DEFAULT 500"),
+                                 ("chunk_threshold", "INTEGER DEFAULT 5000")]:
+                try:
+                    conn.execute(f"ALTER TABLE data_compare_tasks ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass
             # 迁移：不可变备份/保留锁定（G13：保留锁定+产物写保护+完整性复检）
             for col, typedef in [
                 ("locked", "INTEGER DEFAULT 0"),
@@ -1691,6 +1702,9 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                     tables          TEXT DEFAULT '[]',
                     enable_checksum INTEGER DEFAULT 0,
                     sample_rows     INTEGER DEFAULT 100,
+                    force_pk_compare INTEGER DEFAULT 0,
+                    chunk_rows      INTEGER DEFAULT 500,
+                    chunk_threshold INTEGER DEFAULT 5000,
                     schedule_type   TEXT DEFAULT 'manual',
                     cron_expr       TEXT,
                     interval_minutes INTEGER,

@@ -40,10 +40,7 @@ __pycache__/
 # 交付产物镜像 tar（1.4G+，绝不入构建上下文）
 packages/
 
-# AI 助手：收费功能，约定不进 git 与打包产物（2026-09-19 用户决定）
-core/ai_agent/
-static/js/agent-render.js
-static/css/agent-render.css
-static/css/agent.css
-templates/agent.html
-api/ai_agent.py
+# AI 智能助手（2026-10-15 用户决定）：开源 GitHub 仓库不含（.gitignore 剥离），
+# 但【镜像/离线交付包含】——此处不再排除 ai_agent/agent 文件。
+# 注意：static/css/agent.css 与 agent-render.js 仍排除（页面遗留样式，助手
+# 前端已并入 static/js/ai-agent.js 可选模块）。

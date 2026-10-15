@@ -65,6 +65,11 @@ ENV PYTHONUNBUFFERED=1 \
 # 容器实测报 "Can't locate English.pm in @INC"）；libdbd-mysql-perl/libdbi-perl
 # 供 xtrabackup 2.4 连接 MySQL（容器实测报 "DBD::mysql module is not installed"）；
 # postgresql-client 供 PG 与平台同机（容器部署）场景的本机备份/恢复
+# 国内镜像源加速（deb.debian.org 直连极慢时构建卡死；构建期替换，
+# 不影响运行期——运行环境零联网）
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null \
+    || sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list \
+    || true
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        default-jre-headless \
@@ -84,8 +89,8 @@ WORKDIR /app
 
 # 先装依赖（利用层缓存）：requirements.txt 为主，JDBC 兜底另装 jpype/jaydebeapi
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt \
-    && pip install --no-cache-dir jpype1 jaydebeapi
+RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ -r requirements.txt \
+    && pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ jpype1 jaydebeapi
 
 # 再拷贝应用代码与资源（drivers/ JDBC 驱动 jar 供 JDBC 兜底通道加载）
 COPY app.py run.py init_db.py config.py auth.py start.sh ./

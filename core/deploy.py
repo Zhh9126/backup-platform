@@ -333,17 +333,21 @@ fi
 build_stmts() {{
     local auth_clause=""
     [ -n "$AUTH_PLUGIN" ] && auth_clause=" IDENTIFIED WITH $AUTH_PLUGIN BY '{pw}'" || auth_clause=" IDENTIFIED BY '{pw}'"
+    # 授权顺序关键约束：**先建远程用户、最后才改 root@localhost 密码**——
+    # 逐条执行共用同一认证上下文，若先 ALTER 密码，后续 CREATE USER 'root'@'%'
+    # 会因认证失效静默失败（单条失败仅告警），部署完的实例只能本机登录、
+    # 平台无法远程纳管备份（137 实测暴露）。
     if [ "$MAJOR" -eq 5 ] && [ "$MINOR" -lt 7 ]; then
         # 5.5 / 5.6（无 ALTER USER，用 SET PASSWORD + GRANT 隐式建用户）
-        echo "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('{pw}');"
-        echo "GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' IDENTIFIED BY '{pw}' WITH GRANT OPTION;"
         echo "GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' IDENTIFIED BY '{pw}' WITH GRANT OPTION;"
+        echo "GRANT ALL PRIVILEGES ON *.* TO 'root'@'localhost' IDENTIFIED BY '{pw}' WITH GRANT OPTION;"
+        echo "SET PASSWORD FOR 'root'@'localhost' = PASSWORD('{pw}');"
         echo "FLUSH PRIVILEGES;"
     else
         # 5.7.6+ / 8.x / 9.x
-        echo "ALTER USER 'root'@'localhost' IDENTIFIED BY '{pw}';"
         echo "CREATE USER IF NOT EXISTS 'root'@'%'$auth_clause;"
         echo "GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;"
+        echo "ALTER USER 'root'@'localhost' IDENTIFIED BY '{pw}';"
         echo "FLUSH PRIVILEGES;"
     fi
 }}
@@ -714,8 +718,18 @@ timeout 300
 {cluster_cfg}
 EOF
 {base}/bin/redis-server {base}/redis.conf --daemonize yes 2>&1 | head -5
-sleep 2
-if REDISCLI_AUTH={pw} {base}/bin/redis-cli PING 2>/dev/null | grep -q PONG; then
+# 启动就绪探测：redis-server daemonize 后需要短暂时间完成初始化，
+# 固定 sleep 2 后单次 PING 存在时序误报（137 实测：部署成功但告警 PING
+# 未返回 PONG）——改为重试 10 次 × 1s，全失败才告警。
+REDIS_PING_OK=0
+for _i in $(seq 1 10); do
+  sleep 1
+  if REDISCLI_AUTH={pw} {base}/bin/redis-cli PING 2>/dev/null | grep -q PONG; then
+    REDIS_PING_OK=1
+    break
+  fi
+done
+if [ "$REDIS_PING_OK" = "1" ]; then
     echo "[deploy] Redis 启动成功 (PONG)"
 else
     echo "[deploy] 警告: PING 未返回 PONG，见上方日志"

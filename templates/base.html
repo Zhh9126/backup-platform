@@ -36,6 +36,7 @@
         <a class="nav-link {% if page=='tasks' %}active{% endif %}" href="/tasks" title="数据库备份" data-perm="backup.task.view"><i class="bi bi-list-check"></i> <span class="nav-label">数据库备份</span></a>
         <a class="nav-link {% if page=='file_backup' %}active{% endif %}" href="/file_backup" title="文件备份" data-perm="backup.task.view"><i class="bi bi-folder2-open"></i> <span class="nav-label">文件备份</span></a>
         <a class="nav-link {% if page=='object_storage' %}active{% endif %}" href="/object_storage" title="对象存储备份（MinIO / 阿里云 OSS / 腾讯云 COS / S3 兼容，桶级保护，桶侧零安装）" data-perm="backup.task.view"><i class="bi bi-cloud-arrow-up"></i> <span class="nav-label">对象存储备份</span></a>
+        <a class="nav-link {% if page=='vm' %}active{% endif %}" href="/vm" title="虚拟机备份（整机恢复点 / 永久增量 / 克隆新 VM）"><i class="bi bi-pc-display-horizontal"></i> <span class="nav-label">虚拟机备份</span></a>
         <a class="nav-link {% if page=='storage' %}active{% endif %}" href="/storage" title="存储管理" data-perm="backup.storage.manage"><i class="bi bi-hdd-rack"></i> <span class="nav-label">存储管理</span></a>
         <a class="nav-link {% if page=='protection' %}active{% endif %}" href="/protection" title="备份策略" data-perm="backup.policy.manage"><i class="bi bi-shield-lock"></i> <span class="nav-label">备份策略</span></a>
         <a class="nav-link {% if page=='agentless' %}active{% endif %}" href="/agentless" title="无 Agent 接入：任务本次通道与侵入等级、目标端免装取证"><i class="bi bi-shield-check"></i> <span class="nav-label">无 Agent</span></a>
@@ -54,7 +55,6 @@
         <a class="nav-link {% if page=='sync' %}active{% endif %}" href="/sync" title="数据同步" data-perm="dr.sync.manage"><i class="bi bi-arrow-left-right"></i> <span class="nav-label">数据同步</span></a>
         <a class="nav-link {% if page=='dr-link' %}active{% endif %}" href="/dr-link" title="容灾链路" data-perm="dr.link.manage"><i class="bi bi-diagram-3"></i> <span class="nav-label">容灾链路</span></a>
         <a class="nav-link {% if page=='clone' %}active{% endif %}" href="/clone" title="克隆服务" data-perm="dr.clone.manage"><i class="bi bi-layers"></i> <span class="nav-label">克隆服务</span></a>
-        <a class="nav-link {% if page=='vm' %}active{% endif %}" href="/vm" title="虚拟机备份（整机恢复点 / 永久增量 / 克隆新 VM）"><i class="bi bi-pc-display-horizontal"></i> <span class="nav-label">虚拟机备份</span></a>
         <div class="nav-group-label">运维</div>
         <a class="nav-link {% if page=='operations' %}active{% endif %}" href="/operations" title="运维运营分析（超长 / 超频备份统计与阈值配置）" data-perm="operations.view"><i class="bi bi-graph-up-arrow"></i> <span class="nav-label">运维运营分析</span></a>
         <a class="nav-link {% if page=='inspection' %}active{% endif %}" href="/inspection" title="巡检" data-perm="inspection.manage"><i class="bi bi-shield-check"></i> <span class="nav-label">巡检</span></a>

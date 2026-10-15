@@ -259,6 +259,32 @@ class FailoverEngine:
             return {"reachable": r["reachable"], "error": r["error"]}
         self._step("主库故障探测", _probe)
 
+        # 步骤 0.5：Fencing（围栏）——业界 failover 三步法 detect → fence →
+        # redirect 中不可省略的一步：即便主库可达（force 场景，如原主假死
+        # 后恢复），也必须先冻结其写入（read_only=1 + super_read_only=1），
+        # 保证提升备库前后**同一时刻只有一个写入点**，防止 split-brain
+        # 数据分叉（调研：PRadeep failover 三步法 / Patroni 硬 fencing）。
+        def _fence():
+            r = _probe_mysql(pc.get("host"), pc.get("port"),
+                             pc.get("user"), pc.get("password"), timeout=5)
+            if not r["reachable"]:
+                return {"fenced": "unreachable（已不可达，无需围栏）"}
+            conn = native_conn.connect("mysql", pc.get("host"), pc.get("port"),
+                                       None, pc.get("user"), pc.get("password"), timeout=5)
+            try:
+                cur = conn.cursor()
+                cur.execute("SET GLOBAL read_only=1")
+                cur.execute("SET GLOBAL super_read_only=1")
+                conn.commit()
+                cur.close()
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            return {"fenced": "旧主已置 read_only=1 + super_read_only=1（写入冻结）"}
+        self._step("Fencing 旧主写入冻结", _fence)
+
         # 步骤 1：备库提升为主
         self._step("备库提升为主库", lambda: {
             "stmts": _promote_mysql(sc.get("host"), sc.get("port"),
@@ -286,8 +312,16 @@ class FailoverEngine:
                                   sc.get("user"), sc.get("password"))})
 
         rto = round(time.monotonic() - t0, 1)
+        # 业务导向（容灾以业务为最终目标，数据库只是底层）：数据库切换
+        # 完成后，应用/中间件层需要人工跟进的事项清单随结果返回
         result = {"direction": "failover", "to": sc.get("host"),
-                  "steps": self.steps, "rto_sec": rto, "at": db.now_iso()}
+                  "steps": self.steps, "rto_sec": rto, "at": db.now_iso(),
+                  "manual_checklist": [
+                      "确认应用连接池已重连到新主（域名解析已切换，客户端需重试重连）",
+                      "重启或重载依赖该库的缓存/队列中间件连接（如 Redis/Nginx upstream）",
+                      "通知业务方进行状态与一致性确认（对标政务云方案 60s 检查步骤）",
+                      "确认后尽快在原主侧重新配置反向复制，保持持续保护",
+                  ]}
         self._save_history(result)
         # 链路状态更新：主备站点互换，状态 active
         db.execute(
@@ -306,6 +340,42 @@ class FailoverEngine:
         pc = self.primary      # 原（旧）主——即将重新提升
         sc = self.standby      # 现主（failover 后）
         repl = self.cfg.get("replication_user") or {}
+
+        # 步骤 0：GTID 分叉检测——旧主 rejoin 前必须确认其已执行事务集是
+        # 现主的子集（即旧主在切换后**没有**出现独立写入）。存在分叉时
+        # 如实拒绝并提示处置策略，绝不静默丢弃数据（业界惯例：pg_rewind
+        # 小分歧/全量重建大分歧，均需人工确认）。
+        def _divergence_check():
+            def gtid_set(c):
+                conn = native_conn.connect("mysql", c.get("host"), c.get("port"),
+                                           None, c.get("user"), c.get("password"), timeout=8)
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT @@GLOBAL.gtid_executed")
+                    v = cur.fetchone()[0] or ""
+                    cur.close()
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                return set(filter(None, (s.strip() for s in v.split("\n") if s.strip())) or
+                           ({v} if v else set()))
+            old_set = gtid_set(pc)
+            new_set = gtid_set(sc)
+            # uuid 集合级比对：旧主执行的 uuid 是否都被新主覆盖（粗粒度），
+            # 细粒度事务级分叉由 START REPLICA 后的复制错误暴露。
+            orphan = old_set - new_set
+            if orphan:
+                raise FailoverError(
+                    "检测到旧主 %s 存在现主缺失的事务来源（uuid: %s）——"
+                    "切换后旧主上可能发生了独立写入（数据分叉）。"
+                    "请人工核对后选择：a) 丢弃旧主分歧数据并重试；"
+                    "b) 导出分歧数据合并到现主。当前已拒绝自动回切，防止数据丢失。"
+                    % (pc.get("host"), ", ".join(sorted(orphan))[:200]))
+            return {"old_uuids": len(old_set), "new_uuids": len(new_set),
+                    "divergence": "none"}
+        self._step("GTID 分叉检测", _divergence_check)
 
         # 步骤 1：旧主以从库身份追平现主增量
         self._step("旧主追平现主增量", lambda: _rejoin_as_replica(
@@ -347,7 +417,13 @@ class FailoverEngine:
 
         rto = round(time.monotonic() - t0, 1)
         result = {"direction": "failback", "to": pc.get("host"),
-                  "steps": self.steps, "rto_sec": rto, "at": db.now_iso()}
+                  "steps": self.steps, "rto_sec": rto, "at": db.now_iso(),
+                  "manual_checklist": [
+                      "确认应用连接池已重连回原主（域名已切回）",
+                      "重启/重载中间件连接（缓存/Nginx upstream）",
+                      "通知业务方进行状态与一致性确认",
+                      "确认反向复制（现主→原主）运行正常，保持持续保护",
+                  ]}
         self._save_history(result)
         db.execute(
             "UPDATE disaster_links SET status='active', primary_site=?, dr_site=?, "

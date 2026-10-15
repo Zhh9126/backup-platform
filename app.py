@@ -95,10 +95,12 @@ def create_app() -> Flask:
     def _inject_bkp_meta():
         try:
             from api.system import build_meta
-            return {"bkp_meta": build_meta()}
+            return {"bkp_meta": build_meta(),
+                    "platform_version": config.PLATFORM_VERSION}
         except Exception as e:  # noqa: BLE001 - 注入失败不能影响页面渲染
             print(f"[startup] bkp_meta 注入失败（前端将回退到 /api/meta）: {e}")
-            return {"bkp_meta": {}}
+            return {"bkp_meta": {},
+                    "platform_version": config.PLATFORM_VERSION}
 
     app.config["BACKUP_ROOT"] = str(config.get_backup_root())
     _root_info = config.backup_root_info()

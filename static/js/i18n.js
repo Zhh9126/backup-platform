@@ -1877,7 +1877,7 @@ window.I18N = (function () {
     "pre · 黄金回退点（全量备份）": "pre · golden fallback (full backup)",
     "replay 到目标时间": "replay to target time",
     "tar.gz 将解压到此目录": "tar.gz will be extracted here",
-    "v1.4.2 · AIDBM · AI 原生智能数据库灾备管理平台 © 2026": "v1.4.2 · AIDBM · AI-Native Database DR Management © 2026",
+    "v1.4.2 · AIDBM · AI 原生智能数据库灾备管理平台 © 2026": "AIDBM · AI-Native Database DR Management Platform © 2026",
     "viewer（只读）": "viewer (read-only)",
     "| 每 6 小时：": "| Every 6 hours:",
     "| 每周一 8 点：": "| Mondays 8:00:",

@@ -2,7 +2,8 @@
 
 # AIDBM
 
-<p align="center"><img src="static/img/aidbm-logo.png" alt="AIDBM" width="260"></p>
+<img width="2048" height="2048" alt="数据备份管理平台介绍" src="https://github.com/user-attachments/assets/dd47aa03-e36c-4381-9533-6d13cf4327d6" />
+
 
 **AI 原生智能数据库灾备管理平台**（AI-Native Database Backup & Disaster Recovery Management）
 

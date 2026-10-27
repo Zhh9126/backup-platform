@@ -19,16 +19,17 @@ cd /root/CodeBuddy/20260826095855/backup-platform
 |---|---|---|---|
 | 129-oracle-pitr | Oracle 19c RMAN PITR 全链路（全量→标记→回推备份片→RESTORE/RECOVER→OPEN RESETLOGS→硬核对） | 10/10 | 2026-10-26 |
 | 139-pg14 | PostgreSQL 14.24 逻辑备份（SSH 远端 pg_dump）+ 产物校验 | 4/4 | 2026-10-27 |
+| 139-mysql9 | MySQL 9.3.0（端口 33060）逻辑备份（SSH 远端 mysqldump）+ 产物校验 | 4/4 | 2026-10-27 |
+| 137-kingbase | 金仓 V9（54321，/opt/Kingbase）sys_dump + 产物校验 | 4/4 | 2026-10-27 |
+| 137-dameng | 达梦 8（5236，/dm/dbms）dexp + 产物校验 | 4/4 | 2026-10-27 |
+| 129-mysql | MySQL 5.7.44（23306）逻辑备份（SSH 远端 mysqldump）+ 产物校验 + 恢复闭环硬核对（行数/中文一致，脚本 /root/e2e/e2e_129mysql_restore.py） | 4/4 + 5/5 | 2026-10-27 |
 | rsync-delta | MySQL 物理备份 rsync 增量拉取（裸 tar，实测实传 0.0%） | R1-R5b 过 | 2026-10-26 |
 
 ## 待登记（凭据就绪后即可回归）
 
 | target | 库型 | 所需凭据 |
 |---|---|---|
-| 137-kingbase | 金仓 V9（54321，/opt/Kingbase） | system 密码 |
-| 137-dameng | 达梦 8（5236，/dm/dbms） | SYSDBA 密码（默认 SYSDBA/SYSDBA 不对） |
-| 129-mysql | MySQL（/usr/local/mysql，端口待探测） | root 密码 |
-| 139-mysql8 | MySQL 8 | root 密码 |
+| 129-mysql-23307 | MySQL 5.7 第二实例（23307） | root 密码（123456 不对） |
 | 137-redis | Redis | 无密码或密码 |
 
 ## 已知环境注意

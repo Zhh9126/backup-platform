@@ -21,6 +21,16 @@
       "expect": {"message_contains": "mysqldump"}
     },
     {
+      "id": "129-mysql",
+      "ssh": {"host": "192.168.220.129", "port": 22, "username": "root",
+              "password": "123123", "auth_type": "password", "os_type": "linux"},
+      "task": {"name": "matrix-129-mysql", "db_type": "mysql",
+               "host": "192.168.220.129", "port": 23306,
+               "username": "root", "password": "123456",
+               "db_name": "aidbm_mx", "backup_mode": "logical"},
+      "expect": {"message_contains": "mysqldump"}
+    },
+    {
       "id": "137-kingbase",
       "ssh": {"host": "192.168.220.137", "port": 22, "username": "root",
               "password": "Zhh@190226", "auth_type": "password", "os_type": "linux"},

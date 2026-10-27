@@ -456,6 +456,7 @@ class SyncEngine:
                                "（时间戳列如 updated_at 或自增列 id）"}
         from .realtime_runners import get_stop_event
 
+        stop = get_stop_event(cfg.task_id)
         poll_interval = int((cfg.flink_config or {}).get("poll_interval", 5))
         # 回看窗口（秒）：时间戳水位向前重叠读取，重叠部分由目标端 upsert
         # 幂等吸收，消除同秒多条记录/时间精度不足造成的边界丢数

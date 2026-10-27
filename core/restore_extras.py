@@ -97,12 +97,23 @@ def _norm_stop_datetime(ts: str) -> str:
 def mysql_pitr_restore(backup_path: str, target_time: str, target: dict) -> Dict[str, Any]:
     """MySQL PITR：先做全量恢复，再调用 mysqlbinlog replay 到 target_time。
     target: {host, port, user, password, db}
+    target["segments"]（可选，推荐）：恢复链 db-log 段有序列表，
+        每项 {"path": 段文件路径, "start_pos": 起始位点, "stop_pos": 结束位点|None}。
+        传入时按段逐文件回放（修复旧版只能回放单个 binlog 文件的跨段缺口），
+        最后一段优先用 --stop-position 精确截断（--stop-datetime 仍作为兜底）。
     """
-    # 1) 解压 .gz（如果是）
+    # 1) 解压 .gz / .zst（平台产物压缩链：gzip 或 zstd）
     actual = backup_path
     if backup_path.endswith(".gz"):
         out = subprocess.run(["gunzip", "-k", backup_path], capture_output=True, text=True)
         actual = backup_path[:-3]
+    elif backup_path.endswith(".zst"):
+        import zstandard  # 平台 requirements 自带（产物校验读 zstd 头依赖）
+        out_path = backup_path[:-4]
+        if not os.path.exists(out_path):
+            with open(backup_path, "rb") as fh, open(out_path, "wb") as wf:
+                zstandard.ZstdDecompressor().copy_stream(fh, wf)
+        actual = out_path
     # 安全整改：目标库名必须是合法 MySQL 标识符，防参数注入
     db_name = str(target.get("db") or "")
     if db_name and not re.match(r"^[A-Za-z0-9_$]{1,64}$", db_name):
@@ -120,6 +131,53 @@ def mysql_pitr_restore(backup_path: str, target_time: str, target: dict) -> Dict
         r = subprocess.run(cmd_full, env=env, stdin=f, capture_output=True, text=True)
     if r.returncode != 0:
         return {"ok": False, "message": f"全量恢复失败: {r.stderr[:200]}"}
+
+    stop_dt = _norm_stop_datetime(target_time)
+    segments = target.get("segments") or []
+    if segments:
+        # ---- 多段逐文件回放（v2：修复跨段链只回放单个文件的缺口） ----
+        sql_parts = []
+        replayed = []
+        for seg in segments:
+            seg_path = str(seg.get("path") or "")
+            if not seg_path or not os.path.isfile(seg_path):
+                return {"ok": False,
+                        "message": f"binlog 段文件缺失: {seg_path}"}
+            cmd_seg = ["mysqlbinlog", "--skip-gtids=true"]
+            start_pos = int(seg.get("start_pos") or 0)
+            if start_pos > 4:
+                cmd_seg.append(f"--start-position={start_pos}")
+            stop_pos = int(seg.get("stop_pos") or 0)
+            is_last = seg is segments[-1]
+            if is_last and stop_pos > 4:
+                # 精确位点截断（journal 段尾位点）；--stop-datetime 并用兜底
+                cmd_seg.append(f"--stop-position={stop_pos}")
+            cmd_seg.append(seg_path)
+            logger.info("[pitr] mysqlbinlog replay 段: %s", " ".join(cmd_seg))
+            r2 = subprocess.run(cmd_seg, capture_output=True, text=True,
+                                timeout=1800)
+            if r2.returncode != 0:
+                return {"ok": False,
+                        "message": f"binlog replay 失败（{os.path.basename(seg_path)}）"
+                                   f": {r2.stderr[:200]}"}
+            sql_parts.append(r2.stdout)
+            replayed.append(os.path.basename(seg_path))
+        cmd_apply = ["mysql", "--no-defaults",
+                     "-h", str(target.get("host") or "127.0.0.1"),
+                     "-P", str(target.get("port") or 3306),
+                     "-u", str(target.get("user") or "root")] + db_arg.split()
+        r3 = subprocess.run(cmd_apply, env=env, input="".join(sql_parts),
+                            capture_output=True, text=True)
+        if r3.returncode != 0:
+            return {"ok": False, "message": f"apply binlog SQL 失败: {r3.stderr[:200]}"}
+        return {"ok": True,
+                "message": (f"PITR 成功：全量 + {len(replayed)} 个 binlog 段"
+                            f"（{' → '.join(replayed[:3])}"
+                            f"{'…' if len(replayed) > 3 else ''}）"),
+                "binlog_replayed": True, "segments": len(replayed),
+                "target_time": target_time}
+
+    # ---- 旧单文件路径（无 segments 时保留兼容） ----
     # 3) 找到对应 binlog 文件（简化：从备份路径推断或在 binlog 目录查最新）
     binlog_file = os.path.basename(target.get("binlog_file") or "")
     binlog_pos = target.get("binlog_pos", 0)
@@ -132,7 +190,6 @@ def mysql_pitr_restore(backup_path: str, target_time: str, target: dict) -> Dict
     if not os.path.exists(binlog_path):
         return {"ok": True, "message": f"全量恢复成功（找不到 binlog {binlog_path}，未执行增量）",
                 "skipped_replay": True}
-    stop_dt = _norm_stop_datetime(target_time)
     # --skip-gtids：源库 GTID_MODE=ON 而目标可能为 OFF，回放 SQL 中的
     # SET @@SESSION.GTID_NEXT 会导致 ERROR 1781，统一剥离 GTID 语句
     cmd_binlog = ["mysqlbinlog", "--skip-gtids=true",

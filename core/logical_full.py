@@ -475,6 +475,19 @@ def backup_full_instance(db_type: str, *, host, port, user, password,
         # 空间，若连上一个库的两倍都放不下，就在**这里**停，而不是跑到最后
         # 一个库写满设备才失败（用户现场就是跑了几分钟才炸）。
         prev_size = 0
+        # GTID 探测：源库 gtid_mode=ON 时，部分库 dump 默认带 GTID 上下文，
+        # 某些版本 mysqldump 直接 rc=2 报 "partial dump from a server that
+        # has GTIDs..."——备份产物不需要 GTID 位点（PITR 走 binlog），统一
+        # 加 --set-gtid-purged=OFF（mysqldump ≥5.6 均支持；GTID 关闭时不加，
+        # 兼容不认识该参数的老版本）。
+        gtid_on = False
+        events_retry_notes = []
+        if not is_pg:
+            _rc, _out, _e = _run([
+                dump_tool, "--no-defaults", "-h", str(host), "-P", str(port),
+                "-u", user, "-N", "-e", "SELECT @@global.gtid_mode",
+            ], env, timeout=60)
+            gtid_on = _rc == 0 and (_out or "").strip().upper().startswith("ON")
         for idx, d in enumerate(dbs, 1):
             if is_pg:
                 rc, _o, err = _run([
@@ -488,8 +501,20 @@ def backup_full_instance(db_type: str, *, host, port, user, password,
                        "-u", user, "--single-transaction", "--routines",
                        "--triggers", "--events", "--default-character-set=utf8mb4",
                        "--databases", d]
+                if gtid_on:
+                    cmd.append("--set-gtid-purged=OFF")
                 rc, _o, err = _mysqldump_to_file(
                     cmd, env, os.path.join(dbs_dir, f"{d}.sql"))
+                if rc != 0 and "Can't find file: 'event'" in (err or ""):
+                    # mysql.event 表缺失/损坏（老版本/异常实例）——去掉
+                    # --events 重试一次：优先保住整库备份而不是整任务失败
+                    cmd = [c for c in cmd if c != "--events"]
+                    rc, _o, err = _mysqldump_to_file(
+                        cmd, env, os.path.join(dbs_dir, f"{d}.sql"))
+                    if rc == 0:
+                        events_retry_notes.append(
+                            "库 %s 源库 mysql.event 缺失，已自动去掉 --events "
+                            "重试成功（该库不含事件定义）" % d)
             if rc != 0:
                 # errno 28 = ENOSPC：给出"写哪个路径满了、还剩多少"的真实诊断，
                 # 而不是把裸错误原样丢给用户
@@ -546,6 +571,10 @@ def backup_full_instance(db_type: str, *, host, port, user, password,
             "auto_include_system": bool(
                 not include_system_dbs_orig and include_system_dbs),
             "databases": dbs,
+            # 源库 gtid_mode=ON 时部分库 dump 统一带 --set-gtid-purged=OFF
+            # （恢复到异实例不卡 GTID）；events 缺表自动降级记录
+            "gtid_purged_off": bool(gtid_on),
+            "events_retry_notes": events_retry_notes,
         }
         with open(os.path.join(work, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)

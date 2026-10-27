@@ -25,9 +25,11 @@ from typing import Optional
 logger = logging.getLogger("core.crypto_pool")
 
 MAGIC = b"BKPX"
-VERSION = 1
+VERSION = 2          # v1=AES-256-GCM（无算法字节）；v2=头带算法标识
 SALT_LEN = 16
 NONCE_LEN = 12
+ALGO_AES = 1         # AES-256-GCM（v1 存量格式等价）
+ALGO_SM4 = 2         # SM4-128-GCM（GB/T 32907 国密）
 TAG_LEN = 16
 
 
@@ -161,39 +163,57 @@ def is_encrypted(path: str) -> bool:
         return False
 
 
-def encrypt_file(path: str, passphrase: Optional[bytes] = None) -> dict:
+def encrypt_file(path: str, passphrase: Optional[bytes] = None,
+                 algo: str = "aes") -> dict:
     """对 path 原地加密（备份产物落盘后调用）。返回统计。
 
+    algo: "aes"（默认，AES-256-GCM）| "sm4"（国密 SM4-128-GCM，
+    GB/T 32907，cryptography 库原生实现，v2 头带算法标识）。
     若无可用工序密钥，则跳过加密（明文落盘），返回 {"encrypted": False}。
     """
     if passphrase is None:
         passphrase = _get_passphrase()
     if not passphrase:
         return {"encrypted": False, "reason": "no_passphrase"}
+    algo_id = ALGO_SM4 if str(algo or "").lower() == "sm4" else ALGO_AES
     try:
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.ciphers import (
+            Cipher, algorithms, modes)
     except ImportError:
         return {"encrypted": False, "reason": "no_crypto_lib"}
 
     import os as _os
     plaintext = _read_file(path)
-    salt = os.urandom(SALT_LEN)
-    nonce = os.urandom(NONCE_LEN)
-    key = _derive_key(passphrase, salt)
-    aes = AESGCM(key)
-    # TAG 由库附加在密文尾部（encrypt 返回 ciphertext||tag）
-    ct = aes.encrypt(nonce, plaintext, None)
-    out = MAGIC + bytes([VERSION]) + salt + nonce + ct
+    salt = _os.urandom(SALT_LEN)
+    nonce = _os.urandom(NONCE_LEN)
+    key_len = 16 if algo_id == ALGO_SM4 else 32   # SM4 128 位 / AES 256 位
+    key = _derive_key(passphrase, salt, length=key_len)
+    if algo_id == ALGO_SM4:
+        enc = Cipher(algorithms.SM4(key), modes.GCM(nonce)).encryptor()
+        body = enc.update(plaintext)
+        enc.finalize()
+        # GCM tag 在 encryptor.tag 属性（finalize 返回值为空），密文=body||tag
+        ct = body + enc.tag
+    else:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        enc = AESGCM(key)
+        # TAG 由库附加在密文尾部（encrypt 返回 ciphertext||tag）
+        ct = enc.encrypt(nonce, plaintext, None)
+    out = MAGIC + bytes([VERSION, algo_id]) + salt + nonce + ct
     _write_file(path, out)
     return {
         "encrypted": True,
+        "algo": "sm4" if algo_id == ALGO_SM4 else "aes",
         "original_bytes": len(plaintext),
         "encrypted_bytes": len(out),
     }
 
 
 def decrypt_file(path: str, passphrase: Optional[bytes] = None) -> bytes:
-    """解密文件，返回明文 bytes。非加密文件原样返回（兼容旧数据）。"""
+    """解密文件，返回明文 bytes。非加密文件原样返回（兼容旧数据）。
+
+    兼容三种格式：v1（AES-256-GCM 无算法字节）与 v2 aes/sm4。
+    """
     if not is_encrypted(path):
         return _read_file(path)
     if passphrase is None:
@@ -201,21 +221,35 @@ def decrypt_file(path: str, passphrase: Optional[bytes] = None) -> bytes:
     if not passphrase:
         raise RuntimeError("解密失败：缺少主密钥 BACKUP_POOL_KEY")
     try:
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.ciphers import (
+            Cipher, algorithms, modes)
     except ImportError:
         raise RuntimeError("解密失败：缺少 cryptography 库")
     data = _read_file(path)
     if data[:4] != MAGIC:
         raise RuntimeError("解密失败：magic 不匹配")
     version = data[4]
-    if version != VERSION:
+    if version == 1:
+        algo_id, hdr = ALGO_AES, 5            # v1：无算法字节
+    elif version == 2:
+        algo_id = data[5]
+        hdr = 6
+    else:
         raise RuntimeError(f"解密失败：版本不兼容 {version}")
-    salt = data[5:5 + SALT_LEN]
-    nonce = data[5 + SALT_LEN:5 + SALT_LEN + NONCE_LEN]
-    ct = data[5 + SALT_LEN + NONCE_LEN:]
-    key = _derive_key(passphrase, salt)
-    aes = AESGCM(key)
-    return aes.decrypt(nonce, ct, None)
+    salt = data[hdr:hdr + SALT_LEN]
+    nonce = data[hdr + SALT_LEN:hdr + SALT_LEN + NONCE_LEN]
+    ct = data[hdr + SALT_LEN + NONCE_LEN:]
+    key_len = 16 if algo_id == ALGO_SM4 else 32
+    key = _derive_key(passphrase, salt, length=key_len)
+    if algo_id == ALGO_SM4:
+        # GCM 解密需显式 tag：密文尾部 16 字节为 tag（cryptography 不自动拆分）
+        if len(ct) < 16:
+            raise RuntimeError("解密失败：密文过短（缺 GCM tag）")
+        tag, body = ct[-16:], ct[:-16]
+        dec = Cipher(algorithms.SM4(key), modes.GCM(nonce, tag)).decryptor()
+        return dec.update(body) + dec.finalize()
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    return AESGCM(key).decrypt(nonce, ct, None)
 
 
 def _read_file(path: str) -> bytes:

@@ -567,6 +567,11 @@ class MySQLPlugin(BasePlugin):
         if jt == JavaType.BOOLEAN:
             return bool(value)
         if jt == JavaType.LONG:
+            # BIT 列（pymysql 类型码 16）返回 bytes——按大端转整数，兼容
+            # PG SMALLINT / MySQL BIT / 布尔等数值型目标列（bytes 透传会
+            # 以 bytea 写入数值列，触发 DatatypeMismatch 整批失败）
+            if isinstance(value, (bytes, bytearray)):
+                return int.from_bytes(bytes(value), "big")
             return int(value)
         if jt == JavaType.DOUBLE:
             return float(value)

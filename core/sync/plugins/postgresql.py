@@ -32,11 +32,23 @@ class PostgreSQLSourceReader(SourceReader):
         try:
             with conn.cursor() as cur:
                 schema = self.config.src_schema or "public"
-                cur.execute(
-                    "SELECT table_name FROM information_schema.tables "
-                    "WHERE table_schema=%s ORDER BY table_name",
-                    (schema,),
-                )
+                try:
+                    # 分区表感知：保留父表（relkind='p'），排除分区子表
+                    # （relkind='r' 且 relispartition=true）——子表数据由父表
+                    # 代表，按子表逐张同步会重复且打乱父表语义。
+                    cur.execute(
+                        "SELECT c.relname FROM pg_class c "
+                        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                        "WHERE n.nspname=%s AND c.relkind IN ('r','p') "
+                        "AND c.relispartition = false ORDER BY c.relname",
+                        (schema,),
+                    )
+                except Exception:
+                    cur.execute(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema=%s ORDER BY table_name",
+                        (schema,),
+                    )
                 return [r[0] for r in cur.fetchall()]
         finally:
             conn.close()

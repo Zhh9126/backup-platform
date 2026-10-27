@@ -95,7 +95,8 @@ _PYMYSQL_CODE_MAP = {
     12: JavaType.DATETIME,   # DATETIME
     13: JavaType.LONG,       # YEAR
     15: JavaType.STRING,     # VARCHAR
-    16: JavaType.BYTES,      # BIT（bytes 原样透传）
+    16: JavaType.LONG,       # BIT（位串，读取端转 int——bytes 透传到数值目标列
+                             #  会因 bytea↔smallint 类型不匹配整批写入失败）
     245: JavaType.STRING,    # JSON
     246: JavaType.DECIMAL,   # NEWDECIMAL
     247: JavaType.STRING,    # ENUM

@@ -97,7 +97,7 @@ i.bi { line-height: 1; }
   z-index: 1040;
   box-shadow: var(--shadow-sidebar);
   transition: width .25s ease-in-out, flex-basis .25s ease-in-out;
-  overflow-x: hidden;
+  overflow: hidden;
 }
 .layout.sidebar-collapsed .sidebar {
   width: var(--sidebar-w-collapsed);
@@ -171,7 +171,30 @@ i.bi { line-height: 1; }
 .layout.sidebar-collapsed .nav-group-label { opacity: 0; height: 0; padding: 0; overflow: hidden; }
 
 /* 导航 */
-.sidebar .nav { gap: var(--space-xs); }
+.sidebar .nav {
+  gap: var(--space-xs);
+  /* 菜单长于视口时 nav 独立滚动（品牌区常驻可见）：
+     1) flex-wrap 必须 nowrap——Bootstrap .nav 默认 wrap，加高度约束后
+        放不下的菜单项会换列而不是滚动（实测两列乱象）；
+     2) overscroll-behavior 隔离滚动链——滚轮滚到菜单底部不再带动整页；
+     3) 跨页面跳转由 JS 恢复滚动位置并居中当前项，点底部菜单不再"跳"回顶部 */
+  flex: 1 1 auto;
+  min-height: 0;
+  flex-wrap: nowrap;
+  flex-direction: column;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, .18) transparent;
+  padding-right: 2px;
+  margin-right: -4px;
+}
+.sidebar .nav::-webkit-scrollbar { width: 6px; }
+.sidebar .nav::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, .18);
+  border-radius: 999px;
+}
+.sidebar .nav::-webkit-scrollbar-track { background: transparent; }
 .sidebar .nav-link {
   display: flex;
   align-items: center;

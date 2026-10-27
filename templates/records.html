@@ -105,7 +105,7 @@
         <div class="mb-3">
           <label class="form-label fw-bold"><i class="bi bi-exclamation-triangle text-danger"></i> 错误信息 / 结果说明</label>
           <pre class="form-control bg-light font-monospace small" id="rl_message" style="min-height:140px; max-height:400px; overflow:auto; white-space:pre-wrap; word-break:break-all;"></pre>
-          <button class="btn btn-sm btn-outline-secondary mt-1" onclick="navigator.clipboard.writeText(document.getElementById('rl_message').textContent).then(()=>toast('已复制到剪贴板','success'))"><i class="bi bi-clipboard"></i> 复制日志</button>
+          <button class="btn btn-sm btn-outline-secondary mt-1" onclick="copyText(document.getElementById('rl_message').textContent).then(()=>toast('已复制到剪贴板','success')).catch(()=>toast('复制失败（浏览器限制），请手动选择复制','warning'))"><i class="bi bi-clipboard"></i> 复制日志</button>
         </div>
         <div class="row g-3">
           <div class="col-md-12"><div class="border rounded p-2 bg-light"><div class="text-muted small">备份文件路径</div><div id="rl_backup_path" class="font-monospace small"></div><div id="rl_path_hint" class="small mt-1 d-none"></div></div></div>

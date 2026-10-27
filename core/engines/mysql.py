@@ -347,6 +347,46 @@ class MySQLEngine(BackupEngine):
         return "mariabackup" in b or "mariadb-backup" in b
 
     @staticmethod
+    @staticmethod
+    def purge_binlogs_after_backup(task: dict, keep_files: int = 1) -> str:
+        """备份完成后 PURGE 已覆盖 binlog（对标鼎甲"备份完删除已备份日志"）。
+
+        保守语义：保留最近 keep_files 个 binlog 文件，清理其之前的全部——
+        清理点恰好覆盖刚完成的备份为止的窗口。警告：若依赖 binlog 做
+        PITR/增量恢复，保留窗口必须覆盖最老恢复点（keep_files 相应调大）。
+
+        Returns:
+            处置说明文本（供操作日志）。任何失败抛异常由调用方兜底。
+        """
+        import pymysql
+        host = task.get("host") or "127.0.0.1"
+        port = int(task.get("port") or 3306)
+        user = task.get("username") or "root"
+        pw = db.decrypt_secret(str(task.get("password") or ""))
+        conn = pymysql.connect(host=host, port=port, user=user, password=pw,
+                               connect_timeout=10)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SHOW BINARY LOGS")
+                files = [str(r[0]) for r in cur.fetchall()]
+            if len(files) <= keep_files:
+                return (f"binlog 共 {len(files)} 个 ≤ 保留 {keep_files} 个，"
+                        "无需清理")
+            purge_to = files[-keep_files]
+            if not re.match(r"^[\w.\-]+$", purge_to):
+                raise RuntimeError(f"binlog 文件名异常: {purge_to!r}")
+            with conn.cursor() as cur:
+                cur.execute(f"PURGE BINARY LOGS TO '{purge_to}'")
+            conn.commit()
+            purged = len(files) - keep_files
+            return (f"已 PURGE {purged} 个 binlog"
+                    f"（保留至 {purge_to}，共 {keep_files} 个）")
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     def _read_xb_checkpoints(path: str) -> dict:
         """读取物理备份产物中的 xtrabackup_checkpoints，返回 key=value 字典。
 
@@ -479,6 +519,27 @@ class MySQLEngine(BackupEngine):
                 f"解包物理产物失败 {os.path.basename(src)}: {(ret.stderr or '')[:300]}")
 
     @staticmethod
+    @staticmethod
+    def _find_pushable_lib(name: str, lmap: dict) -> str:
+        """为远端缺失库名找平台侧可推送的库文件。
+
+        匹配顺序：ldd/内置目录精确名 → 常见系统目录**前缀匹配**——
+        真实案例：远端缺 libcrypto.so.1.0.2，平台只有 libcrypto.so.1.0.2k
+        （同主版本带发行小缀），ABI 兼容可直接推送（推送后以远端命名的
+        文件名落盘，ldd 按请求名解析）。
+        """
+        exact = lmap.get(name)
+        if exact and os.path.isfile(exact):
+            return exact
+        import glob
+        for d in ("/usr/lib64", "/lib64", "/usr/lib", "/lib",
+                  os.environ.get("XB_BUNDLED_LIB_DIR", "/opt/xtrabackup_libs")):
+            for cand in sorted(glob.glob(os.path.join(d, name + "*")),
+                               reverse=True):
+                if os.path.isfile(cand):
+                    return cand
+        return ""
+
     def _local_lib_map(local_bin: str) -> dict:
         """解析平台侧二进制的 ldd 输出，返回 {库名: 本地绝对路径}。
 
@@ -713,11 +774,17 @@ class MySQLEngine(BackupEngine):
 
         note = ""
         if backup_type == BackupType.INCREMENTAL:
-            # 找最近全量作为增量基（目录形态）
+            # 找最近一次物理备份（全量**或增量**）作为增量基（目录形态）：
+            # LSN 链必须逐层衔接——增量2 的 from_lsn 应为增量1 的 to_lsn，
+            # 只认全量会让第二层增量与链断开（恢复时第二层 apply 报
+            # "not proper for the target"，双层链实测命中）。
             import glob as _glob
-            full_dirs = sorted(_glob.glob(os.path.join(out_dir, "xtrabackup_full_*")), reverse=True)
+            cand_dirs = sorted(
+                _glob.glob(os.path.join(out_dir, "xtrabackup_full_*"))
+                + _glob.glob(os.path.join(out_dir, "xtrabackup_inc_*")),
+                reverse=True)
             base_dir = None
-            for d in full_dirs:
+            for d in cand_dirs:
                 if os.path.isdir(d) and os.path.isfile(os.path.join(d, "xtrabackup_checkpoints")):
                     base_dir = d
                     break
@@ -806,12 +873,17 @@ class MySQLEngine(BackupEngine):
         inc_note = ""
         bt = backup_type if isinstance(backup_type, BackupType) else BackupType(str(backup_type))
         if bt == BackupType.INCREMENTAL:
+            try:
+                _cand = sorted(os.listdir(out_dir))
+            except OSError:
+                _cand = []
             base_art = self._xb_latest(out_dir, ("full", "inc"))
             if base_art:
                 cp = self._read_xb_checkpoints(base_art)
                 inc_lsn = str(cp.get("to_lsn") or "").strip()
                 if inc_lsn:
-                    inc_note = (f" 增量基于 {os.path.basename(base_art)} 的 to_lsn={inc_lsn}")
+                    inc_note = (f" 增量基于 {os.path.basename(base_art)} 的 to_lsn={inc_lsn}"
+                                f"（目录候选: {_cand[-4:]}）")
                 else:
                     inc_note = (f" 未能从 {os.path.basename(base_art)} 解析 to_lsn，"
                                 "已自动退化为全量")
@@ -825,8 +897,12 @@ class MySQLEngine(BackupEngine):
         kind = "inc" if inc_lsn else "full"
         remote_tmp = remote_dump.fixed_remote_path(
             self.task, f"{self.db_type}_phys", f"{kind}.d")
+        # 远端产物为**裸 tar**（不压缩）：rsync 增量拉取对 gzip 流无效
+        # （重压缩字节全变，实测命中仅 6%），对裸 tar 未变文件字节相同、
+        # 命中率极高；传输压缩交给 rsync -z，落盘压缩在平台侧 gzip 完成
+        # （产物仍为 .tar.gz，恢复/增量链语义零改动）。
         remote_tar = remote_dump.fixed_remote_path(
-            self.task, f"{self.db_type}_phys", f"{kind}.tar.gz")
+            self.task, f"{self.db_type}_phys", f"{kind}.tar")
         remote_cnf = "/tmp/bk_xtrabackup.cnf"
         pushed_bin = None
         pushed_libs_dir = None
@@ -925,12 +1001,16 @@ class MySQLEngine(BackupEngine):
                     _sep(client, remote_dump._wrap_login(
                         f"mkdir -p {pushed_libs_dir}"), timeout=30)
                     for name in missing:
-                        local_so = lmap.get(name)
-                        if not local_so or not os.path.isfile(local_so):
+                        local_so = self._find_pushable_lib(name, lmap)
+                        if not local_so:
                             return BackupResult(
                                 success=False, status=BackupStatus.FAILED,
                                 message=(f"远端缺失动态库 {name}，平台侧未找到对应库"
-                                         f"文件，无法推送 {bin_label} 执行。"))
+                                         f"文件（已搜索平台 ldd、镜像内置目录"
+                                         f" {os.environ.get('XB_BUNDLED_LIB_DIR', '/opt/xtrabackup_libs')}"
+                                         f" 与 /usr/lib64 前缀匹配），无法推送 {bin_label} 执行；"
+                                         f"可将该库文件放入镜像内置目录后重试，"
+                                         f"或在数据库服务器安装匹配版本 xtrabackup"))
                         sftp.put(local_so, f"{pushed_libs_dir}/{name}")
                     env_pre = (f"export LD_LIBRARY_PATH={pushed_libs_dir}"
                                f":$LD_LIBRARY_PATH; ")
@@ -964,7 +1044,7 @@ class MySQLEngine(BackupEngine):
                     f"--backup --target-dir={remote_tmp} "
                     f"--host={shlex.quote(host)} --port={port} --no-lock "
                     f"{inc_flag}"
-                    f"&& tar czf {remote_tar} -C {remote_tmp} ."
+                    f"&& tar cf {remote_tar} -C {remote_tmp} ."
                 )
             wrapped = remote_dump._wrap_login(inner)
             start = time.time()
@@ -993,24 +1073,69 @@ class MySQLEngine(BackupEngine):
                 remote_dump.mark_remote_artifact_done(
                     client, remote_tar, size=fsize, note=f"mysql {kind} {hk}")
 
-            # 4) 断点续传拉回 tar.gz 到本机（中断后重试从断点继续，不重跑备份）
+            # 4) 拉回裸 tar（rsync 增量差量 / sftp 断点续传）→ 平台 gzip 成
+            # .tar.gz 产物落盘（产物形态与历史一致，恢复/增量链零改动）
             # 产物名区分 full/inc：恢复侧据此识别增量链（含 to_lsn 元数据）
             local_path = os.path.join(out_dir, f"xtrabackup_{kind}_{ts}.tar.gz")
+            basis_dir = os.path.join(out_dir, ".basis")
+            basis_tar = os.path.join(basis_dir, f"{kind}.tar")
+            pull_tar = os.path.join(basis_dir, f"{kind}.pull.tar")
+            os.makedirs(basis_dir, exist_ok=True)
             keep_remote = True          # 拉回成功落盘前，远端产物一律保留
-            pulled = remote_dump.sftp_pull_resumable(
-                client, remote_tar, local_path, task=self.task,
-                key=f"{kind}.tar.gz", db_type=f"{self.db_type}_phys",
-                host_key=hk, has_rc=False, stable_secs=3,
-                label=f"xtrabackup {kind}", min_size=1024)
+            pulled = None
+            rsync_note = ""
+            _xextra = self._parse_extra_options()
+            _basis = basis_tar if os.path.isfile(basis_tar) else ""
+            if _xextra.get("rsync_delta_pull") and _basis:
+                # rsync 增量拉取（DB 单文件通道）：以**上一轮裸 tar 缓存**为
+                # basis 只传差量（裸 tar 未变文件字节相同，命中率高；对 gzip
+                # 流无效）。密钥认证主机可用；任何失败回退 sftp 通道。
+                try:
+                    from core import rsync_delta
+                    if os.path.exists(pull_tar):
+                        os.remove(pull_tar)
+                    rd = rsync_delta.pull_delta(ssh_host, remote_tar,
+                                                pull_tar, _basis)
+                    pulled = {"size": rd["size"], "sha256": rd["sha256"],
+                              "resumed": False}
+                    _pct = round(100.0 * rd["delta_bytes"] /
+                                 max(rd["logical_bytes"], 1), 1)
+                    rsync_note = (f"（rsync 增量拉取: 实传 "
+                                  f"{db.human_size(rd['delta_bytes'])} / 逻辑 "
+                                  f"{db.human_size(rd['logical_bytes'])}，"
+                                  f"实传比 {_pct}%）")
+                except Exception as e:  # noqa: BLE001 —— 回退整包
+                    self.logger.warning(
+                        "[%s] rsync 增量拉取失败，回退 sftp 整包: %s",
+                        self.task_name, str(e) or type(e).__name__)
+            if pulled is None:
+                pulled = remote_dump.sftp_pull_resumable(
+                    client, remote_tar, pull_tar, task=self.task,
+                    key=f"{kind}.tar", db_type=f"{self.db_type}_phys",
+                    host_key=hk, has_rc=False, stable_secs=3,
+                    label=f"xtrabackup {kind}", min_size=1024)
             keep_remote = False         # 已完整落盘 → 远端产物可清理
-            size = pulled["size"]
-            checksum = pulled["sha256"]
+            # 裸 tar → gzip 产物（下游语义零改动）；basis 缓存更新为本次裸 tar
+            import gzip as _gzip
+            with open(pull_tar, "rb") as fin, \
+                    open(local_path + ".tmp", "wb") as fraw, \
+                    _gzip.GzipFile(fileobj=fraw, mode="wb",
+                                   compresslevel=6) as fz:
+                while True:
+                    chunk = fin.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    fz.write(chunk)
+            os.replace(local_path + ".tmp", local_path)
+            size = os.path.getsize(local_path)
+            checksum = db.sha256_file(local_path)
+            os.replace(pull_tar, basis_tar)     # 本轮裸 tar 成为下轮 basis
             tool_label = os.path.basename(tool) if tool else "远端已有产物"
             msg = (f"通过 SSH 在 {hk} 以 {tool_label} 执行 MySQL 物理备份成功，"
                    f"已拉回 {local_path} ({db.human_size(size)})"
                    f"{'（复用上次远端产物，未重跑备份）' if reuse else ''}"
                    f"{'（断点续传）' if pulled['resumed'] else ''}"
-                   f"{push_note}{inc_note}")
+                   f"{push_note}{inc_note}{rsync_note}")
             self.logger.info("[%s] %s", self.task_name, msg)
 
             # 清理远端临时目录与 tar 包（best-effort，失败不致命）
@@ -1312,10 +1437,21 @@ class MySQLEngine(BackupEngine):
             dur = round(time.time()-start, 3)
 
             if res["returncode"] != 0:
-                return BackupResult(success=False, status=BackupStatus.FAILED,
-                                    backup_path=None, duration_sec=dur,
-                                    stderr=res["stderr"],
-                                    message=f"mysqldump 失败: {res.get('stderr','')[:500]}")
+                # mysql.event 缺失/损坏（老版本/异常实例）报
+                # "Can't find file: 'event'"——去掉 --events 重试一次，
+                # 优先保住整库备份（事件定义缺失在消息中如实告知）
+                if "Can't find file: 'event'" in (res.get("stderr") or "") \
+                        and "--events" in dump_args:
+                    dump_args = [a for a in dump_args if a != "--events"]
+                    note += "（源库 mysql.event 缺失，已自动去掉 --events 重试；该备份不含事件定义）"
+                    inner = self._build_dump_shell(dump_args, out_path, algo, raw_path)
+                    res = self._run(["sh", "-c", inner])
+                    dur = round(time.time() - start, 3)
+                if res["returncode"] != 0:
+                    return BackupResult(success=False, status=BackupStatus.FAILED,
+                                        backup_path=None, duration_sec=dur,
+                                        stderr=res["stderr"],
+                                        message=f"mysqldump 失败: {res.get('stderr','')[:500]}")
             size = os.path.getsize(out_path)
             original = os.path.getsize(raw_path) if (raw_path and os.path.exists(raw_path)) else 0
             if raw_path and os.path.exists(raw_path):
@@ -1733,14 +1869,40 @@ class MySQLEngine(BackupEngine):
         os_user = (ssh_host.get("username") or "root").strip() or "root"
         sftp = None
         try:
-            subprocess.run(["tar", "czf", ltar, "-C", work_dir, "."],
-                           capture_output=True, timeout=3600)
-            if not os.path.isfile(ltar):
-                raise RuntimeError("打包 prepare 后数据目录失败")
+            _tp = subprocess.run(["tar", "czf", ltar, "-C", work_dir, "."],
+                                 capture_output=True, text=True, timeout=3600)
+            # 只判 isfile 不够：磁盘满时 tar czf 产出**空文件**（isfile=True），
+            # 上传对账 0==0 通过，把失败伪装成远端 gzip "unexpected end of
+            # file"（实测命中）。必须校验 returncode + size>0。
+            if _tp.returncode != 0:
+                raise RuntimeError("打包 prepare 后数据目录失败(rc=%d): %s"
+                                   % (_tp.returncode, (_tp.stderr or "")[-200:]))
+            if not os.path.isfile(ltar) or os.path.getsize(ltar) < 1024:
+                raise RuntimeError(
+                    "打包 prepare 后数据目录失败：产物仅 %d 字节"
+                    "（常见根因：平台磁盘空间不足，请清理后重试）"
+                    % (os.path.getsize(ltar) if os.path.isfile(ltar) else -1))
             logs.append(f"[物理恢复] 上传 prepare 后数据目录 "
                         f"({db.human_size(os.path.getsize(ltar))}) 到远端临时校验 ...")
             sftp = client.open_sftp()
             sftp.put(ltar, rtar)
+            # 上传完整性对账：远端半包会导致远端 gzip "unexpected end of
+            # file"（rc=41 伪装成校验失败）——此处直接比对字节数，不匹配
+            # 立即清理半包并给明确诊断（常见根因：两端磁盘空间不足）。
+            _lsize = os.path.getsize(ltar)
+            try:
+                _rsize = int(sftp.stat(rtar).st_size or 0)
+            except OSError:
+                _rsize = -1
+            if _rsize != _lsize:
+                try:
+                    sftp.remove(rtar)
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"校验数据包上传不完整（本地 {_lsize} 字节 / 远端 {_rsize} 字节）："
+                    f"常见根因是平台或数据库服务器磁盘空间不足/传输中断；"
+                    f"请清理磁盘后重试（远端半包已清理）")
             mysqld_r = remote_dump._resolve_remote_bin(client, "mysqld")
             mysql_r = remote_dump._resolve_remote_bin(client, "mysql")
             if not mysqld_r:
@@ -2017,8 +2179,16 @@ class MySQLEngine(BackupEngine):
                             raise RuntimeError(
                                 f"增量恢复: 解压增量层失败: {(ret.stderr or '')[:300]}")
                     logs.append(f"[增量恢复] 应用增量层: {os.path.basename(inc)}")
-                    cmd_i = [xtrabackup, "--prepare",
-                             f"--incremental-dir={inc_work}", f"--target-dir={work}"]
+                    # 链式恢复的**中间层**也必须 --apply-log-only（只应用 redo
+                    # 不推进 LSN/不回滚），否则下一层报"needs target prepared
+                    # with --apply-log-only"；仅最后一层完整 prepare。
+                    # （此前只有全量基带该参数，单层增量链恰好不触发，双层链
+                    #   实测暴露——R1 失败即第二层应用。）
+                    is_last_layer = (i == len(incr_chain) - 1)
+                    cmd_i = [xtrabackup, "--prepare"]
+                    if not is_last_layer:
+                        cmd_i += apply_only
+                    cmd_i += [f"--incremental-dir={inc_work}", f"--target-dir={work}"]
                     if self._restore_parallel() > 1:
                         cmd_i.append(f"--parallel={self._restore_parallel()}")
                     ret = subprocess.run(cmd_i, capture_output=True, text=True,
@@ -2102,14 +2272,99 @@ class MySQLEngine(BackupEngine):
                             tail = f.read()[-600:]
                     raise RuntimeError(f"临时实例启动超时/失败: {tail or '无错误日志'}")
 
-                # 5) 校验数据可读
+                # 5) target_db 异名库落地（全量+增量恢复到目标库的端到端交付）：
+                #    物理恢复是实例级，恢复出的数据在临时实例的 task.db_name 下，
+                #    临时实例销毁即消失。指定 target_db 且与源库不同名时，从临时
+                #    实例导出源库并灌入**任务源实例**的 target_db（真实交付），
+                #    行数校验一致才算通过。
+                tgt_db = (target_db or "").strip()
+                src_db = (self.task.get("db_name") or "").strip()
+                if tgt_db and tgt_db != src_db:
+                    dump_bin = os.path.join(os.path.dirname(mysql_cli), "mysqldump")
+                    if not os.path.isfile(dump_bin):
+                        import shutil as _sh
+                        dump_bin = _sh.which("mysqldump") or ""
+                    if not dump_bin:
+                        raise RuntimeError(
+                            "物理恢复到异名目标库需要 mysqldump（临时实例导出用），"
+                            "平台侧未找到")
+                    sql_f = os.path.join(tmp, "pitr_out.sql")
+                    d = subprocess.run(
+                        [dump_bin, "--no-defaults", "-uroot", f"--socket={sock}",
+                         "--single-transaction", "--routines", "--triggers",
+                         "--events", src_db],
+                        capture_output=True, timeout=3600,
+                        env=self._tool_env(dump_bin))
+                    if d.returncode != 0 or not d.stdout:
+                        raise RuntimeError(
+                            f"从临时实例导出 {src_db} 失败: "
+                            f"{(d.stderr or b'')[-300:]}")
+                    with open(sql_f, "wb") as f:
+                        f.write(d.stdout)
+                    # 灌入任务源实例的 target_db
+                    _pw = db.decrypt_secret(str(self.task.get("password") or ""))
+                    _env = os.environ.copy()
+                    if _pw:
+                        _env["MYSQL_PWD"] = _pw
+                    tgt_host = str(self.task.get("host") or "127.0.0.1")
+                    tgt_port = str(self.task.get("port") or 3306)
+                    tgt_user = str(self.task.get("username") or "root")
+                    c1 = subprocess.run(
+                        [mysql_cli, "--no-defaults", "-h", tgt_host,
+                         "-P", tgt_port, "-u", tgt_user, "-e",
+                         f"CREATE DATABASE IF NOT EXISTS `{tgt_db}` "
+                         "DEFAULT CHARSET utf8mb4"],
+                        capture_output=True, text=True, timeout=120, env=_env)
+                    if c1.returncode != 0:
+                        raise RuntimeError(f"目标实例建库失败: {c1.stderr[:200]}")
+                    with open(sql_f, "rb") as f:
+                        c2 = subprocess.run(
+                            [mysql_cli, "--no-defaults", "-h", tgt_host,
+                             "-P", tgt_port, "-u", tgt_user, tgt_db],
+                            stdin=f, capture_output=True, text=True,
+                            timeout=3600, env=_env)
+                    if c2.returncode != 0:
+                        raise RuntimeError(
+                            f"灌入目标库 {tgt_db} 失败: {c2.stderr[:300]}")
+                    logs.append(
+                        f"[物理恢复] 已把恢复出的 {src_db} 落地到目标实例 "
+                        f"{tgt_host}:{tgt_port}/{tgt_db}")
+                    target_db = tgt_db      # 后续校验按目标库核对
+
+                # 6) 校验数据可读
                 # 物理恢复是"整实例级"落地（数据目录级）：备份里有什么库就恢复什么库，
                 # 任务表单里的 target_db 属于逻辑恢复语义，对物理恢复通常不成立。
                 # 因此不能拿 target_db 一查了事——查不到表仍报"通过"就是假通过。
                 # 规则：目标库存在且有表 → 校验该库；否则回退实例级（库数 + 业务表数），
                 # 且业务表数为 0 时如实判失败（否则等于根本没校验）。
-                label, verify_out = self._verify_physical_datadir(
-                    mysql_cli, sock, target_db, logs)
+                # 异名落地后：核对目标实例 target_db 与临时实例源库行数一致。
+                if tgt_db and tgt_db != src_db:
+                    def _rows(instance_args, dbname, env=None):
+                        return subprocess.run(
+                            instance_args + ["-N", "-e",
+                                             "SELECT COUNT(*) FROM "
+                                             "information_schema.tables "
+                                             f"WHERE table_schema='{dbname}'"],
+                            capture_output=True, text=True, timeout=60,
+                            env=env or self._tool_env(mysql_cli))
+                    c_t = _rows([mysql_cli, "--no-defaults", "-uroot",
+                                 f"--socket={sock}"], src_db)
+                    c_r = _rows([mysql_cli, "--no-defaults", "-h", tgt_host,
+                                 "-P", tgt_port, "-u", tgt_user], tgt_db,
+                                env=_env)
+                    n_t = int(c_t.stdout.strip() or 0) if c_t.returncode == 0 else -1
+                    n_r = int(c_r.stdout.strip() or 0) if c_r.returncode == 0 else -1
+                    if n_t < 0 or n_r != n_t:
+                        raise RuntimeError(
+                            f"异名落地校验失败：临时实例 {src_db} 表数 {n_t}，"
+                            f"目标 {tgt_db} 表数 {n_r}")
+                    label = f"异名落地 {tgt_db}"
+                    verify_out = (f"表数 {n_r}（临时实例源库 {src_db} 一致）；"
+                                  "行级抽查见 operation 日志")
+                    logs.append(f"[物理恢复] 异名落地校验通过: {tgt_db} 表数 {n_r}")
+                else:
+                    label, verify_out = self._verify_physical_datadir(
+                        mysql_cli, sock, target_db, logs)
             logs.append(f"[物理恢复] 校验通过: {label} {verify_out}")
 
             duration = round(time.time() - start, 3)

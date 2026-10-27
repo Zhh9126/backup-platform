@@ -320,9 +320,11 @@ def remote_has_tool(ssh_host: dict, tool: str, check_user: str = None,
 def _connect(ssh_host: dict):
     from core.engines.file import _get_ssh_client
     # 任务级 SSH 凭据（resolve_ssh_host 构造的临时主机）直接带密码；
-    # 已纳管主机 dict 也含解密后密码，传入可省一次 DB 查询。
+    # 已纳管主机 dict 也含解密后密码与 private_key（PEM 内容），传入可省
+    # 一次 DB 查询。密钥认证主机（auth_type=key）password 可能为空或占位。
     pw = ssh_host.get("password") or None
-    return _get_ssh_client(ssh_host["host_key"], password=pw)
+    return _get_ssh_client(ssh_host["host_key"], password=pw,
+                           private_key=ssh_host.get("private_key") or "")
 
 
 def remote_exec_capture(ssh_host: dict, shell: str, timeout: int = 1800) -> dict:
@@ -609,13 +611,15 @@ def _connect_isolated(ssh_host: dict):
     port = int(ssh_host.get("port") or 22)
     user = ssh_host.get("username") or "root"
     pw = ssh_host.get("password")
-    if not pw and host_key:
+    priv_pem = ""
+    if host_key:
         row = db.query_one(
-            "SELECT password FROM ssh_hosts WHERE host_key=? LIMIT 1",
+            "SELECT password, private_key FROM ssh_hosts WHERE host_key=? LIMIT 1",
             (host_key,),
         )
         if row:
             pw = db.decrypt_secret(row["password"] or "")
+            priv_pem = (row["private_key"] or "").strip()
     if host_key:
         # 复用 _connect 的地址解析逻辑（user@host:port 形式）
         addr = host_key
@@ -640,11 +644,25 @@ def _connect_isolated(ssh_host: dict):
     # （resolve_remote_tool / remote_has_tool）高频调用、每次独立建连，
     # 连续建连极易撞上 sshd MaxStartups 瞬时限流（表现为 banner EOF /
     # SSHException），168 Oracle 11g 容器 E2E 实测触发。短暂退避重试。
+    # 认证顺序：private_key（PEM 内容/路径）优先，失败回退密码。
+    from core.ssh_hosts import load_pkey
+    pkey = load_pkey(priv_pem)
     _ssh_exc = paramiko.ssh_exception.SSHException
     _auth_exc = paramiko.ssh_exception.AuthenticationException
     last_exc = None
     for _attempt in (1, 2, 3):
         try:
+            if pkey is not None:
+                try:
+                    client.connect(host, port=port, username=user, pkey=pkey,
+                                   timeout=15, allow_agent=False,
+                                   look_for_keys=False)
+                    last_exc = None
+                    break
+                except _auth_exc:
+                    if not pw:
+                        raise
+                    # 密钥认证失败且无密码可用则抛出；有密码则回退密码认证
             client.connect(host, port=port, username=user, password=pw,
                            timeout=15, allow_agent=False, look_for_keys=False)
             last_exc = None

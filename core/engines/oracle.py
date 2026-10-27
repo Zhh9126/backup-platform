@@ -24,6 +24,7 @@ Oracle 客户端前置条件（重要）：
 
 import os
 import json
+import re
 import shlex
 import shutil
 import time
@@ -72,6 +73,34 @@ class OracleEngine(BackupEngine):
             self.logger.warning("[%s] extra_options 不是合法 JSON，忽略: %r",
                                  self.task_name, raw)
             return {}
+
+    def _dp_mode_args(self, extra: dict = None, for_import: bool = False) -> tuple:
+        """expdp/impdp 模式参数：tables 优先（支持 `表:分区` 分区级导出/导入，
+        分区表按表名整体导出亦由此路径生效），其次 schemas，最后 FULL=Y。
+
+        tables 未带模式前缀时自动补 schemas 首个模式（expdp TABLES 要求
+        schema-qualified 名称）。返回 (mode_args, mode_desc)；
+        for_import=True 且无 tables/schemas 时返回空串（= 整包导入，
+        与历史行为一致，避免 FULL=Y 改变既有恢复语义）。
+        """
+        extra = extra if extra is not None else self._parse_extra()
+        schemas = extra.get("schemas")
+        schemas_arg = (",".join(str(s) for s in schemas)
+                       if isinstance(schemas, list) else
+                       (str(schemas) if schemas else ""))
+        tables = extra.get("tables")
+        if tables:
+            tlist = [t.strip() for t in
+                     (tables if isinstance(tables, list)
+                      else str(tables).split(",")) if t.strip()]
+            if schemas_arg:
+                s0 = schemas_arg.split(",")[0].strip().upper()
+                tlist = [t if "." in t else f"{s0}.{t}" for t in tlist]
+            arg = ",".join(tlist)
+            return f"TABLES={arg}", f"指定表(tables={arg})"
+        if schemas_arg:
+            return f"SCHEMAS={schemas_arg}", f"指定模式(schemas={schemas_arg})"
+        return ("" if for_import else "FULL=Y"), "全库"
 
     @staticmethod
     def _quote_password(pw: str) -> str:
@@ -263,7 +292,7 @@ class OracleEngine(BackupEngine):
             if not impdp_bin:
                 return BackupResult(success=False, status=BackupStatus.FAILED,
                                     message="远端未找到 impdp，无法执行 SQLFILE 校验")
-            mode_args = f"SCHEMAS={schemas_arg}" if schemas_arg else ""
+            mode_args = self._dp_mode_args(for_import=True)[0]
             verify_conn = f"{username}/{self._quote_password(pw)}@//{self._db_host_for_remote(ssh_host)}:{port}/{service}"
             inner = (f"export PATH=$ORACLE_HOME/bin:$PATH; "
                      f"{shlex.quote(impdp_bin)} {shlex.quote(verify_conn)} "
@@ -541,18 +570,8 @@ class OracleEngine(BackupEngine):
                 success=False, status=BackupStatus.FAILED,
                 message="expdp 客户端不可用，无法执行 Oracle 全量导出")
 
-        schemas = extra.get("schemas")
-        if schemas:
-            # schemas 可为列表或逗号分隔字符串
-            if isinstance(schemas, list):
-                schemas_arg = ",".join(str(s) for s in schemas)
-            else:
-                schemas_arg = str(schemas)
-            mode_args = ["SCHEMAS=" + schemas_arg]
-            mode_desc = f"指定模式(schemas={schemas_arg})"
-        else:
-            mode_args = ["FULL=Y"]
-            mode_desc = "全库(FULL=Y)"
+        mode_args_str, mode_desc = self._dp_mode_args(extra)
+        mode_args = [mode_args_str] if mode_args_str else []
 
         dumpfile = f"{ts}.dmp"
         logfile = f"{ts}.log"
@@ -648,12 +667,92 @@ class OracleEngine(BackupEngine):
     # ------------------------------------------------------------------ #
     # 对外接口
     # ------------------------------------------------------------------ #
+    def _archive_trigger_met(self) -> tuple:
+        """归档日志备份触发条件检查（对标鼎甲"自定义归档日志备份触发条件"）。
+
+        extra.archive_trigger = {"min_unbacked_logs": N, "fra_free_floor_gb": X}
+        - 未备份归档日志数（v$archived_log backup_count=0 且未删除）≥ N → 触发；
+        - FRA 剩余空间 ≤ X GB → 触发（快满优先备份，防止 FRA 打爆挂库）。
+        配置了多个条件按 **任一满足即触发**；全部未满足 → 不触发。
+        未配置 archive_trigger → 恒触发（兼容既有行为）。
+
+        Returns:
+            (met: bool, detail: str)
+        """
+        extra = self._parse_extra()
+        trig = extra.get("archive_trigger")
+        if not isinstance(trig, dict) or not trig:
+            return True, "未配置触发条件（恒触发）"
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+
+        ssh = remote_dump.resolve_ssh_host(self.task)
+        if not ssh:
+            return True, "未纳管 SSH 主机，无法查询触发条件（按触发处理）"
+        try:
+            client = remote_dump._connect(ssh)
+            ts = self._timestamp()
+            sqlfile = f"/tmp/atrigger_{ts}.sql"
+            sftp = client.open_sftp()
+            try:
+                with sftp.open(sqlfile, "w") as f:
+                    f.write(
+                        "connect / as sysdba\nSET PAGESIZE 0 FEEDBACK OFF "
+                        "HEADING OFF\n"
+                        "SELECT COUNT(*) FROM v$archived_log "
+                        "WHERE backup_count = 0 AND deleted = 'NO';\n"
+                        "SELECT ROUND((SPACE_LIMIT - SPACE_USED)/1024/1024/1024, 1) "
+                        "FROM v$recovery_file_dest;\nEXIT;\n")
+            finally:
+                sftp.close()
+            shell = (f"su - {self._resolve_check_user(ssh)} -c "
+                     f"{shlex.quote('sqlplus -s /nolog @' + sqlfile)}")
+            out, err, rc = _ssh_exec_pipe(
+                client, remote_dump._wrap_login(shell), timeout=60)
+            txt = out.decode("utf-8", "replace") if isinstance(out, bytes) \
+                else str(out or "")
+            nums = [l.strip() for l in txt.splitlines() if l.strip().isdigit()]
+            unbacked = int(nums[0]) if len(nums) > 0 else 0
+            fra_free_gb = float(nums[1]) if len(nums) > 1 else -1.0
+        except Exception as e:  # 探测失败按触发处理（宁多备不漏备）
+            return True, f"触发条件探测失败（按触发处理）: {e}"
+
+        reasons = []
+        met = False
+        n_min = int(trig.get("min_unbacked_logs") or 0)
+        if n_min > 0:
+            if unbacked >= n_min:
+                met = True
+                reasons.append(f"未备份归档日志 {unbacked} 个 ≥ 阈值 {n_min}（满足）")
+            else:
+                reasons.append(f"未备份归档日志 {unbacked} 个 < 阈值 {n_min}")
+        floor = float(trig.get("fra_free_floor_gb") or 0)
+        if floor > 0 and fra_free_gb >= 0:
+            if fra_free_gb <= floor:
+                met = True
+                reasons.append(f"FRA 剩余 {fra_free_gb}GB ≤ 阈值 {floor}GB（满足）")
+            else:
+                reasons.append(f"FRA 剩余 {fra_free_gb}GB > 阈值 {floor}GB")
+        return met, "；".join(reasons) or "条件字段为空（恒触发）"
+
     def backup(self, backup_type: BackupType) -> BackupResult:
         """Oracle 备份：按 backup_mode 分发物理(RMAN)/逻辑(expdp/exp)。
 
         逻辑备份优先在 SSH 备份机/数据库服务器执行 exp，失败再回退本机 expdp/exp。
+        配置 extra.archive_trigger 时先做触发条件检查（未满足则如实跳过）。
         """
         # demo_only / DEMO_MODE 不再触发仿真，统一走真实备份
+
+        trig = self._parse_extra().get("archive_trigger")
+        if isinstance(trig, dict) and trig:
+            met, detail = self._archive_trigger_met()
+            if not met:
+                return BackupResult(
+                    success=True, status=BackupStatus.SUCCESS,
+                    message=(f"归档备份触发条件未满足，已跳过（{detail}）。"
+                             "如需强制执行请调整 archive_trigger 配置或临时移除该选项"),
+                )
+            self.logger.info("[%s] 归档触发条件满足: %s", self.task_name, detail)
 
         if self.backup_mode == BackupMode.PHYSICAL:
             # 物理备份优先走 SSH 远端真实 RMAN（Oracle 服务器自带 rman，
@@ -920,18 +1019,7 @@ class OracleEngine(BackupEngine):
                 message="无法确定连接 service name：请填写 db_name 或服务名(service)")
 
         extra = self._parse_extra()
-        schemas = extra.get("schemas")
-        if schemas:
-            if isinstance(schemas, list):
-                schemas_arg = ",".join(str(s) for s in schemas)
-            else:
-                schemas_arg = str(schemas)
-            mode_args = f"SCHEMAS={schemas_arg}"
-            mode_desc = f"指定模式(schemas={schemas_arg})"
-        else:
-            mode_args = "FULL=Y"
-            mode_desc = "全库(FULL=Y)"
-
+        mode_args, mode_desc = self._dp_mode_args(extra)
         host = self.task.get("host") or "127.0.0.1"
         port = self.task.get("port") or 1521
         username = self.task.get("username") or "system"
@@ -1220,7 +1308,7 @@ class OracleEngine(BackupEngine):
                         success=False, status=BackupStatus.FAILED,
                         message="远端未找到 impdp（已探测 oracle 用户 PATH 与常见 "
                                 "ORACLE_HOME 安装目录），请确认数据库软件安装完整")
-                mode_args = f"SCHEMAS={schemas_arg}" if schemas_arg else ""
+                mode_args = self._dp_mode_args(for_import=True)[0]
                 inner = (f"export PATH=$ORACLE_HOME/bin:$PATH; "
                          f"{shlex.quote(impdp_bin)} {shlex.quote(restore_conn)} "
                          f"DUMPFILE={dmp_name} LOGFILE={log_name} "
@@ -1537,6 +1625,202 @@ exit;
             message=(f"RMAN PITR 脚本已生成但未执行：{script}；"
                      "请在数据库服务器上（Oracle 用户）执行该脚本，"
                      "或在「实时备份/PITR」中通过平台 SSH 通道下发"))
+
+    def rman_pitr_remote(self, target_time: str, confirm: bool = False,
+                         ssh_host: dict = None) -> BackupResult:
+        """RMAN 时间点恢复（PITR）——平台 SSH 通道真实执行。
+
+        破坏性操作：SHUTDOWN → RESTORE/RECOVER → OPEN RESETLOGS 会把目标库
+        整体回退到 target_time，必须 confirm=True 显式确认。
+
+        前提：ARCHIVELOG 模式 + target_time 之前存在有效 RMAN 全量（0 级）
+        备份 + 归档日志在 FRA/备份中可用。
+
+        流程（全部经 SSH 在数据库服务器以 oracle 用户执行）：
+          1) sqlplus 预检：log_mode=ARCHIVELOG；
+          2) sqlplus：SHUTDOWN IMMEDIATE; STARTUP MOUNT;
+          3) rman：RUN { SET UNTIL TIME ...; RESTORE DATABASE; RECOVER DATABASE;
+             ALTER DATABASE OPEN RESETLOGS; }
+          4) sqlplus 验证实例 OPEN。
+        """
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+
+        if not target_time:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="必须提供 target_time（YYYY-MM-DD HH24:MI:SS）")
+        if not re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$",
+                        str(target_time).strip()):
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="target_time 格式必须为 YYYY-MM-DD HH24:MI:SS")
+        if not confirm:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message=("PITR 为破坏性操作（RESTORE+RECOVER+OPEN RESETLOGS 将把"
+                         "目标库整体回退到指定时点），必须显式传 confirm=true"))
+
+        ssh = ssh_host or remote_dump.resolve_ssh_host(self.task)
+        if not ssh:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="任务未纳管 SSH 备份机，无法在数据库服务器"
+                                        "执行 PITR（本机通道不支持远端恢复）")
+        client = remote_dump._connect(ssh)
+        check_user = self._resolve_check_user(ssh)
+        ts = self._timestamp()
+
+        def ora(sql_text: str, timeout: int = 120) -> tuple:
+            """远端 sqlplus 执行（SFTP 写脚本，避免多层引号嵌套）。"""
+            sqlfile = f"/tmp/pitr_{ts}_{int(time.time()*1000)%100000}.sql"
+            sftp = client.open_sftp()
+            try:
+                with sftp.open(sqlfile, "w") as f:
+                    f.write("connect / as sysdba\nSET PAGESIZE 0 FEEDBACK OFF "
+                            "HEADING OFF\n" + sql_text + "\nEXIT;\n")
+            finally:
+                sftp.close()
+            shell = (f"su - {check_user} -c "
+                     f"{shlex.quote('sqlplus -s /nolog @' + sqlfile)}")
+            out, err, rc = _ssh_exec_pipe(
+                client, remote_dump._wrap_login(shell), timeout=timeout)
+            txt = out.decode("utf-8", "replace") if isinstance(out, bytes) \
+                else str(out or "")
+            return txt, err, rc
+
+        def rman_run(rman_script: str, timeout: int = 7200) -> tuple:
+            rman_bin = self._resolve_oracle_tool(client, "rman")
+            if not rman_bin:
+                raise RuntimeError("远端未找到 rman（已探测 oracle 用户 PATH 与 "
+                                   "常见 ORACLE_HOME 目录）")
+            shfile = f"/tmp/pitr_{ts}.rman"
+            sftp = client.open_sftp()
+            try:
+                with sftp.open(shfile, "w") as f:
+                    f.write(rman_script)
+            finally:
+                sftp.close()
+            shell = (f"su - {check_user} -c "
+                     f"{shlex.quote(rman_bin + ' target / cmdfile=' + shfile)}")
+            return _ssh_exec_pipe(client, remote_dump._wrap_login(shell),
+                                  timeout=timeout)
+
+        def has_ora_error(text: str) -> str:
+            for line in text.splitlines():
+                s = line.strip()
+                if s.startswith("ORA-") or s.startswith("RMAN-"):
+                    return s[:200]
+            return ""
+
+        # 0.5) 备份片回推：物理备份拉回后远端**零残留**，而 RMAN PITR 在数据库
+        # 服务器上执行 RESTORE，必须有备份片——否则 ORA-19505 failed to
+        # identify file（实测命中）。从平台产物目录推回最近一轮备份片并 CATALOG。
+        out_dir = self._output_dir()
+        try:
+            import glob as _glob
+            all_bkps = [(p, os.path.getmtime(p)) for p in _glob.glob(
+                os.path.join(out_dir, "ora_bkp_*.bkp"))]
+            if all_bkps:
+                all_bkps.sort(key=lambda x: -x[1])
+                m_pref = re.search(r"(ora_bkp_t\d+)",
+                                   os.path.basename(all_bkps[0][0]))
+                prefix = m_pref.group(1) if m_pref else ""
+                batch = ([p for p, _ in all_bkps
+                          if prefix and prefix in os.path.basename(p)]
+                         if prefix else [all_bkps[0][0]])
+                dp_dir = self._query_dp_dir(client) or "/u01/app/oracle/backup"
+                _sftp = client.open_sftp()
+                try:
+                    for p in batch:
+                        rmt = f"{dp_dir}/{os.path.basename(p)}"
+                        try:
+                            if int(_sftp.stat(rmt).st_size or 0) == \
+                                    os.path.getsize(p):
+                                continue   # 已在且完整（重试续传）
+                        except FileNotFoundError:
+                            pass
+                        self.logger.info("[%s] PITR: 回推备份片 %s (%s)",
+                                         self.task_name, os.path.basename(p),
+                                         db.human_size(os.path.getsize(p)))
+                        _sftp.put(p, rmt)
+                finally:
+                    try:
+                        _sftp.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                rman_run(f"CATALOG START WITH '{dp_dir}/' NOPROMPT;\nexit;\n")
+                self.logger.info("[%s] PITR: 已回推 %d 个备份片并 CATALOG",
+                                 self.task_name, len(batch))
+        except Exception as e:  # noqa: BLE001 —— 回推失败不阻断（RMAN 本地能找到则可忽略）
+            self.logger.warning("[%s] PITR 备份片回推失败: %s",
+                                self.task_name, e)
+
+        try:
+            # 1) 预检：ARCHIVELOG
+            pre, _e, _rc = ora("SELECT log_mode FROM v$database;")
+            if "ARCHIVELOG" not in pre.upper():
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    message=f"源库非 ARCHIVELOG 模式，无法 PITR（log_mode 输出: "
+                            f"{pre.strip()[:60]}）")
+
+            # 2) 停库到 MOUNT
+            self.logger.info("[%s] PITR: SHUTDOWN IMMEDIATE + STARTUP MOUNT",
+                             self.task_name)
+            sh_out, sh_err, sh_rc = ora(
+                "SHUTDOWN IMMEDIATE;\nSTARTUP MOUNT;\n"
+                "SELECT status FROM v$instance;", timeout=300)
+            err_line = has_ora_error(sh_out)
+            if err_line:
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                    message=f"停库/加载阶段失败: {err_line}")
+
+            # 3) RMAN RESTORE + RECOVER + OPEN RESETLOGS
+            safe_t = str(target_time).strip()
+            rman_script = (
+                # 不写 connect target /：命令行已 `rman target /`，脚本内重复
+                # connect 会报 RMAN-06167 "already connected"（实测命中）
+                "RUN {\n"
+                f"  SET UNTIL TIME \"TO_DATE('{safe_t}','YYYY-MM-DD HH24:MI:SS')\";\n"
+                "  RESTORE DATABASE;\n"
+                "  RECOVER DATABASE;\n"
+                "}\n"
+                "ALTER DATABASE OPEN RESETLOGS;\n"
+                "exit;\n")
+            self.logger.info("[%s] PITR: RESTORE/RECOVER 到 %s …",
+                             self.task_name, safe_t)
+            out, err, rc = rman_run(rman_script)
+            rman_txt = out.decode("utf-8", "replace") if isinstance(out, bytes) \
+                else str(out or "")
+            err_line = has_ora_error(rman_txt)
+            if rc != 0 or err_line:
+                # 恢复失败时尽力把实例拉回 OPEN，避免留下 MOUNT 状态
+                try:
+                    ora("ALTER DATABASE OPEN RESETLOGS;", timeout=300)
+                except Exception:  # noqa: BLE001
+                    try:
+                        ora("ALTER DATABASE OPEN;", timeout=300)
+                    except Exception:  # noqa: BLE001
+                        pass
+                tail = rman_txt[-500:] if rman_txt else str(err or "")[-500:]
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                    message=f"RMAN RESTORE/RECOVER 失败: "
+                                            f"{err_line or 'rc=' + str(rc)}；"
+                                            f"日志尾部: {tail}")
+
+            # 4) 验证实例 OPEN
+            st, _e2, _r2 = ora("SELECT status FROM v$instance;", timeout=60)
+            opened = "OPEN" in st.upper() and "MOUNTED" not in st.upper()
+            return BackupResult(
+                success=opened,
+                status=(BackupStatus.SUCCESS if opened
+                        else BackupStatus.FAILED),
+                message=(f"Oracle PITR 完成：已恢复至 {safe_t} 并 OPEN RESETLOGS"
+                         f"（实例状态: {'OPEN' if opened else st.strip()[:30]}）；"
+                         "incarnate 已变化，请立即做一次全量备份"),
+                stdout=rman_txt[-2000:],
+            )
+        except Exception as e:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message=f"PITR 执行异常: {e}")
 
     def archivelog_backup(self) -> BackupResult:
         """RMAN 归档日志备份（保证 PITR 窗口）。

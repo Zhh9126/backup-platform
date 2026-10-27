@@ -78,6 +78,14 @@
       <select class="form-select" id="schTargets" multiple size="3"></select>
     </div>
     <div class="col-md-2">
+      <label class="form-label">演练模式</label>
+      <div class="form-check form-switch mt-2">
+        <input class="form-check-input" type="checkbox" id="schRealMode">
+        <label class="form-check-label small" for="schRealMode">真实恢复</label>
+      </div>
+      <div class="form-text small">开启后排程走真实恢复演练（真恢复+校验+销毁，当前支持 MySQL/MariaDB）</div>
+    </div>
+    <div class="col-md-2">
       <label class="form-label">下次执行</label>
       <div id="schNextRun" class="mt-2 small text-muted">—</div>
     </div>
@@ -109,10 +117,12 @@
         <div class="mb-3">
           <label class="form-label">演练类型</label>
           <select class="form-select" id="drill_type">
-            <option value="full_recovery">全量恢复演练</option>
+            <option value="real_restore">真实恢复演练（真恢复到临时库+数据校验+自动销毁）</option>
+            <option value="full_recovery">全量恢复演练（元数据检查）</option>
             <option value="partial">对象级恢复演练</option>
             <option value="table_recovery">单表恢复演练</option>
           </select>
+          <div class="form-text">真实演练当前支持 MySQL/MariaDB；隔离口径为库级（drill_ 前缀临时库，不触碰生产库），演练完自动销毁。</div>
         </div>
         <div class="mb-3">
           <label class="form-label">演练时间</label>

@@ -1,0 +1,44 @@
+{
+  "targets": [
+    {
+      "id": "139-pg14",
+      "ssh": {"host": "192.168.220.139", "port": 22, "username": "root",
+              "password": "123123", "auth_type": "password", "os_type": "linux"},
+      "task": {"name": "matrix-139-pg14", "db_type": "postgresql",
+               "host": "192.168.220.139", "port": 5432,
+               "username": "postgres", "password": "Test@2026",
+               "db_name": "backup_test", "backup_mode": "logical"},
+      "expect": {"message_contains": "pg_dump"}
+    },
+    {
+      "id": "139-mysql9",
+      "ssh": {"host": "192.168.220.139", "port": 22, "username": "root",
+              "password": "123123", "auth_type": "password", "os_type": "linux"},
+      "task": {"name": "matrix-139-mysql9", "db_type": "mysql",
+               "host": "192.168.220.139", "port": 33060,
+               "username": "root", "password": "123123",
+               "db_name": "aidbm_big", "backup_mode": "logical"},
+      "expect": {"message_contains": "mysqldump"}
+    },
+    {
+      "id": "137-kingbase",
+      "ssh": {"host": "192.168.220.137", "port": 22, "username": "root",
+              "password": "Zhh@190226", "auth_type": "password", "os_type": "linux"},
+      "task": {"name": "matrix-137-kingbase", "db_type": "kingbase",
+               "host": "192.168.220.137", "port": 54321,
+               "username": "system", "password": "",
+               "db_name": "test", "backup_mode": "logical"},
+      "expect": {"message_contains": ""}
+    },
+    {
+      "id": "137-dameng",
+      "ssh": {"host": "192.168.220.137", "port": 22, "username": "root",
+              "password": "Zhh@190226", "auth_type": "password", "os_type": "linux"},
+      "task": {"name": "matrix-137-dameng", "db_type": "dameng",
+               "host": "192.168.220.137", "port": 5236,
+               "username": "SYSDBA", "password": "Ceshi@5235",
+               "db_name": "DAMENG", "backup_mode": "logical"},
+      "expect": {"message_contains": ""}
+    }
+  ]
+}

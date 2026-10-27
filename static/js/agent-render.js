@@ -236,7 +236,11 @@
 
   function summarizeResult(name, res) {
     const d = res && res.data;
-    if (res && res.needs_clarify) return "匹配到多个任务，等待你确认执行哪一个";
+    if (res && res.needs_clarify) {
+      const n = Array.isArray(res.candidates) ? res.candidates.length : 0;
+      return n ? "匹配到 " + n + " 个候选任务，等待你确认执行哪一个"
+        : "匹配到多个任务，等待你确认执行哪一个";
+    }
     if (res && res.ok === false) return res.error || "执行未成功";
     if (name === "run_backup_task" && d) {
       return "任务「" + (d.task_name || ("#" + d.task_id)) + "」" +
@@ -251,6 +255,38 @@
       if (hit.length) return hit.join("，");
     }
     return res && res.message ? String(res.message) : "已完成";
+  }
+
+  /**
+   * 歧义澄清候选：渲染成可点击按钮。
+   *
+   * 复用 #agentMessages 上已有的 .agent-tip 点击委托（填入输入框并发送），
+   * 因此按钮点击即发送「执行任务 <ID>」，与手打完全同一条链路，无需新逻辑。
+   * @param {Object} res 工具结果（含 needs_clarify / candidates）
+   */
+  function clarifyCands(res) {
+    if (!res || !res.needs_clarify) return "";
+    const cands = Array.isArray(res.candidates) ? res.candidates : [];
+    if (!cands.length) return "";
+    const btns = cands.slice(0, 10).map((c) => {
+      const id = String(c && c.id != null ? c.id : "");
+      const st = statusKey(c && c.last_status);
+      const rec = c && c.recommended ? " ag-cand-rec" : "";
+      const name = String((c && c.name) || "");
+      return '<button type="button" class="agent-tip ag-cand' + rec + '"' +
+        ' data-tip="执行任务 ' + escHtml(id) + '"' +
+        ' title="' + escHtml("#" + id + " " + name) + '">' +
+        '<span class="ag-cand-id">#' + escHtml(id) + "</span>" +
+        '<span class="ag-cand-name">' + escHtml(name) + "</span>" +
+        (st ? '<span class="ag-cand-st ag-cand-st-' + st + '">' +
+          escHtml(STATUS_TEXT[st] || "") + "</span>" : "") +
+        "</button>";
+    }).join("");
+    return '<div class="ag-cands">' +
+      '<div class="ag-cands-title"><i class="bi bi-hand-index-thumb me-1"></i>' +
+        escHtml(res.clarify_hint || "点击候选直接执行，或回复「执行任务 <ID>」") + "</div>" +
+      '<div class="ag-cands-btns">' + btns + "</div>" +
+    "</div>";
   }
 
   /**
@@ -277,6 +313,7 @@
         "</summary>" +
         '<div class="ag-step-body">' +
           '<div class="ag-step-sum">' + escHtml(summarizeResult(name, res)) + "</div>" +
+          clarifyCands(res) +
           '<div class="ag-step-json-title">调用参数</div>' +
           '<pre class="ag-pre ag-pre-json"><code>' +
             escHtml(JSON.stringify(t.args || {}, null, 2)) + "</code></pre>" +

@@ -14,6 +14,36 @@ import logging
 _logger = logging.getLogger("ssh_hosts")
 
 
+def load_pkey(pem_or_path: str):
+    """加载私钥（PEM 内容或文件路径），自动识别算法（Ed25519/RSA/ECDSA）。
+
+    失败返回 None（调用方回退密码认证）。
+    """
+    import io
+    import os
+    import paramiko
+
+    s = (pem_or_path or "").strip()
+    if not s:
+        return None
+    classes = (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey)
+    if s.startswith("-----BEGIN"):
+        data = s if s.endswith("\n") else s + "\n"
+        for cls in classes:
+            try:
+                return cls.from_private_key(io.StringIO(data))
+            except Exception:  # noqa: BLE001
+                continue
+        return None
+    if os.path.isfile(s):
+        for cls in classes:
+            try:
+                return cls.from_private_key_file(s)
+            except Exception:  # noqa: BLE001
+                continue
+    return None
+
+
 HOST_FIELDS = [
     "name", "host_key", "hostname", "port", "username",
     "password", "auth_type", "private_key", "os_type", "db_os_user", "remark",

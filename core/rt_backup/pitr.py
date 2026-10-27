@@ -392,6 +392,31 @@ class PITRRestore:
                 "binlog_pos": int(plan.base_point.binlog_pos or 0),
                 "binlog_dir": log_dir,
             })
+            # 多段逐文件回放：修复旧版只回放单个 binlog 文件的跨段缺口。
+            # 段序列按链序组装；基准全量位点所在段用 base pos 起始，其余段
+            # 从文件头 4 开始；最后一段用 stop_position 精确截断
+            # （--stop-datetime 由 restore_extras 并用兜底）。
+            segments = []
+            log_points = [p for p in plan.chain
+                          if p.rp_kind == RP_DB_LOG and p.object_key]
+            base_file = (getattr(plan.base_point, "binlog_file", "") or "")
+            for idx, p in enumerate(log_points):
+                seg_file = (p.binlog_file or "")
+                if base_file and seg_file and seg_file < base_file:
+                    continue  # 基准全量之前的段（内容已含在全量中）
+                start = 4
+                if base_file and seg_file == base_file \
+                        and int(plan.base_point.binlog_pos or 0) > 4:
+                    start = int(plan.base_point.binlog_pos)
+                stop = None
+                if idx == len(log_points) - 1 and plan.stop_binlog_file \
+                        and seg_file == plan.stop_binlog_file \
+                        and int(plan.stop_binlog_pos or 0) > 4:
+                    stop = int(plan.stop_binlog_pos)
+                segments.append({"path": p.object_key, "start_pos": start,
+                                 "stop_pos": stop})
+            if segments:
+                conn["segments"] = segments
             raw = restore_extras.mysql_pitr_restore(full_path, plan.target_ts, conn)
         elif engine_key in _PG_ENGINES:
             conn.setdefault("data_dir", target.get("data_dir") or "")

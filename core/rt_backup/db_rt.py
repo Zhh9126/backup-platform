@@ -318,7 +318,12 @@ class DbRtCapture:
                 self.daemon.tick()
                 segments = self.daemon.seal_ready_segments(force=True)
             else:
-                segments = self.daemon.seal_ready_segments(force=False)
+                # 真实守护：手动触发 = 促成轮转 + 立即封存活跃段
+                # （此前 force 仅对仿真生效，真实 binlog/WAL 流的活跃段
+                #   永远封不掉，手动触发形同虚设）
+                force = getattr(self.daemon, "force_seal", None)
+                segments = (force() if callable(force)
+                            else self.daemon.seal_ready_segments(force=False))
         except Exception as exc:
             self.last_error = str(exc)
             return {"ok": False, "task_id": self.task_id, "message": str(exc)}

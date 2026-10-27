@@ -636,7 +636,8 @@ class TestT04ApiContractAndT05Page(unittest.TestCase):
         client = test_app.test_client()
         self._login(client)
 
-        r = client.get("/rt-timeline")
+        # /rt-timeline 已合并到 /realtime（302 跳转），跟随重定向后断言目标页
+        r = client.get("/rt-timeline", follow_redirects=True)
         self.assertEqual(r.status_code, 200)
         html = r.get_data(as_text=True)
         # 页面含「实时备份」标记（导航 + 页面标题）

@@ -237,6 +237,19 @@ def create_task():
         return jsonify({"error": f"不支持的数据库类型: {data.get('db_type')}"}), 400
     if not data.get("name"):
         return jsonify({"error": "任务名称为必填"}), 400
+    # backup_type 校验：必须是备份类型（full/incremental/differential/snapshot）。
+    # 用户常把备份模式（logical/physical）误填进此字段——错误前置给出明确提示，
+    # 而不是等运行时 BackupType() 枚举异常 500。
+    _bt = (data.get("backup_type") or "full").strip().lower()
+    if _bt in ("logical", "physical"):
+        return jsonify({"error": "backup_type 应为备份类型（full/incremental/"
+                                 "differential/snapshot），"
+                                 f"不能填备份模式 '{_bt}'（logical/physical 应填"
+                                 " backup_mode 字段）"}), 400
+    if _bt not in ("full", "incremental", "differential", "snapshot"):
+        return jsonify({"error": f"不支持的备份类型: {_bt}（可选 full/"
+                                 "incremental/differential/snapshot）"}), 400
+    data["backup_type"] = _bt
     # 新建通道强校验（设计 §4.2.1 / §8.6）
     err = _validate_biz_system(data.get("biz_system"), required=True)
     if err:
@@ -326,6 +339,43 @@ def run_task(task_id):
     if record.get("accepted"):
         return jsonify(record), 202
     return jsonify(record)
+
+
+@api_bp.route("/tasks/quick-backup", methods=["POST"])
+@login_required
+def quick_backup():
+    """一键备份（对标中科热备"一键备份"）：批量立即执行备份。
+
+    body: {"task_ids": [..]} 可选——缺省对**全部启用任务**触发；给了则按
+    勾选清单触发。每个任务跑一次 full（异步，逐任务独立，失败互不影响）。
+    返回触发计数与逐任务受理结果，前端 toast 汇报即可。
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    ids = data.get("task_ids") or []
+    tasks = models.list_tasks(include_secret=False) or []
+    enabled = [t for t in tasks if t.get("enabled")]
+    targets = ([t for t in enabled if int(t.get("id")) in set(int(i) for i in ids)]
+               if ids else enabled)
+    if not targets:
+        return jsonify({"error": "没有可备份的启用任务"}), 400
+    results = []
+    for t in targets:
+        tid = int(t["id"])
+        try:
+            rec = scheduler.run_task_now(tid, backup_type="full",
+                                         operator="quick-backup")
+            ok = bool(rec) and (rec.get("status") in ("running", "success")
+                                or rec.get("accepted"))
+            results.append({"task_id": tid, "task_name": t.get("name"),
+                            "ok": ok,
+                            "message": (rec or {}).get("message", "")[:120]})
+        except Exception as exc:  # 单任务失败不影响其余
+            results.append({"task_id": tid, "task_name": t.get("name"),
+                            "ok": False, "message": str(exc)[:120]})
+    triggered = sum(1 for r in results if r["ok"])
+    return jsonify({"ok": True, "triggered": triggered,
+                    "total": len(targets), "results": results,
+                    "message": f"一键备份已触发 {triggered}/{len(targets)} 个任务"})
 
 
 @api_bp.route("/tasks/<int:task_id>/discover", methods=["POST"])

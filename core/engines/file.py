@@ -110,6 +110,8 @@ MTIME_TOLERANCE = 5
 # 全局 SSH 连接池（线程安全）
 _ssh_pool: Dict[str, object] = {}
 _ssh_lock = threading.Lock()
+# PEM 内容私钥落盘的临时文件（host_key → 路径），连接池复用期间保留
+_tmp_key_files = {}
 
 
 def _get_extra(task: dict) -> dict:
@@ -123,7 +125,8 @@ def _get_extra(task: dict) -> dict:
         return {}
 
 
-def _get_ssh_client(host_key: str, password: str = None):
+def _get_ssh_client(host_key: str, password: str = None,
+                    private_key: str = None):
     """
     获取或创建 SSH 连接（带连接池复用 + 活性探测）。
     host_key 格式: "user@hostname:port" 或 "user@hostname"
@@ -180,9 +183,9 @@ def _get_ssh_client(host_key: str, password: str = None):
     else:
         user, hostname = "root", addr
 
-    # 未传入密码则从 DB 查询
-    priv_key = ""
-    if not password:
+    # 未传入密码/私钥则从 DB 查询（显式参数优先——调用方已解密）
+    priv_key = (private_key or "").strip()
+    if not password and not priv_key:
         row = db.query_one(
             "SELECT password, auth_type, private_key FROM ssh_hosts "
             "WHERE host_key=? LIMIT 1",
@@ -194,12 +197,22 @@ def _get_ssh_client(host_key: str, password: str = None):
                 priv_key = (row["private_key"] or "").strip()
             except Exception:
                 priv_key = ""
-        key_file = priv_key if priv_key and os.path.isfile(priv_key) else None
+        # private_key 列两义兼容：PEM 内容（表单粘贴，-----BEGIN 开头）或
+        # 私钥文件路径。PEM 内容写临时文件 0600 供 paramiko 加载。
+    if priv_key and priv_key.startswith("-----BEGIN"):
+        key_file = _tmp_key_files.get(host_key)
+        if not key_file or not os.path.isfile(key_file):
+            fd, kf = tempfile.mkstemp(prefix="ssh_key_", suffix=".pem")
+            with os.fdopen(fd, "w") as f:
+                f.write(priv_key if priv_key.endswith("\n") else priv_key + "\n")
+            os.chmod(kf, 0o600)
+            key_file = kf
+            _tmp_key_files[host_key] = kf     # 连接池复用期间保留，进程退出清理
     else:
-        key_file = None
-    # 无口令时才启用 SSH 公钥/agent 认证（如 ~/.ssh/id_rsa、指定私钥文件）。
-    # 有口令时保持原行为，避免对既有纳管主机产生任何影响。
-    no_password = not password
+        key_file = priv_key if priv_key and os.path.isfile(priv_key) else None
+    # private_key 存在（内容或路径）→ 优先密钥认证，密码作后备（paramiko
+    # 会依次尝试）；无 private_key 且无口令时才启用 agent/look_for_keys。
+    no_password = not password and not key_file
 
     with _ssh_lock:
         existing = _ssh_pool.get(host_key)
@@ -809,6 +822,8 @@ class FileBackupEngine(BackupEngine):
         #   "rt" —— 准 CDP 实时任务，落在 file_snapshots/rt/<md5>/
         # 实时捕获频率远高于普通增量，两者共用基准会互相污染，必须隔离。
         self.snapshot_namespace: str = ""
+        # 源端去重本轮统计（_tar_remote_to_local_dedup 写入，消息透出后清零）
+        self._dedup_stats = None
 
     @staticmethod
     def _clean_path(path: str) -> str:
@@ -1032,12 +1047,14 @@ class FileBackupEngine(BackupEngine):
                 return  # 已加密，避免重复
             if not os.path.abspath(path).startswith(os.path.abspath(self.storage_root)):
                 return
-            r = cp.encrypt_file(path)
+            r = cp.encrypt_file(path, algo=str(self.extra.get("encrypt_algo") or "aes"))
             if r.get("encrypted"):
-                self.logger.info("[%s] 存储池加密完成: %s",
-                                 self.task_name, db.human_size(r["encrypted_bytes"]))
+                _algo_disp = "国密 SM4" if r.get("algo") == "sm4" else "AES-256"
+                self.logger.info("[%s] 存储池加密完成（%s-GCM）: %s",
+                                 self.task_name, _algo_disp,
+                                 db.human_size(r["encrypted_bytes"]))
                 if result.message:
-                    result.message += " | 已加密存储"
+                    result.message += f" | 已加密存储（{_algo_disp}-GCM）"
             else:
                 self.logger.warning("[%s] 存储池加密跳过: %s",
                                     self.task_name, r.get("reason"))
@@ -1047,6 +1064,11 @@ class FileBackupEngine(BackupEngine):
     def _apply_global_dedup(self, result: BackupResult) -> None:
         """对本次备份产物做全局切片重删（非阻塞、失败安全）。"""
         try:
+            if getattr(self, "_dedup_stats", None):
+                # 本轮已走源端去重通道：块级记账（.dedup_index 引用计数）在
+                # 传输阶段完成，这里再做一次会重复计数
+                self._dedup_stats = None
+                return
             from core import global_dedup as gd
             path = getattr(result, "backup_path", None)
             if not path or not isinstance(path, str) or not os.path.isfile(path):
@@ -1140,12 +1162,25 @@ class FileBackupEngine(BackupEngine):
         # 保存快照作为下次增量基准，并记录本次全量归档路径供恢复链使用
         self._save_snapshot(sf, full_path=final)
 
+        message = f"全量备份完成 | {len(paths)} 个源 | {db.human_size(size)}"
+        ds_stats = getattr(self, "_dedup_stats", None)
+        if ds_stats:
+            if ds_stats.get("saved_bytes", 0) > 0:
+                message += (" | 源端去重: 实传 %s / 逻辑 %s（节省 %s%%，"
+                            "命中 %d 文件 / 拉取 %d 文件）" % (
+                                db.human_size(ds_stats["transferred_bytes"]),
+                                db.human_size(ds_stats["logical_bytes"]),
+                                ds_stats["ratio_pct"],
+                                ds_stats["hit_blocks"],
+                                ds_stats["fetched_blocks"]))
+            else:
+                message += " | 源端去重: 首轮建立块库（本轮无节省，次轮起生效）"
         return BackupResult(
             success=True, status=BackupStatus.SUCCESS,
             backup_path=final, size_bytes=size,
             original_size_bytes=original, compress_algo=algo, compress_ratio=ratio,
             checksum=checksum,
-            message=f"全量备份完成 | {len(paths)} 个源 | {db.human_size(size)}",
+            message=message,
         )
 
     # ---------- 增量快照 ----------
@@ -1842,7 +1877,24 @@ class FileBackupEngine(BackupEngine):
 
         全程不把产物读进内存：此前是整包 bytes 回内存，大目录会把平台内存撑爆
         （表现为 MemoryError，而它的 str() 是空字符串，只会留下一个空白原因）。
+
+        任务开启 extra.source_dedup 时优先走**源端传输去重**通道（远端分块
+        指纹，仅新块走网络）；任何失败安全回退本流式通道（正确性不受影响）。
         """
+        if self.extra.get("source_dedup"):
+            try:
+                self._tar_remote_to_local_dedup(src, archive_path)
+                return
+            except Exception as e:  # noqa: BLE001 —— 去重失败不影响备份
+                self.logger.warning(
+                    "[%s] 源端去重通道失败，回退整包流式: %s",
+                    self.task_name, str(e) or type(e).__name__)
+                self._dedup_stats = None
+                try:
+                    if os.path.exists(archive_path):
+                        os.unlink(archive_path)
+                except OSError:
+                    pass
         self.logger.info("[%s] [1/3] 连接远程主机: %s", self.task_name, src["host"])
         client = _get_ssh_client(src["host"])
         pairs = self._resolve_src_pairs(src)
@@ -1866,6 +1918,55 @@ class FileBackupEngine(BackupEngine):
                 "远程打包", r.get("rc") or -1, r.get("err"), cmd,
                 extra="源主机: %s" % src["host"]))
         self.logger.info("[%s] [3/3] 归档落盘完成: %s", self.task_name, archive_path)
+
+    def _tar_remote_to_local_dedup(self, src: dict, archive_path: str) -> dict:
+        """源端传输去重通道（远程 → 本地，文件级）：重复文件不走网络。
+
+        流程：远端只读清单（find+sha256sum+stat，零 agent 零临时文件）→
+        平台比对文件库（.dedup_store/files/<sha>）→ 仅新/变文件 SFTP 拉取 →
+        平台侧重建标准 tar.gz（逐成员回读哈希硬核对）。
+
+        与 4MB 固定块方案相比：tar/gzip 流式归档中任一文件变化会导致其后
+        全部块移位（业界用变长块 CDC 解决，零 agent 远端无法实现）；文件级
+        粒度无移位问题，未变文件 100% 命中——日变化率 3% 场景实传即 ~3%。
+
+        返回统计 dict；任何异常向上抛出，由 _tar_remote_to_local 回退流式。
+        """
+        from core import dedup_source as ds
+
+        self.logger.info("[%s] [1/4] 源端去重通道(文件级): 连接 %s",
+                         self.task_name, src["host"])
+        client = _get_ssh_client(src["host"])
+        pairs = self._resolve_src_pairs(src)
+        src_paths = [p for p, _kind in pairs]
+
+        def exec_fn(c: str):
+            return _ssh_exec(client, c, timeout=3600)
+
+        self.logger.info("[%s] [2/4] 远端只读清单（find+sha256sum）…",
+                         self.task_name)
+        manifest = ds.remote_file_manifest(exec_fn, src_paths)
+        n_files = sum(len(s["files"]) for s in manifest["sources"])
+
+        self.logger.info("[%s] [3/4] 清单就绪（%d 文件），比对文件库拉取差异…",
+                         self.task_name, n_files)
+        local_map, stats = ds.pull_files_dedup(
+            client, manifest, task_id=self.task.get("id"),
+            excludes=self._excludes())
+
+        self.logger.info("[%s] [4/4] 平台重建 tar + 回读校验…", self.task_name)
+        vr = ds.build_tar_from_manifest(manifest, local_map, archive_path,
+                                        excludes=self._excludes())
+        stats["verified_files"] = vr["verified_files"]
+        self._dedup_stats = stats
+        self.logger.info(
+            "[%s] 源端去重完成: 逻辑 %s / 实传 %s（节省 %s%%，"
+            "命中 %d / 拉取 %d / 回读校验 %d）",
+            self.task_name, db.human_size(stats["logical_bytes"]),
+            db.human_size(stats["transferred_bytes"]), stats["ratio_pct"],
+            stats["hit_blocks"], stats["fetched_blocks"],
+            stats["verified_files"])
+        return stats
 
     def _tar_remote_to_remote(self, src: dict, dst: dict, archive_path: str):
         """远程 → 远程：源打包 → 本机临时文件（流式）→ SFTP 上传 → 目标解压。

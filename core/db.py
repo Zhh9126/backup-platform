@@ -1968,19 +1968,52 @@ def _derive_key(key: str) -> bytes:
     return hashlib.sha256(key.encode("utf-8")).digest()
 
 
+def _sm4_key() -> bytes:
+    """凭据加密 SM4 密钥（128 位，派生自 SECRET_KEY）。"""
+    return hashlib.sha256(("sm4:" + config.SECRET_KEY).encode("utf-8")).digest()[:16]
+
+
 def encrypt_secret(plain: str) -> str:
-    """对密码等敏感字段做轻量混淆存储（非高强度加密，生产请用密钥文件/环境变量）。"""
+    """敏感字段高强度加密存储：国密 SM4-128-GCM（随机 nonce，AEAD 认证）。
+
+    格式 ``sm4v1:base64(nonce||ciphertext||tag)``。历史 ``enc:`` 前缀
+    （轻量混淆）由 decrypt_secret 兼容读取；新写入一律高强度。
+    """
     if not plain:
         return ""
-    k = _derive_key(config.SECRET_KEY)
-    data = plain.encode("utf-8")
-    out = bytes(b ^ k[i % len(k)] for i, b in enumerate(data))
-    return "enc:" + base64.b64encode(out).decode("ascii")
+    from cryptography.hazmat.primitives.ciphers import (
+        Cipher, algorithms, modes)
+    key = _sm4_key()
+    nonce = os.urandom(12)
+    enc = Cipher(algorithms.SM4(key), modes.GCM(nonce)).encryptor()
+    body = enc.update(plain.encode("utf-8"))
+    enc.finalize()
+    ct = body + enc.tag   # GCM tag 在 encryptor.tag 属性
+    return "sm4v1:" + base64.b64encode(nonce + ct).decode("ascii")
+
+
+def _decrypt_sm4v1(token: str) -> str:
+    from cryptography.hazmat.primitives.ciphers import (
+        Cipher, algorithms, modes)
+    data = base64.b64decode(token)
+    nonce, ct = data[:12], data[12:]
+    if len(ct) < 16:
+        raise ValueError("密文过短（缺 GCM tag）")
+    tag, body = ct[-16:], ct[:-16]
+    dec = Cipher(algorithms.SM4(_sm4_key()),
+                 modes.GCM(nonce, tag)).decryptor()
+    return (dec.update(body) + dec.finalize()).decode("utf-8", "ignore")
 
 
 def decrypt_secret(token: str) -> str:
     if not token:
         return ""
+    if token.startswith("sm4v1:"):
+        try:
+            return _decrypt_sm4v1(token[6:])
+        except Exception:
+            # 密钥轮换/记录损坏时返回空（SM4 认证失败绝不静默给错值）
+            return ""
     if token.startswith("enc:"):
         token = token[4:]
         data = base64.b64decode(token)

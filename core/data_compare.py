@@ -119,12 +119,27 @@ def _list_tables(conn, db_type: str, database: str, schema: str) -> list:
             sch = schema or "public"
             if not _SAFE_IDENT.match(sch):
                 raise ValueError(f"非法 schema: {sch!r}")
-            cur.execute(
-                "SELECT tablename FROM pg_tables "
-                f"WHERE schemaname = '{sch}' "
-                "AND tablename NOT LIKE 'pg\\_%' "
-                "AND tablename NOT LIKE 'xx\\_%' "
-                "ORDER BY tablename")
+            try:
+                # 分区表感知：父表（relkind='p'）保留，分区子表（relkind='r'
+                # 且 relispartition=true）排除——否则父表+子表会被重复对比。
+                # 金仓 V9/PG10+ 均有 relispartition 列。
+                cur.execute(
+                    "SELECT c.relname FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    f"WHERE n.nspname = '{sch}' "
+                    "AND c.relkind IN ('r','p') "
+                    "AND c.relispartition = false "
+                    "AND c.relname NOT LIKE 'pg\\_%' "
+                    "AND c.relname NOT LIKE 'xx\\_%' "
+                    "ORDER BY c.relname")
+            except Exception:
+                # 旧版本无 relispartition 列时回退 pg_tables（分区子表会列出）
+                cur.execute(
+                    "SELECT tablename FROM pg_tables "
+                    f"WHERE schemaname = '{sch}' "
+                    "AND tablename NOT LIKE 'pg\\_%' "
+                    "AND tablename NOT LIKE 'xx\\_%' "
+                    "ORDER BY tablename")
         elif db_type in ("oracle", "dameng"):
             owner = (schema or _user_of(conn) or "").upper()
             if not owner:

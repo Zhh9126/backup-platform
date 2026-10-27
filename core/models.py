@@ -28,8 +28,25 @@ TASK_FIELDS = [
 
 
 # ------------------------- 任务 -------------------------
+def _normalize_json_fields(data: dict) -> dict:
+    """dict/list 字段归一为 JSON 字符串（SQLite 不支持 dict 绑定）。
+
+    外部 API 调用方（Bearer 令牌自动化等）可能直接传 extra_options 为 dict；
+    API 层仅在个别路径序列化，此处统一兜底，避免 POST/PUT 500。
+    """
+    for key in ("extra_options", "tables", "tables_json"):
+        v = data.get(key)
+        if isinstance(v, (dict, list)):
+            try:
+                data[key] = json.dumps(v, ensure_ascii=False)
+            except (TypeError, ValueError):
+                data[key] = str(v)
+    return data
+
+
 def create_task(data: dict) -> int:
     data = {k: data.get(k) for k in TASK_FIELDS}
+    data = _normalize_json_fields(data)
     now = db.now_iso()
     data["created_at"] = now
     data["updated_at"] = now
@@ -68,6 +85,7 @@ def update_task(task_id: int, data: dict) -> bool:
     data = {k: v for k, v in data.items() if k in TASK_FIELDS}
     if not data:
         return False
+    data = _normalize_json_fields(data)
     data["updated_at"] = db.now_iso()
     sets = []
     params = []

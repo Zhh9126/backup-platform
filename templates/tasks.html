@@ -20,6 +20,8 @@
   <div class="d-flex align-items-center gap-2 flex-wrap">
     <button class="btn btn-outline-secondary btn-sm" id="cleanupBtn"
             title="按每个任务的备份保留天数/份数，定期清理过期备份产物"><i class="bi bi-eraser"></i> <span data-i18n="定期清理">定期清理</span></button>
+    <button class="btn btn-success btn-sm" id="quickBackupBtn"
+            title="一键备份：对全部启用任务（或勾选任务）立即执行一次全量备份"><i class="bi bi-lightning-charge"></i> <span data-i18n="一键备份">一键备份</span></button>
     <button class="btn btn-outline-secondary btn-sm" onclick="refreshTasks()" title="刷新"><i class="bi bi-arrow-clockwise"></i> <span data-i18n="刷新">刷新</span></button>
     <button class="btn btn-outline-secondary btn-sm" onclick="importTasksCsv()" title="批量导入CSV"><i class="bi bi-upload"></i> <span data-i18n="导入">导入</span></button>
     <a class="btn btn-outline-secondary btn-sm" href="/api/tasks/template?type=db" title="下载CSV模板"><i class="bi bi-file-earmark-spreadsheet"></i> <span data-i18n="模板">模板</span></a>

@@ -58,3 +58,8 @@ docs/ai-agent-prd.md
 tests/test_ai_agent.py
 templates/agent.html
 static/js/ai-agent.js
+
+# E2E 矩阵运行产物
+data/
+matrix_report.json
+tests/.tmp_*/

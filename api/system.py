@@ -396,6 +396,22 @@ def _insights(tasks, records, total_size):
             att.append({"kind": "sched", "severity": "low", "task_id": None,
                         "title": f"{len(no_sched)} 个启用任务未配调度",
                         "detail": "不会自动执行备份，需补配调度或停用"})
+        # 保护目标缺口（P0-2 目标驱动收口：RPO→CDP / 间隔 / 异地）
+        try:
+            from core.goals import protection_gaps
+            pg = protection_gaps()
+            out["protection_gaps"] = {"fail_count": pg["fail_count"],
+                                      "warn_count": pg["warn_count"]}
+            for g in pg["gaps"]:
+                if len(att) >= 12:
+                    break
+                att.append({"kind": f"goal_{g['code']}",
+                            "task_id": g.get("task_id"),
+                            "severity": "high" if g["level"] == "fail" else "medium",
+                            "title": g.get("task_name"),
+                            "detail": g.get("message")})
+        except Exception as exc:
+            logger.debug("protection gaps 计算失败: %s", exc)
         out["attention"] = att[:12]
     except Exception as exc:
         logger.debug("attention 计算失败: %s", exc)
@@ -761,6 +777,14 @@ def _calc_health(tasks, records, insights=None):
     score += fresh_score
     details.append(f"备份时效: {fresh_score}/10 ({lag_txt})")
     return min(score, 100), details
+
+
+@api_bp.route("/protection-gaps", methods=["GET"])
+@login_required
+def protection_gaps():
+    """保护目标缺口汇总（P0-2 目标驱动收口）：RPO→CDP / 备份间隔 / 异地副本。"""
+    from core.goals import protection_gaps as _gaps
+    return jsonify(_gaps())
 
 
 @api_bp.route("/scheduler", methods=["GET"])

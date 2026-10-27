@@ -146,6 +146,28 @@
     });
   }
 
+  // 剪贴板降级：HTTP 环境 navigator.clipboard 为 undefined（安全上下文限制），
+  // 复制日志等按钮统一走 copyText（clipboard API → execCommand 回退）
+  window.copyText = function (text) {
+    return new Promise((resolve, reject) => {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(resolve)
+          .catch(() => { try { _execCopy(text) ? resolve() : reject(new Error("copy failed")); } catch (e) { reject(e); } });
+        return;
+      }
+      try { _execCopy(text) ? resolve() : reject(new Error("copy failed")); } catch (e) { reject(e); }
+    });
+    function _execCopy(t) {
+      const ta = document.createElement("textarea");
+      ta.value = t; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      let ok = false;
+      try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      return ok;
+    }
+  };
+
   // ------------------------- 侧边栏（7.1） -------------------------
   function bindSidebar() {
     const layout = $("layout");
@@ -161,16 +183,26 @@
       localStorage.setItem("sidebar-collapsed", collapsed ? "1" : "0");
     };
 
-    // 页面加载后把当前激活菜单项滚到可视区（侧边栏是独立滚动容器，
-    // 跳转新页面时滚动位置会重置到顶部，导致下方菜单高亮项看不到）
+    // 侧边栏菜单长于视口：nav 是独立滚动容器（品牌区常驻）。
+    // 1) 跨页面记忆滚动位置——点底部菜单后新页面不再"跳"回顶部；
+    // 2) 无记忆时把当前激活项居中滚动到可视区。
     try {
-      const sidebar = document.querySelector(".sidebar");
-      const active = sidebar && sidebar.querySelector(".nav-link.active");
-      if (sidebar && active) {
-        const top = active.offsetTop; // offsetParent 即 .sidebar（fixed 定位）
+      const nav = document.querySelector(".sidebar .nav");
+      if (!nav) return;
+      const KEY = "sidebar-nav-scroll";
+      let saved = 0;
+      try { saved = parseInt(sessionStorage.getItem(KEY) || "0", 10) || 0; } catch (e) { saved = 0; }
+      nav.addEventListener("scroll", () => {
+        try { sessionStorage.setItem(KEY, String(nav.scrollTop)); } catch (e) { /* 忽略 */ }
+      }, { passive: true });
+      const active = nav.querySelector(".nav-link.active");
+      if (saved > 0) {
+        nav.scrollTop = Math.min(saved, Math.max(0, nav.scrollHeight - nav.clientHeight));
+      } else if (active) {
+        const top = active.offsetTop;
         const bottom = top + active.offsetHeight;
-        if (top < sidebar.scrollTop || bottom > sidebar.scrollTop + sidebar.clientHeight) {
-          sidebar.scrollTop = Math.max(0, top - sidebar.clientHeight / 2 + active.offsetHeight / 2);
+        if (top < nav.scrollTop || bottom > nav.scrollTop + nav.clientHeight) {
+          nav.scrollTop = Math.max(0, top - nav.clientHeight / 2 + active.offsetHeight / 2);
         }
       }
     } catch (e) { /* 不影响主流程 */ }
@@ -1871,6 +1903,25 @@
     if ($("cl_scan_btn")) $("cl_scan_btn").onclick = () => cleanupPlan();
     if ($("cl_run_btn")) $("cl_run_btn").onclick = cleanupRun;
     if ($("cl_save_btn")) $("cl_save_btn").onclick = cleanupSaveConfig;
+    // 一键备份（对标中科热备）：对全部启用任务立即触发一次全量备份
+    if ($("quickBackupBtn")) {
+      $("quickBackupBtn").onclick = () => {
+        if (!confirm("一键备份：立即对全部启用任务执行一次全量备份？\n" +
+            "任务将逐个异步触发，可在备份记录页查看进度。")) return;
+        apiFetch("/api/tasks/quick-backup", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        }).then(r => {
+          if (!r.ok && !r.body) throw new Error(r.error || "HTTP " + r.status);
+          const d = r.body || {};
+          toast((d.message || "一键备份已触发") +
+                (d.triggered === d.total ? "" : `（${d.triggered}/${d.total}）`),
+                d.triggered > 0 ? "success" : "warning");
+          setTimeout(refreshTasks, 1500);
+        }).catch(e => toast("一键备份失败: " + e.message, "danger"));
+      };
+    }
   }
 
   function _cleanupParams() {
@@ -3259,6 +3310,7 @@
       $("f_target_path").value = cleanFilePath(extra.target_path || "");
       $("f_exclude_patterns").value = (extra.exclude_patterns || []).join("\n");
       if ($("f_mirror_mode")) $("f_mirror_mode").checked = !!extra.file_mirror;
+      if ($("f_source_dedup")) $("f_source_dedup").checked = !!extra.source_dedup;
       // 按天调度回填：单任务主 schedule 映射到对应子区；mixed 同时回填两套
       const bt = task.backup_type || "full";
       if (bt === "full") {
@@ -3332,6 +3384,7 @@
       target_path: cleanFilePath($("f_target_path").value),
       exclude_patterns: $("f_exclude_patterns").value.split("\n").map((s) => s.trim()).filter(Boolean),
       file_mirror: !!($("f_mirror_mode") && $("f_mirror_mode").checked),
+      source_dedup: !!($("f_source_dedup") && $("f_source_dedup").checked),
       follow_symlinks: false,
       encrypt_pool: !!($("f_encrypt_pool")?.checked),
     };
@@ -5258,7 +5311,7 @@
         '<td>' + dr.id + '</td>' +
         '<td>' + esc(dr.name) + '</td>' +
         '<td>' + (dr.task_id ? esc(window._taskNames[dr.task_id] || dr.task_id) : '-') + '</td>' +
-        '<td>' + esc(dr.drill_type === 'full_recovery' ? '...' : dr.drill_type === 'partial' ? '...' : '...') + '</td>' +
+        '<td>' + esc(dr.drill_type === 'real_restore' ? '真实恢复' : dr.drill_type === 'full_recovery' ? '全量检查' : dr.drill_type === 'partial' ? '对象级' : '单表') + '</td>' +
         '<td>' + statusBadge(dr.status) + '</td>' +
         '<td>' + scoreBadge + '</td>' +
         '<td>' + (dr.rto_actual_sec != null ? dr.rto_actual_sec.toFixed(1) + 's' : '-') + '</td>' +
@@ -5425,6 +5478,7 @@
       const en = $("schEnabled"), fr = $("schFrequency"), nr = $("schNextRun"), st = $("schTargets");
       if (en) en.checked = !!d.enabled;
       if (fr) fr.value = d.frequency || "quarterly";
+      if ($("schRealMode")) $("schRealMode").checked = !!d.real_mode;
       if (nr) nr.textContent = d.next_run ? fmtTime(d.next_run) : "未设置";
       if (st && Array.isArray(d.target_task_ids)) {
         Array.from(st.options).forEach(o => { o.selected = d.target_task_ids.includes(Number(o.value)); });
@@ -5440,6 +5494,7 @@
         enabled: $("schEnabled") ? $("schEnabled").checked : false,
         frequency: $("schFrequency") ? $("schFrequency").value : "quarterly",
         target_task_ids: targetIds,
+        real_mode: !!($("schRealMode") && $("schRealMode").checked),
       };
       const r = await api("POST", "/api/drills/schedule", payload);
       toast("排程已保存" + (r.config && r.config.enabled ? "（已启用）" : "（未启用）"));

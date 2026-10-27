@@ -275,10 +275,27 @@ def _bg_execute_backup(task: dict, backup_type: str = None,
         _logger.exception("[async] 后台文件任务 #%s 执行异常", task.get("id"))
 
 
+def _normalize_backup_type(value):
+    """backup_type 容错归一：非法值/模式值（logical/physical）回落 full。
+
+    任务字段错配（backup_type 填成了 backup_mode 的 'logical'/'physical'）
+    时 BackupType() 会抛 ValueError → POST /tasks/<id>/run 500；这里归一为
+    可执行的 full，不再让枚举异常打断运行入口。
+    """
+    from core.engines.base import BackupType
+    s = str(value or "full").strip().lower()
+    if s in ("logical", "physical"):  # 模式值误填进类型字段
+        return BackupType.FULL
+    try:
+        return BackupType(s)
+    except ValueError:
+        return BackupType.FULL
+
+
 def _execute_backup(task: dict, backup_type: str = None,
                     operator: str = None) -> dict:
     from core.engines.base import BackupType, BackupResult
-    bt = BackupType(backup_type or task.get("backup_type") or "full")
+    bt = _normalize_backup_type(backup_type or task.get("backup_type") or "full")
     # 全局并发控制：限制同时执行的备份数量（缺省保守，不破坏旧串行行为）
     _CONCURRENCY.acquire()
     try:
@@ -453,6 +470,25 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
             tier_replication.replicate_async(path, task, rec_id, _logger)
         except Exception as e:
             _logger.warning("[tier] 三级复制启动失败（不影响备份结果）: %s", e)
+
+    # 备份完 PURGE 已覆盖 binlog（P0-4，对标"备份完删除已备份日志"）：
+    # extra.purge_binlog_after_backup=true 且 purge_binlog_keep_files=N 时，
+    # 清理保留窗口之外的 binlog。失败不影响备份结果。
+    if result.success and (task.get("db_type") or "").lower() in ("mysql", "mariadb"):
+        try:
+            import json as _json
+            _eo = task.get("extra_options") or {}
+            if isinstance(_eo, str):
+                _eo = _json.loads(_eo)
+            if isinstance(_eo, dict) and _eo.get("purge_binlog_after_backup"):
+                keep = int(_eo.get("purge_binlog_keep_files") or 0)
+                if keep > 0:
+                    from core.engines.mysql import MySQLEngine
+                    _pmsg = MySQLEngine.purge_binlogs_after_backup(task, keep)
+                    _logger.info("[binlog-purge] task=%s %s", task.get("id"), _pmsg)
+        except Exception as e:
+            _logger.warning("[binlog-purge] task=%s 失败（不影响备份结果）: %s",
+                            task.get("id"), e)
 
     title = f"[{'成功' if result.success else '失败'}] 备份任务 {task['name']}"
     text = (f"数据库类型: {task['db_type']}\n目标: {task.get('host')}:"

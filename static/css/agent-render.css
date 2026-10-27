@@ -202,8 +202,49 @@
 }
 .ag-copy:hover { color: #0D9488; }
 
+/* ---------- 歧义澄清候选按钮 ---------- */
+.ag-cands { margin: 10px 0 6px; }
+.ag-cands-title { font-size: 12px; color: #64748b; margin-bottom: 6px; }
+.ag-cands-btns { display: flex; flex-wrap: wrap; gap: 6px; }
+.ag-cand {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 4px 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 999px;
+  background: #fff;
+  color: #334155;
+  font-size: 12.5px;
+  line-height: 1.5;
+  cursor: pointer;
+  transition: all .15s ease;
+}
+.ag-cand:hover { border-color: #0D9488; background: #f0fdfa; color: #0D9488; }
+.ag-cand-rec { border-color: #0D9488; background: #f0fdfa; }
+.ag-cand-id { color: #0D9488; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ag-cand-name {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ag-cand-st {
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #f1f5f9;
+  color: #64748b;
+  font-size: 11px;
+}
+.ag-cand-st-success { background: #dcfce7; color: #15803d; }
+.ag-cand-st-failed { background: #fee2e2; color: #b91c1c; }
+.ag-cand-st-warn { background: #fef3c7; color: #b45309; }
+.ag-cand-st-never { background: #f1f5f9; color: #64748b; }
+
 /* ---------- 窄屏适配 ---------- */
 @media (max-width: 768px) {
   .ag-table { font-size: 12.5px; min-width: 360px; }
   .ag-step-arg { display: none; }
+  .ag-cand-name { max-width: 140px; }
 }

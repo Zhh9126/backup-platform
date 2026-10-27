@@ -651,7 +651,9 @@
   }
   $("logViewerCopy").addEventListener("click", async () => {
     try {
-      await navigator.clipboard.writeText(viewerContent);
+      await (window.copyText
+        ? copyText(viewerContent)
+        : navigator.clipboard.writeText(viewerContent));
       toast("已复制到剪贴板", "success");
     } catch (e) {
       toast("复制失败：浏览器权限受限", "warning");

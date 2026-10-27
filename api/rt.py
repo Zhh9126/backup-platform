@@ -413,6 +413,22 @@ def rt_update_config(task_id: int):
     body = request.get_json(silent=True) or {}
     if not isinstance(body, dict) or not body:
         return _fail("请求体为空")
+    # MySQL/MariaDB 开启实时保护前的 binlog 预检（错误前置：此前只能等
+    # worker 启动失败才在日志里看到"无法获取源库当前 binlog 位点"）
+    rt_warnings = []
+    if body.get("rt_enabled") and str(
+            (models.get_task(task_id) or {}).get("db_type") or "").lower() \
+            in ("mysql", "mariadb"):
+        from core.cdc.mysql_binlog import check_binlog_ready
+        try:
+            chk = check_binlog_ready(models.get_task(task_id, include_secret=True))
+        except Exception as exc:  # 预检异常不阻断保存（保守）
+            chk = {"ok": True, "level": "warn",
+                   "message": f"binlog 预检异常（已跳过）: {exc}"}
+        if not chk.get("ok"):
+            return _fail(chk.get("message") or "binlog 预检未通过")
+        if chk.get("level") == "warn":
+            rt_warnings = [chk.get("message")]
     try:
         task = models.update_rt_config(task_id, body)
     except ValueError as exc:
@@ -430,6 +446,7 @@ def rt_update_config(task_id: int):
         reconciled = {"error": str(exc)}
     return jsonify({"ok": True, "task": task, "reconcile": reconciled,
                     "rt_task": rt_task_sync,
+                    "warnings": rt_warnings,
                     "message": "实时保护配置已更新"})
 
 

@@ -516,11 +516,27 @@ textarea.form-control { height: auto; padding: 8px 12px; }
 .login-brand .login-sub { font-size: var(--font-size-base); color: var(--text-secondary); margin: 0; }
 
 /* ---------- 响应式 ---------- */
-@media (max-width: 768px) {
-  .sidebar { width: var(--sidebar-w-collapsed); flex-basis: var(--sidebar-w-collapsed); }
-  .sidebar .brand .brand-text,
-  .sidebar .nav-link .nav-label { opacity: 0; width: 0; overflow: hidden; }
-  .content { margin-left: var(--sidebar-w-collapsed); padding: var(--space-md); }
+/* ≤992px：侧边栏抽屉化（默认滑出屏幕外，汉堡唤起，遮罩点击/选中菜单后收起） */
+.sidebar-overlay {
+  display: none;
+  position: fixed;
+  top: 0; right: 0; bottom: 0; left: 0;
+  z-index: 1035; /* 低于 .sidebar(1040) */
+  background: rgba(15, 23, 42, .55);
+}
+@media (max-width: 992px) {
+  .sidebar {
+    width: var(--sidebar-w);
+    flex-basis: var(--sidebar-w);
+    transform: translateX(-100%);
+    transition: transform .25s ease-in-out;
+  }
+  .layout.sidebar-open .sidebar {
+    transform: translateX(0);
+    box-shadow: 0 0 40px rgba(0, 0, 0, .35);
+  }
+  .layout.sidebar-open .sidebar-overlay { display: block; }
+  .content { margin-left: 0 !important; padding: var(--space-md); }
   .login-card { min-width: 0; }
 }
 

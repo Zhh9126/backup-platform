@@ -174,14 +174,55 @@
     const toggle = $("sidebarToggle");
     if (!layout || !toggle) return;
 
-    // 记忆折叠状态
-    if (localStorage.getItem("sidebar-collapsed") === "1") {
+    const isNarrow = () => window.matchMedia("(max-width: 992px)").matches;
+
+    // 记忆折叠状态（仅宽屏；窄屏为抽屉模式，刷新后默认收起）
+    if (!isNarrow() && localStorage.getItem("sidebar-collapsed") === "1") {
       layout.classList.add("sidebar-collapsed");
     }
+
     toggle.onclick = () => {
+      if (isNarrow()) {
+        // 窄屏：抽屉模式——唤起/收起 + 遮罩
+        layout.classList.toggle("sidebar-open");
+        return;
+      }
       const collapsed = layout.classList.toggle("sidebar-collapsed");
       localStorage.setItem("sidebar-collapsed", collapsed ? "1" : "0");
     };
+
+    // 遮罩点击 → 收起抽屉
+    const overlay = $("sidebarOverlay");
+    if (overlay) {
+      overlay.addEventListener("click", () => layout.classList.remove("sidebar-open"));
+    }
+
+    // 点菜单后：
+    //  1) 宽屏 → 自动折叠侧边栏（省空间；跳转后新页面按记忆保持折叠，
+    //     汉堡按钮可再展开）——「点哪个都压缩空间」
+    //  2) 窄屏 → 收起抽屉（遮罩消失，内容区域完整可见）
+    layout.addEventListener("click", (ev) => {
+      const a = ev.target.closest(".nav-link");
+      if (!a) return;
+      // 高亮即时切换（跳转前视觉反馈；新页面渲染后以服务端 active 为准）
+      layout.querySelectorAll(".nav-link.active").forEach((el) => el.classList.remove("active"));
+      a.classList.add("active");
+      if (isNarrow()) {
+        layout.classList.remove("sidebar-open");
+      } else {
+        layout.classList.add("sidebar-collapsed");
+        localStorage.setItem("sidebar-collapsed", "1");
+      }
+    });
+
+    // 窗口尺寸切换时清理另一模式的残留状态
+    window.addEventListener("resize", () => {
+      if (isNarrow()) {
+        layout.classList.remove("sidebar-collapsed");
+      } else {
+        layout.classList.remove("sidebar-open");
+      }
+    });
 
     // 侧边栏菜单长于视口：nav 是独立滚动容器（品牌区常驻）。
     // 1) 跨页面记忆滚动位置——点底部菜单后新页面不再"跳"回顶部；

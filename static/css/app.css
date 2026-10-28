@@ -142,9 +142,9 @@ i.bi { line-height: 1; }
 
 /* 社区版徽章（品牌名右侧小 pill） */
 .brand .brand-edition {
-  display: inline-block;
-  margin-left: 6px;
-  padding: 1px 7px;
+  align-self: flex-start;
+  margin-top: 3px;
+  padding: 1px 8px;
   font-size: 10px;
   font-weight: var(--weight-semibold);
   line-height: 1.6;
@@ -152,8 +152,7 @@ i.bi { line-height: 1; }
   background: rgba(94, 234, 212, .12);
   border: 1px solid rgba(94, 234, 212, .35);
   border-radius: 999px;
-  vertical-align: 2px;
-  letter-spacing: .05em;
+  letter-spacing: .08em;
   white-space: nowrap;
 }
 .layout.sidebar-collapsed .brand .brand-edition { display: none; }
@@ -191,7 +190,7 @@ i.bi { line-height: 1; }
 
 /* 导航 */
 .sidebar .nav {
-  gap: 10px;                  /* 菜单项间距（宽松呼吸感） */
+  gap: 12px;                  /* 菜单项间距（宽松呼吸感） */
   /* 菜单长于视口时 nav 独立滚动（品牌区常驻可见）：
      1) flex-wrap 必须 nowrap——Bootstrap .nav 默认 wrap，加高度约束后
         放不下的菜单项会换列而不是滚动（实测两列乱象）；

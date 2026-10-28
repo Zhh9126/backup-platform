@@ -176,8 +176,9 @@
 
     const isNarrow = () => window.matchMedia("(max-width: 992px)").matches;
 
-    // 记忆折叠状态（仅宽屏；窄屏为抽屉模式，刷新后默认收起）
-    if (!isNarrow() && localStorage.getItem("sidebar-collapsed") === "1") {
+    // 折叠记忆（v2 键：作废旧的 sidebar-collapsed 值——默认展开，
+    // 仅用户手动点汉堡折叠才记忆）
+    if (!isNarrow() && localStorage.getItem("sidebar-collapsed-v2") === "1") {
       layout.classList.add("sidebar-collapsed");
     }
 
@@ -188,7 +189,7 @@
         return;
       }
       const collapsed = layout.classList.toggle("sidebar-collapsed");
-      localStorage.setItem("sidebar-collapsed", collapsed ? "1" : "0");
+      localStorage.setItem("sidebar-collapsed-v2", collapsed ? "1" : "0");
     };
 
     // 遮罩点击 → 收起抽屉
@@ -197,22 +198,14 @@
       overlay.addEventListener("click", () => layout.classList.remove("sidebar-open"));
     }
 
-    // 点菜单后：
-    //  1) 宽屏 → 自动折叠侧边栏（省空间；跳转后新页面按记忆保持折叠，
-    //     汉堡按钮可再展开）——「点哪个都压缩空间」
-    //  2) 窄屏 → 收起抽屉（遮罩消失，内容区域完整可见）
+    // 点菜单后：高亮即时切换（跳转前视觉反馈）；侧边栏保持展开不动
+    //（宽屏不折叠、窄屏抽屉随整页跳转自然复位）。
+    // 跳转后的滚动定位见下方 nav 定位逻辑（active 居中）。
     layout.addEventListener("click", (ev) => {
       const a = ev.target.closest(".nav-link");
       if (!a) return;
-      // 高亮即时切换（跳转前视觉反馈；新页面渲染后以服务端 active 为准）
       layout.querySelectorAll(".nav-link.active").forEach((el) => el.classList.remove("active"));
       a.classList.add("active");
-      if (isNarrow()) {
-        layout.classList.remove("sidebar-open");
-      } else {
-        layout.classList.add("sidebar-collapsed");
-        localStorage.setItem("sidebar-collapsed", "1");
-      }
     });
 
     // 窗口尺寸切换时清理另一模式的残留状态
@@ -225,21 +218,13 @@
     });
 
     // 侧边栏菜单长于视口：nav 是独立滚动容器（品牌区常驻）。
-    // 1) 跨页面记忆滚动位置——点底部菜单后新页面不再"跳"回顶部；
-    // 2) 无记忆时把当前激活项居中滚动到可视区。
+    // 每次页面加载都把当前激活项滚动到可视区（居中）——菜单很长，
+    // 点底部的菜单后不用再手动下拉找当前项在哪。
     try {
       const nav = document.querySelector(".sidebar .nav");
       if (!nav) return;
-      const KEY = "sidebar-nav-scroll";
-      let saved = 0;
-      try { saved = parseInt(sessionStorage.getItem(KEY) || "0", 10) || 0; } catch (e) { saved = 0; }
-      nav.addEventListener("scroll", () => {
-        try { sessionStorage.setItem(KEY, String(nav.scrollTop)); } catch (e) { /* 忽略 */ }
-      }, { passive: true });
       const active = nav.querySelector(".nav-link.active");
-      if (saved > 0) {
-        nav.scrollTop = Math.min(saved, Math.max(0, nav.scrollHeight - nav.clientHeight));
-      } else if (active) {
+      if (active) {
         const top = active.offsetTop;
         const bottom = top + active.offsetHeight;
         if (top < nav.scrollTop || bottom > nav.scrollTop + nav.clientHeight) {

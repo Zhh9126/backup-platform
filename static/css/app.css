@@ -166,13 +166,14 @@ i.bi { line-height: 1; }
   letter-spacing: .08em;
   text-transform: uppercase;
   padding: var(--space-sm) var(--space-md) var(--space-xs);
+  margin-top: 6px;           /* 分组与上一组菜单的间隔 */
   white-space: nowrap;
 }
 .layout.sidebar-collapsed .nav-group-label { opacity: 0; height: 0; padding: 0; overflow: hidden; }
 
 /* 导航 */
 .sidebar .nav {
-  gap: var(--space-xs);
+  gap: 8px;                  /* 菜单项间距（宽松呼吸感） */
   /* 菜单长于视口时 nav 独立滚动（品牌区常驻可见）：
      1) flex-wrap 必须 nowrap——Bootstrap .nav 默认 wrap，加高度约束后
         放不下的菜单项会换列而不是滚动（实测两列乱象）；

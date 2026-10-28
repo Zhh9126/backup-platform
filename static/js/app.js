@@ -2451,12 +2451,12 @@
     const rs = await api("GET", "/api/restores");
     const hl = Number(highlightId || 0);
     const pg = Pager.slice("restoreList", rs);
-    $("restoreTable").innerHTML = pg.list.map((r) => {
+    $("restoreTable").innerHTML = pg.list.map((r, ri) => {
       const cls = (hl && Number(r.id) === hl) ? ' class="restore-row-new"' : "";
       // 收编为统一 fmtBizCell：R2 回退与 #id 语义只维护一处；
       // 同时修复此处原内联拼装把 #id 渲染成「恢复记录 ID」的历史缺陷（现为任务 ID）
       return `<tr${cls}>
-        <td>${r.id}</td><td>${r.record_id}</td>
+        <td>${pg.startNo + ri}</td><td>${r.record_id}</td>
         <td>${fmtBizCell(r)}</td>
         <td>${esc(r.db_type_display || r.db_type || "-")}</td>
         <td>${fmtTime(r.backup_started_at)}</td>
@@ -2473,7 +2473,7 @@
   async function loadVdbs() {
     const vdbs = await api("GET", "/api/vdb");
     const pgv = Pager.slice("vdbs", vdbs);
-    $("vdbTable").innerHTML = pgv.list.map((v) => {
+    $("vdbTable").innerHTML = pgv.list.map((v, vi) => {
       const conn = `${v.username || 'root'}@${v.host || '127.0.0.1'}:${v.port || 3306}/${v.database_name || ''}`;
       const expiresIn = v.expires_at ? Math.max(0, Math.floor((new Date(v.expires_at) - new Date()) / 1000 / 3600)) : null;
       const expiresBadge = expiresIn === null ? '-' :
@@ -2485,7 +2485,7 @@
                         : v.status === "error" ? '<span class="badge bg-danger">异常</span>'
                         : `<span class="badge bg-secondary">${esc(v.status)}</span>`;
       return `<tr>
-        <td>${v.id}</td>
+        <td>${pgv.startNo + vi}</td>
         <td><code>${esc(v.name)}</code></td>
         <td>${esc(v.db_type)}</td>
         <td>#${v.source_record_id || '-'}</td>
@@ -3469,7 +3469,7 @@
   async function loadFileTasks() {
     const tasks = await api("GET", "/api/tasks?db_type=file");
     const pg = Pager.slice("fileTasks", tasks);
-    $("fileTaskTable").innerHTML = pg.list.map((t) => {
+    $("fileTaskTable").innerHTML = pg.list.map((t, fi) => {
       let extra = {};
       try { extra = JSON.parse(t.extra_options || "{}"); } catch (e) { extra = {}; }
       const src = extra.source_type === "remote"
@@ -3479,7 +3479,7 @@
         ? `${esc(extra.target_host || "")} : ${esc(extra.target_path || "")}`
         : `本地 : ${esc(extra.target_path || "")}`;
       return `<tr>
-        <td>${t.id}</td>
+        <td>${pg.startNo + fi}</td>
         <td>${esc(t.biz_label || "-")}</td>
         <td>${esc(t.name)}</td>
         <td class="text-truncate" style="max-width:200px">${src}</td>
@@ -3620,7 +3620,7 @@
   async function loadHosts() {
     FILE_HOSTS = await api("GET", "/api/hosts");
     const pgh = Pager.slice("hosts", FILE_HOSTS);
-    $("hostTable").innerHTML = pgh.list.map((h) => {
+    $("hostTable").innerHTML = pgh.list.map((h, hi) => {
       const status = h.last_status || "unknown";
       const dotCls = status === "ok" ? "ok" : (status === "failed" ? "fail" : "unknown");
       const statusText = status === "ok" ? "正常" : (status === "failed" ? "失败" : "未探测");
@@ -3631,7 +3631,7 @@
             : '<span class="badge bg-secondary">未探测</span>');
       const dot = `<span class="host-dot ${dotCls}"></span>`;
       return `<tr>
-        <td>${h.id}</td>
+        <td>${pgh.startNo + hi}</td>
         <td>${esc(h.name)}</td>
         <td><code>${esc(h.host_key)}</code></td>
         <td>${esc(h.hostname)}:${esc(h.port || 22)}</td>
@@ -3738,8 +3738,8 @@
   async function loadSyncRecords() {
     const recs = await api("GET", "/api/sync/records");
     const pg = Pager.slice("syncRecords", recs);
-    $("syncRecordTable").innerHTML = pg.list.map((r) =>
-      `<tr><td>${r.id}</td><td>${esc(r.sync_name || r.sync_task_id)}</td>
+    $("syncRecordTable").innerHTML = pg.list.map((r, ri) =>
+      `<tr><td>${pg.startNo + ri}</td><td>${esc(r.sync_name || r.sync_task_id)}</td>
        <td>${fmtTime(r.started_at)}</td><td>${fmtTime(r.finished_at)}</td>
        <td>${statusBadge(r.status)}</td><td>${esc(r.message || "")}</td></tr>`).join("") ||
       '<tr><td colspan="6" class="text-muted text-center">暂无同步记录</td></tr>';
@@ -3977,12 +3977,12 @@
   async function loadInspections() {
     const rs = await api("GET", "/api/inspection/records");
     const pg = Pager.slice("inspections", rs);
-    $("inspectionTable").innerHTML = pg.list.map((r) => {
+    $("inspectionTable").innerHTML = pg.list.map((r, ri) => {
       const trig = r.triggered_by || "-";
       const trigBadge = trig === "schedule"
         ? '<span class="badge bg-info">定时</span>'
         : (trig === "manual" ? '<span class="badge bg-secondary">手动</span>' : esc(trig));
-      return `<tr><td>${r.id}</td><td>${esc(r.task_name || r.task_id)}</td>
+      return `<tr><td>${pg.startNo + ri}</td><td>${esc(r.task_name || r.task_id)}</td>
        <td>${esc(r.db_type || "-")}</td><td>${inspBadge(r.status)}</td>
        <td class="text-truncate" style="max-width:360px" title="${esc(r.detail || "")}">${esc(r.detail || "")}</td>
        <td>${trigBadge}</td><td>${fmtTime(r.started_at)}</td></tr>`;
@@ -4043,9 +4043,9 @@
   async function loadDeployments() {
     const deps = await api("GET", "/api/deploy");
     const pg = Pager.slice("deploys", deps);
-    $("deployTable").innerHTML = pg.list.map((d) =>
+    $("deployTable").innerHTML = pg.list.map((d, di) =>
       `<tr>
-        <td>${d.id}</td><td>${esc(d.name)}</td><td>${esc(d.db_type)}</td>
+        <td>${pg.startNo + di}</td><td>${esc(d.name)}</td><td>${esc(d.db_type)}</td>
         <td>${esc(d.host_display || (d.host_id ? '#'+d.host_id : d.direct_host) || '-')}</td>
         <td class="text-truncate" style="max-width:150px" title="${esc(d.base_dir||'')}">${esc(d.base_dir || '-')}</td>
         <td>${d.port || '-'}</td>
@@ -5328,13 +5328,13 @@
   window.loadDrills = async () => {
     const d = await api("GET", "/api/drills");
     const pg = Pager.slice("drills", d);
-    $("drillTable").innerHTML = pg.list.map(dr => {
+    $("drillTable").innerHTML = pg.list.map((dr, dri) => {
       const scoreBadge = dr.score >= 90 ? '<span class="badge bg-success">' + dr.score + '</span>'
                        : dr.score >= 60 ? '<span class="badge bg-warning text-dark">' + dr.score + '</span>'
                        : dr.score > 0 ? '<span class="badge bg-danger">' + dr.score + '</span>'
                        : '-';
       return '<tr>' +
-        '<td>' + dr.id + '</td>' +
+        '<td>' + pg.startNo + dri + '</td>' +
         '<td>' + esc(dr.name) + '</td>' +
         '<td>' + (dr.task_id ? esc(window._taskNames[dr.task_id] || dr.task_id) : '-') + '</td>' +
         '<td>' + esc(dr.drill_type === 'real_restore' ? '真实恢复' : dr.drill_type === 'full_recovery' ? '全量检查' : dr.drill_type === 'partial' ? '对象级' : '单表') + '</td>' +
@@ -6637,14 +6637,14 @@
     window.loadMigrations = async function () {
       const rows = await api("GET", "/api/migration");
       const pg = Pager.slice("migrations", rows);
-      $("migrationTable").innerHTML = pg.list.map(function (p) {
+      $("migrationTable").innerHTML = pg.list.map(function (p, pi) {
         const verified = p.verified
           ? '<span class="badge badge-ok">已校验</span>'
           : '<span class="badge bg-secondary">未校验</span>';
         const golden = p.golden_backup_record_id ? String(p.golden_backup_record_id) : '-';
         const taskLabel = p.task_id ? (esc(p.task_name || ('# ' + p.task_id))) : '-';
         return '<tr>' +
-          '<td>' + p.id + '</td>' +
+          '<td>' + pg.startNo + pi + '</td>' +
           '<td>' + taskLabel + '</td>' +
           '<td><span class="badge bg-info">' + esc(p.stage || '-') + '</span></td>' +
           '<td>' + golden + '</td>' +
@@ -6793,7 +6793,7 @@
       const rows = await api("GET", "/api/db-migrate");
       let running = false;
       const pg = Pager.slice("dbMigrations", rows);
-      $("dbMigrateTable").innerHTML = pg.list.map(function (p) {
+      $("dbMigrateTable").innerHTML = pg.list.map(function (p, pi) {
         if (["checking", "migrating", "verifying"].indexOf(p.status) >= 0) running = true;
         const link = '<span class="badge bg-info">' + esc(p.src_db_type) + '</span> ' +
           esc(p.src_host + ':' + (p.src_port || '-') + '/' + p.src_db_name) +
@@ -6810,7 +6810,7 @@
         const del = '<button class="btn btn-sm btn-outline-danger" onclick="deleteDbMigrate(' + p.id + ')">' +
           '<i class="bi bi-trash"></i> 删除</button>';
         return '<tr>' +
-          '<td>' + p.id + '</td>' +
+          '<td>' + pg.startNo + pi + '</td>' +
           '<td>' + esc(p.name) + '</td>' +
           '<td style="max-width:380px">' + link + '</td>' +
           '<td>' + esc(types) + '</td>' +
@@ -7040,7 +7040,7 @@
       const rows = await api("GET", "/api/clone");
       let provisioning = false;
       const pg = Pager.slice("clones", rows);
-      $("cloneTable").innerHTML = pg.list.map(function (c) {
+      $("cloneTable").innerHTML = pg.list.map(function (c, cii) {
         // VDB 连接信息：就绪时展示可直接使用的连接串
         let vdb = '-';
         if (c.status === 'ready' && c.vdb_dbname) {
@@ -7074,7 +7074,7 @@
           : '';
         if (c.status === 'creating') provisioning = true;
         return '<tr>' +
-          '<td>' + c.id + '</td>' +
+          '<td>' + pg.startNo + cii + '</td>' +
           '<td>' + (c.task_name ? esc(c.task_name) + ' <span class="text-muted">(记录 ' + c.source_record_id + ')</span>' : (c.source_record_id != null ? c.source_record_id : '-')) + '</td>' +
           '<td>' + (c.source_db_type ? '<span class="badge bg-info">' + esc(c.source_db_type) + '</span>' : '-') + '</td>' +
           '<td>' + esc(c.target_env || '') + '</td>' +

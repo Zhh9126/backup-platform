@@ -24,6 +24,9 @@
       pages,
       total,
       pageSize: ps,
+      // 连续序号起始（第 N 页从 (N-1)*pageSize+1 开始）——列表 ID 列
+      // 显示用：`pg.list.map((x, i) => ... ${pg.startNo + i} ...)`
+      startNo: start + 1,
     };
   }
 

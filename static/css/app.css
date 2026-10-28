@@ -139,6 +139,24 @@ i.bi { line-height: 1; }
   color: var(--sidebar-text-muted);
   letter-spacing: .02em;
 }
+
+/* 社区版徽章（品牌名右侧小 pill） */
+.brand .brand-edition {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  font-size: 10px;
+  font-weight: var(--weight-semibold);
+  line-height: 1.6;
+  color: #5EEAD4;
+  background: rgba(94, 234, 212, .12);
+  border: 1px solid rgba(94, 234, 212, .35);
+  border-radius: 999px;
+  vertical-align: 2px;
+  letter-spacing: .05em;
+  white-space: nowrap;
+}
+.layout.sidebar-collapsed .brand .brand-edition { display: none; }
 .layout.sidebar-collapsed .brand .brand-text { opacity: 0; width: 0; overflow: hidden; }
 .layout.sidebar-collapsed .brand .brand-logo { width: 32px; height: 32px; font-size: 17px; }
 
@@ -173,7 +191,7 @@ i.bi { line-height: 1; }
 
 /* 导航 */
 .sidebar .nav {
-  gap: 8px;                  /* 菜单项间距（宽松呼吸感） */
+  gap: 10px;                  /* 菜单项间距（宽松呼吸感） */
   /* 菜单长于视口时 nav 独立滚动（品牌区常驻可见）：
      1) flex-wrap 必须 nowrap——Bootstrap .nav 默认 wrap，加高度约束后
         放不下的菜单项会换列而不是滚动（实测两列乱象）；
@@ -200,7 +218,8 @@ i.bi { line-height: 1; }
   display: flex;
   align-items: center;
   gap: 12px;                 /* 图标与文字间距 */
-  height: 48px;              /* 5.5 菜单项高度 */
+  height: 46px;              /* 菜单项高度 */
+  margin-bottom: 2px;        /* 项间额外空隙，避免压扁感 */
   padding: 0 var(--space-md);
   color: var(--sidebar-text);
   border-radius: var(--radius-md);

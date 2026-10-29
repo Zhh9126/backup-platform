@@ -183,31 +183,11 @@ class PostgreSQLEngine(BackupEngine):
                 res.message = res.message + " " + fb_note
             return res
         comp = int(self.task.get("compress") or 0)
-        data, compressed, fmt = remote_dump.remote_db_dump(self.task, ssh_host, self._dump_db_type, comp)
-        if not data:
-            return BackupResult(
-                success=False, status=BackupStatus.FAILED,
-                backup_path="",
-                message=("远端 pg_dump 输出为空（rc=0 但无数据）——疑似认证失败"
-                         "或连接异常，请检查任务凭据与数据库服务器日志"))
-        if fmt == "multi-db-tar":
-            # 全实例：逐库 tar.gz（远端已 gzip，manifest.json 标注库清单）
-            res = self._write_dump_file(data, backup_type, ssh_host, ".tar.gz", "pg_dump")
-            res.compress_algo = "gzip"
-            return _with_note(res)
-        if fmt == "dumpall":
-            res = self._write_dump_file(data, backup_type, ssh_host, ".sql", "pg_dumpall")
-            res.compress_algo = "none"
-            return _with_note(res)
-        # 单库：落盘后缀由任务「备份文件格式」(extra_options.dump_format) 决定
-        # （远端 -Fc 自带压缩，不再外挂 gzip；directory 由远端直接打成 tar.gz 流）
-        from core import dump_format as _dfmt
-        spec = _dfmt.resolve(self._dump_db_type, self._extra_dict(), compress=bool(comp))
-        ext = spec.get("ext") or (".dump" if compressed else ".sql")
-        if spec.get("dir"):
-            ext = ".dir.tar.gz"
-        res = self._write_dump_file(data, backup_type, ssh_host, ext, "pg_dump")
-        res.compress_algo = "zlib" if compressed else "none"
+        # 通用落盘续传通道：远端 stage 落盘 + 断点续传拉回 + 限速
+        # （替代旧 remote_db_dump 整包 bytes 进内存；openGauss/磐维继承本方法）
+        res = self._backup_logical_remote_file(
+            ssh_host, backup_type, self._dump_db_type,
+            "pg_dump", "pg_dumpall")
         return _with_note(res)
 
     def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:

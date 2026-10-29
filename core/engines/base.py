@@ -967,6 +967,56 @@ class BackupEngine:
             message=f"通过 SSH 在数据库服务器({hk})执行 {label} 成功 | {db.human_size(size)}",
         )
 
+    def _backup_logical_remote_file(self, ssh_host: dict, backup_type: BackupType,
+                                    db_type: str, single_label: str,
+                                    dumpall_label: str = "") -> BackupResult:
+        """通用远端逻辑备份落盘通道（全库型共用）。
+
+        与旧 remote_db_dump（整包 bytes 进内存）的差别：远端 stage 落盘 +
+        断点续传拉回 + 瞬时重试 + 平台侧限速（bandwidth_limit），内存恒定，
+        大库在受限链路上中断后可从断点继续（dump 与传输都不重来）。
+        """
+        from core import remote_dump
+        comp = int(self.task.get("compress") or 0)
+        extra0 = self._extra_dict() if hasattr(self, "_extra_dict") else {}
+        db_name = self.task.get("db_name") or ""
+        schemas = [str(s).strip() for s in (extra0.get("schemas") or []) if str(s).strip()]
+        tables = [str(t).strip() for t in (extra0.get("tables") or []) if str(t).strip()]
+        all_inst = ((extra0.get("use_all_db") or not db_name)
+                    and not schemas and not tables)
+        dumpall_mode = (extra0.get("all_db_mode") or "").strip().lower() == "dumpall"
+        if all_inst and dumpall_mode:
+            fmt, ext, calgo = "dumpall", ".sql", "none"
+        elif all_inst:
+            fmt, ext, calgo = "multi-db-tar", ".tar.gz", "gzip"
+        else:
+            from core import dump_format as _dfmt
+            spec = _dfmt.resolve(db_type, extra0, compress=bool(comp))
+            ext = spec.get("ext") or (".dump" if comp else ".sql")
+            if spec.get("dir"):
+                ext = ".dir.tar.gz"
+            fmt, calgo = "single", ("zlib" if comp else "none")
+        out_path = self._new_dump_path(backup_type, ext)
+        res_d = remote_dump.remote_db_dump_to_file(
+            self.task, ssh_host, db_type, out_path, comp)
+        size = int(res_d.get("size") or 0)
+        notes = []
+        if res_d.get("resumed"):
+            notes.append("断点续传拉回")
+        if res_d.get("dumped") is False:
+            notes.append("复用远端已完成导出")
+        note = ("（" + "，".join(notes) + "）") if notes else ""
+        hk = (ssh_host or {}).get("host_key", "remote")
+        label = dumpall_label if fmt == "dumpall" and dumpall_label else single_label
+        return BackupResult(
+            success=True, status=BackupStatus.SUCCESS,
+            backup_path=out_path, size_bytes=size, duration_sec=0.0,
+            checksum=res_d.get("sha256") or "",
+            compress_algo=calgo,
+            message=(f"通过 SSH 在数据库服务器({hk})执行 {label} 成功 | "
+                     f"{db.human_size(size)}{note}"),
+        )
+
     # ---------------- 远程优先回退策略 ----------------
     def _try_remote_then_local(self, remote_fn, local_fn, label: str) -> BackupResult:
         """先尝试在 SSH 备份机/数据库服务器执行，失败再回退到本机。
@@ -1619,7 +1669,10 @@ class BackupEngine:
         sftp = client.open_sftp()
         try:
             remote_file = f"/tmp/platform_restore_{ts}_{os.path.basename(backup_path)}"
-            sftp.put(backup_path, remote_file)
+            remote_dump.sftp_put_resumable(
+                client, backup_path, remote_file,
+                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                label="自定义恢复备份包推送")
             remote_script = f"/tmp/platform_custom_restore_{ts}.sh"
             with sftp.open(remote_script, "w") as f:
                 f.write(script if script.endswith("\n") else script + "\n")

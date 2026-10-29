@@ -337,7 +337,10 @@ class OpenGaussEngine(PostgreSQLEngine):
                     f"rm -rf {shlex.quote(remote_tmp)} && mkdir -p {remote_tmp}"), timeout=60)
             try:
                 sftp = client.open_sftp()
-                sftp.put(backup_path, remote_tmp.rstrip("/") + "/artifact.tar.gz")
+                sftp.close()
+                remote_dump.sftp_put_resumable(
+                    client, backup_path, remote_tmp.rstrip("/") + "/artifact.tar.gz",
+                    label="openGauss 恢复产物推送")
                 sftp.close()
             except Exception as e:  # noqa: BLE001
                 return BackupResult(success=False, status=BackupStatus.FAILED,

@@ -214,36 +214,9 @@ class KingbaseEngine(BackupEngine):
             simulated=False, checksum=checksum, message=msg)
 
     def _backup_logical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
-        """在 SSH 备份机/数据库服务器上执行 sys_dump，把流拉回到本地落盘。"""
-        from core import remote_dump
-        comp = int(self.task.get("compress") or 0)
-        data, compressed, fmt = remote_dump.remote_db_dump(self.task, ssh_host, "kingbase", comp)
-        if not data:
-            return BackupResult(
-                success=False, status=BackupStatus.FAILED,
-                backup_path="",
-                message=("远端 sys_dump 输出为空（rc=0 但无数据）——疑似认证失败"
-                         "或连接异常，请检查任务凭据与数据库服务器日志"))
-        if fmt == "multi-db-tar":
-            # 全实例：逐库 tar.gz（远端已 gzip，manifest.json 标注库清单）
-            res = self._write_dump_file(data, backup_type, ssh_host, ".tar.gz", "sys_dump")
-            res.compress_algo = "gzip"
-            return res
-        if fmt == "dumpall":
-            # 整实例 SQL 流（extra.all_db_mode="dumpall"）
-            res = self._write_dump_file(data, backup_type, ssh_host, ".sql", "sys_dumpall")
-            res.compress_algo = "none"
-            return res
-        # 单库：落盘后缀由任务「备份文件格式」(extra_options.dump_format) 决定
-        # （远端 -Fc 自带压缩，不再外挂 gzip；directory 由远端直接打成 tar.gz 流）
-        from core import dump_format as _dfmt
-        _spec = _dfmt.resolve("kingbase", self._extra_dict(), compress=bool(comp))
-        ext = _spec.get("ext") or (".dump" if compressed else ".sql")
-        if _spec.get("dir"):
-            ext = ".dir.tar.gz"
-        res = self._write_dump_file(data, backup_type, ssh_host, ext, "sys_dump")
-        res.compress_algo = "zlib" if compressed else "none"
-        return res
+        """在 SSH 备份机/数据库服务器上执行 sys_dump，远端落盘 + 断点续传拉回。"""
+        return self._backup_logical_remote_file(
+            ssh_host, backup_type, "kingbase", "sys_dump", "sys_dumpall")
 
     def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:
         """逻辑备份：sys_dump（沿用原有实现）。"""

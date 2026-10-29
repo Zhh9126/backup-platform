@@ -441,7 +441,9 @@ class SQLServerEngine(BackupEngine):
             sftp = client.open_sftp()
             try:
                 remote_ref = disk_path.replace("\\", "/") if win else disk_path
-                sftp.put(backup_path, remote_ref)
+                sftp.close()
+                remote_dump.sftp_put_resumable(
+                    client, backup_path, remote_ref, label="mssql .bak 推送")
             finally:
                 sftp.close()
                 try:
@@ -614,7 +616,9 @@ class SQLServerEngine(BackupEngine):
         sftp = client.open_sftp()
         try:
             remote_ref = disk_path.replace("\\", "/") if win else disk_path
-            sftp.put(backup_path, remote_ref)
+            sftp.close()
+            remote_dump.sftp_put_resumable(
+                client, backup_path, remote_ref, label="mssql .bak 恢复推送")
         finally:
             sftp.close()
             try:

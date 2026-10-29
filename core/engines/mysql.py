@@ -977,7 +977,10 @@ class MySQLEngine(BackupEngine):
                             f"架构（{remote_arch}）不一致，无法推送执行。"
                             f"请在平台侧部署 {remote_arch} 架构的对应版本物理备份"
                             f"二进制，或改用逻辑备份。"))
-                sftp.put(local_bin, pushed_bin)
+                remote_dump.sftp_put_resumable(
+                    client, local_bin, pushed_bin,
+                    rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                    label="xtrabackup 二进制推送")
                 try:
                     sftp.chmod(pushed_bin, 0o755)
                 except Exception:
@@ -1011,7 +1014,9 @@ class MySQLEngine(BackupEngine):
                                          f" 与 /usr/lib64 前缀匹配），无法推送 {bin_label} 执行；"
                                          f"可将该库文件放入镜像内置目录后重试，"
                                          f"或在数据库服务器安装匹配版本 xtrabackup"))
-                        sftp.put(local_so, f"{pushed_libs_dir}/{name}")
+                        remote_dump.sftp_put_resumable(
+                            client, local_so, f"{pushed_libs_dir}/{name}",
+                            label="xtrabackup 依赖库推送")
                     env_pre = (f"export LD_LIBRARY_PATH={pushed_libs_dir}"
                                f":$LD_LIBRARY_PATH; ")
                     push_note = f"（远端零安装：平台推送 {bin_label} + {len(missing)} 个动态库"
@@ -1885,7 +1890,10 @@ class MySQLEngine(BackupEngine):
             logs.append(f"[物理恢复] 上传 prepare 后数据目录 "
                         f"({db.human_size(os.path.getsize(ltar))}) 到远端临时校验 ...")
             sftp = client.open_sftp()
-            sftp.put(ltar, rtar)
+            remote_dump.sftp_put_resumable(
+                client, ltar, rtar,
+                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                label="物理恢复数据包推送")
             # 上传完整性对账：远端半包会导致远端 gzip "unexpected end of
             # file"（rc=41 伪装成校验失败）——此处直接比对字节数，不匹配
             # 立即清理半包并给明确诊断（常见根因：两端磁盘空间不足）。

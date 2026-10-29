@@ -349,16 +349,151 @@ def remote_exec_capture(ssh_host: dict, shell: str, timeout: int = 1800) -> dict
 
 
 def sftp_put(ssh_host: dict, local_path: str, remote_path: str) -> None:
-    """通过 SFTP 把本地文件上传到远端指定路径（供 plugin_installer 上传离线包）。"""
+    """通过 SFTP 把本地文件上传到远端指定路径（供 plugin_installer 上传离线包）。
+
+    内部走 sftp_put_resumable：断点续传 + 瞬时重试（限速需传 task）。
+    """
     client = _connect(ssh_host)
-    sftp = client.open_sftp()
     try:
-        sftp.put(local_path, remote_path)
+        sftp_put_resumable(client, local_path, remote_path, ssh_host=ssh_host)
     finally:
         try:
-            sftp.close()
+            client.close()
         except Exception:
             pass
+
+
+def _sftp_session_refresh(client, ssh_host=None, host_key=""):
+    """SSH 会话保活 + 断线重连（限速慢传大文件的关键配套）。
+
+    长传输期间 sshd 可能掐掉空闲连接（ClientAlive 超时）——入口先开
+    keepalive(15s)；重试前检查会话活性，已断开则重连（断点续传保证
+    从已传字节继续，重连不丢进度）。返回（可能新的）client。
+    """
+    try:
+        tr = client.get_transport()
+        if tr is not None:
+            tr.set_keepalive(15)
+            if tr.is_active():
+                return client
+    except Exception:
+        pass
+    if ssh_host is not None or host_key:
+        logging.getLogger(__name__).info(
+            "[remote_dump] SSH 会话已断开，重连后从断点重试")
+        return _connect(ssh_host if ssh_host is not None
+                        else {"host_key": host_key})
+    return client
+
+
+def sftp_put_resumable(client, local_path: str, remote_path: str, *,
+                       rate_kbps: int = 0, attempts: int = 3,
+                       label: str = "", ssh_host=None) -> dict:
+    """通用恢复推送通道：断点续传 + 瞬时异常退避重试 + 平台侧限速。
+
+    机制：先传 remote_path + ".aidbm_part"（SFTP append 从已传字节续传），
+    完成后远端原子改名到目标路径——恢复中途中断不会在目标路径留下半成品，
+    重试/重跑从断点继续，不重传已推字节。
+
+    返回 dict(remote_path, size, resumed)。
+    """
+    import time as _t
+
+    log = logging.getLogger(__name__)
+
+    def _push(sftp, part: str, offset: int) -> int:
+        size = os.path.getsize(local_path)
+        rf = sftp.open(part, "ab" if offset else "wb")
+        try:
+            try:
+                # 单请求写负载必须 ≤ OpenSSH sftp-server 的 255KB 包上限——
+                # 512KB 请求会被服务端直接断连（"Server connection dropped"，
+                # 本机回环实测必现）。读请求不受此限（服务端自行分片回包）。
+                rf.MAX_REQUEST_SIZE = 64 * 1024
+            except Exception:
+                pass
+            if offset:
+                rf.seek(offset)
+            with open(local_path, "rb") as lf:
+                if offset:
+                    lf.seek(offset)
+                start = _t.time()
+                base = offset
+                while True:
+                    chunk = lf.read(256 * 1024)
+                    if not chunk:
+                        break
+                    rf.write(chunk)
+                    offset += len(chunk)
+                    if rate_kbps > 0:
+                        _expect = (offset - base) / (rate_kbps * 1024.0)
+                        _drift = _expect - (_t.time() - start)
+                        if _drift > 0.05:
+                            _t.sleep(min(_drift, 2.0))
+            rf.flush()
+        finally:
+            try:
+                rf.close()
+            except Exception:
+                pass
+        return offset
+
+    last_err = None
+    client = _sftp_session_refresh(client, ssh_host=ssh_host)
+    for attempt in range(1, attempts + 1):
+        sftp = None
+        part = remote_path + ".aidbm_part"
+        try:
+            client = _sftp_session_refresh(client, ssh_host=ssh_host)
+            sftp = client.open_sftp()
+            offset = 0
+            try:
+                offset = int(sftp.stat(part).st_size or 0)
+            except Exception:
+                offset = 0
+            try:
+                lsize = os.path.getsize(local_path)
+            except OSError:
+                raise RuntimeError(f"本地文件不存在，无法推送：{local_path}")
+            if offset > lsize:          # 远端残件比本地还大（脏数据）→ 重传
+                try:
+                    sftp.remove(part)
+                except Exception:
+                    pass
+                offset = 0
+            resumed = offset > 0
+            size = _push(sftp, part, offset)
+            if size != lsize:
+                raise RuntimeError(
+                    f"推送字节数不一致（远端 {size} != 本地 {lsize}）")
+            # 原子改名到目标路径（同目录；目标已存在先清）
+            try:
+                sftp.remove(remote_path)
+            except Exception:
+                pass
+            try:
+                sftp.posix_rename(part, remote_path)
+            except Exception:
+                sftp.rename(part, remote_path)
+            if resumed:
+                log.info("[remote_dump] 恢复推送断点续传完成: %s（从 %s 处继续）",
+                         remote_path, db.human_size(offset))
+            return {"remote_path": remote_path, "size": size, "resumed": resumed}
+        except Exception as e:                # noqa: BLE001 - 瞬时重试
+            last_err = e
+            from core.engines.file import _is_transient
+            if attempt >= attempts or not _is_transient(e):
+                raise
+            backoff = min(2 ** attempt, 10)
+            log.warning("[remote_dump] 恢复推送中断（第 %s/%s 次），%ss 后从断点重试: %s",
+                        attempt, attempts, backoff, str(e)[:140])
+            _t.sleep(backoff)
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+    raise last_err
 
 
 def _remote_compress_pipe(enable: bool, level: int = None) -> str:
@@ -1234,11 +1369,11 @@ def _pg_family_resolve_dumpall_bin(client, cfg) -> str:
     return ""
 
 
-def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
-                                 user: str, pw: str, port: int,
-                                 include_sys: bool = False,
-                                 tool_path: str = "") -> bytes:
-    """全实例备份：一次 SSH 会话内逐库 dump + globals + manifest → tar.gz 流。
+def _pg_family_full_instance_shell(client, cfg: dict, dump_bin: str,
+                                   user: str, pw: str, port: int,
+                                   include_sys: bool = False,
+                                   tool_path: str = "") -> str:
+    """全实例备份脚本（stdout=tar.gz 流）：逐库 dump + globals + manifest。
 
     每库 -Fc（独立一致性快照，支持并行恢复）；单库失败即整体失败（rc=32）；
     dumpall 缺失/失败仅降级跳过 globals（在 manifest 中标记），不阻塞备份。
@@ -1318,7 +1453,17 @@ def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
         '  tar -czf - -C "$WORK" manifest.json dbs',
         "fi",
     ]
-    script = "\n".join(lines)
+    return "\n".join(lines)
+
+
+def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
+                                 user: str, pw: str, port: int,
+                                 include_sys: bool = False,
+                                 tool_path: str = "") -> bytes:
+    """全实例备份（bytes 形态，供 remote_db_dump 兼容通道使用）。"""
+    from core.engines.file import _ssh_exec_pipe
+    script = _pg_family_full_instance_shell(
+        client, cfg, dump_bin, user, pw, port, include_sys, tool_path)
     wrapped = _wrap_login(script)
     out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=7200)
     if rc != 0:
@@ -1330,14 +1475,10 @@ def _pg_family_full_instance_tar(client, cfg: dict, dump_bin: str,
     return out
 
 
-def _pg_family_dumpall_stream(client, cfg: dict,
-                              user: str, pw: str, port: int,
-                              tool_path: str = "") -> bytes:
-    """整实例 SQL 流模式（extra.all_db_mode="dumpall"）：dumpall 直接输出。
-
-    纯 SQL 文本、单文件；大库恢复较慢，但最贴近原生全实例语义。
-    dumpall 工具缺失时报错并给出说明。
-    """
+def _pg_family_dumpall_shell(client, cfg: dict,
+                             user: str, pw: str, port: int,
+                             tool_path: str = "") -> str:
+    """整实例 SQL 流脚本（stdout=SQL 文本，extra.all_db_mode="dumpall"）。"""
     from core.engines.file import _ssh_exec_pipe
     dumpall_bin = _pg_family_resolve_dumpall_bin(client, cfg)
     if not dumpall_bin:
@@ -1353,6 +1494,15 @@ def _pg_family_dumpall_stream(client, cfg: dict,
         f"{dumpall_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} "
         f"-f {tmpf} > /dev/null && cat {tmpf}; RC=$?; rm -f {tmpf}; exit $RC"
     )
+    return shell
+
+
+def _pg_family_dumpall_stream(client, cfg: dict,
+                              user: str, pw: str, port: int,
+                              tool_path: str = "") -> bytes:
+    """整实例 SQL 流（bytes 形态，供 remote_db_dump 兼容通道使用）。"""
+    from core.engines.file import _ssh_exec_pipe
+    shell = _pg_family_dumpall_shell(client, cfg, user, pw, port, tool_path)
     out, err, rc = _ssh_exec_pipe(client, _wrap_login(shell), timeout=7200)
     if rc != 0:
         raise RuntimeError(
@@ -1360,12 +1510,17 @@ def _pg_family_dumpall_stream(client, cfg: dict,
     return out
 
 
-def _pg_family_dump(task: dict, ssh_host: dict, db_type: str, compress: int) -> tuple:
-    """PG 系统一 dump 入口。返回 (data, fmt)：
+def _pg_family_dump_shell(task: dict, ssh_host: dict, db_type: str,
+                          compress: int) -> tuple:
+    """PG 系统一 dump：构建远端 shell（stdout=产物流）。
 
-    - fmt="single"       单库/多表/多 schema dump（-Fc 自带压缩或 -Fp 纯文本）
-    - fmt="multi-db-tar" 全实例逐库 tar.gz（含 manifest.json + globals.sql）
-    - fmt="dumpall"      整实例 SQL 流（extra.all_db_mode="dumpall" 时）
+    返回 (client, shell, kind)：
+    - kind="single"       单库/多表/多 schema dump（-Fc 自带压缩或 -Fp 纯文本）
+    - kind="multi-db-tar" 全实例逐库 tar.gz（含 manifest.json + globals.sql）
+    - kind="dumpall"      整实例 SQL 流（extra.all_db_mode="dumpall" 时）
+
+    shell 形态供两条通道共用：bytes 兼容通道（remote_db_dump）与
+    stage 落盘 + 断点续传拉回通道（remote_db_dump_to_file）。
     """
     cfg = _PG_FAMILY_TOOLING[db_type]
     client = _connect(ssh_host)
@@ -1399,11 +1554,15 @@ def _pg_family_dump(task: dict, ssh_host: dict, db_type: str, compress: int) -> 
         # 默认仅备份业务库（排除系统库），extra.include_system_dbs=true 时包含
         include_sys = bool(extra.get("include_system_dbs"))
         if (extra.get("all_db_mode") or "").strip().lower() == "dumpall":
-            return _pg_family_dumpall_stream(
-                client, cfg, user, pw, port, tool_path=tp), "dumpall"
-        return _pg_family_full_instance_tar(
-            client, cfg, dump_bin, user, pw, port, include_sys,
-            tool_path=tp), "multi-db-tar"
+            return (client,
+                    _pg_family_dumpall_shell(
+                        client, cfg, user, pw, port, tool_path=tp),
+                    "dumpall")
+        return (client,
+                _pg_family_full_instance_shell(
+                    client, cfg, dump_bin, user, pw, port, include_sys,
+                    tool_path=tp),
+                "multi-db-tar")
 
     # ---- 单库/多表/多 schema（原有行为）----
     # 注意：不使用 "-f -"（显式指定 stdout）。某些环境下 pg_dump 的 "-f -"
@@ -1466,24 +1625,28 @@ def _pg_family_dump(task: dict, ssh_host: dict, db_type: str, compress: int) -> 
             )
         else:
             shell = f"{base} {target_args}{extra_args}"
-    # 压缩策略：-Fc 自带 zlib 压缩，不外挂 gzip/zstd 以免双重压缩；
-    # compress 时落盘 .dump，恢复端用 pg_restore/sys_restore。
-    wrapped = _wrap_login(shell)
+    return client, shell, "single"
+
+
+def _pg_family_dump(task: dict, ssh_host: dict, db_type: str, compress: int) -> tuple:
+    """PG 系统一 dump（bytes 兼容通道，供 remote_db_dump 使用）。"""
+    client, shell, kind = _pg_family_dump_shell(task, ssh_host, db_type, compress)
     from core.engines.file import _ssh_exec_pipe
-    out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=3600)
+    out, err, rc = _ssh_exec_pipe(client, _wrap_login(shell), timeout=3600)
     if rc != 0:
         raise RuntimeError(
-            f"远程 {cfg['dump_tool']} 失败(rc={rc}, bin={dump_bin}): {err[:600]}")
-    if compress and len(out) <= 20:
+            f"远程 {_PG_FAMILY_TOOLING[db_type]['dump_tool']} 失败"
+            f"(rc={rc}): {err[:600]}")
+    if kind == "single" and compress and len(out) <= 20:
         raise RuntimeError(
-            f"远程 {cfg['dump_tool']} 疑似失败：-Fc 压缩后仅 {len(out)} 字节"
-            f"（stderr: {err[:200]}）")
-    return out, "single"
+            f"远程 {_PG_FAMILY_TOOLING[db_type]['dump_tool']} 疑似失败："
+            f"-Fc 压缩后仅 {len(out)} 字节（stderr: {err[:200]}）")
+    return out, kind
 
 
 
-def _remote_redis_dump(task: dict, ssh_host: dict) -> bytes:
-    """在远端备份机执行 redis-cli --rdb -，把 RDB 数据流拉回到本地。"""
+def _remote_redis_dump_shell(task: dict, ssh_host: dict) -> tuple:
+    """redis-cli --rdb - 的远端 shell（stdout=RDB 流）。返回 (client, shell)。"""
     client = _connect(ssh_host)
     redis_cli = _resolve_remote_bin(client, "redis-cli")
     if not redis_cli:
@@ -1500,18 +1663,24 @@ def _remote_redis_dump(task: dict, ssh_host: dict) -> bytes:
     shell = (
         f"{redis_cli} -h {shlex.quote(host)} -p {port}{auth_args} --rdb -"
     )
+    return client, shell
+
+
+def _remote_redis_dump(task: dict, ssh_host: dict) -> bytes:
+    """在远端备份机执行 redis-cli --rdb -，把 RDB 数据流拉回到本地。"""
+    client, shell = _remote_redis_dump_shell(task, ssh_host)
     wrapped = _wrap_login(shell)
     from core.engines.file import _ssh_exec_pipe
     out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=3600)
     if rc != 0:
-        raise RuntimeError(f"远程 redis-cli --rdb 失败(rc={rc}, bin={redis_cli}): {err[:600]}")
+        raise RuntimeError(f"远程 redis-cli --rdb 失败(rc={rc}): {err[:600]}")
     if len(out) <= 20:
         raise RuntimeError(f"远程 redis-cli --rdb 疑似失败：仅 {len(out)} 字节（stderr: {err[:200]}）")
     return out
 
 
-def _remote_mongodb_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
-    """在远端备份机执行 mongodump --archive，把归档流拉回到本地。"""
+def _remote_mongodb_dump_shell(task: dict, ssh_host: dict, compress: int) -> tuple:
+    """mongodump 归档流的远端 shell。返回 (client, shell, compressed)。"""
     client = _connect(ssh_host)
     mongodump = _resolve_remote_bin(client, "mongodump")
     if not mongodump:
@@ -1543,30 +1712,11 @@ def _remote_mongodb_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
         shell = (f"set -o pipefail; rm -rf {work} && mkdir -p {work} && "
                  f"{base_shell} --out {work} && tar -C {work} -czf - .; RC=$?; "
                  f"rm -rf {work}; exit $RC")
-        wrapped = _wrap_login(shell)
-        from core.engines.file import _ssh_exec_pipe
-        # 超时改为任务级（默认不限时长，只由空闲超时兜底），避免大库被 3600s 砍掉后重跑
-        out, err, rc = _ssh_exec_pipe(
-            client, wrapped, timeout=transfer_params(task)["cmd_timeout"])
-        if rc != 0:
-            raise RuntimeError(f"远程 mongodump(目录格式)失败(rc={rc}, bin={mongodump}): {err[:600]}")
-        if len(out) <= 100:
-            raise RuntimeError(f"远程 mongodump(目录格式)疑似失败：仅 {len(out)} 字节"
-                               f"（stderr: {err[:200]}）")
-        return out, False, "single"
+        return client, shell, False
     if spec.get("value") == "gzip":
         # mongodump 自带 gzip：不再外挂 zstd，避免双重压缩
         shell = base_shell + " --archive --gzip"
-        wrapped = _wrap_login(shell)
-        from core.engines.file import _ssh_exec_pipe
-        # 超时改为任务级（默认不限时长，只由空闲超时兜底），避免大库被 3600s 砍掉后重跑
-        out, err, rc = _ssh_exec_pipe(
-            client, wrapped, timeout=transfer_params(task)["cmd_timeout"])
-        if rc != 0:
-            raise RuntimeError(f"远程 mongodump 失败(rc={rc}, bin={mongodump}): {err[:600]}")
-        if len(out) <= 20:
-            raise RuntimeError(f"远程 mongodump 疑似失败：仅 {len(out)} 字节（stderr: {err[:200]}）")
-        return out, False, "single"
+        return client, shell, False
 
     shell = base_shell + " --archive"
     # 统一压缩：--archive 输出到 stdout，外挂 zstd（与本地 mongodump 对齐），
@@ -1580,14 +1730,22 @@ def _remote_mongodb_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
         compress = False
     if compress:
         shell += " | zstd -10 -c -"
+    return client, shell, bool(compress)
+
+
+def _remote_mongodb_dump(task: dict, ssh_host: dict, compress: int) -> bytes:
+    """mongodump 归档流（bytes 兼容通道，供 remote_db_dump 使用）。"""
+    client, shell, compressed = _remote_mongodb_dump_shell(task, ssh_host, compress)
     wrapped = _wrap_login(shell)
     from core.engines.file import _ssh_exec_pipe
-    out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=3600)
+    # 超时改为任务级（默认不限时长，只由空闲超时兜底），避免大库被 3600s 砍掉后重跑
+    out, err, rc = _ssh_exec_pipe(
+        client, wrapped, timeout=transfer_params(task)["cmd_timeout"])
     if rc != 0:
-        raise RuntimeError(f"远程 mongodump 失败(rc={rc}, bin={mongodump}): {err[:600]}")
-    if compress and len(out) <= 20:
-        raise RuntimeError(f"远程 mongodump 疑似失败：zstd 压缩后仅 {len(out)} 字节（stderr: {err[:200]}）")
-    return out, bool(compress), "single"
+        raise RuntimeError(f"远程 mongodump 失败(rc={rc}): {err[:600]}")
+    if compressed and len(out) <= 20:
+        raise RuntimeError(f"远程 mongodump 疑似失败：压缩后仅 {len(out)} 字节（stderr: {err[:200]}）")
+    return out, bool(compressed), "single"
 
 
 def remote_exec_and_fetch(ssh_host: dict, remote_cmd: str, remote_path: str,
@@ -1612,6 +1770,36 @@ def remote_exec_and_fetch(ssh_host: dict, remote_cmd: str, remote_path: str,
                 return buf.read()
         finally:
             sftp.close()
+    finally:
+        if client:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
+def remote_exec_fetch_to_file(ssh_host: dict, remote_cmd: str, remote_path: str,
+                              final_path: str, *, task: dict = None,
+                              timeout: int = 7200, label: str = "") -> dict:
+    """remote_exec_and_fetch 的落盘续传变体：产物以断点续传方式拉回 final_path。
+
+    适用达梦 dexp / Oracle expdp 等"远端生成文件"型工具——旧实现 sftp.getfo
+    把整个产物读进内存；本变体按已传字节增量续拉（限速 + 瞬时重试随
+    sftp_pull_resumable 内置）。
+    """
+    client = _connect(ssh_host)
+    try:
+        wrapped = _wrap_login(remote_cmd)
+        from core.engines.file import _ssh_exec_pipe
+        _out, err, rc = _ssh_exec_pipe(client, wrapped, timeout=timeout)
+        if rc != 0:
+            raise RuntimeError(f"远程命令失败(rc={rc}): {err[:600]}")
+        t = task or {}
+        return sftp_pull_resumable(
+            client, remote_path, final_path, task=t,
+            key=os.path.basename(remote_path), db_type="fixed",
+            host_key=(ssh_host or {}).get("host_key", ""),
+            has_rc=False, label=label or os.path.basename(remote_path))
     finally:
         if client:
             try:
@@ -1880,9 +2068,10 @@ def _sftp_pull_incremental(sftp, remote_path: str, rc_path: str, local_path: str
     offset = int(meta.get("offset") or 0)
     if os.path.exists(local_path):
         try:
-            real = os.path.getsize(local_path)
-            if real < offset:
-                offset = real          # 本地半成品被截断过 → 以实际大小为准
+            # 续传点以本地半成品**实际大小**为准：meta 只在心跳时落盘，
+            # 崩溃/重试间隔内已写入的字节不会反映在 meta 里——若按 meta
+            # offset 续传会把这段字节重复拼接（产物 sha 必不一致）。
+            offset = os.path.getsize(local_path)
         except OSError:
             offset = 0
     else:
@@ -1937,12 +2126,15 @@ def _sftp_pull_incremental(sftp, remote_path: str, rc_path: str, local_path: str
                         lf.write(chunk)
                         offset += len(chunk)
                         idle_since = _t.time()
-                        # 平台侧限速（KB/s）：按"应耗时"补 sleep，不依赖远端 pv
+                        # 平台侧限速（KB/s）：按"应耗时"补 sleep，不依赖远端 pv。
+                        # 注意块粒度是 4MB（_SFTP_READ_CHUNK），补睡上限必须
+                        # 覆盖单块应耗时间（512KB/s 下单块 8s）——写死 2s 会把
+                        # 限速顶穿成 ~1.5MB/s（实测）。
                         if rate_kbps > 0:
                             _expect = (offset - base_offset) / (rate_kbps * 1024.0)
                             _drift = _expect - (_t.time() - start)
                             if _drift > 0.05:
-                                _t.sleep(min(_drift, 2.0))
+                                _t.sleep(min(_drift, 60.0))
                         now = _t.time()
                         if now - last_hb >= 30:
                             spd = (offset - hb_bytes) / max(now - last_hb, 0.001) / (1024 * 1024)
@@ -2225,21 +2417,37 @@ def sftp_pull_resumable(client, remote_path: str, local_path: str, *,
         }
         _meta_write(part_path, meta)
 
-    sftp = client.open_sftp()
-    try:
+    # 瞬时网络故障退避重试（SSHException/socket.timeout/EOF 等）：断点保留，
+    # 重试从本地半成品实际大小继续，不重跑远端备份。
+    from core.engines.file import _is_transient
+    attempts = 3
+    client = _sftp_session_refresh(client, host_key=host_key)
+    for attempt in range(1, attempts + 1):
+        sftp = None
         try:
-            sftp.stat(remote_path)
-        except (IOError, OSError):
-            raise RuntimeError(f"远端产物不存在，无法拉取：{remote_path}")
-        _sftp_pull_incremental(
-            sftp, remote_path, rc_path, part_path, meta, p,
-            label=label or db_type, rate_kbps=int(p.get("rate_kbps") or 0),
-            has_rc=bool(has_rc), stable_secs=stable_secs)
-    finally:
-        try:
-            sftp.close()
-        except Exception:
-            pass
+            client = _sftp_session_refresh(client, host_key=host_key)
+            sftp = client.open_sftp()
+            try:
+                sftp.stat(remote_path)
+            except (IOError, OSError):
+                raise RuntimeError(f"远端产物不存在，无法拉取：{remote_path}")
+            _sftp_pull_incremental(
+                sftp, remote_path, rc_path, part_path, meta, p,
+                label=label or db_type, rate_kbps=int(p.get("rate_kbps") or 0),
+                has_rc=bool(has_rc), stable_secs=stable_secs)
+            break
+        except Exception as e:                # noqa: BLE001 - 瞬时重试
+            if attempt >= attempts or not _is_transient(e):
+                raise
+            backoff = min(2 ** attempt, 10)
+            log.warning("[remote_dump] 拉取中断（第 %s/%s 次），%ss 后从断点重试: %s",
+                        attempt, attempts, backoff, str(e)[:140])
+            time.sleep(backoff)
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
 
     size = os.path.getsize(part_path) if os.path.exists(part_path) else 0
     if min_size and size < int(min_size):
@@ -2422,18 +2630,122 @@ def _remote_mysql_dump_to_file(task: dict, ssh_host: dict, final_path: str,
             pass
 
 
+def _remote_stage_pull_to_file(client, ssh_host: dict, task: dict, shell: str,
+                               final_path: str, *, label: str, stage_key: str,
+                               min_size: int = 1, reuse_hours: float = 24.0) -> dict:
+    """通用「远端 shell stdout → stage 落盘 → 断点续传拉回」通道。
+
+    所有远端 dump（PG 系/Redis/MongoDB/MySQL 等同构）的通用三能力底座：
+    - 断点续传：远端产物写到任务级固定 stage 路径 + rc 标记；本地按已传
+      字节续拉（sftp_pull_resumable），中断后重跑**不重跑 dump**（stage
+      残件 <reuse_hours 小时内有效），也不重传已拉字节。
+    - 瞬时重试：sftp_pull_resumable 内置退避重试。
+    - 限速：transfer_params(task).rate_kbps 平台侧 sleep 限速。
+    返回 dict(path, size, sha256, resumed, dumped)。
+    """
+    stage = fixed_remote_path(task, stage_key, "f")
+    rc_file = stage + ".rc"
+    err_file = stage + ".err"
+    dumped = True
+    # stage 残件复用判定：存在 + rc=0 + 新鲜 → 跳过重跑 dump 直接续拉
+    sftp = client.open_sftp()
+    try:
+        try:
+            st = sftp.stat(stage)
+            with sftp.open(rc_file, "r") as f:
+                rc_val = (f.read() or b"").decode("utf-8", "replace").strip()
+            if rc_val == "0" and (time.time() - (st.st_mtime or 0)) < reuse_hours * 3600:
+                dumped = False
+                logging.getLogger(__name__).info(
+                    "[remote_dump] 复用远端已完成导出: %s（%s）",
+                    stage, db.human_size(int(st.st_size or 0)))
+        except Exception:
+            dumped = True
+    finally:
+        try:
+            sftp.close()
+        except Exception:
+            pass
+
+    def _rm_remote(*paths):
+        try:
+            from core.engines.file import _ssh_exec_pipe
+            _ssh_exec_pipe(client, _wrap_login(
+                "rm -f " + " ".join(shlex.quote(p) for p in paths)), timeout=30)
+        except Exception:
+            pass
+
+    if dumped:
+        from core.engines.file import _ssh_exec_pipe
+        stage_shell = (
+            f"mkdir -p {shlex.quote(os.path.dirname(stage))} && "
+            f"( {shell} ) > {stage} 2>{err_file}; RC=$?; "
+            f"echo $RC > {rc_file}; tail -c 400 {err_file} 2>/dev/null; exit $RC")
+        _out, err, rc = _ssh_exec_pipe(
+            client, _wrap_login(stage_shell),
+            timeout=transfer_params(task)["cmd_timeout"])
+        if rc != 0:
+            # 清残件防脏复用（.rc 可能已写非 0 → 复用判定也不会命中，双保险）
+            _rm_remote(stage, rc_file, err_file)
+            errtxt = ((err or "") + (_out if isinstance(_out, str) else
+                      (_out or b"").decode("utf-8", "replace"))).strip()[-600:]
+            raise RuntimeError(f"远程 {label} 失败(rc={rc}): {errtxt}")
+    else:
+        _rm_remote(err_file)
+
+    res = sftp_pull_resumable(
+        client, stage, final_path, task=task,
+        key=stage_key, db_type="fixed",
+        host_key=(ssh_host or {}).get("host_key", ""),
+        has_rc=False, label=label, min_size=min_size)
+    # 拉回成功后清 stage 残件：下次备份源可能已变化，防续到过期数据
+    _rm_remote(stage, rc_file, err_file)
+    res["dumped"] = dumped
+    return res
+
+
 def remote_db_dump_to_file(task: dict, ssh_host: dict, db_type: str, final_path: str,
                            compress: int = 0, extra_args: str = "",
                            resume: bool = True) -> dict:
     """统一入口：把远端 dump **直接落盘**到 final_path（内存恒定，可断点续传）。
 
     与旧 remote_db_dump 的差别：不再把整个产物（可能 10GB）攒在内存里再写盘。
-    目前 MySQL/MariaDB 走「远端落盘 + SFTP 增量续拉」的完整续传通道；其余类型
-    先落盘（已受益于 SSH 管道 O(n²) 拷贝修复），后续按同一模式接入。
+    mysql/mariadb 走专属完整续传通道；PG 系（postgresql/kingbase/opengauss/
+    panwei）与 redis/mongodb 走通用「远端 stage 落盘 + 断点续传拉回」通道；
+    其余类型保持 bytes 回退。
+    返回 dict(path, size, compressed, fmt, suffix, sha256, resumed, dumped)。
     """
     if (db_type or "").lower() in ("mysql", "mariadb"):
         return _remote_mysql_dump_to_file(task, ssh_host, final_path, compress,
                                           extra_args, resume)
+    if db_type in ("postgresql", "kingbase", "opengauss", "panwei"):
+        client, shell, fmt = _pg_family_dump_shell(task, ssh_host, db_type, compress)
+        res = _remote_stage_pull_to_file(
+            client, ssh_host, task, shell, final_path,
+            label=_PG_FAMILY_TOOLING[db_type]["label"] + " 逻辑导出",
+            stage_key=f"dump_{db_type}")
+        res["compressed"] = bool(compress) and fmt == "single"
+        res["fmt"] = fmt
+        res["suffix"] = ""
+        return res
+    if db_type == "redis":
+        client, shell = _remote_redis_dump_shell(task, ssh_host)
+        res = _remote_stage_pull_to_file(
+            client, ssh_host, task, shell, final_path,
+            label="Redis RDB 导出", stage_key="dump_redis")
+        res["compressed"] = False
+        res["fmt"] = "single"
+        res["suffix"] = ""
+        return res
+    if db_type == "mongodb":
+        client, shell, compressed = _remote_mongodb_dump_shell(task, ssh_host, compress)
+        res = _remote_stage_pull_to_file(
+            client, ssh_host, task, shell, final_path,
+            label="MongoDB 归档导出", stage_key="dump_mongodb")
+        res["compressed"] = compressed
+        res["fmt"] = "single"
+        res["suffix"] = ""
+        return res
     data, compressed, fmt = remote_db_dump(task, ssh_host, db_type, compress, extra_args)
     os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
     with open(final_path, "wb") as f:

@@ -287,7 +287,10 @@ class OracleEngine(BackupEngine):
         try:
             remote_dmp = f"{dp_dir}/platform_verify_{ts}.dmp"
             sqlfile = f"platform_verify_{ts}.sql"
-            sftp.put(local_dmp, remote_dmp)
+            remote_dump.sftp_put_resumable(
+                client, local_dmp, remote_dmp,
+                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                label="恢复校验 dmp 推送")
             impdp_bin = self._resolve_oracle_tool(client, "impdp")
             if not impdp_bin:
                 return BackupResult(success=False, status=BackupStatus.FAILED,
@@ -410,7 +413,10 @@ class OracleEngine(BackupEngine):
                 remote_dir = "/u01/app/oracle/backup"
             for _p in sorted(_glob.glob(os.path.join(local_dir, "*.bkp"))):
                 _rp = f"{remote_dir}/{os.path.basename(_p)}"
-                sftp.put(_p, _rp)
+                remote_dump.sftp_put_resumable(
+                    client, _p, _rp,
+                    rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                    label="RMAN 备份片回推")
                 pushed.append(_rp)
             if pushed:
                 _ssh_exec_pipe(
@@ -1297,7 +1303,10 @@ class OracleEngine(BackupEngine):
             sftp = client.open_sftp()
             try:
                 remote_dmp = f"{dp_dir}/{dmp_name}"
-                sftp.put(local_dmp, remote_dmp)
+                remote_dump.sftp_put_resumable(
+                    client, local_dmp, remote_dmp,
+                    rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                    label="impdp dmp 推送")
                 self.logger.info("[%s] dmp 已推回远端: %s (%s)", self.task_name,
                                  remote_dmp, db.human_size(os.path.getsize(local_dmp)))
 
@@ -1740,7 +1749,10 @@ exit;
                         self.logger.info("[%s] PITR: 回推备份片 %s (%s)",
                                          self.task_name, os.path.basename(p),
                                          db.human_size(os.path.getsize(p)))
-                        _sftp.put(p, rmt)
+                        remote_dump.sftp_put_resumable(
+                            client, p, rmt,
+                            rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                            label="PITR 备份片回推")
                 finally:
                     try:
                         _sftp.close()

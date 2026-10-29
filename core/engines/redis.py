@@ -88,25 +88,24 @@ class RedisEngine(BackupEngine):
         )
 
     def _backup_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
-        """在 SSH 备份机执行 redis-cli --rdb -，把 RDB 数据流拉回到本地落盘。"""
+        """在 SSH 备份机执行 redis-cli --rdb -，远端落盘 + 断点续传拉回。"""
         from core import remote_dump
         import time
         t0 = time.time()
-        data, _, _fmt = remote_dump.remote_db_dump(self.task, ssh_host, "redis")
-        duration = round(time.time() - t0, 3)
         out_dir = self._output_dir()
         ts = self._timestamp()
         rdb_path = os.path.join(out_dir, "%s.rdb" % ts)
-        with open(rdb_path, "wb") as f:
-            f.write(data)
-        size = os.path.getsize(rdb_path)
-        checksum = db.sha256_file(rdb_path)
+        res_d = remote_dump.remote_db_dump_to_file(
+            self.task, ssh_host, "redis", rdb_path)
+        duration = round(time.time() - t0, 3)
+        size = int(res_d.get("size") or 0)
+        note = "（断点续传拉回）" if res_d.get("resumed") else ""
         self.logger.info("[%s] Redis 远程备份完成: %s (%d bytes)", self.task_name, rdb_path, size)
         return BackupResult(
             success=True, status=BackupStatus.SUCCESS,
             backup_path=rdb_path, size_bytes=size, duration_sec=duration,
-            simulated=False, checksum=checksum,
-            message="Redis RDB 远程快照备份成功")
+            simulated=False, checksum=res_d.get("sha256") or "",
+            message="Redis RDB 远程快照备份成功" + note)
 
     def _backup_local(self, backup_type: BackupType) -> BackupResult:
         """本机执行 Redis 备份（RDB 快照）。"""
@@ -237,7 +236,8 @@ class RedisEngine(BackupEngine):
             data_dir = m.group(1) if m else "/data/redis"
             # 2) 推送 rdb
             tmp_rdb = "/tmp/dump_restore.rdb"
-            sftp.put(backup_path, tmp_rdb)
+            _rd.sftp_put_resumable(
+                client, backup_path, tmp_rdb, label="Redis rdb 恢复推送")
             logs.append(f"rdb 已推送 {tmp_rdb}")
             # 3) 停库（数据安全：SHUTDOWN 前确认）
             _run(f"{cli_cmd} SHUTDOWN NOSAVE || true")

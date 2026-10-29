@@ -430,20 +430,22 @@ class DamengEngine(BackupEngine):
             f"FILE={ts}.dmp DIRECTORY={remote_tmp} LOG={ts}.log {scope}"
         )
         t0 = time.time()
-        data = remote_dump.remote_exec_and_fetch(ssh_host, remote_cmd, remote_dmp, timeout=7200)
-        duration = round(time.time() - t0, 3)
         out_dir = self._output_dir()
         os.makedirs(out_dir, exist_ok=True)
         local_path = os.path.join(out_dir, f"{ts}.dmp")
-        with open(local_path, "wb") as f:
-            f.write(data)
-        size = os.path.getsize(local_path)
-        checksum = db.sha256_file(local_path)
+        # 落盘续传通道：dmp 以断点续传方式拉回（限速 + 瞬时重试内置），
+        # 替代旧 sftp.getfo 整包读进内存
+        res_d = remote_dump.remote_exec_fetch_to_file(
+            ssh_host, remote_cmd, remote_dmp, local_path, task=self.task,
+            timeout=7200, label="达梦 dexp dmp 拉回")
+        duration = round(time.time() - t0, 3)
+        size = int(res_d.get("size") or 0)
+        note = "（断点续传拉回）" if res_d.get("resumed") else ""
         return BackupResult(
             success=True, status=BackupStatus.SUCCESS,
             backup_path=local_path, size_bytes=size, duration_sec=duration,
-            simulated=False, checksum=checksum,
-            message=f"达梦 远程逻辑备份(dexp)成功: {local_path}")
+            simulated=False, checksum=res_d.get("sha256") or "",
+            message=f"达梦 远程逻辑备份(dexp)成功: {local_path}{note}")
 
     def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:
         """逻辑备份：dexp（沿用原有实现）。"""
@@ -590,7 +592,10 @@ class DamengEngine(BackupEngine):
             bset_dir = f"/home/{_dm_os_user}/dm_pitr_bset_{ts}"
             # 2) 推送并解包备份集
             logs.append(f"[PITR] 推送备份集: {os.path.basename(backup_path)}")
-            sftp.put(backup_path, remote_pkg)
+            remote_dump.sftp_put_resumable(
+                client, backup_path, remote_pkg,
+                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                label="达梦 PITR 备份集推送")
             out, err, rc = _ssh_exec_pipe(client, remote_dump._wrap_login(
                 f"mkdir -p {bset_dir} {restore_dir} && chown -R {_dm_os_user} {bset_dir} "
                 f"{restore_dir} && tar xzf {remote_pkg} -C {bset_dir} && "
@@ -930,8 +935,11 @@ class DamengEngine(BackupEngine):
             _sep(client, remote_dump._wrap_login(
                 "mkdir -p {0}".format(remote_tmp)), timeout=60)
             sftp = client.open_sftp()
-            sftp.put(backup_path, remote_dmp)
             sftp.close()
+            remote_dump.sftp_put_resumable(
+                client, backup_path, remote_dmp,
+                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                label="达梦 dmp 恢复推送")
         except Exception as e:  # noqa: BLE001
             return BackupResult(success=False, status=BackupStatus.FAILED,
                                 backup_path=backup_path,

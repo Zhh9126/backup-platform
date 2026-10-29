@@ -25,6 +25,7 @@ import io
 import os
 import json
 import shlex
+import socket
 import fnmatch
 import time
 import tarfile
@@ -628,6 +629,276 @@ def _ssh_exec_pipe_to_file(client, cmd: str, out_path: str, *, timeout: int = 0,
 
 # ---------- 文件列表获取 ----------
 
+class _NoopLogger:
+    def info(self, *a, **k): pass
+    def warning(self, *a, **k): pass
+    def error(self, *a, **k): pass
+    def debug(self, *a, **k): pass
+
+
+def _noop_logger():
+    return _NoopLogger()
+
+
+def _is_transient(err: BaseException) -> bool:
+    """传输级瞬时异常（网络中断/SSH 会话断/超时）可重试；
+    远端命令 rc!=0（tar 语法/权限/磁盘满）不是瞬时故障，不重试。"""
+    if isinstance(err, (EOFError, socket.timeout, ConnectionError, TimeoutError)):
+        return True
+    name = type(err).__name__
+    if "SSHException" in name or "ChannelException" in name or "OSError" in name:
+        return True
+    msg = str(err).lower()
+    return any(k in msg for k in ("eof", "socket", "timeout", "connection",
+                                  "broken pipe", "reset by peer"))
+
+
+def _remote_stage_stat(client, path: str) -> tuple:
+    """远端文件 (大小, sha256)。不存在返回 (0, "")。"""
+    q = shlex.quote(path)
+    out, _, _rc = _ssh_exec(
+        client,
+        "stat -c '%s' " % "%s" + q + " 2>/dev/null; "
+        "sha256sum " + q + " 2>/dev/null | awk '{print $1}'",
+        timeout=120)
+    lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+    size = int(lines[0]) if lines and lines[0].isdigit() else 0
+    sha = lines[1] if len(lines) > 1 and len(lines[1]) == 64 else ""
+    return size, sha
+
+
+def _remote_stage_alive(client, path: str, max_age: int = 86400) -> bool:
+    """远端 stage 残件是否可复用（存在、非空、24h 内生成——防续到过期数据）。"""
+    q = shlex.quote(path)
+    # 注意：%Y 会被 Python 的 % 格式化误当格式符（unsupported format
+    # character 'Y'），此前用 % 拼接导致本函数恒 False → stage 永不复用。
+    out, _, _rc = _ssh_exec(
+        client, "stat -c '%s %Y' {p} 2>/dev/null".format(p=q), timeout=60)
+    try:
+        parts = (out or "").split()
+        size, mtime = int(parts[0]), int(parts[1])
+        return size > 0 and (time.time() - mtime) < max_age
+    except (IndexError, ValueError):
+        return False
+
+
+def _db_sha256(path: str) -> str:
+    """大文件分块 sha256（64MB 步长）。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(64 * 1024 * 1024)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _load_resume_offset(part: str, sha_sidecar: str, sha_remote: str,
+                        size: int) -> int:
+    """读取可用的续传偏移；残件与远端 stage 不一致视为脏数据返回 0。
+
+    残件有效性以边车 .sha 记录的 stage sha256 为准：stage 重建（源内容
+    变化）后旧残件对应的字节序列已失效，必须从头拉——否则拼出的产物
+    sha 必然不一致。
+    """
+    offset = 0
+    try:
+        if os.path.exists(part):
+            offset = os.path.getsize(part)
+    except OSError:
+        offset = 0
+    if offset <= 0 or offset > size:
+        return 0
+    try:
+        with open(sha_sidecar, "r", encoding="utf-8") as f:
+            side = (f.read() or "").strip()
+    except OSError:
+        side = ""
+    if side != (sha_remote or ""):
+        return 0
+    return offset
+
+
+def _staged_pull(client, cmd: str, out_path: str, *, stage_path: str,
+                 rate_kbps: int = 0, chunk_mb: int = 64,
+                 block_retries: int = 3, logger=None, label: str = "",
+                 part_path: str = "") -> dict:
+    """分块校验式拉取（真·断点续传）。
+
+    流程：远端执行 cmd 落盘 stage 文件 → 取大小/sha256 → 本地按块
+    续拉（已拉字节数持久化在残件 part，中断后**重跑跨运行**也只拉
+    缺失字节）→ 本地整体 sha256 与远端比对一致后原子改名。
+
+    part_path 未指定时残件与产物同目录（out_path.part）——注意带时间戳
+    的产物名会让跨运行续传失效，跨运行续传必须传任务级稳定路径。
+    残件有效性以边车 .sha（记录 stage sha256）判定，stage 重建后残件
+    自动作废。
+
+    产物是完整文件的字节级拷贝，块级中断可续传——这是流式压缩管道
+    （gzip 流丢前缀即损坏）做不到的。代价：远端需要一次归档落盘空间。
+
+    返回 {written, rc, resume_from, staged: True}；
+    远端磁盘不足抛 RuntimeError("STAGED_ENOSPC: ...") 由调用方回退流式。
+    """
+    log = logger or _noop_logger()
+    part = part_path or (out_path + ".part")
+    sha_sidecar = part + ".sha"
+    q_stage = shlex.quote(stage_path)
+
+    # 1) 远端打包落盘（24h 内 stage 残件直接复用——任务重跑续传不重打包）
+    size, sha_remote = _remote_stage_stat(client, stage_path)
+    if not (size > 0 and _remote_stage_alive(client, stage_path)):
+        out_s, err_s, rc_stage = _ssh_exec(
+            client,
+            "( %s ) > %s 2>/tmp/aidbm_stage.err; rc=$?; "
+            "tail -c 500 /tmp/aidbm_stage.err 2>/dev/null; exit $rc" % (cmd, q_stage),
+            timeout=7200)
+        if rc_stage != 0:
+            _ssh_exec(client, "rm -f %s /tmp/aidbm_stage.err" % q_stage, timeout=30)
+            errtxt = ((err_s or "") + (out_s or "")).strip()[-300:]
+            if "No space left" in errtxt or "ENOSPC" in errtxt:
+                raise RuntimeError("STAGED_ENOSPC: 远端落盘空间不足，回退流式传输")
+            raise RuntimeError("远端打包落盘失败 rc=%s: %s" % (rc_stage, errtxt))
+        size, sha_remote = _remote_stage_stat(client, stage_path)
+        if size <= 0:
+            _ssh_exec(client, "rm -f %s" % q_stage, timeout=30)
+            raise RuntimeError("远端 stage 文件为空")
+    log.info("[%s] [staged] 远端归档就绪: %s（%s）",
+             label, stage_path, db.human_size(size))
+
+    # 2) 本地分块续拉（残件 + .sha 边车共同判定有效性：stage 重建后旧
+    #    残件对应字节序列已失效，必须作废从头拉，否则产物 sha 必不一致）
+    chunk = chunk_mb * 1024 * 1024
+    offset = _load_resume_offset(part, sha_sidecar, sha_remote, size)
+    if offset == 0 and os.path.exists(part):
+        # 脏残件（stage 已重建 / 比远端大 / 边车缺失）：清理后重来
+        try:
+            os.unlink(part)
+        except OSError:
+            pass
+        try:
+            if os.path.exists(sha_sidecar):
+                os.unlink(sha_sidecar)
+        except OSError:
+            pass
+    if offset == 0:
+        # 先落边车再拉：首次块写入前残件即可被跨运行识别
+        try:
+            with open(sha_sidecar, "w", encoding="utf-8") as f:
+                f.write(sha_remote)
+        except OSError:
+            pass
+    resume_from = offset
+    if offset:
+        log.info("[%s] [staged] 断点续传：从 %s（共 %s）继续拉取",
+                 label, db.human_size(offset), db.human_size(size))
+
+    fh = open(part, "ab" if offset else "wb")
+    try:
+        while offset < size:
+            got = 0
+            last_err = None
+            for attempt in range(1, block_retries + 1):
+                try:
+                    # 字节精确拉取：tail -c +(offset+1) | head -c want——
+                    # 修复：.part 残留大小非块对齐时 dd skip=offset//chunk
+                    # 向下取整会造成错位 → 拼接产物 sha 不一致。
+                    want = min(chunk, size - offset)
+                    blk = _ssh_exec_stream(
+                        client,
+                        "tail -c +%d %s 2>/dev/null | head -c %d"
+                        % (offset + 1, q_stage, want),
+                        out_file=fh, timeout=0, rate_kbps=rate_kbps,
+                        label="%s staged-chunk@%s" % (label, db.human_size(offset)))
+                    if blk.get("rc") != 0:
+                        raise RuntimeError("chunk rc=%s" % blk.get("rc"))
+                    got = blk.get("written") or 0
+                    break
+                except Exception as e:            # noqa: BLE001 - 块级重试
+                    last_err = e
+                    if not _is_transient(e) and attempt == block_retries:
+                        raise
+                    backoff = min(2 ** attempt, 10)
+                    log.warning("[%s] [staged] 块拉取失败（第 %s 次），%ss 后重试: %s",
+                                label, attempt, backoff, str(e)[:120])
+                    time.sleep(backoff)
+                    # 追加文件截回块起点，避免半个块
+                    fh.flush()
+                    if os.path.getsize(part) > offset:
+                        fh.truncate(offset)
+                        fh.seek(offset)
+            else:
+                raise RuntimeError("分块拉取连续失败: %s" % last_err)
+            offset += got
+            if got == 0:                  # dd 拉空（远端文件被清）→ 防死循环
+                raise RuntimeError("分块拉取无进展（远端 stage 可能被清理）")
+    finally:
+        fh.close()
+
+    # 3) 本地整体校验
+    sha_local = _db_sha256(part)
+    if sha_local != sha_remote:
+        for junk in (part, sha_sidecar):
+            try:
+                if os.path.exists(junk):
+                    os.unlink(junk)
+            except OSError:
+                pass
+        raise RuntimeError(
+            "分块拉取校验不一致（local=%s remote=%s）——残件已清理，"
+            "stage 保留供重跑" % (sha_local[:12], sha_remote[:12]))
+    os.replace(part, out_path)
+    try:
+        if os.path.exists(sha_sidecar):
+            os.unlink(sha_sidecar)
+    except OSError:
+        pass
+    _ssh_exec(client, "rm -f %s /tmp/aidbm_stage.err" % q_stage, timeout=30)
+    log.info("[%s] [staged] 校验一致，落盘完成: %s",
+             label, db.human_size(size))
+    return {"written": size, "rc": 0, "resume_from": resume_from, "staged": True}
+
+
+def _pull_stream_with_retry(client, cmd: str, out_path: str, *, attempts: int = 3,
+                            rate_kbps: int = 0, logger=None, label: str = "") -> dict:
+    """流式拉取 + 瞬时故障退避重试 + .part 半成品保护。
+
+    流式压缩产物无法字节级续传（gzip 丢前缀即损坏），网络中断只能重拉；
+    但半成品写到 .part（成功才原子改名），不会污染正式产物。
+    """
+    log = logger or _noop_logger()
+    part = out_path + ".part"
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            r = _ssh_exec_pipe_to_file(client, cmd, part, timeout=1800,
+                                       label=label, resume=False,
+                                       rate_kbps=rate_kbps)
+            if r.get("rc") != 0:
+                raise RuntimeError(_tar_fail_msg(
+                    "远程打包", r.get("rc") or -1, "", cmd))
+            os.replace(part, out_path)
+            if attempt > 1:
+                log.info("[%s] 传输重试成功（第 %s 次）", label, attempt)
+            return r
+        except Exception as e:                # noqa: BLE001 - 传输重试
+            last_err = e
+            try:
+                if os.path.exists(part):
+                    os.unlink(part)
+            except OSError:
+                pass
+            if attempt < attempts and _is_transient(e):
+                backoff = min(2 ** attempt, 10)
+                log.warning("[%s] 传输中断（第 %s/%s 次），%ss 后重试: %s",
+                            label, attempt, attempts, backoff, str(e)[:140])
+                time.sleep(backoff)
+                continue
+            raise
+    raise last_err
+
+
 def _match_excludes(rel: str, excludes) -> bool:
     """判断相对路径是否命中排除规则。
 
@@ -1175,6 +1446,10 @@ class FileBackupEngine(BackupEngine):
                                 ds_stats["fetched_blocks"]))
             else:
                 message += " | 源端去重: 首轮建立块库（本轮无节省，次轮起生效）"
+        pull_note = getattr(self, "_pull_note", "")
+        if pull_note:
+            message += " | " + pull_note
+            self._pull_note = ""
         return BackupResult(
             success=True, status=BackupStatus.SUCCESS,
             backup_path=final, size_bytes=size,
@@ -1830,15 +2105,15 @@ class FileBackupEngine(BackupEngine):
 
     def _upload_file_to_remote(self, local_path: str, dst: dict):
         """把本地归档上传到远程目标目录。"""
+        from core import remote_dump
         client = _get_ssh_client(dst["host"])
         remote_dir = dst["path"]
         name = os.path.basename(local_path)
         _ssh_exec(client, f'mkdir -p {shlex.quote(remote_dir)}')
-        sftp = client.open_sftp()
-        try:
-            sftp.put(local_path, f"{remote_dir}/{name}")
-        finally:
-            sftp.close()
+        remote_dump.sftp_put_resumable(
+            client, local_path, f"{remote_dir}/{name}",
+            rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+            label="文件恢复推送")
 
     def _tar_local_to_remote(self, paths: List[str], dst: dict, archive_path: str):
         """本地 → 远程：先打 tar 再通过 SSH pipe 传过去解压。"""
@@ -1872,6 +2147,51 @@ class FileBackupEngine(BackupEngine):
         finally:
             os.unlink(flist)
 
+    def _pull_archive(self, client, cmd: str, archive_path: str, src: dict) -> dict:
+        """归档拉取统一入口：三能力编排。
+
+        - 断点续传：默认 staged 分块校验拉取（远端落盘 + 块级续传 +
+          整体 sha256 校验）；extra_options.staged_pull=false 或远端
+          磁盘不足（STAGED_ENOSPC）时回退流式。
+        - 网络重试：流式路径瞬时故障退避重试 3 次（2s/4s/8s），
+          staged 路径块级重试 3 次；半成品一律写 .part 原子改名。
+        - 带宽限制：任务「流量控制」bandwidth_limit（KB/s）接线到
+          平台侧限速（0=不限）。
+        """
+        extra = _get_extra(self.task)
+        rate = int(self.task.get("bandwidth_limit") or 0)
+        staged = bool(extra.get("staged_pull", True))
+        task_id = self.task.get("id") or "x"
+        kind = "incr" if str(self.task.get("backup_type") or "") == "incremental" else "full"
+        stage = "/tmp/aidbm_stage_%s_%s.tar.gz" % (task_id, kind)
+        if staged:
+            # 跨运行续传：残件用任务级稳定路径（带时间戳的产物名每次运行
+            # 都不同，挂它旁边的 .part 重跑时找不到 → 续传失效）
+            part_stable = os.path.join(
+                os.path.dirname(archive_path) or ".",
+                ".aidbm_part_%s_%s.tar.gz" % (task_id, kind))
+            try:
+                r = _staged_pull(client, cmd, archive_path,
+                                 stage_path=stage, part_path=part_stable,
+                                 rate_kbps=rate,
+                                 logger=self.logger, label=self.task_name)
+                if r.get("resume_from"):
+                    # 引擎 self.logger 不进操作日志——续传观测信息并入任务消息
+                    self._pull_note = (
+                        "断点续传: 从 %s 继续拉取（stage 残件复用）"
+                        % db.human_size(r["resume_from"]))
+                return r
+            except RuntimeError as e:
+                if "STAGED_ENOSPC" not in str(e):
+                    raise
+                self.logger.warning(
+                    "[%s] 远端空间不足，staged 断点续传回退流式传输（可传 "
+                    "extra_options.staged_pull=false 关闭尝试）: %s",
+                    self.task_name, str(e)[:160])
+        return _pull_stream_with_retry(client, cmd, archive_path,
+                                       rate_kbps=rate,
+                                       logger=self.logger, label=self.task_name)
+
     def _tar_remote_to_local(self, src: dict, archive_path: str):
         """远程 → 本地：SSH 端 tar 打包 → **流式落盘**到本地归档。
 
@@ -1902,8 +2222,7 @@ class FileBackupEngine(BackupEngine):
 
         self.logger.info("[%s] [2/3] 远程打包中: %s", self.task_name, cmd)
         t0 = time.time()
-        r = _ssh_exec_pipe_to_file(client, cmd, archive_path, timeout=1800,
-                                   label=self.task_name, resume=False)
+        r = self._pull_archive(client, cmd, archive_path, src)
         elapsed = round(time.time() - t0, 1)
         self.logger.info("[%s] SSH tar 完成, 耗时=%ss, rc=%s, size=%s",
                          self.task_name, elapsed, r.get("rc"),
@@ -1990,8 +2309,12 @@ class FileBackupEngine(BackupEngine):
         try:
             # ---- 1) 源端打包，流式落到本机临时文件 ----
             self.logger.info("[%s] [1/4] 源端打包: %s", self.task_name, cmd)
-            r = _ssh_exec_pipe_to_file(client_src, cmd, tmp_arc, timeout=1800,
-                                       label=self.task_name, resume=False)
+            # 中转模式：流式 + 瞬时故障重试 + 任务限速（staged 不适用——
+            # 本机临时文件即中转，无需远端二次落盘）
+            r = _pull_stream_with_retry(
+                client_src, cmd, tmp_arc,
+                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                logger=self.logger, label=self.task_name)
             if r.get("rc") != 0:
                 raise RuntimeError(_tar_fail_msg(
                     "源打包", r.get("rc") or -1, r.get("err"), cmd,

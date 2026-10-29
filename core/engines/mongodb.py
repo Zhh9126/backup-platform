@@ -67,16 +67,13 @@ class MongoEngine(BackupEngine):
         )
 
     def _backup_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
-        """在 SSH 备份机执行 mongodump --archive，把归档流拉回到本地落盘。"""
+        """在 SSH 备份机执行 mongodump --archive，远端落盘 + 断点续传拉回。"""
         from core import remote_dump
         import time
         # 与本地逻辑备份对齐：统一由全局 COMPRESS_BY_DEFAULT 控制，远端强制 zstd
         enable = getattr(config, "COMPRESS_BY_DEFAULT", True)
         compress = 1 if enable else 0
         t0 = time.time()
-        data, compressed, _fmt = remote_dump.remote_db_dump(self.task, ssh_host, "mongodb", compress)
-
-        duration = round(time.time() - t0, 3)
         out_dir = self._output_dir()
         ts = self._timestamp()
         # 落盘后缀由任务「备份文件格式」决定（archive / gzip / directory）
@@ -87,17 +84,19 @@ class MongoEngine(BackupEngine):
         elif _spec.get("value") == "gzip":
             ext = ".archive.gz"
         else:
-            ext = ".archive.zst" if compressed else ".archive"
+            ext = ".archive.zst" if compress else ".archive"
         archive_path = os.path.join(out_dir, "%s%s" % (ts, ext))
-        with open(archive_path, "wb") as f:
-            f.write(data)
-        size = os.path.getsize(archive_path)
+        res_d = remote_dump.remote_db_dump_to_file(
+            self.task, ssh_host, "mongodb", archive_path, compress)
+        duration = round(time.time() - t0, 3)
+        size = int(res_d.get("size") or 0)
+        note = "（断点续传拉回）" if res_d.get("resumed") else ""
         return BackupResult(
             success=True, status=BackupStatus.SUCCESS,
             backup_path=archive_path, size_bytes=size, duration_sec=duration,
             compress_algo="zstd" if compress else "none",
-            simulated=False, checksum="",
-            message="MongoDB 远程归档备份成功(mongodump --archive)")
+            simulated=False, checksum=res_d.get("sha256") or "",
+            message="MongoDB 远程归档备份成功(mongodump --archive)" + note)
 
     def _backup_local(self, backup_type: BackupType) -> BackupResult:
         """本机执行 MongoDB 逻辑备份。"""

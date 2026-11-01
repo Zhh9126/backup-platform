@@ -2265,6 +2265,47 @@ def task_stage_dir(task: dict) -> str:
     return _remote_stage_dir().rstrip("/")
 
 
+def _probe_datadir(client, db_type: str, os_user: str,
+                   foreign: bool = False, datadir: str = "") -> tuple:
+    """PG 系/金仓：定位数据目录 / 扫描不属于数据库 OS 用户的文件（卫生检查）。
+
+    返回 (stdout_text, err, rc)。foreign=False 时 stdout=数据目录路径；
+    foreign=True 需传 datadir，stdout=外来文件列表（最多 5 行）。
+    """
+    from core.engines.file import _ssh_exec_pipe
+    if db_type == "kingbase":
+        # 数据目录从运行中的 kingbase 主进程 -D 参数反推
+        dd_cmd = ("ps -eo cmd= | awk '/kingbase/ && /-D / "
+                  "{for(i=1;i<=NF;i++) if($i==\"-D\") print $(i+1); exit}'")
+        if not foreign:
+            return _ssh_exec_pipe(client, _wrap_login(dd_cmd), timeout=30)
+        cmd = (f"find {shlex.quote(datadir)} -maxdepth 1 ! -user "
+               f"{shlex.quote(os_user)} | head -5")
+        return _ssh_exec_pipe(client, _wrap_login(cmd), timeout=30)
+    # PG 系：SQL 查询
+    cfg = _PG_FAMILY_TOOLING.get(db_type, {})
+    if foreign:
+        cmd = (f"find {shlex.quote(datadir)} -maxdepth 1 ! -user "
+               f"{shlex.quote(os_user)} | head -5")
+        return _ssh_exec_pipe(client, _wrap_login(cmd), timeout=30)
+    qbin = os.environ.get("AIDBM_PROBE_PSQL", "")
+    if not qbin:
+        # 先从运行进程反推 bin 目录（与 _resolve_remote_bin 同思路）
+        probe = ("ps -eo cmd= | awk '/postgres(\\s|$)/ && !/awk/ {print $1; exit}'"
+                 if db_type != "kingbase" else "")
+        if probe:
+            out, _e, rc = _ssh_exec_pipe(client, _wrap_login(probe), timeout=20)
+            txt = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+            pg_exe = txt.strip().splitlines()[0] if txt.strip() else ""
+            qbin = (pg_exe.rsplit("/", 1)[0] + "/psql") if pg_exe else ""
+    env = _pg_family_env_exports(cfg, "", bin_path=qbin or "")
+    sql_client = qbin or "psql"
+    inner = f"{sql_client} -tAc 'show data_directory;'"
+    cmd = (f"su - {shlex.quote(os_user)} -c "
+           f"{shlex.quote(inner)} 2>/dev/null")
+    return _ssh_exec_pipe(client, _wrap_login(cmd), timeout=30)
+
+
 def ensure_remote_stage_ok(client, task: dict, dir_path: str,
                            label: str = "", need_factor: float = 1.5) -> str:
     """远端暂存目录空间与分区安全检查（返回警告文案，""=无警告）。
@@ -3845,14 +3886,22 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
 
     shell = (
         f"set -o pipefail; {env} "
-        f"{tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} "
-        f"-d {shlex.quote(db_name)}"
+        f"{tool} -v ON_ERROR_STOP=1 -h 127.0.0.1 -p {port} "
+        f"-U {shlex.quote(user)}{wpass} -d {shlex.quote(db_name)}"
     )
     wrapped = _wrap_login(shell)
     _out, err, rc = _ssh_exec_pipe(
         client, wrapped, input_data=dump_bytes, timeout=3600)
+    otext = _out.decode("utf-8", "replace") if isinstance(_out, bytes) else str(_out)
     if rc != 0:
         raise RuntimeError(f"远程恢复失败(rc={rc}): {err[:600]}")
+    # ON_ERROR_STOP 兜底（老版本 psql/gsql 可能不识别该选项时 rc 仍可能为 0）
+    errors = [ln for ln in otext.splitlines()
+              if ln.strip().startswith(("ERROR:", "错误:"))
+              and "already exists" not in ln and "已存在" not in ln]
+    if errors:
+        raise RuntimeError(
+            "远程恢复 SQL 错误（{0} 条）: {1}".format(len(errors), errors[:5]))
 
 
 def _pg_family_tar_restore_script(cfg: dict, restore_bin: str, query_bin: str,

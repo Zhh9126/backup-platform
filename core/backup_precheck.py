@@ -169,6 +169,45 @@ def precheck_backup(task: dict) -> dict:
             except Exception as e:
                 _add(items, "rman_dir", "unknown", "RMAN 目录预检异常: %s" % str(e)[:100])
 
+    # 5.4) 数据目录卫生（PG 系/金仓 物理备份）：数据目录中存在不属于数据库
+    # OS 用户的文件（如 root 落的 .bak）会让 pg_basebackup/sys_basebackup
+    # 直接失败（170/171 实测两次命中）
+    if is_phys and db_type in ("postgresql", "kingbase", "opengauss", "panwei"):
+        try:
+            from core import remote_dump as _rd
+            _sh = _rd.resolve_ssh_host(task)
+            if _sh:
+                _os_user = _rd._PG_FAMILY_TOOLING[db_type]["check_user"]
+                _client = _rd._connect(_sh)
+                _dd_out, _e, _rc = _rd._probe_datadir(_client, db_type, _os_user)
+                try:
+                    _client.close()
+                except Exception:
+                    pass
+                _dd = (_dd_out or "").strip().splitlines()
+                _dd = _dd[0].strip() if _dd else ""
+                if not _dd:
+                    _add(items, "data_dir_hygiene", "unknown",
+                         "未能定位数据目录（跳过卫生检查）")
+                else:
+                    _f_out, _e, _rc = _rd._probe_datadir(_client, db_type, _os_user,
+                                                         foreign=True, datadir=_dd)
+                    _bad = [l for l in (_f_out or "").splitlines() if l.strip()]
+                    if _bad:
+                        _add(items, "data_dir_hygiene", "fail",
+                             f"数据目录 {_dd} 存在 {len(_bad)} 个不属于 {_os_user} "
+                             f"的文件（{_bad[0]}）——将导致物理备份失败；"
+                             f"请在数据库服务器 chown/chmod 或移出")
+                    else:
+                        _add(items, "data_dir_hygiene", "pass",
+                             f"数据目录 {_dd} 属主正常")
+            else:
+                _add(items, "data_dir_hygiene", "skip",
+                     "未绑定 SSH 主机，跳过数据目录卫生检查")
+        except Exception as e:
+            _add(items, "data_dir_hygiene", "unknown",
+                 "数据目录卫生检查异常: %s" % str(e)[:100])
+
     # 5.5) 远端暂存目录（FIX-2026-001 延伸，全库型）：备份会在数据库服务器
     # 本地写入整库大小的临时产物，默认 /tmp 常在根分区
     try:

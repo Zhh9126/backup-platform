@@ -789,12 +789,15 @@ exit 0
             cmd.append(backup_path)
             cmd += self._w_pass_args(pw)
         elif backup_path.endswith(".sql"):
-            # 纯文本格式用 psql 执行 SQL 脚本
+            # 纯文本格式用 psql 执行 SQL 脚本。
+            # 必须带 ON_ERROR_STOP：psql 默认遇 SQL 错误仅打印、rc 仍为 0——
+            # 恢复失败会被误判成功（实测根因，FIX-2026-001 举一反三）
             cmd = [
                 self._resolve_local_tool("psql"),
                 "--host", str(host),
                 "--port", str(port),
                 "--username", str(user),
+                "-v", "ON_ERROR_STOP=1",
                 "-d", str(target_db),
                 "-f", backup_path,
             ]

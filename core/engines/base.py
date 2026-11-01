@@ -221,6 +221,7 @@ class BackupStatus(str, enum.Enum):
     FAILED = "failed"
     SIMULATED = "simulated"
     RUNNING = "running"
+    CANCELLED = "cancelled"
 
 
 @dataclass

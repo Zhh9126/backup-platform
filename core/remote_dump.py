@@ -430,6 +430,9 @@ def sftp_put_resumable(client, local_path: str, remote_path: str, *,
                 start = _t.time()
                 base = offset
                 while True:
+                    # 协作式取消（用户停止）：块边界生效，断点保留可续传
+                    from core import cancel as _cancel_mod
+                    _cancel_mod.check()
                     chunk = lf.read(256 * 1024)
                     if not chunk:
                         break
@@ -2125,6 +2128,9 @@ def _sftp_pull_incremental(sftp, remote_path: str, rc_path: str, local_path: str
         _meta_write(local_path, meta)
         try:
             while True:
+                # 协作式取消（用户停止）：块边界生效，断点保留可续传
+                from core import cancel as _cancel_mod
+                _cancel_mod.check()
                 try:
                     rsize = int(sftp.stat(remote_path).st_size)
                 except (IOError, OSError):

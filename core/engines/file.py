@@ -797,6 +797,12 @@ def _staged_pull(client, cmd: str, out_path: str, *, stage_path: str,
     fh = open(part, "ab" if offset else "wb")
     try:
         while offset < size:
+            # 协作式取消（用户停止）：块边界生效，断点保留可续传
+            try:
+                from core import cancel as _cancel_mod
+                _cancel_mod.check()
+            except RuntimeError:
+                raise
             got = 0
             last_err = None
             for attempt in range(1, block_retries + 1):
@@ -1185,6 +1191,13 @@ class FileBackupEngine(BackupEngine):
             else:
                 result = self._full_transfer(src, dst)
         except Exception as e:
+            # 用户手动停止（协作式取消）：如实标记，不再冠以"失败"
+            from core import cancel as _cancel_mod
+            if isinstance(e, _cancel_mod.CancelledError):
+                return BackupResult(
+                    success=False, status=BackupStatus.CANCELLED,
+                    duration_sec=round(time.time() - t0, 2),
+                    message="任务已被用户手动停止（断点已保留，重新发起将从断点续传）")
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,
                 duration_sec=round(time.time() - t0, 2),

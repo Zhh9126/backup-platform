@@ -518,9 +518,10 @@
         '<div class="small text-muted">保留 ' + (t.retention_days != null ? t.retention_days : "-") + " 天</div></td>" +
         "<td>" + lastCell + "</td>" +
         '<td class="text-end">' +
-        '<button class="btn btn-sm btn-outline-primary me-1" data-os-run="' + t.id + '"' +
-        (running ? " disabled" : "") + ' title="立即执行一次备份">' +
-        (running ? '<span class="spinner-border spinner-border-sm"></span>' : '<i class="bi bi-play-fill"></i> 备份') + "</button>" +
+        (running
+          ? '<button class="btn btn-sm btn-outline-danger me-1" data-os-stop="' + t.id + '" title="停止运行中的备份（协作式取消，断点保留可续传）"><i class="bi bi-stop-circle"></i> 停止</button>' +
+            '<button class="btn btn-sm btn-outline-secondary me-1" onclick="liveLog(' + t.id + ')" title="实时查看操作日志"><i class="bi bi-terminal"></i> 日志</button>'
+          : '<button class="btn btn-sm btn-outline-primary me-1" data-os-run="' + t.id + '" title="立即执行一次备份"><i class="bi bi-play-fill"></i> 备份</button>') +
         '<button class="btn btn-sm btn-outline-secondary me-1" data-os-objs="' + t.id + '" title="最近一次成功备份的对象清单">' +
         '<i class="bi bi-list-ul"></i></button>' +
         '<button class="btn btn-sm btn-outline-secondary me-1" data-os-edit="' + t.id + '" title="编辑"><i class="bi bi-pencil"></i></button>' +
@@ -816,10 +817,12 @@
       const btn = ev.target.closest("button");
       if (!btn) return;
       const run = btn.getAttribute("data-os-run");
+      const stop = btn.getAttribute("data-os-stop");
       const objs = btn.getAttribute("data-os-objs");
       const edit = btn.getAttribute("data-os-edit");
       const del = btn.getAttribute("data-os-del");
       if (run) runBackup(parseInt(run, 10));
+      else if (stop) stopTask(parseInt(stop, 10));
       else if (edit) editTask(parseInt(edit, 10));
       else if (del) deleteTask(parseInt(del, 10));
       else if (objs) {

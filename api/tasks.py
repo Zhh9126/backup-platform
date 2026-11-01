@@ -2,6 +2,7 @@
 """备份任务相关 API：增删改查、立即执行、模板下载、批量导入。"""
 import csv
 import io
+import os
 from flask import request, jsonify, make_response
 
 from auth import login_required
@@ -100,6 +101,61 @@ def _validate_biz_system(value, required: bool = True):
     if len(s) > BIZ_SYSTEM_MAX_LEN:
         return f"业务系统长度不能超过 {BIZ_SYSTEM_MAX_LEN} 字符"
     return None
+
+
+@api_bp.route("/tasks/<int:task_id>/stop", methods=["POST"])
+@login_required
+def api_task_stop(task_id):
+    """停止运行中的备份任务（协作式取消，断点保留可续传）。"""
+    row = db.query_one(
+        "SELECT id FROM backup_records WHERE task_id=? AND status='running' "
+        "ORDER BY id DESC LIMIT 1", (task_id,))
+    if not row:
+        return jsonify({"error": "当前没有运行中的备份任务"}), 400
+    from core import cancel as cancel_mod
+    if not cancel_mod.cancel(f"t{task_id}:r{row['id']}"):
+        return jsonify({"error": "停止失败：该记录的执行上下文未注册"
+                                  "（可能刚刚结束，请刷新确认）"}), 409
+    return jsonify({"ok": True, "record_id": row["id"],
+                    "message": "停止指令已发出，将在传输块边界生效"
+                               "（断点已保留，重新发起将从断点续传）"})
+
+
+@api_bp.route("/tasks/<int:task_id>/live-log", methods=["GET"])
+@login_required
+def api_task_live_log(task_id):
+    """运行中/最近一次备份的实时操作日志尾部（前端轮询展示）。"""
+    rec = db.query_one(
+        "SELECT id, status, started_at, log_path, message FROM backup_records "
+        "WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,))
+    if not rec:
+        return jsonify({"error": "任务还没有任何执行记录"}), 404
+    tail, src, truncated = "", rec.get("log_path") or "", False
+    if not src or not os.path.isfile(src):
+        # 兜底：按任务号在操作日志目录找最新的现场文件
+        import glob
+        cands = glob.glob(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "logs", "operations", "*", f"backup_t{task_id}_*.log"))
+        if cands:
+            src = max(cands, key=os.path.getmtime)
+    if src and os.path.isfile(src):
+        try:
+            size = os.path.getsize(src)
+            with open(src, "rb") as f:
+                if size > 16 * 1024:
+                    f.seek(size - 16 * 1024)
+                    truncated = True
+                tail = f.read().decode("utf-8", "replace")
+            if truncated:
+                tail = "……（仅显示最后 16KB，完整日志见下载）……\n" + tail
+        except OSError as e:
+            tail = f"日志文件读取失败: {e}"
+    elif rec["status"] == "running":
+        tail = "（操作日志文件尚未生成，稍后自动刷新…）"
+    return jsonify({"record_id": rec["id"], "status": rec["status"],
+                    "started_at": rec["started_at"], "log_path": src,
+                    "log_tail": tail})
 
 
 @api_bp.route("/tasks/<int:task_id>/precheck", methods=["POST"])
@@ -322,9 +378,16 @@ def update_task(task_id):
 @api_bp.route("/tasks/<int:task_id>", methods=["DELETE"])
 @login_required
 def delete_task(task_id):
+    # 运行中任务：先发停止指令再删（前后端一致——删除按钮始终可见）
+    row = db.query_one(
+        "SELECT id FROM backup_records WHERE task_id=? AND status='running' "
+        "ORDER BY id DESC LIMIT 1", (task_id,))
+    if row:
+        from core import cancel as cancel_mod
+        cancel_mod.cancel(f"t{task_id}:r{row['id']}")
     models.delete_task(task_id)
     scheduler.reload_scheduler()
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "stopped_running": bool(row)})
 
 
 @api_bp.route("/tasks/<int:task_id>/run", methods=["POST"])

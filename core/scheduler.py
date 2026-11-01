@@ -323,6 +323,12 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
         "task_id": task["id"], "db_type": task["db_type"],
         "backup_type": bt.value, "started_at": started, "status": "running",
     })
+    # 注册协作式取消键（用户「停止」运行中任务）：绑定到当前执行上下文，
+    # 传输类长循环在块边界检查（FIX-2026-001 反馈：运行中不可见不可停）
+    from core import cancel as _cancel_mod
+    _cancel_key = f"t{task['id']}:r{rec_id}"
+    _cancel_mod.register(_cancel_key)
+    _cancel_token = _cancel_mod.attach(_cancel_key)
     _logger.info("开始备份 task=%s(%s) type=%s", task["id"], task["name"], bt.value)
 
     # ---- 操作日志：本次备份的完整现场（上下文/阶段耗时/命令/退出码/输出） ----
@@ -330,6 +336,12 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
     op = _oplog.OperationLog(kind="backup", task=task, record_id=rec_id,
                              operator=operator or "")
     _op_token = _oplog.attach(op)
+    # 日志文件路径立即落记录：运行中任务的「实时日志」查看依赖它
+    try:
+        db.execute("UPDATE backup_records SET log_path=? WHERE id=?",
+                   (str(op.path), rec_id))
+    except Exception:
+        pass
     op.context({
         "任务ID": task["id"],
         "任务名": task.get("name"),
@@ -377,13 +389,29 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
             finally:
                 _rd.reset_task_env_export(_env_token)
     except Exception as e:
-        result = BackupResult(success=False, status=BackupStatus.FAILED, message=f"执行异常: {e}")
-        _logger.exception("备份异常 task=%s", task["id"])
-        op.exception(e, note="[备份流程异常]")
+        from core import cancel as _cancel
+        if isinstance(e, _cancel.CancelledError):
+            # 用户手动停止：记录标记 cancelled（传输断点保留，重跑可续传）
+            result = BackupResult(success=False, status=BackupStatus.CANCELLED,
+                                  message="任务已被用户手动停止"
+                                          "（传输断点已保留，重新发起将从断点续传）")
+            _logger.info("备份被用户停止 task=%s record=%s", task["id"], rec_id)
+            op.error("[用户停止] %s", result.message)
+        else:
+            result = BackupResult(success=False, status=BackupStatus.FAILED,
+                                  message=f"执行异常: {e}")
+            _logger.exception("备份异常 task=%s", task["id"])
+            op.exception(e, note="[备份流程异常]")
 
     finished = db.now_iso()
     status = result.status if hasattr(result, "status") else (
         "success" if result.success else "failed")
+    # 引擎层会把 CancelledError 包成普通失败（BackupResult）——按停止标记
+    # 还原为 cancelled，避免「用户手动停止」显示成失败
+    if str(getattr(status, "value", status)) == "failed" and \
+            "手动停止" in (getattr(result, "message", "") or ""):
+        from core.engines.base import BackupStatus as _BS
+        status = _BS.CANCELLED
     size = int(getattr(result, "size_bytes", 0) or 0)
     path = getattr(result, "backup_path", None)
     checksum = getattr(result, "checksum", "")
@@ -490,7 +518,8 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
             _logger.warning("[binlog-purge] task=%s 失败（不影响备份结果）: %s",
                             task.get("id"), e)
 
-    title = f"[{'成功' if result.success else '失败'}] 备份任务 {task['name']}"
+    title = (f"[{'已停止' if status == 'cancelled' else ('成功' if result.success else '失败')}]"
+             f" 备份任务 {task['name']}")
     text = (f"数据库类型: {task['db_type']}\n目标: {task.get('host')}:"
             f"{task.get('port')}/{task.get('db_name')}\n类型: {bt.value}\n"
             f"状态: {status}\n耗时: {_elapsed_sec(t0)}s\n"
@@ -549,6 +578,12 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
         })
     except Exception as e:
         _logger.warning("[webhooks] 事件推送失败: %s", e)
+    # 取消键收尾（停止后重跑会注册新键）
+    try:
+        _cancel_mod.finish(_cancel_key)
+        _cancel_mod.detach(_cancel_token)
+    except Exception:
+        pass
     return models.get_record(rec_id)
 
 

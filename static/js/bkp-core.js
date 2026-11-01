@@ -171,6 +171,7 @@ window.BKP = (function () {
     var m = {
       success: ["badge-ok", "成功"], failed: ["badge-fail", "失败"],
       simulated: ["badge-sim", "仿真"], running: ["badge-run", "运行中"],
+      cancelled: ["bg-secondary", "已停止"],
       never: ["bg-secondary", "未运行"],
       // 保留策略过期清理 / GFS 过期：留存审计轨迹（记录还在，产物已删）
       expired: ["bg-secondary", "已清理（过期）"],

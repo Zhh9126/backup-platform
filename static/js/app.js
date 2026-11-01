@@ -1803,8 +1803,11 @@
         <td>${t.enabled ? statusBadge(t.last_status || "never") : '<span class="badge bg-secondary">' + T("已停用") + '</span>'}</td>
         <td>${fmtTime(t.last_run_at) || "-"}</td>
         <td class="text-end" style="white-space:nowrap">
-          <button class="btn-row btn-row-primary" onclick="runTask(${t.id})" title="${T("立即备份")}"><i class="bi bi-play-circle"></i> ${T("立即备份")}</button>
-          <button class="btn-row" onclick="BKP.runBackupPrecheck(${t.id})" title="备份预检：先探测配置/通道/源库/工具/空间能否支持本次备份"><i class="bi bi-clipboard-check"></i> ${T("预检")}</button>
+          ${t.last_status === "running"
+            ? `<button class="btn-row btn-row-danger" onclick="stopTask(${t.id})" title="停止运行中的备份（协作式取消：传输块边界生效，断点保留可续传）"><i class="bi bi-stop-circle"></i> ${T("停止")}</button>
+          <button class="btn-row" onclick="liveLog(${t.id})" title="实时查看本次备份的操作日志（2.5s 自动刷新）"><i class="bi bi-terminal"></i> ${T("实时日志")}</button>`
+            : `<button class="btn-row btn-row-primary" onclick="runTask(${t.id})" title="${T("立即备份")}"><i class="bi bi-play-circle"></i> ${T("立即备份")}</button>
+          <button class="btn-row" onclick="BKP.runBackupPrecheck(${t.id})" title="备份预检：先探测配置/通道/源库/工具/空间能否支持本次备份"><i class="bi bi-clipboard-check"></i> ${T("预检")}</button>`}
           <button class="btn-row" onclick="editTask(${t.id})" title="${T("编辑")}"><i class="bi bi-pencil"></i> ${T("编辑")}</button>
           <button class="btn-row btn-row-danger" onclick="delTask(${t.id})" title="${T("删除")}"><i class="bi bi-trash"></i> ${T("删除")}</button>
         </td>
@@ -1886,13 +1889,79 @@
   window.delTask = async (id) => {
     const ok = await confirmDialog({
       title: "确认删除该任务？",
-      message: "将删除该任务及其全部备份记录，此操作不可恢复。",
+      message: "将删除该任务及其全部备份记录，此操作不可恢复。"
+        + "（若任务正在运行，会先自动发出停止指令）",
       confirmText: "删除",
       danger: true,
     });
     if (!ok) return;
     try { await api("DELETE", `/api/tasks/${id}`); toast("已删除"); await loadTasks(); }
     catch (e) { toast(e.message, "danger"); }
+  };
+  window.stopTask = async (id) => {
+    const ok = await confirmDialog({
+      title: "确认停止该备份任务？",
+      message: "停止为协作式取消：在传输块边界生效，已传输的断点会保留，"
+        + "重新发起备份将从断点续传（不浪费已传字节）。",
+      confirmText: "停止任务",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const r = await api("POST", `/api/tasks/${id}/stop`);
+      toast(r.message || "停止指令已发出", "warning");
+      await loadTasks();
+    } catch (e) { toast(e.message, "danger"); }
+  };
+  let _liveLogTimer = null;
+  window.liveLog = async (id) => {
+    // 实时日志弹窗：2.5s 轮询，任务终态后停止轮询
+    let modal = $("liveLogModal");
+    if (!modal) {
+      document.body.insertAdjacentHTML("beforeend", `
+      <div class="modal fade" id="liveLogModal" tabindex="-1">
+        <div class="modal-dialog modal-xl modal-dialog-scrollable">
+          <div class="modal-content">
+            <div class="modal-header">
+              <h5 class="modal-title"><i class="bi bi-terminal"></i> 备份实时日志
+                <span class="badge bg-warning text-dark ms-2" id="liveLogStatus">running</span></h5>
+              <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+              <pre id="liveLogPre" style="max-height:60vh;overflow:auto;background:#0b1220;color:#d1e3ff;"
+                   class="p-3 rounded small font-monospace mb-0">加载中…</pre>
+              <div class="small text-muted mt-2">每 2.5 秒自动刷新；任务结束后停止刷新。</div>
+            </div>
+          </div>
+        </div>
+      </div>`);
+      modal = $("liveLogModal");
+      modal.addEventListener("hidden.bs.modal", () => {
+        if (_liveLogTimer) { clearInterval(_liveLogTimer); _liveLogTimer = null; }
+      });
+    }
+    new bootstrap.Modal(modal).show();
+    const pull = async () => {
+      try {
+        const r = await api("GET", `/api/tasks/${id}/live-log`);
+        const badge = $("liveLogStatus"), pre = $("liveLogPre");
+        if (!badge || !pre) return;
+        badge.textContent = r.status;
+        badge.className = "badge ms-2 " + (
+          r.status === "running" ? "bg-warning text-dark" :
+          r.status === "success" ? "bg-success" :
+          r.status === "cancelled" ? "bg-secondary" : "bg-danger");
+        pre.textContent = r.log_tail || "（暂无日志输出）";
+        pre.scrollTop = pre.scrollHeight;
+        if (r.status !== "running" && _liveLogTimer) {
+          clearInterval(_liveLogTimer); _liveLogTimer = null;
+          await loadTasks();
+        }
+      } catch (e) { /* 静默：下一轮重试 */ }
+    };
+    await pull();
+    if (_liveLogTimer) clearInterval(_liveLogTimer);
+    _liveLogTimer = setInterval(pull, 2500);
   };
 
   async function initTasks() {
@@ -3500,8 +3569,11 @@
         <td>${esc(t.backup_type_display || t.backup_type)}</td>
         <td>${scheduleCell(t)}</td>
         <td>${t.enabled ? statusBadge(t.last_status || "never") : '<span class="badge bg-secondary">' + T("已停用") + '</span>'}</td>
-        <td class="text-end">
-          <button class="btn btn-sm btn-outline-success" onclick="runFileTask(${t.id})">备份</button>
+        <td class="text-end" style="white-space:nowrap">
+          ${t.last_status === "running"
+            ? `<button class="btn btn-sm btn-outline-danger" onclick="stopTask(${t.id})" title="停止运行中的备份（协作式取消，断点保留可续传）">停止</button>
+          <button class="btn btn-sm btn-outline-secondary" onclick="liveLog(${t.id})" title="实时查看操作日志">实时日志</button>`
+            : `<button class="btn btn-sm btn-outline-success" onclick="runFileTask(${t.id})">备份</button>`}
           <button class="btn btn-sm btn-outline-primary" onclick="editFileTask(${t.id})">编辑</button>
           <button class="btn btn-sm btn-outline-danger" onclick="delFileTask(${t.id})">删除</button>
         </td>

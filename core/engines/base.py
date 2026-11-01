@@ -1005,6 +1005,8 @@ class BackupEngine:
             notes.append("断点续传拉回")
         if res_d.get("dumped") is False:
             notes.append("复用远端已完成导出")
+        if res_d.get("warn"):
+            notes.append(str(res_d["warn"]))
         note = ("（" + "，".join(notes) + "）") if notes else ""
         hk = (ssh_host or {}).get("host_key", "remote")
         label = dumpall_label if fmt == "dumpall" and dumpall_label else single_label

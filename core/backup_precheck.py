@@ -169,6 +169,24 @@ def precheck_backup(task: dict) -> dict:
             except Exception as e:
                 _add(items, "rman_dir", "unknown", "RMAN 目录预检异常: %s" % str(e)[:100])
 
+    # 5.5) 远端暂存目录（FIX-2026-001 延伸，全库型）：备份会在数据库服务器
+    # 本地写入整库大小的临时产物，默认 /tmp 常在根分区
+    try:
+        _eo2 = task.get("extra_options")
+        _extra2 = json.loads(_eo2) if isinstance(_eo2, str) else (_eo2 or {})
+        _bsd = str(_extra2.get("backup_stage_dir") or "").strip()
+        if _bsd:
+            _add(items, "remote_stage", "pass",
+                 f"远端暂存目录（任务级）: {_bsd}；执行前将按上次成功备份大小"
+                 f"做空间预算检查，与根分区同盘会告警")
+        else:
+            _add(items, "remote_stage", "warn",
+                 "远端暂存目录未配置（默认 /tmp/bk_stage，常在根分区）——"
+                 "整库大小的临时产物可能占满数据库服务器根分区，"
+                 "建议在任务高级选项配置到独立挂载分区")
+    except Exception as e:
+        _add(items, "remote_stage", "unknown", "暂存目录预检异常: %s" % str(e)[:100])
+
     # 6) 平台存储空间
     du = _disk_usage()
     if du:

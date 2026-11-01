@@ -1718,7 +1718,9 @@ def _remote_mongodb_dump_shell(task: dict, ssh_host: dict, compress: int) -> tup
     spec = _dfmt.resolve("mongodb", _pg_family_parse_extra(task), compress=bool(compress))
     base_shell = f"{mongodump} --host {shlex.quote(host)} --port {port}{auth_args}{db_args}"
     if spec.get("dir"):
-        work = f"/tmp/.bk_mongo_{os.getpid()}_{int(time.time())}"
+        # 目录格式工作区：任务级暂存目录（整库解包落盘，/tmp 会撑爆根分区）
+        work = (task_stage_dir(task)
+                + f"/.bk_mongo_{os.getpid()}_{int(time.time())}")
         shell = (f"set -o pipefail; rm -rf {work} && mkdir -p {work} && "
                  f"{base_shell} --out {work} && tar -C {work} -czf - .; RC=$?; "
                  f"rm -rf {work}; exit $RC")
@@ -2234,11 +2236,101 @@ def _remote_fixed_dir() -> str:
     return _remote_stage_dir().rstrip("/") + "/fixed"
 
 
+def task_stage_dir(task: dict) -> str:
+    """任务级远端暂存目录（FIX-2026-001 延伸：防默认路径撑爆数据库服务器）。
+
+    各库型备份在**数据库服务器本地**写入整库大小的临时产物（mysqldump/xtrabackup
+    /pg_basebackup/dexp/USERID stage 等）——默认 /tmp/bk_stage 常在根分区，大库
+    会把正常机器撑爆。优先级：
+      extra_options.backup_stage_dir > config.BACKUP_REMOTE_STAGE(env) > /tmp/bk_stage
+    """
+    extra = {}
+    raw = task.get("extra_options")
+    if isinstance(raw, dict):
+        extra = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            extra = json.loads(raw)
+        except Exception:
+            extra = {}
+    d = str(extra.get("backup_stage_dir") or "").strip().rstrip("/")
+    if d:
+        return d
+    return _remote_stage_dir().rstrip("/")
+
+
+def ensure_remote_stage_ok(client, task: dict, dir_path: str,
+                           label: str = "", need_factor: float = 1.5) -> str:
+    """远端暂存目录空间与分区安全检查（返回警告文案，""=无警告）。
+
+    - 目录不存在则创建；
+    - 需求预算 = 该任务最近一次成功备份产物大小 × need_factor（同形态近似）；
+      空闲 < 预算 → RuntimeError（在写盘前失败并给出明确处置指引，
+      而不是备份跑到中途 ENOSPC）；
+    - 目录与 / 同文件系统、或空闲 < 2GB → 警告（调用方并入任务消息）。
+    """
+    from core.engines.file import _ssh_exec_pipe
+    _ssh_exec_pipe(client, _wrap_login(f"mkdir -p {shlex.quote(dir_path)}"),
+                   timeout=30)
+    out, _e, _rc = _ssh_exec_pipe(
+        client, _wrap_login(
+            f"df -P -B1 {shlex.quote(dir_path)} | tail -1; "
+            f"stat -c %d / 2>/dev/null; "
+            f"stat -c %d {shlex.quote(dir_path)} 2>/dev/null"),
+        timeout=30)
+    txt = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+    lines = [l.strip() for l in txt.splitlines() if l.strip()]
+    free = None
+    if lines and len(lines[0].split()) >= 4:
+        try:
+            free = int(lines[0].split()[3])   # df -P: Avail 第 4 列
+        except Exception:
+            free = None
+    devs = [l for l in lines[1:] if l.strip().isdigit()]
+    same_fs = len(devs) >= 2 and devs[0] == devs[1]
+
+    # 需求预算：任务最近一次成功备份产物大小（同形态近似）
+    need = 0
+    try:
+        tid = int(task.get("id") or 0)
+        if tid:
+            row = db.query_one(
+                "SELECT size_bytes FROM backup_records WHERE task_id=? AND "
+                "status='success' ORDER BY id DESC LIMIT 1", (tid,))
+            if row and row.get("size_bytes"):
+                need = int(float(row["size_bytes"]) * need_factor)
+    except Exception:
+        need = 0
+    if need and free is not None and free < need:
+        raise RuntimeError(
+            f"远端暂存目录 {dir_path} 空闲空间不足：剩余 {db.human_size(free)}，"
+            f"按上次成功备份 {db.human_size(int(need / need_factor))} 的 "
+            f"{need_factor:.1f} 倍预算需要 {db.human_size(need)}。"
+            f"请在任务高级选项配置「远端暂存目录」(backup_stage_dir) 到实际挂载"
+            f"分区，或清理该机空间后重试")
+    warns = []
+    if same_fs:
+        warns.append(f"远端暂存目录 {dir_path} 与根分区同一文件系统——大库可能"
+                     f"占满根分区，建议在任务高级选项配置独立挂载点")
+    if free is not None and free < 2 * 1024 ** 3:
+        warns.append(f"远端暂存目录剩余空间仅 {db.human_size(free)}")
+    w = "；".join(warns)
+    if w:
+        logging.getLogger(__name__).warning(
+            "[remote_dump] %s: %s", label or "stage", w)
+    return w
+
+
 def fixed_remote_path(task: dict, db_type: str, name: str) -> str:
-    """固定产物的确定性远端路径（**不含随机时间戳**）。"""
+    """固定产物的确定性远端路径（**不含随机时间戳**）。
+
+    基座 = 任务级暂存目录（task_stage_dir）：任务配置了 backup_stage_dir 时
+    整库大小的临时产物（xtrabackup/mysqldump/pg_basebackup 等）落在指定分区。
+    """
     tid = int(task.get("id") or 0)
     safe = re.sub(r"[^0-9A-Za-z._-]", "_", str(name or "artifact"))[:80]
-    return f"{_remote_fixed_dir()}/t{tid}_{db_type}_{safe}"
+    return (task_stage_dir(task).rstrip("/")
+            + f"/fixed/t{tid}_{db_type}_{safe}")
 
 
 def marker_path(target: str, is_dir: bool = False) -> str:
@@ -2549,7 +2641,12 @@ def _remote_mysql_dump_to_file(task: dict, ssh_host: dict, final_path: str,
                     "fmt": "multi-db-tar", "suffix": ".tar.gz",
                     "sha256": db.sha256_file(final_path), "resumed": False}
 
-        stage = _remote_stage_dir()
+        stage = task_stage_dir(task)
+        stage_warn = ""
+        if not (meta and _meta_usable(meta, ssh_host, spec, p)):
+            # 全新导出前：空间/分区安全检查（断点续传复用时不重复写盘，跳过）
+            stage_warn = ensure_remote_stage_ok(
+                client, task, stage, label="mysqldump")
         if meta and _meta_usable(meta, ssh_host, spec, p) \
                 and not _remote_breakpoint_alive(sftp, meta):
             # 断点还"在 TTL 内"，但远端产物已经不存在（客户清过 /tmp、目标机重启、
@@ -2628,7 +2725,7 @@ def _remote_mysql_dump_to_file(task: dict, ssh_host: dict, final_path: str,
         return {"path": final_path, "size": os.path.getsize(final_path),
                 "compressed": bool(spec["enable"]), "fmt": spec["fmt"],
                 "suffix": spec["suffix"], "sha256": db.sha256_file(final_path),
-                "resumed": resumed}
+                "resumed": resumed, "warn": stage_warn}
     finally:
         try:
             sftp.remove(remote_cnf)
@@ -2685,8 +2782,12 @@ def _remote_stage_pull_to_file(client, ssh_host: dict, task: dict, shell: str,
         except Exception:
             pass
 
+    _stage_warn = ""
     if dumped:
         from core.engines.file import _ssh_exec_pipe
+        # 写盘前空间/分区安全检查（需求预算按上次成功备份估算）
+        _stage_warn = ensure_remote_stage_ok(
+            client, task, os.path.dirname(stage), label=label)
         stage_shell = (
             f"mkdir -p {shlex.quote(os.path.dirname(stage))} && "
             f"( {shell} ) > {stage} 2>{err_file}; RC=$?; "
@@ -2711,6 +2812,7 @@ def _remote_stage_pull_to_file(client, ssh_host: dict, task: dict, shell: str,
     # 拉回成功后清 stage 残件：下次备份源可能已变化，防续到过期数据
     _rm_remote(stage, rc_file, err_file)
     res["dumped"] = dumped
+    res["warn"] = _stage_warn
     return res
 
 

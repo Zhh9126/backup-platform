@@ -908,6 +908,7 @@ class MySQLEngine(BackupEngine):
         pushed_libs_dir = None
         env_pre = ""
         push_note = ""
+        stage_note = ""              # 远端空间/分区安全检查警告（FIX-2026-001 延伸）
         keep_remote = False          # 拉回失败时保留远端产物+标记，供重试复用
         hk = ssh_host.get("host_key", "remote")
         sftp = client.open_sftp()
@@ -1042,6 +1043,11 @@ class MySQLEngine(BackupEngine):
             if reuse:
                 inner = "true"      # 产物已就绪，本次只需拉回
             else:
+                # 写盘前空间/分区安全检查（FIX-2026-001 延伸：需求预算按上次
+                # 成功备份估算；xtrabackup 产物 ≈ 数据目录大小，最易撑爆机器）
+                stage_note = remote_dump.ensure_remote_stage_ok(
+                    client, self.task, os.path.dirname(remote_tar),
+                    label="xtrabackup")
                 # xtrabackup 要求 target-dir 为空目录；重试时先清掉上次残留
                 inner = (
                     f"rm -rf {remote_tmp} && {env_pre}{tool} "
@@ -1140,7 +1146,8 @@ class MySQLEngine(BackupEngine):
                    f"已拉回 {local_path} ({db.human_size(size)})"
                    f"{'（复用上次远端产物，未重跑备份）' if reuse else ''}"
                    f"{'（断点续传）' if pulled['resumed'] else ''}"
-                   f"{push_note}{inc_note}{rsync_note}")
+                   f"{push_note}{inc_note}{rsync_note}"
+                   f"{'（' + stage_note + '）' if stage_note else ''}")
             self.logger.info("[%s] %s", self.task_name, msg)
 
             # 清理远端临时目录与 tar 包（best-effort，失败不致命）

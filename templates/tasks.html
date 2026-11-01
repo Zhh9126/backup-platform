@@ -330,6 +330,17 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
                   </div>
                 </div>
                 <div class="col-12 mt-2">
+                  <label class="form-label">远端暂存目录（可选，全数据库类型生效）</label>
+                  <input class="form-control form-control-sm font-monospace" id="t_backup_stage_dir"
+                         placeholder="如 /data/aidbm_stage（留空 = 数据库服务器 /tmp/bk_stage）">
+                  <div class="small text-muted">
+                    备份会在数据库服务器本地写入整库大小的临时产物（mysqldump/xtrabackup/
+                    pg_basebackup/dexp/USERID 导出等）——默认 /tmp 常在根分区，大库会撑爆正常机器。
+                    建议配置到独立挂载分区；平台会在执行前按上次成功备份大小做空间预算检查，
+                    同分区/剩余不足时告警或拦截。
+                  </div>
+                </div>
+                <div class="col-12 mt-2">
                   <div class="form-check">
                     <input class="form-check-input" type="checkbox" id="t_auto_discover">
                     <label class="form-check-label" for="t_auto_discover">

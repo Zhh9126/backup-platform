@@ -1529,6 +1529,7 @@
     if ($("t_tool_path")) $("t_tool_path").value = "";
     if ($("t_db_os_user")) $("t_db_os_user").value = "";
     if ($("t_rman_temp_dir")) $("t_rman_temp_dir").value = "";
+    if ($("t_backup_stage_dir")) $("t_backup_stage_dir").value = "";
     if ($("t_auto_discover")) $("t_auto_discover").checked = false;
     toggleSshFields();
   }
@@ -1544,6 +1545,7 @@
     if ($("t_tool_path")) $("t_tool_path").value = eo.tool_path || "";
     if ($("t_db_os_user")) $("t_db_os_user").value = eo.db_os_user || "";
     if ($("t_rman_temp_dir")) $("t_rman_temp_dir").value = eo.rman_temp_dir || "";
+    if ($("t_backup_stage_dir")) $("t_backup_stage_dir").value = eo.backup_stage_dir || "";
     if ($("t_auto_discover")) $("t_auto_discover").checked = !!eo.auto_discover_new_dbs;
   }
 
@@ -1580,6 +1582,10 @@
     const rtd = ($("t_rman_temp_dir") && $("t_rman_temp_dir").value.trim()) || "";
     if (rtd) eo.rman_temp_dir = rtd;
     else delete eo.rman_temp_dir;
+    // 远端暂存目录（全库型；整库大小临时产物的落盘位置）
+    const bsd = ($("t_backup_stage_dir") && $("t_backup_stage_dir").value.trim()) || "";
+    if (bsd) eo.backup_stage_dir = bsd;
+    else delete eo.backup_stage_dir;
     // 新建库自动纳管（备新建库）
     if ($("t_auto_discover") && $("t_auto_discover").checked) eo.auto_discover_new_dbs = true;
     else delete eo.auto_discover_new_dbs;

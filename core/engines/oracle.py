@@ -410,7 +410,10 @@ class OracleEngine(BackupEngine):
                 if remote_dir:
                     break
             if not remote_dir:
-                remote_dir = "/u01/app/oracle/backup"
+                # 无 manifest 时回退：任务级 rman_temp_dir 优先，再默认值
+                remote_dir = (str((self._parse_extra() or {})
+                                  .get("rman_temp_dir") or "").strip().rstrip("/")
+                              or "/u01/app/oracle/backup")
             for _p in sorted(_glob.glob(os.path.join(local_dir, "*.bkp"))):
                 _rp = f"{remote_dir}/{os.path.basename(_p)}"
                 remote_dump.sftp_put_resumable(
@@ -1143,6 +1146,17 @@ class OracleEngine(BackupEngine):
             remote_sh = ""      # 远端 expdp 包装脚本，成功后一并清理（零残留）
             ready = remote_dump.remote_artifact_ready(client, remote_marker, min_size=1)
             reuse = bool(ready["reusable"])
+            dp_space_note = ""
+            if not reuse:
+                # 写盘前空间预算检查（dmp 体积≈整库；DATA_PUMP_DIR 所在分区
+                # 剩余不足时提前失败并给指引，避免撑爆数据库服务器）
+                try:
+                    dp_space_note = remote_dump.ensure_remote_stage_ok(
+                        client, self.task, dp_dir, label="expdp DATA_PUMP_DIR")
+                except RuntimeError as e:
+                    return BackupResult(
+                        success=False, status=BackupStatus.FAILED,
+                        message=f"expdp 前置检查未通过：{str(e)[:400]}")
             if reuse:
                 self.logger.info("[%s] 复用远端已完成 dmp %s，跳过 expdp 执行",
                                  self.task_name, remote_dmp)
@@ -1229,7 +1243,8 @@ class OracleEngine(BackupEngine):
             msg = (f"通过 SSH 在 {hk} 以 oracle 用户执行 expdp({mode_desc})成功，"
                    f"已拉回 dmp: {local_dmp} ({db.human_size(size)})"
                    f"{'（复用上次远端产物，未重跑导出）' if reuse else ''}"
-                   f"{'（断点续传）' if res['resumed'] else ''}")
+                   f"{'（断点续传）' if res['resumed'] else ''}"
+                   f"{'（' + dp_space_note + '）' if dp_space_note else ''}")
             self.logger.info("[%s] %s", self.task_name, msg)
             return BackupResult(
                 success=True, status=BackupStatus.SUCCESS,

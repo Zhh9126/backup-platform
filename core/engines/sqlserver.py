@@ -247,6 +247,7 @@ class SQLServerEngine(BackupEngine):
         remote_marker = f"{remote_ref}.bkdone"
 
         # 确保目录存在（Linux 归属 mssql 用户，避免“操作系统错误 5/访问被拒绝”）
+        stage_note = ""
         if ssh_host and not win:
             from core import remote_dump as _rd
             client = _rd._connect(ssh_host)
@@ -254,6 +255,13 @@ class SQLServerEngine(BackupEngine):
                 prep = (f"mkdir -p {_sh(bdir)} && chown mssql:mssql {_sh(bdir)} "
                         f"2>/dev/null || true")
                 _ssh_exec_pipe(client, _rd._wrap_login(prep), timeout=60)
+                # 空间预算检查（FIX-2026-001 延伸：bak 体积≈数据库大小）
+                stage_note = _rd.ensure_remote_stage_ok(
+                    client, self.task, bdir, label="SQL Server 备份目录")
+            except RuntimeError as e:
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                    simulated=False,
+                                    message=f"SQL Server 备份前置检查未通过: {str(e)[:300]}")
             except Exception:
                 pass
             finally:
@@ -389,6 +397,7 @@ class SQLServerEngine(BackupEngine):
         msg = (f"SQL Server {op_label}成功: [{db_name}] → "
                f"{os.path.basename(local_path)} ({db.human_size(size)})，"
                f"经 SSH 自 {hk} 拉回"
+               f"{'（' + stage_note + '）' if stage_note else ''}"
                f"{'（复用上次远端产物，未重跑备份）' if reuse else ''}"
                f"{'（断点续传）' if resumed else ''}")
         return BackupResult(

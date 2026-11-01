@@ -23,6 +23,7 @@
     backup_tools: "备份工具",
     physical_note: "物理模式提示",
     rman_dir: "RMAN 备份目录",
+    remote_stage: "远端暂存目录",
     disk_space: "存储空间",
     artifact: "备份产物",
     integrity: "完整性校验",

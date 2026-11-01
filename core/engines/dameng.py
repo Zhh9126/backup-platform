@@ -418,9 +418,15 @@ class DamengEngine(BackupEngine):
                 success=False, status=BackupStatus.FAILED,
                 message=(f"远端主机未找到 dexp（{_dm_os_user} 用户 PATH 与常见安装目录均无），"
                          "无法执行达梦逻辑备份。"))
-        remote_tmp = f"/tmp/dm_bkp_{ts}"
+        # 远端暂存目录：任务级可配（FIX-2026-001 延伸：默认 /tmp 在根分区，
+        # dmp 体积≈整库，会撑爆数据库服务器）
+        from core import remote_dump as _rd
+        remote_tmp = f"{_rd.task_stage_dir(self.task)}/dm_bkp_{ts}"
         remote_dmp = f"{remote_tmp}/{ts}.dmp"
         remote_log = f"{remote_tmp}/{ts}.log"
+        _dm_client = _rd._connect(ssh_host)
+        stage_note = _rd.ensure_remote_stage_ok(
+            _dm_client, self.task, remote_tmp, label="达梦 dexp")
         import shlex as _shlex
         # USERID 中密码带双引号（含特殊字符时），必须整体单引号包裹，
         # 防止 bash -lc 剥掉双引号后达梦连接串被密码中的 @ 截断
@@ -445,7 +451,8 @@ class DamengEngine(BackupEngine):
             success=True, status=BackupStatus.SUCCESS,
             backup_path=local_path, size_bytes=size, duration_sec=duration,
             simulated=False, checksum=res_d.get("sha256") or "",
-            message=f"达梦 远程逻辑备份(dexp)成功: {local_path}{note}")
+            message=(f"达梦 远程逻辑备份(dexp)成功: {local_path}{note}"
+                     f"{'（' + stage_note + '）' if stage_note else ''}"))
 
     def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:
         """逻辑备份：dexp（沿用原有实现）。"""
@@ -926,7 +933,9 @@ class DamengEngine(BackupEngine):
         extra = self._parse_extra()
         userid = self._connect_userid()
         target_db = kwargs.get("target_db")
-        remote_tmp = "/tmp/dm_rst_{0}".format(ts)
+        # 恢复端解包目录同样任务级可配（dmp 推送+解包体积≈整库）
+        remote_tmp = "{0}/dm_rst_{1}".format(
+            remote_dump.task_stage_dir(self.task), ts)
         remote_dmp = "{0}/{1}.dmp".format(remote_tmp, ts)
         try:
             client = remote_dump._connect(ssh_host)

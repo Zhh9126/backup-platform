@@ -340,11 +340,41 @@ class KingbaseEngine(BackupEngine):
     # ------------------------------------------------------------------
     # 恢复
     # ------------------------------------------------------------------
+    # 物理恢复（sys_basebackup 产物）复用 PG 系通道，工具名换金仓 sys_*
+    _restore_ctl_tool = "sys_ctl"
+    _restore_psql_tool = "ksql"
+    _restore_dump_tool = "sys_dump"
+    _restore_wal_dir = "sys_wal"
+    _dump_db_type = "kingbase"
+
+    def _is_physical_backup(self, backup_path: str) -> bool:
+        """识别 sys_basebackup 物理产物（tar 内含 backup_label / PG_VERSION）。"""
+        import tarfile
+        try:
+            if not str(backup_path).endswith((".tar.gz", ".tgz", ".tar")):
+                return False
+            with tarfile.open(backup_path, "r:*") as tf:
+                for m in tf:
+                    n = m.name.rsplit("/", 1)[-1]
+                    if n in ("backup_label", "PG_VERSION", "base.tar.gz"):
+                        return True
+            return False
+        except Exception:
+            return False
+
+    def _restore_physical(self, backup_path: str, **kwargs) -> BackupResult:
+        from core.engines.postgresql import PostgreSQLEngine
+        return PostgreSQLEngine._restore_physical(self, backup_path, **kwargs)
+
     def restore(self, backup_path: str, **kwargs) -> BackupResult:
         if self.task.get("demo_only"):
             return self._simulate_restore(backup_path, "任务标记为演示(demo_only)")
         if config.DEMO_MODE == "on":
             return self._simulate_restore(backup_path, "DEMO_MODE=on 强制仿真")
+
+        # 物理产物绝不能走逻辑恢复兜底（会 DROP+CREATE 源库 + 假成功）
+        if self._is_physical_backup(backup_path):
+            return self._restore_physical(backup_path, **kwargs)
 
         # 跨主机恢复
         target_host_info = kwargs.get("target_host_info")

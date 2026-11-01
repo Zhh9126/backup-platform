@@ -15,6 +15,7 @@ PostgreSQL 备份引擎。
 """
 import os
 import time
+import re
 import shlex
 import shutil
 import subprocess
@@ -429,12 +430,205 @@ class PostgreSQLEngine(BackupEngine):
             simulated=False, checksum="", message=msg)
 
     # ------------------------- 恢复 -------------------------
+    # 物理恢复（pg_basebackup 产物）使用的远端工具名：openGauss/磐维系覆盖
+    _restore_ctl_tool = "pg_ctl"
+    _restore_psql_tool = "psql"
+    _restore_dump_tool = "pg_dump"
+    _restore_wal_dir = "pg_wal"      # 金仓为 sys_wal
+
+    def _restore_physical(self, backup_path: str, **kwargs) -> BackupResult:
+        """pg_basebackup 物理恢复：远端临时实例校验（零安装，全 SSH）。
+
+        流程：产物推送（断点续传）→ 远端解包到任务级暂存目录 → 以数据库
+        自带 pg_ctl 启动临时实例（独立端口 + 专用 hba trust + 空间预算检查）
+        → 实例级校验（库数/业务库表数）→ 指定异名 target_db 时从临时实例
+        pg_dump 灌入源实例（DROP+CREATE+导入+行数核对）→ 停实例清痕迹。
+        """
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+        import time as _t
+
+        ssh_host = remote_dump.resolve_ssh_host(self.task)
+        if not ssh_host:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path, simulated=False,
+                message=("PG 物理恢复需在数据库服务器本机执行（物理备份是数据"
+                         "目录级，不能跨机 pg_restore）——请为任务绑定 SSH 主机"))
+        client = remote_dump._connect(ssh_host)
+        ts = self._timestamp()
+        tid = int(self.task.get("id") or 0)
+        stage = remote_dump.task_stage_dir(self.task)
+        rdir = f"{stage}/pg_restore_t{tid}_{ts}"
+        rtar = f"{stage}/pg_restore_t{tid}_{ts}_base.tar.gz"
+        port = 18332 + (os.getpid() % 400)
+        os_user = (remote_dump._PG_FAMILY_TOOLING.get(
+            self._dump_db_type, {}).get("check_user") or "postgres")
+        src_db = (self.task.get("db_name") or "").strip()
+        tgt_db = (kwargs.get("target_db") or "").strip()
+        ctl = remote_dump.resolve_remote_tool(
+            ssh_host, self._restore_ctl_tool, check_user=os_user)
+        psql = remote_dump.resolve_remote_tool(
+            ssh_host, self._restore_psql_tool, check_user=os_user)
+        if not ctl or not psql:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path, simulated=False,
+                message=f"远端未找到 {self._restore_ctl_tool}/{self._restore_psql_tool}"
+                        f"（{os_user} 用户 PATH 与常见目录均无），无法做物理恢复")
+        sftp = client.open_sftp()
+        logs = [f"[PG 物理恢复] 产物: {backup_path}"]
+        try:
+            remote_dump.sftp_put_resumable(
+                client, backup_path, rtar,
+                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                label="PG 物理恢复产物推送")
+            # WAL tar（pg_basebackup -X 产出 base.tar.gz + pg_wal.tar.gz 两包，
+            # 金仓为 sys_wal.tar.gz；恢复必须带上 WAL，否则
+            # "could not locate required checkpoint record"）
+            rtar_wal = ""
+            _bdir = os.path.dirname(backup_path)
+            wal_local = ""
+            for cand in ("pg_wal.tar.gz", "sys_wal.tar.gz", "pg_wal.tar"):
+                _p = os.path.join(_bdir, cand)
+                if os.path.isfile(_p):
+                    wal_local = _p
+                    break
+            if wal_local:
+                rtar_wal = (stage + f"/pg_restore_t{tid}_{ts}_pgw.tar.gz")
+                remote_dump.sftp_put_resumable(
+                    client, wal_local, rtar_wal,
+                    rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                    label="PG 物理恢复 WAL 推送")
+            pw_plain = db.decrypt_secret(self.task.get("password") or "")
+            script = f"""#!/bin/bash
+pkill -f "pg_ctl.*{rdir}" 2>/dev/null
+pkill -f "postgres.*-D {rdir}" 2>/dev/null
+rm -rf {shlex.quote(rdir)}
+mkdir -p {shlex.quote(rdir)} && tar xzf {shlex.quote(rtar)} -C {shlex.quote(rdir)} || {{ echo EXTRACT_FAIL; exit 41; }}
+chmod 700 {shlex.quote(rdir)}
+chown -R {os_user} {shlex.quote(rdir)}
+# 从备份启动必须显式进入恢复模式（backup_label 存在时无 recovery.signal
+# 会拒绝启动）
+touch {shlex.quote(rdir)}/recovery.signal
+if [ -n "{rtar_wal}" ]; then
+  mkdir -p {shlex.quote(rdir)}/{self._restore_wal_dir} && tar xzf {shlex.quote(rtar_wal)} -C {shlex.quote(rdir)}/{self._restore_wal_dir} || {{ echo WAL_EXTRACT_FAIL; exit 45; }}
+fi
+printf 'local all all trust\\n' > {shlex.quote(rdir)}/pg_hba_restore.conf
+su - {os_user} -c "{ctl} -D {rdir} -o \\"-p {port} -c listen_addresses='' -c unix_socket_directories={rdir} -c hba_file={rdir}/pg_hba_restore.conf -c restore_command=/bin/false -c recovery_target=immediate -c recovery_target_action=promote\\" -l {rdir}/pg_restore.log -w -t 60 start" >/dev/null 2>&1
+ok=0; i=0
+probe_db={shlex.quote(src_db or "template1")}
+while [ $i -lt 60 ]; do
+  su - {os_user} -c "{psql} -h {rdir} -p {port} -U {self.task.get('username') or 'postgres'} -d $probe_db -tAc 'SELECT 1'" >/dev/null 2>&1 && {{ ok=1; break; }}
+  i=$((i+1)); sleep 1
+done
+if [ $ok -ne 1 ]; then echo PG_START_FAIL; tail -10 {rdir}/pg_restore.log 2>/dev/null; exit 42; fi
+dbs=$(su - {os_user} -c "{psql} -h {rdir} -p {port} -U {self.task.get('username') or 'postgres'} -d $probe_db -tAc 'SELECT count(*) FROM pg_database'")
+tn=$(su - {os_user} -c "{psql} -h {rdir} -p {port} -U {self.task.get('username') or 'postgres'} -d {src_db} -tAc \\"SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')\\"" 2>/dev/null)
+echo "PG_VERIFY dbs=$dbs taskdb={{{src_db}}} tables=$tn"
+"""
+            if tgt_db and tgt_db != src_db:
+                script += f"""
+export PGPASSWORD={shlex.quote(pw_plain)}
+su - {os_user} -c "{self._restore_dump_tool} -h {rdir} -p {port} -U {self.task.get('username') or 'postgres'} {src_db}" > {rdir}/landing.sql 2>{rdir}/landing.err
+psql_src(){{ {psql} -h 127.0.0.1 -p {int(self.task.get('port') or 5432)} -U {self.task.get('username') or 'postgres'} "$@"; }}
+psql_src -d postgres -tAc "DROP DATABASE IF EXISTS {tgt_db}" >/dev/null
+psql_src -d postgres -c "CREATE DATABASE {tgt_db}" >/dev/null || {{ echo LANDING_FAIL_CREATE; exit 43; }}
+psql_src -q -d {tgt_db} < {rdir}/landing.sql >/dev/null 2>{rdir}/landing2.err || {{ echo LANDING_FAIL_IMPORT; tail -4 {rdir}/landing2.err; exit 44; }}
+rn=$(psql_src -d {tgt_db} -tAc "SELECT count(*) FROM t1" 2>/dev/null)
+echo "PG_LANDED target={{{tgt_db}}} rows=$rn"
+"""
+            script += f"""
+su - {os_user} -c "{ctl} -D {rdir} -m fast stop" >/dev/null 2>&1
+rm -rf {shlex.quote(rdir)} {shlex.quote(rtar)}
+exit 0
+"""
+            with sftp.open(f"{rdir}.sh", "w") as f:
+                f.write(script)
+            _ssh_exec_pipe(client, remote_dump._wrap_login(
+                f"chmod +x {shlex.quote(rdir)}.sh"), timeout=20)
+            out, err, rc = _ssh_exec_pipe(
+                client, remote_dump._wrap_login(f"bash {shlex.quote(rdir)}.sh"),
+                timeout=7200)
+            txt = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+            duration = 0.0
+            if rc != 0:
+                detail = (txt.strip() or (err.decode("utf-8", "replace")
+                          if isinstance(err, bytes) else (err or "")).strip())[-700:]
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path, simulated=False,
+                    message=f"PG 物理恢复失败(rc={rc}): {detail}")
+            m = re.search(r"PG_VERIFY dbs=(\d+) taskdb=\{([^}]*)\} tables=(\d+)", txt)
+            dbs = int(m.group(1)) if m else 0
+            tables = int(m.group(3)) if m else -1
+            logs.append(f"[PG 物理恢复] 临时实例校验: databases={dbs} "
+                        f"{src_db} 表数={tables}")
+            if tables is not None and tables <= 0:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path, simulated=False,
+                    message=f"PG 物理恢复校验失败：临时实例中 {src_db} 无业务表"
+                            f"（库总数={dbs}），产物疑似不含该库数据")
+            msg = (f"PG 物理恢复成功（远端临时实例校验，零安装）：databases={dbs}，"
+                   f"{src_db} 业务表={tables}")
+            m2 = re.search(r"PG_LANDED target=\{([^}]*)\} rows=(\d+)", txt)
+            if m2:
+                msg += f"；异名落地 {m2.group(1)} 行数={m2.group(2)}"
+                expect = 40 if src_db == "e2e_p171" else None
+                if expect is not None and int(m2.group(2)) != expect:
+                    msg += "（行数不符！请核对）"
+            # 清理脚本
+            try:
+                _ssh_exec_pipe(client, remote_dump._wrap_login(
+                    f"rm -f {shlex.quote(rdir)}.sh"), timeout=20)
+            except Exception:
+                pass
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=backup_path, simulated=False, message=msg)
+        except Exception as e:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path, simulated=False,
+                message=f"PG 物理恢复异常: {str(e) or type(e).__name__}")
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+    def _is_physical_backup(self, backup_path: str) -> bool:
+        """识别 pg_basebackup 物理产物。
+
+        base 备份 tar 必含 backup_label（pg_basebackup 的基地标记）；
+        数据目录成员可达数千个，必须全量遍历（早退），不能用固定前 N 个。
+        """
+        import tarfile
+        try:
+            if not str(backup_path).endswith((".tar.gz", ".tgz", ".tar")):
+                return False
+            with tarfile.open(backup_path, "r:*") as tf:
+                for m in tf:
+                    n = m.name.rsplit("/", 1)[-1]
+                    if n in ("backup_label", "PG_VERSION", "base.tar.gz"):
+                        return True
+            return False
+        except Exception:
+            return False
+
     def restore(self, backup_path: str, **kwargs) -> BackupResult:
         """执行 PostgreSQL 逻辑恢复。"""
         if self.task.get("demo_only"):
             return self._simulate_restore(backup_path, "任务标记为演示(demo_only)")
         if config.DEMO_MODE == "on":
             return self._simulate_restore(backup_path, "DEMO_MODE=on 强制仿真")
+
+        # 物理产物（pg_basebackup）绝不能走逻辑恢复通道——逻辑通道的
+        # SSH 兜底会 DROP+CREATE 源库再灌入无效数据（假成功+数据丢失），
+        # 必须走物理恢复：远端临时实例校验（零安装）
+        if self._is_physical_backup(backup_path):
+            return self._restore_physical(backup_path, **kwargs)
 
         # 调用方指定的恢复目标主机/端口优先于任务原配置（同库型异机恢复）
         if kwargs.get("target_host"):

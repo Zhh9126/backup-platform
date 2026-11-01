@@ -540,6 +540,7 @@ class MySQLEngine(BackupEngine):
                     return cand
         return ""
 
+    @staticmethod
     def _local_lib_map(local_bin: str) -> dict:
         """解析平台侧二进制的 ldd 输出，返回 {库名: 本地绝对路径}。
 
@@ -1744,6 +1745,25 @@ class MySQLEngine(BackupEngine):
             return default
 
     @staticmethod
+    def _version_tuple(version: str):
+        """'8.0.42' → (8, 0, 42)；解析失败返回 ()。"""
+        try:
+            m = re.search(r"(\d+\.\d+\.\d+)", version or "")
+            return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+        except Exception:
+            return ()
+
+    @staticmethod
+    def _mysqld_version(mysqld_path: str) -> str:
+        """获取平台本机 mysqld 完整版本串（失败返回 ''）。"""
+        try:
+            ret = subprocess.run([mysqld_path, "--version"],
+                                 capture_output=True, text=True, timeout=30)
+            return ret.stdout or ""
+        except Exception:
+            return ""
+
+    @staticmethod
     def _mysqld_major(mysqld_path: str) -> int:
         """获取平台本机 mysqld 大版本（失败返回 0）。"""
         try:
@@ -1861,7 +1881,8 @@ class MySQLEngine(BackupEngine):
         return label, verify_out
 
     def _verify_prepared_remote(self, ssh_host: dict, work_dir: str,
-                                target_db: str, logs: list) -> tuple:
+                                target_db: str, logs: list,
+                                extra_args: list = None) -> tuple:
         """把 prepare 后的数据目录推到数据库服务器，用其**自带** mysqld 启动
         临时实例（--skip-grant-tables + --skip-networking）做可恢复性校验。
 
@@ -1945,6 +1966,11 @@ class MySQLEngine(BackupEngine):
                         k = k.strip()
                         if k in safe_keys:
                             xb_args.append(f"--{k.replace('_', '-')}={v.strip()}")
+            # 源实例 lower_case_table_names（MY-011087 硬校验）
+            xb_args += [a for a in (extra_args or [])
+                        if a.split("=")[0].replace("_", "-")
+                        not in {x.split("=")[0].replace("_", "-")
+                                for x in xb_args}]
             # 与本地分支同一套判定：物理恢复是整实例级恢复，target_db 不成立时回退
             # 实例级校验，读不到业务表则如实失败（历史实现只查 target_db 表数，
             # 查到 0 张也照样报"校验通过"）。
@@ -1977,8 +2003,8 @@ class MySQLEngine(BackupEngine):
                     f"grep -q Aborting {sock}.err 2>/dev/null && break; "
                     f"i=$((i+1)); sleep 1; done; "
                     f"if [ $ok -ne 1 ]; then echo XB_START_FAIL; "
-                    f"grep -E \"\\[ERROR\\]\" {sock}.err 2>/dev/null "
-                    f"| head -5; exit 42; fi; "
+                    f"echo ---ERR-TAIL---; tail -12 {sock}.err 2>/dev/null; "
+                    f"exit 42; fi; "
                     f"{mysql_r} --no-defaults -uroot -S {sock} -N -e \"{verify_sql_esc}\"; "
                     f"rc=$?; "
                     f"{mysql_r} --no-defaults -uroot -S {sock} -e \"SHUTDOWN\" "
@@ -2241,7 +2267,33 @@ class MySQLEngine(BackupEngine):
             local_ok = bool(mysqld) and os.path.isfile(mysqld)
             lm_major = self._mysqld_major(mysqld) if local_ok else 0
             sv_major = self._parse_major(sv)
-            mismatch = is_maria_src or (lm_major != sv_major)
+            # 完整版本比对：平台 mysqld 版本**低于**源实例时为降级启动
+            # （MySQL 不支持，实测 8.0.40 启动 8.0.42 datadir 卡死在
+            # InnoDB initialization）→ 必须改用远端自带服务端
+            lm_tuple = self._version_tuple(self._mysqld_version(mysqld)) \
+                if local_ok else ()
+            sv_tuple = self._version_tuple(sv or "")
+            downgrade = bool(lm_tuple and sv_tuple and lm_tuple < sv_tuple)
+            mismatch = is_maria_src or (lm_major != sv_major) or downgrade
+            # lower_case_table_names 必须与源实例一致（MySQL 8.0 硬校验，
+            # 不一致报 MY-011087 Different lower_case_table_names 拒绝启动）
+            lctn = None
+            try:
+                import pymysql as _pym
+                _c = _pym.connect(
+                    host=self.task.get("host"),
+                    port=int(self.task.get("port") or 3306),
+                    user=self.task.get("username") or "root",
+                    password=db.decrypt_secret(self.task.get("password") or ""),
+                    connect_timeout=6)
+                _cur = _c.cursor()
+                _cur.execute("SELECT @@lower_case_table_names")
+                lctn = _cur.fetchone()[0]
+                _c.close()
+            except Exception:
+                lctn = None
+            lctn_args = ([f"--lower-case-table-names={lctn}"]
+                         if lctn is not None else [])
             remote_ssh = None
             if mismatch:
                 from core import remote_dump as _rd
@@ -2251,7 +2303,7 @@ class MySQLEngine(BackupEngine):
                     f"[物理恢复] 平台服务端({lm_major or '无'}.x) 与源实例({sv or '未知'})"
                     f" 不匹配，改用远端自带服务端启动临时校验实例 ...")
                 label, verify_out = self._verify_prepared_remote(
-                    remote_ssh, work, target_db, logs)
+                    remote_ssh, work, target_db, logs, extra_args=lctn_args)
             elif not local_ok:
                 label = "prepare 级校验"
                 verify_out = ("redo log 已应用完成（未启动临时实例：平台侧缺少匹配的服务端"
@@ -2261,7 +2313,7 @@ class MySQLEngine(BackupEngine):
             else:
                 logs.append("[物理恢复] 启动临时 mysqld 实例做可恢复性校验 ...")
                 proc = subprocess.Popen(
-                    [mysqld, "--no-defaults",
+                    [mysqld, "--no-defaults", *lctn_args,
                      f"--datadir={work}", f"--socket={sock}",
                      "--skip-networking", "--skip-grant-tables",
                      "--user=root", f"--pid-file={pid_file}",

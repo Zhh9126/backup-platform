@@ -47,6 +47,7 @@ def load_pkey(pem_or_path: str):
 HOST_FIELDS = [
     "name", "host_key", "hostname", "port", "username",
     "password", "auth_type", "private_key", "os_type", "db_os_user", "remark",
+    "db_type",
 ]
 
 
@@ -95,15 +96,42 @@ def create_host(data: dict) -> int:
         data["host_key"] = _build_host_key(username, hostname, port)
     if not data.get("hostname"):
         data["hostname"] = data["host_key"].split("@")[-1].split(":")[0]
+    # 库型标记（FIX-2026-001 P2）：纳管唯一性在「连接 + 库型」粒度——
+    # 同一台服务器上的 Oracle 与达梦等多套数据库实例可各自纳管；
+    # 空 = 通用 SSH 备份机。同连接 + 同库型视为重复。
+    data["db_type"] = (data.get("db_type") or "").strip().lower()
     if data.get("password"):
         data["password"] = db.encrypt_secret(data["password"])
     else:
         data["password"] = ""
 
+    # 重复预检：给出精确到「连接+库型」的提示，而非笼统的约束报错
+    dup = db.query_one(
+        "SELECT id, name, db_type FROM ssh_hosts WHERE host_key=? AND "
+        "COALESCE(db_type,'')=?",
+        (data["host_key"], data["db_type"]))
+    if dup:
+        _dt = dup.get("db_type") or "通用"
+        raise ValueError(
+            f"纳管记录重复：连接 {data['host_key']} 下已存在同类型（{_dt}）的"
+            f"记录「{dup.get('name')}」(#{dup.get('id')})。同一台服务器上的其他"
+            f"数据库实例请选择不同的数据库类型纳管（同一 IP ≠ 一个实例）；"
+            f"如为同一实例请直接编辑原记录。")
+
     cols = list(data.keys())
     sql = "INSERT INTO ssh_hosts ({}) VALUES ({})".format(
         ",".join(cols), ",".join("?" * len(cols)))
-    return db.execute(sql, tuple(data.values()))
+    try:
+        return db.execute(sql, tuple(data.values()))
+    except Exception as e:
+        # 预检漏网（并发/历史约束）：翻译为同一精确语义
+        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
+            _dt = data.get("db_type") or "通用"
+            raise ValueError(
+                f"纳管记录重复：连接 {data['host_key']} 下已存在同类型（{_dt}）"
+                f"的纳管记录；同一台服务器上的其他数据库实例请选择不同的"
+                f"数据库类型纳管。")
+        raise
 
 
 def update_host(host_id: int, data: dict) -> bool:
@@ -121,6 +149,8 @@ def update_host(host_id: int, data: dict) -> bool:
         h = data.get("hostname", row.get("hostname")) or ""
         p = data.get("port", row.get("port")) or 22
         data["host_key"] = _build_host_key(u, h, p)
+    if "db_type" in data:
+        data["db_type"] = (data.get("db_type") or "").strip().lower()
 
     sets, params = [], []
     for k, v in data.items():

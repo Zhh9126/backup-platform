@@ -72,6 +72,39 @@ _JSON_SECRET_RE = re.compile(
     r'(?i)("(?:[a-z0-9_\-]*(?:password|passwd|pwd|secret|token|api_key)[a-z0-9_\-]*)"\s*:\s*)"[^"]*"')
 # mysql 风格短选项明文密码：-pXXXX（前有空白，且不是 --xxx）
 _SHORT_PWD_RE = re.compile(r"(^|[\s\"'])-p([^\s\-'\"][^\s'\"|;&]*)")
+# 数据泵/达梦连接串：USERID=user/pass@host、disql "USER/"PW\""@host、
+# conn user/pass@db。密码可能含 @（达梦引号包裹写法），普通正则切不准——
+# 用 token 匹配 + 内部「首个 / 之后到末个 @ 之前」拆分打码。
+_USERID_TOKEN_RE = re.compile(r'(?i)\b(userid\s*=\s*)("(?:[^"\\]|\\.)*"|[^\s;|&]+)')
+_CONNSTR_TOKEN_RE = re.compile(
+    r'(?i)\b(disql|sqlplus|conn(?:ect)?|expdp|impdp|dexp|dimp)\s+'
+    r'("(?:[^"\\]|\\.)*"|[^\s;|&]+)')
+# SQL 建用户：IDENTIFIED BY "xxx" / IDENTIFIED BY xxx
+_IDENTIFIED_RE = re.compile(r'(?i)(identified\s+by\s+["\']?)([^"\';\s]+)')
+
+
+def _mask_user_pass_token(token: str) -> str:
+    """对 user/pass@host 形态的连接 token 打码密码段（保留用户与主机）。
+
+    user = 首个 / 之前；pass = 首个 / 之后到**末个** @ 之前（密码含 @ 时
+    依赖引号包裹或用户写法，末个 @ 之后一定是 host:port/service）。
+    无 / 或无 @ 的 token 原样返回（不是连接串）。
+    """
+    quoted = token.startswith('"') and token.endswith('"') and len(token) > 1
+    inner = token[1:-1] if quoted else token
+    if "/" not in inner or "@" not in inner:
+        return token
+    user, rest = inner.split("/", 1)
+    if not user:
+        return token
+    if "@" in rest:
+        pw, host = rest.rsplit("@", 1)
+        if not pw:
+            return token
+        masked = f"{user}/{_MASK}@{host}"
+    else:
+        masked = f"{user}/{_MASK}"
+    return ('"' + masked + '"') if quoted else masked
 
 
 def mask_secrets(value) -> str:
@@ -102,6 +135,14 @@ def mask_secrets(value) -> str:
     s = _JSON_SECRET_RE.sub(lambda m: f'{m.group(1)}"{_MASK}"', s)
     # ⑤ mysql 风格 -pXXXX（保守：仅打码，不影响 -P 端口大写）
     s = _SHORT_PWD_RE.sub(lambda m: f"{m.group(1)}-p{_MASK}", s)
+    # ⑥ 数据泵/达梦连接串：USERID=user/pass@host（保留用户名与主机，
+    #    仅打码密码段——审计追溯要素不受影响）
+    s = _USERID_TOKEN_RE.sub(
+        lambda m: m.group(1) + _mask_user_pass_token(m.group(2)), s)
+    s = _CONNSTR_TOKEN_RE.sub(
+        lambda m: f"{m.group(1)} " + _mask_user_pass_token(m.group(2)), s)
+    # ⑦ SQL 建用户口令：IDENTIFIED BY "xxx"
+    s = _IDENTIFIED_RE.sub(lambda m: m.group(1) + _MASK, s)
     return s
 
 

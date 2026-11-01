@@ -14,6 +14,7 @@
 native_conn（原生连通）、backup_anomaly._sniff_head（产物结构）。
 零库表改动，不影响现有功能。
 """
+import json
 import os
 import shutil
 
@@ -150,6 +151,23 @@ def precheck_backup(task: dict) -> dict:
         _add(items, "physical_note", "warn",
              "物理备份模式：请确认数据库归档/日志配置满足该库型物理备份要求"
              "（如达梦归档开启、MySQL binlog、PG wal_level=replica）")
+        # Oracle RMAN 临时目录预检（FIX-2026-001 P1）：自定义目录的可达性/
+        # 可写性/根分区同盘风险，在提交前给出明确结论
+        if db_type == "oracle":
+            try:
+                _eo = task.get("extra_options")
+                _extra = json.loads(_eo) if isinstance(_eo, str) else (_eo or {})
+                _rtd = str(_extra.get("rman_temp_dir") or "").strip()
+                if not _rtd:
+                    _add(items, "rman_dir", "pass",
+                         "RMAN 目录未配置，使用默认 /u01/app/oracle/backup"
+                         "（建议按实际挂载分区修改）")
+                else:
+                    _add(items, "rman_dir", "pass",
+                         f"RMAN 目录（任务级）: {_rtd}；实际可写性在备份执行时"
+                         f"强校验（oracle 用户 touch 探测），与根分区同盘将告警")
+            except Exception as e:
+                _add(items, "rman_dir", "unknown", "RMAN 目录预检异常: %s" % str(e)[:100])
 
     # 6) 平台存储空间
     du = _disk_usage()

@@ -244,9 +244,26 @@
               <label class="form-label">端口</label>
               <input class="form-control" id="h_port" type="number" value="22">
             </div>
-            <div class="col-md-12">
+            <div class="col-md-6">
               <label class="form-label">用户名</label>
               <input class="form-control" id="h_username" value="root">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label" title="该纳管记录服务的数据库类型；同一台服务器上的 Oracle 与达梦等多套数据库实例可各自纳管（重复判定 = 连接 + 数据库类型）">数据库类型</label>
+              <select class="form-select" id="h_db_type">
+                <option value="">通用（SSH 备份机）</option>
+                <option value="oracle">Oracle</option>
+                <option value="dameng">达梦</option>
+                <option value="mysql">MySQL</option>
+                <option value="mariadb">MariaDB</option>
+                <option value="postgresql">PostgreSQL</option>
+                <option value="kingbase">金仓</option>
+                <option value="opengauss">openGauss</option>
+                <option value="panwei">磐维</option>
+                <option value="sqlserver">SQL Server</option>
+                <option value="redis">Redis</option>
+                <option value="mongodb">MongoDB</option>
+              </select>
             </div>
             <div class="col-md-6">
               <label class="form-label">认证方式</label>

@@ -838,7 +838,11 @@ class OracleEngine(BackupEngine):
         # 备份成功后写完成标记；拉回中断时重试直接续传，**不重跑 RMAN**。
         tid = int(self.task.get("id") or 0)
         bkp_prefix = f"ora_bkp_t{tid}_"
-        remote_dir = "/u01/app/oracle/backup"
+        # 临时备份目录：任务级 rman_temp_dir 可覆盖（FIX-2026-001 P1）。
+        # /u01/app/oracle/backup 非 Oracle 强制路径，只是平台默认值；数据文件/
+        # 归档在独立挂载分区时必须改配，否则备份片会写满根分区。
+        _rman_dir = str((self._parse_extra() or {}).get("rman_temp_dir") or "").strip()
+        remote_dir = (_rman_dir or "/u01/app/oracle/backup").rstrip("/")
         remote_marker = f"{remote_dir}/.bkdone_t{tid}"
         remote_cmd_file = f"{remote_dir}/rman_t{tid}.cmd"
 
@@ -874,9 +878,30 @@ class OracleEngine(BackupEngine):
         # 确保远端备份目录存在且 oracle 可写：
         # SSH 登录身份为 root，故以 root 建目录并把属主改为 oracle
         # （rman 以 oracle 用户运行，否则会 ORA-19504/ORA-27040 权限拒绝）。
+        q_dir = shlex.quote(remote_dir)
         prep = (f"mkdir -p {remote_dir} && chown oracle {remote_dir} "
                 f"&& chmod 755 {remote_dir}")
         _ssh_exec_pipe(client, remote_dump._wrap_login(prep), timeout=60)
+        # 前置校验（FIX-2026-001 P1）：① oracle 用户实际可写（提前失败，
+        # 避免备份跑到中途才 ORA-19504）；② 目录所在文件系统与 / 同分区 →
+        # 警告（RMAN 产物增长不可控，写根分区是高风险操作）。
+        chk = (f"su - {self._resolve_check_user(ssh_host)} -c "
+               f"{shlex.quote(f'touch {q_dir}/.aidbm_wtest && rm -f {q_dir}/.aidbm_wtest')} "
+               f">/dev/null 2>&1; echo W=$?; stat -c %d /; stat -c %d {q_dir}")
+        _wout, _werr, _wrc = _ssh_exec_pipe(
+            client, remote_dump._wrap_login(chk), timeout=30)
+        _wtxt = _wout.decode("utf-8", "replace") if isinstance(_wout, bytes) else (_wout or "")
+        _rootfs_note = ""
+        if "W=1" in _wtxt:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message=(f"RMAN 备份目录 {remote_dir} 对 oracle 用户不可写——"
+                         f"请确认目录存在/属主为 oracle，或在任务高级选项修改 "
+                         f"rman_temp_dir 到实际挂载分区"))
+        _devs = [l.strip() for l in _wtxt.splitlines() if l.strip().isdigit()]
+        if len(_devs) >= 2 and _devs[0] == _devs[1]:
+            _rootfs_note = "（警告：备份目录与根分区同一文件系统，建议改配到独立挂载点）"
+            self.logger.warning("[%s] %s", self.task_name, _rootfs_note)
         sftp = client.open_sftp()
         try:
             # 0) 复用探测：上次 RMAN 已跑完（写了完成标记）但备份片拉回中断/失败 →
@@ -992,7 +1017,7 @@ class OracleEngine(BackupEngine):
                 pass
             msg = (f"通过 SSH 在 {hk} 以 oracle 用户执行 RMAN 物理备份成功，"
                    f"已拉回 {len(pieces)} 个备份片，共 {db.human_size(total_size)}"
-                   f"（主片: {os.path.basename(first_local)}）")
+                   f"（主片: {os.path.basename(first_local)}）{_rootfs_note}")
             self.logger.info("[%s] %s", self.task_name, msg)
             return BackupResult(
                 success=True, status=BackupStatus.SUCCESS,

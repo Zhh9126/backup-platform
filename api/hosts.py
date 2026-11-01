@@ -21,7 +21,11 @@ def create_host():
         return jsonify({"error": "主机名称必填"}), 400
     if not data.get("hostname"):
         return jsonify({"error": "主机地址必填"}), 400
-    hid = ssh_hosts.create_host(data)
+    try:
+        hid = ssh_hosts.create_host(data)
+    except ValueError as e:
+        # 重复纳管：精确到「连接 + 数据库类型」的提示（FIX-2026-001 P2）
+        return jsonify({"error": str(e)}), 400
     return jsonify({"id": hid, "ok": True}), 201
 
 

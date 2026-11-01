@@ -792,8 +792,8 @@ class BackupEngine:
         if len(cmd) == 3 and cmd[0] == "sh" and cmd[1] == "-c":
             cmd = self._translate_shell_script(cmd[2])
 
-        self.logger.info("[%s] 执行命令: %s", self.task_name, " ".join(
-            c if not c.startswith("DB_BACKUP_PASSWORD") else "***" for c in cmd))
+        from core.logging_setup import mask_command
+        self.logger.info("[%s] 执行命令: %s", self.task_name, mask_command(cmd))
         try:
             proc = subprocess.run(
                 cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

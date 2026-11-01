@@ -178,20 +178,21 @@ i.bi { line-height: 1; }
 /* 导航分组标签（侧边栏分类） */
 .nav-group-label {
   color: var(--sidebar-text-muted);
-  font-size: var(--font-size-xs);
+  font-size: 11px;
   font-weight: var(--weight-semibold);
   letter-spacing: .08em;
   text-transform: uppercase;
-  padding: var(--space-sm) var(--space-md) var(--space-xs);
-  margin-top: 14px;          /* 分组与上一组菜单的间隔（参考图留白） */
-  margin-bottom: 4px;
+  opacity: .85;
+  padding: 0 var(--space-md);
+  margin-top: 10px;          /* 分组与上一组菜单的间隔（紧凑） */
+  margin-bottom: 2px;
   white-space: nowrap;
 }
 .layout.sidebar-collapsed .nav-group-label { opacity: 0; height: 0; padding: 0; overflow: hidden; }
 
 /* 导航 */
 .sidebar .nav {
-  gap: 6px;                   /* 菜单项间距（竖向收紧，见 nav-link 行高） */
+  gap: 8px;                   /* 菜单项间距（组内紧凑，分组间靠组标题区隔） */
   /* 菜单长于视口时 nav 独立滚动（品牌区常驻可见）：
      1) flex-wrap 必须 nowrap——Bootstrap .nav 默认 wrap，加高度约束后
         放不下的菜单项会换列而不是滚动（实测两列乱象）；
@@ -218,7 +219,7 @@ i.bi { line-height: 1; }
   display: flex;
   align-items: center;
   gap: 12px;                 /* 图标与文字间距 */
-  height: 40px;              /* 菜单项高度（竖向收紧） */
+  height: 42px;              /* 菜单项高度 */
   padding: 0 var(--space-md);
   color: var(--sidebar-text);
   border-radius: var(--radius-md);

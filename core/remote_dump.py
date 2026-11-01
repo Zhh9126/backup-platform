@@ -79,7 +79,8 @@ def resolve_ssh_host(task: dict):
         except (ValueError, TypeError):
             pass
 
-    # 2) 按数据库地址 IP 匹配
+    # 2) 按数据库地址 IP 匹配（FIX-2026-001 P2：同机多库型纳管后，
+    #    优先命中与任务库型一致的记录，其次通用记录，最后任一记录）
     host = (task.get("host") or "").strip()
     # 回环地址 = 数据库与平台同机，走本机通道即可；若自动匹配到某台
     # hostname 为 127.0.0.1 的 SSH 主机（如取证专用 2222 通道），远程
@@ -87,16 +88,25 @@ def resolve_ssh_host(task: dict):
     # （显式 ssh_host_id / ssh_cred 仍可强制远程，尊重用户意图。）
     if host.lower() in ("127.0.0.1", "localhost", "::1", "0.0.0.0"):
         return None
+    task_dbtype = (task.get("db_type") or "").strip().lower()
     if host:
+        _rank = {2: [], 1: [], 0: []}   # 2=库型一致 1=通用 0=其他
         for h in ssh_hosts.list_hosts(include_secret=True):
-            if h.get("hostname") == host:
-                return h
-            hk = h.get("host_key", "")
-            # host_key 形如 user@1.2.3.4:22
-            if "@" in hk:
-                ip = hk.rsplit("@", 1)[-1].split(":")[0]
-                if ip == host:
-                    return h
+            hit = (h.get("hostname") == host)
+            if not hit:
+                hk = h.get("host_key", "")
+                # host_key 形如 user@1.2.3.4:22
+                if "@" in hk:
+                    ip = hk.rsplit("@", 1)[-1].split(":")[0]
+                    hit = (ip == host)
+            if hit:
+                hdt = (h.get("db_type") or "").strip().lower()
+                rank = 2 if (task_dbtype and hdt == task_dbtype) else \
+                    (1 if not hdt else 0)
+                _rank[rank].append(h)
+        for r in (2, 1, 0):
+            if _rank[r]:
+                return _rank[r][0]
     return None
 
 

@@ -559,7 +559,8 @@ CREATE TABLE IF NOT EXISTS system_logs (
 CREATE TABLE IF NOT EXISTS ssh_hosts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     name        TEXT NOT NULL,
-    host_key    TEXT NOT NULL UNIQUE,
+    host_key    TEXT NOT NULL,
+    db_type     TEXT DEFAULT '',          -- 服务的数据库类型（oracle/dameng/...）；空=通用 SSH 备份机
     hostname    TEXT,
     port        INTEGER DEFAULT 22,
     username    TEXT,
@@ -572,7 +573,10 @@ CREATE TABLE IF NOT EXISTS ssh_hosts (
     last_status TEXT,
     last_check_at TEXT,
     created_at  TEXT,
-    updated_at  TEXT
+    updated_at  TEXT,
+    -- 唯一性在「连接 + 数据库类型」粒度（FIX-2026-001 P2）：
+    -- 同一 IP 的 Oracle 与达梦等多套数据库实例可各自纳管
+    UNIQUE(host_key, db_type)
 );
 
 CREATE TABLE IF NOT EXISTS plugin_host_state (
@@ -1302,6 +1306,61 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                     conn.execute(f"ALTER TABLE ssh_hosts ADD COLUMN {col} {typedef}")
                 except Exception:
                     pass
+            # 迁移（FIX-2026-001 P2）：纳管唯一性从「IP/连接」下沉到「连接+库型」——
+            # 同一台服务器上的 Oracle 与达梦等多套数据库实例可各自纳管。
+            try:
+                conn.execute("ALTER TABLE ssh_hosts ADD COLUMN db_type TEXT DEFAULT ''")
+            except Exception:
+                pass  # 列已存在
+            try:
+                if backend == "sqlite":
+                    # SQLite 无法 DROP 约束 → 检测单列唯一索引并重建表
+                    _uhk = False
+                    for _ix in conn.execute("PRAGMA index_list(ssh_hosts)").fetchall():
+                        try:
+                            _cols = [r[2] for r in conn.execute(
+                                f"PRAGMA index_info({_ix[1]})").fetchall()]
+                        except Exception:
+                            continue
+                        if _ix[2] and _cols == ["host_key"]:
+                            _uhk = True
+                            break
+                    if _uhk:
+                        conn.execute(
+                            "CREATE TABLE ssh_hosts_mig ("
+                            "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,"
+                            "host_key TEXT NOT NULL, db_type TEXT DEFAULT '',"
+                            "hostname TEXT, port INTEGER DEFAULT 22, username TEXT,"
+                            "password TEXT, auth_type TEXT DEFAULT 'password',"
+                            "private_key TEXT, os_type TEXT DEFAULT 'linux',"
+                            "db_os_user TEXT, remark TEXT, last_status TEXT,"
+                            "last_check_at TEXT, created_at TEXT, updated_at TEXT,"
+                            "UNIQUE(host_key, db_type))")
+                        conn.execute(
+                            "INSERT INTO ssh_hosts_mig SELECT id,name,host_key,"
+                            "COALESCE(db_type,''),hostname,port,username,password,"
+                            "auth_type,private_key,os_type,db_os_user,remark,"
+                            "last_status,last_check_at,created_at,updated_at "
+                            "FROM ssh_hosts")
+                        conn.execute("DROP TABLE ssh_hosts")
+                        conn.execute("ALTER TABLE ssh_hosts_mig RENAME TO ssh_hosts")
+                else:
+                    # PG/MySQL：按默认命名约定尽力删除旧单列唯一约束（不存在则忽略）
+                    try:
+                        conn.execute("ALTER TABLE ssh_hosts "
+                                     "DROP CONSTRAINT ssh_hosts_host_key_key")
+                    except Exception:
+                        try:
+                            conn.execute("ALTER TABLE ssh_hosts DROP INDEX host_key")
+                        except Exception:
+                            pass
+                    try:
+                        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS "
+                                     "idx_hosts_key_dbtype ON ssh_hosts(host_key, db_type)")
+                    except Exception:
+                        pass
+            except Exception:
+                pass  # 迁移失败不阻塞启动（旧约束仍在，新字段照常工作）
             # 迁移：容灾链路切换配置与切换历史（failover/failback 引擎）
             for col, typedef in [("failover_config", "TEXT"), ("failover_history", "TEXT")]:
                 try:

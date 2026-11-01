@@ -320,6 +320,16 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
                   </div>
                 </div>
                 <div class="col-12 mt-2">
+                  <label class="form-label">RMAN 临时备份目录（可选，仅 Oracle 物理备份）</label>
+                  <input class="form-control form-control-sm font-monospace" id="t_rman_temp_dir"
+                         placeholder="如 /data/oracle_backup（留空 = 默认 /u01/app/oracle/backup）">
+                  <div class="small text-muted">
+                    默认值 /u01/app/oracle/backup 并非 Oracle 强制路径。数据文件/归档在独立挂载分区时，
+                    请改配到实际分区——备份片增长不可控，写入根分区有撑满风险（平台会在同分区时告警）。
+                    目录将由平台自动创建并把属主改为 oracle。
+                  </div>
+                </div>
+                <div class="col-12 mt-2">
                   <div class="form-check">
                     <input class="form-check-input" type="checkbox" id="t_auto_discover">
                     <label class="form-check-label" for="t_auto_discover">

@@ -1528,6 +1528,7 @@
     if ($("t_ssh_state")) $("t_ssh_state").textContent = "";
     if ($("t_tool_path")) $("t_tool_path").value = "";
     if ($("t_db_os_user")) $("t_db_os_user").value = "";
+    if ($("t_rman_temp_dir")) $("t_rman_temp_dir").value = "";
     if ($("t_auto_discover")) $("t_auto_discover").checked = false;
     toggleSshFields();
   }
@@ -1542,6 +1543,7 @@
     } catch (e) { eo = {}; }
     if ($("t_tool_path")) $("t_tool_path").value = eo.tool_path || "";
     if ($("t_db_os_user")) $("t_db_os_user").value = eo.db_os_user || "";
+    if ($("t_rman_temp_dir")) $("t_rman_temp_dir").value = eo.rman_temp_dir || "";
     if ($("t_auto_discover")) $("t_auto_discover").checked = !!eo.auto_discover_new_dbs;
   }
 
@@ -1574,6 +1576,10 @@
     const u = ($("t_db_os_user") && $("t_db_os_user").value.trim()) || "";
     if (u) eo.db_os_user = u;
     else delete eo.db_os_user;
+    // RMAN 临时备份目录（仅 Oracle 物理备份；留空 = 平台默认）
+    const rtd = ($("t_rman_temp_dir") && $("t_rman_temp_dir").value.trim()) || "";
+    if (rtd) eo.rman_temp_dir = rtd;
+    else delete eo.rman_temp_dir;
     // 新建库自动纳管（备新建库）
     if ($("t_auto_discover") && $("t_auto_discover").checked) eo.auto_discover_new_dbs = true;
     else delete eo.auto_discover_new_dbs;
@@ -3579,6 +3585,7 @@
       $("h_password").value = "";
       $("h_private_key").value = "";
       $("h_db_os_user").value = host.db_os_user || "";
+      $("h_db_type").value = host.db_type || "";
       $("h_remark").value = host.remark || "";
     } else {
       $("hostModalTitle").textContent = "纳管主机";
@@ -3604,6 +3611,7 @@
       password: $("h_password").value,
       private_key: $("h_private_key").value,
       db_os_user: ($("h_db_os_user").value || "").trim(),
+      db_type: ($("h_db_type") && $("h_db_type").value) || "",
       remark: $("h_remark").value,
     };
     if (!data.name) { toast("请填写主机名称", "danger"); return; }
@@ -3630,9 +3638,15 @@
             ? '<span class="badge bg-danger">失败</span>'
             : '<span class="badge bg-secondary">未探测</span>');
       const dot = `<span class="host-dot ${dotCls}"></span>`;
+      const DBT = {oracle: "Oracle", dameng: "达梦", mysql: "MySQL", mariadb: "MariaDB",
+        postgresql: "PG", kingbase: "金仓", opengauss: "openGauss", panwei: "磐维",
+        sqlserver: "SQLServer", redis: "Redis", mongodb: "MongoDB"};
+      const dbtBadge = h.db_type
+        ? `<span class="badge bg-info text-dark" title="该记录服务的数据库类型">${esc(DBT[h.db_type] || h.db_type)}</span>`
+        : '<span class="badge bg-light text-muted" title="通用 SSH 备份机">通用</span>';
       return `<tr>
         <td>${pgh.startNo + hi}</td>
-        <td>${esc(h.name)}</td>
+        <td>${esc(h.name)} ${dbtBadge}</td>
         <td><code>${esc(h.host_key)}</code></td>
         <td>${esc(h.hostname)}:${esc(h.port || 22)}</td>
         <td>${esc(h.auth_type === "key" ? "私钥" : "密码")}</td>

@@ -145,13 +145,21 @@ def remote_install():
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 "agent", "backup_agent.py")
             sftp.put(agent_src, "/opt/aidbm-agent/backup_agent.py")
+            # 远端 python 探测：优先 3.7+（ThreadingHTTPServer），老系统
+            # 3.6 由执行器内置降级兼容，但优先高版本（CentOS7 /usr/bin/python3=3.6）
+            _chn2, _po, _ = c.exec_command(
+                "for v in python3.13 python3.12 python3.11 python3.10 "
+                "python3.9 python3.8 python3.7; do command -v $v && break; done; "
+                "command -v python3", timeout=20)
+            _py = (_po.read().decode(errors="replace").strip().splitlines()
+                   or ["/usr/bin/python3"])[0].strip() or "/usr/bin/python3"
             unit = (
                 "[Unit]\nDescription=AIDBM Backup Agent\n"
                 "After=network.target\n\n[Service]\n"
-                "ExecStart=/usr/bin/python3 /opt/aidbm-agent/backup_agent.py "
+                "ExecStart=%s /opt/aidbm-agent/backup_agent.py "
                 "--token %s --port %d\nRestart=always\nRestartSec=3\n\n"
                 "[Install]\nWantedBy=multi-user.target\n"
-                % (token, agent_port))
+                % (_py, token, agent_port))
             with sftp.open("/etc/systemd/system/aidbm-agent.service", "w") as f:
                 f.write(unit)
         finally:

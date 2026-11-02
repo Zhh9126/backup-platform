@@ -99,9 +99,9 @@
       return;
     }
     const pg = Pager.slice("syncPage", tasks);
-    tbody.innerHTML = pg.list.map(function (t) {
+    tbody.innerHTML = pg.list.map(function (t, ti) {
       return `<tr>
-        <td>${t.id}</td>
+        <td>${pg.startNo + ti}</td>
         <td>${esc(t.name)}</td>
         <td>${esc(t.src_db_display || t.src_db_type || "-")} <i class="bi bi-arrow-right"></i> ${esc(t.tgt_db_display || t.tgt_db_type || "-")}</td>
         <td>${esc(t.source_table || "-")} <i class="bi bi-arrow-right"></i> ${esc(t.target_table || "-")}</td>

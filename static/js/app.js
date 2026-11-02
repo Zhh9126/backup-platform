@@ -1789,9 +1789,9 @@
       : "/api/tasks?db_type_exclude=file";
     const tasks = (await api("GET", url)) || [];
     const pg = Pager.slice("tasks", tasks);
-    $("taskTable").innerHTML = pg.list.map((t) =>
+    $("taskTable").innerHTML = pg.list.map((t, ti) =>
       `<tr data-task-id="${t.id}">
-        <td>${t.id}</td>
+        <td>${pg.startNo + ti}</td>
         <td>${esc(t.biz_label || "-")}</td>
         <td>${esc(t.name)}</td>
         <td>${esc(t.db_display_name || t.db_type)}</td>
@@ -2167,7 +2167,7 @@
     const recs = stFilter ? recs0.filter((r) => r.status === stFilter) : recs0;
     window.recordSel = window.recordSel || new Set();
     const pg = Pager.slice("records", recs);
-    $("recordTable").innerHTML = pg.list.map((r) => {
+    $("recordTable").innerHTML = pg.list.map((r, ri) => {
       // CDC 基线（binlog / wal_lsn）
       let cdc = '-';
       if (r.binlog_file && r.binlog_pos) cdc = `<code class="small">${esc(r.binlog_file)}:${r.binlog_pos}</code>`;
@@ -2203,7 +2203,7 @@
       const checked = window.recordSel.has(r.id) ? " checked" : "";
       return `<tr>
         <td><input type="checkbox" class="form-check-input rec-sel" data-id="${r.id}"${checked}></td>
-        <td>${r.id}</td>
+        <td>${pg.startNo + ri}</td>
         <td>${fmtBizCell(r)}</td>
         <td><code>${esc(r.host_ip || "-")}</code></td>
         <td>${esc(r.db_type_display || r.db_type || "-")}</td>
@@ -3804,13 +3804,13 @@
   async function loadSyncTasks() {
     const tasks = await api("GET", "/api/sync/tasks");
     const pg = Pager.slice("syncTasks", tasks);
-    $("syncTaskTable").innerHTML = pg.list.map((t) => {
+    $("syncTaskTable").innerHTML = pg.list.map((t, mi) => {
       const src = t.source_type === "managed"
         ? `托管任务：${esc(t.source_task_name || ("#" + t.source_task_id))}`
         : `${esc(t.src_db_display || t.src_db_type)} : ${esc(t.src_host || "")}`;
       const dst = `${esc(t.tgt_db_display || t.tgt_db_type)} : ${esc(t.tgt_host || "")}`;
       return `<tr>
-        <td>${t.id}</td><td>${esc(t.name)}</td>
+        <td>${pg.startNo + mi}</td><td>${esc(t.name)}</td>
         <td class="text-truncate" style="max-width:180px">${src}</td>
         <td class="text-truncate" style="max-width:180px">${dst}</td>
         <td>${scheduleCell(t)}</td>
@@ -3981,10 +3981,10 @@
     const rs = st ? rs0.filter((r) => r.status === st) : rs0;
     window.RESTORE_RECORD_ROWS = rs;
     const pg = Pager.slice("restores", rs);
-    $("restoreRecordsTable").innerHTML = pg.list.map((r) => {
+    $("restoreRecordsTable").innerHTML = pg.list.map((r, ri) => {
       // 收编为统一 fmtBizCell（原为内联拼装，缺 #id 且不走 R2）
       const checked = window.restoreSel.has(r.id) ? " checked" : "";
-      return `<tr><td><input type="checkbox" class="form-check-input rs-sel" data-id="${r.id}"${checked}></td><td>${r.id}</td><td>${r.record_id}</td>
+      return `<tr><td><input type="checkbox" class="form-check-input rs-sel" data-id="${r.id}"${checked}></td><td>${pg.startNo + ri}</td><td>${r.record_id}</td>
        <td>${fmtBizCell(r)}</td>
        <td><code>${esc(r.host_ip || "-")}</code></td>
        <td>${esc(r.db_type_display || r.db_type || "-")}</td>

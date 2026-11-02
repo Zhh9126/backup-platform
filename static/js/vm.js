@@ -54,9 +54,9 @@
     try {
       const rows = await window.BKP.api("GET", "/api/vm/hypervisors");
       const pg = Pager.slice("vmHv", rows);
-      $("hvTable").innerHTML = pg.list.map((r) => `
+      $("hvTable").innerHTML = pg.list.map((r, ri) => `
         <tr>
-          <td>${r.id}</td>
+          <td>${pg.startNo + ri}</td>
           <td>${esc(r.name)}</td>
           <td>${esc(r.provider_name || r.provider)}</td>
           <td class="small">${esc(r.endpoint)}</td>
@@ -149,9 +149,9 @@
     try {
       const rows = await window.BKP.api("GET", "/api/vm/protected");
       const pg = Pager.slice("vmProtected", rows);
-      $("vmTable").innerHTML = pg.list.map((v) => `
+      $("vmTable").innerHTML = pg.list.map((v, vi) => `
         <tr>
-          <td>${v.id}</td>
+          <td>${pg.startNo + vi}</td>
           <td>${esc(v.vm_name || v.vm_ref)}<div class="small text-muted">${esc(v.guest_os || "")}</div></td>
           <td class="small">${esc(v.hypervisor_name || "-")}</td>
           <td>${badge(v.power_state)}</td>
@@ -204,9 +204,9 @@
     try {
       const rows = await window.BKP.api("GET", url);
       const pg = Pager.slice("vmRps", rows);
-      $("rpTable").innerHTML = pg.list.map((r) => `
+      $("rpTable").innerHTML = pg.list.map((r, ri) => `
         <tr>
-          <td>${r.id}</td>
+          <td>${pg.startNo + ri}</td>
           <td>${esc(r.vm_name || ("VM#" + r.vm_id))}</td>
           <td class="small">${window.BKP.fmtTime(r.pit_at)}</td>
           <td>${rpBadge(r.rp_type)}</td>
@@ -295,9 +295,9 @@
         restore_in_place: "原位还原", clone: "克隆新 VM", verify: "恢复验证", delete: "销毁"
       };
       const pg = Pager.slice("vmJobs", rows);
-      $("jobTable").innerHTML = pg.list.map((j) => `
+      $("jobTable").innerHTML = pg.list.map((j, ji) => `
         <tr>
-          <td>${j.id}</td>
+          <td>${pg.startNo + ji}</td>
           <td>${esc(j.vm_name || ("VM#" + j.vm_id))}</td>
           <td>${esc(modeName[j.mode] || j.mode)}</td>
           <td class="small">${esc(j.target_name || j.target_ref || "-")}</td>

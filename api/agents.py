@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Agent 执行通道 API：注册 / 列表 / 探活 / 删除 / 远端安装命令生成。"""
+import base64
 import os
 
 from flask import jsonify, request
@@ -63,29 +64,43 @@ def probe_agent(aid):
 
 @api_bp.route("/agents/<int:aid>/install-cmd", methods=["GET"])
 def install_cmd(aid):
-    """生成在数据库服务器上执行的一键安装命令（经 SSH 推送，或复制手工执行）。"""
+    """生成在数据库服务器上执行的一键安装命令（黑盒：loader + 加密载荷，
+    明文源码不出平台）。"""
     rec = agent_hosts.get_by_id(aid)
     if not rec:
         return jsonify({"error": "注册记录不存在"}), 404
     token = agent_hosts.get_token(rec)
-    agent_src = "/root/CodeBuddy/20260826095855/backup-platform/agent/backup_agent.py"
+    from core import agent_payload
+    agent_src = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "agent", "backup_agent.py")
     port = int(rec.get("port") or 8466)
+    loader_py, payload_bytes = agent_payload.build_payload(
+        open(agent_src, encoding="utf-8").read(), token)
+    payload_b64 = base64.b64encode(payload_bytes).decode()
+    loader_b64 = base64.b64encode(loader_py.encode()).decode()
     remote_sh = (
         "mkdir -p /opt/aidbm-agent && "
-        "cat > /opt/aidbm-agent/backup_agent.py <<'AIDBM_AGENT_EOF'\n"
-        "{AGENT_SRC}\n"
-        "AIDBM_AGENT_EOF\n"
-        "chmod 700 /opt/aidbm-agent/backup_agent.py && "
+        "echo '{LOADER_B64}' | base64 -d > /opt/aidbm-agent/{LOADER_NAME} && "
+        "echo '{PAYLOAD_B64}' | base64 -d > /opt/aidbm-agent/{PAYLOAD_NAME} && "
+        "rm -f /opt/aidbm-agent/backup_agent.py && "
+        "chmod 700 /opt/aidbm-agent/{LOADER_NAME} && "
+        "chmod 600 /opt/aidbm-agent/{PAYLOAD_NAME} && "
         "cat > /etc/systemd/system/aidbm-agent.service <<'UNIT_EOF'\n"
         "[Unit]\nDescription=AIDBM Backup Agent\nAfter=network.target\n\n"
-        "[Service]\nExecStart=/usr/bin/python3 /opt/aidbm-agent/backup_agent.py "
-        " --token {TOKEN} --port {PORT}\nRestart=always\nRestartSec=3\n\n"
-        "[Install]\nWantedBy=multi-user.target\n"
+        "[Service]\nExecStart=/usr/bin/python3 /opt/aidbm-agent/{LOADER_NAME} "
+        " --token {TOKEN} --port {PORT} "
+        "--payload /opt/aidbm-agent/{PAYLOAD_NAME}\nRestart=always\n"
+        "RestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n"
         "UNIT_EOF\n"
         "systemctl daemon-reload && systemctl enable --now aidbm-agent && "
         "sleep 1 && systemctl is-active aidbm-agent\n")
-    script = remote_sh.replace("{AGENT_SRC}", open(agent_src, encoding="utf-8").read()) \
-                      .replace("{TOKEN}", token).replace("{PORT}", str(port))
+    script = (remote_sh
+              .replace("{LOADER_B64}", loader_b64)
+              .replace("{PAYLOAD_B64}", payload_b64)
+              .replace("{LOADER_NAME}", agent_payload.LOADER_NAME)
+              .replace("{PAYLOAD_NAME}", agent_payload.PAYLOAD_NAME)
+              .replace("{TOKEN}", token).replace("{PORT}", str(port)))
     return jsonify({"script_file": "/tmp/aidbm_install_agent.sh",
                     "script": script})
 
@@ -141,10 +156,23 @@ def remote_install():
                 sftp.mkdir("/opt/aidbm-agent")
             except IOError:
                 pass
+            # 黑盒下发：磁盘只落 loader + AES-GCM 加密载荷，无明文源码
+            from core import agent_payload
             agent_src = os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 "agent", "backup_agent.py")
-            sftp.put(agent_src, "/opt/aidbm-agent/backup_agent.py")
+            loader_py, payload_bytes = agent_payload.build_payload(
+                open(agent_src, encoding="utf-8").read(), token)
+            with sftp.open("/opt/aidbm-agent/" + agent_payload.LOADER_NAME,
+                           "w") as f:
+                f.write(loader_py)
+            with sftp.open("/opt/aidbm-agent/" + agent_payload.PAYLOAD_NAME,
+                           "wb") as f:
+                f.write(payload_bytes)
+            try:
+                sftp.remove("/opt/aidbm-agent/backup_agent.py")
+            except IOError:
+                pass  # 旧版明文残留清理（首次黑盒升级场景）
             # 远端 python 探测：优先 3.7+（ThreadingHTTPServer），老系统
             # 3.6 由执行器内置降级兼容，但优先高版本（CentOS7 /usr/bin/python3=3.6）
             _chn2, _po, _ = c.exec_command(
@@ -156,16 +184,19 @@ def remote_install():
             unit = (
                 "[Unit]\nDescription=AIDBM Backup Agent\n"
                 "After=network.target\n\n[Service]\n"
-                "ExecStart=%s /opt/aidbm-agent/backup_agent.py "
-                "--token %s --port %d\nRestart=always\nRestartSec=3\n\n"
+                "ExecStart=%s /opt/aidbm-agent/%s --token %s --port %d "
+                "--payload /opt/aidbm-agent/%s\n"
+                "Restart=always\nRestartSec=3\n\n"
                 "[Install]\nWantedBy=multi-user.target\n"
-                % (_py, token, agent_port))
+                % (_py, agent_payload.LOADER_NAME, token, agent_port,
+                   agent_payload.PAYLOAD_NAME))
             with sftp.open("/etc/systemd/system/aidbm-agent.service", "w") as f:
                 f.write(unit)
         finally:
             sftp.close()
         _chn, _o, _rc = c.exec_command(
-            "chmod 700 /opt/aidbm-agent/backup_agent.py && "
+            "chmod 700 /opt/aidbm-agent/%s && chmod 600 /opt/aidbm-agent/%s && "
+            % (agent_payload.LOADER_NAME, agent_payload.PAYLOAD_NAME) +
             "systemctl daemon-reload && systemctl enable --now aidbm-agent "
             "&& sleep 1 && systemctl is-active aidbm-agent", timeout=60)
         out = _o.read().decode(errors="replace").strip()

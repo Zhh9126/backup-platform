@@ -47,6 +47,12 @@ def _normalize_json_fields(data: dict) -> dict:
 def create_task(data: dict) -> int:
     data = {k: data.get(k) for k in TASK_FIELDS}
     data = _normalize_json_fields(data)
+    # 压缩级 1~29（对标 DBackup：1-8 gzip / 9-22 zstd / 23-29 zstd 高档）
+    try:
+        _cl = int(data.get("compress_level") or 0)
+    except Exception:
+        _cl = 0
+    data["compress_level"] = max(0, min(29, _cl))
     now = db.now_iso()
     data["created_at"] = now
     data["updated_at"] = now

@@ -893,6 +893,62 @@ class OracleEngine(BackupEngine):
         client = remote_dump._connect(ssh_host)
         # 19c 场景：确保 PDB OPEN（RMAN 备份 CDB 时要求 PDB 打开）
         self._ensure_pdbs_open(client)
+        # 非归档模式策略（对标 DBackup：abort / auto_enable）：
+        # NOARCHIVELOG 下 RMAN 热备必败（ORA-19602）
+        _arch = self._check_archive_mode()
+        if _arch.get("mode") == "NOARCHIVELOG":
+            _policy = "abort"
+            try:
+                _eo = self.task.get("extra_options")
+                _extra = json.loads(_eo) if isinstance(_eo, str) else (_eo or {})
+                _policy = str(_extra.get("noarchivelog_policy") or "abort").lower()
+            except Exception:
+                pass
+            if _policy != "auto_enable":
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    message=(
+                        "Oracle 处于非归档模式，RMAN 热备将失败（ORA-19602）。"
+                        "处置三选一：① 开启归档模式（shutdown immediate → "
+                        "startup mount → alter database archivelog → alter "
+                        "database open，需 DBA 评估重启窗口）；② 任务高级选项配置 "
+                        "noarchivelog_policy=auto_enable（平台自动开归档后备份，"
+                        "会短暂重启实例）；③ 改用逻辑备份(expdp)"))
+            # auto_enable：自动启用归档（会重启实例，审计日志高亮）
+            self.logger.warning(
+                "[%s] noarchivelog_policy=auto_enable：将自动启用归档模式"
+                "（实例会重启一次，请确保已评估影响）", self.task_name)
+            _ae_sql = (
+                "shutdown immediate;\n"
+                "startup mount;\n"
+                "alter database archivelog;\n"
+                "alter database open;\n"
+                "select log_mode from v$database;\n")
+            _ae_file = "/tmp/platform_enable_arch.sql"
+            from core.engines.file import _ssh_exec_pipe as _sep_ae
+            _asftp = None
+            try:
+                _asftp = client.open_sftp()
+                with _asftp.open(_ae_file, "w") as f:
+                    f.write("SET PAGESIZE 0 FEEDBACK OFF\n" + _ae_sql + "\nEXIT;\n")
+            finally:
+                try:
+                    _asftp.close()
+                except Exception:
+                    pass
+            _chk = self._resolve_check_user(ssh_host)
+            _ae_sh = ("su - %s -c %s" % (
+                _chk, shlex.quote("sqlplus -s / as sysdba @" + _ae_file)))
+            _ao, _ae2, _arc = _sep_ae(
+                client, remote_dump._wrap_login(_ae_sh), timeout=600)
+            _aot = _ao.decode("utf-8", "replace") if isinstance(_ao, bytes) else str(_ao)
+            if "ARCHIVELOG" not in _aot or _arc != 0:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    message="自动启用归档失败（exit=%s）：%s；请 DBA 手工执行开启归档"
+                            % (_arc, _aot[-400:]))
+            self.logger.warning("[%s] 归档模式已自动启用（ARCHIVELOG），继续 RMAN 备份",
+                                self.task_name)
         # rman 路径动态解析（oracle 用户 profile → ORACLE_HOME 目录枚举）
         rman_bin = self._resolve_oracle_tool(client, "rman")
         if not rman_bin:

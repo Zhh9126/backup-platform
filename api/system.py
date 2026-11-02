@@ -126,9 +126,25 @@ def _success_rate_24h(records: list) -> dict:
     return {"total": total, "success": success, "failed": failed, "rate": rate}
 
 
+_DASH_CACHE = {"ts": 0.0, "data": None}
+_DASH_TTL = 30  # 秒：仪表盘指标 30s 进程内缓存（运营态势/实时保护含上百次
+                # 逐任务状态查询，实测首帧 2s；高频刷新走缓存零等待）
+
+
 @api_bp.route("/dashboard", methods=["GET"])
 @login_required
 def dashboard():
+    import time as _time
+    now = _time.time()
+    if _DASH_CACHE["data"] is not None and now - _DASH_CACHE["ts"] < _DASH_TTL:
+        return jsonify(_DASH_CACHE["data"])
+    payload = _dashboard_payload()
+    _DASH_CACHE["ts"] = now
+    _DASH_CACHE["data"] = payload
+    return jsonify(payload)
+
+
+def _dashboard_payload():
     tasks = models.list_tasks(include_secret=False)
     records = models.list_records(limit=500)
     from collections import Counter
@@ -191,7 +207,7 @@ def dashboard():
         }
 
     recent = [_enrich(r) for r in records[:10]]
-    return jsonify({
+    payload = {
         "task_count": len(tasks),
         "db_task_count": db_task_count,
         "file_task_count": file_task_count,
@@ -237,7 +253,8 @@ def dashboard():
         "replication": insights.get("replication") or {},
         "wow": insights.get("wow") or {},
         "objects": insights.get("objects") or {},
-    })
+    }
+    return payload
 
 
 def _parse_dt(val):

@@ -44,3 +44,9 @@ packages/
 # 但【镜像/离线交付包含】——此处不再排除 ai_agent/agent 文件。
 # 注意：static/css/agent.css 与 agent-render.js 仍排除（页面遗留样式，助手
 # 前端已并入 static/js/ai-agent.js 可选模块）。
+.tools/
+packages/
+node_modules/
+*.tar
+*.tar.gz
+*.log

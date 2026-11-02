@@ -579,6 +579,24 @@ CREATE TABLE IF NOT EXISTS ssh_hosts (
     UNIQUE(host_key, db_type)
 );
 
+CREATE TABLE IF NOT EXISTS agent_hosts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    host_key    TEXT NOT NULL UNIQUE,      -- "agent@hostname:port"（与 ssh_hosts 主机关联键一致粒度）
+    hostname    TEXT NOT NULL,
+    port        INTEGER DEFAULT 8466,
+    token       TEXT,                      -- 通道令牌（加密存储）
+    transport   TEXT DEFAULT 'auto',       -- auto | agent | ssh（执行通道选择）
+    db_type     TEXT DEFAULT '',           -- 服务的数据库类型；空=通用
+    enabled     INTEGER DEFAULT 1,
+    enc_algo    TEXT DEFAULT '',           -- 最近一次能力自报的加密算法
+    agent_version TEXT DEFAULT '',
+    last_status TEXT,
+    last_check_at TEXT,
+    created_at  TEXT,
+    updated_at  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS plugin_host_state (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     host_id       INTEGER,                  -- ssh_hosts.id；本机=0

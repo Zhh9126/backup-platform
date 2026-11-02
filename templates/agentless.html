@@ -1,15 +1,15 @@
 {% extends "base.html" %}
-{% block title %}无 Agent 接入{% endblock %}
+{% block title %}Agent 管理{% endblock %}
 
 {% block content %}
 <div class="toolbar">
   <div>
     <div class="page-title">
       <i class="bi bi-shield-check text-success me-2"></i>
-      无 Agent 接入面板
+      Agent 管理（无 Agent / 有 Agent 双模式）
     </div>
     <div class="page-sub">
-      被保护对象上<b>不安装任何软件、不部署常驻进程</b>。
+      两种备份执行方式：<b>无 Agent</b>（SSH 通道，目标端零安装零残留）与<b>有 Agent</b>（执行器插件装在目标主机本地执行备份/恢复）。
       本页按任务推导「本次走了哪条通道、最高侵入到哪一级」，并可对纳管主机做<b>只读取证</b>验证目标端零残留。
     </div>
   </div>
@@ -70,6 +70,52 @@
   </div>
   <div id="a_findings" class="small"></div>
   <div class="text-muted small mt-2">取证命令全部为只读（ps / find / crontab 列表），不写入也不删除目标端任何东西。</div>
+</div>
+
+<!-- 执行器插件（Agent 模式） -->
+<div class="card mb-3" id="agentPluginCard">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <b><i class="bi bi-plug me-2"></i>执行器插件（有 Agent 模式）</b>
+    <span class="text-muted small">备份/恢复任务添加时可选：SSH 通道（无 Agent）· Agent 通道（本插件在主机本地执行）</span>
+  </div>
+  <div class="card-body">
+    <div class="row g-3">
+      <div class="col-lg-7">
+        <div class="table-responsive">
+          <table class="table table-sm table-hover align-middle mb-2">
+            <thead><tr>
+              <th>主机</th><th>端口</th><th>通道模式</th><th>状态</th><th>版本/加密</th><th>操作</th>
+            </tr></thead>
+            <tbody id="agentRows"><tr><td colspan="6" class="text-muted small">加载中…</td></tr></tbody>
+          </table>
+        </div>
+        <button class="btn btn-sm btn-outline-secondary" onclick="loadAgents()">
+          <i class="bi bi-arrow-repeat me-1"></i>刷新列表
+        </button>
+      </div>
+      <div class="col-lg-5">
+        <div class="border rounded p-3 h-100">
+          <div class="fw-bold mb-2"><i class="bi bi-download me-1"></i>一键安装插件到主机</div>
+          <div class="input-group input-group-sm mb-2">
+            <span class="input-group-text">纳管主机</span>
+            <select class="form-select" id="ai_host"></select>
+          </div>
+          <div class="input-group input-group-sm mb-3">
+            <span class="input-group-text">Agent 端口</span>
+            <input class="form-control" id="ai_port" value="8466" style="max-width:110px">
+            <button class="btn btn-success" id="aiBtn" onclick="remoteInstall()">
+              <i class="bi bi-play-fill me-1"></i>安装并启动
+            </button>
+          </div>
+          <div id="ai_result" class="small text-muted">
+            安装内容：推送执行器脚本到 /opt/aidbm-agent → 注册 systemd 服务（开机自启）→ 自动探活。
+            主机需已纳管（凭据可测）。安装后任务执行自动优先走 Agent 通道（auto 模式），
+            目标端加密传输由执行器与平台协商（AES-256-GCM）。
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- 任务 × 通道 -->
@@ -207,12 +253,72 @@
     }
   };
 
+  // ---------------- 执行器插件（Agent 模式） ----------------
+  window.loadAgents = async function () {
+    const tb = document.getElementById("agentRows");
+    try {
+      const list = await api("GET", "/api/v1/agents");
+      if (!(list || []).length) {
+        tb.innerHTML = '<tr><td colspan="6" class="text-muted small">暂无已注册执行器 —— 在右侧选择纳管主机一键安装</td></tr>';
+        return;
+      }
+      tb.innerHTML = list.map((a) => {
+        const st = (a.last_status || "").startsWith("online")
+          ? '<span class="badge bg-success">在线</span>'
+          : '<span class="badge bg-secondary" title="' + esc(a.last_status || "") + '">离线/未知</span>';
+        return "<tr><td>" + esc(a.hostname) + "</td><td>" + esc(a.port) + "</td>" +
+          '<td><span class="badge bg-light text-dark border">' + esc((a.transport || "auto").toUpperCase()) + "</span></td>" +
+          "<td>" + st + "</td><td class='small text-muted'>" + esc(a.agent_version || "-") + " / " + esc(a.enc_algo || "-") + "</td>" +
+          '<td class="text-nowrap">' +
+          '<button class="btn btn-sm btn-outline-success me-1" onclick="probeAgent(' + a.id + ')" title="探活">探活</button>' +
+          '<button class="btn btn-sm btn-outline-danger" onclick="delAgent(' + a.id + ')" title="删除注册记录">删除</button></td></tr>';
+      }).join("");
+    } catch (e) {
+      tb.innerHTML = '<tr><td colspan="6" class="text-danger small">加载失败: ' + esc(String(e.message || e)) + "</td></tr>";
+    }
+  };
+
+  window.probeAgent = async function (id) {
+    try { await api("POST", "/api/v1/agents/" + id + "/probe"); } catch (e) {}
+    await window.loadAgents();
+  };
+
+  window.delAgent = async function (id) {
+    if (!confirm("删除该执行器注册记录？（主机上的服务不受影响，可重新安装）")) return;
+    try { await api("DELETE", "/api/v1/agents/" + id); } catch (e) {}
+    await window.loadAgents();
+  };
+
+  window.remoteInstall = async function () {
+    const hostId = document.getElementById("ai_host").value;
+    if (!hostId) { document.getElementById("ai_host").focus(); return; }
+    const btn = document.getElementById("aiBtn");
+    const box = document.getElementById("ai_result");
+    btn.disabled = true;
+    box.innerHTML = '<span class="text-primary">安装中：推送执行器 → 注册服务 → 启动 → 探活（约 10 秒）…</span>';
+    try {
+      const r = await api("POST", "/api/v1/agents/remote-install",
+        JSON.stringify({ host_id: parseInt(hostId, 10),
+                         agent_port: parseInt(document.getElementById("ai_port").value || "8466", 10) }));
+      box.innerHTML = r.ok
+        ? '<span class="text-success">安装成功，探活在线。</span> 任务添加时该主机会自动优先走 Agent 通道。'
+        : '<span class="text-danger">安装完成但探活失败：</span>' + esc(String((r.probe || {}).error || r.error || ""));
+    } catch (e) {
+      box.innerHTML = '<span class="text-danger">安装失败：</span>' + esc(String(e.message || e));
+    }
+    btn.disabled = false;
+    await window.loadAgents();
+  };
+
   (async function init() {
     try {
       const hosts = await api("GET", "/api/hosts");
-      document.getElementById("a_host").innerHTML = '<option value="">选择纳管主机…</option>' +
+      const opts = '<option value="">选择纳管主机…</option>' +
         (hosts || []).map((h) => '<option value="' + h.id + '">' + esc(h.host_key || h.name) + "</option>").join("");
-    } catch (e) { /* 主机列表不可用时仅影响取证入口 */ }
+      document.getElementById("a_host").innerHTML = opts;
+      document.getElementById("ai_host").innerHTML = opts;
+    } catch (e) { /* 主机列表不可用时仅影响取证/安装入口 */ }
+    window.loadAgents();
     try { await window.loadAll(); } catch (e) {
       document.getElementById("empty_hint").textContent = "加载失败: " + (e.message || e);
     }

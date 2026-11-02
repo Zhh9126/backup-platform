@@ -78,7 +78,8 @@ from . import (tasks, records, restore, system, hosts, sync, inspection, deploy,
                 clone, itsm, link, dr_dns, ai_alert, datamining, rt, plugins,
                 restore_verify, synthesize, dedup, jdbc, data_compare,
                 tape, logs, db_adapters, rbac, cdc, vm, openapi,
-                agentless, object_storage, backup_cleanup, meta_db)  # noqa: E402,F401
+                agentless, object_storage, backup_cleanup, meta_db,
+                agents)  # noqa: E402,F401
 
 # AI 助手（收费功能）：镜像/离线交付包中不含 core/ai_agent 与 api/ai_agent.py，
 # 这里必须容错注册——缺失时平台其余功能不受影响（2026-09-19 用户决定）。

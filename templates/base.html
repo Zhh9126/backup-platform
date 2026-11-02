@@ -6,7 +6,7 @@
   <title>{% block title %}AIDBM · AI 原生智能数据库灾备管理平台{% endblock %}</title>
   <link href="/static/css/bootstrap.min.css?v=2026080210" rel="stylesheet">
   <link href="/static/vendor/bootstrap-icons/bootstrap-icons.css?v=2026081401" rel="stylesheet">
-  <link href="/static/css/app.css?v=2026110101" rel="stylesheet">
+  <link href="/static/css/app.css?v=2026110201" rel="stylesheet">
 </head>
 <body data-page="{{ page }}">
   <!-- 语言切换：右上角悬浮按钮 -->
@@ -41,7 +41,7 @@
         <a class="nav-link {% if page=='vm' %}active{% endif %}" href="/vm" title="虚拟机备份（整机恢复点 / 永久增量 / 克隆新 VM）"><i class="bi bi-pc-display-horizontal"></i> <span class="nav-label">虚拟机备份</span></a>
         <a class="nav-link {% if page=='storage' %}active{% endif %}" href="/storage" title="存储管理" data-perm="backup.storage.manage"><i class="bi bi-hdd-rack"></i> <span class="nav-label">存储管理</span></a>
         <a class="nav-link {% if page=='protection' %}active{% endif %}" href="/protection" title="备份策略" data-perm="backup.policy.manage"><i class="bi bi-shield-lock"></i> <span class="nav-label">备份策略</span></a>
-        <a class="nav-link {% if page=='agentless' %}active{% endif %}" href="/agentless" title="无 Agent 接入：任务本次通道与侵入等级、目标端免装取证"><i class="bi bi-shield-check"></i> <span class="nav-label">无 Agent</span></a>
+        <a class="nav-link {% if page=='agentless' %}active{% endif %}" href="/agentless" title="Agent 管理：无 Agent（SSH 通道）与有 Agent（执行器插件）两种备份方式，插件一键安装到主机"><i class="bi bi-shield-check"></i> <span class="nav-label">Agent 管理</span></a>
         <a class="nav-link {% if page=='plugins' %}active{% endif %}" href="/plugins" title="备份依赖插件（一键安装 xtrabackup / percona / mariabackup 等）" data-perm="backup.plugins.manage"><i class="bi bi-plug"></i> <span class="nav-label">备份插件</span></a>
         <a class="nav-link {% if page in ('rt_timeline', 'realtime', 'cdc') %}active{% endif %}" href="/realtime" title="实时备份：CDC 行级变更捕获 + CDP 恢复点时间轴（任意时间点恢复）" data-perm="rt.manage"><i class="bi bi-broadcast-pin"></i> <span class="nav-label">实时备份</span></a>
         <div class="nav-group-label">数据恢复管理</div>
@@ -106,7 +106,7 @@
   <script src="/static/js/bkp-core.js?v=2026110102"></script>
   <script src="/static/js/pager.js?v=2026102802"></script>
   <script src="/static/js/precheck.js?v=2026110103"></script>
-  <script src="/static/js/app.js?v=2026110103"></script>
+  <script src="/static/js/app.js?v=2026110202"></script>
   {% if has_ai_agent %}<script src="/static/js/ai-agent.js?v=2026101501"></script>{% endif %}
   <script>
     // 按权限隐藏菜单（每个 <a class="nav-link" data-perm="..."> 命中则可见）

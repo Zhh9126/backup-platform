@@ -79,9 +79,37 @@ def resolve_ssh_host(task: dict):
         except (ValueError, TypeError):
             pass
 
+    # 1.5) Agent 代理通道（agent+ssh 双模）：按数据库地址匹配 agent_hosts。
+    #      transport=agent → 强制 Agent（未注册/不在线也不回退 SSH）；
+    #      auto → Agent 在线即优先，离线继续走 SSH 纳管匹配。
+    host = (task.get("host") or "").strip()
+    from core import agent_hosts as _ah
+    if host and host.lower() not in ("127.0.0.1", "localhost", "::1"):
+        rec = _ah.get_by_host(host, (task.get("db_type") or "").strip().lower())
+        if rec:
+            mode = (rec.get("transport") or "auto").lower()
+            _agent_desc = {
+                "name": rec.get("name") or host,
+                "host_key": rec["host_key"],
+                "hostname": rec["hostname"],
+                "port": int(rec.get("port") or 8466),
+                "transport": "agent",
+                "agent_token": _ah.get_token(rec),
+                "os_type": "linux",
+                "remark": "Agent 代理通道（数据库服务器可不开 SSH）",
+            }
+            if mode == "agent":
+                return _agent_desc
+            try:
+                from core.agent_client import AgentTransport
+                AgentTransport(rec["hostname"], int(rec.get("port") or 8466),
+                               _ah.get_token(rec), timeout=5).health()
+                return _agent_desc
+            except Exception:
+                pass  # Agent 离线 → 回退 SSH 匹配
+
     # 2) 按数据库地址 IP 匹配（FIX-2026-001 P2：同机多库型纳管后，
     #    优先命中与任务库型一致的记录，其次通用记录，最后任一记录）
-    host = (task.get("host") or "").strip()
     # 回环地址 = 数据库与平台同机，走本机通道即可；若自动匹配到某台
     # hostname 为 127.0.0.1 的 SSH 主机（如取证专用 2222 通道），远程
     # mysqldump/redis-cli 等要么连不上要么缺工具，徒增一次失败重试。
@@ -328,6 +356,12 @@ def remote_has_tool(ssh_host: dict, tool: str, check_user: str = None,
 
 
 def _connect(ssh_host: dict):
+    # Agent 代理通道：ssh_host 带 transport='agent'（resolve_ssh_host 注入）
+    # 时返回 paramiko 兼容的 AgentSSHClient——引擎零改动。
+    if (ssh_host or {}).get("transport") == "agent":
+        from core.agent_client import connect_agent
+        return connect_agent(ssh_host["hostname"], int(ssh_host.get("port") or 8466),
+                             ssh_host["agent_token"])
     from core.engines.file import _get_ssh_client
     # 任务级 SSH 凭据（resolve_ssh_host 构造的临时主机）直接带密码；
     # 已纳管主机 dict 也含解密后密码与 private_key（PEM 内容），传入可省
@@ -752,7 +786,13 @@ def _connect_isolated(ssh_host: dict):
     """建立一条独立 SSH 连接（不经过连接池），用完即关，避免影响主流程的连接池。
 
     地址解析优先级与 _connect 保持一致：优先 host_key，其次 hostname/host/ip。
+    Agent 通道（transport=agent）直接返回独立的 Agent 兼容客户端。
     """
+    if (ssh_host or {}).get("transport") == "agent":
+        from core.agent_client import connect_agent
+        return connect_agent(ssh_host["hostname"],
+                             int(ssh_host.get("port") or 8466),
+                             ssh_host["agent_token"])
     import paramiko
     host_key = ssh_host.get("host_key")
     host = (ssh_host.get("hostname") or ssh_host.get("host") or ssh_host.get("ip"))
@@ -3029,9 +3069,11 @@ def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
         _log.info("[remote_dump] 复用远端已完成 %s 产物 %s（%s），跳过备份执行",
                   tool, remote_tmp, db.human_size(ready["size"]))
     else:
-        # pg_basebackup -D 要求目标目录为空；重试时先清掉上次残留
-        prep = f"rm -rf {remote_tmp} && mkdir -p {remote_tmp}"
-        _ssh_exec_pipe(client, _wrap_login(prep), timeout=60)
+        # pg_basebackup -D 要求目标目录为空；重试时先清掉上次残留。
+        # agent 通道首航时曾出现"报目录非空但快照为空"：prep 与备份命令
+        # 两条命令之间存在间隙，改为**原子前置**（与备份同一条命令执行），
+        # 顺带在目录仍非空时把内容带回失败信息（长期排障保留）。
+        _stage_snapshot = ""
 
     # extra_options 透传额外参数（如 --verbose、--exclude）
     extra = []
@@ -3060,12 +3102,15 @@ def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
         out_text = (f"复用远端已完成产物 {remote_tmp}"
                     f"（{db.human_size(ready['size'])}），跳过备份执行")
     else:
+        # 原子前置：清空+建目录与备份命令同一条 shell，消除两命令间隙
         inner = (
+            f"rm -rf {remote_tmp} && mkdir -p {remote_tmp} && {{ "
             f"export PGPASSWORD={shlex.quote(pw)}; "
             f"export KINGBASE_PASSWORD={shlex.quote(pw)};"
             f"{env_extra} "
             f"{resolved} -h {shlex.quote(db_host)} -p {port} -U {shlex.quote(user)}{wpass} "
             f"-D {remote_tmp} {flags}"
+            f"; }}"
         )
         if extra:
             inner += " " + " ".join(shlex.quote(a) for a in extra)
@@ -3085,10 +3130,14 @@ def remote_physical_backup(task: dict, ssh_host: dict, *, tool: str,
                 "chown postgres:postgres <file> && chmod 644 <file>），"
                 "或将其移出 PGDATA"
             )
+        _snap_hint = ""
+        if "exists but is not empty" in snippet and _stage_snapshot:
+            _snap_hint = f"；prep 后目录快照: {_stage_snapshot}"
         return {
             "ok": False, "rc": rc, "stdout": out_text, "stderr": err,
             "remote_dir": "",
-            "message": f"远端 {tool_label} 物理备份失败(rc={rc}): {snippet}{hint}",
+            "message": f"远端 {tool_label} 物理备份失败(rc={rc}): "
+                       f"{snippet}{_snap_hint}{hint}",
         }
 
     # 目录模式（pack_after）：openGauss gs_basebackup 的 -Ft 产出非 tar 的裸 gzip

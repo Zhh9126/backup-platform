@@ -153,6 +153,10 @@
                 <div class="col-md-6">
                   <label class="form-label">主机地址 *</label>
                   <input class="form-control" id="t_host" placeholder="IP 或主机名">
+                  <div class="form-text" id="t_channel_hint">
+                    <i class="bi bi-plug me-1"></i>执行通道：默认 SSH（无 Agent）。目标主机安装执行器插件后自动优先走 Agent（
+                    <a href="/agentless" target="_blank">Agent 管理 · 一键安装</a>）
+                  </div>
                 </div>
                 <div class="col-md-2">
                   <label class="form-label">端口 *</label>
@@ -606,3 +610,27 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
   </div>
 </div>
 {% endblock %}
+<script>
+// 执行通道联动提示：输入主机后查该主机是否已注册备份执行器插件（Agent）
+(function () {
+  const inp = document.getElementById("t_host");
+  if (!inp) return;
+  let timer = null;
+  inp.addEventListener("change", async function () {
+    const hint = document.getElementById("t_channel_hint");
+    const host = (inp.value || "").trim();
+    if (!host) { return; }
+    try {
+      const list = await fetch("/api/v1/agents").then(r => r.json());
+      const hit = (list || []).find(a => a.hostname === host && a.enabled);
+      if (hit && (hit.last_status || "").startsWith("online")) {
+        hint.innerHTML = '<i class="bi bi-plug-fill text-success me-1"></i>该主机已安装执行器插件（在线）——备份/恢复将自动走 <b>Agent 通道</b>（本地执行、加密传输）';
+      } else if (hit) {
+        hint.innerHTML = '<i class="bi bi-plug text-warning me-1"></i>该主机已注册执行器但当前不在线，将回退 SSH 通道；可到 <a href="/agentless" target="_blank">Agent 管理</a> 探活';
+      } else {
+        hint.innerHTML = '<i class="bi bi-plug me-1"></i>该主机未安装执行器插件，将走 SSH（无 Agent）通道。如需 Agent 本地执行：<a href="/agentless" target="_blank">Agent 管理 · 一键安装</a>';
+      }
+    } catch (e) { /* 查询失败不影响表单 */ }
+  });
+})();
+</script>

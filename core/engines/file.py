@@ -457,8 +457,10 @@ def _ssh_exec_stream(client, cmd: str, *, out_file=None, timeout: int = 0,
     start = _time.time()
     last_data = start
     last_hb = start
+    last_cancel_chk = start
     hb_bytes = 0
     timed_out = ""
+    from core import cancel as _cancel_mod
     try:
         while True:
             got = False
@@ -486,6 +488,18 @@ def _ssh_exec_stream(client, cmd: str, *, out_file=None, timeout: int = 0,
                     err += _e
                     last_data = _time.time()
             now = _time.time()
+            # 协作式取消（每秒检查一次）：用户停止任务后，在传输块边界
+            # 关闭 SSH 会话并抛 CancelledError——远端 dump/RMAN 进程随
+            # 会话关闭收到 SIGHUP 终止；agent 通道则由「断连即杀」（进程
+            # 组级）兜底终止。取消不清断点（.part 残件保留可续传）。
+            if (now - last_cancel_chk) >= 1.0:
+                last_cancel_chk = now
+                if _cancel_mod.is_cancelled():
+                    try:
+                        sess.close()
+                    except Exception:
+                        pass
+                    _cancel_mod.check()
             # 进度心跳：让运维在大库备份中能看到"还在动、多快"
             if progress_every and now - last_hb >= progress_every:
                 seg = written - hb_bytes

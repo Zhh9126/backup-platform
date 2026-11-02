@@ -55,7 +55,7 @@ try:
 except Exception:
     _HAS_AES = False
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 MAX_BODY = 16 * 1024 * 1024      # 请求体上限（JSON/分块上传均远小于此）
 MAX_SYNC_OUT = 16 * 1024 * 1024          # /exec 同步输出上限（超出建议 exec-stream）
 CHUNK = 512 * 1024                        # 流式块大小
@@ -80,12 +80,25 @@ class AgentState:
     token = ""
     key = None
     allow_dirs = DEFAULT_ALLOW
+    # 活动流式子进程注册表 pid → Popen（exec-stream 断连即杀）
+    active_procs = {}
 
     @classmethod
     def path_allowed(cls, path: str) -> bool:
         rp = os.path.realpath(path)
         return any(rp == d or rp.startswith(d.rstrip("/") + "/")
                    for d in cls.allow_dirs)
+
+
+def _kill_proc_group(p) -> None:
+    """终止子进程及其整个进程组（rman/xtrabackup 等孙进程一并杀，不留孤儿）。"""
+    try:
+        os.killpg(os.getpgid(p.pid), 9)
+    except Exception:
+        try:
+            p.kill()
+        except Exception:
+            pass
 
 
 def _seal(key: bytes, plaintext: bytes) -> bytes:
@@ -305,13 +318,24 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(400, {"error": "cmd 必填"})
             return
         self._audit("exec-stream: %s" % cmd[:120])
+        # start_new_session：子进程独立进程组 —— 断连/取消/超时时 killpg
+        # 把 rman/xtrabackup/mysqldump 等孙进程一并终止，不留孤儿（插件
+        # 工程化第五关：协作式取消的服务端兜底，平台停止任务 → 关流 → 杀进程）
         p = subprocess.Popen(["bash", "-lc", cmd],
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                             stdin=subprocess.DEVNULL)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Transfer-Encoding", "chunked")
-        self.end_headers()
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+        AgentState.active_procs[str(p.pid)] = p
+        sock = self.connection  # BaseHTTPRequestHandler 的原始 socket
+        import select as _select
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            AgentState.active_procs.pop(str(p.pid), None)
+            _kill_proc_group(p)
+            return
 
         def send_chunk(data: bytes):
             if not data:
@@ -337,19 +361,67 @@ class Handler(BaseHTTPRequestHandler):
 
         err_th = threading.Thread(target=_drain_stderr, daemon=True)
         err_th.start()
+        gone = False
+        fd = p.stdout.fileno()
         while True:
+            if gone:
+                _kill_proc_group(p)
+                self._audit("exec-stream: 客户端断开，已终止进程组 pid=%s (%s)"
+                            % (p.pid, cmd[:80]))
+                break
             if timeout and time.time() - start > timeout:
-                p.kill()
+                _kill_proc_group(p)
                 tail_err += "\n[agent] 流式执行超时".encode()
                 break
-            chunk = p.stdout.read(CHUNK)
-            if chunk:
-                send_chunk(chunk)
-            if p.poll() is not None and not chunk:
+            # select 同时监视子进程 stdout 与客户端 socket：客户端断开
+            # （FIN/RST）时 socket 变为可读——即使子进程长时间无 stdout
+            # 输出（RMAN 本地备份），也能秒级发现断连并终止，不让远端
+            # 大备份在无人接收的情况下空跑占满磁盘
+            try:
+                r, _, _ = _select.select([fd, sock], [], [], 1.0)
+            except (OSError, ValueError):
+                gone = True
+                continue
+            if sock in r:
+                # 平台不向本请求发送任何数据，socket 可读即对端断开
+                try:
+                    if not sock.recv(1, socket.MSG_PEEK):
+                        gone = True
+                except (ConnectionResetError, OSError):
+                    gone = True
+                if gone:
+                    continue
+            if fd in r:
+                try:
+                    chunk = os.read(fd, CHUNK)
+                except OSError:
+                    chunk = b""
+                if chunk:
+                    try:
+                        send_chunk(chunk)
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        gone = True
+                else:
+                    break  # stdout EOF：命令结束
+            elif p.poll() is not None:
                 break
-        rest = p.stdout.read()
-        if rest:
-            send_chunk(rest)
+        try:
+            AgentState.active_procs.pop(str(p.pid), None)
+        except Exception:
+            pass
+        if gone:
+            return
+        # 排空剩余输出
+        try:
+            while True:
+                rest = os.read(fd, CHUNK)
+                if not rest:
+                    break
+                send_chunk(rest)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            AgentState.active_procs.pop(str(p.pid), None)
+            _kill_proc_group(p)
+            return
         err_th.join(timeout=30)
         try:
             tail_err += b"".join(err_buf)[:128 * 1024]
@@ -359,9 +431,12 @@ class Handler(BaseHTTPRequestHandler):
         tail = json.dumps({"__done": True, "rc": rc,
                            "err": base64.b64encode(tail_err).decode()}
                           ).encode("utf-8")
-        send_chunk(tail)
-        self.wfile.write(b"0\r\n\r\n")
-        self.wfile.flush()
+        try:
+            send_chunk(tail)
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     # ---------- 3) 文件接收（PUT /file?path=&offset=&truncate=） ----------
     def _file_put(self):

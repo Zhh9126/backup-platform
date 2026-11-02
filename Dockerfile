@@ -86,8 +86,8 @@ WORKDIR /app
 
 # 先装依赖（利用层缓存）：requirements.txt 为主，JDBC 兜底另装 jpype/jaydebeapi
 COPY requirements.txt ./
-RUN pip install --no-cache-dir  -r requirements.txt \
-    && pip install --no-cache-dir  jpype1 jaydebeapi
+RUN pip install --no-cache-dir --retries 10 --timeout 60  -r requirements.txt \
+    && pip install --no-cache-dir --retries 10 --timeout 60  jpype1 jaydebeapi
 
 # 再拷贝应用代码与资源（drivers/ JDBC 驱动 jar 供 JDBC 兜底通道加载）
 COPY app.py run.py init_db.py config.py auth.py start.sh ./

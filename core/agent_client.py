@@ -389,6 +389,14 @@ class AgentChannel:
     def close(self):
         self._closed = True
         self._it = None
+        # 强制断开底层 HTTP 连接：Agent 依靠「断连即杀」（select 检测
+        # socket EOF → killpg）终止远端子进程组。仅丢迭代器不会断 TCP，
+        # 取消/停止任务时远端大备份会在无人接收下继续空跑占满磁盘
+        # （e2e_cancel_kill T3 实测暴露）。
+        try:
+            self.t._reset()
+        except Exception:
+            pass
 
 
 class AgentSessionChannel:
@@ -399,8 +407,10 @@ class AgentSessionChannel:
         self.t = t
         self._ch = None
 
-    def exec_command(self, cmd: str):
-        self._ch = AgentChannel(self.t, cmd)
+    def exec_command(self, cmd: str, timeout: int = 0):
+        # timeout：agent 侧流式执行硬顶（秒，0=不限）——到点 agent killpg
+        # 终止进程组并返回 done 帧（rc 为被杀进程返回码，通常 -9）
+        self._ch = AgentChannel(self.t, cmd, timeout=timeout)
         return 0  # paramiko channel.exec_command 返回 None/状态；引擎不依赖
 
     # 以下全部转发内层 AgentChannel

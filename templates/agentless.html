@@ -84,7 +84,7 @@
         <div class="table-responsive">
           <table class="table table-sm table-hover align-middle mb-2">
             <thead><tr>
-              <th>主机</th><th>端口</th><th>通道模式</th><th>状态</th><th>版本/加密</th><th>操作</th>
+              <th>主机</th><th>端口</th><th>通道模式</th><th>状态</th><th>版本/加密</th><th>最后探活</th><th>操作</th>
             </tr></thead>
             <tbody id="agentRows"><tr><td colspan="6" class="text-muted small">加载中…</td></tr></tbody>
           </table>
@@ -259,7 +259,7 @@
     try {
       const list = await api("GET", "/api/v1/agents");
       if (!(list || []).length) {
-        tb.innerHTML = '<tr><td colspan="6" class="text-muted small">暂无已注册执行器 —— 在右侧选择纳管主机一键安装</td></tr>';
+        tb.innerHTML = '<tr><td colspan="7" class="text-muted small">暂无已注册执行器 —— 在右侧选择纳管主机一键安装</td></tr>';
         return;
       }
       tb.innerHTML = list.map((a) => {
@@ -269,17 +269,25 @@
         return "<tr><td>" + esc(a.hostname) + "</td><td>" + esc(a.port) + "</td>" +
           '<td><span class="badge bg-light text-dark border">' + esc((a.transport || "auto").toUpperCase()) + "</span></td>" +
           "<td>" + st + "</td><td class='small text-muted'>" + esc(a.agent_version || "-") + " / " + esc(a.enc_algo || "-") + "</td>" +
+          "<td class='small text-muted'>" + esc((a.last_check_at || "-").replace("T", " ").slice(0, 19)) + "</td>" +
           '<td class="text-nowrap">' +
           '<button class="btn btn-sm btn-outline-success me-1" onclick="probeAgent(' + a.id + ')" title="探活">探活</button>' +
           '<button class="btn btn-sm btn-outline-danger" onclick="delAgent(' + a.id + ')" title="删除注册记录">删除</button></td></tr>';
       }).join("");
     } catch (e) {
-      tb.innerHTML = '<tr><td colspan="6" class="text-danger small">加载失败: ' + esc(String(e.message || e)) + "</td></tr>";
+      tb.innerHTML = '<tr><td colspan="7" class="text-danger small">加载失败: ' + esc(String(e.message || e)) + "</td></tr>";
     }
   };
 
   window.probeAgent = async function (id) {
-    try { await api("POST", "/api/v1/agents/" + id + "/probe"); } catch (e) {}
+    let ok = false, msg = "";
+    try {
+      const r = await api("POST", "/api/v1/agents/" + id + "/probe");
+      ok = !!r.ok;
+      if (ok) msg = "探活在线 · 版本 " + ((r.caps || {}).version || "-") +
+                    " · 签名 " + ((r.caps || {}).algo || "-");
+    } catch (e) { msg = String(e.message || e); }
+    alert(ok ? "✓ " + msg : "探活失败: " + msg);
     await window.loadAgents();
   };
 
@@ -298,8 +306,8 @@
     box.innerHTML = '<span class="text-primary">安装中：推送执行器 → 注册服务 → 启动 → 探活（约 10 秒）…</span>';
     try {
       const r = await api("POST", "/api/v1/agents/remote-install",
-        JSON.stringify({ host_id: parseInt(hostId, 10),
-                         agent_port: parseInt(document.getElementById("ai_port").value || "8466", 10) }));
+        { host_id: parseInt(hostId, 10),
+          agent_port: parseInt(document.getElementById("ai_port").value || "8466", 10) });
       box.innerHTML = r.ok
         ? '<span class="text-success">安装成功，探活在线。</span> 任务添加时该主机会自动优先走 Agent 通道。'
         : '<span class="text-danger">安装完成但探活失败：</span>' + esc(String((r.probe || {}).error || r.error || ""));

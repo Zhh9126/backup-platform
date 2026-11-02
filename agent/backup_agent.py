@@ -38,7 +38,16 @@ import sys
 import tempfile
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
+
+try:
+    from http.server import ThreadingHTTPServer  # py3.7+
+except ImportError:  # py3.6（CentOS7 等老系统）：线程化 HTTPServer 手工合成
+    import socketserver
+    from http.server import HTTPServer
+
+    class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM

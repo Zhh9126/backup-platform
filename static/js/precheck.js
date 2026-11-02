@@ -113,7 +113,6 @@
     document.getElementById("precheckTitle").innerHTML =
       `备份预检 · ${esc(res.task_name || String(taskId))} ${HEAD_BADGE[res.level] || ""}`;
     document.getElementById("precheckBody").innerHTML = renderBody(res);
-    const go = document.getElementById("precheckGo");
     go.classList.toggle("d-none", !res.ok);
     go.textContent = "立即备份";
     go.onclick = () => {

@@ -181,3 +181,74 @@ def test_gzip_transfer(agent_proc, tmp_path):
     # chunked 尾帧后是 gzip 全量（X-Content-Gzip=1）
     assert _gzip.decompress(raw) == payload
     agent_proc.fs("remove", remote)
+
+
+# ---------------- 安全评审 2026-11-02 修复项 ----------------
+
+def test_capabilities_hmac_required(agent_proc):
+    """caps 上报 hmac=required（版本 ≥1.1.0）。"""
+    caps = agent_proc.capabilities()
+    assert caps.get("hmac") == "required"
+    assert caps.get("version") >= "1.1.0"
+
+
+def test_unsigned_body_rejected(agent_proc):
+    """明文请求不带 sig → 403（完整性校验必选，无绕过路径）。"""
+    import json as _json
+    import urllib.request
+    port = agent_proc.port
+    req = urllib.request.Request(
+        "http://127.0.0.1:%d/exec" % port,
+        data=_json.dumps({"cmd": "echo hi"}).encode(),
+        headers={"Content-Type": "application/json",
+                 "X-AIDBM-Token": agent_proc.token},
+        method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        raise AssertionError("无 sig 请求应被拒绝")
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_bad_sig_rejected(agent_proc):
+    """sig 错误 → 403。"""
+    import json as _json
+    import urllib.request
+    port = agent_proc.port
+    req = urllib.request.Request(
+        "http://127.0.0.1:%d/exec" % port,
+        data=_json.dumps({"cmd": "echo hi", "sig": "deadbeef"}).encode(),
+        headers={"Content-Type": "application/json",
+                 "X-AIDBM-Token": agent_proc.token},
+        method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=5)
+        raise AssertionError("错误 sig 应被拒绝")
+    except urllib.error.HTTPError as e:
+        assert e.code == 403
+
+
+def test_oversized_body_413(agent_proc):
+    """超过 MAX_BODY 的请求体 → 413（OOM 防护）。"""
+    import json as _json
+    import urllib.request
+    port = agent_proc.port
+    big = "x" * (17 * 1024 * 1024)
+    body = _json.dumps({"cmd": big}).encode()
+    req = urllib.request.Request(
+        "http://127.0.0.1:%d/exec" % port, data=body,
+        headers={"Content-Type": "application/json",
+                 "X-AIDBM-Token": agent_proc.token},
+        method="POST")
+    try:
+        urllib.request.urlopen(req, timeout=15)
+        raise AssertionError("超大请求应被 413 拒绝")
+    except urllib.error.HTTPError as e:
+        assert e.code == 413
+
+
+def test_plaintext_response_signed(agent_proc, tmp_path):
+    """AES 可用时响应为加密信封；明文响应（若有）必带 sig——SDK 校验通过。"""
+    # exec 走完整 _respond 链路：SDK _open_json 会校验 enc=1 或 sig
+    r = agent_proc.exec("echo signed-check")
+    assert b"signed-check" in r["out"]

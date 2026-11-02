@@ -185,21 +185,18 @@ class AgentTransport:
             resp.fp.read(2)  # CRLF
             yield data
 
-    # ---- 文件：上传（分块 + 断点续传） ----
+    # ---- 文件：上传（分块，覆盖语义） ----
     def file_put(self, local_path: str, remote_path: str,
                  chunk: int = 4 * 1024 * 1024,
                  progress=None, label: str = "") -> int:
+        """paramiko sftp.put 语义：**全新覆盖**。
+
+        断点续传不走这里——remote_dump.sftp_put_resumable 用 .part 文件
+        + sha 边车管理续传（把目标文件残留 size 当续传 offset 会把上次
+        失败的错误内容拼进去，sha 对账失败，140 实测）。
+        """
         size = os.path.getsize(local_path)
-        # 断点：远端已有 .part 大小
         offset = 0
-        st, _h, data = self._request(
-            "POST", "/fs", body=self._seal({"op": "stat", "path": remote_path}))
-        if st == 200:
-            r = self._open_json(data)
-            if r.get("exists"):
-                offset = int(r.get("size") or 0)
-                if offset > size:
-                    offset = 0
         h = hashlib.sha256()
         with open(local_path, "rb") as f:
             f.seek(offset)
@@ -208,8 +205,12 @@ class AgentTransport:
                 blk = f.read(chunk)
                 if not blk:
                     break
+                # 首块 truncate=1：清掉远端残留（残留会让 append 错位、
+                # sha256 对账失败——140 dbg 实测）；断点续传时 sent=offset>0
+                # 走 append，不破坏已传字节
                 q = urllib.parse.urlencode({
-                    "path": remote_path, "offset": sent, "truncate": "0"})
+                    "path": remote_path, "offset": sent,
+                    "truncate": "1" if sent == 0 else "0"})
                 st, _h, data = self._request(
                     "PUT", "/file?" + q, body=blk, timeout=120)
                 if st != 200:
@@ -275,6 +276,14 @@ class AgentTransport:
         if st != 200:
             raise AgentError("Agent fs.%s HTTP %s" % (op, st))
         return self._open_json(data)
+
+
+    def open_sftp(self):
+        return AgentSFTP(self)
+
+    def open_session(self):
+        """paramiko 语义：transport.open_session() → session channel。"""
+        return AgentSessionChannel(self)
 
 
 class AgentChannel:

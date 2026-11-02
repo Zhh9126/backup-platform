@@ -55,7 +55,8 @@ try:
 except Exception:
     _HAS_AES = False
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+MAX_BODY = 16 * 1024 * 1024      # 请求体上限（JSON/分块上传均远小于此）
 MAX_SYNC_OUT = 16 * 1024 * 1024          # /exec 同步输出上限（超出建议 exec-stream）
 CHUNK = 512 * 1024                        # 流式块大小
 DEFAULT_ALLOW = ["/tmp", "/data", "/opt", "/home", "/var/tmp", "/backup",
@@ -95,7 +96,12 @@ def _seal(key: bytes, plaintext: bytes) -> bytes:
 
 
 def _open_envelope(key: bytes, body: bytes):
-    """解析请求体：enc 信封 → 明文 obj；否则 HMAC 校验后明文。"""
+    """解析请求体：enc 信封 → 明文 obj；明文必须携带 HMAC sig（强制）。
+
+    安全约定（2026-11-02 安全评审）：HMAC 完整性是**必选项**——不带 sig 的
+    明文请求一律 403（攻击者构造无 sig JSON 绕过完整性校验的路径已封死）。
+    平台 SDK 在 AES 与明文降级两种模式下都签名。
+    """
     try:
         obj = json.loads(body.decode("utf-8"))
     except Exception:
@@ -107,15 +113,19 @@ def _open_envelope(key: bytes, body: bytes):
                                  base64.b64decode(obj["ct"]), None)
         return json.loads(pt.decode("utf-8"))
     sig = None
-    for k in ("sig",):
-        if isinstance(obj, dict) and k in obj:
-            sig = obj.pop(k)
-    if sig is not None:
-        mac = hmac.new(key, json.dumps(obj, sort_keys=True).encode(),
-                       hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(mac, sig):
-            raise PermissionError("HMAC 校验失败")
+    if isinstance(obj, dict) and "sig" in obj:
+        sig = obj.pop("sig")
+    if sig is None:
+        raise PermissionError("缺少 HMAC 签名（明文请求必须携带 sig）")
+    mac = hmac.new(key, json.dumps(obj, sort_keys=True).encode(),
+                   hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(mac, sig):
+        raise PermissionError("HMAC 校验失败")
     return obj
+
+
+class PayloadTooLarge(Exception):
+    pass
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -131,7 +141,11 @@ class Handler(BaseHTTPRequestHandler):
         sys.stdout.flush()
 
     def _respond(self, code: int, obj, raw: bytes = None):
-        """加密响应（AES 可用时），文件流走 raw 直发。"""
+        """加密响应（AES 可用时），文件流走 raw 直发。
+
+        加密封装失败时**不再静默裸奔**：降级明文但强制携带响应 HMAC
+        （body 内嵌 sig），完整性与 token 鉴权永不缺位（安全评审 2026-11-02）。
+        """
         if raw is not None:
             self.send_response(code)
             self.send_header("Content-Type", "application/octet-stream")
@@ -144,7 +158,12 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 body = _seal(AgentState.key, body)
             except Exception:
-                pass  # 极端情况下降级明文 JSON（内网 + token 鉴权仍生效）
+                body = json.dumps(
+                    {**obj, "sig": hmac.new(
+                        AgentState.key,
+                        json.dumps(obj, sort_keys=True).encode(),
+                        hashlib.sha256).hexdigest()},
+                    ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -159,6 +178,18 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         if n <= 0:
             return b""
+        # 请求体上限：/file 上传走分块（512KB/块）、JSON 请求都很小，
+        # 无上限会把内存交给客户端（安全评审：OOM 风险）→ 超限 413。
+        # 超限时先排空（上限 64MB）再响应，客户端才能收到完整 413
+        # 而不是发送中途 EPIPE。
+        if n > MAX_BODY:
+            drained = 0
+            while drained < n and drained < 64 * 1024 * 1024:
+                blk = self.rfile.read(min(256 * 1024, n - drained))
+                if not blk:
+                    break
+                drained += len(blk)
+            raise PayloadTooLarge("请求体 %d 字节超过上限 %d" % (n, MAX_BODY))
         return self.rfile.read(n)
 
     # ---------- 路由 ----------
@@ -176,7 +207,7 @@ class Handler(BaseHTTPRequestHandler):
                         qs[k] = v
             if path in ("/health", "/capabilities"):
                 caps = {
-                    "version": VERSION, "enc": bool(_HAS_AES),
+                    "version": VERSION, "hmac": "required", "enc": bool(_HAS_AES),
                     "algo": "AES-256-GCM" if _HAS_AES else "HMAC-SHA256",
                     "chunk": CHUNK, "python": sys.version.split()[0],
                     "allow_dirs": AgentState.allow_dirs,
@@ -212,6 +243,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._respond(404, {"error": "not found"})
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except PayloadTooLarge as e:
+            self._respond(413, {"error": str(e)[:200]})
         except PermissionError as e:
             self._respond(403, {"error": str(e)})
         except Exception as e:
@@ -229,6 +262,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._file_put()
             else:
                 self._respond(404, {"error": "not found"})
+        except PayloadTooLarge as e:
+            self._respond(413, {"error": str(e)[:200]})
         except PermissionError as e:
             self._respond(403, {"error": str(e)})
         except Exception as e:
@@ -246,9 +281,10 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(400, {"error": "cmd 必填"})
             return
         self._audit("exec: %s" % cmd[:120])
+        # py3.6 兼容：capture_output 是 3.7+ 特性（140 实测），用 PIPE
         try:
-            p = subprocess.run(["bash", "-lc", cmd], capture_output=True,
-                               timeout=timeout)
+            p = subprocess.run(["bash", "-lc", cmd], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=timeout)
             rc, out, err = p.returncode, p.stdout[:MAX_SYNC_OUT], p.stderr[:256 * 1024]
         except subprocess.TimeoutExpired as e:
             rc = 124
@@ -284,6 +320,23 @@ class Handler(BaseHTTPRequestHandler):
 
         start = time.time()
         tail_err = b""
+        # stderr 后台读线程：主循环只读 stdout；若 stderr 写满管道缓冲
+        # 而无人消费，子进程写 stderr 会阻塞 → 整个命令死锁（安全评审）
+        err_buf = []
+
+        def _drain_stderr():
+            try:
+                while True:
+                    b = p.stderr.read(64 * 1024)
+                    if not b:
+                        return
+                    if sum(len(x) for x in err_buf) < 256 * 1024:
+                        err_buf.append(b)
+            except Exception:
+                return
+
+        err_th = threading.Thread(target=_drain_stderr, daemon=True)
+        err_th.start()
         while True:
             if timeout and time.time() - start > timeout:
                 p.kill()
@@ -297,8 +350,9 @@ class Handler(BaseHTTPRequestHandler):
         rest = p.stdout.read()
         if rest:
             send_chunk(rest)
+        err_th.join(timeout=30)
         try:
-            tail_err += (p.stderr.read() or b"")[:128 * 1024]
+            tail_err += b"".join(err_buf)[:128 * 1024]
         except Exception:
             pass
         rc = p.wait()
@@ -353,7 +407,7 @@ class Handler(BaseHTTPRequestHandler):
         import urllib.parse
         path = urllib.parse.unquote(qs.get("path", ""))
         offset = int(qs.get("offset", "0") or 0)
-        gz = qs.get("gz", "0") == "1"
+        use_gz = qs.get("gz", "0") == "1"
         if not path or not AgentState.path_allowed(path):
             raise PermissionError("路径不在白名单: %s" % path)
         if not os.path.isfile(path):
@@ -363,26 +417,26 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("X-File-Size", str(size))
-        if gz:
+        if use_gz:
             self.send_header("X-Content-Gzip", "1")
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
-        self._audit("file-get: %s offset=%d gz=%s" % (path, offset, gz))
+        self._audit("file-get: %s offset=%d gz=%s" % (path, offset, use_gz))
         sent = 0
-        if gz:
+        if use_gz:
             import gzip as _gzip
             gzbuf = b""
             with open(path, "rb") as f:
                 if offset:
                     f.seek(offset)
-                gz = _gzip.GzipFile(mode="wb", fileobj=_ChunkedSink(self), mtime=0)
+                gz_sink = _gzip.GzipFile(mode="wb", fileobj=_ChunkedSink(self), mtime=0)
                 while True:
                     blk = f.read(4 * 1024 * 1024)
                     if not blk:
                         break
-                    gz.write(blk)
+                    gz_sink.write(blk)
                     sent += len(blk)
-                gz.close()
+                gz_sink.close()
         else:
             with open(path, "rb") as f:
                 if offset:

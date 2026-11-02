@@ -96,6 +96,16 @@ window.BKP = (function () {
     var resp = await fetch(url, opt);
     var data = null;
     try { data = await resp.json(); } catch (e) { /* ignore */ }
+    // 会话过期：跳登录页而不是在各处反复报错（用户反馈：保存任务报
+    // 未登录或会话已过期——报一次就应该引导重新登录）
+    if (resp.status === 401 && !/\/login/.test(url)) {
+      window.BKP.toast && window.BKP.toast("登录已过期，请重新登录", "warning");
+      setTimeout(function () {
+        window.location.href = "/login?next=" + encodeURIComponent(
+          window.location.pathname + window.location.search);
+      }, 600);
+      throw new Error("未登录或会话已过期，正在跳转登录页…");
+    }
     if (!resp.ok) throw new Error((data && data.error) || ("请求失败 HTTP " + resp.status));
     return data;
   };

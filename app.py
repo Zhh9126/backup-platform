@@ -15,6 +15,7 @@ import datetime as _dt
 from flask import (Flask, render_template, request, redirect,
                    url_for, session, jsonify)
 
+import logging
 import config
 import core.db as db
 from core import error_codes
@@ -66,7 +67,34 @@ def create_app() -> Flask:
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
     app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "false").lower() == "true"
     app.config["PERMANENT_SESSION_LIFETIME"] = _dt.timedelta(seconds=config.SESSION_TIMEOUT)
+
+    # 会话滑动续期：活跃用户不再中途被踢（用户反馈：保存任务报会话过期）。
+    # 每个带有效会话的请求把过期时间重新拉满。
+    @app.before_request
+    def _touch_session():
+        try:
+            if session.get("uid") or session.get("username"):
+                session.permanent = True
+        except Exception:
+            pass
     db.init_schema()
+    # 启动自愈：上次进程留下的 running 记录在进程消亡时不可能再完成，
+    # 统一标记 failed——否则任务列表永远显示"运行中"、实时日志返回旧
+    # 日志（用户实测 task41 两条 10-26 僵尸 running）
+    try:
+        _n1 = db.execute(
+            "UPDATE backup_records SET status='failed', "
+            "message='服务重启，任务中断（启动自愈自动标记）' "
+            "WHERE status='running'")
+        _n2 = db.execute(
+            "UPDATE restore_records SET status='failed', "
+            "message='服务重启，恢复中断（启动自愈自动标记）' "
+            "WHERE status='running'")
+        if _n1 or _n2:
+            logging.getLogger("aidbm").warning(
+                "启动自愈：清理遗留 running 记录 备份=%s 恢复=%s", _n1, _n2)
+    except Exception:
+        pass
     # RBAC 启动种子：users 表为空时建首个 admin（兼容老部署）
     try:
         from core import rbac as _rbac

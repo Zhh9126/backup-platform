@@ -88,15 +88,28 @@
   }
 
   async function runBackupPrecheck(taskId) {
-    window.BKP.toast("预检中…", "secondary");
+    // 立即弹窗显示进行中状态（用户反馈：第一次点没反应——预检含 SSH/源库
+    // 探测可能 10s+，只 toast 一闪而过会被误认为无响应）
+    const modal = ensureModal();
+    document.getElementById("precheckTitle").innerHTML =
+      `备份预检 · 任务 #${esc(taskId)} <span class="badge bg-secondary">检测中…</span>`;
+    document.getElementById("precheckBody").innerHTML =
+      '<div class="text-center py-4"><div class="spinner-border text-primary"></div>' +
+      '<div class="text-muted mt-2">正在探测：任务配置 / SSH 通道 / 源库连通 / 备份工具 / 存储空间' +
+      '<br><span class="small">远程探测通常需要 5~30 秒，请稍候…</span></div></div>';
+    const go = document.getElementById("precheckGo");
+    go.classList.add("d-none");
+    modal.show();
     let res;
     try {
       res = await api("POST", `/api/tasks/${taskId}/precheck`);
     } catch (e) {
-      window.BKP.toast("预检失败: " + e.message, "danger");
+      document.getElementById("precheckTitle").innerHTML =
+        `备份预检 · 任务 #${esc(taskId)} <span class="badge bg-danger">失败</span>`;
+      document.getElementById("precheckBody").innerHTML =
+        '<div class="alert alert-danger mb-0">预检失败: ' + esc(e.message || String(e)) + "</div>";
       return;
     }
-    const modal = ensureModal();
     document.getElementById("precheckTitle").innerHTML =
       `备份预检 · ${esc(res.task_name || String(taskId))} ${HEAD_BADGE[res.level] || ""}`;
     document.getElementById("precheckBody").innerHTML = renderBody(res);

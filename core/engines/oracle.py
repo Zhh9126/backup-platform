@@ -527,6 +527,29 @@ class OracleEngine(BackupEngine):
         """提供缓存 key 用的主机标识（不重连）。"""
         return {"host_key": f"{self.task.get('host') or ''}:{self.task.get('port') or ''}"}
 
+    def _check_archive_mode(self) -> dict:
+        """预检专用：查 v$database.log_mode（oracledb 直连，native-first）。
+
+        返回 {"mode": "ARCHIVELOG"|"NOARCHIVELOG"|""}，失败带 error。
+        """
+        import oracledb as _odb
+        try:
+            conn = _odb.connect(
+                user=self.task.get("username") or "system",
+                password=db.decrypt_secret(self.task.get("password") or ""),
+                host=self.task.get("host") or "127.0.0.1",
+                port=int(self.task.get("port") or 1521),
+                service_name=self.task.get("db_name") or "orcl",
+                login_timeout=8)
+            cur = conn.cursor()
+            cur.execute("select log_mode from v$database")
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            return {"mode": (row[0] or "").strip() if row else ""}
+        except Exception as e:
+            return {"mode": "", "error": str(e)[:160]}
+
     def _ensure_pdbs_open(self, client) -> str:
         """确保 19c（CDB 架构）下的 PDB 处于 OPEN 状态并保存状态。
 
@@ -956,10 +979,26 @@ class OracleEngine(BackupEngine):
             if rc != 0 or ("Finished backup" not in out_text
                            and "Finished backup" not in err_text):
                 snippet = (out_text or err_text)[-1200:]
+                hint = ""
+                # 常见失败专项指引（错误原文透出 + 可执行处置）
+                if "ORA-19602" in snippet or "NOARCHIVELOG" in snippet:
+                    hint = (
+                        "；处置指引：数据库处于非归档模式，无法对活动数据文件做"
+                        " RMAN 热备。开启归档模式（需短暂重启实例，请 DBA 评估窗口）："
+                        "① sqlplus / as sysdba → "
+                        "② shutdown immediate → "
+                        "③ startup mount → "
+                        "④ alter database archivelog → "
+                        "⑤ alter database open → "
+                        "⑥ 验证：select log_mode from v$database（应为 ARCHIVELOG）；"
+                        "或改用本任务【逻辑备份(expdp)】规避")
+                elif "ORA-01031" in snippet or "insufficient privileges" in snippet:
+                    hint = ("；处置指引：RMAN 需 sysdba 权限，请在任务高级选项配置"
+                            " sysdba 账户或授予该用户 sysdba")
                 return BackupResult(
                     success=False, status=BackupStatus.FAILED,
                     duration_sec=duration, stdout=out_text, stderr=err_text,
-                    message=f"远端 RMAN 物理备份失败(rc={rc}): {snippet}")
+                    message=f"远端 RMAN 物理备份失败(rc={rc}): {snippet}{hint}")
 
             # 3.5) 写远端完成标记：下次重试据此复用备份片，**不重跑 RMAN**
             if not reuse:

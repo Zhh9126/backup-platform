@@ -168,6 +168,28 @@ def precheck_backup(task: dict) -> dict:
                          f"强校验（oracle 用户 touch 探测），与根分区同盘将告警")
             except Exception as e:
                 _add(items, "rman_dir", "unknown", "RMAN 目录预检异常: %s" % str(e)[:100])
+            # Oracle 归档模式检测：NOARCHIVELOG 下 RMAN 无法热备活动数据文件
+            # （ORA-19602，用户环境实测）——提交前阻断并给开启归档指引
+            try:
+                from core.engines.oracle import OracleEngine as _OE
+                _eng = _OE(task)
+                _arch = _eng._check_archive_mode()
+                if _arch.get("mode") == "NOARCHIVELOG":
+                    _add(items, "oracle_archivelog", "fail",
+                         "数据库处于非归档模式，RMAN 热备将失败（ORA-19602）。"
+                         "开启归档：sqlplus / as sysdba → shutdown immediate → "
+                         "startup mount → alter database archivelog → alter database open；"
+                         "或改用逻辑备份(expdp)")
+                elif _arch.get("mode"):
+                    _add(items, "oracle_archivelog", "pass",
+                         "归档模式: %s" % _arch["mode"])
+                else:
+                    _add(items, "oracle_archivelog", "unknown",
+                         "归档模式未能确认（%s）——NOARCHIVELOG 下 RMAN 会失败"
+                         % (_arch.get("error") or "连接受限"))
+            except Exception as e:
+                _add(items, "oracle_archivelog", "unknown",
+                     "归档模式预检异常: %s" % str(e)[:100])
 
     # 5.4) 数据目录卫生（PG 系/金仓 物理备份）：数据目录中存在不属于数据库
     # OS 用户的文件（如 root 落的 .bak）会让 pg_basebackup/sys_basebackup

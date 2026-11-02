@@ -17,6 +17,7 @@
 本模块只依赖标准库，离线打包可用。
 """
 import io
+import json
 import os
 import re
 import gzip
@@ -467,7 +468,18 @@ def classify_columns(columns: List[str]) -> List[dict]:
             "suggested_mask": s["mask"], "why": s["why"],
             "confidence": 0.6, "source": "name",
         })
-    out.sort(key=lambda x: (-x["level"], x["column"]))
+    # 排序键：column 可能是 dict（API 层传 {name, samples} 结构），直接
+    # 比较会 TypeError → 多列分类整体返回空（实测 4 列即崩，单列不触发）
+    def _ckey(x):
+        col = x.get("column")
+        if isinstance(col, str):
+            return col
+        try:
+            return json.dumps(col, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return str(col)
+
+    out.sort(key=lambda x: (-x["level"], _ckey(x)))
     return out
 
 

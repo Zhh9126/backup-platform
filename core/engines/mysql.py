@@ -387,6 +387,7 @@ class MySQLEngine(BackupEngine):
             except Exception:  # noqa: BLE001
                 pass
 
+    @staticmethod
     def _read_xb_checkpoints(path: str) -> dict:
         """读取物理备份产物中的 xtrabackup_checkpoints，返回 key=value 字典。
 
@@ -1987,6 +1988,42 @@ class MySQLEngine(BackupEngine):
                 # verify_sql 内含双引号（SQL 字符串字面量），嵌入 bash 双引号
                 # 参数时必须转义，否则内层引号会被剥掉导致 SQL 语法错误
                 verify_sql_esc = verify_sql.replace('"', '\\"')
+                # 异名落地段：target_db 与源库不同名时，从临时实例导出源库
+                # 并灌入任务源实例的 target_db（本地路径已有同能力，远端
+                # 校验路径此前缺失 → 只报“不在产物中”，171 实测）
+                land_seg = ""
+                _tgt = (target_db or "").strip()
+                _src = (self.task.get("db_name") or "").strip()
+                if _tgt and _tgt != _src:
+                    _pw = (self.task.get("password") or "").replace("'", "'\\''")
+                    _th = shlex.quote(str(self.task.get("host") or "127.0.0.1"))
+                    _tp = int(self.task.get("port") or 3306)
+                    _tu = shlex.quote(str(self.task.get("username") or "root"))
+                    _tq = _tgt.replace("`", "``")
+                    _sq = _src.replace("'", "''")
+                    land_seg = (
+                        f"MD=$(dirname {mysqld_r})/mysqldump; "
+                        f"[ -x \"$MD\" ] || MD=$(command -v mysqldump); "
+                        f"T0=$({mysql_r} --no-defaults -uroot -S {sock} -N -e "
+                        f"\"SELECT COUNT(*) FROM information_schema.tables "
+                        f"WHERE table_schema='{_sq}'\"); "
+                        f"export MYSQL_PWD='{_pw}'; "
+                        f"\"$MD\" --no-defaults -uroot -S {sock} "
+                        f"--single-transaction --routines --triggers --events "
+                        f"'{_sq}' > {rdir}/land.sql 2>{rdir}/land.err "
+                        f"|| {{ echo LAND_DUMP_FAIL; tail -3 {rdir}/land.err; exit 46; }}; "
+                        f"{mysql_r} --no-defaults -h {_th} -P {_tp} -u {_tu} "
+                        f"-e \"CREATE DATABASE IF NOT EXISTS \\`{_tq}\\`\" "
+                        f"|| {{ echo LAND_CREATE_FAIL; exit 47; }}; "
+                        f"{mysql_r} --no-defaults -h {_th} -P {_tp} -u {_tu} '{_tq}' "
+                        f"< {rdir}/land.sql || {{ echo LAND_LOAD_FAIL; exit 48; }}; "
+                        f"D1=$({mysql_r} --no-defaults -h {_th} -P {_tp} -u {_tu} -N -e "
+                        f"\"SELECT COUNT(*) FROM information_schema.tables "
+                        f"WHERE table_schema='{_tq}'\"); "
+                        f"unset MYSQL_PWD; "
+                        f"[ \"$T0\" -gt 0 ] && [ \"$T0\" = \"$D1\" ] "
+                        f"|| {{ echo LAND_COUNT_MISMATCH T0=$T0 D1=$D1; exit 49; }}; "
+                        f"echo LANDED tables=$D1; rm -f {rdir}/land.sql; ")
                 return (
                     f"pkill -f \"^{mysqld_r} .*--datadir={rdir}\" 2>/dev/null; "
                     f"rm -rf {rdir}; mkdir -p {rdir} && tar xzf {rtar} -C {rdir} || exit 41; "
@@ -2007,6 +2044,7 @@ class MySQLEngine(BackupEngine):
                     f"exit 42; fi; "
                     f"{mysql_r} --no-defaults -uroot -S {sock} -N -e \"{verify_sql_esc}\"; "
                     f"rc=$?; "
+                    + land_seg +
                     f"{mysql_r} --no-defaults -uroot -S {sock} -e \"SHUTDOWN\" "
                     f">/dev/null 2>&1; "
                     f"sleep 2; rm -rf {rdir} {rtar} {sock} {sock}.pid {sock}.err; "
@@ -2021,6 +2059,17 @@ class MySQLEngine(BackupEngine):
             if rc != 0:
                 detail = (txt.strip() or v_err_txt.strip())[-600:]
                 raise RuntimeError(f"远端临时实例校验失败(rc={rc}): {detail}")
+            if "LANDED tables=" in txt:
+                try:
+                    _n = txt.split("LANDED tables=")[-1].split()[0]
+                except Exception:
+                    _n = "?"
+                if isinstance(logs, list):
+                    logs.append(
+                        f"[物理恢复] 异名落地完成：源库 {self.task.get('db_name')} "
+                        f"已灌入源实例 {target_db}（表数={_n}）")
+                return (f"异名落地（{self.task.get('db_name')} → {target_db}）",
+                        f"tables={_n}")
             return self._parse_physical_verify(txt, target_db, logs)
         finally:
             # best-effort 清理（异常路径兜底强杀临时实例；锚定 mysqld 路径防自杀匹配）

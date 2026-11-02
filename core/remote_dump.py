@@ -642,6 +642,8 @@ def _resolve_remote_bin(client, tool: str, extra_paths: str = None) -> str | Non
         "/pgdb/pgsql/bin /pgdb/*/bin "
         # Oracle：静默安装常见目录（ORACLE_HOME 可能为 product/版本/dbhome_n 结构）
         "/u01/app/oracle/product/*/*/bin /u01/app/oracle/*/bin /home/oracle/product/*/*/bin "
+        "/opt/oracle/product/*/*/bin /opt/oracle/product/*/*/dbhome_*/bin "
+        "/opt/oracle/*/bin "
         # DM 达梦
         "/dm8/bin /opt/dmdbms/bin /home/dmdba/dmdbms/bin /opt/dm*/bin "
         # 人大金仓（V9 为 KESRealPro/<版本>/Server|ClientTools/bin 布局）

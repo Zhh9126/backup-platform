@@ -955,6 +955,28 @@ class DamengEngine(BackupEngine):
                                 message="恢复产物推送远端失败: " + str(e)[:200])
         scope = " ".join(self._scope_args(extra, target_db=target_db,
                                           include_tables=False))
+        # 异名 schema 恢复前置：dimp 的 SCHEMAS 目标必须已存在（170:5236 实测
+        # 缺失时 rc=2）——用 dmPython 直连创建目标 schema（disql 管道引号
+        # 多层嵌套不可靠，db_migrate 的 dmPython 方式已真机验证）
+        if target_db:
+            _pw2 = db.decrypt_secret(self.task.get("password") or "")
+            try:
+                import dmPython
+                _conn = dmPython.connect(user="SYSDBA", password=_pw2,
+                                         server=self.task.get("host"),
+                                         port=int(self.task.get("port") or 5236),
+                                         login_timeout=5)
+                _cur = _conn.cursor()
+                _cur.execute('CREATE SCHEMA "{0}" AUTHORIZATION "SYSDBA"'
+                             .format(target_db.replace('"', '""')))
+                _cur.close()
+                _conn.close()
+                self.logger.info("[%s] 已创建达梦目标 schema: %s",
+                                 self.task_name, target_db)
+            except Exception as _e:
+                # 已存在（-2108 等）不阻塞；真实错误由 dimp 阶段如实暴露
+                self.logger.info("[%s] 目标 schema 预创建跳过: %s",
+                                 self.task_name, str(_e)[:120])
         # dimp 必须用解析出的绝对路径：root 登录 shell 的 PATH 通常没有
         # dimp（裸命令 rc=127，137 实测），dimp_bin 已在方法头解析
         cmd_parts = [dimp_bin or "dimp", "USERID={0}".format(userid),

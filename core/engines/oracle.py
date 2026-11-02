@@ -301,7 +301,7 @@ class OracleEngine(BackupEngine):
                      f"{shlex.quote(impdp_bin)} {shlex.quote(verify_conn)} "
                      f"DUMPFILE=platform_verify_{ts}.dmp SQLFILE={sqlfile} "
                      # DIRECTORY 为必填：缺省时报 ORA-39145（目录对象不能为空）
-                     f"DIRECTORY=DATA_PUMP_DIR NOLOGFILE=Y {mode_args}")
+                     f"DIRECTORY=DATA_PUMP_DIR NOLOGFILE=Y {mode_args} </dev/null")
             shell = (f"su - {self._resolve_check_user(ssh_host)} -c "
                      f"{shlex.quote(inner)}")
             start = _time.time()
@@ -1098,6 +1098,17 @@ class OracleEngine(BackupEngine):
                     break
             dp_dir = dp_dir or f"/u01/app/oracle/admin/{sid or 'orcl'}/dpdump"
         self.logger.info("[%s] 远端 DATA_PUMP_DIR=%s", self.task_name, dp_dir)
+        # 目录属主健康：DATA_PUMP_DIR 被 root 接管（root mkdir 过）时 oracle
+        # 用户写转储/日志必报 ORA-29283（171 实测）——统一修正属主
+        try:
+            _chk = self._resolve_check_user(ssh_host)
+            _ssh_exec_pipe(client, remote_dump._wrap_login(
+                f"mkdir -p {shlex.quote(dp_dir)} && chown -R "
+                f"{_chk}:oinstall {shlex.quote(dp_dir)} 2>/dev/null; "
+                f"chmod 775 {shlex.quote(dp_dir)}"), timeout=30)
+        except Exception as _e:
+            self.logger.warning("[%s] DATA_PUMP_DIR 属主修正失败: %s",
+                                self.task_name, _e)
         # 固定产物形态：dmp/log 文件名**确定性**（按任务固定，不含随机时间戳），
         # 成功后写完成标记 → 拉回中断时重试直接续传，**不重跑 expdp**。
         tid = int(self.task.get("id") or 0)
@@ -1123,12 +1134,12 @@ class OracleEngine(BackupEngine):
             # 连接串整体单引号包裹：口令可能因含特殊字符而带双引号，
             # 直接拼接会被 shell 吃掉引号。
             f"\"$EXPDP_BIN\" '{conn_easy}' {mode_args} DIRECTORY=DATA_PUMP_DIR "
-            f"DUMPFILE={dmp_name} LOGFILE={log_name}\n"
+            f"DUMPFILE={dmp_name} LOGFILE={log_name} </dev/null\n"
             "RC=$?\n"
             "if [ $RC -ne 0 ]; then\n"
             f"  echo '[fallback] primary expdp failed (rc=$RC), retry with / as sysdba'\n"
             f"  \"$EXPDP_BIN\" \"'/ as sysdba'\" {mode_args} DIRECTORY=DATA_PUMP_DIR "
-            f"DUMPFILE={dmp_name} LOGFILE={log_name}\n"
+            f"DUMPFILE={dmp_name} LOGFILE={log_name} </dev/null\n"
             "  RC=$?\n"
             "fi\n"
             'echo "EXPDP_RC=$RC"\n'
@@ -1338,6 +1349,16 @@ class OracleEngine(BackupEngine):
                 return BackupResult(
                     success=False, status=BackupStatus.FAILED,
                     message="无法在远端解析 DATA_PUMP_DIR 实际路径，恢复中止")
+            # 导入目录属主修正（root 接管时 impdp 写日志报 ORA-29283，171 实测）
+            try:
+                from core.engines.file import _ssh_exec_pipe as _sep_rst
+                _chk = self._resolve_check_user(target_host_info)
+                _sep_rst(client, remote_dump._wrap_login(
+                    f"mkdir -p {shlex.quote(dp_dir)} && chown -R "
+                    f"{_chk}:oinstall {shlex.quote(dp_dir)} 2>/dev/null; "
+                    f"chmod 775 {shlex.quote(dp_dir)}"), timeout=30)
+            except Exception:
+                pass
 
             # 1) 上传 dmp 到服务端导入目录
             sftp = client.open_sftp()
@@ -1360,7 +1381,7 @@ class OracleEngine(BackupEngine):
                 mode_args = self._dp_mode_args(for_import=True)[0]
                 inner = (f"export PATH=$ORACLE_HOME/bin:$PATH; "
                          f"{shlex.quote(impdp_bin)} {shlex.quote(restore_conn)} "
-                         f"DUMPFILE={dmp_name} LOGFILE={log_name} "
+                         f"DUMPFILE={dmp_name} LOGFILE={log_name} </dev/null "
                          f"DIRECTORY=DATA_PUMP_DIR "
                          f"TABLE_EXISTS_ACTION=REPLACE {mode_args}")
                 shell = (f"su - {self._resolve_check_user(target_host_info)} -c "

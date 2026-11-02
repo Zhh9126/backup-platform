@@ -479,10 +479,35 @@ class PostgreSQLEngine(BackupEngine):
         sftp = client.open_sftp()
         logs = [f"[PG 物理恢复] 产物: {backup_path}"]
         try:
-            remote_dump.sftp_put_resumable(
-                client, backup_path, rtar,
-                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
-                label="PG 物理恢复产物推送")
+            def _push_and_verify(local_p, remote_p, label):
+                """推送 + 大小/sha 对账（半包会让远端 tar 解包失败伪装成
+                其他错误——实测 171 重启后 SFTP 不稳，必须显式对账）。"""
+                remote_dump.sftp_put_resumable(
+                    client, local_p, remote_p,
+                    rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                    label=label)
+                _lsize = os.path.getsize(local_p)
+                _st, _e2, _rc2 = _ssh_exec_pipe(
+                    client, remote_dump._wrap_login(
+                        f"stat -c %s {shlex.quote(remote_p)}; "
+                        f"sha256sum {shlex.quote(remote_p)} | awk '{{print $1}}'"),
+                    timeout=60)
+                _txt = _st.decode("utf-8", "replace") if isinstance(_st, bytes) else (_st or "")
+                _lines = [l.strip() for l in _txt.splitlines() if l.strip()]
+                if not _lines or int(_lines[0] or 0) != _lsize:
+                    raise RuntimeError(
+                        f"{label} 上传不完整（本地 {_lsize} 字节 / 远端 "
+                        f"{_lines[0] if _lines else '无'}）——请检查两端磁盘与网络后重试")
+                import hashlib as _hl
+                _lsha = _hl.sha256()
+                with open(local_p, "rb") as _f:
+                    for _b in iter(lambda: _f.read(64 * 1024 * 1024), b""):
+                        _lsha.update(_b)
+                if len(_lines) > 1 and _lines[1] != _lsha.hexdigest():
+                    raise RuntimeError(f"{label} 上传内容校验不一致（sha256 不匹配）"
+                                       "——远端残件已清理，请重试")
+
+            _push_and_verify(backup_path, rtar, "PG 物理恢复产物推送")
             # WAL tar（pg_basebackup -X 产出 base.tar.gz + pg_wal.tar.gz 两包，
             # 金仓为 sys_wal.tar.gz；恢复必须带上 WAL，否则
             # "could not locate required checkpoint record"）
@@ -496,10 +521,7 @@ class PostgreSQLEngine(BackupEngine):
                     break
             if wal_local:
                 rtar_wal = (stage + f"/pg_restore_t{tid}_{ts}_pgw.tar.gz")
-                remote_dump.sftp_put_resumable(
-                    client, wal_local, rtar_wal,
-                    rate_kbps=int(self.task.get("bandwidth_limit") or 0),
-                    label="PG 物理恢复 WAL 推送")
+                _push_and_verify(wal_local, rtar_wal, "PG 物理恢复 WAL 推送")
             pw_plain = db.decrypt_secret(self.task.get("password") or "")
             script = f"""#!/bin/bash
 pkill -f "pg_ctl.*{rdir}" 2>/dev/null
@@ -507,13 +529,15 @@ pkill -f "postgres.*-D {rdir}" 2>/dev/null
 rm -rf {shlex.quote(rdir)}
 mkdir -p {shlex.quote(rdir)} && tar xzf {shlex.quote(rtar)} -C {shlex.quote(rdir)} || {{ echo EXTRACT_FAIL; exit 41; }}
 chmod 700 {shlex.quote(rdir)}
-chown -R {os_user} {shlex.quote(rdir)}
 # 从备份启动必须显式进入恢复模式（backup_label 存在时无 recovery.signal
 # 会拒绝启动）
 touch {shlex.quote(rdir)}/recovery.signal
 if [ -n "{rtar_wal}" ]; then
   mkdir -p {shlex.quote(rdir)}/{self._restore_wal_dir} && tar xzf {shlex.quote(rtar_wal)} -C {shlex.quote(rdir)}/{self._restore_wal_dir} || {{ echo WAL_EXTRACT_FAIL; exit 45; }}
 fi
+# 属主修正必须在**全部解包之后**：root 解包的 WAL 文件若不 chown，
+# 数据库进程打开时 PANIC Permission denied（171 实测）
+chown -R {os_user} {shlex.quote(rdir)}
 printf 'local all all trust\\n' > {shlex.quote(rdir)}/pg_hba_restore.conf
 su - {os_user} -c "{ctl} -D {rdir} -o \\"-p {port} -c listen_addresses='' -c unix_socket_directories={rdir} -c hba_file={rdir}/pg_hba_restore.conf -c restore_command=/bin/false -c recovery_target=immediate -c recovery_target_action=promote\\" -l {rdir}/pg_restore.log -w -t 60 start" >/dev/null 2>&1
 ok=0; i=0
@@ -522,7 +546,7 @@ while [ $i -lt 60 ]; do
   su - {os_user} -c "{psql} -h {rdir} -p {port} -U {self.task.get('username') or 'postgres'} -d $probe_db -tAc 'SELECT 1'" >/dev/null 2>&1 && {{ ok=1; break; }}
   i=$((i+1)); sleep 1
 done
-if [ $ok -ne 1 ]; then echo PG_START_FAIL; tail -10 {rdir}/pg_restore.log 2>/dev/null; exit 42; fi
+if [ $ok -ne 1 ]; then echo PG_START_FAIL; tail -6 {rdir}/pg_restore.log 2>/dev/null; tail -10 $(ls -t {rdir}/sys_log/*.log 2>/dev/null | head -1) 2>/dev/null; exit 42; fi
 dbs=$(su - {os_user} -c "{psql} -h {rdir} -p {port} -U {self.task.get('username') or 'postgres'} -d $probe_db -tAc 'SELECT count(*) FROM pg_database'")
 tn=$(su - {os_user} -c "{psql} -h {rdir} -p {port} -U {self.task.get('username') or 'postgres'} -d {src_db} -tAc \\"SELECT count(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema')\\"" 2>/dev/null)
 echo "PG_VERIFY dbs=$dbs taskdb={{{src_db}}} tables=$tn"
@@ -555,6 +579,15 @@ exit 0
             if rc != 0:
                 detail = (txt.strip() or (err.decode("utf-8", "replace")
                           if isinstance(err, bytes) else (err or "")).strip())[-700:]
+                # 失败现场清理：临时实例进程 + 解包目录 + 推送残件
+                try:
+                    _ssh_exec_pipe(client, remote_dump._wrap_login(
+                        f"pkill -f 'postgres.*-D {shlex.quote(rdir)}' 2>/dev/null; "
+                        f"rm -rf {shlex.quote(rtar)} "
+                        f"{shlex.quote(rtar_wal or rtar)} {shlex.quote(rdir)}.sh"),
+                        timeout=60)
+                except Exception:
+                    pass
                 return BackupResult(
                     success=False, status=BackupStatus.FAILED,
                     backup_path=backup_path, simulated=False,
@@ -588,6 +621,14 @@ exit 0
                 success=True, status=BackupStatus.SUCCESS,
                 backup_path=backup_path, simulated=False, message=msg)
         except Exception as e:
+            # 异常路径兜底清理（半包/残件/临时实例进程）
+            try:
+                _ssh_exec_pipe(client, remote_dump._wrap_login(
+                    f"pkill -f 'postgres.*-D {shlex.quote(rdir)}' 2>/dev/null; "
+                    f"rm -rf {shlex.quote(rtar)} "
+                    f"{shlex.quote(rdir)}.sh"), timeout=60)
+            except Exception:
+                pass
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,
                 backup_path=backup_path, simulated=False,

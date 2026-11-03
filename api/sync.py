@@ -61,7 +61,8 @@ def create_task():
              "schedule_type", "cron_expr", "interval_minutes",
              "column_mapping", "source_tables_list", "flink_config",
              "batch_size", "error_threshold", "enabled", "realtime_enabled",
-             "full_db_migrate", "validate_before_run", "verify_after_run"}
+             "full_db_migrate", "validate_before_run", "verify_after_run",
+             "exclude_tables"}
     unknown = [k for k in data.keys() if k not in known]
     # 类型校验：必须是同步插件注册表里的库型（前端下拉也只给这些），
     # 否则任务建出来一跑就失败，且错误信息离根因很远。
@@ -353,7 +354,8 @@ def _prepare_payload(data: dict) -> dict:
         if k in data:
             payload[k] = data[k]
     # JSON / 列表字段
-    for k in ["column_mapping", "source_tables_list", "flink_config"]:
+    for k in ["column_mapping", "source_tables_list", "flink_config",
+              "exclude_tables"]:
         if k in data:
             v = data[k]
             payload[k] = json.dumps(v, ensure_ascii=False) if v is not None else None

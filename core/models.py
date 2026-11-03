@@ -690,7 +690,7 @@ SYNC_FIELDS = [
     "full_db_migrate", "validate_before_run", "verify_after_run",
     "precheck_sample_rows", "realtime_watermark",
     "schedule_type", "cron_expr", "interval_minutes", "enabled", "status",
-    "message",
+    "message", "exclude_tables",
 ]
 
 
@@ -722,15 +722,16 @@ def _decorate_sync(row: dict) -> dict:
             (row["source_task_id"],))
         row["source_task_name"] = name["name"] if name else None
     # JSON 字段反序列化，方便前端/执行器直接使用
-    for k in ("column_mapping", "source_tables_list", "flink_config"):
+    for k in ("column_mapping", "source_tables_list", "flink_config",
+              "exclude_tables"):
         v = row.get(k)
         if isinstance(v, str) and v.strip():
             try:
                 row[k] = json.loads(v)
             except Exception:
-                row[k] = [] if k in ("column_mapping", "source_tables_list") else {}
+                row[k] = {} if k == "flink_config" else []
         elif v is None:
-            row[k] = [] if k in ("column_mapping", "source_tables_list") else {}
+            row[k] = {} if k == "flink_config" else []
     return row
 
 

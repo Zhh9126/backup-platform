@@ -212,6 +212,11 @@
                   <label class="form-label">容错条数（0=不容错）</label>
                   <input type="number" class="form-control" id="errorThreshold" value="0" min="0">
                 </div>
+                <div class="col-md-12">
+                  <label class="form-label">排除表清单（全库/多表模式生效，逗号分隔——对标 KDTS「排除指定表」）</label>
+                  <input type="text" class="form-control font-monospace" id="excludeTables"
+                         placeholder="如 log_2023, tmp_bak, arc_2024">
+                </div>
               </div>
 
               <hr class="my-4">

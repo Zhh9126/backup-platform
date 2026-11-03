@@ -4185,6 +4185,8 @@
       $("s_cron_expr").value = task.cron_expr || "";
       $("s_interval_minutes").value = task.interval_minutes || 60;
       $("s_enabled").checked = !!task.enabled;
+      if ($("s_exclude_tables")) $("s_exclude_tables").value =
+        (task.exclude_tables || []).join(", ");
     } else {
       $("syncModalTitle").textContent = "新建同步任务";
       $("s_id").value = "";
@@ -4193,6 +4195,7 @@
       $("s_enabled").checked = true;
       $("s_src_db_type").value = "mysql";
       $("s_tgt_db_type").value = "mysql";
+      if ($("s_exclude_tables")) $("s_exclude_tables").value = "";
     }
     $("s_source_type").dispatchEvent(new Event("change"));
     $("s_schedule_type").dispatchEvent(new Event("change"));
@@ -4223,6 +4226,8 @@
       cron_expr: $("s_cron_expr").value,
       interval_minutes: num($("s_interval_minutes").value),
       enabled: $("s_enabled").checked ? 1 : 0,
+      exclude_tables: ($("s_exclude_tables") && $("s_exclude_tables").value || "")
+        .split(",").map((s) => s.trim()).filter(Boolean),
     };
     if (!data.name) { toast("请填写同步任务名称", "danger"); return; }
     if (stype === "manual" && (!data.src_db_type || !data.src_host)) { toast("请填写源数据库类型与主机", "danger"); return; }

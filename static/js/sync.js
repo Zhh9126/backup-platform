@@ -192,6 +192,7 @@
     $("tgtDbName").value = t.tgt_db_name || "";
     $("tgtSchema").value = t.tgt_schema || "";
     $("targetTable").value = t.target_table || "";
+    if ($("excludeTables")) $("excludeTables").value = (t.exclude_tables || []).join(", ");
     $("batchSize").value = t.batch_size || 1000;
     $("sourceWhere").value = t.source_where || "";
     $("incrementalColumn").value = t.incremental_column || "";
@@ -469,6 +470,8 @@
       cron_expr: $("cronExpr").value.trim(),
       interval_minutes: $("intervalMinutes").value ? parseInt($("intervalMinutes").value) : null,
       enabled: 1,
+      exclude_tables: $("excludeTables") ? ($("excludeTables").value || "")
+        .split(",").map(function (s) { return s.trim(); }).filter(Boolean) : [],
     };
   }
 

@@ -1934,6 +1934,7 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                 ("validate_before_run", "INTEGER DEFAULT 0"),
                 ("verify_after_run", "INTEGER DEFAULT 0"),
                 ("precheck_sample_rows", "INTEGER DEFAULT 20"),
+                ("exclude_tables", "TEXT"),   # JSON 排除表清单（对标 KDTS「排除指定表」）
             ]:
                 try:
                     conn.execute(f"ALTER TABLE sync_tasks ADD COLUMN {col} {typedef}")

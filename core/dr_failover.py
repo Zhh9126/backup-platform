@@ -96,15 +96,27 @@ def _rejoin_as_replica(host, port, user, password,
                 cur.execute(stmt)
             except Exception:
                 pass
+        # 转从即恢复只读（+super）：防止降级过程中/之后出现第二个写入点
+        # （split-brain 防线；failback 双向使用——旧主本就 frozen，现主
+        # 降级时由此上锁。170/171 容灾 E2E 实测暴露只读未恢复）
+        for stmt in ("SET GLOBAL super_read_only=1", "SET GLOBAL read_only=1"):
+            try:
+                cur.execute(stmt)
+            except Exception:
+                pass
         cur.execute(
             "CHANGE REPLICATION SOURCE TO SOURCE_HOST=%s, SOURCE_PORT=%s, "
             "SOURCE_USER=%s, SOURCE_PASSWORD=%s, SOURCE_AUTO_POSITION=1, "
             "GET_SOURCE_PUBLIC_KEY=1",
             (master_host, int(master_port), repl_user, repl_password))
         cur.execute("START REPLICA")
-        # 等待追平（最多 60s）
+        # 等待追平（最多 60s）。注意：Seconds_Behind=NULL 表示 IO 线程尚未
+        # 连上（复制没跑起来），**不能当成已追平**——此前 `behind == 0 or
+        # behind is None` 在 SQL=Yes/IO=Connecting 窗口内立即误判追平，
+        # 切换期写入实际未到达旧主（170/171 容灾 E2E 实测暴露）
         deadline = time.time() + 60
         behind = None
+        io_sql = ""
         while time.time() < deadline:
             cur.execute("SHOW REPLICA STATUS")
             row = cur.fetchone()
@@ -114,10 +126,15 @@ def _rejoin_as_replica(host, port, user, password,
                 io_ok = (d.get("Replica_IO_Running") or d.get("Slave_IO_Running")) == "Yes"
                 sql_ok = (d.get("Replica_SQL_Running") or d.get("Slave_SQL_Running")) == "Yes"
                 behind = d.get("Seconds_Behind_Source")
-                if io_ok and sql_ok and (behind == 0 or behind is None):
+                io_sql = "%s/%s" % (d.get("Replica_IO_Running"),
+                                    d.get("Replica_SQL_Running"))
+                if io_ok and sql_ok and behind == 0:
                     return {"caught_up": True, "seconds_behind": behind}
             time.sleep(2)
-        return {"caught_up": False, "seconds_behind": behind}
+        raise FailoverError(
+            "旧主 rejoin 追平失败（60s 内 IO/SQL 未达 Yes/Yes 且 behind=0，"
+            "当前 %s，behind=%s）——复制未真正追平，拒绝继续回切以防数据缺失"
+            % (io_sql or "无状态", behind))
     finally:
         try:
             conn.close()
@@ -339,7 +356,10 @@ class FailoverEngine:
         t0 = time.monotonic()
         pc = self.primary      # 原（旧）主——即将重新提升
         sc = self.standby      # 现主（failover 后）
-        repl = self.cfg.get("replication_user") or {}
+        # replication_user 密码同为密文存储，必须解密——否则密文被当明文
+        # 传给 CHANGE REPLICATION SOURCE，MySQL 8 报 3056（超 32 字符）
+        # （170/171 容灾 E2E 实测暴露）
+        repl = _decrypt_conn(self.cfg.get("replication_user") or {})
 
         # 步骤 0：GTID 分叉检测——旧主 rejoin 前必须确认其已执行事务集是
         # 现主的子集（即旧主在切换后**没有**出现独立写入）。存在分叉时

@@ -4,6 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}AIDBM · AI 原生智能数据库灾备管理平台{% endblock %}</title>
+  <!-- 防菜单点击"闪一下"：整页跳转时 CSS 文件就绪前，侧栏/页面底色先以内联
+       关键样式呈现（与 app.css 设计令牌一致），消除深色侧栏区域的白闪 -->
+  <style>
+    html { background: #F8FAFC; }
+    .sidebar { background: #1E293B; color: #CBD5E1; }
+    .sidebar .nav-link { color: #CBD5E1; }
+    .sidebar .brand-text .brand-name { color: #FFFFFF; }
+  </style>
   <link href="/static/css/bootstrap.min.css?v=2026080210" rel="stylesheet">
   <link href="/static/vendor/bootstrap-icons/bootstrap-icons.css?v=2026081401" rel="stylesheet">
   <link href="/static/css/app.css?v=2026110201" rel="stylesheet">
@@ -15,6 +23,18 @@
   </button>
   <div id="jsErrorBox" style="display:none;position:fixed;top:0;left:0;right:0;z-index:99999;background:#dc2626;color:#fff;padding:8px 16px;font-size:13px;font-family:monospace;white-space:pre-wrap;max-height:200px;overflow:auto;"></div>
   <div class="layout" id="layout">
+    <script>
+      /* 同步应用侧栏折叠记忆：若等 DOMContentLoaded 才折叠，页面会先以展开态
+         渲染再瞬间收起（菜单"闪一下"）。解析期同步加类，首帧即是最终态。 */
+      (function () {
+        try {
+          if (!window.matchMedia("(max-width: 992px)").matches &&
+              localStorage.getItem("sidebar-collapsed-v2") === "1") {
+            document.getElementById("layout").classList.add("sidebar-collapsed");
+          }
+        } catch (e) { /* 忽略 */ }
+      })();
+    </script>
     <div class="sidebar-overlay" id="sidebarOverlay" aria-hidden="true"></div>
     <aside class="sidebar">
       <div class="brand">

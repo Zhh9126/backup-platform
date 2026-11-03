@@ -723,15 +723,15 @@ def _decorate_sync(row: dict) -> dict:
         row["source_task_name"] = name["name"] if name else None
     # JSON 字段反序列化，方便前端/执行器直接使用
     for k in ("column_mapping", "source_tables_list", "flink_config",
-              "exclude_tables"):
+              "exclude_tables", "type_mapping"):
         v = row.get(k)
         if isinstance(v, str) and v.strip():
             try:
                 row[k] = json.loads(v)
             except Exception:
-                row[k] = {} if k == "flink_config" else []
+                row[k] = {} if k in ("flink_config", "type_mapping") else []
         elif v is None:
-            row[k] = {} if k == "flink_config" else []
+            row[k] = {} if k in ("flink_config", "type_mapping") else []
     return row
 
 

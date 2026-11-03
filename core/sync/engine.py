@@ -106,6 +106,7 @@ def _task_to_config(task: Dict[str, Any]) -> SyncConfig:
         sync_mode=_norm_mode(task.get("sync_mode"), _SYNC_MODE_ALIASES, "full"),
         save_mode=_norm_mode(task.get("save_mode"), _SAVE_MODE_ALIASES, "append"),
         column_mapping=task.get("column_mapping") or [],
+        type_mapping=task.get("type_mapping") or {},
         field_ide=task.get("field_ide") or "origin",
         incremental_column=task.get("incremental_column", ""),
         incremental_value=task.get("incremental_value", ""),

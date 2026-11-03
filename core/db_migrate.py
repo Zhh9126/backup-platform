@@ -661,6 +661,8 @@ class DbMigrationEngine:
             "verify_after_run": False,
             "skip_tables": skip_tables,
             "exclude_tables": exclude_tables,
+            # 自定义类型映射覆盖（对标 KDTS）：extra.type_mapping={"源类型":"目标类型"}
+            "type_mapping": extra.get("type_mapping") or {},
         }
         started = time.monotonic()
         res = run_sync_task_with_task(synthetic_task)

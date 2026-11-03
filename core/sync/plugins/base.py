@@ -47,6 +47,7 @@ class SyncConfig:
     sync_mode: str = "full"              # full | incremental | realtime
     save_mode: str = "append"            # append | overwrite | upsert | create_if_not_exists
     column_mapping: List[Dict[str, Any]] = field(default_factory=list)
+    type_mapping: Dict[str, str] = field(default_factory=dict)  # 自定义源类型→目标类型覆盖（对标 KDTS 类型映射自定义）
     field_ide: str = "origin"            # origin | upper | lower | camel | underscore
     incremental_column: str = ""
     incremental_value: str = ""
@@ -99,6 +100,14 @@ def matrix_suggest(config, tgt_db: str, type_str: str) -> Optional[str]:
     类型；未识别或目标库明确不支持（level=fail）时返回 None，由调用方保留兜底。
     """
     src = getattr(config, "src_db_type", "") or ""
+    # 自定义类型映射覆盖（对标 KDTS）：type_mapping={"源类型base":"目标类型"} 命中即直取，
+    # 大小写不敏感、支持裸类型名（decimal → NUMBER(10,2) 这种带精度的目标写法也可）
+    _tm = getattr(config, "type_mapping", None) or {}
+    if _tm:
+        base = (type_str or "").split("(")[0].strip().lower()
+        for k, v in _tm.items():
+            if k.split("(")[0].strip().lower() == base:
+                return v
     try:
         from core.sync.type_matrix import map_type
         r = map_type(src, tgt_db, type_str)

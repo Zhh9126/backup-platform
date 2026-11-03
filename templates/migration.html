@@ -119,6 +119,12 @@
           <input class="form-control font-monospace" id="dm_exclude_tables"
                  placeholder="如 log_2023, tmp_bak, arc_2024">
         </div>
+        <div class="mt-2">
+          <label class="form-label">自定义类型映射（可选，JSON——源类型→目标类型，对标 KDTS 类型映射自定义）</label>
+          <input class="form-control font-monospace" id="dm_type_mapping"
+                 placeholder='如 {"decimal":"NUMBER(10,2)", "varchar":"CLOB"}'>
+          <div class="small text-muted">命中即覆盖默认类型矩阵；类型名大小写不敏感、匹配裸类型名（不含精度）。</div>
+        </div>
         <div class="mt-2"><label class="form-label">备注</label>
           <input class="form-control" id="dm_note" placeholder="迁移原因 / 时间窗口等"></div>
       </div>

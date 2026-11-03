@@ -7700,10 +7700,16 @@
         triggers: $("dm_o_triggers").checked };
       const excl = ($("dm_exclude_tables").value || "").split(",")
         .map((s) => s.trim()).filter(Boolean);
-      if (Object.values(mo).some(Boolean) || excl.length) {
+      let typeMapping = null;
+      try {
+        if (($("dm_type_mapping").value || "").trim())
+          typeMapping = JSON.parse($("dm_type_mapping").value);
+      } catch (e) { toast("类型映射不是合法 JSON", "warning"); return; }
+      if (Object.values(mo).some(Boolean) || excl.length || typeMapping) {
         payload.extra_options = {};
         if (Object.values(mo).some(Boolean)) payload.extra_options.migrate_objects = mo;
         if (excl.length) payload.extra_options.exclude_tables = excl;
+        if (typeMapping) payload.extra_options.type_mapping = typeMapping;
       }
       if (!payload.name) { toast("请填写计划名称", "warning"); return; }
       if (!payload.src_host || !payload.src_db_name) { toast("请填写源端主机与数据库", "warning"); return; }

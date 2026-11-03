@@ -3914,7 +3914,7 @@
         const h = hosts.find((x) => Number(x.id) === Number(hid));
         return h ? h.name : (hid ? "#" + hid : "本机(SSH)");
       };
-      tb.innerHTML = tasks.map((t) => {
+      tb.innerHTML = tasks.map((t, i) => {
         const st = t.last_status || "never";
         const badge = st === "synced" ? '<span class="badge badge-ok">已同步</span>'
           : st === "no_change" ? '<span class="badge bg-secondary">无变更</span>'
@@ -3922,7 +3922,7 @@
           : st === "failed" ? '<span class="badge badge-fail" title="' + esc(t.last_error || "") + '">失败</span>'
           : '<span class="badge bg-secondary">未运行</span>';
         return `<tr>
-          <td>${t.id}</td>
+          <td>${i + 1}</td>
           <td><strong>${esc(t.name)}</strong>${t.enabled ? "" : ' <span class="badge bg-secondary">停用</span>'}</td>
           <td class="small">${esc(hostName(t.ssh_host_id))}</td>
           <td class="small text-truncate" style="max-width:220px" title="${esc((t.src_paths || []).join("\n"))}">${esc((t.src_paths || []).join(", "))}</td>

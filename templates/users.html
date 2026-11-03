@@ -111,7 +111,7 @@
 
   function render(){
     const tb=$("#tbody"); tb.innerHTML="";
-    list.forEach(u=>{
+    list.forEach((u,i)=>{
       const tr=document.createElement("tr");
       const status=u.enabled?'<span class="badge bg-success">启用</span>':'<span class="badge bg-warning text-dark">停用</span>';
       const roleBadge={
@@ -121,7 +121,7 @@
       }[u.role]||`<span class="badge bg-secondary">${u.role}</span>`;
       const must=u.must_change_password?'<i class="bi bi-key text-warning ms-1" title="登录后须改密"></i>':"";
       tr.innerHTML=`
-        <td>${u.id}</td>
+        <td>${i+1}</td>
         <td><code>${u.username}</code>${must}</td>
         <td>${u.display_name||""}</td>
         <td>${roleBadge}</td>

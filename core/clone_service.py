@@ -468,7 +468,8 @@ class CloneService:
         res = restore_extras.verify_clone_conn(
             vdb.get("db_type"), vdb.get("host") or "127.0.0.1",
             vdb.get("port"), vdb.get("database_name"), vdb.get("username"),
-            password=password)
+            password=password,
+            service=vdb.get("service") or "")
         self.logger.info("[clone] 请求 #%s 校验: %s", request_id, res.get("message"))
         return res
 

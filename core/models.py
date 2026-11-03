@@ -1353,6 +1353,10 @@ _DISASTER_LINK_FIELDS = [
     "consistency_result", "note", "enabled",
     # UX-20260801 模块 D：数据源引用（sync_task | rt_task | manual）
     "source_kind", "source_id",
+    # P1-1：切换配置/切换历史（create 路径此前被白名单丢弃——
+    # 只有 PUT failover-config 端点能写入，创建时带配置会被静默吞掉，
+    # 170/171 自动切换真机 E2E 实测暴露）
+    "failover_config", "failover_history",
 ]
 
 # 容灾链路允许的数据源类型

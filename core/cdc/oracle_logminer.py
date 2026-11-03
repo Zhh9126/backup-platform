@@ -483,8 +483,8 @@ class OracleLogMinerDaemon(PollingLogMinerDaemon):
     def _contents_sql(self) -> str:
         """构造 ``V$LOGMNR_CONTENTS`` 查询（排除系统 Schema，拍板 Q5）。
 
-        P1-2：追加 ``XIDUSN.XIDSLT.XIDSEQ`` 拼接为 xid，供事务级精准还原
-        按事务聚合（11g/19c 均有这三列，版本安全）。
+        P1-2：追加 ``XIDUSN.XIDSLT.XIDSQN`` 拼接为 xid，供事务级精准还原
+        按事务聚合（129 19c 真机核实列名为 XIDSQN；11g 同名，见 V$TRANSACTION 体系）。
         """
         ops = ", ".join(f"'{op}'" for op in self.CAPTURED_OPERATIONS)
         owners = ", ".join(f"'{name}'" for name in self.EXCLUDED_SCHEMAS)
@@ -492,7 +492,7 @@ class OracleLogMinerDaemon(PollingLogMinerDaemon):
             "SELECT SCN, TIMESTAMP, SEG_OWNER, TABLE_NAME, OPERATION, "
             "SQL_REDO, SQL_UNDO, "
             "TRIM(TO_CHAR(XIDUSN)) || '.' || TRIM(TO_CHAR(XIDSLT)) || '.' || "
-            "TRIM(TO_CHAR(XIDSEQ)) "
+            "TRIM(TO_CHAR(XIDSQN)) "
             "FROM V$LOGMNR_CONTENTS "
             f"WHERE OPERATION IN ({ops}) "
             f"AND (SEG_OWNER IS NULL OR SEG_OWNER NOT IN ({owners})) "

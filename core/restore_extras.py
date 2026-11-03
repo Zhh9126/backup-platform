@@ -473,13 +473,41 @@ def drop_clone(db_type: str, instance_name: str,
 
 
 def verify_clone_conn(db_type: str, host: str, port, database: str, user: str,
-                      password: str = "") -> Dict[str, Any]:
+                      password: str = "", service: str = "") -> Dict[str, Any]:
     """克隆库就绪校验：远程连接探活 + 统计表数量。
 
     返回 {ok, message, tables}。ok=False 时 message 带原因（连不上/库不存在等）。
+    Oracle：database 传 schema 名（克隆出的用户），按 all_tables 统计该 owner 表数。
     """
     env = os.environ.copy()
     host = host or "127.0.0.1"
+    if db_type == "oracle":
+        try:
+            import oracledb
+        except ImportError:
+            return {"ok": False, "tables": 0,
+                    "message": "Oracle 校验需要 oracledb 驱动（镜像已内置）"}
+        dsn = f"{host}:{port or 1521}/{service or 'ORCL'}"
+        try:
+            conn = oracledb.connect(user=user or "system", password=password,
+                                    dsn=dsn, tcp_connect_timeout=10)
+        except TypeError:
+            conn = oracledb.connect(user=user or "system", password=password, dsn=dsn)
+        except Exception as e:
+            return {"ok": False, "tables": 0,
+                    "message": f"连接失败: {str(e)[:200]}"}
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT COUNT(*) FROM all_tables WHERE owner = UPPER(:owner)",
+                {"owner": database or ""})
+            tables = int(cur.fetchone()[0] or 0)
+            return {"ok": True,
+                    "message": f"连接正常，schema {database} 共 {tables} 张表",
+                    "tables": tables}
+        finally:
+            cur.close()
+            conn.close()
     if db_type in ("mysql", "mariadb"):
         if password:
             env["MYSQL_PWD"] = password

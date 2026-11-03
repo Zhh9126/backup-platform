@@ -7382,6 +7382,8 @@
 
   // ======================= 容灾链路 HA（Phase 3 / T10） =======================
   let linkModalInst = null;
+  let drAutoModalInst = null, drWizardModalInst = null;   // P1-1 自动策略/切换向导
+  let drFailCfgModalInst = null;                          // P1-1 切换引擎配置
   // 数据源缓存：{kind, id, name, status, primary_site, dr_site, db_type, rt_mode, rpo_sec}
   let LINK_SOURCES = [];
   let LINK_SELECTED_SRC = null;
@@ -7631,6 +7633,186 @@
     }
   };
 
+  // ---- P1-1：自动切换策略 + 可视化切换向导 ----
+  let DR_MONITOR_STATE = {};
+
+  /** 卡片上的自动策略状态徽章：开启且告警中→红色；开启正常→绿色；未开→无。 */
+  function drAutoBadge(l, states) {
+    const st = states[String(l.id)];
+    if (!st) return '';
+    if (st.alerted) return ' <span class="badge bg-danger" title="主库连续探测失败，已告警待人工确认"><i class="bi bi-exclamation-triangle"></i> 告警中</span>';
+    if (st.auto_running) return ' <span class="badge badge-run" title="正在自动执行容灾切换">自动切换中</span>';
+    if (st.auto_failover_error) return ' <span class="badge badge-fail" title="自动切换失败: ' + esc(st.auto_failover_error) + '">自动失败</span>';
+    return ' <span class="badge badge-ok" title="自动探测开启 · ' + esc(st.last_check_at || '') + '"><i class="bi bi-activity"></i> 自动</span>';
+  }
+
+  // 切换引擎配置：主备连接 / 复制账号 / DNS（密码加密存储，回显掩码）
+  window.openFailCfg = async function (id) {
+    $("dfc_link_id").value = id;
+    try {
+      const d = await api("GET", `/api/disaster-links/${id}/failover-config`);
+      const p = d.primary_conn || {}, s = d.standby_conn || {};
+      $("dfc_p_host").value = p.host || "";
+      $("dfc_p_port").value = p.port || 3306;
+      $("dfc_p_user").value = p.user || "";
+      $("dfc_p_password").value = "";
+      $("dfc_p_password").placeholder = p.has_password ? "已保存（留空保留）" : "密码";
+      $("dfc_s_host").value = s.host || "";
+      $("dfc_s_port").value = s.port || 3306;
+      $("dfc_s_user").value = s.user || "";
+      $("dfc_s_password").value = "";
+      $("dfc_s_password").placeholder = s.has_password ? "已保存（留空保留）" : "密码";
+      $("dfc_repl_user").value = d.replication_user || "";
+      $("dfc_dns_domain").value = (d.dns || {}).domain || "";
+      $("dfc_dns_provider").value = (d.dns || {}).provider || "";
+    } catch (e) { toast("读取配置失败: " + e.message, "danger"); return; }
+    if (drFailCfgModalInst) drFailCfgModalInst.show();
+  };
+
+  window.saveFailCfg = async function () {
+    const id = Number($("dfc_link_id").value);
+    const body = {
+      primary_conn: {
+        host: $("dfc_p_host").value.trim(), port: Number($("dfc_p_port").value) || 3306,
+        user: $("dfc_p_user").value.trim(), password: $("dfc_p_password").value,
+      },
+      standby_conn: {
+        host: $("dfc_s_host").value.trim(), port: Number($("dfc_s_port").value) || 3306,
+        user: $("dfc_s_user").value.trim(), password: $("dfc_s_password").value,
+      },
+      replication_user: $("dfc_repl_user").value.trim(),
+      dns: { domain: $("dfc_dns_domain").value.trim(), provider: $("dfc_dns_provider").value },
+    };
+    if (!body.primary_conn.host) { toast("主库地址必填", "warning"); return; }
+    try {
+      await api("PUT", `/api/disaster-links/${id}/failover-config`, body);
+      toast("切换引擎配置已保存", "success");
+      if (drFailCfgModalInst) drFailCfgModalInst.hide();
+      await loadLinks();
+    } catch (e) { toast("保存失败: " + e.message, "danger"); }
+  };
+
+  window.openDrAuto = async function (id) {
+    $("dra_link_id").value = id;
+    try {
+      const d = await api("GET", `/api/disaster-links/${id}/auto-policy`);
+      const p = d.policy || {};
+      $("dra_enabled").checked = !!p.enabled;
+      $("dra_interval").value = p.check_interval_sec || 30;
+      $("dra_threshold").value = p.consecutive_failures || 3;
+      $("dra_mode").value = p.require_manual_confirm ? "alert" : "auto";
+      $("dra_no_cfg").classList.toggle("d-none", !!d.has_failover_config);
+    } catch (e) { toast("读取策略失败: " + e.message, "danger"); return; }
+    if (drAutoModalInst) drAutoModalInst.show();
+  };
+
+  window.saveDrAuto = async function () {
+    const id = Number($("dra_link_id").value);
+    const body = {
+      enabled: !!$("dra_enabled").checked,
+      check_interval_sec: Number($("dra_interval").value) || 30,
+      consecutive_failures: Number($("dra_threshold").value) || 3,
+      require_manual_confirm: $("dra_mode").value === "alert",
+    };
+    try {
+      await api("PUT", `/api/disaster-links/${id}/auto-policy`, body);
+      toast("自动切换策略已保存", "success");
+      if (drAutoModalInst) drAutoModalInst.hide();
+      await loadLinks();
+    } catch (e) { toast("保存失败: " + e.message, "danger"); }
+  };
+
+  // 切换向导：step1 预检快照 → step2 确认（主库可达提示 force）→ step3 执行报告
+  let DRW_SNAPSHOT = null;
+  window.openFailoverWizard = async function (id) {
+    $("drw_link_id").value = id;
+    DRW_SNAPSHOT = null;
+    drwGoto(1);
+    $("drwStep1").innerHTML = '<div class="text-muted small">正在探测主库/备库/DNS…</div>';
+    $("drwGoBtn").classList.add("d-none");
+    $("drwRecheckBtn").classList.add("d-none");
+    if (drWizardModalInst) drWizardModalInst.show();
+    await drwPrecheck();
+  };
+
+  function drwGoto(step) {
+    ["drwStep1", "drwStep2", "drwStep3"].forEach((sid, i) => {
+      const el = $(sid);
+      if (el) el.classList.toggle("d-none", (i + 1) !== step);
+    });
+    [1, 2, 3].forEach((n) => {
+      const chip = $("drwChip" + n);
+      if (chip) chip.className = "link-step-chip" + (n === step ? " active" : (n < step ? " done" : ""));
+    });
+  }
+
+  window.drwPrecheck = async function () {
+    const id = $("drw_link_id").value;
+    drwGoto(1);
+    try {
+      const d = await api("GET", `/api/disaster-links/${id}/health`);
+      DRW_SNAPSHOT = d.snapshot || {};
+    } catch (e) {
+      $("drwStep1").innerHTML = '<div class="alert alert-danger small">预检失败: ' + esc(e.message) + '</div>';
+      return;
+    }
+    const s = DRW_SNAPSHOT;
+    const p = s.primary || {};
+    const sb = s.standby || {};
+    const dns = s.dns || {};
+    const row = (name, ok, text) =>
+      '<tr><td>' + name + '</td><td>' +
+      (ok === null ? '<span class="badge bg-secondary">未知</span>' :
+        (ok ? '<span class="badge badge-ok">正常</span>' : '<span class="badge badge-fail">异常</span>')) +
+      '</td><td class="small">' + esc(text || '') + '</td></tr>';
+    const behind = sb.behind === null || sb.behind === undefined ? '-' : sb.behind + 's';
+    $("drwStep1").innerHTML = '<table class="table table-sm align-middle mb-0"><thead><tr><th>检测项</th><th>状态</th><th>详情</th></tr></thead><tbody>' +
+      row('主库连通 ' + esc((p.host || '-') + ':' + (p.port || '-')), p.reachable, p.error || '') +
+      (sb.host ? row('备库复制 IO/SQL', sb.io === 'Yes' && sb.sql === 'Yes', 'IO=' + esc(sb.io) + ' SQL=' + esc(sb.sql) + ' 延迟=' + esc(behind) + (sb.error ? ' · ' + esc(sb.error) : '')) : row('备库', null, '未配置 standby_conn，跳过')) +
+      (dns.domain ? row('DNS 解析一致性', dns.in_sync, esc(dns.domain) + ' → ' + esc(dns.resolved_ip || '(无解析)') + '，主库 IP=' + esc(dns.expected_ip || '-')) : '') +
+      '</tbody></table>' +
+      '<div class="text-muted small mt-2">探测时间: ' + esc(s.checked_at || '-') + '</div>';
+    // 确认步骤文案
+    const needForce = p.reachable;
+    $("drwForceWarn").classList.toggle("d-none", !needForce);
+    if (needForce) $("drwForceWarn").textContent = "主库当前仍可达！对生产主库执行切换属于高危操作（可能造成双主/数据分歧），确认后将以强制模式执行。";
+    $("drwConfirmText").innerHTML = '即将对链路执行容灾切换：<b>主库冻结(fencing) → 备库提升为主 → DNS 流量切换 → 新主验证</b>。请确认以上预检结果。';
+    $("drwGoBtn").classList.remove("d-none");
+    $("drwRecheckBtn").classList.remove("d-none");
+  };
+
+  window.drwExecute = async function () {
+    const id = $("drw_link_id").value;
+    const p = (DRW_SNAPSHOT || {}).primary || {};
+    const force = !!p.reachable;
+    if (force && !window.confirm("主库仍可达，确认强制切换？（可能造成双主/数据分歧）")) return;
+    $("drwGoBtn").disabled = true;
+    toast("容灾切换执行中…", "warning");
+    try {
+      const res = await api("POST", "/api/disaster-links/" + id + "/failover", { force: force });
+      const r = res.result || {};
+      const stepsHtml = (r.steps || []).map((s) => {
+        const ok = String(s.result || '').indexOf('ok') === 0 || s.ok === true;
+        const ms = s.ms != null ? ' <span class="text-muted">(' + s.ms + 'ms)</span>' : '';
+        return '<li><b>' + esc(s.name || '') + '</b>' + ms + (ok ? '' : ' <span class="badge badge-fail">异常</span>') +
+          (s.detail ? '<div class="text-muted small">' + esc(String(s.detail).slice(0, 200)) + '</div>' : '') + '</li>';
+      }).join('');
+      $("drwReport").innerHTML =
+        '<div class="alert ' + (r.success ? 'alert-success' : 'alert-danger') + ' small">切换' +
+        (r.success ? '成功' : '失败') + ' · RTO <b>' + esc(String(r.rto_sec != null ? r.rto_sec : '-')) + 's</b> · 切换到 ' + esc(r.to || '-') + '</div>' +
+        (stepsHtml ? '<ol class="small">' + stepsHtml + '</ol>' : '<div class="text-muted small">' + esc(r.error || '') + '</div>');
+      drwGoto(3);
+      $("drwGoBtn").classList.add("d-none");
+      await loadLinks();
+    } catch (e) {
+      $("drwReport").innerHTML = '<div class="alert alert-danger small">切换失败: ' + esc(e.message) + '</div>';
+      drwGoto(3);
+      $("drwGoBtn").classList.add("d-none");
+    } finally {
+      $("drwGoBtn").disabled = false;
+    }
+  };
+
   // 一键容灾切换 / 回切（核心切换引擎 core/dr_failover.py）
   window.runFailover = async function (id) {
     if (!window.confirm("确认执行容灾切换？\n流程：主库故障探测 → 备库提升为主 → DNS 切换 → 新主验证。\n主库仍可达时将被拒绝（防误操作，需强制请在确认后再次点击并允许 force）。")) return;
@@ -7719,6 +7901,12 @@
   async function loadLinks() {
     // 数据源缓存供卡片展示源名 / 状态 / 差异检测使用；失败不阻塞链路列表渲染
     try { await loadLinkSources(); } catch (e) { LINK_SOURCES = []; }
+    // P1-1：自动监控状态（失败则空对象，不阻塞链路渲染）
+    DR_MONITOR_STATE = {};
+    try {
+      const mon = await api("GET", "/api/disaster-links/auto-monitor");
+      DR_MONITOR_STATE = mon.states || {};
+    } catch (e) { /* 忽略 */ }
     const links = await api("GET", "/api/disaster-links");
     const list = links.links || [];
     const container = $("linkList");
@@ -7746,7 +7934,7 @@
         return '<div class="col-md-6 col-xl-4">' +
           '<div class="page-card link-card h-100">' +
             '<div class="d-flex justify-content-between align-items-center">' +
-              '<strong>' + esc(l.name) + '</strong>' + linkStatusBadge(l.status) +
+              '<strong>' + esc(l.name) + '</strong>' + linkStatusBadge(l.status) + (drAutoBadge(l, DR_MONITOR_STATE) || '') +
             '</div>' +
             '<div class="link-sites mt-2">' +
               '<span><i class="bi bi-hdd-network me-1"></i>' + esc(l.primary_site || '主站点') + '</span>' +
@@ -7763,7 +7951,9 @@
               '</table>' +
             '</div>' +
             '<div class="link-actions">' +
-              '<button class="btn btn-sm btn-outline-warning" onclick="runFailover(' + l.id + ')" title="一键容灾切换：主库故障探测→备库提升→DNS切换→新主验证（RTO 计时）"><i class="bi bi-arrow-left-right me-1"></i>切换</button>' +
+              '<button class="btn btn-sm btn-outline-warning" onclick="openFailoverWizard(' + l.id + ')" title="切换向导：预检→确认→执行→RTO 报告"><i class="bi bi-arrow-left-right me-1"></i>切换</button>' +
+              '<button class="btn btn-sm btn-outline-secondary" onclick="openDrAuto(' + l.id + ')" title="自动切换策略：连续 N 次探测失败告警/自动切换"><i class="bi bi-activity me-1"></i>策略</button>' +
+              '<button class="btn btn-sm btn-outline-secondary" onclick="openFailCfg(' + l.id + ')" title="切换引擎配置：主备连接 / 复制账号 / DNS"><i class="bi bi-diagram-3 me-1"></i>配置</button>' +
               '<button class="btn btn-sm btn-outline-success" onclick="runFailback(' + l.id + ')" title="一键回切：旧主追平→提升→现主转从→DNS 切回"><i class="bi bi-arrow-counterclockwise me-1"></i>回切</button>' +
               '<button class="btn btn-sm btn-outline-primary" onclick="selectRoute(' + l.id + ')"><i class="bi bi-signpost-split me-1"></i>选路</button>' +
               '<button class="btn btn-sm btn-outline-info" onclick="fillGap(' + l.id + ')"><i class="bi bi-arrow-down-up me-1"></i>填补</button>' +
@@ -7784,6 +7974,12 @@
     await window.dnsLoad();
     const el = document.getElementById("linkModal");
     if (el) linkModalInst = new bootstrap.Modal(el);
+    const draEl = document.getElementById("drAutoModal");
+    if (draEl) drAutoModalInst = new bootstrap.Modal(draEl);
+    const dfcEl = document.getElementById("drFailCfgModal");
+    if (dfcEl) drFailCfgModalInst = new bootstrap.Modal(dfcEl);
+    const drwEl = document.getElementById("drWizardModal");
+    if (drwEl) drWizardModalInst = new bootstrap.Modal(drwEl);
 
     // 手工模式勾选联动：勾上后无源也可进入第二步
     $("l_manual_mode").addEventListener("change", function () {

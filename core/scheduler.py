@@ -1234,6 +1234,26 @@ def _cleanup_job_wrapper():
         _logger.exception("[cleanup] 定期清理异常")
 
 
+def _register_dr_monitor(sched):
+    """容灾自动切换监控（P1-1）：每 30s 一轮，按链路自身策略节流探测。"""
+    from apscheduler.triggers.interval import IntervalTrigger
+    try:
+        sched.remove_job("dr_auto_monitor")
+    except Exception:
+        pass
+    sched.add_job(_dr_monitor_job_wrapper, IntervalTrigger(seconds=30),
+                  id="dr_auto_monitor", replace_existing=True,
+                  max_instances=1, coalesce=True, misfire_grace_time=60)
+
+
+def _dr_monitor_job_wrapper():
+    try:
+        from core import dr_monitor
+        dr_monitor.check_once()
+    except Exception as e:
+        _logger.error("调度容灾自动监控异常: %s", e)
+
+
 def _register_cleanup(sched):
     """注册备份保留策略定期清理任务（默认每日 03:10）。"""
     from apscheduler.triggers.cron import CronTrigger
@@ -1602,6 +1622,7 @@ def start_scheduler():
     _register_cleanup(_scheduler)
     _register_immutable_check(_scheduler)
     _register_rt_backup(_scheduler)
+    _register_dr_monitor(_scheduler)
     _scheduler.start()
     _logger.info("调度器已启动，已注册 %d 个任务", len(_scheduler.get_jobs()))
     return _scheduler
@@ -1668,6 +1689,7 @@ def _reload_scheduler_locked():
     _register_ferry(_scheduler)
     _register_cleanup(_scheduler)
     _register_immutable_check(_scheduler)
+    _register_dr_monitor(_scheduler)
     # RT 周期任务幂等重注册；Supervisor 主循环 tick 已保留，不重启守护
     if config.RT_BACKUP_ENABLED:
         _register_rt_periodic_jobs(_scheduler)

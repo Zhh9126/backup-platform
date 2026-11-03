@@ -1437,7 +1437,7 @@ def list_disaster_links() -> list:
 
 def update_disaster_link(link_id: int, data: dict) -> bool:
     """更新容灾链路字段（白名单）。"""
-    allow = set(_DISASTER_LINK_FIELDS)
+    allow = set(_DISASTER_LINK_FIELDS) | {"failover_config"}
     updates = {k: v for k, v in data.items() if k in allow}
     if not updates:
         return False
@@ -1446,6 +1446,8 @@ def update_disaster_link(link_id: int, data: dict) -> bool:
         updates["enabled"] = 1 if updates.get("enabled") not in (0, False, "0", None) else 0
     if "route_policy" in updates:
         updates["route_policy"] = _dl_json(updates, "route_policy")
+    if "failover_config" in updates:
+        updates["failover_config"] = _dl_json(updates, "failover_config")
     if "source_kind" in updates:
         kind = str(updates.get("source_kind") or "manual")
         updates["source_kind"] = kind if kind in DISASTER_LINK_SOURCE_KINDS else "manual"

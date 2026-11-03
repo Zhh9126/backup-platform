@@ -481,3 +481,111 @@ def run_failback(link_id: int) -> dict:
     if not link:
         raise FailoverError("容灾链路不存在: %s" % link_id)
     return FailoverEngine(dict(link)).failback()
+
+
+# ---------------------------------------------------------------------------
+# 自动切换策略 + 健康快照（P1-1，对标 DSG 智能导航切换 / 甘肃政务云 §4.4.3）
+# ---------------------------------------------------------------------------
+
+AUTO_POLICY_DEFAULTS = {
+    "enabled": False,                # 自动监控总开关（默认关，不改变存量行为）
+    "check_interval_sec": 30,        # 探测间隔
+    "consecutive_failures": 3,       # 连续 N 次探测失败触发
+    "require_manual_confirm": True,  # true=只告警不切换（默认）；false=自动切换
+}
+
+
+def auto_policy(cfg: dict) -> dict:
+    """提取自动切换策略（缺省补全），调用方传入 _load_config 结果。"""
+    out = dict(AUTO_POLICY_DEFAULTS)
+    auto = cfg.get("auto") if isinstance(cfg, dict) else None
+    if isinstance(auto, dict):
+        for k in out:
+            if k in auto and auto[k] is not None:
+                out[k] = auto[k]
+    out["check_interval_sec"] = max(10, int(out["check_interval_sec"] or 30))
+    out["consecutive_failures"] = max(1, int(out["consecutive_failures"] or 3))
+    return out
+
+
+def _replica_status(host, port, user, password, timeout=5) -> dict:
+    """备库复制状态：io/sql 线程与延迟（兼容 5.7 Slave_* / 8.0 Replica_*）。"""
+    conn = None
+    try:
+        conn = native_conn.connect("mysql", host, port, None, user,
+                                   password, timeout=timeout)
+        cur = conn.cursor()
+        cur.execute("SHOW REPLICA STATUS")
+        row = cur.fetchone()
+        if not row:
+            return {"reachable": True, "is_replica": False, "io": "-", "sql": "-", "behind": None}
+        cols = [c[0] for c in cur.description]
+        d = dict(zip(cols, row))
+        io = d.get("Replica_IO_Running") or d.get("Slave_IO_Running") or "-"
+        sql = d.get("Replica_SQL_Running") or d.get("Slave_SQL_Running") or "-"
+        behind = d.get("Seconds_Behind_Source")
+        if behind is None:
+            behind = d.get("Seconds_Behind_Master")
+        return {"reachable": True, "is_replica": True, "io": io, "sql": sql,
+                "behind": behind}
+    except Exception as e:
+        return {"reachable": False, "is_replica": False, "io": "-", "sql": "-",
+                "behind": None, "error": str(e)[:160]}
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def health_snapshot(link_id: int) -> dict:
+    """链路健康快照（自动监控与切换向导预检共用数据源）。
+
+    返回 {link_id, primary, standby, dns, checked_at}：
+    - primary:  {reachable, error, host, port}
+    - standby:  {reachable, io, sql, behind, is_replica, error, host, port}
+    - dns:      {domain, resolved_ip, expected_ip, in_sync}（未配置 DNS 时各项为空）
+    """
+    from core import models as _models
+    link = _models.get_disaster_link(link_id)
+    if not link:
+        raise FailoverError("容灾链路不存在: %s" % link_id)
+    cfg = _load_config(dict(link))
+    p = _decrypt_conn(cfg.get("primary_conn") or {})
+    s = _decrypt_conn(cfg.get("standby_conn") or {})
+    if not p.get("host"):
+        raise FailoverError("链路缺少 failover_config.primary_conn，无法探测")
+    snap = {"link_id": link_id, "link_name": link.get("name"),
+            "checked_at": db.now_iso(), "primary": None, "standby": None,
+            "dns": None}
+    # 主库
+    pr = _probe_mysql(p.get("host"), int(p.get("port") or 3306),
+                      p.get("user") or p.get("username") or "root",
+                      p.get("password") or "")
+    pr.update({"host": p.get("host"), "port": p.get("port")})
+    snap["primary"] = pr
+    # 备库（复制状态）
+    if s.get("host"):
+        st = _replica_status(s.get("host"), int(s.get("port") or 3306),
+                             s.get("user") or s.get("username") or "root",
+                             s.get("password") or "")
+        st.update({"host": s.get("host"), "port": s.get("port")})
+        snap["standby"] = st
+    # DNS 一致性：域名解析 IP 是否指向主库
+    dns_cfg = cfg.get("dns") or {}
+    domain = dns_cfg.get("domain")
+    if domain:
+        expected = p.get("host") or ""
+        try:
+            resolved = _resolve_domain(domain)
+        except Exception as e:
+            resolved = ""
+            snap["dns"] = {"domain": domain, "resolved_ip": "",
+                           "expected_ip": expected, "in_sync": False,
+                           "error": str(e)[:120]}
+        else:
+            snap["dns"] = {"domain": domain, "resolved_ip": resolved,
+                           "expected_ip": expected,
+                           "in_sync": bool(resolved and resolved == expected)}
+    return snap

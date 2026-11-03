@@ -385,3 +385,119 @@ def api_link_failback(link_id):
     except Exception as e:
         return jsonify({"ok": False, "error": "回切失败: %s" % e}), 500
     return jsonify({"ok": True, "result": res})
+
+
+# --------------------- P1-1：健康快照 / 自动切换策略 / 监控状态 ---------------------
+
+@api_bp.route("/disaster-links/<int:link_id>/health", methods=["GET"])
+@login_required
+def api_link_health(link_id):
+    """链路健康快照（切换向导预检 / 监控用）：主库可达 / 备库复制状态 / DNS 一致性。"""
+    from core import dr_failover
+    try:
+        snap = dr_failover.health_snapshot(link_id)
+    except dr_failover.FailoverError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"ok": False, "error": "探测失败: %s" % e}), 500
+    return jsonify({"ok": True, "snapshot": snap})
+
+
+@api_bp.route("/disaster-links/<int:link_id>/auto-policy", methods=["GET", "PUT"])
+@login_required
+def api_link_auto_policy(link_id):
+    """自动切换策略：GET 读取 / PUT 保存（写入 failover_config.auto）。"""
+    import json as _json
+    from core import dr_failover
+    link = models.get_disaster_link(link_id)
+    if not link:
+        return jsonify({"error": "链路不存在"}), 404
+    if request.method == "GET":
+        cfg = dr_failover._load_config(dict(link))
+        return jsonify({"ok": True, "policy": dr_failover.auto_policy(cfg),
+                        "has_failover_config": bool(cfg.get("primary_conn"))})
+    data = request.get_json(silent=True) or {}
+    cfg = dr_failover._load_config(dict(link))
+    auto = {
+        "enabled": bool(data.get("enabled")),
+        "check_interval_sec": data.get("check_interval_sec") or 30,
+        "consecutive_failures": data.get("consecutive_failures") or 3,
+        "require_manual_confirm": bool(data.get("require_manual_confirm", True)),
+    }
+    try:
+        auto["check_interval_sec"] = max(10, int(auto["check_interval_sec"]))
+        auto["consecutive_failures"] = max(1, int(auto["consecutive_failures"]))
+    except Exception:
+        return jsonify({"error": "探测间隔/连续失败阈值必须是整数"}), 400
+    cfg["auto"] = auto
+    models.update_disaster_link(link_id, {
+        "failover_config": _json.dumps(cfg, ensure_ascii=False)})
+    from core import dr_monitor
+    dr_monitor.reset_state(link_id)   # 策略变更后重置计数窗口
+    return jsonify({"ok": True, "policy": dr_failover.auto_policy(cfg)})
+
+
+_FAILOVER_CONN_KEYS = ("host", "port", "user", "password")
+
+
+def _mask_conn(conn: dict) -> dict:
+    """连接配置掩码回显：密码只回 has_password 标记。"""
+    out = {k: v for k, v in (conn or {}).items() if k != "password"}
+    out["has_password"] = bool((conn or {}).get("password"))
+    return out
+
+
+@api_bp.route("/disaster-links/<int:link_id>/failover-config", methods=["GET", "PUT"])
+@login_required
+def api_link_failover_config(link_id):
+    """切换引擎配置（P1-1）：主库/备库连接 + 复制账号 + DNS。
+
+    GET：密码掩码回显（has_password）；PUT：空密码保留旧值，明文入库自动加密。
+    """
+    import json as _json
+    import core.db as _db
+    from core import dr_failover
+    link = models.get_disaster_link(link_id)
+    if not link:
+        return jsonify({"error": "链路不存在"}), 404
+    cfg = dr_failover._load_config(dict(link))
+    if request.method == "GET":
+        return jsonify({
+            "ok": True,
+            "primary_conn": _mask_conn(cfg.get("primary_conn") or {}),
+            "standby_conn": _mask_conn(cfg.get("standby_conn") or {}),
+            "dns": cfg.get("dns") or {},
+            "replication_user": cfg.get("replication_user") or "",
+        })
+    data = request.get_json(silent=True) or {}
+    for key in ("primary_conn", "standby_conn"):
+        incoming = data.get(key)
+        if not isinstance(incoming, dict):
+            continue
+        old = dict(cfg.get(key) or {})
+        merged = {k: (str(incoming.get(k)).strip() if incoming.get(k) not in (None, "")
+                      else old.get(k)) for k in _FAILOVER_CONN_KEYS}
+        merged.pop("has_password", None)
+        pw = (incoming.get("password") or "").strip()
+        if pw:
+            merged["password"] = _db.encrypt_secret(pw)
+        elif old.get("password"):
+            merged["password"] = old["password"]   # 保留旧密文
+        else:
+            merged.pop("password", None)
+        cfg[key] = merged
+    if isinstance(data.get("dns"), dict):
+        cfg["dns"] = {**cfg.get("dns", {}), **data["dns"]}
+    if data.get("replication_user") is not None:
+        cfg["replication_user"] = str(data["replication_user"]).strip()
+    models.update_disaster_link(link_id, {
+        "failover_config": _json.dumps(cfg, ensure_ascii=False)})
+    return jsonify({"ok": True})
+
+
+@api_bp.route("/disaster-links/auto-monitor", methods=["GET"])
+@login_required
+def api_auto_monitor():
+    """自动监控状态视图（连续失败计数 / 最近检测 / 告警与自动切换结果）。"""
+    from core import dr_monitor
+    return jsonify({"ok": True, "states": dr_monitor.state_view()})

@@ -202,4 +202,134 @@
     </div>
   </div>
 </div>
+
+<!-- P1-1：切换引擎配置弹窗（主备连接 + DNS） -->
+<div class="modal fade" id="drFailCfgModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-diagram-3"></i> 切换引擎配置（主备连接 / DNS）</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="dfc_link_id">
+        <div class="row g-3">
+          <div class="col-md-6"><h6 class="small mb-1"><i class="bi bi-hdd-network"></i> 主库（当前主）</h6>
+            <input class="form-control form-control-sm mb-2" id="dfc_p_host" placeholder="主机 IP">
+            <div class="row g-2">
+              <div class="col-4"><input class="form-control form-control-sm" id="dfc_p_port" type="number" placeholder="端口" value="3306"></div>
+              <div class="col-8"><input class="form-control form-control-sm" id="dfc_p_user" placeholder="用户（如 root）"></div>
+            </div>
+            <input class="form-control form-control-sm mt-2" id="dfc_p_password" type="password" placeholder="密码（留空保留已存）">
+          </div>
+          <div class="col-md-6"><h6 class="small mb-1"><i class="bi bi-hdd-rack"></i> 备库（待提升）</h6>
+            <input class="form-control form-control-sm mb-2" id="dfc_s_host" placeholder="主机 IP">
+            <div class="row g-2">
+              <div class="col-4"><input class="form-control form-control-sm" id="dfc_s_port" type="number" placeholder="端口" value="3306"></div>
+              <div class="col-8"><input class="form-control form-control-sm" id="dfc_s_user" placeholder="用户（如 root）"></div>
+            </div>
+            <input class="form-control form-control-sm mt-2" id="dfc_s_password" type="password" placeholder="密码（留空保留已存）">
+          </div>
+          <div class="col-md-4"><label class="form-label small">复制账号（回切 rejoin 用）</label>
+            <input class="form-control form-control-sm" id="dfc_repl_user" placeholder="如 repl">
+          </div>
+          <div class="col-md-4"><label class="form-label small">业务域名（DNS 牵引）</label>
+            <input class="form-control form-control-sm" id="dfc_dns_domain" placeholder="如 dr-mysql.test">
+          </div>
+          <div class="col-md-4"><label class="form-label small">DNS 提供方</label>
+            <select class="form-select form-select-sm" id="dfc_dns_provider">
+              <option value="dnsmasq">dnsmasq</option>
+              <option value="">未配置</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-text mt-2">
+          密码加密存储、回显只显示是否已设置。自动探测/切换/向导预检均使用此配置。
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" onclick="saveFailCfg()">保存配置</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- P1-1：自动切换策略弹窗 -->
+<div class="modal fade" id="drAutoModal" tabindex="-1">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-activity"></i> 自动切换策略</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="dra_link_id">
+        <div class="alert alert-warning py-2 small d-none" id="dra_no_cfg" role="alert">
+          该链路尚未配置 failover_config（主备连接），自动策略不生效。请先完成容灾切换配置。
+        </div>
+        <div class="form-check form-switch mb-3">
+          <input class="form-check-input" type="checkbox" id="dra_enabled">
+          <label class="form-check-label" for="dra_enabled">启用主库自动探测</label>
+        </div>
+        <div class="row g-3">
+          <div class="col-md-4">
+            <label class="form-label">探测间隔（秒）</label>
+            <input class="form-control" id="dra_interval" type="number" min="10" value="30">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">连续失败阈值</label>
+            <input class="form-control" id="dra_threshold" type="number" min="1" value="3">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">达到阈值后</label>
+            <select class="form-select" id="dra_mode">
+              <option value="alert">告警待人工确认（推荐）</option>
+              <option value="auto">自动执行容灾切换</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-text mt-2">
+          探测内容：主库连通性；恢复（成功探测）后自动重置计数。自动切换复用完整
+          切换引擎（fencing→提升→DNS→验证），不跳步。切换与回切仍可随时手动执行。
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="draSaveBtn" onclick="saveDrAuto()">保存策略</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- P1-1：切换向导弹窗（预检 → 确认 → 执行 → 报告） -->
+<div class="modal fade" id="drWizardModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-signpost-2"></i> 容灾切换向导</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="drw_link_id">
+        <div class="link-steps mb-3">
+          <span class="link-step-chip active" id="drwChip1"><span class="n">1</span>预检</span>
+          <span class="link-step-chip" id="drwChip2"><span class="n">2</span>确认</span>
+          <span class="link-step-chip" id="drwChip3"><span class="n">3</span>执行报告</span>
+        </div>
+        <div id="drwStep1"><div class="text-muted small">正在探测主库/备库/DNS…</div></div>
+        <div id="drwStep2" class="d-none">
+          <div class="alert alert-danger small" id="drwForceWarn" role="alert"></div>
+          <div class="small" id="drwConfirmText"></div>
+        </div>
+        <div id="drwStep3" class="d-none"><div id="drwReport" class="small"></div></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline-secondary" data-bs-dismiss="modal">关闭</button>
+        <button class="btn btn-outline-primary d-none" id="drwRecheckBtn" onclick="drwPrecheck()">重新预检</button>
+        <button class="btn btn-danger d-none" id="drwGoBtn" onclick="drwExecute()">确认切换</button>
+      </div>
+    </div>
+  </div>
+</div>
 {% endblock %}

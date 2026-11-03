@@ -14,6 +14,8 @@
           （priority=snapshot：以快照内容为准覆盖目标 collection）
     校验：GET  /collections/{c}                         status=green + points_count
 
+HTTP 层用标准库 urllib（离线自足：镜像 venv 无 requests，不引入新依赖）。
+
 诚实边界：
   - 快照是 collection 级；Qdrant 云/集群分片部署的快照一致性以官方 API 为准；
   - 恢复按 priority=snapshot 覆盖目标 collection（异名恢复 = 传 target_db）；
@@ -24,8 +26,9 @@
 import json
 import os
 import time
-
-import requests
+import uuid
+import urllib.request
+import urllib.error
 
 from core.engines.base import BackupEngine, BackupResult, BackupStatus
 from core.engines.base import BackupType
@@ -34,6 +37,42 @@ import core.db as db
 _DEFAULT_TIMEOUT = 60
 _SNAPSHOT_TIMEOUT = 1800     # 快照创建可能耗时（大 collection）
 _DL_CHUNK = 1024 * 1024
+
+
+def _http(method: str, url: str, headers: dict = None, data=None,
+          timeout: int = _DEFAULT_TIMEOUT, stream: bool = False):
+    """标准库 HTTP（返回 (status, bytes|response)；非 2xx 抛 RuntimeError）。"""
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers=headers or {})
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        body = e.read()[:300]
+        raise RuntimeError(f"HTTP {e.code}: {body.decode('utf-8', 'replace')}")
+    if stream:
+        return resp
+    return resp.status, resp.read()
+
+
+def _multipart_body(field: str, filename: str, file_path: str,
+                    extra_fields: dict = None) -> tuple:
+    """手工构造 multipart/form-data（标准库，无 requests 依赖）。"""
+    boundary = uuid.uuid4().hex
+    parts = []
+    for k, v in (extra_fields or {}).items():
+        parts.append(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+            .encode("utf-8"))
+    with open(file_path, "rb") as f:
+        payload = f.read()
+    parts.append(
+        (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; "
+         f"filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+         ).encode("utf-8") + payload + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+    body = b"".join(parts)
+    ctype = f"multipart/form-data; boundary={boundary}"
+    return body, ctype
 
 
 class QdrantEngine(BackupEngine):
@@ -51,14 +90,14 @@ class QdrantEngine(BackupEngine):
         return {"api-key": pw} if pw else {}
 
     def _collections(self) -> list:
-        """枚举 collections（db_name 为空 = 全部；task 的 db_name 存 collection 名）。"""
+        """枚举 collections（db_name 为空 = 全部；task 的 db_name 存 collection 名，
+        逗号分隔多个）。"""
         specified = (self.task.get("db_name") or "").strip()
         if specified:
             return [c.strip() for c in specified.split(",") if c.strip()]
-        r = requests.get(f"{self._base_url()}/collections",
-                         headers=self._headers(), timeout=_DEFAULT_TIMEOUT)
-        r.raise_for_status()
-        cols = (r.json().get("result") or {}).get("collections") or []
+        _, body = _http("GET", f"{self._base_url()}/collections",
+                        headers=self._headers())
+        cols = (json.loads(body).get("result") or {}).get("collections") or []
         return [c["name"] for c in cols]
 
     # ---------------- 备份 ----------------
@@ -68,7 +107,6 @@ class QdrantEngine(BackupEngine):
         os.makedirs(out_dir, exist_ok=True)
         base = self._base_url()
         headers = self._headers()
-        pieces = []
         try:
             names = self._collections()
         except Exception as e:
@@ -80,39 +118,40 @@ class QdrantEngine(BackupEngine):
                                 duration_sec=round(time.time() - start, 2),
                                 message="Qdrant 上没有任何 collection 可备份")
         errors = []
+        pieces = []
         for cname in names:
             safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in cname)
             ts = self._timestamp()
             local_path = os.path.join(out_dir, f"qdrant_{safe}_{ts}.snapshot")
             try:
                 # 1) 创建快照（wait=true 同步等完成）
-                r = requests.put(
-                    f"{base}/collections/{cname}/snapshots",
-                    params={"wait": "true"}, headers=headers,
-                    timeout=_SNAPSHOT_TIMEOUT)
-                r.raise_for_status()
-                snap_name = (r.json().get("result") or {}).get("name")
+                _, body = _http("PUT", f"{base}/collections/{cname}/snapshots",
+                                headers=headers,
+                                data=json.dumps({"wait": "true"}).encode(),
+                                timeout=_SNAPSHOT_TIMEOUT)
+                snap_name = (json.loads(body).get("result") or {}).get("name")
                 if not snap_name:
-                    raise RuntimeError(f"快照创建无返回名: {r.text[:150]}")
+                    raise RuntimeError(f"快照创建无返回名: {body[:150]}")
                 # 2) 流式下载
                 total = 0
-                with requests.get(
-                        f"{base}/collections/{cname}/snapshots/{snap_name}",
-                        headers=headers, stream=True,
-                        timeout=_SNAPSHOT_TIMEOUT) as dl:
-                    dl.raise_for_status()
-                    with open(local_path, "wb") as f:
-                        for chunk in dl.iter_content(chunk_size=_DL_CHUNK):
-                            if chunk:
-                                f.write(chunk)
-                                total += len(chunk)
+                resp = _http("GET",
+                             f"{base}/collections/{cname}/snapshots/{snap_name}",
+                             headers=headers, timeout=_SNAPSHOT_TIMEOUT,
+                             stream=True)
+                with open(local_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(_DL_CHUNK)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        total += len(chunk)
                 if total < 64:
                     raise RuntimeError(f"快照下载过小（{total} 字节），疑似失败")
                 # 3) 清理远端快照（数据库服务器不留产物）
                 try:
-                    requests.delete(
-                        f"{base}/collections/{cname}/snapshots/{snap_name}",
-                        headers=headers, timeout=_DEFAULT_TIMEOUT)
+                    _http("DELETE",
+                          f"{base}/collections/{cname}/snapshots/{snap_name}",
+                          headers=headers)
                 except Exception:
                     pass
                 pieces.append((cname, local_path, total))
@@ -130,7 +169,8 @@ class QdrantEngine(BackupEngine):
                f"共 {db.human_size(total_size)}")
         if errors:
             msg += f"；{len(errors)} 个失败: " + "；".join(errors)[:200]
-        manifest = os.path.join(out_dir, f"{pieces[0][1].rsplit('/', 1)[-1]}_manifest.json")
+        manifest = os.path.join(
+            out_dir, os.path.basename(first) + "_manifest.json")
         with open(manifest, "w", encoding="utf-8") as mf:
             json.dump({
                 "kind": "qdrant_snapshot",
@@ -168,13 +208,10 @@ class QdrantEngine(BackupEngine):
         base = self._base_url()
         headers = self._headers()
         try:
-            with open(backup_path, "rb") as f:
-                r = requests.post(
-                    f"{base}/collections/{target}/snapshots/upload",
-                    params={"priority": "snapshot", "wait": "true"},
-                    headers=headers, files={"snapshot": (base_name, f)},
-                    timeout=_SNAPSHOT_TIMEOUT)
-            r.raise_for_status()
+            body, ctype = _multipart_body("snapshot", base_name, backup_path)
+            _http("POST", f"{base}/collections/{target}/snapshots/upload",
+                  headers=dict(headers, **{"Content-Type": ctype}),
+                  data=body, timeout=_SNAPSHOT_TIMEOUT)
         except Exception as e:
             return BackupResult(success=False, status=BackupStatus.FAILED,
                                 duration_sec=round(time.time() - start, 2),
@@ -182,11 +219,10 @@ class QdrantEngine(BackupEngine):
         # 恢复后校验 collection 状态
         status_info = ""
         try:
-            info = requests.get(f"{base}/collections/{target}",
-                                headers=headers, timeout=_DEFAULT_TIMEOUT).json()
-            res = info.get("result") or {}
-            status_info = (f"status={res.get('status')} "
-                           f"points={res.get('points_count')}")
+            _, body = _http("GET", f"{base}/collections/{target}",
+                            headers=headers)
+            res = (json.loads(body).get("result") or {})
+            status_info = f"status={res.get('status')} points={res.get('points_count')}"
         except Exception:
             pass
         return BackupResult(success=True, status=BackupStatus.SUCCESS,
@@ -196,14 +232,13 @@ class QdrantEngine(BackupEngine):
 
     # ---------------- 校验 ----------------
     def verify_record(self, record) -> BackupResult:
-        """快照产物校验：tar 头（Qdrant snapshot 为 tar）+ 记录 manifest 一致性。"""
+        """快照产物校验：tar 头（Qdrant snapshot 为 tar）+ 结构检查。"""
         path = record.get("backup_path") or ""
         if not path or not os.path.isfile(path):
             return BackupResult(success=False, message=f"快照文件不存在: {path}")
         size = os.path.getsize(path)
         if size < 64:
             return BackupResult(success=False, message=f"快照过小（{size} 字节）")
-        # Qdrant snapshot 是 tar 归档（内含 storage/collection/…）
         import tarfile
         try:
             with tarfile.open(path, "r:*") as tf:

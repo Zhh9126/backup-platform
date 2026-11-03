@@ -1703,12 +1703,13 @@ def get_scan_result(scan_id: int) -> Optional[dict]:
 
 
 def list_scan_results(task_id: int = None, limit: int = 100) -> list:
-    sql = "SELECT * FROM data_scan_results"
+    sql = ("SELECT s.*, t.name AS task_name FROM data_scan_results s "
+           "LEFT JOIN backup_tasks t ON t.id = s.task_id")
     params = []
     if task_id:
-        sql += " WHERE task_id=?"
+        sql += " WHERE s.task_id=?"
         params.append(task_id)
-    sql += " ORDER BY id DESC LIMIT ?"
+    sql += " ORDER BY s.id DESC LIMIT ?"
     params.append(limit)
     return [_scan_to_dict(r) for r in db.query(sql, params)]
 

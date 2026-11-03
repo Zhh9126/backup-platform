@@ -430,7 +430,7 @@
 
   async function deleteTask(id) {
     const t = TASK_BY_ID[id];
-    const label = t ? ("「" + (t.name || ("#" + id)) + "」") : ("#" + id);
+    const label = t ? ("「" + (t.name || ("#" + id)) + "」") : "已删除任务";
     if (!window.confirm("确认删除备份任务 " + label + " 及其全部备份记录？此操作不可撤销。")) return;
     try {
       await api("DELETE", "/api/tasks/" + id);
@@ -507,7 +507,7 @@
         : '<span class="text-muted small">从未执行</span>';
       const running = !!RUNNING_TASKS[t.id];
       return '<tr>' +
-        '<td><div class="fw-bold">' + esc(t.name || ("#" + t.id)) + "</div>" +
+        '<td><div class="fw-bold">' + esc(t.name || "未命名任务") + "</div>" +
         '<div class="small text-muted">' + esc(t.biz_system || "-") +
         ' <span class="badge bg-light text-dark border ms-1">#' + t.id + "</span>" +
         (t.enabled ? "" : ' <span class="badge bg-secondary ms-1">已停用</span>') + "</div></td>" +

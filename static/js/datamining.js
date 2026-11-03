@@ -201,7 +201,7 @@ window.DataminingPage = (function () {
           esc(sz(a.impact_bytes)) + "</span>" : "") + "</div>" +
         '<div class="dm-act-body">' + esc(a.reason) + "</div>" +
         '<div class="dm-act-list">' + (a.assets || []).slice(0, 6).map(function (x) {
-          return '<span class="dm-chip">' + esc(x.name || x.checksum || ("#" + (x.task_id || ""))) +
+          return '<span class="dm-chip">' + esc(x.name || x.checksum || "已删除任务") +
             (x.idle_days !== undefined ? " · " + x.idle_days + "天未更新" : "") +
             (x.bytes ? " · " + esc(sz(x.bytes)) : "") + "</span>";
         }).join("") + "</div></div>";
@@ -334,7 +334,7 @@ window.DataminingPage = (function () {
     var pgS = Pager.slice("dmScans", rows);
     setHtml("dmScanHistory", pgS.list.length ? pgS.list.map(function (r) {
       return "<tr><td>" + esc(BKP.fmtTime(r.scanned_at)) + "</td>" +
-        "<td>" + esc(state.taskNames[r.task_id] || ("#" + (r.task_id || "—"))) + "</td>" +
+        "<td>" + esc(state.taskNames[r.task_id] || r.task_name || "已删除任务") + "</td>" +
         "<td class='dm-mono small'>" + esc((r.path || "").split("/").pop()) + "</td>" +
         '<td class="text-end">' + esc(sz(r.size_bytes)) + "</td>" +
         "<td>" + lvBadge(r.max_level) + "</td>" +

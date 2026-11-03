@@ -3912,7 +3912,7 @@
       const hosts = FILE_HOSTS || [];
       const hostName = (hid) => {
         const h = hosts.find((x) => Number(x.id) === Number(hid));
-        return h ? h.name : (hid ? "#" + hid : "本机(SSH)");
+        return h ? h.name : (hid ? "主机已删除" : "本机(SSH)");
       };
       tb.innerHTML = tasks.map((t, i) => {
         const st = t.last_status || "never";
@@ -4105,7 +4105,7 @@
     const pg = Pager.slice("syncTasks", tasks);
     $("syncTaskTable").innerHTML = pg.list.map((t, mi) => {
       const src = t.source_type === "managed"
-        ? `托管任务：${esc(t.source_task_name || ("#" + t.source_task_id))}`
+        ? `托管任务：${esc(t.source_task_name || "已删除任务")}`
         : `${esc(t.src_db_display || t.src_db_type)} : ${esc(t.src_host || "")}`;
       const dst = `${esc(t.tgt_db_display || t.tgt_db_type)} : ${esc(t.tgt_host || "")}`;
       return `<tr>
@@ -8121,7 +8121,7 @@
     const cached = LINK_SOURCES.filter(function (s) {
       return s.kind === kind && Number(s.id) === Number(l.source_id);
     })[0] || null;
-    const name = l.source_name || (cached && cached.name) || ("#" + l.source_id);
+    const name = l.source_name || (cached && cached.name) || "数据源已删除";
     const st = l.source_last_status || (cached && cached.status) || "";
 
     let html = '<div class="link-src-line"><i class="bi ' + icon + ' me-1"></i>' +
@@ -8613,7 +8613,7 @@
         return s.kind === kind && Number(s.id) === Number(l.source_id);
       })[0] || {
         kind: kind, id: Number(l.source_id),
-        name: l.source_name || ("#" + l.source_id),
+        name: l.source_name || "数据源已删除",
         status: l.source_last_status || "",
         primary_site: l.primary_site || "", dr_site: l.dr_site || "", db_type: "",
       };

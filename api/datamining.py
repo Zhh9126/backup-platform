@@ -122,7 +122,21 @@ def scan_sensitive():
         return jsonify({"error": "record_id / task_id / text 至少填一个"}), 400
 
     if not targets:
-        return jsonify({"error": "未找到可扫描的备份产物（该任务的产物可能不在本机）"}), 404
+        # 细化原因：任务名 + 最近记录状态（无成功记录 / 产物文件已清理不在本机）
+        hint = "未找到可扫描的备份产物"
+        if task_id:
+            t = models.get_task(int(task_id)) or {}
+            hint += "（任务「%s」" % (t.get("name") or ("#" + str(task_id)))
+            recent = models.list_records(task_id=int(task_id), limit=5) or []
+            ok_rows = [r for r in recent if r.get("status") == "success"]
+            if not ok_rows:
+                hint += "：最近没有成功的备份记录）"
+            else:
+                hint += "：最近成功记录的产物文件已不在本机（可能已被保留策略清理，"
+                hint += "或备份在远端主机未拉回））"
+        else:
+            hint += "（该备份记录的产物可能不在本机）"
+        return jsonify({"error": hint}), 404
 
     results = []
     for tid, rid, path in targets:

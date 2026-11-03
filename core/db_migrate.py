@@ -38,6 +38,11 @@ ST_FAILED = "failed"
 _VALID_TYPES = ("structure", "full", "verify")
 
 
+def _sql_quote(v: str) -> str:
+    """SQL 字符串字面量（单引号转义，PG/Oracle/达梦/金仓通用）。"""
+    return "'" + str(v).replace("'", "''") + "'"
+
+
 def _enc_secret(v: str) -> str:
     return db.encrypt_secret(v) if v else ""
 
@@ -100,12 +105,12 @@ def _row_to_dict(row, hide_secret: bool = False) -> dict:
     else:
         d["src_password"] = _dec_secret(d.get("src_password"))
         d["tgt_password"] = _dec_secret(d.get("tgt_password"))
-    for key in ("migrate_types", "phases_json"):
+    for key in ("migrate_types", "phases_json", "extra_options"):
         if key in d and isinstance(d.get(key), str):
             try:
                 d[key] = json.loads(d[key])
             except Exception:
-                d[key] = [] if key == "migrate_types" else {}
+                d[key] = [] if key == "migrate_types" else ({} if key == "extra_options" else None)
     return d
 
 
@@ -144,12 +149,18 @@ class DbMigrationEngine:
         if not types:
             raise ValueError("至少选择一项迁移内容")
         now = db.now_iso()
+        extra = data.get("extra_options")
+        if not isinstance(extra, dict):
+            try:
+                extra = json.loads(extra) if extra else {}
+            except Exception:
+                extra = {}
         pid = db.execute(
             "INSERT INTO db_migration_plans (name, src_db_type, src_host, src_port,"
             " src_username, src_password, src_db_name, tgt_db_type, tgt_host,"
             " tgt_port, tgt_username, tgt_password, tgt_db_name, migrate_types,"
-            " status, current_phase, note, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " extra_options, status, current_phase, note, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (name, data["src_db_type"].strip(), data["src_host"].strip(),
              int(data.get("src_port") or 0) or None,
              (data.get("src_username") or "").strip(),
@@ -160,7 +171,9 @@ class DbMigrationEngine:
              (data.get("tgt_username") or "").strip(),
              _enc_secret(data.get("tgt_password") or ""),
              data["tgt_db_name"].strip(),
-             json.dumps(types), ST_CREATED, None,
+             json.dumps(types),
+             json.dumps(extra, ensure_ascii=False) if extra else None,
+             ST_CREATED, None,
              (data.get("note") or "").strip(), now, now))
         return pid
 
@@ -243,6 +256,21 @@ class DbMigrationEngine:
                     self._fail(plan_id, phases, "migrate", mig.get("message", "迁移失败"))
                     return
 
+            # ---------- 阶段 2.5：非表对象迁移（视图/序列/注释/例程/触发器） ----------
+            # 对标 KDTS「迁移对象种类」：表之外还有视图、序列、函数、存储过程、
+            # 触发器、注释等。表迁移成功后执行（对象依赖表）。
+            # 失败不阻断主迁移结论（逐对象记录，异构不支持的导出源码待人工适配）。
+            if ("structure" in types or "full" in types) and mig["ok"]:
+                try:
+                    obj = self._phase_objects(plan)
+                    phases["objects"] = obj
+                    self._set(plan_id, phases_json=json.dumps(phases, ensure_ascii=False))
+                except Exception as exc:  # noqa: BLE001 - 对象阶段绝不阻断主迁移
+                    self.logger.exception("[db_migrate] 计划 #%s 对象迁移异常", plan_id)
+                    phases["objects"] = {"executed": False,
+                                         "error": f"对象迁移异常: {str(exc)[:200]}"}
+                    self._set(plan_id, phases_json=json.dumps(phases, ensure_ascii=False))
+
             # ---------- 阶段 3：数据校验 ----------
             if "verify" in types:
                 self._set(plan_id, status=ST_VERIFYING, current_phase="verify")
@@ -262,6 +290,7 @@ class DbMigrationEngine:
                 "migrate_types": types,
                 "precheck": phases.get("precheck", {}),
                 "migrate": phases.get("migrate", {}),
+                "objects": phases.get("objects", {}),
                 "verify": phases.get("verify", {}),
                 "generated_at": db.now_iso(),
             }
@@ -583,6 +612,14 @@ class DbMigrationEngine:
         失败表可能残留部分写入的行，重迁前先清空目标表，保证单元级幂等。
         """
         from core.sync.engine import run_sync_task_with_task
+        extra = plan.get("extra_options") or {}
+        if not isinstance(extra, dict):
+            try:
+                extra = json.loads(extra) if extra else {}
+            except Exception:
+                extra = {}
+        exclude_tables = [t.strip() for t in (extra.get("exclude_tables") or [])
+                          if isinstance(t, str) and t.strip()]
         skip_tables: list = []
         cleared_tables: list = []
         clear_warnings: list = []
@@ -623,6 +660,7 @@ class DbMigrationEngine:
             "validate_before_run": False,
             "verify_after_run": False,
             "skip_tables": skip_tables,
+            "exclude_tables": exclude_tables,
         }
         started = time.monotonic()
         res = run_sync_task_with_task(synthetic_task)
@@ -676,6 +714,400 @@ class DbMigrationEngine:
             result["precheck"] = res["precheck"]
         return result
 
+    # ================= 非表对象迁移（对标 KDTS 迁移对象种类） =================
+    _PG_FAMILY = ("postgresql", "kingbase", "opengauss", "panwei")
+    _MYSQL_FAMILY = ("mysql", "mariadb")
+    _OBJECT_LIMIT = 500          # 每类对象提取上限（防超大库拖垮迁移窗口）
+
+    def _obj_conn(self, plan: dict, side: str):
+        """对象迁移用原生连接（复用统计连接的建连逻辑）。"""
+        return _stats_connect(
+            plan[f"{side}_db_type"], plan[f"{side}_host"], plan[f"{side}_port"],
+            plan[f"{side}_db_name"], plan[f"{side}_username"],
+            _dec_secret(plan.get(f"{side}_password") or ""))
+
+    @staticmethod
+    def _obj_family(db_type: str) -> str:
+        d = (db_type or "").lower()
+        if d in ("postgresql", "kingbase", "opengauss", "panwei"):
+            return "pg"
+        if d in ("mysql", "mariadb"):
+            return "mysql"
+        if d in ("oracle", "dameng"):
+            return "oracle"
+        return d
+
+    def _phase_objects(self, plan: dict) -> dict:
+        """非表对象迁移：视图 / 序列 / 注释 / 例程(函数·存储过程) / 触发器。
+
+        extra_options.migrate_objects 控制开关：
+          {"views": true, "sequences": true, "comments": true,
+           "routines": true, "triggers": true}
+        策略（诚实边界）：
+          - 同构/同族目标：CREATE OR REPLACE 直通重建；
+          - 异构目标：视图/序列/注释做基础方言适配后执行，失败逐对象记录；
+            例程/触发器**跨方言不翻译**——导出源码进报告，标注需人工适配。
+        """
+        extra = plan.get("extra_options") or {}
+        if not isinstance(extra, dict):
+            try:
+                extra = json.loads(extra) if extra else {}
+            except Exception:
+                extra = {}
+        cfg = extra.get("migrate_objects") or {}
+        if not isinstance(cfg, dict) or not any(bool(v) for v in cfg.values()):
+            return {"executed": False, "reason": "未启用对象迁移（migrate_objects 未配置）"}
+
+        src_t = plan["src_db_type"].lower()
+        tgt_t = plan["tgt_db_type"].lower()
+        src_fam, tgt_fam = self._obj_family(src_t), self._obj_family(tgt_t)
+        same_family = src_fam == tgt_fam
+        src_schema = plan.get("src_db_name") or ""
+        tgt_schema = plan.get("tgt_db_name") or ""
+        started = time.monotonic()
+        self._obj_plan = plan        # 单线程引擎实例内使用（_exec_target 目标执行）
+
+        out = {"executed": True, "same_family": same_family,
+               "views": [], "sequences": [], "comments": [],
+               "routines": [], "triggers": [], "routines_export": []}
+
+        src_conn = self._obj_conn(plan, "src")
+        try:
+            if cfg.get("views"):
+                out["views"] = self._mig_views(src_conn, src_t, tgt_t,
+                                               src_schema, tgt_schema)
+            if cfg.get("sequences"):
+                out["sequences"] = self._mig_sequences(src_conn, src_t, tgt_t,
+                                                       src_schema, tgt_schema)
+            if cfg.get("comments"):
+                out["comments"] = self._mig_comments(src_conn, src_t, tgt_t,
+                                                     src_schema, tgt_schema,
+                                                     exclude=extra.get("exclude_tables"))
+            if cfg.get("routines"):
+                r = self._mig_routines(src_conn, src_t, src_schema)
+                out["routines"] = r if same_family else []
+                if not same_family:
+                    out["routines_export"] = r
+            if cfg.get("triggers"):
+                r = self._mig_triggers(src_conn, src_t, src_schema)
+                out["triggers"] = r if same_family else []
+                if not same_family:
+                    if not isinstance(out.get("routines_export"), list):
+                        out["routines_export"] = []
+                    out["routines_export"] = out["routines_export"] + [
+                        {**x, "kind": "trigger"} for x in r]
+        finally:
+            try:
+                src_conn.close()
+            except Exception:
+                pass
+        out["duration_sec"] = round(time.monotonic() - started, 1)
+        n_ok = sum(1 for sec in ("views", "sequences", "comments")
+                   for it in out[sec] if it.get("status") == "ok")
+        n_fail = sum(1 for sec in ("views", "sequences", "comments")
+                     for it in out[sec] if it.get("status") == "error")
+        out["summary"] = (f"对象迁移：成功 {n_ok}，失败 {n_fail}"
+                          + (f"，导出待人工适配 {len(out['routines_export'])} 个"
+                             if out.get("routines_export") else ""))
+        db.add_log("warning" if n_fail else "info", "db_migrate",
+                   f"迁移计划 #{plan['id']} 对象迁移：{out['summary']}")
+        return out
+
+    def _exec_target(self, plan: dict, sql: str) -> tuple:
+        """在目标端执行一条对象 DDL。返回 (ok, error)。"""
+        try:
+            conn = self._obj_conn(plan, "tgt")
+        except Exception as e:
+            return False, f"目标连接失败: {str(e)[:150]}"
+        try:
+            cur = conn.cursor()
+            cur.execute(sql)
+            conn.commit()
+            cur.close()
+            return True, ""
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return False, str(e)[:250]
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _adapt_view_sql(sql: str, src_fam: str, tgt_fam: str,
+                        src_schema: str = "") -> str:
+        """跨方言视图语句基础净化（失败可接受——逐对象兜底）。"""
+        import re
+        # 剥源 schema 限定：目标库没有同名 schema，带前缀必炸（实测 MySQL→PG）
+        if src_schema:
+            for pat in (rf'(?i)"{re.escape(src_schema)}"\.', rf'(?i)`{re.escape(src_schema)}`\.',
+                        rf'(?i)\b{re.escape(src_schema)}\.'):
+                sql = re.sub(pat, "", sql)
+        if tgt_fam == "pg" and src_fam == "mysql":
+            # MySQL 反引号 → PG 双引号
+            sql = re.sub(r"`([^`]+)`", r'"\1"', sql)
+            sql = sql.replace("\\'", "''")
+        elif tgt_fam == "mysql" and src_fam == "pg":
+            sql = re.sub(r'"([^"]+)"', r"`\1`", sql)
+        return sql
+
+    # ---- 视图 ----
+    def _mig_views(self, src_conn, src_t: str, tgt_t: str,
+                   src_schema: str, tgt_schema: str, tgt_conn=None) -> list:
+        src_fam = self._obj_family(src_t)
+        tgt_fam = self._obj_family(tgt_t)
+        rows = []
+        if src_fam == "mysql":
+            cur = src_conn.cursor()
+            cur.execute(
+                "SELECT TABLE_NAME, VIEW_DEFINITION FROM information_schema.VIEWS "
+                "WHERE TABLE_SCHEMA=%s LIMIT %s", (src_schema, self._OBJECT_LIMIT))
+            rows = [(r[0], r[1] or "") for r in cur.fetchall()]
+            cur.close()
+        elif src_fam == "pg":
+            cur = src_conn.cursor()
+            cur.execute(
+                "SELECT viewname, definition FROM pg_views "
+                "WHERE schemaname=%s LIMIT %s", (src_schema, self._OBJECT_LIMIT))
+            rows = [(r[0], "CREATE VIEW " + r[0] + " AS " + (r[1] or "").rstrip().rstrip(";"))
+                    for r in cur.fetchall()]
+            cur.close()
+        elif src_fam == "oracle":
+            cur = src_conn.cursor()
+            cur.execute(
+                "SELECT view_name, DBMS_METADATA.GET_DDL('VIEW', view_name, owner) "
+                "FROM all_views WHERE owner=:o AND ROWNUM <= :n",
+                {"o": (src_schema or "").upper(), "n": self._OBJECT_LIMIT})
+            rows = [(r[0], (r[1].read() if hasattr(r[1], "read") else str(r[1] or "")))
+                    for r in cur.fetchall()]
+            cur.close()
+        out = []
+        for name, ddl in rows:
+            if not (ddl or "").strip():
+                continue
+            ddl = ddl.strip().rstrip(";")
+            if src_fam != tgt_fam:
+                # 剥源方言 CREATE 头：取第一个 SELECT 关键字（列别名里的
+                # " as " 会干扰 AS 切分——实测 MySQL→PG 暴露）
+                import re as _re
+                m = _re.search(r"(?is)\bselect\b", ddl)
+                select_part = ddl[m.start():].rstrip(";") if m else ddl
+                select_part = self._adapt_view_sql(select_part, src_fam, tgt_fam,
+                                                   src_schema)
+                if tgt_fam == "mysql":
+                    sql = f"CREATE OR REPLACE VIEW `{tgt_schema}`.`{name}` AS {select_part}"
+                else:
+                    sql = f'CREATE OR REPLACE VIEW "{name}" AS {select_part}'
+            else:
+                sql = ddl if ddl.lower().lstrip().startswith("create") else \
+                    f"CREATE OR REPLACE VIEW {name} AS {ddl}"
+            ok, err = self._exec_target(self._obj_plan, sql)
+            out.append({"object": name, "kind": "view",
+                        "status": "ok" if ok else "error",
+                        "error": err})
+        return out
+
+    # ---- 序列 ----
+    def _mig_sequences(self, src_conn, src_t: str, tgt_t: str,
+                       src_schema: str, tgt_schema: str) -> list:
+        src_fam = self._obj_family(src_t)
+        tgt_fam = self._obj_family(tgt_t)
+        out = []
+        if src_fam == "mysql":
+            return [{"object": "-", "kind": "sequence", "status": "skipped",
+                     "error": "MySQL/MariaDB 无序列对象（自增随表迁移）"}]
+        if src_fam == "pg":
+            cur = src_conn.cursor()
+            cur.execute(
+                "SELECT sequencename, COALESCE(last_value, 1), increment_by, "
+                "COALESCE(min_value, 1), COALESCE(max_value, 9223372036854775807) "
+                "FROM pg_sequences WHERE schemaname=%s LIMIT %s",
+                (src_schema, self._OBJECT_LIMIT))
+            seqs = cur.fetchall()
+            cur.close()
+            for name, last, inc, mn, mx in seqs:
+                if tgt_fam == "mysql":
+                    out.append({"object": name, "kind": "sequence", "status": "skipped",
+                                "error": "MySQL 目标无序列对象"})
+                    continue
+                start = int(last or 1) + 1
+                sql = (f'CREATE SEQUENCE IF NOT EXISTS "{name}" '
+                       f'INCREMENT {int(inc)} MINVALUE {int(mn)} '
+                       f'MAXVALUE {int(mx)} START {start}')
+                ok, err = self._exec_target(self._obj_plan, sql)
+                out.append({"object": name, "kind": "sequence",
+                            "status": "ok" if ok else "error", "error": err})
+        elif src_fam == "oracle":
+            cur = src_conn.cursor()
+            cur.execute(
+                "SELECT sequence_name, last_number, increment_by FROM all_sequences "
+                "WHERE sequence_owner=:o AND ROWNUM <= :n",
+                {"o": (src_schema or "").upper(), "n": self._OBJECT_LIMIT})
+            seqs = cur.fetchall()
+            cur.close()
+            for name, last, inc in seqs:
+                if tgt_fam == "mysql":
+                    out.append({"object": name, "kind": "sequence", "status": "skipped",
+                                "error": "MySQL 目标无序列对象"})
+                    continue
+                start = int(last or 1)
+                sql = (f'CREATE SEQUENCE "{name}" START WITH {start} '
+                       f'INCREMENT BY {int(inc)}')
+                ok, err = self._exec_target(self._obj_plan, sql)
+                out.append({"object": name, "kind": "sequence",
+                            "status": "ok" if ok else "error", "error": err})
+        return out
+
+    # ---- 注释 ----
+    def _mig_comments(self, src_conn, src_t: str, tgt_t: str,
+                      src_schema: str, tgt_schema: str,
+                      exclude=None) -> list:
+        src_fam = self._obj_family(src_t)
+        tgt_fam = self._obj_family(tgt_t)
+        out = []
+        if tgt_fam == "mysql":
+            return [{"object": "-", "kind": "comment", "status": "skipped",
+                     "error": "MySQL 目标列级注释需重建列定义，仅支持表级（未执行）"}]
+        excl = {t.strip() for t in (exclude or []) if isinstance(t, str)}
+        tbl, cols = [], []
+        if src_fam == "mysql":
+            cur = src_conn.cursor()
+            cur.execute(
+                "SELECT TABLE_NAME, TABLE_COMMENT FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA=%s AND TABLE_COMMENT<>'' "
+                "AND TABLE_TYPE='BASE TABLE' LIMIT %s",
+                (src_schema, self._OBJECT_LIMIT))
+            tbl = cur.fetchall()
+            cur.execute(
+                "SELECT TABLE_NAME, COLUMN_NAME, COLUMN_COMMENT FROM "
+                "information_schema.COLUMNS WHERE TABLE_SCHEMA=%s AND "
+                "COLUMN_COMMENT<>'' LIMIT %s", (src_schema, self._OBJECT_LIMIT))
+            cols = cur.fetchall()
+            cur.close()
+        elif src_fam == "pg":
+            cur = src_conn.cursor()
+            cur.execute(
+                "SELECT c.relname, d.description FROM pg_description d "
+                "JOIN pg_class c ON c.oid=d.objoid AND d.objsubid=0 "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname=%s AND d.description IS NOT NULL LIMIT %s",
+                (src_schema, self._OBJECT_LIMIT))
+            tbl = cur.fetchall()
+            cur.execute(
+                "SELECT c.relname, a.attname, d.description FROM pg_description d "
+                "JOIN pg_class c ON c.oid=d.objoid "
+                "JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum=d.objsubid "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname=%s AND d.description IS NOT NULL LIMIT %s",
+                (src_schema, self._OBJECT_LIMIT))
+            cols = cur.fetchall()
+            cur.close()
+        elif src_fam == "oracle":
+            cur = src_conn.cursor()
+            cur.execute(
+                "SELECT table_name, comments FROM all_tab_comments "
+                "WHERE owner=:o AND comments IS NOT NULL AND ROWNUM <= :n",
+                {"o": (src_schema or "").upper(), "n": self._OBJECT_LIMIT})
+            tbl = cur.fetchall()
+            cur.execute(
+                "SELECT table_name, column_name, comments FROM all_col_comments "
+                "WHERE owner=:o AND comments IS NOT NULL AND ROWNUM <= :n",
+                {"o": (src_schema or "").upper(), "n": self._OBJECT_LIMIT})
+            cols = cur.fetchall()
+            cur.close()
+        if excl:
+            tbl = [(t, c) for t, c in tbl if t not in excl]
+            cols = [(t, col, c) for t, col, c in cols if t not in excl]
+        for t, c in tbl:
+            sql = f'COMMENT ON TABLE "{t}" IS {_sql_quote(str(c or ""))}'
+            ok, err = self._exec_target(self._obj_plan, sql)
+            out.append({"object": t, "kind": "comment_table",
+                        "status": "ok" if ok else "error", "error": err})
+        for t, col, c in cols:
+            sql = f'COMMENT ON COLUMN "{t}"."{col}" IS {_sql_quote(str(c or ""))}'
+            ok, err = self._exec_target(self._obj_plan, sql)
+            out.append({"object": f"{t}.{col}", "kind": "comment_column",
+                        "status": "ok" if ok else "error", "error": err})
+        return out
+
+    # ---- 例程（函数/存储过程）与触发器 ----
+    def _mig_routines(self, src_conn, src_t: str, src_schema: str) -> list:
+        src_fam = self._obj_family(src_t)
+        out = []
+        if src_fam == "mysql":
+            cur = src_conn.cursor()
+            cur.execute(
+                "SELECT ROUTINE_NAME, ROUTINE_TYPE, ROUTINE_DEFINITION FROM "
+                "information_schema.ROUTINES WHERE ROUTINE_SCHEMA=%s LIMIT %s",
+                (src_schema, self._OBJECT_LIMIT))
+            for name, rtype, body in cur.fetchall():
+                kw = "FUNCTION" if (rtype or "").upper() == "FUNCTION" else "PROCEDURE"
+                out.append({"object": name, "kind": kw.lower(),
+                            "sql": f"DROP {kw} IF EXISTS `{name}`;\n"
+                                   f"CREATE {kw} `{name}`();\n{body or ''}\n"})
+            cur.close()
+        elif src_fam == "pg":
+            cur = src_conn.cursor()
+            cur.execute(
+                "SELECT p.proname, pg_get_functiondef(p.oid) FROM pg_proc p "
+                "JOIN pg_namespace n ON n.oid=p.pronamespace "
+                "WHERE n.nspname=%s AND p.prokind='f' LIMIT %s",
+                (src_schema, self._OBJECT_LIMIT))
+            out = [{"object": r[0], "kind": "function", "sql": r[1]}
+                   for r in cur.fetchall()]
+            cur.close()
+        elif src_fam == "oracle":
+            cur = src_conn.cursor()
+            cur.execute(
+                "SELECT object_name, object_type FROM all_objects WHERE owner=:o "
+                "AND object_type IN ('FUNCTION','PROCEDURE') AND ROWNUM <= :n",
+                {"o": (src_schema or "").upper(), "n": self._OBJECT_LIMIT})
+            objs = cur.fetchall()
+            for name, otype in objs:
+                cur2 = src_conn.cursor()
+                cur2.execute(
+                    "SELECT DBMS_METADATA.GET_DDL(:t, :n, :o) FROM dual",
+                    {"t": otype, "n": name, "o": (src_schema or "").upper()})
+                ddl = cur2.fetchone()[0]
+                cur2.close()
+                out.append({"object": name,
+                            "kind": (otype or "").lower(),
+                            "sql": ddl.read() if hasattr(ddl, "read") else str(ddl or "")})
+            cur.close()
+        return out
+
+    def _mig_triggers(self, src_conn, src_t: str, src_schema: str) -> list:
+        src_fam = self._obj_family(src_t)
+        out = []
+        if src_fam == "mysql":
+            cur = src_conn.cursor()
+            cur.execute(
+                "SELECT TRIGGER_NAME, EVENT_MANIPULATION, EVENT_OBJECT_TABLE, "
+                "ACTION_ORIENTATION, ACTION_STATEMENT, ACTION_TIMING FROM "
+                "information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=%s LIMIT %s",
+                (src_schema, self._OBJECT_LIMIT))
+            for name, ev, tbl, orient, body, timing in cur.fetchall():
+                sql = (f"CREATE TRIGGER `{name}` {timing or 'AFTER'} {ev} "
+                       f"ON `{tbl}` FOR EACH {orient or 'ROW'}\n{body or ''}")
+                out.append({"object": name, "kind": "trigger", "sql": sql})
+            cur.close()
+        elif src_fam == "pg":
+            cur = src_conn.cursor()
+            cur.execute(
+                "SELECT tgname, pg_get_triggerdef(t.oid) FROM pg_trigger t "
+                "JOIN pg_class c ON c.oid=t.tgrelid "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname=%s AND NOT t.tgisinternal LIMIT %s",
+                (src_schema, self._OBJECT_LIMIT))
+            out = [{"object": r[0], "kind": "trigger", "sql": r[1]}
+                   for r in cur.fetchall()]
+            cur.close()
+        return out
+
     def _phase_verify(self, plan: dict, manifest: Optional[list] = None) -> dict:
         """数据校验：逐表行数比对（源 vs 目标）+ manifest 对照。"""
         db_type = plan["src_db_type"].lower()
@@ -720,6 +1152,17 @@ class DbMigrationEngine:
         manifest_diffs = 0
         m_rows = self._manifest_rows_map(manifest)
         from core.data_compare import _norm_val
+        # 排除表不参与校验（目标端本就没有该表——此前会炸"relation not exist"）
+        _extra = plan.get("extra_options") or {}
+        if not isinstance(_extra, dict):
+            try:
+                _extra = json.loads(_extra) if _extra else {}
+            except Exception:
+                _extra = {}
+        _excl = {t.strip() for t in (_extra.get("exclude_tables") or [])
+                 if isinstance(t, str)}
+        if _excl:
+            tables = [t for t in tables if t not in _excl]
         for tb in tables:
             src_cnt = self._count_rows(plan["src_db_type"], plan["src_host"],
                                        plan["src_port"], plan["src_username"],

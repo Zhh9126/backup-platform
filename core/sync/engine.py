@@ -118,6 +118,7 @@ def _task_to_config(task: Dict[str, Any]) -> SyncConfig:
         verify_after_run=bool(task.get("verify_after_run")),
         precheck_sample_rows=int(task.get("precheck_sample_rows") or 20),
         skip_tables=list(task.get("skip_tables") or []),
+        exclude_tables=list(task.get("exclude_tables") or []),
     )
     # managed 源：从 backup_tasks 读取连接信息
     if cfg.source_type == "managed" and cfg.source_task_id:
@@ -993,6 +994,11 @@ class SyncEngine:
         grand_errors = 0
         failed_tables = []
         skipped_tables = []
+        # exclude_tables（对标 KDTS「排除指定表」）：用户显式排除，与断点续跑
+        # 的 skip_tables（成功跳过）语义分开，结果里单独记录
+        excluded_tables = [t for t in tables
+                           if t in set(cfg.exclude_tables or [])]
+        tables = [t for t in tables if t not in set(cfg.exclude_tables or [])]
         skip = set(cfg.skip_tables or [])
 
         logger.info("全库迁移开始：%d 张表（跳过 %d 张）", len(tables), len(skip))
@@ -1036,6 +1042,8 @@ class SyncEngine:
         )
         if failed_tables:
             message += f"，失败表：{', '.join(failed_tables[:5])}"
+        if excluded_tables:
+            message += f"，排除 {len(excluded_tables)} 张"
 
         return {
             "success": success,
@@ -1047,6 +1055,7 @@ class SyncEngine:
             "tables": results,
             "failed_tables": failed_tables,
             "skipped_tables": skipped_tables,
+            "excluded_tables": excluded_tables,
         }
 
     # ---- 约束管理（pg2mysql 核心优化） ----

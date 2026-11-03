@@ -1688,6 +1688,7 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                 ("inc_events", "INTEGER DEFAULT 0"),       # 已追平的增量事件数
                 ("inc_last_apply_at", "TEXT"),             # 最近一次增量投递时刻
                 ("verify_sample_rows", "INTEGER DEFAULT 100"),  # 校验抽样行数（0=关闭）
+                ("extra_options", "TEXT"),                 # 迁移扩展配置 JSON（对象迁移/排除表等，对标 KDTS）
             ]:
                 try:
                     conn.execute(f"ALTER TABLE db_migration_plans ADD COLUMN {col} {typedef}")

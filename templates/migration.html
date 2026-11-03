@@ -98,6 +98,27 @@
           </div>
           <div class="form-text">提交后立即执行：预检查 → 所选阶段顺序编排，进度与报告实时展示；增量/不停机由「数据同步」realtime 模式承接。</div>
         </div>
+        <div class="mt-3">
+          <label class="form-label">迁移对象（表之外，对标金仓 KDTS 对象覆盖）</label>
+          <div class="d-flex gap-3 flex-wrap">
+            <div class="form-check"><input class="form-check-input" type="checkbox" id="dm_o_views">
+              <label class="form-check-label" for="dm_o_views">视图</label></div>
+            <div class="form-check"><input class="form-check-input" type="checkbox" id="dm_o_sequences">
+              <label class="form-check-label" for="dm_o_sequences">序列</label></div>
+            <div class="form-check"><input class="form-check-input" type="checkbox" id="dm_o_comments">
+              <label class="form-check-label" for="dm_o_comments">表/列注释</label></div>
+            <div class="form-check"><input class="form-check-input" type="checkbox" id="dm_o_routines">
+              <label class="form-check-label" for="dm_o_routines">函数/存储过程</label></div>
+            <div class="form-check"><input class="form-check-input" type="checkbox" id="dm_o_triggers">
+              <label class="form-check-label" for="dm_o_triggers">触发器</label></div>
+          </div>
+          <div class="form-text">同构/同族目标直通重建；异构目标视图/序列/注释做方言适配，函数/存储过程/触发器导出源码待人工适配（不伪装成功）。MySQL 目标无序列对象。</div>
+        </div>
+        <div class="mt-2">
+          <label class="form-label">排除表清单（可选，逗号分隔，对标 KDTS「排除指定表」）</label>
+          <input class="form-control font-monospace" id="dm_exclude_tables"
+                 placeholder="如 log_2023, tmp_bak, arc_2024">
+        </div>
         <div class="mt-2"><label class="form-label">备注</label>
           <input class="form-control" id="dm_note" placeholder="迁移原因 / 时间窗口等"></div>
       </div>

@@ -7582,13 +7582,14 @@
         if (p.error_msg) {
           html += '<div class="alert alert-danger py-2 small">' + esc(p.error_msg) + '</div>';
         }
-        const names = { precheck: "① 预检查", migrate: "② 结构迁移 + 全量迁移", verify: "③ 数据校验" };
-        ["precheck", "migrate", "verify"].forEach(function (ph) {
+        const names = { precheck: "① 预检查", migrate: "② 结构迁移 + 全量迁移", objects: "②.5 迁移对象（视图/序列/注释/例程/触发器）", verify: "③ 数据校验" };
+        ["precheck", "migrate", "objects", "verify"].forEach(function (ph) {
           const d = phases[ph];
           if (!d) return;
           html += '<div class="border rounded p-2 mb-2 small">' +
             '<div class="fw-bold mb-1">' + names[ph] + ' ' +
-            '<span class="badge ' + (d.ok ? 'badge-ok' : 'badge-fail') + '">' + (d.ok ? '通过' : '失败') + '</span></div>';
+            (d.ok === undefined ? '' : '<span class="badge ' + (d.ok ? 'badge-ok' : 'badge-fail') + '">' + (d.ok ? '通过' : '失败') + '</span>') +
+            '</div>';
           if (ph === "precheck") {
             (d.checks || []).forEach(function (c) {
               html += '<div>' + (c.ok ? '✅' : '❌') + ' ' + esc(c.item) + '：' + esc(c.message || '') + '</div>';
@@ -7597,7 +7598,27 @@
           } else if (ph === "migrate") {
             html += '<div>结构迁移：' + esc(d.structure || '-') + '</div>' +
               '<div>读取 ' + (d.total_read || 0) + ' 行 / 写入 ' + (d.total_write || 0) + ' 行，耗时 ' + (d.duration_sec || 0) + 's</div>' +
+              (d.excluded_tables && d.excluded_tables.length ? '<div>排除表：' + esc(d.excluded_tables.join(', ')) + '</div>' : '') +
               '<div class="text-muted">' + esc(d.message || '') + '</div>';
+          } else if (ph === "objects") {
+            if (d.executed === false) {
+              html += '<div class="text-muted">' + esc(d.reason || d.error || '未启用') + '</div>';
+            } else {
+              html += '<div>' + esc(d.summary || '') + '（同族直通=' + (d.same_family ? '是' : '否') + '，耗时 ' + (d.duration_sec || 0) + 's）</div>';
+              ["views", "sequences", "comments"].forEach(function (sec) {
+                (d[sec] || []).forEach(function (it) {
+                  html += '<div>' + (it.status === "ok" ? '✅' : (it.status === "skipped" ? '⏭' : '❌')) + ' ' +
+                    esc(sec.replace(/s$/, '')) + ' ' + esc(it.object) +
+                    (it.error ? '：' + esc(it.error.slice(0, 90)) : '') + '</div>';
+                });
+              });
+              (d.routines || []).forEach(function (r) {
+                html += '<div>✅ 例程 ' + esc(r.object) + '（' + esc(r.kind) + '）</div>';
+              });
+              (d.routines_export || []).forEach(function (r) {
+                html += '<div>📄 导出待人工适配：' + esc(r.object) + '（' + esc(r.kind) + '）</div>';
+              });
+            }
           } else if (ph === "verify") {
             html += '<div>' + esc(d.message || '') + '（一致 ' + (d.tables_matched || 0) + '/' + (d.tables_total || 0) + ' 张）</div>';
             (d.tables || []).forEach(function (t) {
@@ -7668,6 +7689,17 @@
       if ($("dm_t_structure").checked) payload.migrate_types.push("structure");
       if ($("dm_t_full").checked) payload.migrate_types.push("full");
       if ($("dm_t_verify").checked) payload.migrate_types.push("verify");
+      // 迁移对象（表之外）+ 排除表（对标 KDTS）
+      const mo = { views: $("dm_o_views").checked, sequences: $("dm_o_sequences").checked,
+        comments: $("dm_o_comments").checked, routines: $("dm_o_routines").checked,
+        triggers: $("dm_o_triggers").checked };
+      const excl = ($("dm_exclude_tables").value || "").split(",")
+        .map((s) => s.trim()).filter(Boolean);
+      if (Object.values(mo).some(Boolean) || excl.length) {
+        payload.extra_options = {};
+        if (Object.values(mo).some(Boolean)) payload.extra_options.migrate_objects = mo;
+        if (excl.length) payload.extra_options.exclude_tables = excl;
+      }
       if (!payload.name) { toast("请填写计划名称", "warning"); return; }
       if (!payload.src_host || !payload.src_db_name) { toast("请填写源端主机与数据库", "warning"); return; }
       if (!payload.tgt_host || !payload.tgt_db_name) { toast("请填写目标端主机与数据库", "warning"); return; }

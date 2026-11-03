@@ -30,6 +30,7 @@ class SyncConfig:
     src_schema: str = ""
     source_table: str = ""
     source_tables_list: List[str] = field(default_factory=list)
+    exclude_tables: List[str] = field(default_factory=list)   # 排除表清单（对标 KDTS「排除指定表」）
     source_where: str = ""
 
     # 目标端连接

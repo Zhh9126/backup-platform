@@ -36,10 +36,14 @@ class MySQLSourceReader(SourceReader):
             with conn.cursor() as cur:
                 db = self.config.src_db_name or self.config.src_schema
                 if db:
-                    cur.execute("SHOW TABLES FROM `{}`".format(db))
+                    cur.execute("SHOW FULL TABLES FROM `{}`".format(db))
                 else:
-                    cur.execute("SHOW TABLES")
-                return [row[0] for row in cur.fetchall()]
+                    cur.execute("SHOW FULL TABLES")
+                # 仅基础表：视图由迁移对象阶段以 CREATE VIEW 语义处理
+                # （此前 SHOW TABLES 把视图当表枚举，同步会建出同名"表"，
+                #  遮挡后续真正的 CREATE VIEW——实测 MySQL→PG 暴露）
+                return [row[0] for row in cur.fetchall()
+                        if len(row) < 2 or (row[1] or "") != "VIEW"]
         finally:
             conn.close()
 

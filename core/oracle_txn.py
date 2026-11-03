@@ -250,8 +250,19 @@ def _connect_oracle(task: dict):
 
 def rollback_execute(task: dict, plan: dict,
                      stop_on_error: bool = False) -> dict:
-    """执行回滚计划：逐条 UNDO 独立提交（错误隔离），结果逐条回传。"""
-    conn = _connect_oracle(task)
+    """执行回滚计划：逐条 UNDO 独立提交（错误隔离），结果逐条回传。
+
+    连接失败抛 OracleTxnError（API 层转 400 结构化错误，绝不伪装成功）。
+    """
+    try:
+        conn = _connect_oracle(task)
+    except OracleTxnError:
+        raise
+    except Exception as e:
+        raise OracleTxnError(
+            "无法连接目标 Oracle（%s:%s/%s）: %s"
+            % (task.get("host"), task.get("port"),
+               task.get("db_name") or "-", str(e)[:160]))
     results = []
     executed, failed = 0, 0
     started = time.time()

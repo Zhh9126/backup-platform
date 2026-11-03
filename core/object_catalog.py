@@ -163,13 +163,41 @@ def _scan_dameng_dmp(path: str) -> list:
     return rows
 
 
+def _scan_mysql_tar(path: str) -> list:
+    """全实例逐库 tar（dbs/<db>.sql）：流式逐成员解析表清单（P0-1）。"""
+    import tarfile
+    rows, seen = [], set()
+    with tarfile.open(path, "r:*") as tf:
+        for m in tf.getmembers():
+            name = m.name.lstrip("./")
+            if not (m.isfile() and name.startswith("dbs/")
+                    and name.endswith(".sql")):
+                continue
+            db_name = os.path.splitext(os.path.basename(name))[0]
+            fh = tf.extractfile(m)
+            if fh is None:
+                continue
+            for mm in re.finditer(
+                    r"CREATE TABLE\s+(?:`?(\w+)`?\.)?`?(\w+)`?\s*\(",
+                    fh.read(512 * 1024 * 1024).decode("utf-8", "ignore")):
+                schema, tbl = mm.group(1) or db_name, mm.group(2)
+                key = (schema, tbl)
+                if key not in seen:
+                    seen.add(key)
+                    rows.append({"obj_type": "TABLE", "obj_name": tbl,
+                                 "schema": schema})
+    return rows
+
+
 def scan(record_id: int, backup_path: str, db_type: str) -> int:
     """扫描备份产物对象清单并落库，返回对象数。"""
     rows = []
     p = (backup_path or "").lower()
-    if db_type in ("mysql", "mariadb") and (p.endswith(".sql") or
-                                            p.endswith(".zst") or
-                                            p.endswith(".gz")):
+    if db_type in ("mysql", "mariadb") and p.endswith((".tar.gz", ".tgz")):
+        rows = _scan_mysql_tar(backup_path)
+    elif db_type in ("mysql", "mariadb") and (p.endswith(".sql") or
+                                              p.endswith(".zst") or
+                                              p.endswith(".gz")):
         rows = _scan_mysql(_read_decompressed(backup_path))
     elif db_type == "postgresql":
         if p.endswith(".dump"):

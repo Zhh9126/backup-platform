@@ -2257,7 +2257,7 @@
       if (actions.length === 0) actions.push('<span class="text-muted">-</span>');
       if (canRestore && isMysqlFamily) {
         actions.push(`<button class="btn btn-sm btn-outline-primary" onclick="openPitrModal(${r.id})" title="任意时间点恢复">PITR</button>`);
-        actions.push(`<button class="btn btn-sm btn-outline-info" onclick="openObjectModal(${r.id})" title="对象级精准恢复">对象</button>`);
+        actions.push(`<button class="btn btn-sm btn-outline-info" onclick="openObjectModal(${r.id})" title="表级/对象级精准恢复（从备份产物勾选单表直接恢复）">对象</button>`);
       }
       const checked = window.recordSel.has(r.id) ? " checked" : "";
       return `<tr>
@@ -2474,7 +2474,33 @@
     $("object_target_db").value = "";
     fillPitrObjectHostSelects();
     objectModal.show();
+    _loadObjectTableList(id);
   };
+
+  // P0-1：拉取产物表清单（tar/单库 dump 切片目录），渲染多选
+  async function _loadObjectTableList(recordId) {
+    const box = $("object_table_list");
+    if (!box) return;
+    box.innerHTML = '<div class="text-muted">正在扫描产物表清单…</div>';
+    try {
+      const rows = await api("GET", `/api/records/${recordId}/tables`);
+      const tables = (rows || []).filter((r) => r.obj_type === "TABLE");
+      if (!tables.length) {
+        box.innerHTML = '<div class="text-muted">未能识别产物内表清单（可手填对象名走旧通道）</div>';
+        return;
+      }
+      box.innerHTML = tables.map((t) => {
+        const val = t.schema ? `${t.schema}.${t.obj_name}` : t.obj_name;
+        const label = t.schema ? `${t.schema}.${t.obj_name}` : t.obj_name;
+        return `<div class="form-check">
+          <input class="form-check-input obj-table-cb" type="checkbox" value="${esc(val)}" id="otc_${esc(val)}">
+          <label class="form-check-label" for="otc_${esc(val)}">${esc(label)}</label>
+        </div>`;
+      }).join("") + '<div class="text-muted mt-1">共 ' + tables.length + " 张表</div>";
+    } catch (e) {
+      box.innerHTML = '<div class="text-danger">表清单加载失败: ' + esc(e.message) + "</div>";
+    }
+  }
 
   $("pitrAddHostBtn").onclick = () => { window.open("/file_backup", "_blank"); };
   $("objectAddHostBtn").onclick = () => { window.open("/file_backup", "_blank"); };
@@ -2499,10 +2525,34 @@
 
   $("objectSubmitBtn").onclick = async () => {
     const id = $("object_record_id").value;
-    const name = $("object_name").value;
-    if (!name) { toast("请输入对象名", "warning"); return; }
+    // P0-1：勾选了表 → 统一恢复通道（/api/restores，切片+审计+验证码闸）
+    const picked = Array.from(document.querySelectorAll("#object_table_list .obj-table-cb:checked"))
+      .map((cb) => cb.value);
     const target = _resolveTargetHost("object");
     if (!target) { toast("请选择目标主机或直接输入 IP/账号/密码", "warning"); return; }
+    if (picked.length) {
+      const body = { record_id: Number(id), tables: picked,
+        target_db: ($("object_target_db").value || "").trim() };
+      if (target.mode === "managed") body.target_host_id = Number(target.host_key);
+      else {
+        body.target_host = `${target.user}@${target.host}:${target.port}`;
+        body.target_host_user = target.user;
+        body.target_host_password = target.password;
+      }
+      objectModal.hide();
+      toast("表级恢复已提交…");
+      try {
+        const r = await verifyGate((code) =>
+          api("POST", "/api/restores", code ? Object.assign({}, body, { verify_code: code }) : body)) || {};
+        const st = String(r.status || "");
+        toast((st === "failed" ? "表级恢复失败：" : "表级恢复完成：")
+          + (r.message || ""), st === "failed" ? "danger" : "success", 6000);
+      } catch (e) { toast("表级恢复失败: " + e.message, "danger"); }
+      return;
+    }
+    // 未勾选：手填对象名走旧通道（兼容保留）
+    const name = $("object_name").value;
+    if (!name) { toast("请勾选要恢复的表，或手填对象名", "warning"); return; }
     objectModal.hide();
     try {
       const r = await api("POST", "/api/restores/object", {

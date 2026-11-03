@@ -191,7 +191,17 @@
       <div class="modal-body">
         <input type="hidden" id="object_record_id">
         <div class="mb-3">
-          <label class="form-label">对象名 *</label>
+          <label class="form-label">从备份产物选择表（可多选）</label>
+          <div id="object_table_list" class="border rounded p-2 small" style="max-height:180px;overflow-y:auto">
+            <div class="text-muted">正在扫描产物表清单…</div>
+          </div>
+          <div class="form-text">
+            支持全实例 tar / 单库 dump 的表锚点切片（P0-1），勾选后走统一恢复通道
+            （含预检/审计/高危验证码）；未勾选时可手填下方对象名走旧通道。
+          </div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">对象名（未勾选表时手填）</label>
           <input class="form-control" id="object_name" placeholder="MySQL: 表名; PG: public.users 或 schema">
           <div class="form-text">仅恢复指定表/schema，其余数据不动</div>
         </div>

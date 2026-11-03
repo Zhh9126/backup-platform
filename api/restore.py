@@ -107,6 +107,31 @@ def api_record_objects(record_id):
     return jsonify(object_catalog.list_objects(record_id))
 
 
+@api_bp.route("/records/<int:record_id>/tables", methods=["GET"])
+@login_required
+def api_record_tables(record_id):
+    """表级恢复：产物内表清单（P0-1）。
+
+    目录为空或只有占位条目时，同步扫描一次产物（tar/单库 dump）后返回。
+    """
+    from core import object_catalog
+    rec = models.get_record(record_id)
+    if not rec:
+        return jsonify({"error": "备份记录不存在"}), 404
+    rows = object_catalog.list_objects(record_id)
+    if not rows or (len(rows) == 1 and rows[0].get("obj_type") == "DATABASE"):
+        db_type = rec.get("db_type")
+        if not db_type:
+            t = models.get_task(rec.get("task_id")) or {}
+            db_type = t.get("db_type")
+        try:
+            object_catalog.scan(record_id, rec.get("backup_path"), db_type)
+        except Exception:
+            pass  # 扫描失败回落到现有清单/占位，不阻断向导
+        rows = object_catalog.list_objects(record_id)
+    return jsonify(rows)
+
+
 @api_bp.route("/webhooks", methods=["GET", "POST"])
 @login_required
 def api_webhooks():

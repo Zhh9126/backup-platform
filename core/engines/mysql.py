@@ -1529,6 +1529,21 @@ class MySQLEngine(BackupEngine):
                 backup_path=backup_path, message=reason,
                 detail_log="\n".join(logs))
 
+        # 1.5) 表级恢复（P0-1）：kwargs.tables → 锚点切片 → 单文件恢复通道
+        # 仅逻辑产物支持；物理备份产物不支持表级语义（如实失败）
+        sel_tables = [str(t).strip() for t in (kwargs.get("tables") or [])
+                      if str(t).strip()]
+        if sel_tables:
+            if self._is_physical_backup(backup_path):
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path,
+                    message="物理备份产物不支持表级恢复（无表级 SQL 语义）；"
+                            "请使用逻辑备份产物或走整实例恢复",
+                    detail_log="\n".join(logs))
+            return self._restore_table_slice(backup_path, sel_tables,
+                                             kwargs, logs)
+
         # 2) 全实例 tar 产物（multi-db-tar）→ 逐库恢复
         if backup_path.endswith((".tar.gz", ".tgz")) and self._is_full_instance_tar(backup_path):
             logs.append("[全实例恢复] 检测到逐库 tar 产物（manifest.json），执行全实例恢复")
@@ -2596,6 +2611,61 @@ class MySQLEngine(BackupEngine):
             "mysql: 目标服务器 %s 版本过低，dump 中 8.0 特有排序规则已降级为通用规则",
             version)
         return text
+
+    def _restore_table_slice(self, backup_path: str, sel_tables: list,
+                             kwargs: dict, logs: list) -> BackupResult:
+        """表级恢复（P0-1）：从全实例 tar / 单库 dump 切片指定表后灌入。
+
+        目标库解析优先级：kwargs.target_db → 首个带库前缀表的源库 →
+        任务 db_name。切片文件为临时文件，恢复后清理。
+        """
+        from core import table_extract
+        started = time.time()
+        logs.append(f"[表级恢复] 指定表: {','.join(sel_tables)}")
+        try:
+            tmp_sql, found, notes = table_extract.slice_tables(
+                backup_path, sel_tables)
+        except table_extract.TableExtractError as e:
+            logs.append(f"[表级恢复] 切片失败: {e}")
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path,
+                duration_sec=round(time.time() - started, 3),
+                message=f"MySQL 表级恢复失败: {e}",
+                detail_log="\n".join(logs))
+        except Exception as e:  # 解包/解压异常如实透出
+            logs.append(f"[表级恢复] 切片异常: {e}")
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path,
+                duration_sec=round(time.time() - started, 3),
+                message=f"MySQL 表级恢复失败（切片异常）: {e}",
+                detail_log="\n".join(logs))
+
+        target_db = (kwargs.get("target_db") or ""
+                     or (found[0]["schema"] if found else "")
+                     or self.task.get("db_name") or "")
+        logs.append(
+            f"[表级恢复] 切片成功 {len(found)} 表"
+            f"({','.join(f['obj_name'] for f in found)})"
+            f" → 目标库 {target_db}"
+            + (f"；{';'.join(notes)}" if notes else ""))
+        kw = dict(kwargs)
+        kw["target_db"] = target_db
+        try:
+            result = self._restore_local(tmp_sql, **kw)
+            if result.success:
+                result.message = (
+                    f"MySQL 表级恢复成功（{len(found)} 表 → {target_db}）"
+                    + (f"；{';'.join(notes)}" if notes else ""))
+            else:
+                result.message = f"MySQL 表级恢复失败: {result.message}"
+            return result
+        finally:
+            try:
+                os.unlink(tmp_sql)
+            except OSError:
+                pass
 
     def _restore_local(self, backup_path: str, **kwargs) -> BackupResult:
         # 连接参数

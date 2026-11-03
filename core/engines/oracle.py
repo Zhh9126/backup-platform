@@ -102,6 +102,21 @@ class OracleEngine(BackupEngine):
             return f"SCHEMAS={schemas_arg}", f"指定模式(schemas={schemas_arg})"
         return ("" if for_import else "FULL=Y"), "全库"
 
+    def _restore_extra_with_tables(self, extra: dict, kwargs: dict) -> dict:
+        """恢复时指定表（P0-1）：kwargs.tables 覆盖任务 extra.tables。
+
+        表级恢复（impdp TABLES=）只在本次恢复生效，不改任务配置；
+        未传 tables 时原样返回，行为与既有完全一致。
+        """
+        rt_tables = [str(t).strip() for t in (kwargs.get("tables") or [])
+                     if str(t).strip()]
+        if not rt_tables:
+            return extra
+        merged = dict(extra or {})
+        merged["tables"] = rt_tables
+        merged.pop("schemas", None)  # TABLES 与 SCHEMAS 互斥，TABLES 优先
+        return merged
+
     @staticmethod
     def _quote_password(pw: str) -> str:
         """给连接串中的口令加引号。
@@ -1473,7 +1488,9 @@ class OracleEngine(BackupEngine):
                         success=False, status=BackupStatus.FAILED,
                         message="远端未找到 impdp（已探测 oracle 用户 PATH 与常见 "
                                 "ORACLE_HOME 安装目录），请确认数据库软件安装完整")
-                mode_args = self._dp_mode_args(for_import=True)[0]
+                mode_args = self._dp_mode_args(
+                    self._restore_extra_with_tables(extra, kwargs),
+                    for_import=True)[0]
                 inner = (f"export PATH=$ORACLE_HOME/bin:$PATH; "
                          f"{shlex.quote(impdp_bin)} {shlex.quote(restore_conn)} "
                          f"DUMPFILE={dmp_name} LOGFILE={log_name} </dev/null "

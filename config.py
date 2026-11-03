@@ -180,6 +180,9 @@ DB_DISPLAY_NAMES = {
     "dameng": "DM 达梦", "sqlserver": "SQL Server",
     "redis": "Redis", "mongodb": "MongoDB", "file": "文件",
     "neo4j": "Neo4j", "vm": "虚拟机", "object_storage": "对象存储",
+    # 国产数据库协议兼容层（2026-11-03）
+    "highgo": "HighGo（瀚高）", "uxdb": "UXDB（优炫）",
+    "tidb": "TiDB", "oceanbase": "OceanBase",
 }
 
 # 备份方式（backup_type）中文映射：full / incremental / differential

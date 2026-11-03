@@ -1297,6 +1297,36 @@ _PG_FAMILY_TOOLING = {
         "env_exports": ("PGPASSWORD",),
         "db_type": "postgresql",
     },
+    # 国产 PG 系发行版（瀚高/优炫）：工具链与社区 PostgreSQL 同名同用法，
+    # 仅默认端口/展示名差异——条目内容与 postgresql 相同，db_type 各自标识。
+    "highgo": {
+        "label": "HighGo",
+        "dump_tool": "pg_dump",
+        "restore_candidates": ("pg_restore",),
+        "query_candidates": ("psql",),
+        "dumpall_candidates": ("pg_dumpall",),
+        "catalog_table": "pg_database",
+        "maint_candidates": ("postgres", "template1"),
+        "default_port": 5866,
+        "default_user": "postgres",
+        "check_user": None,
+        "env_exports": ("PGPASSWORD",),
+        "db_type": "highgo",
+    },
+    "uxdb": {
+        "label": "UXDB",
+        "dump_tool": "pg_dump",
+        "restore_candidates": ("pg_restore",),
+        "query_candidates": ("psql",),
+        "dumpall_candidates": ("pg_dumpall",),
+        "catalog_table": "pg_database",
+        "maint_candidates": ("postgres", "template1"),
+        "default_port": 5432,
+        "default_user": "postgres",
+        "check_user": None,
+        "env_exports": ("PGPASSWORD",),
+        "db_type": "uxdb",
+    },
     "kingbase": {
         "label": "KingbaseES",
         "dump_tool": "sys_dump",
@@ -3030,6 +3060,10 @@ def remote_db_dump(task: dict, ssh_host: dict, db_type: str, compress: int = 0,
         return data, compressed, fmt
     if db_type == "postgresql":
         data, fmt = _remote_pg_dump(task, ssh_host, compress)
+        return data, bool(compress) and fmt == "single", fmt
+    if db_type in ("highgo", "uxdb"):
+        # 国产 PG 系发行版（瀚高/优炫）：工具链同名同用法，复用 PG 通道
+        data, fmt = _pg_family_dump(task, ssh_host, db_type, compress)
         return data, bool(compress) and fmt == "single", fmt
     if db_type == "kingbase":
         data, fmt = _remote_kingbase_dump(task, ssh_host, compress)

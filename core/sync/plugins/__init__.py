@@ -16,5 +16,10 @@ registry.register("dameng", DamengPlugin)
 registry.register("sqlserver", SQLServerPlugin)
 # 金仓复用 PG 协议（sys_dump/psql 兼容）；驱动侧 psycopg2 直连可用
 registry.register("kingbase", PostgreSQLPlugin)
+# 国产数据库协议兼容层：瀚高/优炫（PG 系）、TiDB/OceanBase（MySQL 协议）
+registry.register("highgo", PostgreSQLPlugin)
+registry.register("uxdb", PostgreSQLPlugin)
+registry.register("tidb", MySQLPlugin)
+registry.register("oceanbase", MySQLPlugin)
 
 __all__ = ["registry"]

@@ -33,6 +33,10 @@ from core.engines.file import FileBackupEngine
 from core.engines.object_storage import ObjectStorageEngine
 from core.engines.qdrant import QdrantEngine
 from core.engines.chroma import ChromaEngine
+from core.engines.highgo import HighGoEngine
+from core.engines.uxdb import UXDBEngine
+from core.engines.tidb import TiDBEngine
+from core.engines.oceanbase import OceanBaseEngine
 
 
 def _register_vm_engine():
@@ -71,6 +75,11 @@ ENGINE_REGISTRY = {
     "object_storage": ObjectStorageEngine,
     "qdrant": QdrantEngine,
     "chroma": ChromaEngine,
+    # 国产数据库协议兼容层（PG 系 / MySQL 系复用既有引擎）
+    "highgo": HighGoEngine,
+    "uxdb": UXDBEngine,
+    "tidb": TiDBEngine,
+    "oceanbase": OceanBaseEngine,
 }
 
 ENGINE_DISPLAY = {k: cls.display_name for k, cls in ENGINE_REGISTRY.items()}
@@ -82,7 +91,7 @@ ENGINE_DISPLAY["vm"] = "虚拟机"
 _CORE_SELF = ("oracle", "kingbase", "dameng")
 _PERIPHERAL_API = ("mysql", "mariadb", "postgresql", "sqlserver",
                    "redis", "mongodb", "neo4j", "file", "vm", "object_storage",
-                   "qdrant", "chroma")
+                   "qdrant", "chroma", "highgo", "uxdb", "tidb", "oceanbase")
 for _name in _CORE_SELF:
     if _name in ENGINE_REGISTRY:
         ENGINE_REGISTRY[_name].adapter_tier = "core_self"

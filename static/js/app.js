@@ -1529,6 +1529,8 @@
     if ($("t_tool_path")) $("t_tool_path").value = "";
     if ($("t_db_os_user")) $("t_db_os_user").value = "";
     if ($("t_rman_temp_dir")) $("t_rman_temp_dir").value = "";
+    if ($("t_rman_channels")) $("t_rman_channels").value = "";
+    if ($("t_parallel_pull")) $("t_parallel_pull").checked = false;
     if ($("t_backup_stage_dir")) $("t_backup_stage_dir").value = "";
     if ($("t_auto_discover")) $("t_auto_discover").checked = false;
     toggleSshFields();
@@ -1545,6 +1547,8 @@
     if ($("t_tool_path")) $("t_tool_path").value = eo.tool_path || "";
     if ($("t_db_os_user")) $("t_db_os_user").value = eo.db_os_user || "";
     if ($("t_rman_temp_dir")) $("t_rman_temp_dir").value = eo.rman_temp_dir || "";
+    if ($("t_rman_channels")) $("t_rman_channels").value = eo.rman_channels ? String(eo.rman_channels) : "";
+    if ($("t_parallel_pull")) $("t_parallel_pull").checked = !!eo.parallel_pull;
     if ($("t_backup_stage_dir")) $("t_backup_stage_dir").value = eo.backup_stage_dir || "";
     if ($("t_auto_discover")) $("t_auto_discover").checked = !!eo.auto_discover_new_dbs;
   }
@@ -1589,6 +1593,13 @@
     // 新建库自动纳管（备新建库）
     if ($("t_auto_discover") && $("t_auto_discover").checked) eo.auto_discover_new_dbs = true;
     else delete eo.auto_discover_new_dbs;
+    // P1-5：RMAN 通道数（仅 Oracle 物理备份；空 = 单连接）
+    const rch = ($("t_rman_channels") && $("t_rman_channels").value) || "";
+    if (rch) eo.rman_channels = parseInt(rch, 10);
+    else delete eo.rman_channels;
+    // P1-5：备份片并行拉回
+    if ($("t_parallel_pull") && $("t_parallel_pull").checked) eo.parallel_pull = true;
+    else delete eo.parallel_pull;
   }
 
   function fillSshCred(sc, task) {
@@ -3892,7 +3903,7 @@
   };
 
   // ---- P1-4：文件推送式实时同步 ----
-  async function loadFileSync() {
+  window.loadFileSync = async function () {
     const tb = $("fsTaskTable");
     if (!tb) return;
     try {
@@ -6483,7 +6494,7 @@
   };
 
   // ---- P1-3：池复制两地三中心 ----
-  async function loadPools() {
+  window.loadPools = async function () {
     const box = $("poolList");
     if (!box) return;
     try {
@@ -7151,7 +7162,7 @@
     el.classList.remove("d-none");
   }
 
-  async function loadPolicies() {
+  window.loadPolicies = async function () {
     const rows = await api("GET", "/api/policy");
     const tbody = $("policyTable");
     if (!rows || !rows.length) {
@@ -8406,7 +8417,7 @@
     } catch (e) { toast("删除失败: " + e.message, "danger"); }
   };
 
-  async function loadLinks() {
+  window.loadLinks = async function () {
     // 数据源缓存供卡片展示源名 / 状态 / 差异检测使用；失败不阻塞链路列表渲染
     try { await loadLinkSources(); } catch (e) { LINK_SOURCES = []; }
     // P1-1：自动监控状态（失败则空对象，不阻塞链路渲染）

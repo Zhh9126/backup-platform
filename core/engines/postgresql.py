@@ -142,10 +142,14 @@ class PostgreSQLEngine(BackupEngine):
                 stdout=res.get("stdout", ""), stderr=res.get("stderr", ""))
 
         out_dir = self._output_dir()
-        # 逐 tar 包断点续传拉回（大实例 base.tar.gz 可能数十 GB，断链不必重传）
+        # 逐 tar 包断点续传拉回（大实例 base.tar.gz 可能数十 GB，断链不必重传）。
+        # P1-5：extra.parallel_pull 开启时多包并行拉回。
+        _extra = self._parse_extra() or {}
+        _pp = str(_extra.get("parallel_pull") or "").lower() in ("1", "true", "yes", "on")
         pieces = remote_dump._pull_remote_tars(
             client, res["remote_dir"], out_dir, task=self.task,
-            host_key=ssh_host.get("host_key", ""), db_type=f"{self.db_type}_phys")
+            host_key=ssh_host.get("host_key", ""), db_type=f"{self.db_type}_phys",
+            ssh_host=ssh_host if _pp else None, max_workers=3 if _pp else 1)
         if not pieces:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,

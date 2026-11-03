@@ -457,8 +457,16 @@ class OracleEngine(BackupEngine):
             catalog_line = ""
             if pushed:
                 catalog_line = f"  CATALOG START WITH '{remote_dir}' NOPROMPT;\n"
+            # P1-5：任务配置了多通道时 VALIDATE 同样受益（逐片并行读备份片）
+            _vch = self._rman_channels()
+            _vch_lines = "".join(
+                f"  ALLOCATE CHANNEL ch{i:02d} DEVICE TYPE DISK;\n"
+                for i in range(_vch)) if _vch > 1 else ""
+            _vch_rel = "".join(
+                f"  RELEASE CHANNEL ch{i:02d};\n"
+                for i in range(_vch)) if _vch > 1 else ""
             with sftp.open("/tmp/platform_verify_rman.cmd", "w") as f:
-                f.write(f"RUN {{\n{catalog_line}  RESTORE DATABASE VALIDATE;\n}}\nEXIT;\n")
+                f.write(f"RUN {{\n{_vch_lines}{catalog_line}  RESTORE DATABASE VALIDATE;\n{_vch_rel}}}\nEXIT;\n")
             shell = remote_dump._wrap_login(
                 f"su - {self._resolve_check_user(ssh_host)} -c "
                 f"{shlex.quote(f'{shlex.quote(rman_bin)} target / @/tmp/platform_verify_rman.cmd')}")
@@ -815,6 +823,35 @@ class OracleEngine(BackupEngine):
             "Oracle 逻辑备份(exp/expdp)",
         )
 
+    # ---- P1-5 单任务多通道并行 ----
+    _RMAN_MAX_CHANNELS = 8
+
+    def _rman_channels(self) -> int:
+        """任务级 RMAN 通道数（extra_options.rman_channels，1-8；<=1 返回 0=单连接）。"""
+        try:
+            n = int((self._parse_extra() or {}).get("rman_channels") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 1:
+            return 0
+        return min(n, self._RMAN_MAX_CHANNELS)
+
+    @staticmethod
+    def _rman_run_script(db_backup_line: str, arch_backup_line: str,
+                         channels: int = 0) -> str:
+        """组装 RMAN RUN 块。channels>1 时显式 ALLOCATE/RELEASE 多通道，
+        单条 BACKUP 语句由 RMAN 自动分片到各通道（FORMAT %U 保证片名唯一）。"""
+        nch = max(0, min(int(channels or 0), 8))
+        alloc = rel = ""
+        if nch > 1:
+            alloc = "".join(
+                f"  ALLOCATE CHANNEL ch{i:02d} DEVICE TYPE DISK;\n"
+                for i in range(nch))
+            rel = "".join(
+                f"  RELEASE CHANNEL ch{i:02d};\n" for i in range(nch))
+        return ("RUN {\n" + alloc + db_backup_line + "\n"
+                + arch_backup_line + "\n" + rel + "}\nexit;\n")
+
     def _backup_physical(self, backup_type: BackupType) -> BackupResult:
         """物理备份(本机兜底)：本地执行 RMAN。
 
@@ -834,19 +871,17 @@ class OracleEngine(BackupEngine):
         script = os.path.join(out_dir, f"rman_{ts}.cmd")
         fmt_db = os.path.join(out_dir, f"ora_bkp_{ts}_%U.bkp")
         fmt_arch = os.path.join(out_dir, f"ora_bkp_{ts}_arch_%U.bkp")
-        lines = ["RUN {"]
         if backup_type == BackupType.INCREMENTAL:
-            lines.append(
+            db_line = (
                 f"  BACKUP AS COMPRESSED BACKUPSET INCREMENTAL LEVEL 0 DATABASE "
                 f"FORMAT '{fmt_db}';")
         else:
-            lines.append(f"  BACKUP AS COMPRESSED BACKUPSET DATABASE FORMAT '{fmt_db}';")
-        lines.append(
+            db_line = f"  BACKUP AS COMPRESSED BACKUPSET DATABASE FORMAT '{fmt_db}';"
+        arch_line = (
             f"  BACKUP AS COMPRESSED BACKUPSET ARCHIVELOG ALL FORMAT '{fmt_arch}';")
-        lines.append("}")
-        lines.append("exit;")
+        nch = self._rman_channels()
         with open(script, "w") as f:
-            f.write("\n".join(lines))
+            f.write(self._rman_run_script(db_line, arch_line, channels=nch))
         start = time.time()
         ret = self._run(["rman", "target", "/", f"@{script}"], timeout=7200)
         dur = round(time.time() - start, 3)
@@ -896,14 +931,11 @@ class OracleEngine(BackupEngine):
             db_line = (
                 f"  BACKUP AS COMPRESSED BACKUPSET DATABASE "
                 f"FORMAT '{remote_dir}/{bkp_prefix}%U.bkp';")
-        rman_script = (
-            "RUN {\n"
-            f"{db_line}\n"
+        arch_line = (
             f"  BACKUP AS COMPRESSED BACKUPSET ARCHIVELOG ALL "
-            f"FORMAT '{remote_dir}/{bkp_prefix}arch_%U.bkp';\n"
-            "}\n"
-            "exit;\n"
-        )
+            f"FORMAT '{remote_dir}/{bkp_prefix}arch_%U.bkp';")
+        nch = self._rman_channels()
+        rman_script = self._rman_run_script(db_line, arch_line, channels=nch)
 
         client = remote_dump._connect(ssh_host)
         # 19c 场景：确保 PDB OPEN（RMAN 备份 CDB 时要求 PDB 打开）
@@ -1076,7 +1108,9 @@ class OracleEngine(BackupEngine):
                 remote_dump.mark_remote_artifact_done(
                     client, remote_marker, note=f"rman {ssh_host.get('host_key','')}")
 
-            # 4) 断点续传拉回所有备份片（匹配确定性前缀）；中断后从断点继续
+            # 4) 拉回所有备份片（匹配确定性前缀）；中断后从断点继续。
+            #    P1-5：extra.parallel_pull 开启时多片并行拉回——每 worker 一条
+            #    独立 SSH 连接，单片断点续传语义不变；worker 数 = min(片数, 通道数或 3)。
             out_dir = self._output_dir()
             os.makedirs(out_dir, exist_ok=True)
             try:
@@ -1084,17 +1118,29 @@ class OracleEngine(BackupEngine):
                                if a.filename.startswith(bkp_prefix))
             except Exception:
                 names = []
-            pieces = []
-            for fname in names:
-                remote_path = f"{remote_dir}/{fname}"
-                local_path = os.path.join(out_dir, fname)
-                res = remote_dump.sftp_pull_resumable(
-                    client, remote_path, local_path, task=self.task, key=fname,
-                    db_type=f"{self.db_type}_rman",
-                    host_key=ssh_host.get("host_key", ""),
-                    has_rc=False, stable_secs=3,
-                    label=f"rman {fname}", min_size=1024)
-                pieces.append((res["path"], res["size"]))
+            _parallel = str((self._parse_extra() or {}).get("parallel_pull")
+                            or "").lower() in ("1", "true", "yes", "on")
+            pull_workers = 1
+            if _parallel and len(names) > 1:
+                pull_workers = min(len(names), max(nch or 3, 3))
+                items = [(fn, f"{remote_dir}/{fn}", os.path.join(out_dir, fn))
+                         for fn in names]
+                pieces = remote_dump.sftp_pull_files_parallel(
+                    ssh_host, items, task=self.task,
+                    db_type=f"{self.db_type}_rman", max_workers=pull_workers,
+                    stable_secs=3, min_size=1024)
+            else:
+                pieces = []
+                for fname in names:
+                    remote_path = f"{remote_dir}/{fname}"
+                    local_path = os.path.join(out_dir, fname)
+                    res = remote_dump.sftp_pull_resumable(
+                        client, remote_path, local_path, task=self.task, key=fname,
+                        db_type=f"{self.db_type}_rman",
+                        host_key=ssh_host.get("host_key", ""),
+                        has_rc=False, stable_secs=3,
+                        label=f"rman {fname}", min_size=1024)
+                    pieces.append((res["path"], res["size"]))
 
             if not pieces:
                 return BackupResult(
@@ -1118,6 +1164,8 @@ class OracleEngine(BackupEngine):
                 mf.write(f"task: {self.task_name}\n")
                 mf.write(f"backup_type: {backup_type.value}\n")
                 mf.write(f"remote_dir: {remote_dir}\n")
+                mf.write(f"rman_channels: {nch or 1}\n")
+                mf.write(f"pull_workers: {pull_workers}\n")
                 for p, sz in pieces:
                     mf.write(f"{os.path.basename(p)}\t{sz}\t{db.sha256_file(p)}\n")
 
@@ -1130,7 +1178,9 @@ class OracleEngine(BackupEngine):
                 pass
             msg = (f"通过 SSH 在 {hk} 以 oracle 用户执行 RMAN 物理备份成功，"
                    f"已拉回 {len(pieces)} 个备份片，共 {db.human_size(total_size)}"
-                   f"（主片: {os.path.basename(first_local)}）{_rootfs_note}")
+                   + (f"，RMAN 通道 {nch}" if nch > 1 else "")
+                   + (f"，并行拉回 {pull_workers} 线程" if pull_workers > 1 else "")
+                   + f"（主片: {os.path.basename(first_local)}）{_rootfs_note}")
             self.logger.info("[%s] %s", self.task_name, msg)
             return BackupResult(
                 success=True, status=BackupStatus.SUCCESS,

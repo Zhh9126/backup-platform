@@ -334,6 +334,33 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
                   </div>
                 </div>
                 <div class="col-12 mt-2">
+                  <label class="form-label">RMAN 通道数（可选，仅 Oracle 物理备份）</label>
+                  <select class="form-select form-select-sm" id="t_rman_channels">
+                    <option value="">默认（单连接）</option>
+                    <option value="2">2 通道</option>
+                    <option value="4">4 通道</option>
+                    <option value="6">6 通道</option>
+                    <option value="8">8 通道</option>
+                  </select>
+                  <div class="small text-muted">
+                    多通道时 RMAN 在 RUN 块内显式 ALLOCATE CHANNEL 并把备份集分片到各通道并行写盘
+                    （对标鼎甲多通道，上限 8）；恢复校验（VALIDATE）同样受益。
+                    瓶颈在远端磁盘 IO 时收益有限，通道数不宜超过数据文件数。
+                  </div>
+                </div>
+                <div class="col-12 mt-2">
+                  <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="t_parallel_pull">
+                    <label class="form-check-label" for="t_parallel_pull">
+                      备份片并行拉回（多产物文件时生效）
+                    </label>
+                    <div class="small text-muted">
+                      RMAN 多备份片 / pg_basebackup 多 tar 包时，多条独立 SSH 连接并行 SFTP 拉回
+                      （任务级限速视为总带宽按线程均分，断点续传语义不变）。
+                    </div>
+                  </div>
+                </div>
+                <div class="col-12 mt-2">
                   <label class="form-label">远端暂存目录（可选，全数据库类型生效）</label>
                   <input class="form-control form-control-sm font-monospace" id="t_backup_stage_dir"
                          placeholder="如 /data/aidbm_stage（留空 = 数据库服务器 /tmp/bk_stage）">

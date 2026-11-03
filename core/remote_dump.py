@@ -853,8 +853,12 @@ def _connect_isolated(ssh_host: dict):
                     if not pw:
                         raise
                     # 密钥认证失败且无密码可用则抛出；有密码则回退密码认证
+            # 无 pkey 且无密码（未纳管主机）→ 启用 agent/默认密钥探测，
+            # 与 file._get_ssh_client 的 no_password 分支语义对齐
+            _no_cred = (pkey is None and not pw)
             client.connect(host, port=port, username=user, password=pw,
-                           timeout=15, allow_agent=False, look_for_keys=False)
+                           timeout=15, allow_agent=_no_cred,
+                           look_for_keys=_no_cred)
             last_exc = None
             break
         except _auth_exc:
@@ -2688,6 +2692,60 @@ def sftp_pull_dir_resumable(client, remote_dir: str, out_dir: str, *,
     return out
 
 
+def sftp_pull_files_parallel(ssh_host: dict, items: list, *,
+                             task: dict, db_type: str = "fixed",
+                             max_workers: int = 3,
+                             stable_secs: float = None,
+                             min_size: int = 0) -> list:
+    """P1-5 单任务多通道：多文件并行拉回（对标鼎甲 RMAN 多通道）。
+
+    items: [(fname, remote_path, local_path)]（fname 同时作断点续传 key）。
+    每个 worker 一条独立 SSH 连接（_connect_isolated，用完即关），单片仍走
+    sftp_pull_resumable 的断点续传语义——任一 worker 断链只影响自己那片，
+    其余片续传不回退。任务级 bandwidth_limit 视为总带宽按 worker 数均分。
+    返回 [(local_path, size)]，顺序与 items 一致；任一片失败抛原异常。
+    """
+    import concurrent.futures as _fut
+    if not items:
+        return []
+    workers = max(1, min(int(max_workers or 1), len(items), 8))
+    rate = int((task or {}).get("bandwidth_limit") or 0)
+    per_rate = (rate // workers) if (rate and rate >= workers) else rate
+    hk = (ssh_host or {}).get("host_key", "")
+
+    def _one(i, fname, rpath, lpath):
+        per_task = dict(task or {})
+        if per_rate and per_rate != rate:
+            per_task["bandwidth_limit"] = per_rate
+        per_client = _connect_isolated(ssh_host)
+        try:
+            res = sftp_pull_resumable(
+                per_client, rpath, lpath, task=per_task, key=fname,
+                db_type=db_type, host_key=hk, has_rc=False,
+                stable_secs=stable_secs, label=f"{db_type} {fname}",
+                min_size=min_size)
+            return i, res["path"], res["size"]
+        finally:
+            try:
+                per_client.close()
+            except Exception:
+                pass
+
+    out = [None] * len(items)
+    if workers == 1:
+        for i, (fn, rp, lp) in enumerate(items):
+            _, path, size = _one(i, fn, rp, lp)
+            out[i] = (path, size)
+        return out
+    with _fut.ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(_one, i, fn, rp, lp)
+                for i, (fn, rp, lp) in enumerate(items)]
+        for fu in futs:
+            i, path, size = fu.result()
+            out[i] = (path, size)
+    return out
+
+
 def _remote_mysql_dump_to_file(task: dict, ssh_host: dict, final_path: str,
                                compress: int, extra_args: str = "",
                                resume: bool = True) -> dict:
@@ -3436,12 +3494,15 @@ def remote_probackup_restore(task: dict, ssh_host: dict, *, backup_id: str,
 
 def _pull_remote_tars(client, remote_dir: str, out_dir: str, *,
                       task: dict = None, host_key: str = "",
-                      db_type: str = "pg_phys") -> list:
+                      db_type: str = "pg_phys",
+                      ssh_host: dict = None,
+                      max_workers: int = 1) -> list:
     """从远端目录拉取 *.tar[.gz] 到本地 out_dir，返回 [(local_path, size)]。
 
     传入 task 时**逐文件断点续传**（pg_basebackup 会产出 base.tar.gz + 若干 WAL tar，
     大实例单包可能数十 GB，断链后不该从头再传）；未传 task 时退回整文件 sftp.get，
     保持对既有调用方的兼容。
+    P1-5：ssh_host + max_workers>1 且多包时并行拉回（extra.parallel_pull 开启）。
     """
     os.makedirs(out_dir, exist_ok=True)
     sftp = client.open_sftp()
@@ -3453,6 +3514,13 @@ def _pull_remote_tars(client, remote_dir: str, out_dir: str, *,
             sftp.close()
         except Exception:
             pass
+
+    if task and ssh_host and int(max_workers or 1) > 1 and len(names) > 1:
+        items = [(fn, f"{remote_dir}/{fn}", os.path.join(out_dir, fn))
+                 for fn in names]
+        return sftp_pull_files_parallel(
+            ssh_host, items, task=task, db_type=db_type,
+            max_workers=max_workers, stable_secs=3, min_size=1)
 
     pieces = []
     for fname in names:

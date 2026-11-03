@@ -485,7 +485,30 @@ class CrossDBVerifier:
 
         total = len(src_rows)
 
-        # 2. 在目标库逐行比对
+        # 2. 目标非 MySQL/MariaDB：驱动与 SQL 方言不同，逐行精确匹配不可用
+        #    （此前无脑走 pymysql cursor 在达梦/金仓等连接上直接
+        #    TypeError: Expected bytes or unicode string, got type instead）
+        #    → 降级为行数对账，差异如实写进 error，不伪装成功也不抛异常
+        if self.dst_driver not in ("mysql", "mariadb"):
+            src_ref = (f"`{src_schema}`.`{table}`" if src_schema else f"`{table}`")
+            with self.src_conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {src_ref}")
+                src_count = int(cur.fetchone()[0] or 0)
+            dst_ref = self._dst_ref_generic(table, dst_database)
+            with self.dst_conn.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {dst_ref}")
+                dst_count = int(cur.fetchone()[0] or 0)
+            missing = max(0, src_count - dst_count)
+            return VerifyResult(
+                table_name=table,
+                success=(src_count == dst_count),
+                total_source_rows=src_count,
+                missing_rows=missing,
+                error=("" if src_count == dst_count else
+                       f"目标为 {self.dst_driver}，逐行比对未支持，已降级为行数对账："
+                       f"源 {src_count} 行 / 目标 {dst_count} 行"))
+
+        # 3. 目标 MySQL/MariaDB：逐行精确匹配
         dst_ref = self._dst_table_ref(table, dst_database)
         missing_ids = []
         missing_count = 0
@@ -545,3 +568,14 @@ class CrossDBVerifier:
 
     def _dst_table_ref(self, table: str, db: str) -> str:
         return f"`{db}`.`{table}`" if db else f"`{table}`"
+
+    def _dst_ref_generic(self, table: str, schema: str) -> str:
+        """按目标方言构造表引用（行数对账降级路径用）。"""
+        d = (self.dst_driver or "").lower()
+        if d in ("postgresql", "kingbase", "opengauss", "panwei"):
+            return f'"{schema}"."{table}"' if schema else f'"{table}"'
+        if d in ("dameng", "dm", "oracle"):
+            # 达梦/Oracle 标识符默认大写存储
+            s, t = (schema or "").upper(), table.upper()
+            return f'"{s}"."{t}"' if s else f'"{t}"'
+        return self._dst_table_ref(table, schema)

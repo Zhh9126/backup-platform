@@ -1814,7 +1814,7 @@
         <td>${t.enabled ? statusBadge(t.last_status || "never") : '<span class="badge bg-secondary">' + T("已停用") + '</span>'}</td>
         <td>${fmtTime(t.last_run_at) || "-"}</td>
         <td class="text-end" style="white-space:nowrap">
-          ${t.last_status === "running"
+          ${t._running
             ? `<button class="btn-row btn-row-danger" onclick="stopTask(${t.id})" title="停止运行中的备份（协作式取消：传输块边界生效，断点保留可续传）"><i class="bi bi-stop-circle"></i> ${T("停止")}</button>
           <button class="btn-row" onclick="liveLog(${t.id})" title="实时查看本次备份的操作日志（2.5s 自动刷新）"><i class="bi bi-terminal"></i> ${T("实时日志")}</button>`
             : `<button class="btn-row btn-row-primary" onclick="runTask(${t.id})" title="${T("立即备份")}"><i class="bi bi-play-circle"></i> ${T("立即备份")}</button>
@@ -3693,7 +3693,7 @@
         <td>${scheduleCell(t)}</td>
         <td>${t.enabled ? statusBadge(t.last_status || "never") : '<span class="badge bg-secondary">' + T("已停用") + '</span>'}</td>
         <td class="text-end" style="white-space:nowrap">
-          ${t.last_status === "running"
+          ${t._running
             ? `<button class="btn btn-sm btn-outline-danger" onclick="stopTask(${t.id})" title="停止运行中的备份（协作式取消，断点保留可续传）">停止</button>
           <button class="btn btn-sm btn-outline-secondary" onclick="liveLog(${t.id})" title="实时查看操作日志">实时日志</button>`
             : `<button class="btn btn-sm btn-outline-success" onclick="runFileTask(${t.id})">备份</button>`}

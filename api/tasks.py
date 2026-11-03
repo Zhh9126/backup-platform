@@ -111,7 +111,13 @@ def api_task_stop(task_id):
         "SELECT id FROM backup_records WHERE task_id=? AND status='running' "
         "ORDER BY id DESC LIMIT 1", (task_id,))
     if not row:
-        return jsonify({"error": "当前没有运行中的备份任务"}), 400
+        # 僵尸状态自愈：任务 last_status 停在 running 但已无执行中记录
+        # （进程中断/服务重启未回写终态）——顺手修正，前端刷新后按钮即恢复
+        db.execute(
+            "UPDATE backup_tasks SET last_status='failed' "
+            "WHERE id=? AND last_status='running'", (task_id,))
+        return jsonify({"error": "当前没有运行中的备份任务"
+                                  "（任务状态缓存已自动修正，请刷新列表）"}), 400
     from core import cancel as cancel_mod
     if not cancel_mod.cancel(f"t{task_id}:r{row['id']}"):
         return jsonify({"error": "停止失败：该记录的执行上下文未注册"
@@ -277,6 +283,13 @@ def list_tasks():
     db_type_exclude = request.args.get("db_type_exclude")
     tasks = models.list_tasks(include_secret=False, db_type=db_type,
                               db_type_exclude=db_type_exclude)
+    # 注入真实运行状态：last_status 是任务表缓存，进程中断/服务重启后可能
+    # 陈旧地停在 running（僵尸态）——停止按钮必须以 backup_records 的真实
+    # running 记录为准，否则点了「停止」后端却报「当前没有运行中的备份任务」。
+    running_ids = {int(r["task_id"]) for r in db.query(
+        "SELECT DISTINCT task_id FROM backup_records WHERE status='running'")}
+    for t in tasks:
+        t["_running"] = int(t.get("id") or 0) in running_ids
     # 统一分页：v1 默认 100/页；兼容路径默认返回全量（历史行为不变）
     default_size = 100 if request.path.startswith(contract.V1_PREFIX) else len(tasks) or 1
     _page, size, offset = contract.pagination_args(default_size=default_size,

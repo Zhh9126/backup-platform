@@ -686,6 +686,10 @@ def run_restore_now(record_id: int, target_host: str = None,
     result = BackupResult(success=False, message="未执行")
     try:
         from core.engines import get_engine
+        if not task.get("db_type"):
+            raise ValueError(
+                f"备份记录 {record_id} 所属任务 #{rec.get('task_id')} 缺少数据库类型"
+                "（任务数据异常或已被异常修改），无法恢复")
         engine = get_engine(task["db_type"], task, config.BACKUP_ROOT, _logger)
         op.info("恢复引擎: %s", engine.__class__.__name__)
         # 任务级自定义环境变量：注入本机执行与所有远程 SSH 命令
@@ -1628,6 +1632,20 @@ def start_scheduler():
         return None
     from apscheduler.schedulers.background import BackgroundScheduler
     _scheduler = BackgroundScheduler()
+    # 启动清道：服务中断（kill/OOM/重启）后任务表 last_status 可能僵尸停在
+    # running（执行上下文已不存在）——修正为 failed，避免前端误显示「停止」
+    # 按钮、点击又报「当前没有运行中的备份任务」。
+    _stale = db.query(
+        "SELECT id FROM backup_tasks WHERE last_status='running' "
+        "AND id NOT IN (SELECT DISTINCT task_id FROM backup_records "
+        "WHERE status='running')") or []
+    if _stale:
+        db.execute(
+            "UPDATE backup_tasks SET last_status='failed' "
+            "WHERE last_status='running' AND id NOT IN "
+            "(SELECT DISTINCT task_id FROM backup_records WHERE status='running')")
+        _logger.warning("启动清道：修正 %s 个任务的僵尸 running 状态（%s）",
+                        len(_stale), [r["id"] for r in _stale][:20])
     for task in models.list_tasks(enabled=True):
         _register(_scheduler, task)
     for st in models.list_sync_tasks(enabled=True):

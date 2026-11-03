@@ -58,6 +58,9 @@ docs/ai-agent-prd.md
 tests/test_ai_agent.py
 templates/agent.html
 static/js/ai-agent.js
+static/js/agent-render.js
+static/css/agent-render.css
+static/css/agent.css
 
 # E2E 矩阵运行产物
 data/

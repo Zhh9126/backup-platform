@@ -8981,4 +8981,158 @@
   // AI 智能助手：可选模块（static/js/ai-agent.js，剥离版无此文件）
   window.__AIAgentDeps = { api, toast, esc };
 
+  // ---- AI 模型备份：跨层一致性保护计划 ----
+  const AI_LAYERS = [
+    ["weights", "模型权重与检查点"], ["dataset", "训练与微调数据集"],
+    ["vector_index", "向量索引"], ["rdb_metadata", "关系型元数据与对象存储"],
+    ["orchestration", "编排与运行时配置"], ["lineage", "版本指针与数据血缘"],
+    ["agent_state", "Agent 执行状态与工具配置"],
+  ];
+  window.loadAiPlans = async function () {
+    const box = $("aiPlanTable");
+    if (!box) return;
+    try {
+      const d = await api("GET", "/api/ai-plans");
+      const plans = d.plans || [];
+      if (!plans.length) {
+        box.innerHTML = '<div class="empty-state"><i class="bi bi-cpu"></i>' +
+          '<div class="empty-title">还没有 AI 保护计划</div>' +
+          '把模型权重、向量索引、关系元数据等资产编入同一恢复单元——点击「新建保护计划」</div>';
+        return;
+      }
+      box.innerHTML = '<table class="table table-sm align-middle mb-0"><thead><tr>' +
+        '<th>#</th><th>计划</th><th>成员（层）</th><th>偏差阈值</th><th>上次组恢复点</th><th class="text-end">操作</th>' +
+        '</tr></thead><tbody>' + plans.map((p, i) => {
+          const lr = p.last_result;
+          const lastCell = lr
+            ? `<div>${esc(lr.run_at || "")}</div>` +
+              `<span class="badge ${lr.ok && lr.drift_ok ? "badge-ok" : "badge-fail"}">${esc(lr.consistency || "")}</span>` +
+              `<div class="small text-muted">epoch ${esc(lr.epoch || "-")} · 偏差 ${lr.drift_sec}s/${lr.max_drift_sec}s</div>`
+            : '<span class="text-muted">未运行</span>';
+          const members = (p.members || []).map((m) =>
+            `<span class="badge bg-light text-dark border me-1" title="${esc(m.layer_cn || m.layer)}">${esc(m.task_name)}<span class="text-muted small"> · ${esc(m.layer_cn || m.layer)}</span></span>`).join(" ");
+          return `<tr>
+            <td>${i + 1}</td>
+            <td><strong>${esc(p.name)}</strong>${p.enabled ? "" : ' <span class="badge bg-secondary">停用</span>'}
+              ${p.cron ? `<div class="small text-muted">cron ${esc(p.cron)}</div>` : ""}</td>
+            <td class="small">${members || "-"}</td>
+            <td class="small">${p.max_drift_sec}s</td>
+            <td class="small">${lastCell}</td>
+            <td class="text-end text-nowrap">
+              <button class="btn btn-sm btn-outline-primary" onclick="runAiPlan(${p.id})">运行</button>
+              ${lr ? `<button class="btn btn-sm btn-outline-info" onclick='showAiReport(${JSON.stringify(lr).replace(/'/g, "&#39;")})'>报告</button>` : ""}
+              <button class="btn btn-sm btn-outline-secondary" onclick="openAiPlanModal(${p.id})">编辑</button>
+              <button class="btn btn-sm btn-outline-danger" onclick="delAiPlan(${p.id})">删除</button>
+            </td></tr>`;
+        }).join("") + "</tbody></table>";
+    } catch (e) { toast(e.message, "danger"); }
+  };
+
+  window.aiAddMemberRow = function (taskId, layer) {
+    const tb = $("aiMemberRows");
+    if (!tb) return;
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      '<td><select class="form-select form-select-sm ai-m-task"><option value="">选择备份任务…</option></select></td>' +
+      '<td><select class="form-select form-select-sm ai-m-layer">' +
+      AI_LAYERS.map(([k, v]) => `<option value="${k}" ${layer === k ? "selected" : ""}>${v}</option>`).join("") +
+      '</select></td>' +
+      '<td><button class="btn btn-sm btn-outline-danger" onclick="this.closest(\'tr\').remove()">删</button></td>';
+    tb.appendChild(tr);
+    // 异步填充任务下拉
+    api("GET", "/api/tasks").then((tasks) => {
+      const sel = tr.querySelector(".ai-m-task");
+      sel.innerHTML = '<option value="">选择备份任务…</option>' +
+        (tasks || []).map((t) =>
+          `<option value="${t.id}" ${taskId === t.id ? "selected" : ""}>${esc(t.name)}（${esc(t.db_display_name || t.db_type)}）</option>`).join("");
+    }).catch(() => {});
+  };
+
+  window.openAiPlanModal = async function (id) {
+    $("ai_plan_msg").textContent = "";
+    $("aiMemberRows").innerHTML = "";
+    let plan = null;
+    if (id) {
+      const d = await api("GET", "/api/ai-plans");
+      plan = (d.plans || []).find((p) => p.id === id);
+      $("aiPlanTitle").textContent = "编辑保护计划";
+    } else {
+      $("aiPlanTitle").textContent = "新建保护计划";
+    }
+    $("ai_name").value = plan ? plan.name : "";
+    $("ai_drift").value = plan ? plan.max_drift_sec : 300;
+    $("ai_cron").value = plan ? (plan.cron || "") : "";
+    $("ai_remark").value = plan ? (plan.remark || "") : "";
+    (plan && plan.members || []).forEach((m) => window.aiAddMemberRow(m.task_id, m.layer));
+    if (!plan || !(plan.members || []).length) window.aiAddMemberRow();
+    bootstrap.Modal.getOrCreateInstance($("aiPlanModal")).show();
+  };
+
+  window.saveAiPlan = async function () {
+    const rows = [...document.querySelectorAll("#aiMemberRows tr")];
+    const members = rows.map((tr) => ({
+      task_id: parseInt(tr.querySelector(".ai-m-task").value, 10) || null,
+      layer: tr.querySelector(".ai-m-layer").value,
+    })).filter((m) => m.task_id);
+    const payload = {
+      name: $("ai_name").value.trim(),
+      max_drift_sec: parseInt($("ai_drift").value, 10) || 300,
+      cron: $("ai_cron").value.trim(),
+      remark: $("ai_remark").value.trim(),
+      members,
+    };
+    try {
+      const editing = $("aiPlanTitle").textContent.indexOf("编辑") === 0;
+      if (editing) {
+        // 从列表找回当前编辑 id
+        const d = await api("GET", "/api/ai-plans");
+        const cur = (d.plans || []).find((p) => p.name === payload.name) ||
+          (d.plans || [])[0];
+        if (!cur) throw new Error("未找到要编辑的计划");
+        await api("PUT", `/api/ai-plans/${cur.id}`, payload);
+      } else {
+        await api("POST", "/api/ai-plans", payload);
+      }
+      toast("保护计划已保存", "success");
+      bootstrap.Modal.getOrCreateInstance($("aiPlanModal")).hide();
+      await loadAiPlans();
+    } catch (e) { $("ai_plan_msg").textContent = e.message; }
+  };
+
+  window.runAiPlan = async function (id) {
+    toast("保护计划运行中（按序驱动成员任务备份）…", "info");
+    try {
+      const report = await api("POST", `/api/ai-plans/${id}/run`, {});
+      window.showAiReport(report);
+      await loadAiPlans();
+    } catch (e) { toast(e.message, "danger"); }
+  };
+
+  window.showAiReport = function (r) {
+    if (!r) return;
+    const okBadge = r.ok && r.drift_ok
+      ? '<span class="badge badge-ok">跨层一致</span>'
+      : '<span class="badge badge-fail">' + esc(r.consistency || "存在偏差") + '</span>';
+    const rows = (r.members || []).map((m) =>
+      `<tr><td>${esc(m.task_name)}</td><td>${esc(m.layer_cn || m.layer || "")}</td>` +
+      `<td>${m.status === "success" ? '<span class="badge badge-ok">成功</span>' : '<span class="badge badge-fail">' + esc(m.status) + '</span>'}</td>` +
+      `<td class="small">${esc(m.at || "-")}（记录 ${m.record_id || "-"}）</td>` +
+      `<td class="small text-muted">${esc((m.message || "").slice(0, 80))}</td></tr>`).join("");
+    $("aiReportBody").innerHTML =
+      `<div class="mb-2">${okBadge} ` +
+      `<span class="text-muted small">运行于 ${esc(r.run_at || "")} · 耗时 ${r.duration_sec}s</span></div>` +
+      `<div class="alert ${r.drift_ok ? "alert-success" : "alert-warning"} py-2 small">` +
+      `组恢复点 epoch：<b>${esc(r.epoch || "无成功成员")}</b> · 层间偏差 <b>${r.drift_sec}s</b> / 阈值 ${r.max_drift_sec}s` +
+      (r.ok && r.drift_ok ? "" : "——偏差超过阈值时，各层单独可恢复但合在一起可能状态不一致，请检查未对齐的成员或收紧备份窗口") +
+      `</div>` +
+      `<table class="table table-sm"><thead><tr><th>任务</th><th>层</th><th>状态</th><th>恢复点</th><th>说明</th></tr></thead><tbody>${rows}</tbody></table>`;
+    bootstrap.Modal.getOrCreateInstance($("aiReportModal")).show();
+  };
+
+  window.delAiPlan = async function (id) {
+    if (!confirm("删除该保护计划？（成员备份任务不受影响）")) return;
+    try { await api("DELETE", `/api/ai-plans/${id}`); toast("已删除"); await loadAiPlans(); }
+    catch (e) { toast(e.message, "danger"); }
+  };
+
 })();

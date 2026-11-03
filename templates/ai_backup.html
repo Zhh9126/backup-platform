@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}AI 模型备份 - AIDBM{% endblock %}
+{% block content %}
+<div class="page-card">
+  <div class="page-head">
+    <div>
+      <h2 class="page-title"><i class="bi bi-cpu"></i> AI 模型备份</h2>
+      <div class="page-sub">面向 AI 工作负载的跨层一致性保护：模型权重/检查点 · 训练数据集 · 向量索引（Qdrant / Chroma）· 关系元数据 · 编排配置 —— 七层状态作为一个恢复单元对待</div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="openAiPlanModal()"><i class="bi bi-plus-lg"></i> 新建保护计划</button>
+      <button class="btn btn-outline-secondary" onclick="loadAiPlans()"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+    </div>
+  </div>
+
+  <div class="alert alert-light border small mb-3">
+    <b>为什么需要"跨层一致性"：</b>向量索引、嵌入模型版本、关系元数据与对象存储若不在同一恢复点，
+    系统会"看似启动、实则输出错误"（引用错乱、grounding 失效）。保护计划把多层资产编入同一恢复单元，
+    一次运行产出<b>组恢复点（epoch）</b>与<b>层间偏差（drift）</b>报告——偏差超过阈值即如实告警。
+  </div>
+
+  <div id="aiPlanTable" class="table-responsive"></div>
+</div>
+
+<!-- 新建/编辑计划 -->
+<div class="modal fade" id="aiPlanModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="aiPlanTitle">新建保护计划</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-2">
+          <label class="form-label">计划名称 *</label>
+          <input class="form-control" id="ai_name" placeholder="如：RAG 知识库生产保护（索引+元数据+文档）">
+        </div>
+        <div class="row g-2">
+          <div class="col-md-4">
+            <label class="form-label">层间偏差阈值（秒）</label>
+            <input class="form-control" id="ai_drift" type="number" value="300"
+                   title="组内各成员最近成功备份时间的最大允许偏差；超过即判定该恢复点跨层不一致">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">周期执行 cron（可选，空=手动）</label>
+            <input class="form-control" id="ai_cron" placeholder="如 0 3 * * *">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">备注</label>
+            <input class="form-control" id="ai_remark">
+          </div>
+        </div>
+        <label class="form-label mt-3">成员资产（把多层资产编入同一恢复单元）</label>
+        <table class="table table-sm mb-1" id="aiMemberTable">
+          <thead><tr>
+            <th style="width:44%">备份任务</th><th style="width:34%">所属状态层</th><th></th>
+          </tr></thead>
+          <tbody id="aiMemberRows"></tbody>
+        </table>
+        <button class="btn btn-sm btn-outline-secondary" onclick="aiAddMemberRow()"><i class="bi bi-plus"></i> 添加成员</button>
+        <div class="small text-muted mt-2">
+          层次建议：模型权重/LoRA → <b>模型权重与检查点</b>；语料/标注 → <b>训练数据集</b>（建议不可变锁定）；
+          Qdrant/Chroma 任务 → <b>向量索引</b>；用户/会话/审计库 → <b>关系型元数据</b>；
+          K8s 清单/推理配置 → <b>编排与运行时配置</b>；DVC 指针/实验 run → <b>版本指针与血缘</b>。
+        </div>
+        <div class="text-danger small mt-2" id="ai_plan_msg"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" onclick="saveAiPlan()">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 运行报告 -->
+<div class="modal fade" id="aiReportModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-clipboard-data"></i> 组恢复点报告</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body" id="aiReportBody"></div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(async function () {
+  await window.loadAiPlans();
+})();
+</script>
+{% endblock %}

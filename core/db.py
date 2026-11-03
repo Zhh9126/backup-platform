@@ -1552,6 +1552,21 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                     "created_at TEXT, updated_at TEXT)")
             except Exception:
                 pass
+            # 迁移：AI 工作负载保护计划（跨层一致性组，七层状态模型）
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS ai_protection_plans ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "name TEXT NOT NULL, "
+                    "members TEXT DEFAULT '[]', "            # JSON [{task_id, layer}]
+                    "max_drift_sec INTEGER DEFAULT 300, "    # 组内恢复点偏差阈值
+                    "cron TEXT DEFAULT '', "
+                    "enabled INTEGER DEFAULT 1, "
+                    "last_result TEXT DEFAULT '', "          # 上次组恢复点报告 JSON
+                    "remark TEXT DEFAULT '', "
+                    "created_at TEXT, updated_at TEXT)")
+            except Exception:
+                pass
             for col, typedef in [
                 ("set_type", "TEXT DEFAULT 'full'"),
                 ("storage_tier", "INTEGER DEFAULT 1"),

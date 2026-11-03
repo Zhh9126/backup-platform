@@ -31,6 +31,8 @@ from core.engines.mongodb import MongoEngine
 from core.engines.neo4j import Neo4jEngine
 from core.engines.file import FileBackupEngine
 from core.engines.object_storage import ObjectStorageEngine
+from core.engines.qdrant import QdrantEngine
+from core.engines.chroma import ChromaEngine
 
 
 def _register_vm_engine():
@@ -67,6 +69,8 @@ ENGINE_REGISTRY = {
     "neo4j": Neo4jEngine,
     "file": FileBackupEngine,
     "object_storage": ObjectStorageEngine,
+    "qdrant": QdrantEngine,
+    "chroma": ChromaEngine,
 }
 
 ENGINE_DISPLAY = {k: cls.display_name for k, cls in ENGINE_REGISTRY.items()}
@@ -77,7 +81,8 @@ ENGINE_DISPLAY["vm"] = "虚拟机"
 # peripheral_api : 外围引擎以 API 集成封装为主（逻辑导出 + 远程调用）
 _CORE_SELF = ("oracle", "kingbase", "dameng")
 _PERIPHERAL_API = ("mysql", "mariadb", "postgresql", "sqlserver",
-                   "redis", "mongodb", "neo4j", "file", "vm", "object_storage")
+                   "redis", "mongodb", "neo4j", "file", "vm", "object_storage",
+                   "qdrant", "chroma")
 for _name in _CORE_SELF:
     if _name in ENGINE_REGISTRY:
         ENGINE_REGISTRY[_name].adapter_tier = "core_self"

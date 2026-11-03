@@ -406,6 +406,11 @@ def create_app() -> Flask:
     def datamining_page():
         return render_template("datamining.html", page="datamining")
 
+    @app.route("/ai_backup")
+    @login_required
+    def ai_backup_page():
+        return render_template("ai_backup.html", page="ai_backup")
+
     @app.route("/realtime")
     @login_required
     def realtime_page():

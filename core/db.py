@@ -1501,6 +1501,38 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                     "chain_id TEXT, chain_status TEXT DEFAULT 'active')")
             except Exception:
                 pass
+            # 迁移：池复制作业链（P1-3，两地三中心：生产池→同城池→异地池链式编排）
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS pool_chains ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "name TEXT NOT NULL, "
+                    "sites TEXT NOT NULL DEFAULT '[]', "   # JSON [{seq,name,site_role,target_id}]
+                    "mode TEXT DEFAULT 'serial', "          # serial=逐级 | parallel=扇出
+                    "policy TEXT DEFAULT '{}', "            # JSON {max_retries,retry_interval}
+                    "enabled INTEGER DEFAULT 1, "
+                    "last_run_at TEXT, last_result TEXT, "  # JSON {record_id, ok, sites:[{seq,ok}]}
+                    "remark TEXT, created_at TEXT, updated_at TEXT)")
+            except Exception:
+                pass
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS pool_replica_logs ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "chain_id INTEGER NOT NULL, record_id INTEGER NOT NULL, "
+                    "seq INTEGER, target_id INTEGER, target_name TEXT, "
+                    "status TEXT DEFAULT 'pending', "       # success | failed | skipped
+                    "object_key TEXT, size_bytes INTEGER DEFAULT 0, "
+                    "error TEXT, duration_sec REAL DEFAULT 0, "
+                    "created_at TEXT)")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pool_logs_record "
+                    "ON pool_replica_logs(record_id)")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pool_logs_chain "
+                    "ON pool_replica_logs(chain_id, record_id)")
+            except Exception:
+                pass
             for col, typedef in [
                 ("set_type", "TEXT DEFAULT 'full'"),
                 ("storage_tier", "INTEGER DEFAULT 1"),

@@ -498,6 +498,12 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
             tier_replication.replicate_async(path, task, rec_id, _logger)
         except Exception as e:
             _logger.warning("[tier] 三级复制启动失败（不影响备份结果）: %s", e)
+        # 池复制两地三中心（P1-3）：按「站点链」编排，与层级复制并行互不影响
+        try:
+            from core import pool_replication
+            pool_replication.replicate_record_async(rec_id, path)
+        except Exception as e:
+            _logger.warning("[pool] 池复制启动失败（不影响备份结果）: %s", e)
 
     # 备份完 PURGE 已覆盖 binlog（P0-4，对标"备份完删除已备份日志"）：
     # extra.purge_binlog_after_backup=true 且 purge_binlog_keep_files=N 时，

@@ -2253,6 +2253,7 @@
       if (canRestore) {
         actions.push(`<button class="btn btn-sm btn-outline-warning" onclick="runSecurityCheck(${r.id})" title="恢复点安全检测（体积突变/熵值/结构嗅探，启发式，非病毒查杀）"><i class="bi bi-shield-check"></i></button>`);
         actions.push(`<button class="btn btn-sm btn-outline-info" onclick="BKP.runRestorePrecheck(${r.id})" title="恢复预检：先探测产物/完整性/目标端/工具/空间能否支持恢复"><i class="bi bi-clipboard2-check"></i></button>`);
+        actions.push(`<button class="btn btn-sm btn-outline-secondary" onclick="openPoolReplicas(${r.id})" title="副本分布：该备份在两地三中心各池的副本与取回"><i class="bi bi-collection"></i></button>`);
       }
       if (actions.length === 0) actions.push('<span class="text-muted">-</span>');
       if (canRestore && isMysqlFamily) {
@@ -6321,6 +6322,221 @@
     i.type = i.type === "password" ? "text" : "password";
   };
 
+  // ---- P1-3：池复制两地三中心 ----
+  async function loadPools() {
+    const box = $("poolList");
+    if (!box) return;
+    try {
+      const d = await api("GET", "/api/pool/chains");
+      const chains = d.chains || [];
+      if (!chains.length) {
+        box.innerHTML = '<div class="text-muted small">暂无复制作业链——点击「新建复制作业链」把存储目标组织成两地三中心链路。</div>';
+        return;
+      }
+      const arrow = ' <i class="bi bi-arrow-right text-muted"></i> ';
+      box.innerHTML = '<div class="table-responsive"><table class="table table-sm align-middle mb-0"><thead><tr>' +
+        '<th>链路</th><th>站点拓扑</th><th>模式</th><th>最近执行</th><th class="text-end">操作</th></tr></thead><tbody>' +
+        chains.map((ch) => {
+          const sites = (ch.sites || []).map((s) =>
+            `<span title="${esc(s.site_role_cn || "")} · ${esc(s.target_type || "")}">${esc(s.name || s.target_name)}</span>`).join(arrow);
+          const lr = ch.last_result;
+          const lastRun = ch.last_run_at
+            ? `${esc(ch.last_run_at.slice(0, 16).replace("T", " "))} · ` +
+              (lr && lr.ok ? '<span class="badge badge-ok">全站成功</span>'
+                : '<span class="badge badge-fail">存在失败</span>') +
+              `（记录 #${(lr && lr.record_id) || "-"}）`
+            : '<span class="text-muted">未执行</span>';
+          return `<tr>
+            <td><strong>${esc(ch.name)}</strong>${ch.enabled ? "" : ' <span class="badge bg-secondary">停用</span>'}</td>
+            <td class="small">${sites}</td>
+            <td class="small">${ch.mode === "parallel" ? "扇出并行" : "逐级级联"}</td>
+            <td class="small">${lastRun}</td>
+            <td class="text-end text-nowrap">
+              <button class="btn btn-sm btn-outline-primary" onclick="runPool(${ch.id})">执行</button>
+              <button class="btn btn-sm btn-outline-secondary" onclick="openPoolModal(${ch.id})">编辑</button>
+              <button class="btn btn-sm btn-outline-danger" onclick="delPool(${ch.id})">删除</button>
+            </td></tr>`;
+        }).join("") + "</tbody></table></div>";
+    } catch (e) {
+      box.innerHTML = '<div class="text-danger small">加载失败: ' + esc(e.message) + "</div>";
+    }
+  }
+
+  window.runPool = async function (id) {
+    const rid = window.prompt("对哪条备份记录执行该链复制？输入备份记录 ID：");
+    if (!rid) return;
+    try {
+      const d = await api("POST", `/api/pool/chains/${id}/run`, { record_id: Number(rid) });
+      const r = d.result || {};
+      const sites = (r.sites || []).map((s) => `站点${s.seq}=${s.status}`).join(" ");
+      toast(r.ok ? "池复制完成：" + sites : "池复制存在失败：" + sites, r.ok ? "success" : "danger", 6000);
+      await loadPools();
+    } catch (e) { toast("执行失败: " + e.message, "danger"); }
+  };
+
+  window.delPool = async function (id) {
+    const ok = await confirmDialog({ title: "删除复制作业链？", message: "仅删除链编排，存储目标与已有副本不受影响。", confirmText: "删除", danger: true });
+    if (!ok) return;
+    try { await api("DELETE", `/api/pool/chains/${id}`); toast("已删除"); await loadPools(); }
+    catch (e) { toast(e.message, "danger"); }
+  };
+
+  window.openPoolModal = async function (id) {
+    let chain = null;
+    if (id) {
+      try { chain = (await api("GET", `/api/pool/chains/${id}`)).chain; }
+      catch (e) { toast("读取链失败: " + e.message, "danger"); return; }
+    }
+    let targets = [];
+    try { targets = (await api("GET", "/api/storage/targets")).targets || []; }
+    catch (e) { /* 忽略 */ }
+    const wrap = document.createElement("div");
+    wrap.className = "modal fade";
+    wrap.innerHTML = `
+      <div class="modal-dialog modal-lg modal-dialog-centered"><div class="modal-content">
+        <div class="modal-header"><h6 class="modal-title"><i class="bi bi-diagram-3"></i> ${id ? "编辑" : "新建"}池复制作业链</h6>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body">
+          <div class="row g-3">
+            <div class="col-md-6"><label class="form-label">链名称 *</label>
+              <input class="form-control" id="pl_name" placeholder="如 北京-上海-两地三中心" value="${chain ? esc(chain.name) : ""}"></div>
+            <div class="col-md-3"><label class="form-label">复制模式</label>
+              <select class="form-select" id="pl_mode">
+                <option value="serial">逐级级联（serial）</option>
+                <option value="parallel">扇出并行（parallel）</option>
+              </select></div>
+            <div class="col-md-3"><label class="form-label">重试</label>
+              <div class="input-group input-group-sm">
+                <input class="form-control" id="pl_retries" type="number" min="1" value="3" title="最大重试次数">
+                <span class="input-group-text">次 /</span>
+                <input class="form-control" id="pl_retry_iv" type="number" min="1" value="30" title="重试间隔秒">
+                <span class="input-group-text">s</span>
+              </div></div>
+          </div>
+          <div class="mt-3"><label class="form-label">站点点位（按序构成 A → B → C 拓扑）</label>
+            <div id="pl_sites"></div>
+            <button class="btn btn-sm btn-outline-secondary mt-1" id="pl_add_site">+ 添加站点</button>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+          <button class="btn btn-primary" id="pl_save">保存</button>
+        </div>
+      </div></div>`;
+    document.body.appendChild(wrap);
+    const modal = new bootstrap.Modal(wrap);
+    wrap.addEventListener("hidden.bs.modal", () => { try { wrap.remove(); } catch (e) { /* noop */ } });
+    const $w = (s) => wrap.querySelector(s);
+    $w("pl_mode").value = chain ? chain.mode : "serial";
+    const siteRow = (site) => {
+      const div = document.createElement("div");
+      div.className = "row g-2 align-items-center mb-2 pl-site-row";
+      div.innerHTML = `
+        <div class="col-md-1 text-center"><span class="badge bg-secondary">S${div.dataset ? "" : ""}</span></div>
+        <div class="col-md-3"><select class="form-select form-select-sm pl-t">
+          <option value="">— 选择存储目标 —</option>
+          ${targets.map((t) => `<option value="${t.id}">${esc(t.name)}（${esc(t.type)}）</option>`).join("")}
+        </select></div>
+        <div class="col-md-3"><select class="form-select form-select-sm pl-role">
+          <option value="production">生产中心</option>
+          <option value="same_city">同城灾备</option>
+          <option value="remote">异地灾备</option>
+        </select></div>
+        <div class="col-md-4"><input class="form-control form-control-sm pl-n" placeholder="站点名称（留空用目标名）"></div>
+        <div class="col-md-1 text-end"><button class="btn btn-sm btn-outline-danger pl-del">×</button></div>`;
+      div.querySelector(".pl-del").onclick = () => div.remove();
+      if (site) {
+        div.querySelector(".pl-t").value = site.target_id;
+        div.querySelector(".pl-role").value = site.site_role || "production";
+        div.querySelector(".pl-n").value = site.name || "";
+      }
+      return div;
+    };
+    const renumber = () => wrap.querySelectorAll(".pl-site-row").forEach((row, i) => {
+      row.querySelector("span.badge").textContent = "S" + (i + 1);
+    });
+    $w("pl_add_site").onclick = () => { wrap.querySelector("#pl_sites").appendChild(siteRow()); renumber(); };
+    const sites0 = (chain && chain.sites && chain.sites.length) ? chain.sites : [{}];
+    sites0.forEach((s) => wrap.querySelector("#pl_sites").appendChild(siteRow(s)));
+    renumber();
+    $w("pl_save").onclick = async () => {
+      const sites = [];
+      wrap.querySelectorAll(".pl-site-row").forEach((row) => {
+        const tid = Number(row.querySelector(".pl-t").value || 0);
+        if (tid) sites.push({
+          target_id: tid,
+          site_role: row.querySelector(".pl-role").value,
+          name: row.querySelector(".pl-n").value.trim(),
+        });
+      });
+      const body = {
+        name: $w("pl_name").value.trim(),
+        mode: $w("pl_mode").value,
+        policy: { max_retries: Number($w("pl_retries").value) || 3,
+                  retry_interval: Number($w("pl_retry_iv").value) || 30 },
+        sites: sites,
+        enabled: chain ? chain.enabled : true,
+      };
+      try {
+        if (id) await api("PUT", `/api/pool/chains/${id}`, body);
+        else await api("POST", "/api/pool/chains", body);
+        toast("已保存", "success");
+        modal.hide();
+        await loadPools();
+      } catch (e) { toast("保存失败: " + e.message, "danger"); }
+    };
+    modal.show();
+  };
+
+  /** 副本分布视图（记录页「副本」按钮 / 池复制入口共用）。 */
+  window.openPoolReplicas = async function (recordId) {
+    const wrap = document.createElement("div");
+    wrap.className = "modal fade";
+    wrap.innerHTML = `
+      <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable"><div class="modal-content">
+        <div class="modal-header"><h6 class="modal-title"><i class="bi bi-collection"></i> 副本分布（记录 #${recordId}）</h6>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body small"><div class="text-muted">加载中…</div></div>
+      </div></div>`;
+    document.body.appendChild(wrap);
+    const modal = new bootstrap.Modal(wrap);
+    wrap.addEventListener("hidden.bs.modal", () => { try { wrap.remove(); } catch (e) { /* noop */ } });
+    try {
+      const d = await api("GET", "/api/pool/replicas?record_id=" + recordId);
+      const rs = d.replicas || [];
+      const box = wrap.querySelector(".modal-body");
+      if (!rs.length) {
+        box.innerHTML = '<div class="text-muted">该记录暂无池副本（未配置启用的复制作业链，或配置链之前备份）。</div>';
+      } else {
+        box.innerHTML = '<table class="table table-sm align-middle"><thead><tr><th>链路</th><th>站点</th><th>状态</th><th>对象</th><th>大小</th><th>时间</th><th></th></tr></thead><tbody>' +
+          rs.map((r) => `<tr>
+            <td class="small">${esc(r.chain_name)}</td>
+            <td class="small">S${r.seq} ${esc(r.target_name)}<br><span class="text-muted">${esc({ production: "生产中心", same_city: "同城灾备", remote: "异地灾备" }[r.site_role] || r.site_role || "")}</span></td>
+            <td>${r.status === "success" ? '<span class="badge badge-ok">有副本</span>' : r.status === "skipped" ? '<span class="badge bg-secondary">跳过</span>' : '<span class="badge badge-fail">失败</span>'}</td>
+            <td class="small text-break" style="max-width:220px"><code>${esc(r.object_key || "-")}</code></td>
+            <td class="small">${BKP.humanSize(r.size_bytes || 0)}</td>
+            <td class="small">${esc((r.created_at || "").slice(0, 19))}</td>
+            <td>${r.fetchable ? `<button class="btn btn-sm btn-outline-primary" data-log="${r.chain_id}" data-lid="${r.id || ""}" onclick="fetchPoolBack(${recordId}, this.dataset.lid)">取回</button>` : ""}</td>
+          </tr>`).join("") + "</tbody></table>" +
+          `<div class="text-muted">本地一层：${esc(d.local_backup_path || "-")} · tier=${esc(d.storage_tier || "-")}</div>`;
+      }
+    } catch (e) {
+      wrap.querySelector(".modal-body").innerHTML = '<div class="text-danger">' + esc(e.message) + "</div>";
+    }
+    modal.show();
+  };
+
+  window.fetchPoolBack = async function (recordId, logId) {
+    if (!logId) { toast("副本记录无效", "warning"); return; }
+    toast("正在从异地池取回…", "warning");
+    try {
+      const d = await api("POST", "/api/pool/fetch", { record_id: Number(recordId), log_id: Number(logId) });
+      const r = d.result || {};
+      toast(d.ok ? `已取回：${r.dest}（${BKP.humanSize(r.size_bytes || 0)}）`
+        : "取回失败", d.ok ? "success" : "danger", 8000);
+    } catch (e) { toast("取回失败: " + e.message, "danger"); }
+  };
+
   async function loadTargets() {
     try {
       const data = await api("GET", "/api/storage/targets");
@@ -6650,6 +6866,7 @@
     if (smEl) storageModal = new bootstrap.Modal(smEl);
     const rcEl = document.getElementById("replicateConfigModal");
     if (rcEl) replicateConfigModal = new bootstrap.Modal(rcEl);
+    loadPools();   // P1-3 池复制作业链
     try {
       storageUsage = await api("GET", "/api/storage/usage");
     } catch (e) {

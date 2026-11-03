@@ -123,6 +123,23 @@
   </div>
 </div>
 
+<!-- P1-3：池复制两地三中心 -->
+<div class="page-card mb-3">
+  <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-2">
+    <div class="card-section-title mb-0"><i class="bi bi-diagram-3"></i> 池复制（两地三中心）</div>
+    <div class="d-flex gap-2">
+      <button class="btn btn-primary btn-sm" onclick="openPoolModal()">
+        <i class="bi bi-plus-lg me-1"></i>新建复制作业链
+      </button>
+      <button class="btn btn-outline-secondary btn-sm" onclick="loadPools()">
+        <i class="bi bi-arrow-clockwise me-1"></i>刷新
+      </button>
+    </div>
+  </div>
+  <p class="form-text-hint mb-2">把存储目标组织成「生产中心 → 同城灾备 → 异地灾备」站点点位链：serial 逐级级联（上游成功才向下游复制）、parallel 扇出并行；备份成功后自动执行，副本分布可查、异地副本可取回。</p>
+  <div id="poolList"></div>
+</div>
+
 <!-- 冷热分级生命周期策略 -->
 <div class="page-card mb-3">
   <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">

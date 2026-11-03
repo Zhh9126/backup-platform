@@ -193,17 +193,29 @@ class SyncEngine:
     # ---- 全库表列表 ----
 
     def _get_tables_to_sync(self) -> List[str]:
-        """决定要同步哪些表（单表 or 全库）。"""
+        """决定要同步哪些表（单表 or 全库）。
+
+        exclude_tables（对标 KDTS 排除指定表）在此统一过滤——注意 full_db_migrate
+        分支返回前不过滤（_run_full_migration 内有排除报告逻辑），仅对
+        source_tables_list / source_table 清单路径生效（此前只在 full 路径过滤，
+        多表清单路径漏掉——实测 深测-排除表 任务 drop_t 仍被同步暴露）。
+        """
         cfg = self.config
         if cfg.full_db_migrate:
             tables = self.list_source_tables()
             logger.info("全库迁移：共 %d 张表", len(tables))
             return tables
         if cfg.source_tables_list:
-            return [t.strip() for t in cfg.source_tables_list if t and t.strip()]
-        if cfg.source_table:
-            return [cfg.source_table]
-        return []
+            tables = [t.strip() for t in cfg.source_tables_list if t and t.strip()]
+        elif cfg.source_table:
+            tables = [cfg.source_table]
+        else:
+            return []
+        excl = set(cfg.exclude_tables or [])
+        if excl:
+            logger.info("排除指定表：%s", sorted(excl & set(tables)))
+            tables = [t for t in tables if t not in excl]
+        return tables
 
     # ---- 核心同步 ----
 

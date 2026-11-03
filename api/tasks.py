@@ -378,6 +378,10 @@ def update_task(task_id):
 @api_bp.route("/tasks/<int:task_id>", methods=["DELETE"])
 @login_required
 def delete_task(task_id):
+    # P0-2：删除任务（连带全部备份记录）属高危操作，开关开启时需验证码
+    gate = verify_code_gate(request.get_json(silent=True) or {})
+    if gate:
+        return jsonify(gate[0]), gate[1]
     # 运行中任务：先发停止指令再删（前后端一致——删除按钮始终可见）
     row = db.query_one(
         "SELECT id FROM backup_records WHERE task_id=? AND status='running' "

@@ -106,7 +106,12 @@ window.BKP = (function () {
       }, 600);
       throw new Error("未登录或会话已过期，正在跳转登录页…");
     }
-    if (!resp.ok) throw new Error((data && data.error) || ("请求失败 HTTP " + resp.status));
+    if (!resp.ok) {
+      var err = new Error((data && data.error) || ("请求失败 HTTP " + resp.status));
+      err.status = resp.status;   // P0-2：调用方可按状态码分流（如验证码 403）
+      err.data = data || null;
+      throw err;
+    }
     return data;
   };
 

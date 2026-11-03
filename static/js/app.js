@@ -1895,8 +1895,11 @@
       danger: true,
     });
     if (!ok) return;
-    try { await api("DELETE", `/api/tasks/${id}`); toast("已删除"); await loadTasks(); }
-    catch (e) { toast(e.message, "danger"); }
+    try {
+      await verifyGate((code) =>
+        api("DELETE", `/api/tasks/${id}`, code ? { verify_code: code } : undefined));
+      toast("已删除"); await loadTasks();
+    } catch (e) { toast(e.message, "danger"); }
   };
   window.stopTask = async (id) => {
     const ok = await confirmDialog({
@@ -2036,6 +2039,62 @@
     return { keep_min: Number.isFinite(km) ? km : 1 };
   }
 
+  // ---- P0-2 高危操作验证码 ----
+  // 用法：await verifyGate((code) => api(..., code ? {...body, verify_code: code} : body))
+  // 开关关闭时 action(null) 直接执行（零破坏）；服务端 403 verify_code_required
+  // 时取码弹窗二次确认后重试。
+  window.verifyGate = async function (action) {
+    try { return await action(null); }
+    catch (e) {
+      if (!(e && e.data && e.data.verify_code_required)) throw e;
+    }
+    let vc;
+    try { vc = await api("GET", "/api/verify-code"); }
+    catch (e2) { throw new Error("获取操作验证码失败：" + e2.message); }
+    const code = await promptOpVerifyCode(vc.code || "");
+    if (!code) throw new Error("已取消操作（未输入验证码）");
+    return await action(code);
+  };
+
+  function promptOpVerifyCode(displayCode) {
+    return new Promise((resolve) => {
+      const wrap = document.createElement("div");
+      wrap.className = "modal fade";
+      wrap.innerHTML = `
+        <div class="modal-dialog modal-dialog-centered"><div class="modal-content">
+          <div class="modal-header"><h6 class="modal-title"><i class="bi bi-shield-lock"></i> 高危操作确认</h6>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+          <div class="modal-body">
+            <p class="small text-muted mb-2">该操作影响备份产物或恢复目标，请输入下方验证码确认执行。验证码 5 分钟内有效。</p>
+            <div class="text-center mb-3"><span style="font-size:28px;letter-spacing:8px;font-weight:700;font-family:monospace" class="text-primary">${esc(displayCode)}</span></div>
+            <input class="form-control text-center" id="opvc_input" maxlength="4" placeholder="输入 4 位验证码" autocomplete="off">
+          </div>
+          <div class="modal-footer">
+            <button class="btn btn-outline-secondary" data-bs-dismiss="modal">取消</button>
+            <button class="btn btn-danger" id="opvc_ok">确认执行</button>
+          </div>
+        </div></div>`;
+      document.body.appendChild(wrap);
+      const modal = new bootstrap.Modal(wrap);
+      let settled = false;
+      const done = (val) => {
+        if (settled) return;
+        settled = true;
+        modal.hide();
+        setTimeout(() => { try { wrap.remove(); } catch (e) { /* noop */ } }, 400);
+        resolve(val);
+      };
+      wrap.querySelector("#opvc_ok").onclick = () =>
+        done((wrap.querySelector("#opvc_input").value || "").trim());
+      wrap.querySelector("#opvc_input").addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") done((ev.target.value || "").trim());
+      });
+      wrap.addEventListener("hidden.bs.modal", () => done(null));
+      modal.show();
+      setTimeout(() => { const inp = wrap.querySelector("#opvc_input"); inp && inp.focus(); }, 300);
+    });
+  }
+
   async function openCleanupPanel() {
     const m = _cleanupModal();
     if (!m) { toast("页面尚未就绪，请刷新后重试", "danger"); return; }
@@ -2100,9 +2159,9 @@
     if (!confirm("确认立即按保留策略清理过期备份？\n\n" + (sum || "建议先点「扫描预览」确认范围。") +
       "\n\n被清理记录的产物文件会被删除且不可恢复。")) return;
     try {
-      const d = await api("POST", "/api/backup-cleanup/run",
+      const d = await verifyGate((code) => api("POST", "/api/backup-cleanup/run",
         Object.assign({ dry_run: false }, _cleanupParams(),
-          { purge_records: !!$("cl_purge").checked }));
+          { purge_records: !!$("cl_purge").checked }, code ? { verify_code: code } : {})));
       const r = d.report || {};
       toast(`清理完成：${r.tasks} 个任务 / ${r.records} 条记录，删除文件 ${r.deleted_files} 个，释放 ${BKP.humanSize(r.freed_bytes || 0)}`, "success");
       await cleanupPlan();
@@ -2717,7 +2776,9 @@
 
     try {
       // POST /api/restores 同步执行并回传整条 restore_records 行（含 id / status / message）
-      const r = await api("POST", "/api/restores", body) || {};
+      // P0-2：开关开启时先返回 403 要求验证码，弹窗确认后携带 verify_code 重试
+      const r = await verifyGate((code) =>
+        api("POST", "/api/restores", code ? Object.assign({}, body, { verify_code: code }) : body)) || {};
       const newId = Number(r.id || 0);
       const st = String(r.status || "");
       const okMsg = r.message || "恢复任务已提交，结果见下方恢复记录表";
@@ -3722,15 +3783,19 @@
       const dbtBadge = h.db_type
         ? `<span class="badge bg-info text-dark" title="该记录服务的数据库类型">${esc(DBT[h.db_type] || h.db_type)}</span>`
         : '<span class="badge bg-light text-muted" title="通用 SSH 备份机">通用</span>';
+      const protBadge = h.protected
+        ? '<span class="badge bg-warning text-dark" title="受保护资源：禁止作为恢复/演练目标"><i class="bi bi-shield-lock"></i> 受保护</span>'
+        : '';
       return `<tr>
         <td>${pgh.startNo + hi}</td>
-        <td>${esc(h.name)} ${dbtBadge}</td>
+        <td>${esc(h.name)} ${dbtBadge} ${protBadge}</td>
         <td><code>${esc(h.host_key)}</code></td>
         <td>${esc(h.hostname)}:${esc(h.port || 22)}</td>
         <td>${esc(h.auth_type === "key" ? "私钥" : "密码")}</td>
         <td>${dot}${statusBadge}<br><small class="text-muted">${h.last_check_at ? "最近测试 " + esc(fmtTime(h.last_check_at)) : ""}</small></td>
         <td class="text-end">
           <button class="btn btn-sm btn-outline-secondary" onclick="testHost(${h.id})">测试</button>
+          <button class="btn btn-sm ${h.protected ? "btn-warning" : "btn-outline-warning"}" onclick="toggleProtectHost(${h.id})" title="受保护主机禁止作为恢复目标">${h.protected ? "解除保护" : "保护"}</button>
           <button class="btn btn-sm btn-outline-primary" onclick="editHost(${h.id})">编辑</button>
           <button class="btn btn-sm btn-outline-danger" onclick="delHost(${h.id})">删除</button>
         </td>
@@ -3759,8 +3824,20 @@
       confirmText: "移除", danger: true,
     });
     if (!ok) return;
-    try { await api("DELETE", `/api/hosts/${id}`); toast("已移除"); await loadHosts(); await loadFileTasks(); }
-    catch (e) { toast(e.message, "danger"); }
+    try {
+      await verifyGate((code) =>
+        api("DELETE", `/api/hosts/${id}`, code ? { verify_code: code } : undefined));
+      toast("已移除"); await loadHosts(); await loadFileTasks();
+    } catch (e) { toast(e.message, "danger"); }
+  };
+  window.toggleProtectHost = async (id) => {
+    try {
+      const r = await api("POST", `/api/hosts/${id}/protect`, {});
+      toast(r.protected
+        ? "已标记为受保护：该主机将禁止作为恢复/演练目标"
+        : "已解除保护", r.protected ? "warning" : "success");
+      await loadHosts();
+    } catch (e) { toast(e.message, "danger"); }
   };
 
   async function initFileBackup() {

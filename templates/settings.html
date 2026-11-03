@@ -75,6 +75,18 @@
   </div>
 </div>
 
+<!-- 高危操作防护（P0-2） -->
+<div class="page-card">
+  <div class="card-section-title"><i class="bi bi-shield-lock"></i> 高危操作防护</div>
+  <p class="form-text-hint mb-2">开启后，<b>恢复执行、备份清理执行、删除任务、删除主机</b>等高危操作需要输入页面展示的 4 位验证码二次确认（验证码 5 分钟有效、一次性）。默认关闭，不影响现有自动化与脚本调用。</p>
+  <div class="form-check">
+    <input class="form-check-input" type="checkbox" id="og_vc_enabled">
+    <label class="form-check-label">高危操作需要验证码确认</label>
+  </div>
+  <button class="btn btn-primary mt-2" id="ogSaveBtn"><i class="bi bi-save"></i> 保存安全设置</button>
+  <span class="form-text ms-2 text-muted" id="og_result"></span>
+</div>
+
 <!-- AI 预测告警配置 -->
 <div class="page-card">
   <div class="card-section-title"><i class="bi bi-robot"></i> AI 预测告警配置</div>
@@ -484,6 +496,31 @@ document.addEventListener("DOMContentLoaded", async function () {
   };
   document.getElementById("whSaveBtn")?.addEventListener("click", () => save(false));
   document.getElementById("whTestBtn")?.addEventListener("click", () => save(true));
+});
+</script>
+<script>
+document.addEventListener("DOMContentLoaded", async function () {
+  const cb = document.getElementById("og_vc_enabled");
+  if (!cb) return;
+  try {
+    const cfg = await (await fetch("/api/op-guard/config", { credentials: "include" })).json();
+    cb.checked = !!cfg.verify_code_enabled;
+  } catch (e) { /* 忽略，保持默认关 */ }
+  document.getElementById("ogSaveBtn")?.addEventListener("click", async () => {
+    const res = document.getElementById("og_result");
+    try {
+      await (await fetch("/api/op-guard/config", {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ verify_code_enabled: cb.checked }),
+      })).json();
+      res.textContent = "已保存，对恢复/清理/删除等高危操作" + (cb.checked ? "生效" : "关闭");
+      res.className = "form-text ms-2 text-success";
+    } catch (e) {
+      res.textContent = "保存失败: " + e;
+      res.className = "form-text ms-2 text-danger";
+    }
+  });
 });
 </script>
 {% endblock %}

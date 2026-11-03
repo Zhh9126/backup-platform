@@ -569,6 +569,8 @@ CREATE TABLE IF NOT EXISTS ssh_hosts (
     private_key TEXT,
     os_type     TEXT DEFAULT 'linux',
     db_os_user  TEXT,                     -- 数据库软件的 OS 用户（oracle/dmdba/omm/kingbase 等）；空=按库型默认
+    protected   INTEGER DEFAULT 0,        -- 受保护资源标记（P0-2）：1=禁止作为恢复/复制目标
+    protected_note TEXT,                  -- 保护备注
     remark      TEXT,
     last_status TEXT,
     last_check_at TEXT,
@@ -1330,6 +1332,13 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                 conn.execute("ALTER TABLE ssh_hosts ADD COLUMN db_type TEXT DEFAULT ''")
             except Exception:
                 pass  # 列已存在
+            # 迁移（P0-2）：受保护资源标记——受保护主机禁止作为恢复/复制目标
+            for col, typedef in [("protected", "INTEGER DEFAULT 0"),
+                                 ("protected_note", "TEXT")]:
+                try:
+                    conn.execute(f"ALTER TABLE ssh_hosts ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass  # 列已存在
             try:
                 if backend == "sqlite":
                     # SQLite 无法 DROP 约束 → 检测单列唯一索引并重建表

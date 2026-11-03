@@ -2,7 +2,7 @@
 """SSH 主机纳管 API：增删改查 + 连接测试。"""
 from flask import request, jsonify
 
-from auth import login_required
+from auth import login_required, verify_code_gate
 from core import ssh_hosts
 from . import api_bp
 
@@ -51,10 +51,25 @@ def update_host(host_id):
 @api_bp.route("/hosts/<int:host_id>", methods=["DELETE"])
 @login_required
 def delete_host(host_id):
+    # P0-2：移除纳管主机属高危操作，开关开启时需验证码
+    gate = verify_code_gate(request.get_json(silent=True) or {})
+    if gate:
+        return jsonify(gate[0]), gate[1]
     if not ssh_hosts.get_host(host_id):
         return jsonify({"error": "主机不存在"}), 404
     ssh_hosts.delete_host(host_id)
     return jsonify({"ok": True})
+
+
+@api_bp.route("/hosts/<int:host_id>/protect", methods=["POST"])
+@login_required
+def protect_host(host_id):
+    """资源受保护标记（P0-2）：受保护主机禁止作为恢复/复制/演练目标。"""
+    data = request.get_json(silent=True) or {}
+    if not ssh_hosts.set_protected(host_id, bool(data.get("protected")),
+                                   data.get("note") or ""):
+        return jsonify({"error": "主机不存在"}), 404
+    return jsonify({"ok": True, "protected": bool(data.get("protected"))})
 
 
 @api_bp.route("/hosts/<int:host_id>/test", methods=["POST"])

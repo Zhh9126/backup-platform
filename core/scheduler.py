@@ -629,6 +629,12 @@ def run_restore_now(record_id: int, target_host: str = None,
         target_host_info = ssh_mod.get_host(target_host_id, include_secret=True)
         if not target_host_info:
             return None
+        # P0-2 资源受保护标记：受保护主机禁止作为恢复/演练目标（覆盖全部恢复入口）
+        if target_host_info.get("protected"):
+            raise ValueError(
+                f"目标主机「{target_host_info.get('name')}」"
+                f"({target_host_info.get('host_key')}) 已被标记为受保护资源，"
+                f"禁止作为恢复目标；如确需恢复，请先在纳管主机页解除保护标记")
         target_host_label = f"{target_host_info.get('hostname')}:{target_host_info.get('port',22)} (跨主机)"
         detail_log_lines.append(f"[目标主机] 纳管主机 ID={target_host_id}, {target_host_label}")
     elif target_host and (target_host_user or target_host_password):

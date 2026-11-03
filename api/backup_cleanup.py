@@ -14,7 +14,7 @@ retention_count 判定过期，keep_min 兜底保证至少留住最近 N 份成�
 """
 from flask import request, jsonify
 
-from auth import login_required
+from auth import login_required, verify_code_gate
 from . import api_bp
 
 
@@ -57,6 +57,11 @@ def api_cleanup_preview(task_id=None):
 def api_cleanup_run():
     from core import backup_cleanup
     data = request.get_json(silent=True) or {}
+    # P0-2：dry_run 只读预览不拦；真实删除动作需要操作验证码（开关开启时）
+    if not data.get("dry_run"):
+        gate = verify_code_gate(data)
+        if gate:
+            return jsonify(gate[0]), gate[1]
     keep_min = data.get("keep_min")
     purge = data.get("purge_records")
     report = backup_cleanup.run_cleanup(

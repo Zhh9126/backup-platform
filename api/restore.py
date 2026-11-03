@@ -3,7 +3,7 @@
 from flask import request, jsonify
 
 import core.db as db
-from auth import login_required
+from auth import login_required, verify_code_gate
 from core import models, scheduler
 from . import api_bp
 
@@ -53,6 +53,9 @@ def list_records_enriched():
 @login_required
 def create_restore():
     data = request.get_json(force=True, silent=True) or {}
+    gate = verify_code_gate(data)
+    if gate:
+        return jsonify(gate[0]), gate[1]
     record_id = data.get("record_id")
     if not record_id:
         return jsonify({"error": "record_id 必填"}), 400
@@ -73,20 +76,24 @@ def create_restore():
             [k.strip() for k in str(keys).replace("\n", ",").split(",")
              if k.strip()] if isinstance(keys, str) else list(keys))
 
-    result = scheduler.run_restore_now(
-        record_id,
-        target_host_id=data.get("target_host_id"),
-        target_host=data.get("target_host"),
-        target_db=data.get("target_db"),
-        target_port=data.get("target_port"),
-        operator=data.get("operator"),
-        target_host_user=data.get("target_host_user"),
-        target_host_password=data.get("target_host_password"),
-        target_time=data.get("target_time"),
-        pitr_restore_dir=data.get("pitr_restore_dir"),
-        tables=data.get("tables"),
-        restore_options=restore_options or None,
-    )
+    try:
+        result = scheduler.run_restore_now(
+            record_id,
+            target_host_id=data.get("target_host_id"),
+            target_host=data.get("target_host"),
+            target_db=data.get("target_db"),
+            target_port=data.get("target_port"),
+            operator=data.get("operator"),
+            target_host_user=data.get("target_host_user"),
+            target_host_password=data.get("target_host_password"),
+            target_time=data.get("target_time"),
+            pitr_restore_dir=data.get("pitr_restore_dir"),
+            tables=data.get("tables"),
+            restore_options=restore_options or None,
+        )
+    except ValueError as e:
+        # 受保护主机 / 其他业务前置校验拒绝（P0-2）
+        return jsonify({"error": str(e), "protected_target": "受保护" in str(e)}), 400
     if not result:
         return jsonify({"error": "备份记录不存在"}), 404
     return jsonify(result), 201

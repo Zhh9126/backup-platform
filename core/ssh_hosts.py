@@ -172,6 +172,23 @@ def delete_host(host_id: int) -> bool:
     return True
 
 
+def set_protected(host_id: int, protected: bool, note: str = "") -> bool:
+    """资源受保护标记（P0-2）：受保护主机禁止作为恢复/复制/演练目标。"""
+    if not get_host(host_id):
+        return False
+    db.execute(
+        "UPDATE ssh_hosts SET protected=?, protected_note=?, updated_at=? WHERE id=?",
+        (1 if protected else 0, (note or "").strip(), db.now_iso(), host_id))
+    _logger.info("[ssh_hosts] 主机 #%s 保护状态 -> %s（%s）",
+                 host_id, "受保护" if protected else "已解除", (note or "").strip())
+    return True
+
+
+def is_protected(host_id: int) -> bool:
+    row = db.query_one("SELECT protected FROM ssh_hosts WHERE id=?", (host_id,))
+    return bool(row and row.get("protected"))
+
+
 def test_connection(host_id: int) -> dict:
     """
     对指定主机做一次真实 SSH 连通性探测（独立连接，不进全局池）。

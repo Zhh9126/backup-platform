@@ -16,6 +16,7 @@ Redis 不能通过 redis-cli 直接“灌入”一个 rdb 文件；常规做法�
 """
 
 import os
+from shlex import quote as shlex_quote
 
 import config
 from core.engines.base import (
@@ -221,48 +222,105 @@ class RedisEngine(BackupEngine):
         port = int(self.task.get("port") or 6379)
         pw = db.decrypt_secret(self.task.get("password") or "")
         auth = f" -a '{pw}'" if pw else ""
-        cli_bin = "/opt/redis/bin/redis-cli"
-        cli_cmd = f"{cli_bin} -h 127.0.0.1 -p {port}{auth}"
+        # redis-cli 路径自适应（170 实测 /opt/redis 不存在，装在
+        # /usr/local/redis/bin）——硬编码路径会让 SHUTDOWN/PING 全部落空
         from core.engines.file import _ssh_exec_pipe
+        _o, _e, _rc = _ssh_exec_pipe(
+            client, _rd._wrap_login(
+                "command -v redis-cli || ls /opt/redis/bin/redis-cli "
+                "/usr/local/redis/bin/redis-cli 2>/dev/null | head -1"),
+            timeout=30)
+        cli_bin = (_o.decode("utf-8", "replace").strip().splitlines()
+                   or ["/opt/redis/bin/redis-cli"])[-1].strip() or \
+            "/opt/redis/bin/redis-cli"
+        cli_cmd = f"{cli_bin} -h 127.0.0.1 -p {port}{auth}"
         logs = []
         try:
             def _run(shell, timeout=120):
                 o, e, rc = _ssh_exec_pipe(client, _rd._wrap_login(shell),
                                           timeout=timeout)
                 return rc, (o.decode("utf-8", "replace") if isinstance(o, bytes) else o or ""), e
-            # 1) 定位数据目录（dir 配置）
-            rc, out, _ = _run(f"grep -E '^dir ' /opt/redis/redis.conf /etc/redis.conf 2>/dev/null | head -1")
-            m = _re.search(r"dir\s+(\S+)", out)
-            data_dir = m.group(1) if m else "/data/redis"
-            # 2) 推送 rdb
+            # 0) 读取实例持久化配置（重启保真）：daemonize 后 redis 会把
+            #    argv 改写成 "redis-server 0.0.0.0:port"（/proc/cmdline 拿
+            #    不到原 conf），因此按 CONFIG GET 生成最小保真 conf 重启
+            rc, out, _ = _run(
+                f"{cli_cmd} config get dbfilename 2>/dev/null; "
+                f"{cli_cmd} config get appendonly 2>/dev/null; "
+                f"{cli_cmd} config get save 2>/dev/null | head -2")
+            kv = {}
+            lines = [x.strip() for x in out.splitlines() if x.strip()]
+            for i in range(len(lines) - 1):
+                if lines[i] and not lines[i].startswith(("(", "#")) and \
+                        not lines[i + 1].startswith(("(", "#")):
+                    kv[lines[i].lower()] = lines[i + 1]
+            # 1) 定位数据目录（CONFIG GET dir 最可靠，conf grep 兜底）
+            rc, out, _ = _run(f"{cli_cmd} config get dir 2>/dev/null | tail -1")
+            m = _re.search(r"^(/\S+)", out.strip() or "")
+            data_dir = m.group(1) if m else ""
+            if not data_dir:
+                rc, out, _ = _run(
+                    f"grep -E '^dir ' /opt/redis/redis.conf /etc/redis.conf 2>/dev/null | head -1")
+                m = _re.search(r"dir\s+(\S+)", out)
+                data_dir = m.group(1) if m else "/data/redis"
+            # 2) 生成最小保真 conf 并推送（port/dir/dbfilename/appendonly/
+            #    requirepass 保真；daemonize+独立 pid/log 不污染原环境）
+            gen_conf = "/tmp/platform_redis_restart_%d.conf" % port
+            conf_text = (
+                f"port {port}\nbind 0.0.0.0\ndir {data_dir}\n"
+                f"dbfilename {kv.get('dbfilename') or 'dump.rdb'}\n"
+                f"appendonly {kv.get('appendonly') or 'no'}\n"
+                f"save {kv.get('save') or ''}\n"
+                f"daemonize yes\npidfile /tmp/platform_redis_{port}.pid\n"
+                f"logfile /tmp/platform_redis_{port}.log\n")
+            if pw:
+                conf_text += "requirepass %s\n" % pw.replace("\n", "")
+            with sftp.open(gen_conf, "w") as f:
+                f.write(conf_text)
+            # 3) 推送 rdb
             tmp_rdb = "/tmp/dump_restore.rdb"
             _rd.sftp_put_resumable(
                 client, backup_path, tmp_rdb, label="Redis rdb 恢复推送")
             logs.append(f"rdb 已推送 {tmp_rdb}")
-            # 3) 停库（数据安全：SHUTDOWN 前确认）
-            _run(f"{cli_cmd} SHUTDOWN NOSAVE || true")
-            import time as _t; _t.sleep(2)
-            # 4) 替换 dump.rdb
-            rc, out, _ = _run(
-                f"cp {tmp_rdb} {data_dir}/dump.rdb && echo COPY_OK")
-            if "COPY_OK" not in out:
-                raise RuntimeError(f"替换 dump.rdb 失败: {out[:200]}")
-            logs.append(f"dump.rdb 已替换至 {data_dir}")
-            # 5) 重启（优先部署脚本）
-            _run("/usr/local/bin/redis-start.sh || "
-                 "(redis-server --daemonize yes) || true")
-            _t.sleep(3)
-            # 6) PING 验证
-            rc, out, _ = _run(f"{cli_cmd} PING")
+            # 4-6) 停库→替换→重启→PING 合并为**单命令原子执行**：拆成多条
+            # SSH 会话时，中间步骤可能因连接停顿丢失，实例会遗留在停机
+            # 状态无人重启（170 实测 cp 阶段会话停顿 120s 超时）。重启按
+            # 生成的保真 conf；替换失败也照常重启实例（不留死实例）。
+            atomic = (
+                f"{cli_cmd} SHUTDOWN NOSAVE >/dev/null 2>&1; "
+                f"sleep 2; "
+                # 用 cat 重定向而非 cp：很多环境 root 的 .bashrc 把 cp 别名
+                # 成 `cp -i`（bash -lc 登录 shell 会加载），目标存在时 cp -i
+                # 等待 y/n 确认 → 无 stdin 永久挂起（170 实测暴露）
+                f"cat {shlex_quote(tmp_rdb)} > {shlex_quote(data_dir)}/dump.rdb; "
+                f"RC_CP=$?; "
+                f"setsid redis-server {shlex_quote(gen_conf)} >/dev/null 2>&1 & "
+                f"sleep 3; "
+                f"echo CP_RC=$RC_CP; "
+                f"{cli_cmd} PING 2>&1"
+            )
+            rc, out, _ = _run(atomic, timeout=180)
+            cp_rc = "?"
+            m = _re.search(r"CP_RC=(\d+)", out)
+            if m:
+                cp_rc = m.group(1)
+            logs.append(f"停库+替换({data_dir}/dump.rdb rc_cp={cp_rc})"
+                        f"+按保真conf({gen_conf})重启")
+            if cp_rc not in ("0", "?"):
+                logs.append(f"cp 退出码 {cp_rc}"
+                            "（rdb 替换失败，实例已按原样重启）")
             ping_ok = "PONG" in out
             duration = __import__("time").time() - t0
             if ping_ok:
-                self.logger.info("[%s] Redis 恢复完成: %s", self.task_name, "; ".join(logs))
+                self.logger.info("[%s] Redis 恢复完成: %s", self.task_name,
+                                 "; ".join(logs))
                 return BackupResult(success=True, status=BackupStatus.SUCCESS,
-                                    backup_path=backup_path, duration_sec=duration,
-                                    message="Redis 恢复成功（rdb 推送+重启加载，PING=PONG）")
+                                    backup_path=backup_path,
+                                    duration_sec=duration,
+                                    message="Redis 恢复成功（rdb 替换+保真conf"
+                                            "重启加载，PING=PONG）")
             return BackupResult(success=False, status=BackupStatus.FAILED,
-                                backup_path=backup_path, duration_sec=duration,
+                                backup_path=backup_path,
+                                duration_sec=duration,
                                 message="Redis 重启后 PING 失败；" + "; ".join(logs))
         except Exception as e:
             return BackupResult(success=False, status=BackupStatus.FAILED,

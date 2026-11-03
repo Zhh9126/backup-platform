@@ -544,7 +544,7 @@ exit $RC
 
     elif db_type == "redis":
         # 上传 .rdb / .tar.gz
-        return f"redis-cli -h 127.0.0.1 -a '$(echo)' CONFIG SET dir /tmp && redis-cli SHUTDOWN NOSAVE 2>/dev/null; cp {remote_pkg} /tmp/dump.rdb && redis-server --dbfilename dump.rdb --dir /tmp --daemonize yes"
+        return f"redis-cli -h 127.0.0.1 -a '$(echo)' CONFIG SET dir /tmp && redis-cli SHUTDOWN NOSAVE 2>/dev/null; cat {remote_pkg} > /tmp/dump.rdb && redis-server --dbfilename dump.rdb --dir /tmp --daemonize yes"
 
     elif db_type == "mongodb":
         host = "127.0.0.1"

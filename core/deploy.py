@@ -581,7 +581,9 @@ if [[ "{pkg}" == *.iso ]] && command -v mount &>/dev/null; then
     DMINST=$(ls /tmp/dm_mnt/DMInstall.bin 2>/dev/null)
 elif [[ "{pkg}" == *.iso ]] || [[ "{pkg}" == *.bin ]]; then
     mkdir -p /tmp/dm_mnt
-    cp {pkg} /tmp/dm_mnt/DMInstall.bin 2>/dev/null || true
+    # cat 重定向而非 cp：root .bashrc 将 cp 别名为 cp -i 时目标存在会等待
+    # y/n 确认挂起（170 实测）
+    cat {pkg} > /tmp/dm_mnt/DMInstall.bin 2>/dev/null || true
     chmod +x /tmp/dm_mnt/DMInstall.bin 2>/dev/null
     DMINST=/tmp/dm_mnt/DMInstall.bin
 else

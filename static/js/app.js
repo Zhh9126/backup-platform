@@ -5457,6 +5457,7 @@
       await rtLoadHealth();
     });
     $("rtRecoverBtn").addEventListener("click", () => rtOpenRecoverModal());
+    $("rtTxnBtn").addEventListener("click", () => rtOpenTxnModal());
     $("rtLatestBtn").addEventListener("click", () => {
       const buckets = (RT.timeline && RT.timeline.buckets) || [];
       for (let i = buckets.length - 1; i >= 0; i -= 1) {
@@ -5466,6 +5467,136 @@
     });
     $("rtDryRunBtn").addEventListener("click", () => rtDoRecover(true));
     $("rtConfirmRecoverBtn").addEventListener("click", () => rtDoRecover(false));
+
+    // ---- P1-2：Oracle 事务级精准还原（事务浏览 → UNDO 回滚） ----
+    window.rtOpenTxnModal = async function () {
+      if (!RT.taskId) { toast("请先选择实时任务", "warning"); return; }
+      const wrap = document.createElement("div");
+      wrap.className = "modal fade";
+      wrap.innerHTML = `
+        <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable"><div class="modal-content">
+          <div class="modal-header"><h6 class="modal-title"><i class="bi bi-hourglass-split"></i> 事务级精准还原（Oracle LogMiner）</h6>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+          <div class="modal-body">
+            <div class="row g-2 align-items-end mb-2">
+              <div class="col-md-8"><label class="form-label small mb-1">捕获段</label>
+                <select class="form-select form-select-sm" id="rtx_seg"></select></div>
+              <div class="col-md-4 text-end"><button class="btn btn-sm btn-outline-primary" id="rtx_reload">加载事务</button></div>
+            </div>
+            <div id="rtx_txn_box" class="small">选择段后点「加载事务」。</div>
+            <div id="rtx_detail_box" class="small mt-3"></div>
+          </div>
+        </div></div>`;
+      document.body.appendChild(wrap);
+      const modal = new bootstrap.Modal(wrap);
+      wrap.addEventListener("hidden.bs.modal", () => { try { wrap.remove(); } catch (e) { /* noop */ } });
+      const $w = (id) => wrap.querySelector("#" + id);
+      const loadSegs = async () => {
+        $w("rtx_seg").innerHTML = '<option value="">加载中…</option>';
+        try {
+          const d = await api("GET", "/api/oracle-txn/segments?task_id=" + RT.taskId);
+          const segs = d.segments || [];
+          if (!segs.length) { $w("rtx_seg").innerHTML = '<option value="">暂无捕获段（Oracle 实时捕获未产生数据）</option>'; return; }
+          $w("rtx_seg").innerHTML = segs.map((s) =>
+            `<option value="${esc(s.name)}">${esc(s.dir)}/${esc(s.name)}（${BKP.humanSize(s.size_bytes || 0)}）</option>`).join("");
+        } catch (e) { $w("rtx_seg").innerHTML = `<option value="">${esc(e.message)}</option>`; }
+      };
+      const loadTxns = async () => {
+        const seg = $w("rtx_seg").value;
+        if (!seg) { toast("请先选择捕获段", "warning"); return; }
+        $w("rtx_txn_box").innerHTML = '<div class="text-muted">聚合同…</div>';
+        $w("rtx_detail_box").innerHTML = "";
+        try {
+          const d = await api("GET", `/api/oracle-txn/transactions?task_id=${RT.taskId}&seg=${encodeURIComponent(seg)}`);
+          const txns = d.transactions || [];
+          if (!txns.length) { $w("rtx_txn_box").innerHTML = '<div class="text-muted">该段没有捕获到已提交事务</div>'; return; }
+          $w("rtx_txn_box").innerHTML = '<table class="table table-sm align-middle"><thead><tr><th>事务 XID</th><th>时间</th><th>SCN</th><th>操作</th><th>对象表</th><th></th></tr></thead><tbody>' +
+            txns.map((t) => {
+              const ops = [`插${t.n_insert}`, `改${t.n_update}`, `删${t.n_delete}`].join(" / ")
+                + (t.n_ddl ? ` / DDL ${t.n_ddl}` : "");
+              const tables = (t.tables || []).slice(0, 3).map(esc).join(", ") + ((t.tables || []).length > 3 ? " 等" + t.tables.length + "表" : "");
+              return `<tr>
+                <td><code>${esc(t.xid)}</code>${t.xid === "-" ? ' <span class="text-muted small">(旧段无XID)</span>' : ""}</td>
+                <td class="small">${esc((t.start_ts || "").slice(0, 19))}</td>
+                <td class="small">${esc(String(t.first_scn || "-"))}</td>
+                <td class="small">${esc(ops)}</td>
+                <td class="small">${tables}</td>
+                <td class="text-end text-nowrap">
+                  <button class="btn btn-sm btn-outline-secondary" data-xid="${esc(t.xid)}" data-act="detail">明细</button>
+                  <button class="btn btn-sm btn-outline-danger" data-xid="${esc(t.xid)}" data-act="rollback">回滚</button>
+                </td></tr>`;
+            }).join("") + "</tbody></table>" +
+            `<div class="text-muted">共 ${txns.length} 个事务，按 SCN 降序（最新在前）</div>`;
+          $w("rtx_txn_box").querySelectorAll("button[data-act]").forEach((btn) => {
+            btn.onclick = () => btn.dataset.act === "detail"
+              ? rtTxnDetail(RT.taskId, seg, btn.dataset.xid, $w("rtx_detail_box"))
+              : rtTxnRollback(RT.taskId, seg, btn.dataset.xid, $w("rtx_detail_box"));
+          });
+        } catch (e) { $w("rtx_txn_box").innerHTML = '<div class="text-danger">' + esc(e.message) + "</div>"; }
+      };
+      $w("rtx_reload").onclick = loadTxns;
+      modal.show();
+      await loadSegs();
+      if ($w("rtx_seg").value) await loadTxns();
+    };
+
+    async function rtTxnDetail(taskId, seg, xid, box) {
+      box.innerHTML = '<div class="text-muted">读取事务明细…</div>';
+      try {
+        const d = await api("GET", `/api/oracle-txn/transaction?task_id=${taskId}&seg=${encodeURIComponent(seg)}&xid=${encodeURIComponent(xid)}`);
+        const evs = d.events || [];
+        box.innerHTML = `<h6 class="small">事务 <code>${esc(xid)}</code> 时间轴（SCN 升序，共 ${evs.length} 条）</h6>` +
+          '<table class="table table-sm align-middle"><thead><tr><th>SCN</th><th>时间</th><th>表</th><th>操作</th><th>SQL_REDO</th></tr></thead><tbody>' +
+          evs.slice(0, 200).map((e) => `<tr>
+            <td class="small">${esc(String(e.scn || ""))}</td>
+            <td class="small">${esc((e.ts || "").slice(0, 19))}</td>
+            <td class="small">${esc(e.owner || "")}.${esc(e.table || "")}</td>
+            <td class="small">${esc(e.op || "")}</td>
+            <td style="max-width:420px"><code class="small" style="white-space:pre-wrap;word-break:break-all">${esc((e.redo || "").slice(0, 300))}</code></td>
+          </tr>`).join("") + "</tbody></table>" +
+          (evs.length > 200 ? `<div class="text-muted">仅显示前 200 条 / 共 ${evs.length} 条</div>` : "");
+      } catch (e) { box.innerHTML = '<div class="text-danger">' + esc(e.message) + "</div>"; }
+    }
+
+    async function rtTxnRollback(taskId, seg, xid, box) {
+      box.innerHTML = '<div class="text-muted">生成回滚计划…</div>';
+      try {
+        const d = await api("POST", "/api/oracle-txn/rollback",
+          { task_id: taskId, segment: seg, xid: xid, preview: true });
+        const p = d.plan || {};
+        const stmts = (p.statements || []).slice(0, 100).map((s) =>
+          `<tr><td>${s.seq}</td><td class="small">${esc(s.table)}</td><td class="small">${esc(s.op)}</td>
+           <td><code class="small" style="white-space:pre-wrap;word-break:break-all">${esc((s.undo_sql || "").slice(0, 260))}</code></td></tr>`).join("");
+        const skips = (p.skipped || []).map((s) =>
+          `<div class="small text-muted">SCN ${esc(String(s.scn))} ${esc(s.table)} ${esc(s.op)}：${esc(s.reason)}</div>`).join("");
+        box.innerHTML = `<div class="alert alert-warning small py-2">
+            事务 <code>${esc(xid)}</code> 回滚计划：<b>${p.n_undo} 条 UNDO</b>（${esc(p.order)}），
+            ${p.n_skip} 条不可撤销（DDL 等无 SQL_UNDO，将跳过）。
+            执行将<b>直接修改生产库</b>，每条 UNDO 独立提交。
+          </div>` +
+          (stmts ? '<table class="table table-sm"><thead><tr><th>#</th><th>表</th><th>操作</th><th>SQL_UNDO</th></tr></thead><tbody>' + stmts + "</tbody></table>" : "") +
+          skips +
+          '<div class="text-end mt-2"><button class="btn btn-danger btn-sm" id="rtx_exec">确认执行回滚</button></div>';
+        const execBtn = box.querySelector("#rtx_exec");
+        if (execBtn) execBtn.onclick = async () => {
+          if (!window.confirm(`确认回滚事务 ${xid}？（${p.n_undo} 条 UNDO 将直接在生产库执行）`)) return;
+          execBtn.disabled = true;
+          try {
+            const r = await verifyGate((code) => api("POST", "/api/oracle-txn/rollback", Object.assign(
+              { task_id: taskId, segment: seg, xid: xid, preview: false, confirm: true },
+              code ? { verify_code: code } : {})));
+            const res = r.result || {};
+            const fails = (res.results || []).filter((x) => !x.ok);
+            box.innerHTML = `<div class="alert ${r.ok ? "alert-success" : "alert-danger"} small py-2">
+                回滚完成：执行 ${res.executed} 条 / 失败 ${res.failed} 条 · 耗时 ${res.duration_sec}s</div>` +
+              (fails.length ? '<div class="small text-danger">' + fails.slice(0, 10).map((f) => `#${f.seq} ${esc(f.table)}: ${esc(f.error || "")}`).join("<br>") + "</div>" : "");
+          } catch (e) {
+            box.innerHTML = '<div class="alert alert-danger small py-2">执行失败: ' + esc(e.message) + "</div>";
+            execBtn.disabled = false;
+          }
+        };
+      } catch (e) { box.innerHTML = '<div class="text-danger">' + esc(e.message) + "</div>"; }
+    }
 
     // 键盘微调选点（← / →）
     document.addEventListener("keydown", (ev) => {

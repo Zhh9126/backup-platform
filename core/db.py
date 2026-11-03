@@ -1533,6 +1533,25 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                     "ON pool_replica_logs(chain_id, record_id)")
             except Exception:
                 pass
+            # 迁移：文件推送式实时同步（P1-4，零 Agent：指纹轮询替代 inotify）
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS file_sync_tasks ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "name TEXT NOT NULL, "
+                    "ssh_host_id INTEGER, "                 # 纳管主机；空=本机
+                    "src_paths TEXT NOT NULL DEFAULT '[]', "  # JSON 多源路径
+                    "excludes TEXT DEFAULT '[]', "           # JSON glob 排除
+                    "interval_sec INTEGER DEFAULT 60, "
+                    "keep_versions INTEGER DEFAULT 10, "
+                    "enabled INTEGER DEFAULT 0, "
+                    "last_run_at TEXT, last_status TEXT, "   # synced | no_change | failed | running
+                    "last_summary TEXT, "                    # JSON {new,changed,deleted,bytes}
+                    "manifest TEXT, "                        # 上轮指纹清单 JSON（diff 基线）
+                    "last_error TEXT, "
+                    "created_at TEXT, updated_at TEXT)")
+            except Exception:
+                pass
             for col, typedef in [
                 ("set_type", "TEXT DEFAULT 'full'"),
                 ("storage_tier", "INTEGER DEFAULT 1"),

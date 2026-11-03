@@ -1260,6 +1260,26 @@ def _dr_monitor_job_wrapper():
         _logger.error("调度容灾自动监控异常: %s", e)
 
 
+def _register_file_sync(sched):
+    """文件推送式实时同步 tick（P1-4）：30s 一轮，任务各自 interval 节流。"""
+    from apscheduler.triggers.interval import IntervalTrigger
+    try:
+        sched.remove_job("file_sync_tick")
+    except Exception:
+        pass
+    sched.add_job(_file_sync_job_wrapper, IntervalTrigger(seconds=30),
+                  id="file_sync_tick", replace_existing=True,
+                  max_instances=1, coalesce=True, misfire_grace_time=60)
+
+
+def _file_sync_job_wrapper():
+    try:
+        from core import file_sync
+        file_sync.tick()
+    except Exception as e:
+        _logger.error("调度文件实时同步异常: %s", e)
+
+
 def _register_cleanup(sched):
     """注册备份保留策略定期清理任务（默认每日 03:10）。"""
     from apscheduler.triggers.cron import CronTrigger
@@ -1629,6 +1649,7 @@ def start_scheduler():
     _register_immutable_check(_scheduler)
     _register_rt_backup(_scheduler)
     _register_dr_monitor(_scheduler)
+    _register_file_sync(_scheduler)
     _scheduler.start()
     _logger.info("调度器已启动，已注册 %d 个任务", len(_scheduler.get_jobs()))
     return _scheduler
@@ -1696,6 +1717,7 @@ def _reload_scheduler_locked():
     _register_cleanup(_scheduler)
     _register_immutable_check(_scheduler)
     _register_dr_monitor(_scheduler)
+    _register_file_sync(_scheduler)
     # RT 周期任务幂等重注册；Supervisor 主循环 tick 已保留，不重启守护
     if config.RT_BACKUP_ENABLED:
         _register_rt_periodic_jobs(_scheduler)

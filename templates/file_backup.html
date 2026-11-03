@@ -42,6 +42,26 @@
   </div>
 </div>
 
+<!-- ============ P1-4：文件推送式实时同步（零 Agent） ============ -->
+<div class="page-card mt-4">
+  <div class="card-section-title d-flex justify-content-between align-items-center">
+    <span><i class="bi bi-broadcast-pin"></i> 文件实时同步（指纹轮询 · 零 Agent）
+      <span class="text-muted small ms-2">源端零安装：平台周期只读指纹扫描，仅拉取变更文件，版本化保留</span></span>
+    <div class="d-flex gap-2">
+      <button class="btn btn-sm btn-outline-secondary" onclick="loadFileSync()"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+      <button class="btn btn-sm btn-primary" onclick="openFileSyncModal()"><i class="bi bi-plus-lg"></i> 新建同步任务</button>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>ID</th><th>名称</th><th>源主机</th><th>源路径</th><th>间隔</th><th>版本保留</th><th>状态</th><th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="fsTaskTable"><tr><td colspan="8" class="text-center text-muted">加载中…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
 <!-- ============ 文件备份任务 模态框 ============ -->
 <div class="modal fade" id="fileTaskModal" tabindex="-1">
   <div class="modal-dialog modal-lg modal-dialog-scrollable">

@@ -3891,6 +3891,165 @@
     } catch (e) { toast(e.message, "danger"); }
   };
 
+  // ---- P1-4：文件推送式实时同步 ----
+  async function loadFileSync() {
+    const tb = $("fsTaskTable");
+    if (!tb) return;
+    try {
+      const d = await api("GET", "/api/file-sync");
+      const tasks = d.tasks || [];
+      const hosts = FILE_HOSTS || [];
+      const hostName = (hid) => {
+        const h = hosts.find((x) => Number(x.id) === Number(hid));
+        return h ? h.name : (hid ? "#" + hid : "本机(SSH)");
+      };
+      tb.innerHTML = tasks.map((t) => {
+        const st = t.last_status || "never";
+        const badge = st === "synced" ? '<span class="badge badge-ok">已同步</span>'
+          : st === "no_change" ? '<span class="badge bg-secondary">无变更</span>'
+          : st === "running" ? '<span class="badge badge-run">运行中</span>'
+          : st === "failed" ? '<span class="badge badge-fail" title="' + esc(t.last_error || "") + '">失败</span>'
+          : '<span class="badge bg-secondary">未运行</span>';
+        return `<tr>
+          <td>${t.id}</td>
+          <td><strong>${esc(t.name)}</strong>${t.enabled ? "" : ' <span class="badge bg-secondary">停用</span>'}</td>
+          <td class="small">${esc(hostName(t.ssh_host_id))}</td>
+          <td class="small text-truncate" style="max-width:220px" title="${esc((t.src_paths || []).join("\n"))}">${esc((t.src_paths || []).join(", "))}</td>
+          <td class="small">${t.interval_sec}s</td>
+          <td class="small">${t.keep_versions} 版</td>
+          <td class="small">${badge}<br><span class="text-muted">${t.last_run_at ? esc(t.last_run_at.slice(0, 19).replace("T", " ")) : ""}</span></td>
+          <td class="text-end text-nowrap">
+            <button class="btn btn-sm btn-outline-primary" onclick="runFileSync(${t.id})">同步</button>
+            <button class="btn btn-sm btn-outline-info" onclick="fsShowVersions(${t.id})">版本</button>
+            <button class="btn btn-sm ${t.enabled ? "btn-outline-warning" : "btn-outline-success"}" onclick="toggleFileSync(${t.id}, ${t.enabled ? 0 : 1})">${t.enabled ? "停用" : "启用"}</button>
+            <button class="btn btn-sm btn-outline-secondary" onclick="editFileSync(${t.id})">编辑</button>
+            <button class="btn btn-sm btn-outline-danger" onclick="delFileSync(${t.id})">删除</button>
+          </td></tr>`;
+      }).join("") || '<tr><td colspan="8" class="text-center text-muted">暂无同步任务——源端零安装，平台周期指纹扫描仅拉取变更文件。</td></tr>';
+    } catch (e) {
+      tb.innerHTML = '<tr><td colspan="8" class="text-center text-danger">加载失败: ' + esc(e.message) + "</td></tr>";
+    }
+  }
+
+  window.openFileSyncModal = async function (id) {
+    let task = null;
+    if (id) {
+      try { task = (await api("GET", "/api/file-sync")).tasks.filter((t) => t.id === id)[0]; }
+      catch (e) { toast("读取失败: " + e.message, "danger"); return; }
+      if (!task) { toast("任务不存在", "danger"); return; }
+    }
+    const hosts = FILE_HOSTS || [];
+    const wrap = document.createElement("div");
+    wrap.className = "modal fade";
+    wrap.innerHTML = `
+      <div class="modal-dialog modal-lg modal-dialog-centered"><div class="modal-content">
+        <div class="modal-header"><h6 class="modal-title"><i class="bi bi-broadcast-pin"></i> ${id ? "编辑" : "新建"}文件实时同步</h6>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body">
+          <div class="row g-3">
+            <div class="col-md-6"><label class="form-label">任务名称 *</label>
+              <input class="form-control" id="fsm_name" value="${task ? esc(task.name) : ""}" placeholder="如 业务附件目录容灾同步"></div>
+            <div class="col-md-6"><label class="form-label">源主机（纳管；不选=本机 SSH）</label>
+              <select class="form-select" id="fsm_host">
+                <option value="">本机（SSH 127.0.0.1 密钥）</option>
+                ${hosts.map((h) => `<option value="${h.id}" ${task && Number(task.ssh_host_id) === Number(h.id) ? "selected" : ""}>${esc(h.name)}（${esc(h.host_key || "")}）</option>`).join("")}
+              </select></div>
+            <div class="col-12"><label class="form-label">源路径（绝对路径，每行一个）*</label>
+              <textarea class="form-control" id="fsm_paths" rows="3" placeholder="/data/app/attachments&#10;/etc/myapp">${task ? esc((task.src_paths || []).join("\n")) : ""}</textarea></div>
+            <div class="col-md-4"><label class="form-label">轮询间隔（秒）</label>
+              <input class="form-control" id="fsm_interval" type="number" min="30" value="${task ? task.interval_sec : 60}"></div>
+            <div class="col-md-4"><label class="form-label">版本保留</label>
+              <input class="form-control" id="fsm_keep" type="number" min="1" value="${task ? task.keep_versions : 10}"></div>
+            <div class="col-md-4"><label class="form-label">排除（glob，逗号分隔，可空）</label>
+              <input class="form-control" id="fsm_ex" value="${task ? esc((task.excludes || []).join(",")) : "*.tmp,*.log"}"></div>
+            <div class="col-12"><div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="fsm_enabled" ${!task || task.enabled ? "checked" : ""}>
+              <label class="form-check-label" for="fsm_enabled">启用（调度器按间隔自动同步）</label>
+            </div></div>
+          </div>
+          <div class="form-text mt-2">首轮为全量基线，之后每轮只拉取新增/变更文件（sha256+size+mtime 指纹比对），删除文件记入版本 .deleted.txt。</div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+          <button class="btn btn-primary" id="fsm_save">保存</button>
+        </div>
+      </div></div>`;
+    document.body.appendChild(wrap);
+    const modal = new bootstrap.Modal(wrap);
+    wrap.addEventListener("hidden.bs.modal", () => { try { wrap.remove(); } catch (e) { /* noop */ } });
+    wrap.querySelector("#fsm_save").onclick = async () => {
+      const body = {
+        name: wrap.querySelector("#fsm_name").value.trim(),
+        ssh_host_id: wrap.querySelector("#fsm_host").value || null,
+        src_paths: wrap.querySelector("#fsm_paths").value.split("\n").map((s) => s.trim()).filter(Boolean),
+        excludes: wrap.querySelector("#fsm_ex").value.split(",").map((s) => s.trim()).filter(Boolean),
+        interval_sec: Number(wrap.querySelector("#fsm_interval").value) || 60,
+        keep_versions: Number(wrap.querySelector("#fsm_keep").value) || 10,
+        enabled: wrap.querySelector("#fsm_enabled").checked,
+      };
+      try {
+        if (id) await api("PUT", "/api/file-sync/" + id, body);
+        else await api("POST", "/api/file-sync", body);
+        toast("已保存", "success");
+        modal.hide();
+        await loadFileSync();
+      } catch (e) { toast("保存失败: " + e.message, "danger"); }
+    };
+    modal.show();
+  };
+
+  window.editFileSync = (id) => window.openFileSyncModal(id);
+
+  window.runFileSync = async function (id) {
+    toast("同步执行中…", "warning");
+    try {
+      const d = await api("POST", `/api/file-sync/${id}/run`, {});
+      const r = d.result || {};
+      toast(d.ok
+        ? `同步完成：${r.status === "no_change" ? "无变更（共 " + r.total_files + " 文件）" : "拉取 " + (r.new || 0) + " 文件 / " + BKP.humanSize(r.bytes || 0) + (r.failed ? "，失败 " + r.failed : "")}`
+        : "同步失败", d.ok ? "success" : "danger", 6000);
+      await loadFileSync();
+    } catch (e) { toast("同步失败: " + e.message, "danger"); }
+  };
+
+  window.toggleFileSync = async function (id, enabled) {
+    try {
+      await api("PUT", `/api/file-sync/${id}`, { enabled: !!enabled });
+      toast(enabled ? "已启用" : "已停用");
+      await loadFileSync();
+    } catch (e) { toast(e.message, "danger"); }
+  };
+
+  window.delFileSync = async function (id) {
+    const ok = await confirmDialog({ title: "删除同步任务？", message: "仅删除任务配置；已同步的版本目录保留在磁盘。", confirmText: "删除", danger: true });
+    if (!ok) return;
+    try { await api("DELETE", `/api/file-sync/${id}`); toast("已删除"); await loadFileSync(); }
+    catch (e) { toast(e.message, "danger"); }
+  };
+
+  window.fsShowVersions = async function (id) {
+    try {
+      const d = await api("GET", `/api/file-sync/${id}/versions`);
+      const vs = d.versions || [];
+      const wrap = document.createElement("div");
+      wrap.className = "modal fade";
+      wrap.innerHTML = `
+        <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable"><div class="modal-content">
+          <div class="modal-header"><h6 class="modal-title"><i class="bi bi-layers"></i> 同步版本（任务 #${id}）</h6>
+            <button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+          <div class="modal-body small">
+            ${vs.length ? '<table class="table table-sm"><thead><tr><th>版本</th><th>文件数</th><th>大小</th></tr></thead><tbody>' +
+              vs.map((v) => `<tr><td><code>${esc(v.version)}</code></td><td>${v.files}</td><td>${BKP.humanSize(v.size_bytes || 0)}</td></tr>`).join("") + "</tbody></table>"
+            : '<div class="text-muted">暂无版本（尚未执行同步）</div>'}
+          </div>
+        </div></div>`;
+      document.body.appendChild(wrap);
+      const modal = new bootstrap.Modal(wrap);
+      wrap.addEventListener("hidden.bs.modal", () => { try { wrap.remove(); } catch (e) { /* noop */ } });
+      modal.show();
+    } catch (e) { toast(e.message, "danger"); }
+  };
+
   async function initFileBackup() {
     const ftmEl = document.getElementById("fileTaskModal");
     if (ftmEl) fileTaskModal = new bootstrap.Modal(ftmEl);
@@ -3898,6 +4057,7 @@
     if (hmEl) hostModal = new bootstrap.Modal(hmEl);
     bindFileTaskFormEvents();
     bindHostFormEvents();
+    loadFileSync();   // P1-4 文件实时同步
     const ftsBtn = $("fileTaskSaveBtn");
     if (ftsBtn) ftsBtn.onclick = saveFileTask;
     const hsBtn = $("hostSaveBtn");

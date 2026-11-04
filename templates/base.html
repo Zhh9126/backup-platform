@@ -81,6 +81,7 @@
         <div class="nav-group-label">运维</div>
         <a class="nav-link {% if page=='operations' %}active{% endif %}" href="/operations" title="运维运营分析（超长 / 超频备份统计与阈值配置）" data-perm="operations.view"><i class="bi bi-graph-up-arrow"></i> <span class="nav-label">运维运营分析</span></a>
         <a class="nav-link {% if page=='inspection' %}active{% endif %}" href="/inspection" title="巡检" data-perm="inspection.manage"><i class="bi bi-shield-check"></i> <span class="nav-label">巡检</span></a>
+        <a class="nav-link {% if page=='reports' %}active{% endif %}" href="/reports" title="报表中心" data-perm="inspection.manage"><i class="bi bi-file-earmark-bar-graph"></i> <span class="nav-label">报表中心</span></a>
         {% if has_ai_agent %}
                 <a class="nav-link {% if page=='agent' %}active{% endif %}" href="/agent" title="AI 智能助手" data-perm="agent.use"><i class="bi bi-robot"></i> <span class="nav-label">AI 智能助手</span></a>
         {% endif %}
@@ -127,7 +128,7 @@
   <script src="/static/js/bkp-core.js?v=2026110301"></script>
   <script src="/static/js/pager.js?v=2026102802"></script>
   <script src="/static/js/precheck.js?v=2026110203"></script>
-  <script src="/static/js/app.js?v=2026110309"></script>
+  <script src="/static/js/app.js?v=2026110401"></script>
   {% if has_ai_agent %}<script src="/static/js/ai-agent.js?v=2026101501"></script>{% endif %}
   <script>
     // 按权限隐藏菜单（每个 <a class="nav-link" data-perm="..."> 命中则可见）

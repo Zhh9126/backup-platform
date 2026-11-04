@@ -67,6 +67,10 @@ class SyncConfig:
     # 断点续跑（对标 influxdb2tsfile --resume）：上次迁移已成功的表跳过不重迁，
     # 只补做缺失/失败的表；由迁移计划依据 manifest 生成
     skip_tables: List[str] = field(default_factory=list)
+    # 多表并行迁移（对标 KDTS/DTS 并行度）：>1 且多表时按并行度并发迁移。
+    # 引擎配置实例隔离——每个 worker 独立 SyncEngine（浅拷贝 config + 独立连接），
+    # 因为 _run_single_table 会改写共享 config 的 source_table/target_table。
+    parallel_tables: int = 1
 
 
 @dataclass

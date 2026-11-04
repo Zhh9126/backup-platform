@@ -663,6 +663,8 @@ class DbMigrationEngine:
             "exclude_tables": exclude_tables,
             # 自定义类型映射覆盖（对标 KDTS）：extra.type_mapping={"源类型":"目标类型"}
             "type_mapping": extra.get("type_mapping") or {},
+            # 多表并行迁移（对标 DTS 并行度）：并行度上限 8
+            "parallel_tables": max(1, min(8, int(extra.get("parallel_tables") or 1))),
         }
         started = time.monotonic()
         res = run_sync_task_with_task(synthetic_task)
@@ -740,15 +742,18 @@ class DbMigrationEngine:
         return d
 
     def _phase_objects(self, plan: dict) -> dict:
-        """非表对象迁移：视图 / 序列 / 注释 / 例程(函数·存储过程) / 触发器。
+        """非表对象迁移：视图 / 序列 / 注释 / 同义词 / 程序包 / 自定义类型 / 例程 / 触发器。
 
         extra_options.migrate_objects 控制开关：
           {"views": true, "sequences": true, "comments": true,
+           "synonyms": true, "packages": true, "types": true,
            "routines": true, "triggers": true}
         策略（诚实边界）：
-          - 同构/同族目标：CREATE OR REPLACE 直通重建；
+          - 同构/同族目标：CREATE OR REPLACE 直通重建，逐对象成败如实记录；
           - 异构目标：视图/序列/注释做基础方言适配后执行，失败逐对象记录；
-            例程/触发器**跨方言不翻译**——导出源码进报告，标注需人工适配。
+            例程/触发器/同义词/程序包/自定义类型**跨方言不翻译**——导出源码
+            进报告（routines_export / objects_export），标注需人工适配；
+          - dblink 同义词不迁移（跨库依赖）；MySQL/PG 系无对应对象时如实 skipped。
         """
         extra = plan.get("extra_options") or {}
         if not isinstance(extra, dict):
@@ -771,7 +776,9 @@ class DbMigrationEngine:
 
         out = {"executed": True, "same_family": same_family,
                "views": [], "sequences": [], "comments": [],
-               "routines": [], "triggers": [], "routines_export": []}
+               "synonyms": [], "packages": [], "types": [],
+               "routines": [], "triggers": [], "routines_export": [],
+               "objects_export": []}
 
         src_conn = self._obj_conn(plan, "src")
         try:
@@ -785,6 +792,13 @@ class DbMigrationEngine:
                 out["comments"] = self._mig_comments(src_conn, src_t, tgt_t,
                                                      src_schema, tgt_schema,
                                                      exclude=extra.get("exclude_tables"))
+            if cfg.get("synonyms"):
+                out["synonyms"] = self._mig_synonyms(src_conn, src_t, tgt_t,
+                                                     tgt_schema)
+            if cfg.get("packages"):
+                out["packages"] = self._mig_packages(src_conn, src_t, tgt_t)
+            if cfg.get("types"):
+                out["types"] = self._mig_types(src_conn, src_t, tgt_t)
             if cfg.get("routines"):
                 r = self._mig_routines(src_conn, src_t, src_schema)
                 out["routines"] = r if same_family else []
@@ -804,13 +818,18 @@ class DbMigrationEngine:
             except Exception:
                 pass
         out["duration_sec"] = round(time.monotonic() - started, 1)
-        n_ok = sum(1 for sec in ("views", "sequences", "comments")
+        _secs = ("views", "sequences", "comments", "synonyms", "packages", "types")
+        n_ok = sum(1 for sec in _secs
                    for it in out[sec] if it.get("status") == "ok")
-        n_fail = sum(1 for sec in ("views", "sequences", "comments")
+        n_fail = sum(1 for sec in _secs
                      for it in out[sec] if it.get("status") == "error")
+        # 异构目标导出容器：同义词/程序包/类型 SQL + 例程导出，统一进 objects_export
+        out["objects_export"] = [it for it in
+                                 (out["synonyms"] + out["packages"] + out["types"])
+                                 if it.get("status") == "export"]
+        n_export = len(out["objects_export"]) + len(out.get("routines_export") or [])
         out["summary"] = (f"对象迁移：成功 {n_ok}，失败 {n_fail}"
-                          + (f"，导出待人工适配 {len(out['routines_export'])} 个"
-                             if out.get("routines_export") else ""))
+                          + (f"，导出待人工适配 {n_export} 个" if n_export else ""))
         db.add_log("warning" if n_fail else "info", "db_migrate",
                    f"迁移计划 #{plan['id']} 对象迁移：{out['summary']}")
         return out
@@ -1109,6 +1128,219 @@ class DbMigrationEngine:
                    for r in cur.fetchall()]
             cur.close()
         return out
+
+    # ---- 同义词 / 程序包 / 自定义类型（对标 KDTS 对象覆盖第三批） ----
+    #
+    # 策略与例程/触发器一致（诚实边界）：
+    #   - 同族目标（oracle↔dameng 互为目标）直通重建，逐对象成败如实记录；
+    #   - 异构目标（MySQL/PG 系无这些对象类型）导出源码进报告待人工适配；
+    #   - dblink 同义词、TYPE BODY 等特殊形态跳过并说明原因。
+
+    def _mig_synonyms(self, src_conn, src_t: str, tgt_t: str,
+                      tgt_schema: str) -> list:
+        src_fam, tgt_fam = self._obj_family(src_t), self._obj_family(tgt_t)
+        if src_fam == "mysql":
+            return [{"object": "-", "kind": "synonym", "status": "skipped",
+                     "error": "MySQL/MariaDB 无同义词对象"}]
+        if src_fam == "pg":
+            return [{"object": "-", "kind": "synonym", "status": "skipped",
+                     "error": "PG 系无同义词对象（跨库访问用 dblink/FDW，不在此范围）"}]
+        out = []
+        rows = None
+        try:
+            cur = src_conn.cursor()
+            if src_t == "dameng":
+                cur.execute(sql, (self._syn_schema(), self._OBJECT_LIMIT))
+            else:
+                cur.execute(
+                    "SELECT synonym_name, table_owner, table_name, db_link "
+                    "FROM all_synonyms WHERE owner=:o AND ROWNUM <= :n",
+                    {"o": self._syn_schema(), "n": self._OBJECT_LIMIT})
+            rows = cur.fetchall()
+            cur.close()
+        except Exception as e:  # noqa: BLE001
+            return [{"object": "-", "kind": "synonym", "status": "skipped",
+                     "error": f"同义词清单探测失败（对象类型可能不受支持）：{str(e)[:120]}"}]
+        for name, owner, tname, dblink in rows or []:
+            if dblink:
+                out.append({"object": name, "kind": "synonym", "status": "skipped",
+                            "error": f"dblink 同义词（→{dblink}）跨库依赖不迁移"})
+                continue
+            ddl = f"CREATE OR REPLACE SYNONYM {name} FOR {owner}.{tname}"
+            if src_fam == tgt_fam:
+                ok, err = self._exec_target(self._obj_plan, ddl)
+                out.append({"object": name, "kind": "synonym",
+                            "status": "ok" if ok else "error", "error": err})
+            else:
+                out.append({"object": name, "kind": "synonym", "status": "export",
+                            "sql": ddl})
+        return out
+
+    def _syn_schema(self) -> str:
+        """Oracle 族源对象 owner：src_schema 显式指定 > 连接用户名 > 库名。
+
+        Oracle 的 src_db_name 是服务名（连接语义），不是对象 schema——
+        首轮真机实测暴露：把 C##E2E17 填进 db_name 会当成服务名连不上。
+        达梦源用户即 schema（SYSDBA），Oracle 源 schema 可与登录用户不同。
+        """
+        p = self._obj_plan
+        return str(p.get("src_schema") or p.get("src_username")
+                   or p.get("src_db_name") or "").upper()
+
+    def _mig_packages(self, src_conn, src_t: str, tgt_t: str) -> list:
+        src_fam, tgt_fam = self._obj_family(src_t), self._obj_family(tgt_t)
+        if src_fam == "mysql":
+            return [{"object": "-", "kind": "package", "status": "skipped",
+                     "error": "MySQL/MariaDB 无程序包对象"}]
+        if src_fam == "pg":
+            return [{"object": "-", "kind": "package", "status": "skipped",
+                     "error": "PG 系无程序包对象（schema+函数组合承载）"}]
+        owner = self._syn_schema()
+        out = []
+        try:
+            cur = src_conn.cursor()
+            if src_t == "dameng":
+                cur.execute(
+                    "SELECT object_name, object_type FROM all_objects "
+                    "WHERE owner=? AND object_type IN ('PACKAGE','PACKAGE BODY') "
+                    "AND ROWNUM <= ?", (owner, self._OBJECT_LIMIT))
+                objs = cur.fetchall()
+                ddl_of = self._dm_metadata_ddl
+            else:
+                cur.execute(
+                    "SELECT object_name, object_type FROM all_objects "
+                    "WHERE owner=:o AND object_type IN ('PACKAGE','PACKAGE BODY') "
+                    "AND ROWNUM <= :n", {"o": owner, "n": self._OBJECT_LIMIT})
+                objs = cur.fetchall()
+                ddl_of = self._ora_metadata_ddl
+            cur.close()
+            for name, otype in objs:
+                ddl = ddl_of(src_conn, otype, name, owner)
+                if not ddl:
+                    out.append({"object": name, "kind": "package", "status": "skipped",
+                                "error": "DDL 提取失败（DBMS_METADATA 无返回）"})
+                    continue
+                if src_fam == tgt_fam:
+                    ok, err = self._exec_target(self._obj_plan, ddl)
+                    out.append({"object": name, "kind": (otype or "").lower(),
+                                "status": "ok" if ok else "error", "error": err})
+                else:
+                    out.append({"object": name, "kind": (otype or "").lower(),
+                                "status": "export", "sql": ddl})
+        except Exception as e:  # noqa: BLE001
+            return [{"object": "-", "kind": "package", "status": "skipped",
+                     "error": f"程序包探测失败：{str(e)[:120]}"}]
+        return out
+
+    def _mig_types(self, src_conn, src_t: str, tgt_t: str) -> list:
+        src_fam, tgt_fam = self._obj_family(src_t), self._obj_family(tgt_t)
+        out = []
+        if src_fam == "mysql":
+            return [{"object": "-", "kind": "type", "status": "skipped",
+                     "error": "MySQL/MariaDB 无自定义类型对象（ENUM 随列定义迁移）"}]
+        if src_fam == "oracle":
+            owner = self._syn_schema()
+            ddl_of = self._dm_metadata_ddl if src_t == "dameng" else self._ora_metadata_ddl
+            try:
+                cur = src_conn.cursor()
+                if src_t == "dameng":
+                    cur.execute(
+                        "SELECT type_name FROM all_types WHERE owner=? "
+                        "AND ROWNUM <= ?", (owner, self._OBJECT_LIMIT))
+                else:
+                    cur.execute(
+                        "SELECT type_name FROM all_types WHERE owner=:o "
+                        "AND ROWNUM <= :n", {"o": owner, "n": self._OBJECT_LIMIT})
+                names = [r[0] for r in cur.fetchall()]
+                cur.close()
+                for name in names:
+                    ddl = ddl_of(src_conn, "TYPE", name, owner)
+                    if not ddl:
+                        out.append({"object": name, "kind": "type", "status": "skipped",
+                                    "error": "DDL 提取失败（DBMS_METADATA 无返回）"})
+                        continue
+                    if src_fam == tgt_fam:
+                        ok, err = self._exec_target(self._obj_plan, ddl)
+                        out.append({"object": name, "kind": "type",
+                                    "status": "ok" if ok else "error", "error": err})
+                    else:
+                        out.append({"object": name, "kind": "type",
+                                    "status": "export", "sql": ddl})
+            except Exception as e:  # noqa: BLE001
+                return [{"object": "-", "kind": "type", "status": "skipped",
+                         "error": f"自定义类型探测失败：{str(e)[:120]}"}]
+        elif src_fam == "pg":
+            # 枚举类型：pg_enum 聚合；复合类型：pg_attribute 还原列定义
+            schema = self._obj_plan.get("src_db_name") or ""
+            try:
+                cur = src_conn.cursor()
+                cur.execute(
+                    "SELECT t.typname, array_agg(e.enumlabel ORDER BY e.enumsortorder) "
+                    "FROM pg_type t JOIN pg_enum e ON e.enumtypid=t.oid "
+                    "JOIN pg_namespace n ON n.oid=t.typnamespace "
+                    "WHERE n.nspname=%s GROUP BY t.typname LIMIT %s",
+                    (schema, self._OBJECT_LIMIT))
+                for name, labels in cur.fetchall():
+                    lbl = ",".join(f"'{x}'" for x in (labels or []))
+                    ddl = f'CREATE TYPE "{name}" AS ENUM ({lbl})'
+                    if tgt_fam == "pg":
+                        ok, err = self._exec_target(self._obj_plan, ddl)
+                        out.append({"object": name, "kind": "enum_type",
+                                    "status": "ok" if ok else "error", "error": err})
+                    else:
+                        out.append({"object": name, "kind": "enum_type",
+                                    "status": "export", "sql": ddl})
+                cur.execute(
+                    "SELECT t.typname, "
+                    "string_agg(a.attname || ' ' || format_type(a.atttypid, a.atttypmod), ', ' "
+                    "ORDER BY a.attnum) "
+                    "FROM pg_type t JOIN pg_class c ON c.oid=t.typrelid "
+                    "JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum > 0 "
+                    "AND NOT a.attisdropped "
+                    "JOIN pg_namespace n ON n.oid=t.typnamespace "
+                    "WHERE n.nspname=%s AND t.typtype='c' AND c.relkind='c' "
+                    "GROUP BY t.typname LIMIT %s", (schema, self._OBJECT_LIMIT))
+                for name, cols in cur.fetchall():
+                    cols = ", ".join(cols) if isinstance(cols, list) else cols
+                    ddl = f'CREATE TYPE "{name}" AS ({cols})'
+                    if tgt_fam == "pg":
+                        ok, err = self._exec_target(self._obj_plan, ddl)
+                        out.append({"object": name, "kind": "composite_type",
+                                    "status": "ok" if ok else "error", "error": err})
+                    else:
+                        out.append({"object": name, "kind": "composite_type",
+                                    "status": "export", "sql": ddl})
+                cur.close()
+            except Exception as e:  # noqa: BLE001
+                return [{"object": "-", "kind": "type", "status": "skipped",
+                         "error": f"自定义类型探测失败：{str(e)[:120]}"}]
+        return out
+
+    def _ora_metadata_ddl(self, conn, obj_type: str, name: str, owner: str):
+        """Oracle：DBMS_METADATA.GET_DDL 提取对象 DDL（LOB 需 read()）。"""
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT DBMS_METADATA.GET_DDL(:t, :n, :o) FROM dual",
+                {"t": obj_type, "n": name, "o": owner})
+            ddl = cur.fetchone()[0]
+            cur.close()
+            return ddl.read() if hasattr(ddl, "read") else (str(ddl or "") or None)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _dm_metadata_ddl(self, conn, obj_type: str, name: str, owner: str):
+        """达梦：DBMS_METADATA.GET_DDL（占位符 ?，与 dmPython 对齐）。"""
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT DBMS_METADATA.GET_DDL(?, ?, ?) FROM dual",
+                (obj_type, name, owner))
+            ddl = cur.fetchone()[0]
+            cur.close()
+            return ddl.read() if hasattr(ddl, "read") else (str(ddl or "") or None)
+        except Exception:  # noqa: BLE001
+            return None
 
     def _phase_verify(self, plan: dict, manifest: Optional[list] = None) -> dict:
         """数据校验：逐表行数比对（源 vs 目标）+ manifest 对照。"""

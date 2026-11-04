@@ -356,6 +356,11 @@ def create_app() -> Flask:
     def inspection_page():
         return render_template("inspection.html", page="inspection")
 
+    @app.route("/reports")
+    @login_required
+    def reports_page():
+        return render_template("reports.html", page="reports")
+
     @app.route("/storage")
     @login_required
     def storage_page():

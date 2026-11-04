@@ -193,6 +193,7 @@
     $("tgtSchema").value = t.tgt_schema || "";
     $("targetTable").value = t.target_table || "";
     if ($("excludeTables")) $("excludeTables").value = (t.exclude_tables || []).join(", ");
+    if ($("parallelTables")) $("parallelTables").value = String(t.parallel_tables || 1);
     $("batchSize").value = t.batch_size || 1000;
     $("sourceWhere").value = t.source_where || "";
     $("incrementalColumn").value = t.incremental_column || "";
@@ -472,6 +473,7 @@
       enabled: 1,
       exclude_tables: $("excludeTables") ? ($("excludeTables").value || "")
         .split(",").map(function (s) { return s.trim(); }).filter(Boolean) : [],
+      parallel_tables: $("parallelTables") ? (parseInt($("parallelTables").value) || 1) : 1,
     };
   }
 

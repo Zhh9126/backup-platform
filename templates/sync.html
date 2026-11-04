@@ -217,6 +217,17 @@
                   <input type="text" class="form-control font-monospace" id="excludeTables"
                          placeholder="如 log_2023, tmp_bak, arc_2024">
                 </div>
+                <div class="col-md-3">
+                  <label class="form-label">并行度（多表并行，1=串行）</label>
+                  <select class="form-select" id="parallelTables">
+                    <option value="1" selected>1（串行，默认）</option>
+                    <option value="2">2</option>
+                    <option value="4">4</option>
+                    <option value="6">6</option>
+                    <option value="8">8</option>
+                  </select>
+                  <div class="form-text">仅全库迁移/多表 full 同步生效；每表独立引擎实例并发。</div>
+                </div>
               </div>
 
               <hr class="my-4">
@@ -349,7 +360,7 @@
 .field-item .field-name { font-weight: 500; }
 .field-item .field-type { font-size: 0.75rem; color: #6c757d; }
 </style>
-<script src="/static/js/sync.js?v=2026110202"></script>
+<script src="/static/js/sync.js?v=2026110401"></script>
 <!-- 预检结果模态框 -->
 <div class="modal fade" id="precheckModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog modal-lg modal-dialog-scrollable">

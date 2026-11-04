@@ -690,7 +690,7 @@ SYNC_FIELDS = [
     "full_db_migrate", "validate_before_run", "verify_after_run",
     "precheck_sample_rows", "realtime_watermark",
     "schedule_type", "cron_expr", "interval_minutes", "enabled", "status",
-    "message", "exclude_tables",
+    "message", "exclude_tables", "type_mapping", "parallel_tables",
 ]
 
 
@@ -735,6 +735,20 @@ def _decorate_sync(row: dict) -> dict:
     return row
 
 
+def _normalize_sync_json_fields(data: dict) -> None:
+    """JSON 型字段的 dict/list 就地序列化。
+
+    与备份任务 _normalize_json_fields 同款防御：API 直调（不经 api/sync.py
+    的 _prepare_payload）或调用方直接传 dict/list 时，sqlite 绑定会抛
+    "type 'dict' is not supported" 500（2026-10-26 备份任务同款缺陷）。
+    """
+    for k in ("column_mapping", "source_tables_list", "flink_config",
+              "exclude_tables", "type_mapping"):
+        v = data.get(k)
+        if isinstance(v, (dict, list)):
+            data[k] = json.dumps(v, ensure_ascii=False)
+
+
 def create_sync_task(data: dict) -> int:
     data = {k: data.get(k) for k in SYNC_FIELDS}
     now = db.now_iso()
@@ -743,6 +757,7 @@ def create_sync_task(data: dict) -> int:
     data["status"] = "never"
     data["last_status"] = "never"
     data["last_run_at"] = None
+    _normalize_sync_json_fields(data)
     if data.get("src_password"):
         data["src_password"] = db.encrypt_secret(data["src_password"])
     if data.get("tgt_password"):
@@ -796,6 +811,7 @@ def update_sync_task(sync_id: int, data: dict) -> bool:
     data = {k: v for k, v in data.items() if k in SYNC_FIELDS}
     if not data:
         return False
+    _normalize_sync_json_fields(data)
     data["updated_at"] = db.now_iso()
     sets, params = [], []
     for k, v in data.items():

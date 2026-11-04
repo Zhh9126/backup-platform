@@ -351,11 +351,42 @@ class BackupEngine:
 
     @property
     def bandwidth_limit(self) -> int:
-        """任务级限速（KB/s）：0 表示不限制。"""
+        """任务级限速（KB/s）：0 表示不限制。
+
+        时间段限速（P2）：extra_options.rate_limit_window={"start":"09:00",
+        "end":"21:00"} 配置「限速生效时段」——时段内应用带宽限制，时段外
+        全速（夜间备份不减速的典型场景）。跨零点窗口（start>end，如
+        22:00-06:00）按环绕语义判断。窗口非法/未配置时退化为全程限速。
+        """
         try:
             bw = int(self.task.get("bandwidth_limit") or 0)
         except (TypeError, ValueError):
             bw = 0
+        if not bw:
+            return 0
+        try:
+            from datetime import datetime as _dt
+            eo = self.task.get("extra_options") or {}
+            if isinstance(eo, str):
+                import json as _json
+                eo = _json.loads(eo) if eo.strip() else {}
+            win = (eo or {}).get("rate_limit_window") or {}
+            start, end = str(win.get("start") or ""), str(win.get("end") or "")
+            if start and end and ":" in start and ":" in end:
+                sh, sm = start.split(":")[:2]
+                eh, em = end.split(":")[:2]
+                now = _dt.now()
+                cur = now.hour * 60 + now.minute
+                s = int(sh) * 60 + int(sm)
+                e = int(eh) * 60 + int(em)
+                if s <= e:
+                    in_win = s <= cur < e
+                else:  # 跨零点：22:00-06:00
+                    in_win = cur >= s or cur < e
+                if not in_win:
+                    return 0  # 窗口外全速
+        except Exception:  # noqa: BLE001
+            pass  # 窗口解析失败退化为全程限速（不因限速配置影响备份）
         return bw
 
     def _pv_throttle(self) -> List[str]:

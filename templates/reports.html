@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">报表中心</div>
+    <div class="page-sub">备份 / 恢复 / 校验运行报表聚合（P2 池）——聚合平台元数据库已有记录，如实呈现不补数</div>
+  </div>
+  <select class="form-select form-select-sm" id="rcDays" style="width:150px">
+    <option value="7" selected>近 7 天</option>
+    <option value="30">近 30 天</option>
+    <option value="90">近 90 天</option>
+    <option value="365">近 365 天</option>
+  </select>
+  <button class="btn btn-outline-secondary btn-sm" onclick="loadReportCenter()"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+  <div class="btn-group btn-group-sm" role="group">
+    <button class="btn btn-outline-primary" onclick="exportReport('csv')"><i class="bi bi-filetype-csv"></i> CSV</button>
+    <button class="btn btn-outline-primary" onclick="exportReport('docx')"><i class="bi bi-file-earmark-word"></i> Word</button>
+    <button class="btn btn-outline-primary" onclick="exportReport('pdf')"><i class="bi bi-file-earmark-pdf"></i> PDF</button>
+  </div>
+</div>
+
+<!-- 汇总卡 -->
+<div class="row g-3 mb-1" id="rcCards"></div>
+
+<div class="row g-3">
+  <div class="col-lg-6">
+    <div class="page-card p-3">
+      <div class="card-section-title"><i class="bi bi-diagram-3"></i> 按库型聚合（备份）</div>
+      <div class="table-responsive"><table class="table table-sm table-hover mb-0">
+        <thead><tr><th>库型</th><th>总数</th><th>成功</th><th>失败</th><th>数据量</th></tr></thead>
+        <tbody id="rcByType"><tr><td colspan="5" class="text-muted">加载中…</td></tr></tbody>
+      </table></div>
+    </div>
+  </div>
+  <div class="col-lg-6">
+    <div class="page-card p-3">
+      <div class="card-section-title"><i class="bi bi-exclamation-triangle"></i> 失败任务 Top 10</div>
+      <div class="table-responsive"><table class="table table-sm table-hover mb-0">
+        <thead><tr><th>任务</th><th>失败次数</th><th>最近失败</th></tr></thead>
+        <tbody id="rcTopFail"><tr><td colspan="3" class="text-muted">加载中…</td></tr></tbody>
+      </table></div>
+    </div>
+  </div>
+</div>
+
+<div class="page-card p-3 mt-3">
+  <div class="card-section-title"><i class="bi bi-list-ul"></i> 备份明细（导出文件含完整明细行）</div>
+  <div class="table-responsive"><table class="table table-sm table-hover mb-0">
+    <thead><tr><th>#</th><th>开始时间</th><th>任务</th><th>库型</th><th>类型</th><th>状态</th><th>大小</th><th>耗时</th></tr></thead>
+    <tbody id="rcDetail"><tr><td colspan="8" class="text-muted">加载中…</td></tr></tbody>
+  </table></div>
+</div>
+
+<script>
+  window.loadReportCenter = async function () {
+    const B = window.BKP;
+    const days = parseInt(document.getElementById("rcDays").value) || 7;
+    try {
+      const res = await B.api("GET", "/api/report-center/summary?days=" + days);
+      const d = res.data || {};
+      const esc = B.esc;
+      const b = d.backup || {}, r = d.restore || {}, v = d.verify || {};
+      const mb = (x) => ((x || 0) / 1024 / 1024).toFixed(1) + " MB";
+      const cards = [
+        ["备份总数", b.total ?? 0, "成功 " + (b.success ?? 0) + " / 失败 " + (b.failed ?? 0)],
+        ["备份数据量", mb(b.size_bytes), "平均耗时 " + (b.avg_duration_sec ?? 0) + "s"],
+        ["恢复", r.total ?? 0, "成功 " + (r.success ?? 0) + " / 失败 " + (r.failed ?? 0)],
+        ["恢复校验", (v.success ?? 0) + "/" + (v.total ?? 0), "通过 / 总数"],
+        ["锁定产物", d.locked_records ?? 0, "不可变备份（保留锁定）"],
+      ];
+      document.getElementById("rcCards").innerHTML = cards.map(([t, n, sub]) =>
+        '<div class="col"><div class="page-card p-3"><div class="text-muted small">' + t +
+        '</div><div class="fs-3 fw-bold">' + esc(n) +
+        '</div><div class="text-muted small">' + esc(sub) + '</div></div></div>').join("");
+      const typeNames = window.__dbTypeNames || {};
+      document.getElementById("rcByType").innerHTML = (d.by_db_type || []).length
+        ? d.by_db_type.map((x) => "<tr><td>" + esc(typeNames[x.db_type] || x.db_type) +
+            "</td><td>" + x.total + "</td><td>" + (x.success ?? 0) + "</td><td>" +
+            (x.failed ?? 0) + "</td><td>" + mb(x.size_bytes) + "</td></tr>").join("")
+        : '<tr><td colspan="5" class="text-muted">窗口内无备份记录</td></tr>';
+      document.getElementById("rcTopFail").innerHTML = (d.top_failed_tasks || []).length
+        ? d.top_failed_tasks.map((x) => "<tr><td>" + esc(x.name || ("任务 #" + x.task_id)) +
+            "</td><td>" + x.failed_count + "</td><td class=\"text-muted\">" +
+            esc((x.last_failed_at || "").slice(0, 19)) + "</td></tr>").join("")
+        : '<tr><td colspan="3" class="text-muted">窗口内无失败记录</td></tr>';
+      // 明细走 records API（前 20 条预览；完整明细见导出）
+      try {
+        const recs = await B.api("GET", "/api/records?limit=20");
+        const list = recs.data ? recs.data : recs;
+        document.getElementById("rcDetail").innerHTML = (list || []).length
+          ? list.map((x, i) => "<tr><td>" + (i + 1) + "</td><td class=\"text-muted\">" +
+              esc((x.started_at || "").slice(0, 19)) + "</td><td>" + esc(x.task_name || "-") +
+              "</td><td>" + esc(x.db_type || "-") + "</td><td>" + esc(x.backup_type || "-") +
+              "</td><td>" + B.statusBadge(x.status) + "</td><td>" +
+              esc(x.size_human || "-") + "</td><td>" + esc(x.duration_sec ?? "-") +
+              "</td></tr>").join("")
+          : '<tr><td colspan="8" class="text-muted">无记录</td></tr>';
+      } catch (e) {
+        document.getElementById("rcDetail").innerHTML =
+          '<tr><td colspan="8" class="text-muted">明细加载失败：' + esc(e.message) + '</td></tr>';
+      }
+    } catch (e) { B.toast(e.message, "danger"); }
+  };
+
+  window.exportReport = function (fmt) {
+    const days = parseInt(document.getElementById("rcDays").value) || 7;
+    window.open("/api/report-center/export?fmt=" + fmt + "&days=" + days, "_blank");
+  };
+</script>
+{% endblock %}

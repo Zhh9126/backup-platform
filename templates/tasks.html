@@ -408,6 +408,12 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
                     <span class="input-group-text">KB/s</span>
                   </div>
                   <div class="form-text">0 = 不限速；Linux 部署机需安装 pv 才能生效</div>
+                  <div class="input-group input-group-sm mt-1">
+                    <span class="input-group-text">限速时段</span>
+                    <input type="time" class="form-control" id="t_rate_start" value="09:00">
+                    <input type="time" class="form-control" id="t_rate_end" value="21:00">
+                  </div>
+                  <div class="form-text">该时段内应用限速，时段外全速（支持跨零点，如 22:00-06:00）；留空则全程限速</div>
                 </div>
                 <div class="col-md-4">
                   <label class="form-label">压缩级别</label>

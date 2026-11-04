@@ -10,6 +10,7 @@
 
 参考：pg2mysql (Go) migrator / validator / verifier。
 """
+import copy
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ import threading
 import time
 import traceback
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from core import db, models
@@ -120,6 +122,7 @@ def _task_to_config(task: Dict[str, Any]) -> SyncConfig:
         precheck_sample_rows=int(task.get("precheck_sample_rows") or 20),
         skip_tables=list(task.get("skip_tables") or []),
         exclude_tables=list(task.get("exclude_tables") or []),
+        parallel_tables=max(1, min(8, int(task.get("parallel_tables") or 1))),
     )
     # managed 源：从 backup_tasks 读取连接信息
     if cfg.source_type == "managed" and cfg.source_task_id:
@@ -275,6 +278,27 @@ class SyncEngine:
             }
         if len(tables) == 1:
             return self._run_single_table(tables[0], cfg.target_table or tables[0], progress_callback)
+
+        # 多表：并行度 >1 且 full 模式时并发同步（incremental/realtime 保持
+        # 串行——水位回写共享任务行，并行会产生回写竞态）
+        _workers = max(1, min(8, int(getattr(cfg, "parallel_tables", 1) or 1)))
+        if _workers > 1 and cfg.sync_mode == "full":
+            agg = self._run_tables_parallel(tables, _workers, progress_callback)
+            return {
+                "success": agg["success"],
+                "message": agg["message"],
+                "total_read": agg["total_read"],
+                "total_write": agg["total_write"],
+                "errors": agg["errors"],
+                "duration": agg["duration"],
+                "per_table": [
+                    {k: t.get(k) for k in ("table", "success", "message",
+                                           "total_read", "total_write", "errors")}
+                    for t in agg["tables"]
+                ],
+                "failed_tables": agg["failed_tables"],
+                "parallel": _workers,
+            }
 
         # 多表：逐个同步并聚合结果
         start = datetime.now()
@@ -1014,6 +1038,16 @@ class SyncEngine:
         tables = [t for t in tables if t not in set(cfg.exclude_tables or [])]
         skip = set(cfg.skip_tables or [])
 
+        # 多表并行迁移（对标 KDTS/DTS 迁移并行度）：并行度 >1 且待迁表 >1 时
+        # 走并行通道，结果结构与串行版完全一致
+        _workers = max(1, min(8, int(getattr(cfg, "parallel_tables", 1) or 1)))
+        _run_tables = [t for t in tables if t not in skip]
+        if _workers > 1 and len(_run_tables) > 1:
+            return self._run_tables_parallel(
+                _run_tables, _workers, progress_callback,
+                skipped_tables=[t for t in tables if t in skip],
+                excluded_tables=excluded_tables)
+
         logger.info("全库迁移开始：%d 张表（跳过 %d 张）", len(tables), len(skip))
 
         for idx, table in enumerate(tables):
@@ -1069,6 +1103,95 @@ class SyncEngine:
             "failed_tables": failed_tables,
             "skipped_tables": skipped_tables,
             "excluded_tables": excluded_tables,
+        }
+
+    def _run_tables_parallel(self, tables: List[str], workers: int,
+                             progress_callback=None,
+                             skipped_tables=None,
+                             excluded_tables=None) -> Dict[str, Any]:
+        """多表并行迁移（引擎配置实例隔离重构）。
+
+        为什么不能直接并发调用 _run_single_table：它会把 src/dst 表名写进
+        共享 config（reader/writer 全都读 config），并发改写必然串表。因此
+        每个 worker 拷贝一份 config 并构造独立 SyncEngine（连接互不共享），
+        结果结构与串行版完全一致。
+
+        边界（如实）：
+        - 单表失败如实记录，不阻断其他表（并行下无串行版的 error_threshold
+          中途熔断，错误阈值仍在单表内生效，汇总后统一判定成败）
+        - 增量水位回写（update_sync_task）仅 sync_mode=incremental 触发；
+          并行仅用于 full 迁移/同步，不产生该竞态
+        - 并行度上限 8：更高受目标端写入能力约束，收益趋零
+        """
+        cfg = self.config
+        start = datetime.now()
+        skipped_tables = skipped_tables or []
+        excluded_tables = excluded_tables or []
+        cb_lock = threading.Lock()
+
+        def _cb(payload):
+            if progress_callback is None:
+                return
+            with cb_lock:
+                progress_callback(payload)
+
+        def _worker(table: str) -> Dict[str, Any]:
+            t_cfg = copy.copy(cfg)
+            t_cfg.source_table = table
+            t_cfg.target_table = table
+            t_cfg.full_db_migrate = False
+            t_cfg.source_tables_list = []
+            t_cfg.skip_tables = []
+            eng = SyncEngine(t_cfg)
+            return {"table": table, **eng._run_single_table(table, table, _cb)}
+
+        logger.info("全库迁移（并行）：并行度 %d，共 %d 张表", workers, len(tables))
+        results: List[Dict[str, Any]] = []
+        grand_total_read = grand_total_write = grand_errors = 0
+        failed_tables: List[str] = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [pool.submit(_worker, t) for t in tables]
+            for fut, table in zip(futs, tables):
+                try:
+                    r = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("并行迁移 worker 异常（%s）", table)
+                    r = {"table": table, "success": False,
+                         "message": f"同步失败：{e}", "total_read": 0,
+                         "total_write": 0, "errors": 0, "error_details": []}
+                results.append(r)
+                grand_total_read += r.get("total_read", 0)
+                grand_total_write += r.get("total_write", 0)
+                grand_errors += r.get("errors", 0)
+                if not r.get("success"):
+                    failed_tables.append(r.get("table") or table)
+
+        duration = (datetime.now() - start).total_seconds()
+        # 判定口径与串行版一致：有失败表一律判失败
+        success = (not failed_tables) and bool(
+            grand_errors == 0 or (cfg.error_threshold and grand_errors <= cfg.error_threshold))
+        message = (
+            f"全库迁移（并行度 {workers}）：执行 {len(results)} 张 / 跳过 "
+            f"{len(skipped_tables)} 张（共 {len(tables) + len(skipped_tables)} 张），"
+            f"读取 {grand_total_read} 行，写入 {grand_total_write} 行，错误 {grand_errors} 行"
+        )
+        if failed_tables:
+            message += f"，失败表：{', '.join(failed_tables[:5])}"
+        if excluded_tables:
+            message += f"，排除 {len(excluded_tables)} 张"
+
+        return {
+            "success": success,
+            "message": message,
+            "total_read": grand_total_read,
+            "total_write": grand_total_write,
+            "errors": grand_errors,
+            "duration": duration,
+            "tables": results,
+            "failed_tables": failed_tables,
+            "skipped_tables": skipped_tables,
+            "excluded_tables": excluded_tables,
+            "parallel": workers,
         }
 
     # ---- 约束管理（pg2mysql 核心优化） ----

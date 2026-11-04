@@ -965,6 +965,12 @@
         fillToolPath(task.extra_options, task);
         // 备份产物导出格式回填（extra_options.dump_format）
         if ($("t_dump_format")) $("t_dump_format").value = eo.dump_format || "";
+        // 限速时段回填（extra_options.rate_limit_window）
+        if ($("t_rate_start")) {
+          const rw = eo.rate_limit_window || {};
+          $("t_rate_start").value = rw.start || "";
+          $("t_rate_end").value = rw.end || "";
+        }
         // 自定义脚本回填
         if ($("t_custom_script")) $("t_custom_script").value = eo.custom_script || "";
         if ($("t_custom_restore")) $("t_custom_restore").value = eo.custom_restore_script || "";
@@ -1685,6 +1691,12 @@
       collectProbackup(eo);
       const sshId = val("t_ssh_host");
       if (sshId) eo.ssh_host_id = Number(sshId); else delete eo.ssh_host_id;
+      // 限速时段（仅填写了起止时间才生效；与带宽=0 互斥无意义自动忽略）
+      if ($("t_rate_start") && $("t_rate_end")) {
+        const rs = $("t_rate_start").value, re = $("t_rate_end").value;
+        if (rs && re) eo.rate_limit_window = { start: rs, end: re };
+        else delete eo.rate_limit_window;
+      }
       if (chk("t_encrypt_pool")) eo.encrypt_pool = true; else delete eo.encrypt_pool;
       // 自定义脚本（备份方式 = custom 时必填脚本内容）
       const customMode = val("t_backup_mode") === "custom";
@@ -3702,7 +3714,7 @@
         </td>
       </tr>`;
     }).join("") ||
-      '<tr><td colspan="9" class="text-muted text-center">暂无文件备份任务，点击右上角“新建任务”</td></tr>';
+      '<tr><td colspan="9" class="text-muted text-center">暂无文件备份任务，点击右上角"新建任务"</td></tr>';
     Pager.attach("fileTasks", $("fileTaskTable"), pg.page, pg.pages, pg.total, loadFileTasks);
   }
 
@@ -4122,7 +4134,7 @@
         </td>
       </tr>`;
     }).join("") ||
-      '<tr><td colspan="8" class="text-muted text-center">暂无同步任务，点击右上角“新建同步任务”</td></tr>';
+      '<tr><td colspan="8" class="text-muted text-center">暂无同步任务，点击右上角"新建同步任务"</td></tr>';
     Pager.attach("syncTasks", $("syncTaskTable"), pg.page, pg.pages, pg.total, loadSyncTasks);
   }
 
@@ -4281,7 +4293,7 @@
     const st = ($("restoreStatusFilter")?.value || "");
     let url = kw ? "/api/restores?keyword=" + encodeURIComponent(kw) : "/api/restores";
     const rs0 = await api("GET", url);
-    // 状态筛选（成功/失败）+ 保存到全局，方便“查看日志”按钮快速读取
+    // 状态筛选（成功/失败）+ 保存到全局，方便"查看日志"按钮快速读取
     const rs = st ? rs0.filter((r) => r.status === st) : rs0;
     window.RESTORE_RECORD_ROWS = rs;
     const pg = Pager.slice("restores", rs);
@@ -6472,7 +6484,7 @@
     }
   };
 
-  // 相对时间（“3 分钟前检查”），借鉴 Databasus 的健康检查时间展示
+  // 相对时间（"3 分钟前检查"），借鉴 Databasus 的健康检查时间展示
   const fromNow = (iso) => {
     if (!iso) return "尚未测试";
     const t = new Date(iso.includes("T") ? iso : iso.replace(" ", "T"));
@@ -7587,7 +7599,7 @@
         if (p.error_msg) {
           html += '<div class="alert alert-danger py-2 small">' + esc(p.error_msg) + '</div>';
         }
-        const names = { precheck: "① 预检查", migrate: "② 结构迁移 + 全量迁移", objects: "②.5 迁移对象（视图/序列/注释/例程/触发器）", verify: "③ 数据校验" };
+        const names = { precheck: "① 预检查", migrate: "② 结构迁移 + 全量迁移", objects: "②.5 迁移对象（视图/序列/注释/同义词/程序包/类型/例程/触发器）", verify: "③ 数据校验" };
         ["precheck", "migrate", "objects", "verify"].forEach(function (ph) {
           const d = phases[ph];
           if (!d) return;
@@ -7610,10 +7622,10 @@
               html += '<div class="text-muted">' + esc(d.reason || d.error || '未启用') + '</div>';
             } else {
               html += '<div>' + esc(d.summary || '') + '（同族直通=' + (d.same_family ? '是' : '否') + '，耗时 ' + (d.duration_sec || 0) + 's）</div>';
-              ["views", "sequences", "comments"].forEach(function (sec) {
+              ["views", "sequences", "comments", "synonyms", "packages", "types"].forEach(function (sec) {
                 (d[sec] || []).forEach(function (it) {
-                  html += '<div>' + (it.status === "ok" ? '✅' : (it.status === "skipped" ? '⏭' : '❌')) + ' ' +
-                    esc(sec.replace(/s$/, '')) + ' ' + esc(it.object) +
+                  const st = it.status === "ok" ? '✅' : (it.status === "skipped" ? '⏭' : (it.status === "export" ? '📄' : '❌'));
+                  html += '<div>' + st + ' ' + esc(sec.replace(/s$/, '')) + ' ' + esc(it.object) +
                     (it.error ? '：' + esc(it.error.slice(0, 90)) : '') + '</div>';
                 });
               });
@@ -7621,6 +7633,9 @@
                 html += '<div>✅ 例程 ' + esc(r.object) + '（' + esc(r.kind) + '）</div>';
               });
               (d.routines_export || []).forEach(function (r) {
+                html += '<div>📄 导出待人工适配：' + esc(r.object) + '（' + esc(r.kind) + '）</div>';
+              });
+              (d.objects_export || []).forEach(function (r) {
                 html += '<div>📄 导出待人工适配：' + esc(r.object) + '（' + esc(r.kind) + '）</div>';
               });
             }
@@ -7697,19 +7712,24 @@
       // 迁移对象（表之外）+ 排除表（对标 KDTS）
       const mo = { views: $("dm_o_views").checked, sequences: $("dm_o_sequences").checked,
         comments: $("dm_o_comments").checked, routines: $("dm_o_routines").checked,
-        triggers: $("dm_o_triggers").checked };
+        triggers: $("dm_o_triggers").checked,
+        synonyms: $("dm_o_synonyms") ? $("dm_o_synonyms").checked : false,
+        packages: $("dm_o_packages") ? $("dm_o_packages").checked : false,
+        types: $("dm_o_types") ? $("dm_o_types").checked : false };
       const excl = ($("dm_exclude_tables").value || "").split(",")
         .map((s) => s.trim()).filter(Boolean);
+      const dmParallel = parseInt($("dm_parallel").value) || 1;
       let typeMapping = null;
       try {
-        if (($("dm_type_mapping").value || "").trim())
+        if ($("dm_type_mapping") && ($("dm_type_mapping").value || "").trim())
           typeMapping = JSON.parse($("dm_type_mapping").value);
       } catch (e) { toast("类型映射不是合法 JSON", "warning"); return; }
-      if (Object.values(mo).some(Boolean) || excl.length || typeMapping) {
+      if (Object.values(mo).some(Boolean) || excl.length || typeMapping || dmParallel > 1) {
         payload.extra_options = {};
         if (Object.values(mo).some(Boolean)) payload.extra_options.migrate_objects = mo;
         if (excl.length) payload.extra_options.exclude_tables = excl;
         if (typeMapping) payload.extra_options.type_mapping = typeMapping;
+        if (dmParallel > 1) payload.extra_options.parallel_tables = dmParallel;
       }
       if (!payload.name) { toast("请填写计划名称", "warning"); return; }
       if (!payload.src_host || !payload.src_db_name) { toast("请填写源端主机与数据库", "warning"); return; }

@@ -649,6 +649,8 @@ CREATE TABLE IF NOT EXISTS sync_tasks (
     realtime_enabled   INTEGER DEFAULT 0,        -- 实时同步开关（预留 Flink CDC）
     flink_config       TEXT,                     -- JSON Flink CDC 配置
     realtime_watermark TEXT,                     -- 轮询实时同步持久化水位 JSON {"col":..,"value":..}
+    type_mapping       TEXT,                     -- JSON 自定义源类型→目标类型（对标 KDTS）
+    parallel_tables    INTEGER DEFAULT 1,        -- 多表并行迁移并行度（1=串行，上限 8）
     schedule_type      TEXT DEFAULT 'none',
     cron_expr          TEXT,
     interval_minutes   INTEGER,
@@ -1935,6 +1937,8 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                 ("verify_after_run", "INTEGER DEFAULT 0"),
                 ("precheck_sample_rows", "INTEGER DEFAULT 20"),
                 ("exclude_tables", "TEXT"),   # JSON 排除表清单（对标 KDTS「排除指定表」）
+                ("type_mapping", "TEXT"),     # JSON 自定义类型映射（此前漏列，API 收了存不进）
+                ("parallel_tables", "INTEGER DEFAULT 1"),  # 多表并行迁移并行度
             ]:
                 try:
                     conn.execute(f"ALTER TABLE sync_tasks ADD COLUMN {col} {typedef}")

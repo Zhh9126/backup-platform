@@ -14,6 +14,9 @@
   let selectedSource = null;
   let selectedTarget = null;
   let runningTimer = null;  // 运行态任务的列表自动轮询定时器
+  let detailTaskId = null;  // 详情弹窗当前任务
+  let detailTaskData = null;
+  let detailTimer = null;   // 详情弹窗自动刷新定时器
 
   // 概念区分（业界定义）：迁移=一次性任务（full，跑完即止，支持覆盖写入）；
   // 同步=持续性任务（incremental/realtime，常驻运行保持两端一致）
@@ -100,19 +103,39 @@
     }
     const pg = Pager.slice("syncPage", tasks);
     tbody.innerHTML = pg.list.map(function (t, ti) {
+      // 实时任务运行徽章：进程内 runner 真实状态（rt_running 由后端注入）
+      let statusCell;
+      if (t.sync_mode === "realtime" && t.rt_running) {
+        statusCell = '<span class="badge badge-run">实时运行中</span>';
+      } else {
+        statusCell = statusBadge(t.status === "running" ? "running" : (t.last_status || t.status));
+      }
+      // 摘要：实时任务透出水位与监听状态；普通任务显示执行消息
+      let msgCell = "";
+      if (t.sync_mode === "realtime") {
+        const wm = t.realtime_watermark;
+        const wmTxt = (wm && wm.col) ? ("水位: " + esc(wm.col) + " = " + esc(wm.value)) : "水位: 未建立";
+        msgCell = '<div class="small">' + wmTxt + "</div>" +
+          '<div class="small text-muted">' + esc(t.message || "") + "</div>";
+      } else {
+        msgCell = esc(t.message || "");
+      }
       return `<tr>
         <td>${pg.startNo + ti}</td>
         <td>${esc(t.name)}</td>
         <td>${esc(t.src_db_display || t.src_db_type || "-")} <i class="bi bi-arrow-right"></i> ${esc(t.tgt_db_display || t.tgt_db_type || "-")}</td>
         <td>${esc(t.source_table || "-")} <i class="bi bi-arrow-right"></i> ${esc(t.target_table || "-")}</td>
         <td>${(t.sync_mode === "full") ? "迁移·一次性" : "同步·持续"} / ${esc(t.save_mode || "append")}</td>
-        <td>${statusBadge(t.status === "running" ? "running" : (t.last_status || t.status))}</td>
+        <td>${statusCell}</td>
         <td class="small text-nowrap">${fmtTime(t.created_at) || "-"}</td>
         <td class="small text-nowrap">${fmtTime(t.last_run_at) || "-"}</td>
-        <td>${esc(t.message || "")}</td>
+        <td class="small">${msgCell}</td>
         <td>
           <button class="btn btn-sm btn-primary" onclick="SYNC.editTask(${t.id})">编辑</button>
-          <button class="btn btn-sm btn-success" onclick="SYNC.runTask(${t.id})">运行</button>
+          ${t.sync_mode === "realtime" && t.rt_running
+            ? '<button class="btn btn-sm btn-warning" onclick="SYNC.stopTask(' + t.id + ')">停止</button>'
+            : '<button class="btn btn-sm btn-success" onclick="SYNC.runTask(' + t.id + ')">运行</button>'}
+          <button class="btn btn-sm btn-outline-primary" onclick="SYNC.detailTask(${t.id})">详情</button>
           <button class="btn btn-sm btn-outline-secondary" onclick="SYNC.precheckTask(${t.id})">预检</button>
           <button class="btn btn-sm btn-outline-info" onclick="SYNC.validateTask(${t.id})">校验</button>
           <button class="btn btn-sm btn-danger" onclick="SYNC.deleteTask(${t.id})">删除</button>
@@ -123,7 +146,8 @@
     // 运行态任务自动轮询：实时/长任务的状态与进度需要及时反映（3s）
     clearTimeout(runningTimer);
     if (tasks.some(function (t) {
-      return (t.status || t.last_status) === "running";
+      return (t.status || t.last_status) === "running" ||
+        (t.sync_mode === "realtime" && t.rt_running);
     })) {
       runningTimer = setTimeout(refreshTasks, 3000);
     }
@@ -536,6 +560,14 @@
         toast(res.message, res.success ? "success" : "danger");
         setTimeout(refreshTasks, 500);
       } catch (e) {
+        // run 端点 400 时带 precheck 报告体：弹模态框展示失败明细，
+        // 而不是一句 toast 让用户看不到具体原因（2026-11-04 用户反馈）
+        const d = e.data || {};
+        if (d.precheck) {
+          SYNC.showPrecheckReport(d.precheck, true);
+          refreshTasks();
+          return;
+        }
         toast("启动失败：" + e.message, "danger");
       }
     },
@@ -550,6 +582,7 @@
     },
     showPrecheckReport: function (pc, blocked) {
       const esc = window.esc || function (s) { return s; };
+      $("precheckTitle").textContent = blocked ? "预校验未通过（已阻止执行）" : "预校验报告";
       const icon = {pass: ["✓", "success"], warn: ["⚠", "warning"], fail: ["✗", "danger"]};
       const kind = function (c) {
         if (c.startsWith("column_compat")) return "结构/类型兼容";
@@ -608,21 +641,24 @@
         const res = await api("POST", "/api/sync-tasks/" + id + "/validate", {});
         if (res.success && res.validated) {
           if (res.passed) {
-            toast("Schema 校验通过");
+            SYNC.showResultReport("Schema 结构校验报告",
+              '<div class="alert alert-success py-2">结构校验通过：源/目标列类型兼容</div>');
           } else {
-            let msg = "Schema 校验不通过：\n";
-            if (res.incompatible_columns && res.incompatible_columns.length) {
-              msg += res.incompatible_columns.map(function (c) {
-                return "  " + c.column + ": " + c.reason + "（" + c.src_type + " → " + c.dst_type + "）";
-              }).join("\n");
-            }
-            if (res.incompatible_row_count > 0) {
-              msg += "\n  不兼容行数：" + res.incompatible_row_count;
-            }
-            toast(msg, "warning");
+            let rows = "";
+            (res.incompatible_columns || []).forEach(function (col) {
+              rows += '<tr><td>' + esc(col.column) + "</td><td>" + esc(col.src_type) +
+                "</td><td>" + esc(col.dst_type) + "</td><td>" + esc(col.reason || "") + "</td></tr>";
+            });
+            SYNC.showResultReport("Schema 结构校验报告",
+              '<div class="alert alert-danger py-2">结构校验不通过：不兼容列 ' +
+              (res.incompatible_columns || []).length + " 处，涉及约 " +
+              esc(res.incompatible_row_count || 0) + " 行数据</div>" +
+              '<table class="table table-sm table-bordered"><thead><tr><th>列</th><th>源类型</th><th>目标类型</th><th>原因</th></tr></thead><tbody>' +
+              rows + "</tbody></table>");
           }
         } else {
-          toast(res.message || "校验失败", "danger");
+          SYNC.showResultReport("Schema 结构校验报告",
+            '<div class="alert alert-danger py-2">校验执行失败：' + esc(res.message || "未知错误") + "</div>");
         }
       } catch (e) {
         toast("校验失败：" + e.message, "danger");
@@ -633,16 +669,120 @@
         const res = await api("POST", "/api/sync-tasks/" + id + "/verify", {});
         if (res.success && res.verified) {
           if (res.passed) {
-            toast("数据校验通过：所有源行在目标中均存在");
+            SYNC.showResultReport("数据一致性校验报告",
+              '<div class="alert alert-success py-2">数据校验通过：全部 ' +
+              esc(res.total_source_rows || 0) + " 行源数据在目标端均存在</div>");
           } else {
-            toast("数据校验不通过：" + res.missing_rows + "/" + res.total_source_rows + " 行缺失", "warning");
+            SYNC.showResultReport("数据一致性校验报告",
+              '<div class="alert alert-warning py-2">数据校验不通过：源 ' +
+              esc(res.total_source_rows || 0) + " 行，目标缺失 " +
+              esc(res.missing_rows || 0) + " 行（可能未同步完成或被目标删除）</div>");
           }
         } else {
-          toast(res.message || "校验失败", "danger");
+          SYNC.showResultReport("数据一致性校验报告",
+            '<div class="alert alert-danger py-2">校验执行失败：' + esc(res.message || "未知错误") + "</div>");
         }
       } catch (e) {
         toast("校验失败：" + e.message, "danger");
       }
+    },
+    // 结果报告复用预检模态框展示（替代一闪而过的 toast——用户反馈看不到具体信息）
+    showResultReport: function (title, html) {
+      $("precheckTitle").textContent = title;
+      $("precheckBody").innerHTML = html;
+      new bootstrap.Modal($("precheckModal")).show();
+    },
+    stopTask: async function (id) {
+      if (!confirm("确定停止该实时同步任务？")) return;
+      try {
+        const res = await api("POST", "/api/sync-tasks/" + id + "/stop", {});
+        toast(res.message || "已停止", res.success ? "success" : "danger");
+        refreshTasks();
+      } catch (e) {
+        toast("停止失败：" + e.message, "danger");
+      }
+    },
+    // -------------- 同步详情弹窗（执行记录 / 实时状态 / 水位） --------------
+    detailTask: async function (id) {
+      detailTaskId = id;
+      try {
+        const res = await api("GET", "/api/sync-tasks/" + id);
+        if (!res.success) throw new Error(res.message);
+        detailTaskData = res.data;
+        await SYNC.renderDetail();
+        new bootstrap.Modal($("detailModal")).show();
+        // 实时运行中：5s 自动刷新（水位/行数持续变化）
+        clearInterval(detailTimer);
+        detailTimer = setInterval(function () {
+          const modalEl = $("detailModal");
+          const isOpen = modalEl.classList.contains("show");
+          if (!isOpen) { clearInterval(detailTimer); return; }
+          if (detailTaskData && detailTaskData.rt_running) SYNC.renderDetail();
+        }, 5000);
+      } catch (e) {
+        toast("加载详情失败：" + e.message, "danger");
+      }
+    },
+    refreshDetail: function () {
+      if (detailTaskId) SYNC.detailTask(detailTaskId);
+    },
+    renderDetail: async function () {
+      const t = detailTaskData || {};
+      const esc = window.esc || function (s) { return s; };
+      $("detailTitle").textContent = "同步详情 · " + (t.name || ("#" + t.id));
+      $("detailRtBadge").innerHTML = (t.sync_mode === "realtime")
+        ? (t.rt_running
+          ? '<span class="badge badge-run">实时运行中</span>'
+          : '<span class="badge bg-secondary">实时已停止</span>')
+        : "";
+      // 概要信息
+      const wm = t.realtime_watermark;
+      const wmTxt = (wm && wm.col) ? (esc(wm.col) + " = " + esc(wm.value)) : "未建立";
+      const info = [
+        ["链路", (t.src_db_display || t.src_db_type) + " → " + (t.tgt_db_display || t.tgt_db_type)],
+        ["表", (t.source_table || "-") + " → " + (t.target_table || "-")],
+        ["模式", (t.sync_mode === "full" ? "迁移·一次性" : (t.sync_mode === "realtime" ? "同步·实时 CDC" : "同步·周期增量")) + " / " + (t.save_mode || "append")],
+        ["状态", t.rt_running ? "实时运行中" : (t.last_status || t.status || "-")],
+        ["最近运行", fmtTime(t.last_run_at) || "-"],
+        ["增量/实时水位", t.sync_mode === "realtime" ? wmTxt : (t.incremental_column || "-")],
+        ["启用", t.enabled ? "是" : "否"],
+      ];
+      let html = '<table class="table table-sm table-bordered mb-3" style="max-width:720px"><tbody>';
+      info.forEach(function (kv) {
+        html += '<tr><th style="width:140px" class="text-muted">' + kv[0] + "</th><td>" + kv[1] + "</td></tr>";
+      });
+      html += "</tbody></table>";
+      // 最近执行记录
+      let recs = [];
+      try {
+        const rr = await api("GET", "/api/sync-tasks/" + t.id + "/records?limit=50");
+        recs = rr.data || [];
+      } catch (e) { /* 记录加载失败不阻断 */ }
+      recs = recs.slice(0, 50);
+      html += '<div class="card-section-title"><i class="bi bi-list-check"></i> 最近执行记录（' + recs.length + ' 条）</div>';
+      if (recs.length) {
+        html += '<div class="table-responsive"><table class="table table-sm table-hover align-middle mb-0"><thead><tr>' +
+          "<th>#</th><th>开始时间</th><th>结束时间</th><th>状态</th><th>读取</th><th>写入</th><th>失败行</th><th>水位</th><th>说明</th>" +
+          "</tr></thead><tbody>";
+        recs.forEach(function (r, i) {
+          html += "<tr><td>" + (i + 1) + "</td>" +
+            '<td class="small text-nowrap">' + fmtTime(r.started_at) + "</td>" +
+            '<td class="small text-nowrap">' + fmtTime(r.finished_at) + "</td>" +
+            "<td>" + statusBadge(r.status) + "</td>" +
+            "<td>" + (r.read_rows != null ? r.read_rows : "-") + "</td>" +
+            "<td>" + (r.rows_synced != null ? r.rows_synced : "-") + "</td>" +
+            '<td class="' + ((r.error_rows || 0) > 0 ? "text-danger fw-bold" : "") + '">' + (r.error_rows || 0) + "</td>" +
+            '<td class="small">' + esc(r.watermark || "-") + "</td>" +
+            '<td class="small text-muted text-truncate" style="max-width:260px" title="' +
+            esc(r.message || "") + '">' + esc(r.message || "-") + "</td></tr>";
+        });
+        html += "</tbody></table></div>";
+      } else {
+        html += '<div class="text-muted small py-3">暂无执行记录（点击「运行」后产生）</div>';
+      }
+      $("detailBody").innerHTML = html;
+      $("detailAutoNote").textContent = (t.sync_mode === "realtime" && t.rt_running)
+        ? "实时任务运行中，每 5 秒自动刷新" : "";
     },
     flinkConfig: async function (id) {
       try {

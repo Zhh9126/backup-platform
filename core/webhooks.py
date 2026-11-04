@@ -37,7 +37,18 @@ def _urls_and_secret() -> tuple:
 
 
 def emit(event: str, data: dict) -> int:
-    """同步推送（内部用），返回成功送达的端点数。"""
+    """同步推送（内部用），返回成功送达的端点数。
+
+    SNMP 通道（P2）：启用后所有事件同步发 trap 到网管平台
+    （fire-and-forget，不阻塞不重试——webhook 才是带重试的主通道）。
+    """
+    try:
+        from core import snmp_trap
+        snmp_trap.notify_event(
+            f"[{event}] {str(data.get('message') or data)[:300]}",
+            str(data.get("severity") or ("critical" if "fail" in event else "warning")))
+    except Exception:  # noqa: BLE001
+        pass  # SNMP 告警失败不影响 webhook 主链路
     urls, secret = _urls_and_secret()
     if not urls:
         return 0

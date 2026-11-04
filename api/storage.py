@@ -30,6 +30,21 @@ _FORBIDDEN_ROOTS = {
 }
 _MAX_STAT_ENTRIES = 20000  # 目录用量统计上限（防超大目录拖慢接口）
 
+# D3 存储池类型抽象（对标 DSG/鼎甲存储池体系）：local=本地/标准池、
+# dedup=重删池、synthetic=合成池（合成全量/黄金副本）、archive=归档冷池。
+POOL_KINDS = {
+    "local": "标准池",
+    "dedup": "重删池",
+    "synthetic": "合成池",
+    "archive": "归档冷池",
+}
+
+
+def _norm_pool_kind(v):
+    """池类型归一：非法值回退 local。"""
+    k = (v or "local").lower()
+    return k if k in POOL_KINDS else "local"
+
 
 def _dir_usage(path: str) -> dict:
     """统计目录内文件总量（超过上限则标记为近似值）。"""
@@ -171,6 +186,14 @@ def _row_to_dict(row) -> dict:
     type_info = TYPE_META.get(d.get("type"), {})
     d["display_name"] = type_info.get("name", d["type"])
     d["tier_name"] = TIER_NAMES.get(d.get("tier", 1), f"L{d.get('tier', 1)}")
+    if d.get("pool_policy"):
+        try:
+            d["pool_policy"] = json.loads(d["pool_policy"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if not d.get("pool_kind"):
+        d["pool_kind"] = "local"
+    d["pool_kind_name"] = POOL_KINDS.get(d["pool_kind"], "标准池")
     return d
 
 
@@ -249,8 +272,9 @@ def api_create_target():
 
     target_id = db.execute("""
         INSERT INTO storage_targets (name, type, tier, endpoint, access_key, secret_key,
-            bucket, region, prefix, enabled, is_default, extra_options, remark, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            bucket, region, prefix, enabled, is_default, extra_options, remark, created_at, updated_at,
+            pool_kind, pool_policy)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         data["name"], stype, data.get("tier", TYPE_META[stype]["tier"]),
         data.get("endpoint", ""), data.get("access_key", ""),
@@ -259,6 +283,9 @@ def api_create_target():
         1 if data.get("enabled") else 0,
         1 if data.get("is_default") else 0,
         extra_opts, data.get("remark", ""), now, now,
+        _norm_pool_kind(data.get("pool_kind")),
+        json.dumps(data["pool_policy"], ensure_ascii=False)
+        if isinstance(data.get("pool_policy"), dict) else (data.get("pool_policy") or ""),
     ))
 
     db.add_log("info", "storage", f"创建存储目标: {data['name']} ({stype})")
@@ -277,14 +304,19 @@ def api_update_target(target_id):
 
     allowed = [
         "name", "type", "tier", "endpoint", "access_key", "bucket",
-        "region", "prefix", "enabled", "is_default", "remark",
+        "region", "prefix", "enabled", "is_default", "remark", "pool_kind",
     ]
     sets = []
     params = []
     for f in allowed:
         if f in data:
             sets.append(f"{f}=?")
-            params.append(data[f])
+            params.append(_norm_pool_kind(data[f]) if f == "pool_kind" else data[f])
+
+    if "pool_policy" in data:
+        pol = data["pool_policy"]
+        sets.append("pool_policy=?")
+        params.append(json.dumps(pol, ensure_ascii=False) if isinstance(pol, dict) else (pol or ""))
 
     if "secret_key" in data and data["secret_key"]:
         sets.append("secret_key=?")

@@ -285,6 +285,213 @@ def _sample_sql(db_type: str, ref: str, order_col: str, n: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 结构/元数据校验（对标银行校验体系三「库表结构与元数据校验」、DTS 结构校验）：
+# 列名集合、列序、类型（同族归一）、可空、主键——恢复后结构偏差会直接导致
+# 业务报错，是数据比对的前置核验环节。
+# ---------------------------------------------------------------------------
+_TYPE_FAMILIES = (
+    # (家族, 匹配正则)——跨库型同义类型归一（oracle number ↔ mysql decimal 等）
+    ("int", r"^(tinyint|smallint|mediumint|int|integer|bigint|binary_integer|pls_integer)"),
+    ("decimal", r"^(decimal|numeric|number)"),
+    ("float", r"^(float|double|real|binary_double|binary_float)"),
+    ("varchar", r"^(varchar|varchar2|nvarchar|character varying|varying character|text|clob|longtext|mediumtext|tinytext|nclob)"),
+    ("char", r"^(char|nchar|character)"),
+    ("datetime", r"^(datetime|timestamp|date|time)"),
+    ("blob", r"^(blob|bytea|raw|long raw|image|varbinary|binary)"),
+    ("bool", r"^(boolean|bool|bit)"),
+)
+
+
+def _type_family(t: str) -> str:
+    t = (t or "").lower().strip()
+    for fam, pat in _TYPE_FAMILIES:
+        if re.match(pat, t):
+            return fam
+    return t.split("(")[0] or "unknown"
+
+
+def _fetch_column_meta(conn, db_type: str, database: str, schema: str,
+                       table: str) -> list:
+    """取列元数据 [(name, type, nullable, is_pk)]。异构库型各自 information_schema。"""
+    db_type = (db_type or "").lower()
+    cur = conn.cursor()
+    try:
+        if db_type in ("mysql", "mariadb"):
+            cur.execute(
+                "SELECT column_name, column_type, CASE WHEN is_nullable='NO' "
+                "THEN 1 ELSE 0 END, IFNULL(CASE WHEN column_key='PRI' THEN 1 "
+                "ELSE 0 END,0) FROM information_schema.columns "
+                "WHERE table_schema=%s AND table_name=%s ORDER BY ordinal_position",
+                (database, table))
+            return [(str(r[0]), str(r[1]), int(r[2]), int(r[3]))
+                    for r in cur.fetchall()]
+        elif db_type in ("postgresql", "kingbase", "opengauss", "panwei",
+                         "highgo", "uxdb"):
+            cur.execute(
+                "SELECT column_name, CASE WHEN character_maximum_length IS NOT NULL "
+                "AND data_type LIKE 'character%' THEN data_type||'('||"
+                "character_maximum_length||')' ELSE data_type END, "
+                "CASE WHEN is_nullable='NO' THEN 1 ELSE 0 END, 0 "
+                "FROM information_schema.columns "
+                "WHERE table_schema=%s AND table_name=%s ORDER BY ordinal_position",
+                (schema or "public", table))
+            rows = [list(r) for r in cur.fetchall()]
+            cur.execute(
+                "SELECT a.attname FROM pg_index i "
+                "JOIN pg_attribute a ON a.attrelid=i.indrelid "
+                "AND a.attnum=ANY(i.indkey) "
+                "WHERE i.indrelid=%s::regclass AND i.indisprimary",
+                (f"{schema or 'public'}.{table}",))
+            pks = {str(r[0]).lower() for r in cur.fetchall()}
+            for r in rows:
+                if str(r[0]).lower() in pks:
+                    r[3] = 1
+            return [(str(r[0]), str(r[1]), int(r[2]), int(r[3])) for r in rows]
+        elif db_type in ("oracle", "dameng"):
+            owner = (schema or _user_of(conn) or "").upper()
+            cur.execute(
+                "SELECT column_name, data_type || CASE WHEN data_precision IS NOT NULL "
+                "AND data_type IN ('NUMBER','DECIMAL','NUMERIC') THEN '('||"
+                "data_precision||CASE WHEN data_scale>0 THEN ','||data_scale ELSE '' END||')' "
+                "WHEN char_length>0 AND data_type LIKE '%CHAR%' THEN '('||char_length||')' "
+                "ELSE '' END, CASE WHEN nullable='N' THEN 1 ELSE 0 END, 0 "
+                "FROM all_tab_columns "
+                f"WHERE owner = '{_lit_ident(db_type, owner)}' "
+                f"AND table_name = '{_lit_ident(db_type, table)}' "
+                "ORDER BY column_id")
+            rows = [list(r) for r in cur.fetchall()]
+            cur.execute(
+                "SELECT cols.column_name FROM all_constraints c "
+                "JOIN all_cons_columns cols ON c.owner=cols.owner "
+                "AND c.constraint_name=cols.constraint_name "
+                f"WHERE c.owner = '{_lit_ident(db_type, owner)}' "
+                f"AND c.table_name = '{_lit_ident(db_type, table)}' "
+                "AND c.constraint_type='P'")
+            pks = {str(r[0]).lower() for r in cur.fetchall()}
+            for r in rows:
+                if str(r[0]).lower() in pks:
+                    r[3] = 1
+            return [(str(r[0]), str(r[1]), int(r[2]), int(r[3])) for r in rows]
+        else:
+            return []
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+
+
+def _schema_compare(src, dst, src_type: str, dst_type: str, task: dict,
+                    table: str, dst_table: str) -> dict:
+    """双侧列元数据比对。返回 {schema_match, schema_diffs: [..]}（空元数据=unknown）。"""
+    src_db = task.get("source_database") or ""
+    src_schema = task.get("source_schema") or ""
+    dst_db = task.get("target_database") or ""
+    dst_schema = task.get("target_schema") or ""
+    try:
+        cs = _fetch_column_meta(src, src_type, src_db, src_schema, table)
+        cd = _fetch_column_meta(dst, dst_type, dst_db, dst_schema, dst_table)
+    except Exception as e:
+        return {"schema_match": None, "schema_diffs": [],
+                "schema_note": "结构元数据获取失败（不影响数据比对）: %s" % str(e)[:100]}
+    if not cs or not cd:
+        return {"schema_match": None, "schema_diffs": [],
+                "schema_note": "结构元数据不可得（该库型不支持元数据探测）"}
+    diffs = []
+    names_s = [c[0].lower() for c in cs]
+    names_d = [c[0].lower() for c in cd]
+    for c in cs:
+        if c[0].lower() not in names_d:
+            diffs.append("目标侧缺少列 %s" % c[0])
+    for c in cd:
+        if c[0].lower() not in names_s:
+            diffs.append("目标侧多出列 %s" % c[0])
+    dmap = {c[0].lower(): c for c in cd}
+    for c in cs:
+        d = dmap.get(c[0].lower())
+        if not d:
+            continue
+        if _type_family(c[1]) != _type_family(d[1]):
+            diffs.append("列 %s 类型不一致: %s vs %s" % (c[0], c[1], d[1]))
+        if bool(c[2]) != bool(d[2]):
+            diffs.append("列 %s 可空性不一致: %s vs %s"
+                         % (c[0], "NOT NULL" if c[2] else "NULL",
+                            "NOT NULL" if d[2] else "NULL"))
+        if bool(c[3]) != bool(d[3]):
+            diffs.append("列 %s 主键属性不一致: %s"
+                         % (c[0], "仅源侧为主键" if c[3] else "仅目标侧为主键"))
+    return {"schema_match": not diffs, "schema_diffs": diffs[:20],
+            "schema_note": "结构比对：%d 列（类型按同族归一）" % len(cs)}
+
+
+# ---------------------------------------------------------------------------
+# 随机抽样核验（对标银行校验体系四「数据行数与字段抽样核验」：总量统计 +
+# 随机抽样，按 PK 定位双侧行逐字段比对——避免固定头部样本只覆盖老数据，
+# 也避免两侧行序错位造成的假差异）。
+# ---------------------------------------------------------------------------
+def _random_sample_sql(db_type: str, ref: str, n: int) -> str:
+    db_type = (db_type or "").lower()
+    if db_type == "oracle":
+        # 11g 兼容：dbms_random.value 排序 + ROWNUM（无 TABLESAMPLE）
+        return ("SELECT * FROM (SELECT * FROM {r} ORDER BY dbms_random.value) "
+                "WHERE ROWNUM <= {n}").format(r=ref, n=int(n))
+    if db_type in ("postgresql", "kingbase", "opengauss", "panwei",
+                   "highgo", "uxdb"):
+        return "SELECT * FROM {r} ORDER BY random() LIMIT {n}".format(r=ref, n=int(n))
+    # MySQL/MariaDB/TiDB/OceanBase(MySQL 租户)
+    return "SELECT * FROM {r} ORDER BY RAND() LIMIT {n}".format(r=ref, n=int(n))
+
+
+def _random_sample_compare(src, dst, src_type: str, dst_type: str,
+                           ref_s: str, ref_d: str, pk: str,
+                           sample_n: int, out: dict, dst_table: str = None):
+    """源侧随机抽 N 行 → 按 PK 到目标侧精确定位 → 逐行比对。
+    差异语义：missing（目标缺行）/ changed（字段值不一致）。"""
+    cur_s = src.cursor()
+    cur_d = dst.cursor()
+    try:
+        cur_s.execute(_random_sample_sql(src_type, ref_s, sample_n))
+        cols_s = [d[0] for d in (cur_s.description or [])]
+        rows_s = cur_s.fetchall()
+        pk_idx = next((i for i, c in enumerate(cols_s)
+                       if c.lower() == pk.lower()), 0)
+        out["sample_mode"] = "random_pk"
+        missing, changed = [], []
+        for r in rows_s:
+            pkv = r[pk_idx]
+            lit = _sql_lit(pkv)
+            q = f"SELECT * FROM {ref_d} WHERE {_qident(dst_type, pk)} = {lit}"
+            cur_d.execute(q)
+            row_d = cur_d.fetchone()
+            if row_d is None:
+                missing.append({pk: str(pkv)})
+            else:
+                rd = _norm_row(row_d)
+                rs = _norm_row(r)
+                if rd != rs:
+                    diff = {pk: str(pkv)}
+                    for i, cn in enumerate(cols_s):
+                        if i < len(rs) and i < len(rd) and rs[i] != rd[i]:
+                            diff[cn] = "%s -> %s" % (rs[i], rd[i])
+                    changed.append(diff)
+            if len(missing) + len(changed) >= 20:
+                break
+        out["sample_diff_count"] = len(missing) + len(changed)
+        out["sample_diffs"] = ([{"diff": "missing", **m} for m in missing]
+                               + [{"diff": "changed", **c} for c in changed])[:20]
+        out["sampled_rows"] = len(rows_s)
+    finally:
+        try:
+            cur_s.close()
+        except Exception:
+            pass
+        try:
+            cur_d.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # 行值归一化与比对
 # ---------------------------------------------------------------------------
 def _norm_val(v) -> str:
@@ -511,6 +718,13 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
     dst_table = target_table or table
     sample_n = int(task.get("sample_rows") or 100)
     enable_checksum = bool(task.get("enable_checksum"))
+    # 分层校验级别（对标银行校验体系六「分层校验流程」）：
+    #   quick=行数+结构（秒级粗检）；standard=行数+结构+校验和+随机抽样（默认）；
+    #   deep=行数+结构+主键全量归并（行级精确）。旧字段（enable_checksum/
+    #   force_pk_compare）向下兼容：级别缺省时按旧字段行为。
+    level = (task.get("compare_level") or "").lower() or ""
+    if level not in ("quick", "standard", "deep"):
+        level = ""
 
     out = {
         "table": table,
@@ -537,18 +751,39 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
         out["target_rows"] = int(cur_d.fetchone()[0])
         out["rows_match"] = out["source_rows"] == out["target_rows"]
 
+        # 结构/元数据比对（每级别都做：information_schema 查询开销秒级）
+        pk = _get_pk_column(src, src_type, src_db, src_schema, table)
+        sch = _schema_compare(src, dst, src_type, dst_type, task,
+                              table, dst_table)
+        out.update(sch)
+        if sch.get("schema_match") is False:
+            out["status"] = "mismatch"
+            out["message"] = ("结构不一致（%s）；%s"
+                              % ("; ".join(sch.get("schema_diffs")[:3]),
+                                 sch.get("schema_note") or ""))
+            return out
+
         # 行数不一致不短路——继续主键归并/抽样定位具体差异行
         # （对标 DTS：行数差异只是表象，用户需要知道缺了哪些行、
         #   哪些行被改过，才能直接生成修复清单）
         row_pre = (f"行数不一致({out['source_rows']}≠{out['target_rows']})；"
                    if not out["rows_match"] else "")
 
+        # quick：行数+结构即止（秒级粗检，不逐行）
+        if level == "quick":
+            out["mode"] = "quick"
+            out["status"] = "match" if out["rows_match"] else "mismatch"
+            out["message"] = (row_pre + "quick 级：行数+结构一致"
+                              if out["rows_match"]
+                              else row_pre + "quick 级：行数不一致")
+            return out
+
         # ---- 分块对比（对标 pt-table-checksum）：大表或有主键时走
         #      keyset 归并，精确输出差异行（missing/extra/changed）；
-        #      行数少且无主键时退回抽样比对。
-        pk = _get_pk_column(src, src_type, src_db, src_schema, table)
+        #      行数少且无主键时退回抽样比对。deep 级强制走归并。
         threshold = int(task.get("chunk_threshold") or 20000)
-        if pk and (out["source_rows"] > threshold
+        if pk and (level == "deep"
+                   or out["source_rows"] > threshold
                    or str(task.get("force_pk_compare") or "") == "1"
                    or not out["rows_match"]):
             cols_s = _get_columns(src, src_type, src_db, src_schema, table)
@@ -597,12 +832,30 @@ def _compare_table(src, dst, src_type: str, dst_type: str, task: dict,
                 out["message"] = row_pre + "全表校验和不一致"
                 return out
 
-        # 抽样比对
+        # 抽样比对：有单列主键时优先随机抽样 + PK 定位（对标银行校验体系四
+        # 「随机抽取样本逐条比对」，且避免两侧行序错位造成假差异）；
+        # 无主键表回退顺序抽样（如实标注 sample_mode=head）。
+        if pk and sample_n > 0:
+            try:
+                _random_sample_compare(src, dst, src_type, dst_type,
+                                       ref_s, ref_d, pk, sample_n, out,
+                                       dst_table=dst_table)
+                if out.get("sample_diff_count"):
+                    out["status"] = "mismatch"
+                    out["message"] = (row_pre + "随机抽样发现 %d 处差异（抽样 %d 行）"
+                                      % (out["sample_diff_count"],
+                                         out.get("sampled_rows") or 0))
+                    return out
+            except Exception as e:
+                # 随机抽样失败（如排序内存限制）回退顺序抽样，如实记录
+                out["sample_mode"] = "random_fallback_head"
+                out["sample_note"] = "随机抽样失败回退顺序抽样: %s" % str(e)[:100]
         order_col = None
         cols = _get_columns(src, src_type, src_db, src_schema, table)
         if cols:
             order_col = cols[0]
-        if order_col and sample_n > 0:
+        if order_col and sample_n > 0 and out.get("sample_mode") != "random_pk":
+            out.setdefault("sample_mode", "head")
             cur_s.execute(_sample_sql(src_type, ref_s, order_col, sample_n))
             rows_s = [_norm_row(r) for r in cur_s.fetchall()]
             cur_d.execute(_sample_sql(dst_type, ref_d, order_col, sample_n))

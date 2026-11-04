@@ -219,6 +219,14 @@ def stop_task(task_id):
     if not is_running(task_id):
         return jsonify({"success": False, "message": "实时同步未在运行"}), 400
     res = stop_runner(task_id)
+    # 标记 stopped：区别于异常/重启中断（running），手动停止的任务
+    # 在服务重启后不会被自动恢复（2026-11-04 实时自启恢复机制）
+    models.update_sync_task(task_id, {
+        "status": "stopped",
+        "last_status": "stopped",
+        "message": "实时同步已手动停止（点击运行重新启动）",
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    })
     return jsonify({"success": True, "data": res, "message": res.get("message", "已停止")})
 
 

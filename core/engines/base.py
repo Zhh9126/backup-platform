@@ -214,6 +214,7 @@ class BackupMode(str, enum.Enum):
     """备份模式：物理备份（raw files）vs 逻辑备份（SQL dump）。"""
     LOGICAL = "logical"    # mysqldump / pg_dump / expdp / dexp
     PHYSICAL = "physical"  # XtraBackup / pg_basebackup / RMAN / dmrman
+    HOT_COPY = "hot_copy"  # Oracle 非归档应急热备（begin/end backup 文件拷贝）
 
 
 class BackupStatus(str, enum.Enum):
@@ -288,6 +289,8 @@ class BackupEngine:
         raw = self.task.get("backup_mode") or ""
         if raw.lower() == "physical":
             return BackupMode.PHYSICAL
+        if raw.lower() == "hot_copy":
+            return BackupMode.HOT_COPY
         return BackupMode.LOGICAL  # 默认逻辑备份（兼容旧数据）
 
     @property

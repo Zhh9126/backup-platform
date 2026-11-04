@@ -106,5 +106,9 @@
     const days = parseInt(document.getElementById("rcDays").value) || 7;
     window.open("/api/report-center/export?fmt=" + fmt + "&days=" + days, "_blank");
   };
+
+  document.getElementById("rcDays").addEventListener("change", loadReportCenter);
+  // 页面打开即加载（此前只定义未调用，首次进入停留在“加载中…”）
+  loadReportCenter();
 </script>
 {% endblock %}

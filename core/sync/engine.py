@@ -685,13 +685,18 @@ class SyncEngine:
 
     @staticmethod
     def _load_persisted_watermark(task_id) -> Optional[dict]:
-        """读取持久化水位（sync_tasks.realtime_watermark，JSON）。"""
+        """读取持久化水位（sync_tasks.realtime_watermark，JSON）。
+
+        注意：_decorate_sync 会把该列解析为 dict（前端展示用），
+        这里必须同时容忍 dict 与 str 两种形态——json.loads(dict)
+        会 TypeError 导致水位永远读不到、实时任务每次都重做全量快照。
+        """
         try:
             row = models.get_sync_task(task_id, include_secret=True)
             raw = (row or {}).get("realtime_watermark")
             if not raw:
                 return None
-            data = json.loads(raw)
+            data = raw if isinstance(raw, dict) else json.loads(raw)
             if isinstance(data, dict) and data.get("col") \
                     and data.get("value") is not None:
                 return data

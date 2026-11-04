@@ -11,8 +11,10 @@
   </div>
 
   <div class="alert alert-info py-2 small">
-    平台内置三档角色：<b>admin</b>（全部权限）/ <b>operator</b>（备份·恢复·同步·克隆·对比·部署，不含系统设置与用户管理）/
-    <b>viewer</b>（只读）。可勾选附加权限（permissions）。删除内置 admin 或最后一个启用的 admin 会被拒绝。
+    角色体系：<b>admin</b>（全部权限·三员合一）/ <b>sys_admin</b>（系统管理员：业务运维全权，不能管用户与安全配置）/
+    <b>sec_admin</b>（安全保密管理员：用户管理·系统设置·安全配置）/ <b>audit_admin</b>（审计管理员：全站只读+日志审计）/
+    <b>operator</b>（备份·恢复·同步·克隆·对比·部署）/ <b>viewer</b>（只读）。三员分立满足政企三权分立要求。
+    可勾选附加权限（permissions）。删除内置 admin 或最后一个启用的 admin 会被拒绝。
     首次部署时 admin 用户来自 <code>config.WEB_USERNAME/WEB_PASSWORD</code>，登录后会强制改密（must_change_password=1）。
   </div>
 
@@ -59,7 +61,10 @@
             <select class="form-select" id="f_role">
               <option value="viewer">viewer（只读）</option>
               <option value="operator">operator（备份/恢复/同步/克隆）</option>
-              <option value="admin">admin（全部权限）</option>
+              <option value="sys_admin">sys_admin（系统管理员·三员）</option>
+              <option value="sec_admin">sec_admin（安全保密管理员·三员）</option>
+              <option value="audit_admin">audit_admin（审计管理员·三员）</option>
+              <option value="admin">admin（全部权限·三员合一）</option>
             </select></div>
           <div class="col-md-2"><label class="form-check-label mt-4">
             <input type="checkbox" class="form-check-input" id="f_enabled" checked> 启用</label></div>
@@ -115,9 +120,12 @@
       const tr=document.createElement("tr");
       const status=u.enabled?'<span class="badge bg-success">启用</span>':'<span class="badge bg-warning text-dark">停用</span>';
       const roleBadge={
-        admin:'<span class="badge bg-danger">admin</span>',
+        admin:'<span class="badge bg-danger">admin（三员合一）</span>',
         operator:'<span class="badge bg-warning text-dark">operator</span>',
         viewer:'<span class="badge bg-info text-dark">viewer</span>',
+        sys_admin:'<span class="badge bg-primary">sys_admin（系统管理员）</span>',
+        sec_admin:'<span class="badge bg-success">sec_admin（安全保密）</span>',
+        audit_admin:'<span class="badge bg-dark">audit_admin（审计）</span>',
       }[u.role]||`<span class="badge bg-secondary">${u.role}</span>`;
       const must=u.must_change_password?'<i class="bi bi-key text-warning ms-1" title="登录后须改密"></i>':"";
       tr.innerHTML=`

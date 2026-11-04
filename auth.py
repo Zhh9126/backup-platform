@@ -19,6 +19,30 @@ def _extract_bearer_token() -> str:
     return (request.headers.get("X-API-Token") or "").strip()
 
 
+def _valid_ak_signature() -> bool:
+    """AccessKey HMAC 签名认证（P2，对标鼎甲 E7）。
+
+    头：X-AK-Access-Key / X-AK-Timestamp / X-AK-Signature
+    签名=hex(HMAC_SHA256(SK, METHOD+"\n"+path+"\n"+ts))，±300s 防重放。
+    """
+    ak = (request.headers.get("X-AK-Access-Key") or "").strip()
+    if not ak:
+        return False
+    ts = (request.headers.get("X-AK-Timestamp") or "").strip()
+    sign = (request.headers.get("X-AK-Signature") or "").strip()
+    try:
+        from core import access_key
+        ok, err = access_key.verify_signature(ak, ts, sign, request.method, request.path)
+        if ok:
+            g.ak_auth = {"access_key": ak}
+            return True
+        import logging
+        logging.getLogger("aidbm.auth").info("AccessKey 验签失败: %s", err)
+    except Exception:
+        pass
+    return False
+
+
 def _valid_api_token(token: str) -> bool:
     if not token:
         return False
@@ -51,7 +75,7 @@ def login_required(f):
         if session.get("user"):
             return f(*args, **kwargs)
         # 外部系统调用：Bearer Token / X-API-Token 认证
-        if _valid_api_token(_extract_bearer_token()):
+        if _valid_api_token(_extract_bearer_token()) or _valid_ak_signature():
             return f(*args, **kwargs)
         if request.path.startswith("/api/"):
             return jsonify({"error": "未登录"}), 401

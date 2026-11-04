@@ -283,8 +283,8 @@
 
       <div class="row g-3 mt-1">
         <div class="col-md-6">
-          <label class="form-label">导出列（可多选）</label>
-          <select class="form-select" id="dmColumns" multiple size="6"></select>
+          <label class="form-label">导出列（可多选，点击卡片勾选）</label>
+          <div id="dmColumnsBox" class="dm-col-box"></div>
           <div class="d-flex gap-2 mt-2">
             <button class="btn btn-outline-secondary btn-sm" type="button" id="dmAddColumn">+ 添加自定义列</button>
             <button class="btn btn-outline-secondary btn-sm" type="button" id="dmSelectAll">全选</button>
@@ -350,6 +350,51 @@
     </div>
   </div>
 </div>
+
+<style>
+  /* 导出列复选卡片（2026-11-04 替换丑的多选下拉框） */
+  .dm-col-box {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 12px;
+    border: 1px solid var(--border, #e2e8f0);
+    border-radius: 10px;
+    min-height: 74px;
+    max-height: 190px;
+    overflow-y: auto;
+    background: var(--card-bg, #fff);
+  }
+  .dm-col-box:empty::after {
+    content: "选择来源记录后自动带入推荐列";
+    color: var(--muted, #94a3b8);
+    font-size: .85rem;
+    align-self: center;
+  }
+  .dm-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 14px;
+    border: 1px solid var(--border, #cbd5e1);
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: .875rem;
+    color: var(--text, #334155);
+    background: var(--card-bg, #fff);
+    user-select: none;
+    transition: background .15s, border-color .15s, color .15s, box-shadow .15s;
+  }
+  .dm-chip:hover { border-color: var(--primary, #0d9488); }
+  .dm-chip input { accent-color: var(--primary, #0d9488); margin: 0; cursor: pointer; }
+  .dm-chip.on {
+    background: rgba(13, 148, 136, .08);
+    border-color: var(--primary, #0d9488);
+    color: var(--primary, #0f766e);
+    font-weight: 500;
+    box-shadow: 0 1px 3px rgba(13, 148, 136, .15);
+  }
+</style>
 {% endblock %}
 
 {% block scripts %}

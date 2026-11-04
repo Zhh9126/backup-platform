@@ -451,6 +451,34 @@ CREATE TABLE IF NOT EXISTS restore_test_reports (
     finished_at  TEXT
 );
 
+CREATE TABLE IF NOT EXISTS db_monitor_metrics (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    db_type         TEXT NOT NULL DEFAULT 'mysql',
+    host            TEXT NOT NULL DEFAULT '127.0.0.1',
+    port            INTEGER DEFAULT 0,
+    db_name         TEXT DEFAULT '',
+    username        TEXT DEFAULT '',
+    password_enc    TEXT DEFAULT '',                    -- 加密存储
+    sql_text        TEXT NOT NULL,                      -- 自定义监控 SQL（第一行第一列为指标值）
+    interval_min    INTEGER DEFAULT 5,                  -- 采集间隔（分钟）
+    unit            TEXT DEFAULT '',                    -- 单位（连接数/QPS/MB...）
+    enabled         INTEGER DEFAULT 1,
+    last_run_at     TEXT,
+    last_value      TEXT,
+    last_error      TEXT,
+    created_at      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS db_monitor_points (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    metric_id       INTEGER NOT NULL,
+    ts              TEXT NOT NULL,
+    value_num       REAL,                               -- 数值（可画折线）
+    value_text      TEXT                                -- 非数值指标原文
+);
+CREATE INDEX IF NOT EXISTS idx_dm_points ON db_monitor_points(metric_id, id);
+
 CREATE TABLE IF NOT EXISTS data_compare_tasks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     name            TEXT NOT NULL,
@@ -470,6 +498,7 @@ CREATE TABLE IF NOT EXISTS data_compare_tasks (
     target_schema   TEXT,
     tables          TEXT DEFAULT '[]',                    -- JSON 数组；空 = 两端交集
     enable_checksum INTEGER DEFAULT 0,                    -- 全表校验和（大表慎用）
+    compare_level   TEXT DEFAULT 'standard',              -- quick | standard | deep（分层校验）
     sample_rows     INTEGER DEFAULT 100,                  -- 抽样行数
     force_pk_compare INTEGER DEFAULT 0,               -- 1=强制 PK 逐行比对数
     chunk_rows      INTEGER DEFAULT 500,                  -- PK 分块行数数
@@ -960,6 +989,7 @@ CREATE TABLE IF NOT EXISTS clone_requests (
     target_host    TEXT DEFAULT '127.0.0.1',          -- 目标主机（克隆库拉起位置，可为远程机器 IP）
     target_password TEXT,                            -- 目标实例 root/管理员密码（加密存储，可空=沿用源任务密码）
     status         TEXT DEFAULT 'pending',            -- pending|approved|rejected|creating|ready|expired|deleted
+    purpose        TEXT DEFAULT 'test',               -- test|dev|staging|emergency（B3 应急接管）
     itsm_ticket_id INTEGER,                          -- 关联的 ITSM 工单
     requested_by   TEXT,
     approved_by    TEXT,
@@ -1341,6 +1371,18 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                     conn.execute(f"ALTER TABLE ssh_hosts ADD COLUMN {col} {typedef}")
                 except Exception:
                     pass  # 列已存在
+            # 迁移（D3 存储池类型抽象）：池分类 + 池级策略 JSON
+            for col, typedef in [("pool_kind", "TEXT DEFAULT 'local'"),
+                                 ("pool_policy", "TEXT")]:
+                try:
+                    conn.execute(f"ALTER TABLE storage_targets ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass  # 列已存在
+            # 迁移（B3 应急接管）：克隆用途（emergency=应急接管预案）
+            try:
+                conn.execute("ALTER TABLE clone_requests ADD COLUMN purpose TEXT DEFAULT 'test'")
+            except Exception:
+                pass  # 列已存在
             try:
                 if backend == "sqlite":
                     # SQLite 无法 DROP 约束 → 检测单列唯一索引并重建表
@@ -1438,7 +1480,8 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
             # 迁移：data_compare_tasks 分块/强制 PK 列（models 字段同步）
             for col, typedef in [("force_pk_compare", "INTEGER DEFAULT 0"),
                                  ("chunk_rows", "INTEGER DEFAULT 500"),
-                                 ("chunk_threshold", "INTEGER DEFAULT 5000")]:
+                                 ("chunk_threshold", "INTEGER DEFAULT 5000"),
+                                 ("compare_level", "TEXT DEFAULT 'standard'")]:
                 try:
                     conn.execute(f"ALTER TABLE data_compare_tasks ADD COLUMN {col} {typedef}")
                 except Exception:
@@ -2006,12 +2049,22 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                     "permissions TEXT DEFAULT '', "          # 逗号分隔，附加权限
                     "enabled INTEGER DEFAULT 1, "
                     "must_change_password INTEGER DEFAULT 0, "
+                    "failed_count INTEGER DEFAULT 0, "
+                    "locked_until TEXT, "
                     "last_login_at TEXT, last_login_ip TEXT, "
                     "created_at TEXT, updated_at TEXT, "
                     "created_by TEXT DEFAULT '')")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users(role, enabled)")
             except Exception:
                 pass  # 表已存在，忽略
+
+            # 三员管理配套列（账号级登录锁定）——幂等补齐存量库
+            for _col, _def in (("failed_count", "INTEGER DEFAULT 0"),
+                               ("locked_until", "TEXT")):
+                try:
+                    conn.execute(f"ALTER TABLE users ADD COLUMN {_col} {_def}")
+                except Exception:
+                    pass
 
             conn.commit()
         finally:

@@ -96,6 +96,7 @@ function TaskTable({ tasks, onRun, onEdit, onDelete }) {
             <td class="small">
               ${tables}
               ${t.enable_checksum && html`<div><span class="badge bg-info bg-opacity-10 text-info">含校验和</span></div>`}
+              ${t.compare_level && html`<div><span class="badge bg-secondary bg-opacity-10 text-secondary">校验级别: ${LV_NAMES[t.compare_level] || t.compare_level}</span></div>`}
             </td>
             <td class="small">${scheduleLabel(t)}</td>
             <td><${EnableBadge} on=${!!t.enabled} /></td>
@@ -187,6 +188,14 @@ function TaskModal({ state, onSave, onClose }) {
               <div class="col-md-4">
                 <label class="form-label">表清单（逗号分隔，留空=两端共有表）</label>
                 <input class="form-control" value=${f.tables} onInput=${set("tables")} placeholder="t1,t2,t3" />
+              </div>
+              <div class="col-md-2">
+                <label class="form-label">校验级别</label>
+                <select class="form-select" value=${f.compare_level || "standard"} onChange=${set("compare_level")}>
+                  <option value="quick">快检（行数+结构）</option>
+                  <option value="standard">标准（行数+结构+校验和+随机抽样）</option>
+                  <option value="deep">深度（行数+结构+主键全量归并）</option>
+                </select>
               </div>
               <div class="col-md-2">
                 <label class="form-label">抽样行数</label>
@@ -525,9 +534,11 @@ function ReportModal({ report, onClose, onRepaired }) {
     </div>`;
 }
 
+const LV_NAMES = { quick: "快检", standard: "标准", deep: "深度" };
+
 // ---------- 主应用 ----------
 const emptyForm = {
-  name: "", tables: "", sample_rows: 100, enable_checksum: false,
+  name: "", tables: "", sample_rows: 100, enable_checksum: false, compare_level: "standard",
   schedule_type: "manual", cron_expr: "", interval_minutes: "", enabled: true,
   source_db_type: "mysql", source_host: "", source_port: "", source_username: "",
   source_password: "", source_database: "", source_schema: "",

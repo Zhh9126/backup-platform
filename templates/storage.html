@@ -337,8 +337,27 @@
             </div>
           </div>
 
-          <!-- 公共字段 -->
+          <!-- 池类型与策略（D3 存储池体系，对标 DSG/鼎甲） -->
           <div class="row g-3 mt-2 pt-3 border-top">
+            <div class="col-md-4">
+              <label class="form-label">池类型</label>
+              <select class="form-select" id="st_pool_kind">
+                <option value="local">标准池</option>
+                <option value="dedup">重删池</option>
+                <option value="synthetic">合成池（合成全量/黄金副本）</option>
+                <option value="archive">归档冷池</option>
+              </select>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">池默认保留期(天，0=不限制)</label>
+              <input type="number" class="form-control" id="st_pool_retention" min="0" value="0"
+                     title="池级默认保留期：任务未单独配置 retention_days 时参考此值">
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">池默认锁定(天，0=不锁定)</label>
+              <input type="number" class="form-control" id="st_pool_lock" min="0" value="0"
+                     title="池级默认保留锁天数：入池备份产物自动上不可变锁（对标 WORM 保留策略）">
+            </div>
             <div class="col-md-8">
               <label class="form-label">备注</label>
               <input type="text" class="form-control" id="st_remark" placeholder="可选备注信息">

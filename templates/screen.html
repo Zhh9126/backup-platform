@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>AIDBM 运维大屏</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link href="/static/css/app.css" rel="stylesheet">
+<style>
+  html, body { background:#0B1220; color:#E2E8F0; height:100%; margin:0;
+    font-family:"Segoe UI","Microsoft YaHei",sans-serif; overflow:hidden; }
+  .scr-head { display:flex; justify-content:space-between; align-items:center;
+    padding:14px 28px; border-bottom:1px solid #1E293B; }
+  .scr-title { font-size:22px; font-weight:700; letter-spacing:4px;
+    background:linear-gradient(90deg,#5EEAD4,#38BDF8); -webkit-background-clip:text;
+    -webkit-text-fill-color:transparent; }
+  .scr-clock { font-variant-numeric:tabular-nums; color:#94A3B8; }
+  .grid { display:grid; gap:14px; padding:16px 28px;
+    grid-template-columns:repeat(6,1fr); grid-auto-rows:minmax(120px,auto); height:calc(100vh - 66px); }
+  .card { background:linear-gradient(160deg,#101B30,#0D1526); border:1px solid #1E293B;
+    border-radius:12px; padding:16px 18px; position:relative; overflow:hidden; }
+  .card::before { content:""; position:absolute; top:0; left:0; right:0; height:2px;
+    background:linear-gradient(90deg,#5EEAD4,#38BDF8); opacity:.6; }
+  .k-num { font-size:40px; font-weight:800; color:#5EEAD4; line-height:1.1;
+    font-variant-numeric:tabular-nums; }
+  .k-label { color:#94A3B8; font-size:13px; margin-top:4px; }
+  .k-sub { color:#64748B; font-size:12px; margin-top:6px; }
+  .k-danger { color:#F87171; }
+  .k-warn { color:#FBBF24; }
+  .span2 { grid-column:span 2; } .span3 { grid-column:span 3; } .span4 { grid-column:span 4; }
+  .span6 { grid-column:span 6; } .span5 { grid-column:span 5; }
+  table.mini { width:100%; font-size:12px; border-collapse:collapse; }
+  table.mini td { padding:4px 6px; border-bottom:1px dashed #1E293B; color:#CBD5E1; }
+  table.mini tr td:first-child { color:#64748B; white-space:nowrap; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; }
+  .ok { background:rgba(94,234,212,.12); color:#5EEAD4; }
+  .bad { background:rgba(248,113,113,.14); color:#F87171; }
+  .run { background:rgba(56,189,248,.14); color:#38BDF8; }
+  .bar-row { display:flex; align-items:center; gap:8px; margin:6px 0; font-size:12px; }
+  .bar-track { flex:1; height:8px; background:#1E293B; border-radius:4px; overflow:hidden; }
+  .bar-fill { height:100%; background:linear-gradient(90deg,#5EEAD4,#38BDF8); border-radius:4px; }
+  .bar-fill.bad { background:linear-gradient(90deg,#F87171,#FB923C); }
+</style>
+</head>
+<body>
+<div class="scr-head">
+  <div class="scr-title">AIDBM · 智能数据库灾备管理平台</div>
+  <div style="display:flex;gap:24px;align-items:center">
+    <span id="scrHealth" class="pill ok">健康度 --</span>
+    <span class="scr-clock" id="scrClock"></span>
+  </div>
+</div>
+<div class="grid">
+  <div class="card span2"><div class="k-num" id="kTasks">-</div><div class="k-label">备份任务总数</div><div class="k-sub" id="kTasksSub"></div></div>
+  <div class="card span2"><div class="k-num" id="kRecords">-</div><div class="k-label">可用恢复点</div><div class="k-sub" id="kSize"></div></div>
+  <div class="card span2"><div class="k-num" id="kRate">-</div><div class="k-label">24h 成功率</div><div class="k-sub" id="kRateSub"></div></div>
+
+  <div class="card span3"><div class="k-label" style="font-size:15px;font-weight:700;color:#CBD5E1">备份趋势（近 14 天）</div><div id="kTrend"></div></div>
+  <div class="card span3"><div class="k-label" style="font-size:15px;font-weight:700;color:#CBD5E1">保护对象分布</div><div id="kTypes"></div></div>
+
+  <div class="card span3"><div class="k-label" style="font-size:15px;font-weight:700;color:#CBD5E1">最近备份记录</div>
+    <table class="mini" id="kRecent"></table></div>
+  <div class="card span3"><div class="k-label" style="font-size:15px;font-weight:700;color:#CBD5E1">需要关注</div>
+    <table class="mini" id="kAttention"></table></div>
+</div>
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  function tick() {
+    $("scrClock").textContent = new Date().toLocaleString("zh-CN", { hour12: false });
+  }
+  tick(); setInterval(tick, 1000);
+
+  function bars(items, fmt) {
+    const max = Math.max(1, ...items.map((x) => x[1]));
+    return items.map(([name, val, bad]) =>
+      '<div class="bar-row"><span style="width:150px;color:#94A3B8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' +
+      esc(name) + '</span><div class="bar-track"><div class="bar-fill' + (bad ? " bad" : "") +
+      '" style="width:' + Math.round((val / max) * 100) + '%"></div></div><span style="width:70px;text-align:right;color:#CBD5E1">' +
+      fmt(val) + "</span></div>").join("");
+  }
+
+  async function load() {
+    try {
+      const r = await (await fetch("/api/dashboard", { credentials: "include" })).json();
+      $("kTasks").textContent = r.task_count ?? 0;
+      $("kTasksSub").textContent = "数据库 " + (r.db_task_count ?? 0) + " · 文件 " + (r.file_task_count ?? 0);
+      $("kRecords").textContent = r.record_count ?? 0;
+      $("kSize").textContent = r.total_size_human || "-";
+      const sr = r.success_rate_24h || {};
+      $("kRate").textContent = (sr.rate != null ? sr.rate + "%" : "-");
+      $("kRate").className = "k-num " + ((sr.rate ?? 100) >= 95 ? "" : (sr.rate ?? 0) >= 80 ? "k-warn" : "k-danger");
+      $("kRateSub").textContent = "成功 " + (sr.success ?? 0) + " / 总 " + (sr.total ?? 0);
+      const hs = r.health_score;
+      $("scrHealth").textContent = "健康度 " + (hs ?? "--");
+      $("scrHealth").className = "pill " + ((hs ?? 100) >= 90 ? "ok" : (hs ?? 0) >= 70 ? "run" : "bad");
+      // 趋势（纯 SVG 柱状）
+      const trend = r.trend || [];
+      if (trend.length) {
+        const W = 520, H = 120, bw = W / trend.length - 6;
+        let svg = '<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;height:150px;margin-top:8px">';
+        trend.forEach((t, i) => {
+          const v = t.success ?? t.value ?? 0, f = t.failed ?? 0;
+          const mx = Math.max(1, ...trend.map((x) => (x.success ?? x.value ?? 0) + (x.failed ?? 0)));
+          const h1 = Math.round((v / mx) * (H - 30));
+          const h2 = Math.round((f / mx) * (H - 30));
+          const x = i * (W / trend.length) + 3;
+          svg += '<rect x="' + x + '" y="' + (H - 18 - h1) + '" width="' + bw + '" height="' + h1 + '" fill="#5EEAD4" opacity=".85"/>';
+          if (f) svg += '<rect x="' + x + '" y="' + (H - 18 - h1 - h2) + '" width="' + bw + '" height="' + h2 + '" fill="#F87171" opacity=".9"/>';
+          svg += '<text x="' + (x + bw / 2) + '" y="' + (H - 4) + '" font-size="9" fill="#64748B" text-anchor="middle">' + esc((t.date || "").slice(5)) + "</text>";
+        });
+        $("kTrend").innerHTML = svg + "</svg>";
+      }
+      // 类型分布
+      const cnt = r.db_counter_display || r.db_counter || {};
+      const items = Object.entries(cnt).map(([k, v]) => [k, v, false]).sort((a, b) => b[1] - a[1]).slice(0, 8);
+      $("kTypes").innerHTML = bars(items, (v) => String(v));
+      // 最近记录
+      const recs = (r.recent_records || []).slice(0, 7);
+      $("kRecent").innerHTML = recs.length ? recs.map((x) =>
+        "<tr><td>" + esc((x.started_at || "").slice(5, 16)) + "</td><td>" + esc(x.task_name || "-") +
+        '</td><td><span class="pill ' + (x.status === "success" ? "ok" : x.status === "running" ? "run" : "bad") + '">' +
+        esc(x.status || "-") + "</span></td><td>" + esc(x.size_human || "-") + "</td></tr>").join("")
+        : '<tr><td class="text-muted">暂无记录</td></tr>';
+      // 需要关注
+      const att = (r.attention || []).slice(0, 7);
+      $("kAttention").innerHTML = att.length ? att.map((x) =>
+        "<tr><td>" + esc(x.title || x.kind || "-") + "</td><td>" + esc((x.message || "").slice(0, 60)) + "</td></tr>").join("")
+        : '<tr><td style="color:#5EEAD4">一切正常，无待关注风险</td></tr>';
+    } catch (e) { /* 静默重试 */ }
+  }
+  load();
+  setInterval(load, 10000);
+})();
+</script>
+</body>
+</html>

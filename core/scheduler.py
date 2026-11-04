@@ -1284,6 +1284,8 @@ def _file_sync_job_wrapper():
         _logger.error("调度文件实时同步异常: %s", e)
 
 
+
+
 def _register_cleanup(sched):
     """注册备份保留策略定期清理任务（默认每日 03:10）。"""
     from apscheduler.triggers.cron import CronTrigger
@@ -1669,6 +1671,8 @@ def start_scheduler():
     _register_dr_monitor(_scheduler)
     _register_file_sync(_scheduler)
     _scheduler.start()
+    # 实时同步任务自动恢复（重启前处于 running 的实时任务重新拉起）
+    _resume_realtime_sync_tasks()
     _logger.info("调度器已启动，已注册 %d 个任务", len(_scheduler.get_jobs()))
     return _scheduler
 
@@ -1740,6 +1744,38 @@ def _reload_scheduler_locked():
     if config.RT_BACKUP_ENABLED:
         _register_rt_periodic_jobs(_scheduler)
     _logger.info("调度器已重载，当前 %d 个任务", len(_scheduler.get_jobs()))
+
+
+def _resume_realtime_sync_tasks() -> None:
+    """自动恢复实时同步任务（2026-11-04 用户反馈：实时同步应常驻运行）。
+
+    实时任务不进 APScheduler（见上方 skip），进程内 runner 注册表随服务
+    重启丢失——重启后任务永远停在"已停止"，必须手动点运行。这里按
+    last_status=="running"（服务停止时仍在运行的标记）自动恢复线程；
+    手动停止的任务已标记 stopped，不会被误恢复。
+    """
+    try:
+        from core.sync.realtime_runners import is_running, start_runner
+        from core.sync.engine import run_sync_task
+    except Exception:
+        return
+    resumed = []
+    for st in models.list_sync_tasks(enabled=True):
+        if st.get("sync_mode") != "realtime":
+            continue
+        if st.get("last_status") != "running":
+            continue
+        tid = st["id"]
+        if is_running(tid):
+            continue
+        if start_runner(tid, run_sync_task, tid):
+            models.update_sync_task(tid, {
+                "message": "服务重启后自动恢复实时同步",
+                "updated_at": db.now_iso(),
+            })
+            resumed.append(tid)
+    if resumed:
+        _logger.info("实时同步任务已自动恢复: %s", resumed)
 
 
 def stop_scheduler():

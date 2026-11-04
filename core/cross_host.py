@@ -20,6 +20,7 @@
 """
 import os
 import time
+from shlex import quote as shlex_quote
 import paramiko
 
 
@@ -543,8 +544,49 @@ exit $RC
                 f"{gsql_bin} -h {host} -p {port} -U {user} {wflag} {target} -f '{actual}'")
 
     elif db_type == "redis":
-        # 上传 .rdb / .tar.gz
-        return f"redis-cli -h 127.0.0.1 -a '$(echo)' CONFIG SET dir /tmp && redis-cli SHUTDOWN NOSAVE 2>/dev/null; cat {remote_pkg} > /tmp/dump.rdb && redis-server --dbfilename dump.rdb --dir /tmp --daemonize yes"
+        # Redis 跨主机恢复（2026-11-04 170/171 真机测试发现旧命令假成功修复）：
+        # 旧命令的问题——①无密码实例注入 -a '$(echo)' 导致 CONFIG SET/SHUTDOWN
+        # 全部认证失败，实例根本没重启但 rc=0；②dir 写死 /tmp；③新起 6379
+        # 端口实例而非重启目标实例。
+        # 新语义（对齐引擎通道的保真 conf 重启）：按目标端口定位实例 →
+        # CONFIG GET 读 dir/dbfilename/appendonly/save → 生成最小保真 conf →
+        # 停库→cat 替换 rdb（避免 cp -i 挂起）→重启→PING 必须返回 PONG。
+        port = int(extra.get("source_port") or 6379)
+        pw = extra.get("source_password") or ""
+        auth = (" -a " + shlex_quote(pw)) if pw else ""
+        pkg = shlex_quote(remote_pkg)
+        return (
+            "CLI=$(command -v redis-cli || ls /usr/local/redis/bin/redis-cli "
+            "/opt/redis/bin/redis-cli 2>/dev/null | head -1); "
+            "SRV=$(command -v redis-server || ls /usr/local/redis/bin/redis-server "
+            "/opt/redis/bin/redis-server 2>/dev/null | head -1); "
+            "[ -n \"$CLI\" ] || { echo '[ERROR] 目标主机未找到 redis-cli'; exit 127; }; "
+            "[ -n \"$SRV\" ] || { echo '[ERROR] 目标主机未找到 redis-server'; exit 127; }; "
+            f"PORT={port}; "
+            f"CLI=\"$CLI -h 127.0.0.1 -p $PORT{auth}\"; "
+            "DATA_DIR=$($CLI CONFIG GET dir 2>/dev/null | tail -1); "
+            "DBFN=$($CLI CONFIG GET dbfilename 2>/dev/null | tail -1); "
+            "AOF=$($CLI CONFIG GET appendonly 2>/dev/null | tail -1); "
+            "SAVE=$($CLI CONFIG GET save 2>/dev/null | tail -1); "
+            "[ -n \"$DATA_DIR\" ] || { echo '[ERROR] 无法读取实例数据目录"
+            "（实例不可达或认证失败）'; exit 1; }; "
+            f"printf 'port {port}\\nbind 0.0.0.0\\ndir %s\\ndbfilename %s\\n"
+            "appendonly %s\\nsave %s\\ndaemonize yes\\n"
+            f"pidfile /tmp/platform_redis_{port}.pid\\n"
+            f"logfile /tmp/platform_redis_{port}.log\\n' "
+            "\"$DATA_DIR\" \"${DBFN:-dump.rdb}\" \"${AOF:-no}\" \"${SAVE:-}\" "
+            f"> /tmp/platform_redis_restart_{port}.conf; "
+            + (f"printf 'requirepass %s\\n' {shlex_quote(pw)} >> /tmp/platform_redis_restart_{port}.conf; "
+               if pw else "")
+            + f"$CLI SHUTDOWN NOSAVE >/dev/null 2>&1; "
+            f"sleep 2; "
+            f"cat {pkg} > \"$DATA_DIR/${{DBFN:-dump.rdb}}\"; "
+            "RC_CP=$?; "
+            f"setsid \"$SRV\" /tmp/platform_redis_restart_{port}.conf >/dev/null 2>&1 & "
+            "sleep 3; "
+            "echo CP_RC=$RC_CP; "
+            "PING_OUT=$($CLI PING 2>&1); echo \"$PING_OUT\"; "
+            "echo \"$PING_OUT\" | grep -q PONG")
 
     elif db_type == "mongodb":
         host = "127.0.0.1"

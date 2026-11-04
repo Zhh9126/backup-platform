@@ -44,7 +44,8 @@ def api_request_clone():
             target_host=data.get("target_host") or "127.0.0.1",
             target_password=data.get("target_password") or "",
             clone_mode=data.get("clone_mode") or "logical",
-            live_source_db=data.get("live_source_db") or "")
+            live_source_db=data.get("live_source_db") or "",
+            purpose=data.get("purpose") or "test")
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"ok": True, "id": req["id"], "request": req}), 201
@@ -89,6 +90,19 @@ def api_destroy_clone(request_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"ok": True, "request": req})
+
+
+@api_bp.route("/clone/<int:request_id>/takeover-check", methods=["POST"])
+@login_required
+def api_clone_takeover_check(request_id):
+    """应急接管就绪检查（B3）：验证 ready 克隆库可否临时承载业务。"""
+    from flask import session as _sess
+    operator = ( (_sess.get("user") or {}).get("username") or "unknown")
+    try:
+        res = _service.takeover_check(request_id, operator=operator)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": res.get("ok"), **res})
 
 
 @api_bp.route("/clone/<int:request_id>/verify", methods=["POST"])

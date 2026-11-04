@@ -52,21 +52,27 @@ def start_runner(task_id: int, fn: Callable[..., Any], *args, **kwargs) -> bool:
 
 
 def _wrap(task_id: int, fn: Callable[..., Any], *args, **kwargs) -> None:
+    res = None
     try:
-        res = fn(*args, **kwargs)
-    except Exception as e:  # noqa: BLE001
-        logger.exception("realtime sync %s 异常", task_id)
-        res = {"success": False, "message": f"实时同步异常: {e}"}
         try:
-            from .. import models  # noqa: PLC0415
+            res = fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("realtime sync %s 异常", task_id)
+            res = {"success": False, "message": f"实时同步异常: {e}"}
+        # 线程退出时如实落终态：异常、失败返回（如源库不可达）、正常停止都
+        # 不能遗留 running（2026-11-04 实测：resume 后源库不可达的任务
+        # 返回失败 dict 退出，状态卡在 running 而 rt_running=False）
+        if not (res or {}).get("success", False):
+            try:
+                from .. import models  # noqa: PLC0415
 
-            models.update_sync_task(task_id, {
-                "status": "failed",
-                "last_status": "failed",
-                "message": f"实时同步异常: {e}",
-            })
-        except Exception:  # noqa: BLE001
-            logger.warning("realtime sync %s 更新失败状态出错", task_id)
+                models.update_sync_task(task_id, {
+                    "status": "failed",
+                    "last_status": "failed",
+                    "message": (res or {}).get("message") or "实时同步已退出",
+                })
+            except Exception:  # noqa: BLE001
+                logger.warning("realtime sync %s 更新失败状态出错", task_id)
     finally:
         with _LOCK:
             if task_id in _RUNNERS:

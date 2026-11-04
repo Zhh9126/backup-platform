@@ -1088,6 +1088,15 @@
       sel.value = "logical";
       if (typeof toast === "function") toast("该数据库类型不支持物理备份，已切换为逻辑备份");
     }
+    // hot_copy 仅 Oracle 支持非归档应急热备
+    const hc = Array.prototype.find.call(sel.options, (o) => o.value === "hot_copy");
+    if (hc) {
+      hc.disabled = t !== "oracle";
+      if (hc.disabled && sel.value === "hot_copy") {
+        sel.value = "logical";
+        if (typeof toast === "function") toast("在线热备仅支持 Oracle，已切换为逻辑备份");
+      }
+    }
     if (typeof toggleCustomBox === "function") toggleCustomBox();
   }
   window.refreshBackupModeOptions = refreshBackupModeOptions;
@@ -1557,6 +1566,9 @@
     if ($("t_parallel_pull")) $("t_parallel_pull").checked = !!eo.parallel_pull;
     if ($("t_backup_stage_dir")) $("t_backup_stage_dir").value = eo.backup_stage_dir || "";
     if ($("t_auto_discover")) $("t_auto_discover").checked = !!eo.auto_discover_new_dbs;
+    if ($("t_hot_copy_tablespaces")) $("t_hot_copy_tablespaces").value = eo.hot_copy_tablespaces || "";
+    if ($("t_bad_block_check")) $("t_bad_block_check").checked = !!eo.bad_block_check;
+    if ($("t_bad_block_mode")) $("t_bad_block_mode").value = eo.bad_block_mode || "fast";
   }
 
   // 备份产物导出格式：保存收集（写入 extra_options.dump_format）
@@ -1606,6 +1618,16 @@
     // P1-5：备份片并行拉回
     if ($("t_parallel_pull") && $("t_parallel_pull").checked) eo.parallel_pull = true;
     else delete eo.parallel_pull;
+    // Oracle 非归档应急热备（hot_copy）：表空间清单（空 = 全库）
+    const hct = ($("t_hot_copy_tablespaces") && $("t_hot_copy_tablespaces").value.trim()) || "";
+    if (hct) eo.hot_copy_tablespaces = hct;
+    else delete eo.hot_copy_tablespaces;
+    // A7 备份前坏块检测
+    if ($("t_bad_block_check") && $("t_bad_block_check").checked) eo.bad_block_check = true;
+    else delete eo.bad_block_check;
+    const bbm = ($("t_bad_block_mode") && $("t_bad_block_mode").value) || "";
+    if (bbm && bbm !== "fast") eo.bad_block_mode = bbm;
+    else delete eo.bad_block_mode;
   }
 
   function fillSshCred(sc, task) {
@@ -6099,7 +6121,7 @@
   function _dmRenderRulePreview() {
     const box = $("dmRulePreview");
     if (!box) return;
-    const cols = Array.from($("dmColumns").selectedOptions).map((o) => o.value);
+    const cols = _dmSelectedColumns();
     if (!cols.length) {
       box.innerHTML = '<span class="text-muted">请先选择导出列。</span>';
       return;
@@ -6122,7 +6144,7 @@
   }
 
   async function _dmRecalcRules() {
-    const cols = Array.from($("dmColumns").selectedOptions).map((o) => o.value);
+    const cols = _dmSelectedColumns();
     if (!cols.length) { DM.currentRules = {}; _dmRenderRulePreview(); return; }
     let userRules = {};
     try {
@@ -6155,7 +6177,7 @@
 
   function _dmApplyTemplate(tpl) {
     const tplRules = DM.templates[tpl] || {};
-    const cols = Array.from($("dmColumns").selectedOptions).map((o) => o.value);
+    const cols = _dmSelectedColumns();
     const rules = {};
     cols.forEach((c) => { rules[c] = "none"; });
     Object.keys(tplRules).forEach((k) => {
@@ -6193,10 +6215,18 @@
   }
 
   function _dmRenderColumns(columns) {
-    const sel = $("dmColumns");
-    if (!sel) return;
-    sel.innerHTML = columns.map((c) =>
-      '<option value="' + esc(c) + '" selected>' + esc(c) + '</option>').join("");
+    const box = $("dmColumnsBox");
+    if (!box) return;
+    box.innerHTML = (columns || []).map((c) =>
+      '<label class="dm-chip on"><input type="checkbox" value="' + esc(c) +
+      '" checked><span>' + esc(c) + '</span></label>').join("");
+  }
+
+  function _dmSelectedColumns() {
+    const box = $("dmColumnsBox");
+    if (!box) return [];
+    return Array.from(box.querySelectorAll("input[type=checkbox]:checked"))
+      .map((c) => c.value);
   }
 
   async function _dmOnSourceChange() {
@@ -6253,27 +6283,43 @@
       if (t) _dmRenderColumns(t.columns);
       _dmRecalcRules();
     };
-    const cols = $("dmColumns");
-    if (cols) cols.onchange = _dmRecalcRules;
+    const colBox = $("dmColumnsBox");
+    if (colBox) colBox.addEventListener("change", (ev) => {
+      const chip = ev.target.closest(".dm-chip");
+      if (chip) chip.classList.toggle("on", ev.target.checked);
+      _dmRecalcRules();
+    });
     const ta = $("dmMaskRules");
     if (ta) ta.oninput = _dmRecalcRules;
     const addBtn = $("dmAddColumn");
     if (addBtn) addBtn.onclick = () => {
       const name = prompt("请输入新列名：");
       if (!name) return;
-      const sel = $("dmColumns");
-      const opt = document.createElement("option");
-      opt.value = name; opt.textContent = name; opt.selected = true;
-      sel.appendChild(opt); _dmRecalcRules();
+      const box = $("dmColumnsBox");
+      if (!box) return;
+      const label = document.createElement("label");
+      label.className = "dm-chip on";
+      label.innerHTML = '<input type="checkbox" value="' + esc(name) +
+        '" checked><span>' + esc(name) + "</span>";
+      box.appendChild(label);
+      _dmRecalcRules();
     };
     const allBtn = $("dmSelectAll");
     if (allBtn) allBtn.onclick = () => {
-      Array.from($("dmColumns").options).forEach((o) => { o.selected = true; });
+      const box = $("dmColumnsBox");
+      if (!box) return;
+      box.querySelectorAll("input[type=checkbox]").forEach((c) => {
+        c.checked = true; c.closest(".dm-chip").classList.add("on");
+      });
       _dmRecalcRules();
     };
     const clrBtn = $("dmClearColumns");
     if (clrBtn) clrBtn.onclick = () => {
-      Array.from($("dmColumns").options).forEach((o) => { o.selected = false; });
+      const box = $("dmColumnsBox");
+      if (!box) return;
+      box.querySelectorAll("input[type=checkbox]").forEach((c) => {
+        c.checked = false; c.closest(".dm-chip").classList.remove("on");
+      });
       _dmRecalcRules();
     };
     document.querySelectorAll("#dmRuleTemplates button").forEach((b) => {
@@ -6293,8 +6339,7 @@
   async function dmExport() {
     const src = $("dmSource");
     if (!src || !src.value) { toast("请先选择来源备份记录", "warning"); return; }
-    const cols = $("dmColumns");
-    const columns = cols ? Array.from(cols.selectedOptions).map((o) => o.value) : [];
+    const columns = _dmSelectedColumns();
     if (!columns.length) { toast("请至少选择一个导出列", "warning"); return; }
     let mask_rules = undefined;
     const ta = $("dmMaskRules");
@@ -6324,9 +6369,16 @@
         const cols = Array.isArray(e.columns) ? e.columns.join(", ") : (e.columns || "-");
         const rules = e.mask_rules && typeof e.mask_rules === "object"
           ? Object.entries(e.mask_rules).map(([k, v]) => k + ":" + v).join(" ") : "-";
+        // 来源记录显示任务名（去掉裸 #编号——与全站 #编号清理口径一致）；
+        // 记录号保留在 title 悬停里供追溯
+        const srcRec = (DM.sources || []).find(
+          (s) => String(s.id) === String(e.source_record_id));
+        const srcName = srcRec
+          ? (srcRec.task_name || srcRec.biz_label || ("备份记录 " + e.source_record_id))
+          : ("备份记录 " + e.source_record_id);
         return '<tr>' +
           '<td>' + e.id + '</td>' +
-          '<td>' + (e.source_record_id != null ? '#' + e.source_record_id : '-') + '</td>' +
+          '<td title="备份记录 #' + esc(e.source_record_id) + '">' + esc(srcName) + '</td>' +
           '<td><span class="text-truncate d-inline-block" style="max-width:220px">' + esc(cols) + '</span></td>' +
           '<td><span class="text-truncate d-inline-block" style="max-width:200px">' + esc(rules) + '</span></td>' +
           '<td>' + (e.row_count != null ? e.row_count : '-') + '</td>' +
@@ -6772,12 +6824,17 @@
         tierTargets.map(t => {
           const icon = TYPE_ICONS[t.type] || "bi-hdd";
           const statusOk = t.enabled && !t.last_error;
+          const POOL_BADGES = { dedup: "bg-info", synthetic: "bg-warning text-dark", archive: "bg-secondary" };
+          const poolBadge = t.pool_kind && t.pool_kind !== "local"
+            ? ' <span class="badge ' + (POOL_BADGES[t.pool_kind] || "bg-secondary") + '" style="font-size:0.6em" title="池类型">' + esc(t.pool_kind_name || t.pool_kind) + '</span>'
+            : '';
           return '<div class="tier-target-item' + (!t.enabled ? ' opacity-50' : '') + '">' +
             '<div class="d-flex justify-content-between align-items-start">' +
               '<div class="flex-grow-1 min-w-0">' +
                 '<div class="d-flex align-items-center gap-1 mb-1">' +
                   '<strong class="text-truncate">' + esc(t.name) + '</strong>' +
                   (t.is_default ? ' <span class="badge bg-primary" style="font-size:0.6em">默认</span>' : '') +
+                  poolBadge +
                   statusPill(t) +
                 '</div>' +
                 (t.endpoint ? '<div class="small text-muted text-truncate"><i class="bi bi-link-45deg me-1"></i>' + esc(t.endpoint) + '</div>' : '') +
@@ -6858,6 +6915,10 @@
       $("st_remark").value = d.remark || "";
       $("st_enabled").checked = !!d.enabled;
       $("st_default").checked = !!d.is_default;
+      $("st_pool_kind").value = d.pool_kind || "local";
+      const pol = (d.pool_policy && typeof d.pool_policy === "object") ? d.pool_policy : {};
+      $("st_pool_retention").value = pol.retention_days || 0;
+      $("st_pool_lock").value = pol.lock_days || 0;
       // 密码不回显，留空表示不修改
       $("st_secret_key").value = "";
       // 按类型填充字段
@@ -6907,6 +6968,12 @@
     data.remark = $("st_remark").value.trim();
     data.enabled = $("st_enabled").checked ? 1 : 0;
     data.is_default = $("st_default").checked ? 1 : 0;
+    // D3 池类型与池级策略
+    data.pool_kind = $("st_pool_kind").value || "local";
+    data.pool_policy = {
+      retention_days: parseInt($("st_pool_retention").value || "0", 10) || 0,
+      lock_days: parseInt($("st_pool_lock").value || "0", 10) || 0,
+    };
 
     if (type === "local") {
       data.endpoint = $("st_endpoint_local").value.trim() || "./backups";
@@ -7858,6 +7925,9 @@
         if (c.status === 'ready') {
           actions.push('<button class="btn btn-sm btn-outline-success" onclick="verifyClone(' + c.id + ')">' +
             '<i class="bi bi-shield-check"></i> 校验</button>');
+          // B3 应急接管：emergency 用途的克隆给「接管检查」按钮
+          actions.push('<button class="btn btn-sm btn-outline-warning" onclick="takeoverCheck(' + c.id + ')" title="应急接管就绪检查：直连/表数量/行数抽样">' +
+            '<i class="bi bi-lightning-charge"></i> 接管检查</button>');
         }
         if (['ready', 'creating', 'failed', 'expired'].indexOf(c.status) >= 0) {
           actions.push('<button class="btn btn-sm btn-outline-danger" onclick="destroyClone(' + c.id + ')">' +
@@ -7878,7 +7948,7 @@
           '<td>' + pg.startNo + cii + '</td>' +
           '<td>' + (c.task_name ? esc(c.task_name) + ' <span class="text-muted">(记录 ' + c.source_record_id + ')</span>' : (c.source_record_id != null ? c.source_record_id : '-')) + '</td>' +
           '<td>' + (c.source_db_type ? '<span class="badge bg-info">' + esc(c.source_db_type) + '</span>' : '-') + '</td>' +
-          '<td>' + esc(c.target_env || '') + '</td>' +
+          '<td>' + esc(c.target_env || '') + (c.purpose === 'emergency' ? ' <span class="badge bg-danger" title="应急接管">应急</span>' : '') + '</td>' +
           '<td>' + esc(c.target_host || '127.0.0.1') + '</td>' +
           '<td>' + badge + verifyHtml + '</td>' +
           '<td>' + esc(c.requested_by || '-') + '</td>' +
@@ -7909,6 +7979,17 @@
       await loadClones();
     };
     // failed 重试拉起（复用后端幂等的 approve 直通通道）
+    window.takeoverCheck = async function (id) {
+      try {
+        const res = await api("POST", "/api/clone/" + id + "/takeover-check");
+        const items = (res.checks || []).map(c =>
+          (c.pass ? "✓ " : "✗ ") + c.message).join("\n");
+        toast((res.ok ? "接管检查通过：" : "接管检查未通过：") + (res.summary || ""),
+          res.ok ? "success" : "warning");
+        if (items) console.log("接管检查明细 #" + id + "\n" + items);
+      } catch (e) { toast(e.message, "danger"); }
+      await loadClones();
+    };
     window.retryClone = async function (id) {
       try {
         await api("POST", "/api/clone/" + id + "/approve");
@@ -7945,6 +8026,7 @@
         target_password: $("c_target_password").value,
         requested_by: $("c_requested_by").value.trim(),
         note: $("c_note").value,
+        purpose: $("c_purpose") ? $("c_purpose").value : "test",
       };
       if (!payload.target_env) { toast("请填写目标环境", "warning"); return; }
       try {
@@ -8217,6 +8299,10 @@
 
   // ---- P1-1：自动切换策略 + 可视化切换向导 ----
   let DR_MONITOR_STATE = {};
+  let DR_LINKS = [];            // 链路列表缓存（拓扑/详情弹窗使用）
+  let drTopoModalInst = null;   // 拓扑与详情弹窗
+  let drTopoTimer = null;       // 实时探测定时器
+  let DR_TOPO_LINK_ID = null;   // 当前弹窗展示的链路
 
   /** 卡片上的自动策略状态徽章：开启且告警中→红色；开启正常→绿色；未开→无。 */
   function drAutoBadge(l, states) {
@@ -8491,6 +8577,7 @@
     } catch (e) { /* 忽略 */ }
     const links = await api("GET", "/api/disaster-links");
     const list = links.links || [];
+    DR_LINKS = list;
     const container = $("linkList");
     const empty = $("linkEmpty");
     if (!list.length) {
@@ -8533,6 +8620,7 @@
               '</table>' +
             '</div>' +
             '<div class="link-actions">' +
+              '<button class="btn btn-sm btn-outline-info" onclick="openDrTopo(' + l.id + ')" title="拓扑图与健康详情：主备拓扑可视化 / 实时探测 / 切换历史"><i class="bi bi-diagram-3 me-1"></i>拓扑</button>' +
               '<button class="btn btn-sm btn-outline-warning" onclick="openFailoverWizard(' + l.id + ')" title="切换向导：预检→确认→执行→RTO 报告"><i class="bi bi-arrow-left-right me-1"></i>切换</button>' +
               '<button class="btn btn-sm btn-outline-secondary" onclick="openDrAuto(' + l.id + ')" title="自动切换策略：连续 N 次探测失败告警/自动切换"><i class="bi bi-activity me-1"></i>策略</button>' +
               '<button class="btn btn-sm btn-outline-secondary" onclick="openFailCfg(' + l.id + ')" title="切换引擎配置：主备连接 / 复制账号 / DNS"><i class="bi bi-diagram-3 me-1"></i>配置</button>' +
@@ -8551,6 +8639,157 @@
     const broken = list.filter(function (l) { return l.status === 'broken'; }).length;
     $("linkSummary").textContent = '共 ' + list.length + ' 条链路 · 主用 ' + active + ' · 中断 ' + broken;
   }
+
+  // ==================== 链路拓扑与详情（2026-11-04 用户反馈：没地方看具体信息和进度，拓扑图也没有） ====================
+  function _dlJson(v, fallback) {
+    if (v == null || v === "") return fallback;
+    if (typeof v === "object") return v;
+    try { return JSON.parse(v); } catch (e) { return fallback; }
+  }
+
+  window.openDrTopo = async function (id) {
+    DR_TOPO_LINK_ID = id;
+    const link = (DR_LINKS || []).find((l) => l.id === id);
+    if (!link) { toast("链路数据未加载，请刷新后重试", "warning"); return; }
+    if (!drTopoModalInst) drTopoModalInst = new bootstrap.Modal($("drTopoModal"));
+    $("drTopoName").textContent = "· " + (link.name || ("#" + id));
+    drTopoModalInst.show();
+    $("drTopoBody").innerHTML = '<div class="text-muted small py-4 text-center">' +
+      '<span class="spinner-border spinner-border-sm me-2"></span>正在探测主库/备库/DNS…</div>';
+    await window.renderDrTopo();
+    // 实时探测定时器（默认关，勾选后 10s 刷新健康状态）
+    clearInterval(drTopoTimer);
+    drTopoTimer = setInterval(function () {
+      const open = $("drTopoModal").classList.contains("show");
+      if (!open) { clearInterval(drTopoTimer); return; }
+      if ($("drTopoLive") && $("drTopoLive").checked) window.renderDrTopo();
+    }, 10000);
+  };
+
+  window.renderDrTopo = async function () {
+    const link = (DR_LINKS || []).find((l) => l.id === DR_TOPO_LINK_ID);
+    if (!link) return;
+    const cfg = _dlJson(link.failover_config, {});
+    const pc = cfg.primary_conn || {};
+    const sc = cfg.standby_conn || {};
+    const dnsCfg = cfg.dns || {};
+    const hist = _dlJson(link.failover_history, []);
+    // 健康快照（实时探测，可能失败——失败降级为纯配置拓扑）
+    let snap = null, snapErr = "";
+    try {
+      const resp = await api("GET", "/api/disaster-links/" + link.id + "/health");
+      if (resp && resp.snapshot) snap = resp.snapshot;
+      else if (resp && resp.error) snapErr = resp.error;
+    } catch (e) { snapErr = e.message || "探测失败"; }
+    const p = (snap && snap.primary) || null;
+    const s = (snap && snap.standby) || null;
+    const d = (snap && snap.dns) || null;
+    $("drTopoCheckedAt").textContent = snap ? ("最近探测: " + (snap.checked_at || "").replace("T", " ")) : "";
+
+    const box = (x, y, w, h, cls) =>
+      '<rect class="dr-topo-node ' + cls + '" x="' + x + '" y="' + y +
+      '" width="' + w + '" height="' + h + '" rx="10"/>';
+    const txt = (x, y, sTxt, cls, anchor) =>
+      '<text class="' + (cls || "dr-topo-label") + '" x="' + x + '" y="' + y + '"' +
+      (anchor ? ' text-anchor="' + anchor + '"' : "") + ">" + esc(sTxt) + "</text>";
+
+    // 节点状态
+    const pOk = p ? !!p.reachable : null;
+    const sRep = s ? !!s.is_replica : null;
+    const sIo = s ? s.io === "Yes" : null;
+    const sSql = s ? s.sql === "Yes" : null;
+    const sBehind = s ? s.behind : null;
+    const pClass = pOk === null ? "" : (pOk ? "primary" : "bad");
+    const sClass = s ? (sIo && sSql ? "standby" : (sRep ? "standby" : "bad")) : "";
+
+    let svg = '<svg class="dr-topo-svg" viewBox="0 0 920 330" xmlns="http://www.w3.org/2000/svg">' +
+      '<defs><marker id="drArrow" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">' +
+      '<polygon points="0 0, 9 3.5, 0 7" fill="#0d9488"/></marker>' +
+      '<marker id="drArrowAmber" markerWidth="9" markerHeight="7" refX="8" refY="3.5" orient="auto">' +
+      '<polygon points="0 0, 9 3.5, 0 7" fill="#f59e0b"/></marker></defs>';
+    // 应用接入层（DNS）
+    svg += box(360, 18, 200, 58, d && d.in_sync ? "primary" : "");
+    svg += txt(460, 42, "应用接入 · " + (dnsCfg.domain || "未配置 DNS"), "dr-topo-label", "middle");
+    svg += txt(460, 60, d ? ("解析 → " + (d.resolved_ip || "?") + (d.in_sync ? "（与主库一致）" : "（与主库不一致！）")) : "业务通过域名接入，切换时自动牵引", "dr-topo-sub", "middle");
+    // 数据源（捕获流）
+    const srcName = link.source_name || (link.source_kind === "rt_task" ? "实时备份任务" : link.source_kind === "sync_task" ? "数据同步任务" : "手工链路（无数据源）");
+    svg += box(30, 248, 250, 58, link.source_kind === "manual" ? "" : "standby");
+    svg += txt(155, 272, "数据源：" + srcName, "dr-topo-sub", "middle");
+    svg += txt(155, 290, link.source_kind === "manual" ? "一致性校验需绑定实时/同步任务" : "状态: " + (link.source_last_status || "-"), "dr-topo-sub", "middle");
+    // 主库
+    svg += box(140, 140, 260, 92, pClass);
+    svg += txt(270, 165, "主库 PRIMARY", "dr-topo-label", "middle");
+    svg += txt(270, 186, (pc.host || esc(link.primary_site || "-")) + ":" + (pc.port || ""), "dr-topo-sub", "middle");
+    svg += txt(270, 206, p ? (pOk
+      ? "可达 · 可写" + (p.version ? " · " + p.version : "")
+      : "不可达 · " + (p.error || "").slice(0, 30)) : "未探测（缺主库连接配置）", "dr-topo-sub", "middle");
+    // 备库
+    svg += box(540, 140, 260, 92, sClass);
+    svg += txt(670, 165, "备库 STANDBY", "dr-topo-label", "middle");
+    svg += txt(670, 186, (sc.host || esc(link.dr_site || "-")) + ":" + (sc.port || ""), "dr-topo-sub", "middle");
+    svg += txt(670, 206, s ? ("复制: IO=" + (s.io || "?") + " SQL=" + (s.sql || "?") +
+      (s.behind != null ? " · 延迟 " + s.behind + "s" : "")) : "未探测（缺备库连接配置）", "dr-topo-sub", "middle");
+    // 箭头：应用 → 主库；主 → 备（复制流）；数据源 → 主库
+    svg += '<path class="dr-topo-arrow dns" d="M 380 76 Q 260 100 270 140" marker-end="url(#drArrowAmber)" fill="none"/>';
+    svg += (s && s.io === "Yes" ? '<path class="dr-topo-arrow" d="M 400 186 L 540 186" marker-end="url(#drArrow)"/>' :
+      '<path class="dr-topo-arrow dashed" d="M 400 186 L 540 186" marker-end="url(#drArrow)"/>');
+    svg += txt(470, 178, "复制流" + (cfg.replication_user ? " · " + cfg.replication_user : ""), "dr-topo-sub", "middle");
+    svg += '<path class="dr-topo-arrow dashed" d="M 155 248 L 200 232" marker-end="url(#drArrow)" fill="none"/>';
+    svg += "</svg>";
+
+    // 下方信息区
+    const monState = (DR_MONITOR_STATE || {})[String(link.id)] || (DR_MONITOR_STATE || {})[link.id] || {};
+    let html = '<div class="row g-3">' +
+      '<div class="col-lg-7">' + svg + "</div>" +
+      '<div class="col-lg-5">';
+    // 健康快照明细
+    html += '<div class="card-section-title"><i class="bi bi-heart-pulse"></i> 健康快照</div>';
+    if (snapErr && !snap) {
+      html += '<div class="alert alert-warning py-2 small mb-2">探测失败：' + esc(snapErr) +
+        "（请在「配置」中完善主备连接后重试）</div>";
+    }
+    html += '<table class="table table-sm table-bordered mb-3"><tbody>' +
+      "<tr><th style='width:110px'>主库</th><td>" +
+      (p ? (pOk ? '<span class="badge badge-ok">可达</span>' : '<span class="badge badge-fail">不可达</span>') +
+        ' <span class="small text-muted">' + esc(p.host) + ":" + esc(p.port) + "</span>" : "未配置") + "</td></tr>" +
+      "<tr><th>备库复制</th><td>" +
+      (s ? (sRep
+        ? '<span class="badge badge-ok">复制中</span> IO=' + esc(s.io) + " SQL=" + esc(s.sql) +
+          (s.behind != null ? " · 延迟 " + esc(s.behind) + "s" : "")
+        : '<span class="badge badge-fail">未在复制</span>' + (s.error ? ' <span class="small text-muted">' + esc(String(s.error)).slice(0, 60) + "</span>" : ""))
+        : "未配置") + "</td></tr>" +
+      "<tr><th>DNS 一致性</th><td>" +
+      (d ? (d.in_sync ? '<span class="badge badge-ok">一致</span> ' : '<span class="badge badge-fail">不一致</span> ') +
+        '<span class="small">' + esc(d.domain) + " → " + esc(d.resolved_ip || "?") + "</span>" : "未配置") + "</td></tr>" +
+      "<tr><th>自动监控</th><td>" +
+      (monState && monState.enabled
+        ? '<span class="badge badge-run">运行中</span> 连续失败 ' + esc(monState.consecutive_failures || 0) + " 次"
+        : '<span class="text-muted">未开启</span>（可在「策略」中开启自动切换）') + "</td></tr>" +
+      "</tbody></table>";
+    html += "</div></div>";
+
+    // 切换历史时间线（进度信息）
+    html += '<div class="card-section-title mt-2"><i class="bi bi-clock-history"></i> 切换历史（' + hist.length + ' 次）</div>';
+    if (hist.length) {
+      html += '<div class="p-2">';
+      hist.slice(0, 10).forEach(function (h) {
+        const ok = (h.steps || []).every((st) => st.ok);
+        html += '<div class="dr-flow-item">' +
+          '<span class="dr-flow-dot ' + (ok ? "ok" : "bad") + '"></span>' +
+          '<div class="flex-grow-1">' +
+          '<div><strong>' + esc(h.direction === "failover" ? "故障切换" : h.direction === "failback" ? "回切" : (h.direction || "-")) +
+          '</strong> → ' + esc(h.to || "-") +
+          ' <span class="badge ' + (ok ? "badge-ok" : "badge-fail") + ' ms-2">RTO ' + (h.rto_sec != null ? h.rto_sec + "s" : "-") + "</span></div>" +
+          '<div class="small text-muted">' + esc((h.at || "").replace("T", " ")) + " · 步骤: " +
+          (h.steps || []).map((st) => (st.ok ? "✓" : "✗") + st.name).join(" → ") + "</div>" +
+          "</div></div>";
+      });
+      html += "</div>";
+    } else {
+      html += '<div class="text-muted small py-2">暂无切换记录（执行「切换」或「回切」后在此展示每一步进度与 RTO）</div>';
+    }
+    $("drTopoBody").innerHTML = html;
+  };
 
   async function initDrLink() {
     await window.dnsLoad();

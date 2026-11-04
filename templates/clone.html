@@ -45,6 +45,16 @@
           <input class="form-control" id="c_target_env" placeholder="如 test / dev / staging">
         </div>
         <div class="mb-3">
+          <label class="form-label">用途</label>
+          <select class="form-select" id="c_purpose">
+            <option value="test">测试环境</option>
+            <option value="dev">开发环境</option>
+            <option value="staging">预发布</option>
+            <option value="emergency">应急接管（生产故障时临时承载业务，B3 对标一键激活）</option>
+          </select>
+          <div class="form-text">选「应急接管」时，就绪后可做接管就绪检查（直连/表数量/行数抽样），检查通过才具备临时承载业务读流量的条件。</div>
+        </div>
+        <div class="mb-3">
           <label class="form-label">目标主机</label>
           <input class="form-control" id="c_target_host" list="c_target_host_options"
                  placeholder="默认本机 127.0.0.1，可填其他机器 IP">

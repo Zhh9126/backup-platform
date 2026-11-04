@@ -721,6 +721,21 @@ def _decorate_sync(row: dict) -> dict:
             "SELECT name FROM backup_tasks WHERE id=?",
             (row["source_task_id"],))
         row["source_task_name"] = name["name"] if name else None
+    # 实时同步运行状态与水位（2026-11-04 用户反馈：实时任务没地方看运行数据）：
+    # rt_running 来自进程内 runner 注册表（API/调度同进程，真实可信）；
+    # realtime_watermark 为持久化水位 JSON（断点续传依据）。
+    if str(row.get("sync_mode")) == "realtime":
+        try:
+            from core.sync.realtime_runners import is_running
+            row["rt_running"] = bool(is_running(row.get("id")))
+        except Exception:
+            row["rt_running"] = False
+        wm = row.get("realtime_watermark")
+        if isinstance(wm, str) and wm.strip():
+            try:
+                row["realtime_watermark"] = json.loads(wm)
+            except Exception:
+                pass
     # JSON 字段反序列化，方便前端/执行器直接使用
     for k in ("column_mapping", "source_tables_list", "flink_config",
               "exclude_tables", "type_mapping"):
@@ -1199,7 +1214,7 @@ def delete_migration_plan(plan_id: int) -> None:
 # ------------------------- 克隆请求（CloneRequest，Phase 2） -------------------------
 _CLONE_FIELDS = [
     "source_record_id", "target_env", "target_host", "target_password",
-    "status", "itsm_ticket_id",
+    "status", "purpose", "itsm_ticket_id",
     "requested_by", "approved_by", "expires_at", "vdb_instance_id", "note",
 ]
 
@@ -2430,6 +2445,7 @@ _DATA_COMPARE_TASK_FIELDS = [
     "target_password", "target_database", "target_schema",
     "tables", "enable_checksum", "sample_rows",
     "force_pk_compare", "chunk_rows", "chunk_threshold",
+    "compare_level",
     "schedule_type", "cron_expr", "interval_minutes", "enabled",
 ]
 
@@ -2476,6 +2492,8 @@ def _dct_prepare_row(data: dict) -> dict:
         row["tables"] = _json.dumps(row["tables"], ensure_ascii=False)
     row["enable_checksum"] = 1 if row.get("enable_checksum") not in (0, False, "0", None) else 0
     row["enabled"] = 1 if row.get("enabled") not in (0, False, "0", None) else 1
+    _lv = (row.get("compare_level") or "").lower()
+    row["compare_level"] = _lv if _lv in ("quick", "standard", "deep") else "standard"
     row["sample_rows"] = int(row.get("sample_rows") or 100)
     row["source_port"] = int(row["source_port"]) if row.get("source_port") not in (None, "") else None
     row["target_port"] = int(row["target_port"]) if row.get("target_port") not in (None, "") else None

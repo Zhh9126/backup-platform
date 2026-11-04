@@ -47,12 +47,17 @@
     return out;
   }
 
-  // 在 anchor 元素（通常是表格）的父容器底部挂分页条。
+  // 在 anchor 元素（通常是表格）的宿主卡片底部挂分页条。
   // onChange 为重新加载函数（通常直接调 loadXxx）。
   function attach(key, anchorEl, page, pages, total, onChange) {
     if (!anchorEl || pages <= 0) return;
     const host = anchorEl.closest(".page-card, .card, table") || anchorEl;
-    const container = host.parentElement || host;
+    // 分页条必须放进卡片内部（卡片末尾）：此前 append 到卡片父级，
+    // 单卡片页面看不出问题，多张分页卡片同页（如任务监控页的
+    // 失败分诊 + 最近执行流）会把所有分页条堆到页面最底部（2026-11-04）
+    const isCard = host.classList && (host.classList.contains("page-card") ||
+      host.classList.contains("card"));
+    const container = isCard ? host : (host.parentElement || host);
     let bar = document.getElementById("pager-" + key);
     if (!bar) {
       bar = document.createElement("div");

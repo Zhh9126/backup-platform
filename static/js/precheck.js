@@ -25,6 +25,7 @@
     rman_dir: "RMAN 备份目录",
     remote_stage: "远端暂存目录",
     data_dir_hygiene: "数据目录卫生",
+    bad_block: "坏块检测",
     disk_space: "存储空间",
     artifact: "备份产物",
     integrity: "完整性校验",

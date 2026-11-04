@@ -332,4 +332,45 @@
     </div>
   </div>
 </div>
+
+<!-- 拓扑图与详情（主备拓扑可视化 / 健康快照 / 切换历史时间线） -->
+<div class="modal fade" id="drTopoModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-centered modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-diagram-3"></i> 链路拓扑与详情 <span class="text-muted small" id="drTopoName"></span></h5>
+        <div class="ms-2 form-check form-switch">
+          <input class="form-check-input" type="checkbox" id="drTopoLive">
+          <label class="form-check-label small" for="drTopoLive">实时探测（10s）</label>
+        </div>
+        <button type="button" class="btn-close ms-auto" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body" id="drTopoBody">
+        <div class="text-muted small">加载中…</div>
+      </div>
+      <div class="modal-footer">
+        <span class="small text-muted me-auto" id="drTopoCheckedAt"></span>
+        <button class="btn btn-outline-secondary" data-bs-dismiss="modal">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<style>
+  .dr-topo-svg { width: 100%; height: auto; display: block; }
+  .dr-topo-node { fill: var(--card-bg, #fff); stroke: var(--border, #cbd5e1); stroke-width: 1.5; rx: 10; }
+  .dr-topo-node.primary { stroke: #0d9488; stroke-width: 2.5; }
+  .dr-topo-node.standby  { stroke: #3b82f6; stroke-width: 2; }
+  .dr-topo-node.bad      { stroke: #ef4444; stroke-width: 2.5; }
+  .dr-topo-label { font-size: 13px; font-weight: 600; fill: var(--text, #1e293b); }
+  .dr-topo-sub   { font-size: 11px; fill: var(--muted, #64748b); }
+  .dr-topo-arrow { stroke: #0d9488; stroke-width: 2; marker-end: url(#drArrow); fill: none; }
+  .dr-topo-arrow.dns { stroke: #f59e0b; }
+  .dr-topo-arrow.dashed { stroke-dasharray: 5 4; }
+  .dr-flow-item { display: flex; gap: 10px; align-items: flex-start; padding: 6px 0; }
+  .dr-flow-dot { width: 10px; height: 10px; border-radius: 50%; margin-top: 5px; flex: none; }
+  .dr-flow-dot.ok { background: #10b981; } .dr-flow-dot.bad { background: #ef4444; }
+  .dr-flow-dot.warn { background: #f59e0b; }
+  .dr-flow-time { color: var(--muted, #94a3b8); font-size: .78rem; white-space: nowrap; }
+</style>
 {% endblock %}

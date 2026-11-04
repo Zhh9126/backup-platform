@@ -181,6 +181,26 @@ def api_task_precheck(task_id):
     return jsonify(res)
 
 
+@api_bp.route("/tasks/<int:task_id>/badblock-check", methods=["POST"])
+@login_required
+def api_task_badblock_check(task_id):
+    """备份前坏块检测（A7 对标 DSG/鼎甲）。
+
+    mode=fast（默认，SQL 视图级/CHECK QUICK）| full（Oracle RMAN VALIDATE
+    CHECK LOGICAL，读全库耗时长）。只读不改数据。
+    """
+    from core import models, badblock_check
+    task = models.get_task(task_id, include_secret=True)
+    if not task:
+        return jsonify({"error": "任务不存在"}), 404
+    mode = (request.get_json(silent=True) or {}).get("mode") or "fast"
+    try:
+        res = badblock_check.check_bad_blocks(task, mode=mode)
+    except Exception as e:
+        return jsonify({"error": "坏块检测失败: %s" % e}), 500
+    return jsonify(res)
+
+
 @api_bp.route("/tasks/<int:task_id>/list-databases", methods=["GET"])
 @login_required
 def list_task_databases(task_id):

@@ -29,7 +29,9 @@ def list_permissions():
             {"key": k, "name": n, "group": g} for (k, n, g) in rbac.PERMISSIONS
         ],
         "roles": rbac.VALID_ROLES,
+        "role_labels": getattr(rbac, "ROLE_LABELS", {}),
         "role_permissions": rbac.ROLE_PERMISSIONS,
+        "password_policy_enabled": rbac.password_policy_enabled(),
     })
 
 
@@ -66,6 +68,9 @@ def change_my_password():
         return jsonify({"error": "当前账号未在 users 表中（内置账号，请用 config.WEB_PASSWORD 登录后通过 init 创建）"}), 400
     if not rbac.verify_password(old, row.get("password_hash") or ""):
         return jsonify({"error": "旧密码错误"}), 401
+    ok_pwd, err_pwd = rbac.validate_password(new)
+    if not ok_pwd:
+        return jsonify({"error": err_pwd}), 400
     try:
         rbac.set_password(uid, new)
     except ValueError as e:
@@ -88,6 +93,9 @@ def list_users():
 def create_user():
     data = request.get_json(force=True, silent=True) or {}
     pwd = data.get("password") or ""
+    ok_pwd, err_pwd = rbac.validate_password(pwd)
+    if not ok_pwd:
+        return jsonify({"error": err_pwd}), 400
     try:
         new_id = rbac.create(data, pwd, created_by=(session.get("user") or {}).get("username", ""))
     except ValueError as e:
@@ -115,6 +123,9 @@ def update_user(uid: int):
 def reset_password(uid: int):
     data = request.get_json(force=True, silent=True) or {}
     pwd = data.get("password") or ""
+    ok_pwd, err_pwd = rbac.validate_password(pwd)
+    if not ok_pwd:
+        return jsonify({"error": err_pwd}), 400
     try:
         rbac.set_password(uid, pwd)
     except ValueError as e:
@@ -130,3 +141,17 @@ def delete_user(uid: int):
     if not ok:
         return jsonify({"error": msg or "删除失败"}), 400
     return jsonify({"ok": True})
+
+# --------------- 强口令策略（三员管理配套） ---------------
+@api_bp.route("/rbac/password-policy", methods=["GET", "POST"])
+@login_required
+@permission_required("security.manage")
+def password_policy():
+    if request.method == "POST":
+        data = request.get_json(force=True, silent=True) or {}
+        rbac.set_password_policy(bool(data.get("enabled")))
+        import core.db as _db
+        _db.add_log("warning", "auth",
+                    f"强口令策略已{'开启' if data.get('enabled') else '关闭'}"
+                    f"（操作者 {(session.get('user') or {}).get('username', '')}）")
+    return jsonify({"enabled": rbac.password_policy_enabled()})

@@ -248,6 +248,30 @@ def precheck_backup(task: dict) -> dict:
     except Exception as e:
         _add(items, "remote_stage", "unknown", "暂存目录预检异常: %s" % str(e)[:100])
 
+    # 5.6) 备份前坏块检测（A7 对标 DSG/鼎甲）：任务 extra.bad_block_check=1
+    # 开启时在预检中真实检测源库数据块健康度，把「带病备份」风险前置暴露
+    try:
+        _extra3 = json.loads(_eo2) if isinstance(_eo2, str) else (_eo2 or {})
+    except Exception:
+        _extra3 = {}
+    if _extra3.get("bad_block_check") and db_type != "file":
+        try:
+            from core import badblock_check as _bbc
+            _mode = "full" if _extra3.get("bad_block_mode") == "full" else "fast"
+            _r = _bbc.check_bad_blocks(task, mode=_mode)
+            if _r.get("status") == "clean":
+                _add(items, "bad_block", "pass", str(_r.get("message"))[:200])
+            elif _r.get("status") == "corrupt":
+                _add(items, "bad_block", "fail",
+                     "%s（%s）" % (str(_r.get("message"))[:160],
+                                   "; ".join(_r.get("details") or [])[:120]))
+            elif _r.get("status") == "skip":
+                _add(items, "bad_block", "warn", str(_r.get("message"))[:200])
+            else:
+                _add(items, "bad_block", "unknown", str(_r.get("message"))[:200])
+        except Exception as e:
+            _add(items, "bad_block", "unknown", "坏块检测异常: %s" % str(e)[:120])
+
     # 6) 平台存储空间
     du = _disk_usage()
     if du:

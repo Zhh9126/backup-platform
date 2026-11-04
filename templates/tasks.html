@@ -96,6 +96,7 @@
                     <option value="logical">逻辑备份 (推荐)</option>
                     <option value="physical">物理备份</option>
                     <option value="custom">自定义脚本</option>
+                    <option value="hot_copy">在线热备（Oracle 非归档应急）</option>
                   </select>
                 </div>
                 <div class="col-md-3">
@@ -347,6 +348,32 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
                     （对标鼎甲多通道，上限 8）；恢复校验（VALIDATE）同样受益。
                     瓶颈在远端磁盘 IO 时收益有限，通道数不宜超过数据文件数。
                   </div>
+                </div>
+                <div class="col-12 mt-2">
+                  <label class="form-label">在线热备表空间（可选，仅 Oracle 在线热备模式）</label>
+                  <input class="form-control form-control-sm font-monospace" id="t_hot_copy_tablespaces"
+                         placeholder="留空=全库；如：USERS 或 USERS,EXAMPLE">
+                  <div class="small text-muted">
+                    非归档应急热备（begin/end backup 文件拷贝，免开归档免 RMAN）。指定表空间时只拷该表空间数据文件（快进快出）；
+                    产物为崩溃一致备份，恢复需整包替换文件后 startup（联机日志自动前滚）。建议尽快转储并做恢复校验。
+                  </div>
+                </div>
+                <div class="col-12 mt-2">
+                  <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="t_bad_block_check">
+                    <label class="form-check-label" for="t_bad_block_check">
+                      备份前坏块检测（A7，对标鼎甲备份前数据块校验）
+                    </label>
+                    <div class="small text-muted">
+                      预检时真实检测源库数据块健康度：MySQL CHECK TABLE QUICK 逐表；
+                      Oracle fast=视图级（坏块视图/待恢复文件）、full=RMAN VALIDATE CHECK LOGICAL 全库校验（耗时长）。
+                      发现坏块将阻断预检并提示处置。
+                    </div>
+                  </div>
+                  <select class="form-select form-select-sm mt-1" id="t_bad_block_mode" style="max-width:260px">
+                    <option value="fast">快速模式（SQL/CHECK QUICK，秒级）</option>
+                    <option value="full">全库校验（Oracle RMAN VALIDATE，读全库）</option>
+                  </select>
                 </div>
                 <div class="col-12 mt-2">
                   <div class="form-check">

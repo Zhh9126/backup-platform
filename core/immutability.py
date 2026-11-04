@@ -255,6 +255,8 @@ def maybe_autolock(task: dict, record_id: int) -> dict:
 
     任务 extra_options.retention_lock_days > 0 时自动加锁；为产品提供
     「备份即上锁」的防勒索默认姿势。
+    任务未配置时回退存储池默认（D3：pool_policy.lock_days > 0，对标
+    鼎甲池级 WORM 保留策略）。
     """
     import json as _json
     try:
@@ -264,6 +266,13 @@ def maybe_autolock(task: dict, record_id: int) -> dict:
     except Exception:  # noqa: BLE001
         return {}
     if days <= 0:
+        # D3 池级默认锁定：任务未显式配置时，取产物目标存储池的
+        # pool_policy.lock_days（>0 生效）。取不到或为 0 则不上锁。
+        try:
+            days = _pool_default_lock_days(task)
+        except Exception:  # noqa: BLE001
+            days = 0
+    if days <= 0:
         return {}
     try:
         return lock_record(record_id, days, operator="auto",
@@ -272,3 +281,28 @@ def maybe_autolock(task: dict, record_id: int) -> dict:
         db.add_log("WARNING", _log_target,
                    f"备份记录 #{record_id} 自动锁定失败: {e}")
         return {"error": str(e)}
+
+
+def _pool_default_lock_days(task: dict) -> int:
+    """从任务的目标存储池读 pool_policy.lock_days（D3 池级默认锁定）。
+
+    任务通过 backup_tasks.storage_backend（local/minio/s3）与存储目标关联；
+    同类型多行时取 is_default 优先、其次最小 id。
+    """
+    import json as _json
+    backend = (task or {}).get("storage_backend") or "local"
+    rows = db.query(
+        "SELECT id, pool_policy FROM storage_targets "
+        "WHERE type=? AND enabled=1 AND pool_policy IS NOT NULL AND pool_policy!='' "
+        "ORDER BY is_default DESC, id", (backend,))
+    if not rows:
+        return 0
+    for r in rows:
+        try:
+            pol = _json.loads(r["pool_policy"])
+            days = int((pol or {}).get("lock_days") or 0)
+            if days > 0:
+                return days
+        except (ValueError, TypeError):
+            continue
+    return 0

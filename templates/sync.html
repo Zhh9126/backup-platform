@@ -360,17 +360,35 @@
 .field-item .field-name { font-weight: 500; }
 .field-item .field-type { font-size: 0.75rem; color: #6c757d; }
 </style>
-<script src="/static/js/sync.js?v=2026110401"></script>
+<script src="/static/js/sync.js?v=2026110402"></script>
 <!-- 预检结果模态框 -->
 <div class="modal fade" id="precheckModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog modal-lg modal-dialog-scrollable">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title">迁移前预校验报告</h5>
+        <h5 class="modal-title" id="precheckTitle">迁移前预校验报告</h5>
         <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
       </div>
       <div class="modal-body" id="precheckBody"></div>
       <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+<!-- 同步详情模态框（执行记录 / 实时状态 / 水位） -->
+<div class="modal fade" id="detailModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="detailTitle">同步详情</h5>
+        <span class="ms-3" id="detailRtBadge"></span>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body" id="detailBody"></div>
+      <div class="modal-footer">
+        <span class="small text-muted me-auto" id="detailAutoNote"></span>
+        <button type="button" class="btn btn-outline-primary" id="detailRefreshBtn" onclick="SYNC.refreshDetail()">刷新</button>
         <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
       </div>
     </div>

@@ -11,9 +11,28 @@
     .sidebar { background: #1E293B; color: #CBD5E1; }
     .sidebar .nav-link { color: #CBD5E1; }
     .sidebar .brand-text .brand-name { color: #FFFFFF; }
+    /* 跨文档视图过渡（View Transitions API，Chrome/Edge 126+）：点击菜单
+       整页跳转时，侧栏作为命名元素跨页面无缝保留（浏览器截旧帧过渡到新帧），
+       彻底消除"闪一下"；Firefox/Safari 等不支持的浏览器自动忽略回退原行为。 */
+    @view-transition { navigation: auto; }
+    .sidebar { view-transition-name: sidebar; }
+    /* 过渡期间侧栏不做淡入淡出位移，直接定格，观感=侧栏从未刷新 */
+    ::view-transition-old(sidebar) { animation: none; }
+    ::view-transition-new(sidebar) { animation: none; }
+    /* root（内容区）禁用默认 0.25s 交叉溶解——旧帧半透明叠新帧在视觉差异大的
+       页面（如仪表盘→智能告警）会整页"闪一下"；改为瞬间切换 + 新页面内容区
+       自己的短淡入，视觉=内容柔和浮现、侧栏纹丝不动。 */
+    ::view-transition-old(root) { animation: none; }
+    ::view-transition-new(root) { animation: none; }
+    /* 内容区加载淡入（对不支持 VT 的浏览器同样柔化整页跳变的突兀感） */
+    .content-inner { animation: content-in .16s ease backwards; }
+    @keyframes content-in { from { opacity: .3; } to { opacity: 1; } }
+    @media (prefers-reduced-motion: reduce) {
+      .content-inner { animation: none; }
+    }
   </style>
   <link href="/static/css/bootstrap.min.css?v=2026080210" rel="stylesheet">
-  <link href="/static/vendor/bootstrap-icons/bootstrap-icons.css?v=2026081401" rel="stylesheet">
+  <link href="/static/vendor/bootstrap-icons/bootstrap-icons-inline.css?v=2026110401" rel="stylesheet">
   <link href="/static/css/app.css?v=2026110201" rel="stylesheet">
 </head>
 <body data-page="{{ page }}">
@@ -81,6 +100,7 @@
         <div class="nav-group-label">运维</div>
         <a class="nav-link {% if page=='operations' %}active{% endif %}" href="/operations" title="运维运营分析（超长 / 超频备份统计与阈值配置）" data-perm="operations.view"><i class="bi bi-graph-up-arrow"></i> <span class="nav-label">运维运营分析</span></a>
         <a class="nav-link {% if page=='inspection' %}active{% endif %}" href="/inspection" title="巡检" data-perm="inspection.manage"><i class="bi bi-shield-check"></i> <span class="nav-label">巡检</span></a>
+        <a class="nav-link {% if page=='monitor' %}active{% endif %}" href="/monitor" title="备份任务监控（作业健康/连续失败/未按计划执行/RPO 逾期）" data-perm="inspection.manage"><i class="bi bi-activity"></i> <span class="nav-label">任务监控</span></a>
         <a class="nav-link {% if page=='reports' %}active{% endif %}" href="/reports" title="报表中心" data-perm="inspection.manage"><i class="bi bi-file-earmark-bar-graph"></i> <span class="nav-label">报表中心</span></a>
         {% if has_ai_agent %}
                 <a class="nav-link {% if page=='agent' %}active{% endif %}" href="/agent" title="AI 智能助手" data-perm="agent.use"><i class="bi bi-robot"></i> <span class="nav-label">AI 智能助手</span></a>
@@ -92,6 +112,22 @@
         <a class="nav-link {% if page=='users' %}active{% endif %}" href="/users" title="用户与角色管理（RBAC）" data-perm="users.manage"><i class="bi bi-people"></i> <span class="nav-label">用户管理</span></a>
         <a class="nav-link logout" href="/logout" title="退出登录"><i class="bi bi-box-arrow-right"></i> <span class="nav-label">退出登录</span></a>
       </nav>
+      <script>
+        /* 侧栏滚动位置跨页连续（配合 View Transitions）：解析期立即恢复上次
+           滚动位置（app.js 的 active 居中只作兜底，恢复后当前项可见即不动），
+           pagehide 时保存——整页跳转前后滚动位置零跳变。 */
+        (function () {
+          try {
+            var nav = document.querySelector(".sidebar .nav");
+            if (!nav) return;
+            var saved = sessionStorage.getItem("sidebar-scroll-top");
+            if (saved !== null) nav.scrollTop = parseInt(saved, 10) || 0;
+            window.addEventListener("pagehide", function () {
+              try { sessionStorage.setItem("sidebar-scroll-top", String(nav.scrollTop)); } catch (e) {}
+            });
+          } catch (e) { /* 忽略 */ }
+        })();
+      </script>
     </aside>
     <main class="content">
       <div class="content-inner">{% block content %}{% endblock %}</div>
@@ -126,9 +162,9 @@
   <script>window.__BKP_META__ = {{ bkp_meta | default({}) | tojson }};</script>
   <script src="/static/js/i18n.js?v=2026101303"></script>
   <script src="/static/js/bkp-core.js?v=2026110301"></script>
-  <script src="/static/js/pager.js?v=2026102802"></script>
+  <script src="/static/js/pager.js?v=2026110403"></script>
   <script src="/static/js/precheck.js?v=2026110203"></script>
-  <script src="/static/js/app.js?v=2026110401"></script>
+  <script src="/static/js/app.js?v=2026110406"></script>
   {% if has_ai_agent %}<script src="/static/js/ai-agent.js?v=2026101501"></script>{% endif %}
   <script>
     // 按权限隐藏菜单（每个 <a class="nav-link" data-perm="..."> 命中则可见）

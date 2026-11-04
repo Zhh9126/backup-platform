@@ -87,6 +87,18 @@
   <span class="form-text ms-2 text-muted" id="og_result"></span>
 </div>
 
+<!-- 强口令策略（三员管理配套） -->
+<div class="page-card">
+  <div class="card-section-title"><i class="bi bi-shield-check"></i> 强口令策略（三员管理配套）</div>
+  <p class="form-text-hint mb-2">开启后，创建用户 / 重置密码 / 自助改密时强制校验：<b>长度 ≥ 8 位且包含大写字母、小写字母、数字</b>。账号级登录锁定已内置：连续失败 5 次锁定 15 分钟（自动解锁）。三员角色在「用户管理」页分配。</p>
+  <div class="form-check">
+    <input class="form-check-input" type="checkbox" id="pp_enabled">
+    <label class="form-check-label">启用强口令策略（≥8 位 + 大小写 + 数字）</label>
+  </div>
+  <button class="btn btn-primary mt-2" id="ppSaveBtn"><i class="bi bi-save"></i> 保存口令策略</button>
+  <span class="form-text ms-2 text-muted" id="pp_result"></span>
+</div>
+
 <!-- AI 预测告警配置 -->
 <div class="page-card">
   <div class="card-section-title"><i class="bi bi-robot"></i> AI 预测告警配置</div>
@@ -524,3 +536,146 @@ document.addEventListener("DOMContentLoaded", async function () {
 });
 </script>
 {% endblock %}
+<script>
+document.addEventListener("DOMContentLoaded", async function () {
+  const cb = document.getElementById("pp_enabled");
+  if (!cb) return;
+  try {
+    const cfg = await (await fetch("/api/rbac/password-policy", { credentials: "include" })).json();
+    cb.checked = !!cfg.enabled;
+  } catch (e) { /* 忽略，保持默认关 */ }
+  document.getElementById("ppSaveBtn")?.addEventListener("click", async () => {
+    const res = document.getElementById("pp_result");
+    try {
+      const r = await (await fetch("/api/rbac/password-policy", {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: cb.checked }),
+      })).json();
+      res.textContent = r.error ? ("保存失败: " + r.error)
+        : ("已保存，新密码" + (cb.checked ? "须 ≥8 位且含大小写字母与数字" : "不再强制复杂度"));
+      res.className = "form-text ms-2 " + (r.error ? "text-danger" : "text-success");
+    } catch (e) {
+      res.textContent = "保存失败: " + e;
+      res.className = "form-text ms-2 text-danger";
+    }
+  });
+});
+</script>
+<!-- AccessKey 免密认证（P2） -->
+<div class="page-card">
+  <div class="card-section-title"><i class="bi bi-key"></i> AccessKey 免密认证</div>
+  <p class="form-text-hint mb-2">密码周期轮换环境的外部系统接入：创建 AK/SK 对后，请求头携带
+    <code>X-AK-Access-Key</code> / <code>X-AK-Timestamp</code> / <code>X-AK-Signature</code>
+    （签名 = hex(HMAC-SHA256(SK, "METHOD\npath\ntimestamp"))，±300 秒防重放）即可调用全部 API，SK 不上网可随时吊销。</p>
+  <div class="row g-2 align-items-end mb-2">
+    <div class="col-md-4"><input class="form-control form-control-sm" id="ak_name" placeholder="名称（如 CI 平台）"></div>
+    <div class="col-md-3"><button class="btn btn-primary btn-sm" id="akCreateBtn"><i class="bi bi-plus-lg"></i> 生成 AK/SK</button></div>
+  </div>
+  <div class="alert alert-success d-none" id="akCreated"></div>
+  <div class="table-responsive"><table class="table table-sm table-hover mb-0">
+    <thead><tr><th>#</th><th>名称</th><th>AccessKey</th><th>状态</th><th>最近使用</th><th>操作</th></tr></thead>
+    <tbody id="akTbody"><tr><td colspan="6" class="text-muted">加载中…</td></tr></tbody>
+  </table></div>
+</div>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  const esc = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  async function loadAK() {
+    try {
+      const r = await (await fetch("/api/access-keys", { credentials: "include" })).json();
+      const rows = r.data || [];
+      document.getElementById("akTbody").innerHTML = rows.length ? rows.map((k) =>
+        "<tr><td>" + k.id + "</td><td>" + esc(k.name) + "</td><td><code>" + esc(k.access_key) +
+        "</code></td><td>" + (k.revoked ? '<span class="badge bg-secondary">已吊销</span>'
+          : '<span class="badge bg-success">启用</span>') + "</td><td class=\"text-muted\">" +
+        esc((k.last_used_at || "").slice(0, 19)) + '</td><td>' +
+        (k.revoked ? "" : '<button class="btn btn-outline-danger btn-sm" onclick="revokeAK(' + k.id + ')">吊销</button>') +
+        "</td></tr>").join("") : '<tr><td colspan="6" class="text-muted">暂无 AccessKey</td></tr>';
+    } catch (e) {
+      document.getElementById("akTbody").innerHTML = '<tr><td colspan="6" class="text-muted">加载失败（需安全保密管理权限）</td></tr>';
+    }
+  }
+  window.revokeAK = async function (id) {
+    if (!confirm("确认吊销该 AccessKey？使用它的外部系统将立即失去访问能力。")) return;
+    await fetch("/api/access-keys/" + id + "/revoke", { method: "POST", credentials: "include" });
+    loadAK();
+  };
+  document.getElementById("akCreateBtn")?.addEventListener("click", async () => {
+    const box = document.getElementById("akCreated");
+    try {
+      const r = await (await fetch("/api/access-keys", {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: document.getElementById("ak_name").value.trim() }),
+      })).json();
+      if (!r.success) { box.className = "alert alert-danger"; box.textContent = r.message || "创建失败"; return; }
+      box.className = "alert alert-success";
+      box.innerHTML = "<b>请立即保存（仅此一次展示）</b><br>AccessKey: <code>" + esc(r.data.access_key) +
+        "</code><br>SecretKey: <code>" + esc(r.data.secret_key) + "</code>";
+      loadAK();
+    } catch (e) { box.className = "alert alert-danger"; box.textContent = "创建失败: " + e; }
+  });
+  loadAK();
+});
+</script>
+
+<!-- SNMP 告警对接（P2） -->
+<div class="page-card">
+  <div class="card-section-title"><i class="bi bi-broadcast-pin"></i> SNMP Trap 告警对接</div>
+  <p class="form-text-hint mb-2">启用后所有告警事件（备份失败/恢复完成/链路劣化等）同步发 SNMPv2c trap 到网管平台（Zabbix/NMS）。纯标准库实现零依赖；UDP fire-and-forget 不阻塞告警链路。</p>
+  <div class="row g-2 align-items-end">
+    <div class="col-md-2"><div class="form-check form-switch">
+      <input class="form-check-input" type="checkbox" id="snmp_enabled">
+      <label class="form-check-label">启用</label></div></div>
+    <div class="col-md-3"><label class="form-label small">网管地址</label>
+      <input class="form-control form-control-sm" id="snmp_target" placeholder="如 10.0.0.8 / nms.corp.local"></div>
+    <div class="col-md-1"><label class="form-label small">端口</label>
+      <input class="form-control form-control-sm" id="snmp_port" value="162"></div>
+    <div class="col-md-2"><label class="form-label small">Community</label>
+      <input class="form-control form-control-sm" id="snmp_community" value="public"></div>
+    <div class="col-md-2"><label class="form-label small">企业 OID</label>
+      <input class="form-control form-control-sm" id="snmp_enterprise" value="1.3.6.1.4.1.60000"></div>
+    <div class="col-md-2 text-end">
+      <button class="btn btn-primary btn-sm" id="snmpSaveBtn">保存</button>
+      <button class="btn btn-outline-secondary btn-sm" id="snmpTestBtn">发测试 Trap</button>
+    </div>
+  </div>
+  <span class="form-text text-muted" id="snmp_result"></span>
+</div>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  const $ = (id) => document.getElementById(id);
+  fetch("/api/snmp/config", { credentials: "include" }).then(r => r.json()).then((d) => {
+    const c = (d.data || {});
+    $("snmp_enabled").checked = !!c.enabled;
+    $("snmp_target").value = c.target || "";
+    $("snmp_port").value = c.port || 162;
+    $("snmp_community").value = c.community || "public";
+    $("snmp_enterprise").value = c.enterprise || "1.3.6.1.4.1.60000";
+  }).catch(() => {});
+  const payload = () => ({
+    enabled: $("snmp_enabled").checked, target: $("snmp_target").value.trim(),
+    port: parseInt($("snmp_port").value) || 162, community: $("snmp_community").value.trim() || "public",
+    enterprise: $("snmp_enterprise").value.trim() || "1.3.6.1.4.1.60000",
+  });
+  $("snmpSaveBtn")?.addEventListener("click", async () => {
+    const r = await (await fetch("/api/snmp/config", {
+      method: "POST", credentials: "include",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload()),
+    })).json();
+    $("snmp_result").textContent = r.success ? "已保存" : (r.message || "保存失败");
+    $("snmp_result").className = "form-text " + (r.success ? "text-success" : "text-danger");
+  });
+  $("snmpTestBtn")?.addEventListener("click", async () => {
+    const r = await (await fetch("/api/snmp/test", {
+      method: "POST", credentials: "include",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload()),
+    })).json();
+    $("snmp_result").textContent = r.success
+      ? ("测试 trap 已发出（" + (r.data.bytes || 0) + " 字节 → " + (r.data.target || "") + "），请在网管侧确认接收")
+      : ("发送失败: " + (r.message || (r.data || {}).detail || "未知"));
+    $("snmp_result").className = "form-text " + (r.success ? "text-success" : "text-danger");
+  });
+});
+</script>

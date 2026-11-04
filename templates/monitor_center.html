@@ -1,0 +1,172 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title">备份任务监控</div>
+    <div class="page-sub">作业健康总览 · 失败任务分诊（连续失败/未按计划执行/RPO 逾期）· 最近执行流</div>
+  </div>
+  <label class="form-check form-switch mt-2 me-2">
+    <input class="form-check-input" type="checkbox" id="jmAuto" checked>
+    <label class="form-check-label small" for="jmAuto">30 秒自动刷新</label>
+  </label>
+  <button class="btn btn-outline-secondary btn-sm" onclick="loadJobMonitor()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+</div>
+
+<div class="row g-3 stat-cards">
+  <div class="col">
+    <div class="page-card p-3">
+      <div class="small text-muted">今日成功</div>
+      <div class="fs-3 fw-bold text-success" id="jmSuccess">-</div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="page-card p-3">
+      <div class="small text-muted">今日失败</div>
+      <div class="fs-3 fw-bold text-danger" id="jmFailed">-</div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="page-card p-3">
+      <div class="small text-muted">执行中任务</div>
+      <div class="fs-3 fw-bold text-info" id="jmRunning">-</div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="page-card p-3">
+      <div class="small text-muted">需要关注</div>
+      <div class="fs-3 fw-bold text-warning" id="jmAttention">-</div>
+    </div>
+  </div>
+  <div class="col">
+    <div class="page-card p-3">
+      <div class="small text-muted">任务总数（启用/全部）</div>
+      <div class="fs-4 fw-bold" id="jmTasks">-</div>
+    </div>
+  </div>
+</div>
+
+<div class="page-card mt-3">
+  <div class="card-section-title"><i class="bi bi-exclamation-triangle"></i> 需要关注的任务（失败分诊）</div>
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>#</th><th>任务</th><th>目标</th><th>最近执行</th><th>最近成功</th>
+        <th>关注原因</th><th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="jmAttentionTable"></tbody>
+    </table>
+  </div>
+  <div id="jmAttPager"></div>
+</div>
+
+<div class="page-card mt-3">
+  <div class="card-section-title"><i class="bi bi-list-check"></i> 最近执行流</div>
+  <div class="table-responsive" style="flex:1">
+    <table class="table table-hover align-middle mb-0">
+      <thead><tr>
+        <th>任务</th><th>状态</th><th>开始时间</th><th>耗时</th><th>大小</th><th>说明</th>
+      </tr></thead>
+      <tbody id="jmRecentTable"></tbody>
+    </table>
+  </div>
+  <div id="jmPager"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
+    c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const fmtBytes = (n) => {
+    n = Number(n) || 0;
+    for (const u of ["B", "KB", "MB", "GB", "TB"]) {
+      if (n < 1024 || u === "TB") return n.toFixed(1) + u;
+      n /= 1024;
+    }
+  };
+  const statusPill = (st) => {
+    const map = { success: ["badge-ok", "成功"], failed: ["badge-fail", "失败"],
+      running: ["badge-run", "运行中"] };
+    const m = map[st] || ["badge-sim", st || "-"];
+    return '<span class="badge ' + m[0] + '">' + m[1] + "</span>";
+  };
+
+  function render(d) {
+    $("jmSuccess").textContent = d.today.success;
+    $("jmFailed").textContent = d.today.failed;
+    $("jmRunning").textContent = d.today.running;
+    $("jmAttention").textContent = d.attention.length;
+    $("jmTasks").textContent = d.enabled_total + " / " + d.task_total;
+
+    const kindLabel = { consecutive_fail: ["连续失败", "bg-danger"],
+      missed: ["未按计划执行", "bg-warning text-dark"],
+      stale: ["长期未成功", "bg-warning text-dark"],
+      never_ran: ["从未执行", "bg-secondary"] };
+    const pgAtt = Pager.slice("jmatt", d.attention, 10);
+    $("jmAttentionTable").innerHTML = d.attention.length
+      ? pgAtt.list.map((a, i) => {
+          const badges = a.reasons.map(r => {
+            const m = kindLabel[r.kind] || [r.kind, "bg-secondary"];
+            return '<span class="badge ' + m[1] + ' me-1" title="' + esc(r.note) + '">' +
+              m[0] + (r.kind === "consecutive_fail" ? "×" + a.consecutive_fail : "") + "</span>";
+          }).join(" ");
+          return "<tr>" +
+            "<td>" + (pgAtt.startNo + i) + "</td>" +
+            '<td><a href="/tasks?focus=' + a.task_id + '">' + esc(a.name) + "</a></td>" +
+            '<td class="small">' + esc(a.db_type) + " @ " + esc(a.host) + ":" + esc(a.port) +
+              (a.db_name ? "/" + esc(a.db_name) : "") + "</td>" +
+            '<td class="small text-muted">' + esc(a.last_run_at || "-") + "</td>" +
+            '<td class="small text-muted">' + esc(a.last_success_at || "从未成功") + "</td>" +
+            "<td>" + badges + "</td>" +
+            '<td class="text-end btn-row">' +
+              '<button class="btn btn-sm btn-outline-primary" onclick="jmRun(' + a.task_id + ')">立即备份</button>' +
+            "</td></tr>";
+        }).join("")
+      : '<tr><td colspan="7" class="text-center text-muted py-4">所有任务运行正常，无需关注</td></tr>';
+    Pager.attach("jmatt", $("jmAttPager"), pgAtt.page, pgAtt.pages, pgAtt.total,
+      () => render(d));
+
+    const pg = Pager.slice("jmrec", d.recent);
+    $("jmRecentTable").innerHTML = pg.list.length ? pg.list.map(r =>
+      "<tr>" +
+      '<td class="small">' + esc(r.task_name) + "</td>" +
+      "<td>" + statusPill(r.status) + "</td>" +
+      '<td class="small text-muted">' + esc(r.started_at || "-") + "</td>" +
+      '<td class="small">' + (r.duration_sec != null ? Number(r.duration_sec).toFixed(1) + "s" : "-") + "</td>" +
+      '<td class="small">' + fmtBytes(r.size_bytes) + "</td>" +
+      '<td class="small text-muted text-truncate" style="max-width:280px" title="' +
+        esc(r.message) + '">' + esc(r.message || "-") + "</td>" +
+      "</tr>").join("")
+      : '<tr><td colspan="6" class="text-center text-muted py-4">暂无执行记录</td></tr>';
+    Pager.attach("jmrec", $("jmPager"), pg.page, pg.pages, pg.total, window.loadJobMonitor);
+  }
+
+  async function refresh() {
+    try {
+      const r = await fetch("/api/job-monitor/summary", {
+        headers: { "Content-Type": "application/json" } });
+      const j = await r.json();
+      if (j.success) render(j.data);
+    } catch (e) { /* 下轮重试 */ }
+  }
+
+  window.loadJobMonitor = refresh;
+
+  window.jmRun = async function (taskId) {
+    try {
+      const r = await fetch("/api/tasks/" + taskId + "/run", { method: "POST",
+        headers: { "Content-Type": "application/json" } });
+      const j = await r.json();
+      if (window.toast) toast(j.success ? "已发起备份" : (j.message || "发起失败"),
+        !!j.success);
+      refresh();
+    } catch (e) { if (window.toast) toast(e.message, false); }
+  };
+
+  setInterval(() => { if ($("jmAuto") && $("jmAuto").checked) refresh(); }, 30000);
+  refresh();
+})();
+</script>
+{% endblock %}

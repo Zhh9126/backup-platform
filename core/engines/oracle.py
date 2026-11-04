@@ -225,6 +225,198 @@ class OracleEngine(BackupEngine):
             self.logger.warning("[%s] 查询远端 DATA_PUMP_DIR 失败: %s", self.task_name, e)
             return ""
 
+    # ---- 非归档应急热备（hot_copy，对标鼎甲 A6「Oracle 非归档在线热备」） ----
+
+    def _hot_copy_tablespaces(self) -> list:
+        """extra_options.hot_copy_tablespaces：指定表空间清单（空=全库）。"""
+        raw = (self.extra or {}).get("hot_copy_tablespaces") or ""
+        if isinstance(raw, str):
+            return [x.strip().upper() for x in raw.split(",") if x.strip()]
+        return [str(x).strip().upper() for x in raw if str(x).strip()]
+
+    def _hot_copy_dirs(self) -> tuple:
+        """返回 (备份目录, 时间戳)。备份目录取 extra.backup_dir，缺省 /tmp/hotcopy。"""
+        ts = self._timestamp()
+        bdir = ((self.extra or {}).get("backup_dir") or "/tmp/hotcopy").rstrip("/")
+        return bdir, ts
+
+    def _backup_hot_copy_remote(self, ssh_host, backup_type: BackupType) -> BackupResult:
+        """SSH 通道：sqlplus BEGIN/END BACKUP + cp 数据文件 + tar + 拉回。"""
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+        import shlex as _shlex
+        bdir, ts = self._hot_copy_dirs()
+        tss = self._hot_copy_tablespaces()
+        work = f"{bdir}/hotcopy_{ts}"
+        client = remote_dump._connect(ssh_host)
+        try:
+            sftp = client.open_sftp()
+            sql = ["SET PAGESIZE 0 FEEDBACK OFF HEADING OFF VERIFY OFF LINESIZE 400"]
+            if tss:
+                lst = ",".join("'" + t + "'" for t in tss)
+                sql.append("".join("ALTER TABLESPACE " + t + " BEGIN BACKUP;\n" for t in tss))
+                sql.append("SELECT f.name FROM v$datafile f JOIN v$tablespace t "
+                           "ON t.ts#=f.ts# WHERE t.name IN (" + lst + ");")
+            else:
+                sql.append("ALTER DATABASE BEGIN BACKUP;")
+                sql.append("SELECT name FROM v$datafile;")
+            sql += ["SELECT name FROM v$controlfile;",
+                    "SELECT value FROM v$parameter WHERE name='spfile';", "EXIT;"]
+            endsql = "SET PAGESIZE 0 FEEDBACK OFF\n" + (
+                "".join("ALTER TABLESPACE " + t + " END BACKUP;\n" for t in tss)
+                if tss else "ALTER DATABASE END BACKUP;\n") + "EXIT;\n"
+            sqlfile, endfile, shfile = ("/tmp/hc_%s.sql" % ts, "/tmp/hc_%s_end.sql" % ts,
+                                        "/tmp/hc_%s.sh" % ts)
+            try:
+                with sftp.open(sqlfile, "w") as f:
+                    f.write("\n".join(sql))
+                with sftp.open(endfile, "w") as f:
+                    f.write(endsql)
+                script = (
+                    "#!/bin/bash\n"
+                    "set -u\n"
+                    "W=" + _shlex.quote(work) + "\n"
+                    "mkdir -p \"$W\" || exit 4\n"
+                    "sqlplus -s '/ as sysdba' @" + _shlex.quote(sqlfile) +
+                    " > /tmp/hc_" + ts + ".list 2>&1\n"
+                    "rc1=$?\n"
+                    "if [ $rc1 -ne 0 ]; then echo SQLSTEP1_RC=$rc1; cat /tmp/hc_" + ts +
+                    ".list; exit 3; fi\n"
+                    "n=0\n"
+                    "while IFS= read -r f; do\n"
+                    "  f=$(echo \"$f\" | xargs)\n"
+                    "  case \"$f\" in /*) [ -f \"$f\" ] && cp -f \"$f\" \"$W/\" && n=$((n+1));; esac\n"
+                    "done < /tmp/hc_" + ts + ".list\n"
+                    "if [ \"$n\" -eq 0 ]; then echo NO_FILES_COPIED; cat /tmp/hc_" + ts +
+                    ".list; exit 5; fi\n"
+                    "ls -la \"$W\" > \"$W/manifest.txt\" 2>&1 || true\n"
+                    "sqlplus -s '/ as sysdba' @" + _shlex.quote(endfile) +
+                    " > /tmp/hc_" + ts + "_end.log 2>&1\n"
+                    "tar czf " + _shlex.quote(work + ".tar.gz") + " -C " +
+                    _shlex.quote(bdir) + " hotcopy_" + ts + " 2>/dev/null\n"
+                    "echo HOTCOPY_OK files=$n size=$(du -b " +
+                    _shlex.quote(work + ".tar.gz") + " | cut -f1)\n")
+                with sftp.open(shfile, "w") as f:
+                    f.write(script)
+                try:
+                    sftp.chmod(shfile, 0o755)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+            shell = remote_dump._wrap_login(
+                "su - " + self._resolve_check_user() + " -c " +
+                _shlex.quote("bash " + shfile))
+            out, err, rc = _ssh_exec_pipe(client, shell, timeout=7200)
+            text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+            if "HOTCOPY_OK" not in text:
+                # 兜底 END BACKUP（防悬挂在备份模式拖垮 redo）
+                try:
+                    _ssh_exec_pipe(client, remote_dump._wrap_login(
+                        "su - " + self._resolve_check_user() + " -c " +
+                        _shlex.quote("sqlplus -s '/ as sysdba' @" + endfile)),
+                        timeout=60)
+                except Exception:
+                    pass
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    message=("在线热备失败（远端 rc=%s）：%s" % (rc, (text or err)[-400:])))
+            n_files, size = 0, 0
+            for line in text.splitlines():
+                if line.startswith("HOTCOPY_OK"):
+                    for tok in line.split():
+                        if tok.startswith("files="):
+                            n_files = int(tok.split("=")[1])
+                        if tok.startswith("size="):
+                            size = int(tok.split("=")[1])
+            if size <= 0:
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                    message="在线热备产物为空（远端打包异常）")
+            local_path = os.path.join(self.storage_root,
+                                      "hotcopy_%s_%s.tar.gz" % ((self.task.get("db_name") or "orcl"), ts))
+            pulled = remote_dump.sftp_pull_resumable(
+                client, work + ".tar.gz", local_path, task=self.task,
+                db_type="oracle", label="oracle_hot_copy")
+            final = (pulled or {}).get("path") or local_path
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=os.path.abspath(final),
+                size_bytes=os.path.getsize(os.path.abspath(final)),
+                message=("在线热备完成：%d 个文件（表空间 %s），产物 %d KB。"
+                         "崩溃一致备份：恢复需整包替换文件后 startup"
+                         % (n_files, ",".join(tss) if tss else "全库",
+                            os.path.getsize(os.path.abspath(final)) // 1024)))
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def _backup_hot_copy_local(self, backup_type: BackupType) -> BackupResult:
+        """本机通道：平台与 Oracle 同机，subprocess 直跑同一流程。"""
+        import subprocess
+        import tarfile
+        bdir, ts = self._hot_copy_dirs()
+        tss = self._hot_copy_tablespaces()
+        work = "%s/hotcopy_%s" % (bdir, ts)
+        os.makedirs(work, exist_ok=True)
+        sql = ["SET PAGESIZE 0 FEEDBACK OFF HEADING OFF VERIFY OFF LINESIZE 400"]
+        if tss:
+            lst = ",".join("'" + t + "'" for t in tss)
+            sql.append("".join("ALTER TABLESPACE " + t + " BEGIN BACKUP;\n" for t in tss))
+            sql.append("SELECT f.name FROM v$datafile f JOIN v$tablespace t "
+                       "ON t.ts#=f.ts# WHERE t.name IN (" + lst + ");")
+        else:
+            sql.append("ALTER DATABASE BEGIN BACKUP;")
+            sql.append("SELECT name FROM v$datafile;")
+        sql += ["SELECT name FROM v$controlfile;",
+                "SELECT value FROM v$parameter WHERE name='spfile';", "EXIT;"]
+        sqlfile = "/tmp/hc_%s.sql" % ts
+        with open(sqlfile, "w") as f:
+            f.write("\n".join(sql))
+        try:
+            r1 = subprocess.run(["sqlplus", "-s", "/ as sysdba", "@" + sqlfile],
+                                capture_output=True, timeout=300)
+            files = []
+            for line in (r1.stdout or b"").decode("utf-8", "replace").splitlines():
+                line = line.strip()
+                if line.startswith("/") and os.path.isfile(line):
+                    files.append(line)
+            if not files:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    message=("在线热备失败：未获取到数据文件清单（检查 sysdba 权限） %s"
+                             % (r1.stdout or b"")[-200:]))
+            import shutil as _sh
+            for f_ in files:
+                _sh.copy2(f_, work)
+            endsql = "SET PAGESIZE 0 FEEDBACK OFF\n" + (
+                "".join("ALTER TABLESPACE " + t + " END BACKUP;\n" for t in tss)
+                if tss else "ALTER DATABASE END BACKUP;\n") + "EXIT;\n"
+            with open("/tmp/hc_%s_end.sql" % ts, "w") as f:
+                f.write(endsql)
+            subprocess.run(["sqlplus", "-s", "/ as sysdba", "@/tmp/hc_%s_end.sql" % ts],
+                           capture_output=True, timeout=120)
+            local_path = os.path.join(self.storage_root,
+                                      "hotcopy_%s_%s.tar.gz" % ((self.task.get("db_name") or "orcl"), ts))
+            with tarfile.open(local_path, "w:gz") as tf:
+                for fn in sorted(os.listdir(work)):
+                    tf.add(os.path.join(work, fn), arcname="hotcopy_" + ts + "/" + fn)
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=os.path.abspath(local_path),
+                size_bytes=os.path.getsize(local_path),
+                message=("在线热备完成：%d 个文件（表空间 %s）。崩溃一致备份，"
+                         "恢复需整包替换文件后 startup"
+                         % (len(files), ",".join(tss) if tss else "全库")))
+        except FileNotFoundError:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="本机通道未找到 sqlplus（本机无 Oracle 客户端，"
+                                        "请纳管 SSH 主机走远端通道）")
+
     def verify_record(self, record: dict, options: dict = None) -> BackupResult:
         """Oracle 恢复校验（真实恢复验证，非文件检查占位）。
 
@@ -816,6 +1008,15 @@ class OracleEngine(BackupEngine):
                 lambda ssh_host: self._backup_physical_remote(ssh_host, backup_type),
                 lambda: self._backup_physical(backup_type),
                 "Oracle 物理备份(RMAN)",
+            )
+        if self.backup_mode == BackupMode.HOT_COPY:
+            # 非归档应急热备（对标鼎甲 A6）：begin/end backup 文件拷贝，
+            # 免开归档免 RMAN。诚实边界：崩溃一致备份（恢复=整包替换文件后
+            # startup，崩溃恢复自动应用联机日志）；推荐尽快转储并做恢复校验。
+            return self._try_remote_then_local(
+                lambda ssh_host: self._backup_hot_copy_remote(ssh_host, backup_type),
+                lambda: self._backup_hot_copy_local(backup_type),
+                "Oracle 在线热备(begin backup 文件拷贝)",
             )
         return self._try_remote_then_local(
             lambda ssh_host: self._backup_logical_remote(ssh_host, backup_type),

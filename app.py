@@ -175,6 +175,15 @@ def create_app() -> Flask:
             "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
             "font-src 'self' data:; connect-src 'self'",
         )
+        # HTML 页面禁缓存（2026-11-04 用户反馈：报表中心改完仍显示旧页面）：
+        # 模板是动态页面，页面壳被浏览器缓存会导致服务端模板修复
+        # （如"进入页面自动加载"）对用户永远不生效。静态资源有独立
+        # ?v= 缓存戳，不受影响。
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if "text/html" in ctype and request.method == "GET":
+            resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            resp.headers["Pragma"] = "no-cache"
+            resp.headers["Expires"] = "0"
         return resp
 
     # API 双前缀注册（差异 G5）：
@@ -232,9 +241,18 @@ def create_app() -> Flask:
                 import core.rbac as rbac
                 # 启动种子（首次部署 users 表为空时建超管）
                 rbac.seed_admin_if_empty()
+                # 三员配套：账号级锁定检查（连续失败达阈值锁 15 分钟）
+                locked, remain = rbac.account_locked(u)
+                if locked:
+                    if is_json:
+                        return jsonify({"error":
+                            f"账号已被锁定（连续登录失败），请 {max(1, remain // 60) + 1} 分钟后再试"}), 429
+                    return render_template("login.html",
+                        error=f"账号已被锁定（连续登录失败），请 {max(1, remain // 60) + 1} 分钟后再试")
                 user_row = rbac.get_by_username(u, include_disabled=False)
                 if user_row:
                     if not rbac.verify_password(p, user_row.get("password_hash") or ""):
+                        rbac.record_login_failure(u)
                         user_row = None
             except Exception:
                 user_row = None
@@ -263,6 +281,7 @@ def create_app() -> Flask:
                     if user_row.get("id"):
                         import core.rbac as rbac
                         rbac.record_login(user_row["id"], ip)
+                        rbac.reset_login_failures(user_row.get("username") or u)
                 except Exception:
                     pass
                 if is_json:
@@ -355,6 +374,18 @@ def create_app() -> Flask:
     @login_required
     def inspection_page():
         return render_template("inspection.html", page="inspection")
+
+    @app.route("/monitor")
+    @login_required
+    def monitor_center_page():
+        """备份任务监控中心（作业健康/连续失败/未按计划执行/RPO 逾期，对标 Commvault/Veeam 作业监控）。"""
+        return render_template("monitor_center.html", page="monitor")
+
+    @app.route("/screen")
+    @login_required
+    def screen_page():
+        """运维大屏（只读，10 秒自动刷新，适合监控室投屏）。"""
+        return render_template("screen.html")
 
     @app.route("/reports")
     @login_required

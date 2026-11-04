@@ -74,7 +74,8 @@ class CloneService:
                       target_host: str = "127.0.0.1",
                       target_password: str = "",
                       clone_mode: str = "logical",
-                      live_source_db: str = "") -> dict:
+                      live_source_db: str = "",
+                      purpose: str = "test") -> dict:
         """提交克隆申请。
 
         clone_mode：
@@ -82,6 +83,10 @@ class CloneService:
         - template：PostgreSQL 模板库 COW 秒级克隆（live_source_db=同实例源库名）
         - snapshot：MySQL LVM 快照秒级克隆（源 datadir 须在 LVM 卷上）
         - schema：Oracle expdp/impdp REMAP schema 克隆（live_source_db=源 schema）
+
+        purpose：用途标记（test/dev/staging/emergency）。emergency=应急接管
+        （B3 对标鼎甲「自动灾难恢复一键激活」）：生产故障时从最新备份拉起的
+        克隆库可临时承载业务，配合「接管检查」验证就绪状态。
 
         免审批直通（默认，业界 VDB 标准打法，借鉴 Delphix/Neon）：
         1) 建 clone_request(pending)
@@ -119,6 +124,7 @@ class CloneService:
             "target_host": target_host,
             "target_password": target_password or "",
             "status": STATUS_PENDING,
+            "purpose": (purpose or "test").strip() or "test",
             "requested_by": requested_by,
             "note": note,
         })
@@ -262,6 +268,123 @@ class CloneService:
         self.logger.info("[clone] 请求 #%s 已到期自动销毁", request_id)
         return self.get_clone(request_id)
 
+    def takeover_check(self, request_id: int, operator: str = "") -> dict:
+        """应急接管就绪检查（B3，对标鼎甲「自动灾难恢复一键激活」）。
+
+        对 ready 的克隆库做业务承载就绪验证：VDB 状态 / 原生直连 / 表数量 /
+        行数抽样（首表前 5 行计数）。全部通过=克隆库可临时承载业务读流量；
+        写流量接管需应用侧切换连接串（如实说明，不伪装自动切流）。
+        结果写入审计日志与请求 note。
+        """
+        import time as _t
+        req = self.get_clone(request_id)
+        if not req:
+            raise ValueError(f"克隆请求不存在: {request_id}")
+        if req.get("status") != STATUS_READY:
+            raise ValueError("仅就绪（ready）状态的克隆库可做接管检查")
+        # 连接信息从 vdb_instances 取（get_clone 是原始行，无 join 字段）
+        vrow = db.query_one(
+            "SELECT host, port, database_name, username FROM vdb_instances "
+            "WHERE id=?", (req.get("vdb_instance_id"),))
+        if not vrow:
+            raise ValueError("克隆库连接信息缺失（vdb 实例不存在）")
+        vdb_host = vrow["host"]
+        vdb_port = vrow["port"]
+        vdb_db = vrow["database_name"]
+        vdb_user = vrow["username"]
+        if not (vdb_host and vdb_port and vdb_db):
+            raise ValueError("克隆库连接信息缺失（vdb 实例未就绪）")
+        from core import native_conn
+        src_type = (req.get("source_db_type") or "mysql").lower()
+        checks = []
+        t0 = _t.time()
+        ok_all = True
+        # 密码：优先 vdb 实例拉起时的真实密码（加密存储），回退 target_password
+        from core.models import get_clone_request as _get_req
+        req_full = _get_req(request_id, include_secret=True) or {}
+        vprow = db.query_one("SELECT password FROM vdb_instances WHERE id=?",
+                             (req.get("vdb_instance_id"),))
+        vdb_pw = ""
+        if vprow and vprow.get("password"):
+            raw = vprow["password"]
+            try:
+                vdb_pw = db.decrypt_secret(raw) or ""
+            except Exception:
+                vdb_pw = raw
+        if not vdb_pw:
+            try:
+                vdb_pw = db.decrypt_secret(req_full.get("target_password") or "") or ""
+            except Exception:
+                vdb_pw = req_full.get("target_password") or ""
+        try:
+            conn = native_conn.connect(
+                src_type, vdb_host, int(vdb_port), vdb_db,
+                vdb_user or "", vdb_pw, timeout=15)
+            try:
+                cur = conn.cursor()
+                try:
+                    cur.execute("SELECT 1")
+                    checks.append(("connectivity", True, "克隆库直连成功"))
+                    n_tables = 0
+                    first_rows = None
+                    if src_type in ("mysql", "mariadb", "tidb", "oceanbase"):
+                        cur.execute("SELECT count(*) FROM information_schema.tables "
+                                    "WHERE table_schema=%s", (vdb_db,))
+                        n_tables = int(cur.fetchone()[0])
+                        if n_tables:
+                            cur.execute("SELECT table_name FROM information_schema.tables "
+                                        "WHERE table_schema=%s AND table_type='BASE TABLE' LIMIT 1",
+                                        (vdb_db,))
+                            r = cur.fetchone()
+                            if r:
+                                fq = "`%s`.`%s`" % (vdb_db.replace("`", "``"),
+                                                    str(r[0]).replace("`", "``"))
+                                cur.execute("SELECT count(*) FROM %s" % fq)
+                                first_rows = int(cur.fetchone()[0])
+                    else:  # PG 系 / Oracle schema
+                        q = ("SELECT count(*) FROM information_schema.tables "
+                             "WHERE table_schema=%s" if src_type not in ("oracle",)
+                             else "SELECT count(*) FROM all_tables WHERE owner=UPPER(:1)")
+                        try:
+                            cur.execute(q, (vdb_db,))
+                            n_tables = int(cur.fetchone()[0])
+                        except Exception:
+                            cur.execute("SELECT count(*) FROM information_schema.tables")
+                            n_tables = int(cur.fetchone()[0])
+                    checks.append(("tables", n_tables > 0,
+                                   "表数量 %d" % n_tables))
+                    if first_rows is not None:
+                        checks.append(("sample_rows", True,
+                                       "首表行数 %d" % first_rows))
+                finally:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            ok_all = False
+            checks.append(("connectivity", False, "克隆库直连失败: %s" % str(e)[:150]))
+        ok_all = ok_all and all(c[1] for c in checks)
+        dur = round(_t.time() - t0, 2)
+        summary = "接管检查%s（%.1fs）：%s" % (
+            "通过" if ok_all else "未通过", dur,
+            "; ".join("%s=%s" % (n, m) for n, ok, m in checks))
+        note = ((req.get("note") or "") + "\n" if req.get("note") else "") + \
+            "[接管检查 %s] %s（操作者 %s）" % (
+                _t.strftime("%Y-%m-%d %H:%M", _t.localtime()), summary,
+                operator or "unknown")
+        models.update_clone_request(request_id, {"note": note})
+        db.add_log("INFO" if ok_all else "WARNING", "clone",
+                   "克隆 #%s 应急接管检查：%s" % (request_id, summary))
+        return {"ok": ok_all, "checks": [
+            {"item": n, "pass": bool(ok), "message": m} for n, ok, m in checks],
+            "duration_sec": dur, "summary": summary}
+
     def expire_due_clones(self) -> list:
         """扫描到期（expires_at <= now）的 ready/creating 克隆并自动销毁。供 scheduler 调用。"""
         due = db.query(
@@ -380,6 +503,13 @@ class CloneService:
         target_host = (req.get("target_host") or "127.0.0.1").strip() or "127.0.0.1"
         port = 3306 if db_type in ("mysql", "mariadb") else (
             5432 if db_type == "postgresql" else 0)
+        # target_host 支持 host:port 形式（B3 应急接管/自定义实例端口）
+        if ":" in target_host:
+            _th, _tp = target_host.rsplit(":", 1)
+            if _tp.isdigit() and _th:
+                target_host, port = _th, int(_tp)
+                req = dict(req)
+                req["target_host"] = target_host  # vdb 注册存纯主机名
         user = "root" if db_type in ("mysql", "mariadb") else (
             "postgres" if db_type == "postgresql" else "")
         # 连接密码：目标实例密码优先，未填则沿用源任务密码
@@ -427,6 +557,7 @@ class CloneService:
             "host": req.get("target_host") or "127.0.0.1",
             "database_name": name,
             "username": user,
+            "password": db.encrypt_secret(password or "") if password else "",
             "status": "ready",
             "created_at": db.now_iso(),
             "expires_at": _compute_expires(_default_ttl_days()),

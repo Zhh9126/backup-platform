@@ -580,11 +580,40 @@
     await loadJdbcDrivers();
   }
 
+  // 页面注册元数据缓存（可注册库型模板）
+  let JDBC_TEMPLATES = [];
+
+  async function loadJdbcRegistry() {
+    try {
+      const data = await api("GET", "/api/jdbc/registry");
+      JDBC_TEMPLATES = data.templates || [];
+      fillJdbcTestTypes();
+    } catch (e) { /* 不阻断驱动列表 */ }
+  }
+
+  // 直连测试下拉动态填充：内置库型 + 页面注册的库型（如 SQL Server）
+  function fillJdbcTestTypes() {
+    const sel = $("jdbcTestType");
+    if (!sel || !JDBC_TEMPLATES.length) return;
+    const cur = sel.value;
+    sel.innerHTML = JDBC_TEMPLATES.map((t) =>
+      '<option value="' + esc(t.db_type) + '">' + esc(t.label) + "</option>").join("");
+    if (cur && JDBC_TEMPLATES.some((t) => t.db_type === cur)) sel.value = cur;
+  }
+
   async function loadJdbcDrivers() {
     const body = $("jdbcDriverBody");
     if (!body) return;
     try {
-      const data = await api("GET", "/api/jdbc/drivers");
+      const [data, reg] = await Promise.all([
+        api("GET", "/api/jdbc/drivers"),
+        api("GET", "/api/jdbc/registry").catch(() => ({})),
+      ]);
+      if (reg && reg.templates) {
+        JDBC_TEMPLATES = reg.templates;
+        fillJdbcTestTypes();
+      }
+      const userReg = (reg && reg.user_registry) || {};
       const list = data.drivers || [];
       const cnt = $("jdbcDriverCount");
       if (cnt) cnt.textContent = list.length;
@@ -592,16 +621,35 @@
         body.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-3">暂无驱动，点击右上角"上传驱动 jar"上传</td></tr>';
         return;
       }
+      const tmplOpts = (selected) => JDBC_TEMPLATES.map((t) =>
+        '<option value="' + esc(t.db_type) + '"' + (t.db_type === selected ? " selected" : "")
+        + ">" + esc(t.label) + "</option>").join("");
       body.innerHTML = list.map((d) => {
         const size = (d.size >= 1048576) ? (d.size / 1048576).toFixed(1) + " MB" : (d.size / 1024).toFixed(1) + " KB";
+        const bound = d.bound_db_types || [];
+        const boundLabel = bound.map((bt) => {
+          const t = JDBC_TEMPLATES.find((x) => x.db_type === bt);
+          return esc((t && t.label) || bt);
+        }).join("、");
+        const userBound = bound.some((bt) => userReg[bt]);
         const badge = d.registered
-          ? '<span class="badge bg-success">已注册</span>'
+          ? '<span class="badge bg-success" title="绑定到: ' + esc(bound.join(", ")) + '">已注册'
+            + (boundLabel ? " · " + boundLabel : "") + "</span>"
+            + (userBound
+              ? ' <button class="btn btn-sm btn-outline-secondary border-0 text-muted p-0 ms-1" data-unreg="'
+                + esc(bound.find((bt) => userReg[bt])) + '" title="解除页面注册绑定（内置库型回退内置配置）">解除</button>'
+              : "")
           : '<span class="badge bg-secondary">未注册</span>';
+        const regCtl = d.registered ? "" :
+          ' <span class="d-inline-flex gap-1 align-items-center ms-1">'
+          + '<select class="form-select form-select-sm" style="width:110px;" data-reg-sel="' + esc(d.name) + '">'
+          + tmplOpts("sqlserver") + "</select>"
+          + '<button class="btn btn-sm btn-outline-success" data-reg="' + esc(d.name) + '" title="把该 jar 绑定到所选数据库类型（覆盖该类型现有绑定）"><i class="bi bi-check-lg"></i> 注册</button></span>';
         return '<tr>'
           + '<td><i class="bi bi-filetype-jar text-info me-1"></i>' + esc(d.name) + "</td>"
           + "<td>" + size + "</td>"
           + '<td class="text-muted">' + (d.mtime_h || "") + "</td>"
-          + "<td>" + badge + "</td>"
+          + "<td>" + badge + regCtl + "</td>"
           + '<td class="text-end">'
           + '<a class="btn btn-sm btn-outline-primary" href="/api/jdbc/drivers/' + encodeURIComponent(d.name) + '/download" download title="下载 jar"><i class="bi bi-download"></i> 下载</a> '
           + '<button class="btn btn-sm btn-outline-danger" data-del="' + encodeURIComponent(d.name) + '" title="删除 jar"><i class="bi bi-trash"></i></button>'
@@ -617,6 +665,35 @@
             await loadJdbcDrivers();
           } catch (e) {
             toast("删除失败：" + (e.message || e), "danger");
+          }
+        });
+      });
+      $$("#jdbcDriverBody button[data-reg]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const name = btn.dataset.reg;
+          const sel = body.querySelector('select[data-reg-sel="' + CSS.escape(name) + '"]');
+          const dbType = sel ? sel.value : "";
+          if (!dbType) { toast("请先选择要绑定的数据库类型", "warning"); return; }
+          try {
+            const r = await api("POST", "/api/jdbc/drivers/" + encodeURIComponent(name) + "/register",
+                                { db_type: dbType });
+            toast(r.message || "注册成功", "success");
+            await Promise.all([loadJdbcDrivers(), loadJdbcRegistry()]);
+          } catch (e) {
+            toast("注册失败：" + (e.message || e), "danger");
+          }
+        });
+      });
+      $$("#jdbcDriverBody button[data-unreg]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const dbType = btn.dataset.unreg;
+          if (!confirm("解除 " + dbType + " 的页面注册绑定？（内置库型将回退到内置配置）")) return;
+          try {
+            await api("DELETE", "/api/jdbc/registry/" + encodeURIComponent(dbType));
+            toast("已解除 " + dbType + " 的注册绑定", "success");
+            await Promise.all([loadJdbcDrivers(), loadJdbcRegistry()]);
+          } catch (e) {
+            toast("解除失败：" + (e.message || e), "danger");
           }
         });
       });

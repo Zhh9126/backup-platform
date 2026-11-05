@@ -23,6 +23,7 @@ jpype1、jaydebeapi、本机 JDK（JRE 亦可）、drivers/ 下的驱动 jar（�
 from __future__ import annotations
 
 import os
+import json
 import re
 import time
 import threading
@@ -104,6 +105,143 @@ DRIVER_CONFIG = {
 # 使用 JDBC 的数据库类型（redis / mongodb 走 python 原生驱动，不需要 JDBC）
 JDBC_DB_TYPES = tuple(DRIVER_CONFIG.keys())
 
+# ---------------------------------------------------------------------------
+# 页面注册（用户上传 jar 后在页面绑定到库型，持久化到 instance/ 下 JSON）
+# ---------------------------------------------------------------------------
+
+# 已知库型的连接模板：注册时提供驱动类/URL 模板/探活 SQL 默认值。
+# jar 由注册条目决定，其余字段缺省取这里。
+KNOWN_DRIVER_TEMPLATES = {
+    "mysql": {"label": "MySQL", "class": "com.mysql.cj.jdbc.Driver",
+              "url": DRIVER_CONFIG["mysql"]["url"], "probe": "SELECT 1",
+              "list_sql": DRIVER_CONFIG["mysql"]["list_sql"],
+              "filter": list(DRIVER_CONFIG["mysql"]["filter"])},
+    "mariadb": {"label": "MariaDB", "class": "org.mariadb.jdbc.Driver",
+                "url": DRIVER_CONFIG["mariadb"]["url"], "probe": "SELECT 1",
+                "list_sql": DRIVER_CONFIG["mariadb"]["list_sql"],
+                "filter": list(DRIVER_CONFIG["mariadb"]["filter"])},
+    "postgresql": {"label": "PostgreSQL", "class": "org.postgresql.Driver",
+                   "url": DRIVER_CONFIG["postgresql"]["url"], "probe": "SELECT 1",
+                   "list_sql": DRIVER_CONFIG["postgresql"]["list_sql"],
+                   "filter": []},
+    "kingbase": {"label": "KingbaseES", "class": "com.kingbase8.Driver",
+                 "url": DRIVER_CONFIG["kingbase"]["url"], "probe": "SELECT 1",
+                 "list_sql": DRIVER_CONFIG["kingbase"]["list_sql"],
+                 "filter": [], "fallback_to_pg": True},
+    "oracle": {"label": "Oracle", "class": "oracle.jdbc.OracleDriver",
+               "url": DRIVER_CONFIG["oracle"]["url"],
+               "probe": "SELECT 1 FROM DUAL",
+               "list_sql": DRIVER_CONFIG["oracle"]["list_sql"], "filter": []},
+    "dameng": {"label": "达梦", "class": "dm.jdbc.driver.DmDriver",
+               "url": DRIVER_CONFIG["dameng"]["url"], "probe": "SELECT 1",
+               "list_sql": DRIVER_CONFIG["dameng"]["list_sql"],
+               "filter": list(DRIVER_CONFIG["dameng"]["filter"])},
+    "sqlserver": {"label": "SQL Server",
+                  "class": "com.microsoft.sqlserver.jdbc.SQLServerDriver",
+                  "url": ("jdbc:sqlserver://{host}:{port};databaseName={db};"
+                          "encrypt=false;trustServerCertificate=true;"
+                          "loginTimeout=8;socketTimeout=15"),
+                  "probe": "SELECT 1",
+                  "list_sql": ("SELECT name FROM sys.databases "
+                               "WHERE database_id > 4 ORDER BY 1"),
+                  "filter": []},
+}
+
+USER_REGISTRY_PATH = Path(__file__).resolve().parent.parent / "instance" / "jdbc_user_registry.json"
+
+
+def _load_user_registry() -> dict:
+    """读取用户页面注册的驱动绑定：{db_type: {jar/class/url/probe/list_sql/filter}}。"""
+    try:
+        if USER_REGISTRY_PATH.exists():
+            data = json.loads(USER_REGISTRY_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_user_registry(reg: dict) -> None:
+    USER_REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    USER_REGISTRY_PATH.write_text(
+        json.dumps(reg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def effective_config(db_type: str) -> dict:
+    """合并视图：用户页面注册覆盖内置 DRIVER_CONFIG。"""
+    reg = _load_user_registry().get(db_type)
+    if reg:
+        return dict(reg)
+    cfg = DRIVER_CONFIG.get(db_type)
+    return dict(cfg) if cfg else {}
+
+
+def effective_db_types() -> tuple:
+    """当前可用的 JDBC 库型（内置 ∪ 用户注册），保持内置顺序在前。"""
+    merged = list(DRIVER_CONFIG.keys())
+    for k in _load_user_registry().keys():
+        if k not in merged:
+            merged.append(k)
+    return tuple(merged)
+
+
+def register_driver(jar_name: str, db_type: str, driver_class: str = None,
+                    url: str = None) -> dict:
+    """把一个 jar 绑定到库型（页面注册）：覆盖该库型现有绑定（内置或用户）。
+
+    db_type 必须在 KNOWN_DRIVER_TEMPLATES 内（提供驱动类/URL 默认值）；
+    driver_class/url 可显式覆盖模板。
+    """
+    jar_name = _check_jar_name(jar_name)
+    db_type = (db_type or "").strip().lower()
+    tpl = KNOWN_DRIVER_TEMPLATES.get(db_type)
+    if not tpl:
+        raise ValueError(
+            f"不支持的库型: {db_type}（可注册: "
+            f"{', '.join(sorted(KNOWN_DRIVER_TEMPLATES))}）")
+    p = DRIVERS_DIR / jar_name
+    if not (p.exists() and p.stat().st_size > 100000):
+        raise ValueError(f"驱动文件不存在: {jar_name}")
+    reg = _load_user_registry()
+    entry = {
+        "jar": jar_name,
+        "class": (driver_class or "").strip() or tpl["class"],
+        "url": (url or "").strip() or tpl["url"],
+        "probe": tpl["probe"],
+        "list_sql": tpl["list_sql"],
+        "filter": tpl.get("filter") or [],
+        "label": tpl.get("label") or db_type,
+        "user_registered": True,
+        "registered_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    reg[db_type] = entry
+    _save_user_registry(reg)
+    return {"db_type": db_type, **entry}
+
+
+def unregister_driver(db_type: str) -> dict:
+    """解除库型的用户注册绑定（回退内置 DRIVER_CONFIG；内置库型回退后仍注册）。"""
+    db_type = (db_type or "").strip().lower()
+    reg = _load_user_registry()
+    if db_type not in reg:
+        raise ValueError(f"库型 {db_type} 没有用户注册绑定")
+    del reg[db_type]
+    _save_user_registry(reg)
+    return {"db_type": db_type, "unregistered": True,
+            "fallback_builtin": db_type in DRIVER_CONFIG}
+
+
+def jar_bound_db_types() -> dict:
+    """jar 文件名 → 绑定的库型列表（含内置与用户注册，供列表页展示）。"""
+    out: dict = {}
+    for db_type, cfg in DRIVER_CONFIG.items():
+        if cfg.get("jar"):
+            out.setdefault(cfg["jar"], []).append(db_type)
+    for db_type, cfg in _load_user_registry().items():
+        if cfg.get("jar"):
+            out.setdefault(cfg["jar"], []).append(db_type)
+    return out
+
 # 各类型默认端口（与引擎默认值对齐）
 DEFAULT_PORTS = {
     "mysql": 3306,
@@ -112,6 +250,7 @@ DEFAULT_PORTS = {
     "kingbase": 54321,
     "oracle": 1521,
     "dameng": 5236,
+    "sqlserver": 1433,
 }
 
 
@@ -313,10 +452,13 @@ def _ensure_jvm():
 # ---------------------------------------------------------------------------
 
 def _resolve_config(db_type):
-    """返回 (jar 路径, 驱动类, url 模板, probe_sql, list_sql, filter)。带 kingbase 降级。"""
-    cfg = DRIVER_CONFIG.get(db_type)
+    """返回 (jar 路径, 驱动类, url 模板, probe_sql, list_sql, filter)。带 kingbase 降级。
+
+    走合并视图（用户页面注册覆盖内置 DRIVER_CONFIG）。
+    """
+    cfg = effective_config(db_type)
     if not cfg:
-        raise ValueError(f"暂不支持 JDBC 连接类型: {db_type}（支持: {', '.join(JDBC_DB_TYPES)}）")
+        raise ValueError(f"暂不支持 JDBC 连接类型: {db_type}（支持: {', '.join(effective_db_types())}）")
 
     jar = DRIVERS_DIR / cfg["jar"]
     if not (jar.exists() and jar.stat().st_size > 100000):
@@ -375,7 +517,7 @@ def test_connection(db_type, host, port, db, user, password, timeout=15):
     t0 = time.monotonic()
     try:
         conn = connect(db_type, host, port, db, user, password, timeout=timeout)
-        cfg = DRIVER_CONFIG.get(db_type, {})
+        cfg = effective_config(db_type)
         probe = cfg.get("probe", "SELECT 1")
         cur = conn.cursor()
         cur.execute(probe)
@@ -390,7 +532,7 @@ def test_connection(db_type, host, port, db, user, password, timeout=15):
             "db": db,
             "user": user,
             "mode": "jdbc",
-            "driver_class": DRIVER_CONFIG.get(db_type, {}).get("class"),
+            "driver_class": cfg.get("class"),
             "latency_ms": ms,
             "probe_result": str(_to_py(row[0])) if row else "",
         }
@@ -428,21 +570,28 @@ def list_databases(db_type, host, port, db, user, password, timeout=30):
 
 
 def available_drivers():
-    """返回各 db_type 的 JDBC 驱动就绪状态。"""
+    """返回各 db_type 的 JDBC 驱动就绪状态（含用户页面注册的库型）。"""
     result = {}
-    for db_type, cfg in DRIVER_CONFIG.items():
+    for db_type in effective_db_types():
+        cfg = effective_config(db_type)
         jar = DRIVERS_DIR / cfg["jar"]
         ready = jar.exists() and jar.stat().st_size > 100000
         if not ready and cfg.get("fallback_to_pg") and db_type == "kingbase":
-            pg = DRIVER_CONFIG["postgresql"]
+            pg = effective_config("postgresql")
             ready = (DRIVERS_DIR / pg["jar"]).exists()
         result[db_type] = {
             "available": ready,
             "jar": cfg["jar"],
-            "driver_class": cfg["class"],
+            "driver_class": cfg.get("class"),
             "fallback": bool(cfg.get("fallback_to_pg")),
+            "user_registered": bool(cfg.get("user_registered")),
+            "label": cfg.get("label") or config_label(db_type),
         }
     return result
+
+
+def config_label(db_type: str) -> str:
+    return KNOWN_DRIVER_TEMPLATES.get(db_type, {}).get("label") or db_type
 
 
 # ---------------------------------------------------------------------------
@@ -458,9 +607,12 @@ _JAR_NAME_RE = _re.compile(r"^[A-Za-z0-9._\-]{1,200}\.jar$")
 
 
 def _registered_jar_names() -> set:
-    """返回 DRIVER_CONFIG 中所有 db_type 引用的 jar 文件名集合。"""
+    """返回已注册（内置 + 用户页面注册）引用的 jar 文件名集合。"""
     names = set()
     for cfg in DRIVER_CONFIG.values():
+        if cfg.get("jar"):
+            names.add(cfg["jar"])
+    for cfg in _load_user_registry().values():
         if cfg.get("jar"):
             names.add(cfg["jar"])
     return names
@@ -469,9 +621,10 @@ def _registered_jar_names() -> set:
 def list_driver_files() -> list:
     """列出 drivers/ 目录下所有 jar 文件及其元信息。
 
-    返回: [{"name", "size", "mtime", "registered", "mtime_h"}, ...]
+    返回: [{"name", "size", "mtime", "registered", "mtime_h", "bound_db_types"}, ...]
     """
     registered = _registered_jar_names()
+    bound = jar_bound_db_types()
     items: list = []
     if DRIVERS_DIR.exists():
         for jar in sorted(DRIVERS_DIR.glob("*.jar")):
@@ -483,6 +636,7 @@ def list_driver_files() -> list:
                 "mtime_h": time.strftime("%Y-%m-%d %H:%M:%S",
                                           time.localtime(st.st_mtime)),
                 "registered": jar.name in registered,
+                "bound_db_types": bound.get(jar.name, []),
             })
     return items
 

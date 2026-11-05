@@ -34,7 +34,7 @@ def jdbc_status():
         },
         "jvm": jdbc.jvm_info(),
         "drivers": jdbc.available_drivers(),
-        "db_types": list(jdbc.JDBC_DB_TYPES),
+        "db_types": list(jdbc.effective_db_types()),
     })
 
 
@@ -65,11 +65,14 @@ def _resolve_params(body: dict) -> dict:
     db_type = params["db_type"]
     if not db_type:
         raise ValueError("缺少 db_type")
-    if db_type not in jdbc.DRIVER_CONFIG:
+    # 页面注册的库型（如 SQL Server）同样可测——走合并视图而非仅内置 DRIVER_CONFIG
+    if db_type not in jdbc.effective_db_types():
         raise ValueError(f"暂不支持 JDBC 连接类型: {db_type}")
     params["host"] = params["host"] or "127.0.0.1"
     if params["port"] in (None, "", 0):
-        params["port"] = DEFAULT_PORTS.get(db_type, 0)
+        params["port"] = jdbc.DEFAULT_PORTS.get(db_type, 0)
+        if not params["port"]:
+            params["port"] = 1433 if db_type == "sqlserver" else 0
     return params
 
 
@@ -150,13 +153,62 @@ def jdbc_upload_driver():
         return jsonify({
             "success": True,
             "driver": info,
-            "message": f"已上传驱动 {info['name']}，"
-                       f"{'已注册到 DRIVER_CONFIG' if info['registered'] else '尚未注册，请在 DRIVER_CONFIG 中添加映射以启用'}",
+            "message": (f"已上传驱动 {info['name']}，"
+                        + ("已绑定到: " + ", ".join(info["bound_db_types"])
+                           if info.get("registered") and info.get("bound_db_types")
+                           else "请在下方列表点击「注册」绑定到数据库类型以启用")),
         })
     except ValueError as e:
         return jsonify({"success": False, "error": str(e)}), 400
     except Exception as e:
         return jsonify({"success": False, "error": f"上传失败: {e}"}), 500
+
+
+@api_bp.route("/jdbc/registry", methods=["GET"])
+@login_required
+def jdbc_registry_meta():
+    """页面注册元数据：可注册的库型模板清单 + 当前用户注册绑定。"""
+    return jsonify({
+        "success": True,
+        "templates": [
+            {"db_type": k, "label": v.get("label") or k,
+             "driver_class": v.get("class"),
+             "builtin": k in _jdbc.DRIVER_CONFIG}
+            for k, v in _jdbc.KNOWN_DRIVER_TEMPLATES.items()
+        ],
+        "user_registry": _jdbc._load_user_registry(),
+        "effective": _jdbc.available_drivers(),
+    })
+
+
+@api_bp.route("/jdbc/drivers/<name>/register", methods=["POST"])
+@login_required
+def jdbc_register_driver(name: str):
+    """页面注册：把上传的 jar 绑定到一个数据库类型（覆盖该类型现有绑定）。"""
+    data = request.get_json(silent=True) or {}
+    try:
+        info = _jdbc.register_driver(
+            name, data.get("db_type") or "",
+            driver_class=data.get("driver_class") or "",
+            url=data.get("url") or "")
+        return jsonify({"success": True, "registered": info,
+                        "message": f"驱动 {name} 已注册到 {info['db_type']}，"
+                                   "直连测试下拉已可用"})
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": f"注册失败: {e}"}), 500
+
+
+@api_bp.route("/jdbc/registry/<db_type>", methods=["DELETE"])
+@login_required
+def jdbc_unregister_driver(db_type: str):
+    """解除库型的用户注册绑定（内置库型回退到内置配置）。"""
+    try:
+        info = _jdbc.unregister_driver(db_type)
+        return jsonify({"success": True, **info})
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
 
 
 @api_bp.route("/jdbc/drivers/<name>/download", methods=["GET"])

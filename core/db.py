@@ -906,12 +906,14 @@ CREATE TABLE IF NOT EXISTS db_migration_plans (
     src_username   TEXT,
     src_password   TEXT,                     -- 加密存储
     src_db_name    TEXT NOT NULL,
+    src_schema     TEXT,                     -- 源 schema（Oracle/达梦：schema 即用户；缺省用 src_username）
     tgt_db_type    TEXT NOT NULL,
     tgt_host       TEXT NOT NULL,
     tgt_port       INTEGER,
     tgt_username   TEXT,
     tgt_password   TEXT,                     -- 加密存储
     tgt_db_name    TEXT NOT NULL,
+    tgt_schema     TEXT,                     -- 目标 schema（Oracle/达梦；缺省用 tgt_username）
     -- 迁移内容开关：structure(结构) / full(全量) / verify(校验)，JSON 数组
     migrate_types  TEXT DEFAULT '["structure","full","verify"]',
     status         TEXT DEFAULT 'created',   -- created|checking|migrating|verifying|completed|failed
@@ -1734,6 +1736,8 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                 ("inc_last_apply_at", "TEXT"),             # 最近一次增量投递时刻
                 ("verify_sample_rows", "INTEGER DEFAULT 100"),  # 校验抽样行数（0=关闭）
                 ("extra_options", "TEXT"),                 # 迁移扩展配置 JSON（对象迁移/排除表等，对标 KDTS）
+                ("src_schema", "TEXT"),                    # 源 schema（Oracle/达梦）
+                ("tgt_schema", "TEXT"),                    # 目标 schema（Oracle/达梦）
             ]:
                 try:
                     conn.execute(f"ALTER TABLE db_migration_plans ADD COLUMN {col} {typedef}")

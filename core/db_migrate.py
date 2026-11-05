@@ -157,20 +157,22 @@ class DbMigrationEngine:
                 extra = {}
         pid = db.execute(
             "INSERT INTO db_migration_plans (name, src_db_type, src_host, src_port,"
-            " src_username, src_password, src_db_name, tgt_db_type, tgt_host,"
-            " tgt_port, tgt_username, tgt_password, tgt_db_name, migrate_types,"
+            " src_username, src_password, src_db_name, src_schema, tgt_db_type, tgt_host,"
+            " tgt_port, tgt_username, tgt_password, tgt_db_name, tgt_schema, migrate_types,"
             " extra_options, status, current_phase, note, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (name, data["src_db_type"].strip(), data["src_host"].strip(),
              int(data.get("src_port") or 0) or None,
              (data.get("src_username") or "").strip(),
              _enc_secret(data.get("src_password") or ""),
              data["src_db_name"].strip(),
+             (data.get("src_schema") or "").strip() or None,
              data["tgt_db_type"].strip(), data["tgt_host"].strip(),
              int(data.get("tgt_port") or 0) or None,
              (data.get("tgt_username") or "").strip(),
              _enc_secret(data.get("tgt_password") or ""),
              data["tgt_db_name"].strip(),
+             (data.get("tgt_schema") or "").strip() or None,
              json.dumps(types),
              json.dumps(extra, ensure_ascii=False) if extra else None,
              ST_CREATED, None,
@@ -646,6 +648,9 @@ class DbMigrationEngine:
             "src_username": plan["src_username"],
             "src_password": plan["src_password"],
             "src_db_name": plan["src_db_name"],
+            # schema 透传（Oracle/达梦：schema 即用户，src_db_name 是服务名/实例名）
+            "src_schema": plan.get("src_schema") or "",
+            "tgt_schema": plan.get("tgt_schema") or "",
             "tgt_db_type": plan["tgt_db_type"],
             "tgt_host": plan["tgt_host"],
             "tgt_port": plan["tgt_port"],
@@ -1360,7 +1365,7 @@ class DbMigrationEngine:
                     tables = [r[0] for r in cur.fetchall()]
             finally:
                 conn.close()
-        elif db_type == "postgresql":
+        elif db_type in ("postgresql", "kingbase", "highgo", "uxdb"):
             import psycopg2
             conn = psycopg2.connect(
                 host=plan["src_host"], port=int(plan["src_port"] or 5432),
@@ -1374,6 +1379,47 @@ class DbMigrationEngine:
                     tables = [r[0] for r in cur.fetchall()]
             finally:
                 conn.close()
+        elif db_type in ("dameng", "oracle"):
+            # 达梦/Oracle：schema 即用户（src_schema 优先，缺省 src_username/db_name）
+            _owner = (plan.get("src_schema") or plan.get("src_username")
+                      or plan.get("src_db_name") or "").strip().upper()
+            try:
+                if db_type == "dameng":
+                    import dmPython
+                    conn = dmPython.connect(server=plan["src_host"],
+                                            port=int(plan["src_port"] or 5236),
+                                            user=plan["src_username"],
+                                            password=plan["src_password"] or "")
+                else:
+                    import oracledb
+                    conn = oracledb.connect(user=plan["src_username"],
+                                            password=plan["src_password"] or "",
+                                            dsn=f"{plan['src_host']}:{plan['src_port'] or 1521}"
+                                                f"/{plan['src_db_name']}")
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT table_name FROM all_tables WHERE owner='%s'"
+                                " ORDER BY table_name" % _owner.replace("'", "''"))
+                    tables = [str(r[0]) for r in cur.fetchall()]
+                finally:
+                    conn.close()
+                # ## 前缀为达梦会话级内部表（不可读"非法标识符"），剔除
+                tables = [t for t in tables if not t.startswith("##")]
+            except Exception:  # noqa: BLE001 - 原生驱动缺失时回退 JDBC
+                from core import jdbc as _jdbc
+                conn = _jdbc.connect(db_type, plan["src_host"],
+                                     int(plan["src_port"] or 0),
+                                     plan["src_db_name"] or "",
+                                     plan["src_username"],
+                                     plan["src_password"] or "")
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT table_name FROM all_tables WHERE owner='%s'"
+                                " ORDER BY table_name" % _owner.replace("'", "''"))
+                    tables = [str(r[0]) for r in cur.fetchall()]
+                finally:
+                    conn.close()
+                tables = [t for t in tables if not t.startswith("##")]
 
         results = []
         all_match = True
@@ -1398,12 +1444,24 @@ class DbMigrationEngine:
         if _excl:
             tables = [t for t in tables if t not in _excl]
         for tb in tables:
+            # schema 语义：达梦 src_db_name 即 schema；Oracle src_db_name 是服务名，
+            # 前缀必须取 src_schema；金仓/PG/MySQL 库隔离无前缀
+            if plan["src_db_type"].lower() == "oracle":
+                _src_schema = plan.get("src_schema") or ""
+            else:
+                _src_schema = plan.get("src_schema") or plan["src_db_name"]
+            if plan["tgt_db_type"].lower() == "oracle":
+                _tgt_schema = plan.get("tgt_schema") or ""
+            else:
+                _tgt_schema = plan.get("tgt_schema") or plan["tgt_db_name"]
             src_cnt = self._count_rows(plan["src_db_type"], plan["src_host"],
                                        plan["src_port"], plan["src_username"],
-                                       plan["src_password"], plan["src_db_name"], tb)
+                                       plan["src_password"], plan["src_db_name"], tb,
+                                       schema=_src_schema)
             tgt_cnt = self._count_rows(plan["tgt_db_type"], plan["tgt_host"],
                                        plan["tgt_port"], plan["tgt_username"],
-                                       plan["tgt_password"], plan["tgt_db_name"], tb)
+                                       plan["tgt_password"], plan["tgt_db_name"], tb,
+                                       schema=_tgt_schema)
             match = src_cnt == tgt_cnt
             entry = {"table": tb, "source_rows": src_cnt,
                      "target_rows": tgt_cnt, "match": match}
@@ -1535,17 +1593,35 @@ class DbMigrationEngine:
                 pass
 
     @staticmethod
-    def _count_rows(db_type, host, port, user, password, database, table) -> int:
+    def _count_rows(db_type, host, port, user, password, database, table,
+                    schema=None) -> int:
         db_type = (db_type or "").lower()
-        # 达梦 / Oracle / 金仓：JDBC 通道（驱动 jar 随离线包内置，零安装）
-        if db_type in ("dameng", "oracle", "kingbase"):
+        # 金仓/PG 系：原生直连（database 是库隔离语义，绝不能拼 "库"."表" 前缀
+        # ——此前 kingbase 走 JDBC 分支拼前缀，报 relation does not exist）
+        if db_type in ("kingbase", "postgresql", "highgo", "uxdb"):
+            import psycopg2
+            conn = psycopg2.connect(host=host, port=int(port or 5432), user=user,
+                                    password=password, dbname=database,
+                                    connect_timeout=5)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute('SELECT COUNT(*) FROM "{}"'.format(
+                        table.replace('"', "")))
+                    return int(cur.fetchone()[0])
+            finally:
+                conn.close()
+        # 达梦 / Oracle：JDBC 通道（驱动 jar 随离线包内置，零安装）
+        if db_type in ("dameng", "oracle"):
             from core import jdbc as _jdbc
             # 达梦/Oracle 未加引号标识符自动转大写，目标表由 writer
             # 按 _upper 建表 → 查询表名必须大写
             tbl = table.replace('"', "").upper()
+            # schema 前缀：达梦 src_db_name 即 schema；Oracle src_db_name 是
+            # 服务名，前缀必须用 schema（src_schema > username > db_name）
+            _owner = (schema or "").strip()
             q = f'"{tbl}"'
-            if database:
-                q = f'"{database.replace(chr(34), "")}".' + q
+            if _owner:
+                q = f'"{_owner.replace(chr(34), "")}".' + q
             sql = f"SELECT COUNT(*) FROM {q}"
             conn = _jdbc.connect(db_type, host, int(port or 0),
                                  database or "", user, password or "")

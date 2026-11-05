@@ -154,6 +154,9 @@ def _list_tables(conn, db_type: str, database: str, schema: str) -> list:
         else:
             raise ValueError(f"暂不支持列出 {db_type} 的表清单")
         names = [str(r[0]) for r in cur.fetchall()]
+        # ## 前缀是达梦会话级临时/内部表（如 ##HISTOGRAMS_TABLE），
+        # 不可读（"非法标识符"）也不可迁移，统一剔除
+        names = [n for n in names if not n.startswith("##")]
     finally:
         try:
             cur.close()

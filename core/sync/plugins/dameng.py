@@ -166,7 +166,10 @@ class DamengSourceReader(SourceReader):
                  "ORDER BY table_name", (schema,)),
             ], allow_user_view=(schema == _upper(self.config.src_username
                                                  or "")))
-            return [_s(r[0]) for r in rows]
+            # ## 前缀是达梦会话级临时/内部表（如 ##HISTOGRAMS_TABLE），
+            # 不可迁移也不可读（"非法标识符"），枚举时剔除
+            return [_s(r[0]) for r in rows
+                    if not str(r[0]).startswith("##")]
         finally:
             conn.close()
 

@@ -5895,7 +5895,7 @@
                        : dr.score > 0 ? '<span class="badge bg-danger">' + dr.score + '</span>'
                        : '-';
       return '<tr>' +
-        '<td>' + pg.startNo + dri + '</td>' +
+        '<td>' + (pg.startNo + dri) + '</td>' +
         '<td>' + esc(dr.name) + '</td>' +
         '<td>' + (dr.task_id ? esc(window._taskNames[dr.task_id] || dr.task_id) : '-') + '</td>' +
         '<td>' + esc(dr.drill_type === 'real_restore' ? '真实恢复' : dr.drill_type === 'full_recovery' ? '全量检查' : dr.drill_type === 'partial' ? '对象级' : '单表') + '</td>' +
@@ -7466,7 +7466,7 @@
         const golden = p.golden_backup_record_id ? String(p.golden_backup_record_id) : '-';
         const taskLabel = p.task_id ? (esc(p.task_name || ('# ' + p.task_id))) : '-';
         return '<tr>' +
-          '<td>' + pg.startNo + pi + '</td>' +
+          '<td>' + (pg.startNo + pi) + '</td>' +
           '<td>' + taskLabel + '</td>' +
           '<td><span class="badge bg-info">' + esc(p.stage || '-') + '</span></td>' +
           '<td>' + golden + '</td>' +
@@ -7632,7 +7632,7 @@
         const del = '<button class="btn btn-sm btn-outline-danger" onclick="deleteDbMigrate(' + p.id + ')">' +
           '<i class="bi bi-trash"></i> 删除</button>';
         return '<tr>' +
-          '<td>' + pg.startNo + pi + '</td>' +
+          '<td>' + (pg.startNo + pi) + '</td>' +
           '<td>' + esc(p.name) + '</td>' +
           '<td style="max-width:380px">' + link + '</td>' +
           '<td>' + esc(types) + '</td>' +
@@ -7945,7 +7945,7 @@
           : '';
         if (c.status === 'creating') provisioning = true;
         return '<tr>' +
-          '<td>' + pg.startNo + cii + '</td>' +
+          '<td>' + (pg.startNo + cii) + '</td>' +
           '<td>' + (c.task_name ? esc(c.task_name) + ' <span class="text-muted">(记录 ' + c.source_record_id + ')</span>' : (c.source_record_id != null ? c.source_record_id : '-')) + '</td>' +
           '<td>' + (c.source_db_type ? '<span class="badge bg-info">' + esc(c.source_db_type) + '</span>' : '-') + '</td>' +
           '<td>' + esc(c.target_env || '') + (c.purpose === 'emergency' ? ' <span class="badge bg-danger" title="应急接管">应急</span>' : '') + '</td>' +

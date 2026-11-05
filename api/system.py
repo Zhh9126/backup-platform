@@ -2,6 +2,8 @@
 """系统/仪表盘/调度/日志/元信息 API。"""
 import os
 import logging
+import threading
+import time as _time_mod
 from flask import jsonify, request, session
 import json
 
@@ -127,8 +129,29 @@ def _success_rate_24h(records: list) -> dict:
 
 
 _DASH_CACHE = {"ts": 0.0, "data": None}
-_DASH_TTL = 30  # 秒：仪表盘指标 30s 进程内缓存（运营态势/实时保护含上百次
-                # 逐任务状态查询，实测首帧 2s；高频刷新走缓存零等待）
+_DASH_TTL = 120  # 秒：仪表盘指标进程内缓存。过期后不再同步重算（冷算约 1-3s，
+                 # 用户进页面的体感是"转圈等好几秒"），改为 stale-while-revalidate：
+                 # 立即返回旧快照 + 后台线程重算刷新（首帧零等待）
+_DASH_RECALC = {"running": False}
+_DASH_LOCK = threading.Lock()
+
+
+def _dash_recalc_async():
+    """后台重算仪表盘快照（并发去重），完成后更新缓存。"""
+    def _job():
+        try:
+            payload = _dashboard_payload()
+            _DASH_CACHE["ts"] = _time_mod.time()
+            _DASH_CACHE["data"] = payload
+        except Exception:
+            logger.debug("仪表盘后台刷新失败", exc_info=True)
+        finally:
+            _DASH_RECALC["running"] = False
+    with _DASH_LOCK:
+        if _DASH_RECALC["running"]:
+            return
+        _DASH_RECALC["running"] = True
+    threading.Thread(target=_job, daemon=True).start()
 
 
 @api_bp.route("/dashboard", methods=["GET"])
@@ -137,6 +160,11 @@ def dashboard():
     import time as _time
     now = _time.time()
     if _DASH_CACHE["data"] is not None and now - _DASH_CACHE["ts"] < _DASH_TTL:
+        return jsonify(_DASH_CACHE["data"])
+    # 过期：有旧快照立即返回（stale）+ 后台重算（revalidate）——用户永远秒开；
+    # 仅服务刚启动无任何快照时才同步算一次
+    if _DASH_CACHE["data"] is not None:
+        _dash_recalc_async()
         return jsonify(_DASH_CACHE["data"])
     payload = _dashboard_payload()
     _DASH_CACHE["ts"] = now
@@ -480,27 +508,27 @@ def _insights(tasks, records, total_size):
         logger.debug("capacity 计算失败: %s", exc)
 
     # 7) 实时保护（CDP / 日志流）运行状态
+    # 仪表盘只需要计数 + top5 概览——直接查 rt_capture_state 一张表组装，
+    # 不走 monitor.of()（此前对每个 rt 任务逐个查询且各建 SQLite 连接，
+    # 79 任务约 0.5s，是仪表盘冷启动 3s+ 的主因之一）
     try:
-        from core import rt_backup
         rows = models.list_rt_tasks(only_enabled=True)
-        monitor = rt_backup.get_health_monitor()
+        state_rows = db.query(
+            "SELECT task_id, daemon_status, degrade_reason FROM rt_capture_state")
+        state_map = {int(r["task_id"]): r for r in state_rows}
         rt_items, running, degraded = [], 0, 0
         for row in rows:
             tid = int(row.get("id") or 0)
             if tid <= 0:
                 continue
-            try:
-                h = monitor.of(tid).to_dict()
-            except Exception:
-                h = {}
-            st = (h.get("daemon_status") or "").lower()
+            st = ((state_map.get(tid) or {}).get("daemon_status") or "").lower()
             if st == "running":
                 running += 1
             else:
                 degraded += 1
             rt_items.append({"task_id": tid, "name": row.get("name") or f"task_{tid}",
                              "status": st or "unknown",
-                             "reason": (h.get("degrade_reason") or "")[:120]})
+                             "reason": ((state_map.get(tid) or {}).get("degrade_reason") or "")[:120]})
         out["rt"] = {"total": len(rt_items), "running": running, "degraded": degraded,
                      "items": rt_items[:5]}
     except Exception as exc:

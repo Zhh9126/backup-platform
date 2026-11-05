@@ -108,7 +108,26 @@
   };
 
   document.getElementById("rcDays").addEventListener("change", loadReportCenter);
-  // 页面打开即加载（此前只定义未调用，首次进入停留在“加载中…”）
-  loadReportCenter();
+  // 页面打开即加载。此前在 DOM 解析期同步执行，个别环境（外层脚本未就绪/
+  // 首次 fetch 被导航竞争取消）会静默失败停留"加载中…"，手动刷新才能出来。
+  // 改为 DOMContentLoaded 后执行，且若各区仍是"加载中…"占位则自动重试一次。
+  (function () {
+    var _autoLoaded = false;
+    function _autoLoad() {
+      if (_autoLoaded) return;
+      _autoLoaded = true;
+      loadReportCenter().catch(function () {}).then(function () {
+        setTimeout(function () {
+          var rc = document.getElementById("rcByType");
+          if (rc && rc.textContent.indexOf("加载中") >= 0) loadReportCenter();
+        }, 1500);
+      });
+    }
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", _autoLoad);
+    } else {
+      _autoLoad();
+    }
+  })();
 </script>
 {% endblock %}

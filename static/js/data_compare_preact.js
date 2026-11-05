@@ -510,7 +510,7 @@ function ReportModal({ report, onClose, onRepaired }) {
                             <summary class="text-primary small">抽样差异（前 ${t.sample_diffs.length}）</summary>
                             <div class="small">
                               ${t.sample_diffs.map((d, i) => html`
-                                <div class="text-break" key=${i}>#${i + 1} 源: ${rowStr(d.source)} / 目标: ${rowStr(d.target)}</div>`)}
+                                <div class="text-break" key=${i}>差异 ${i + 1} 源: ${rowStr(d.source)} / 目标: ${rowStr(d.target)}</div>`)}
                             </div>
                           </details>`}
                       </div>

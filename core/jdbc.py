@@ -69,7 +69,8 @@ DRIVER_CONFIG = {
         "filter": (),
     },
     "kingbase": {
-        # 官方 kingbase8.jar 需从人大金仓官网获取；缺失时自动降级用 PG 驱动
+        # 官方 kingbase8.jar（Maven Central: cn.com.kingbase）已内置 drivers/，
+        # 缺失时自动降级用 PG 驱动
         "jar": "kingbase8-8.6.0.jar",
         "class": "com.kingbase8.Driver",
         "url": "jdbc:kingbase8://{host}:{port}/{db}?connectTimeout=8&socketTimeout=15",
@@ -77,6 +78,16 @@ DRIVER_CONFIG = {
         "list_sql": "SELECT datname FROM sys_database WHERE datistemplate = false ORDER BY 1",
         "filter": (),
         "fallback_to_pg": True,
+    },
+    "opengauss": {
+        # openGauss 官方 JDBC 为 PG 分叉：类仍在 org.postgresql 包，
+        # URL 前缀用 jdbc:opengauss://（Maven Central: org.opengauss:opengauss-jdbc）
+        "jar": "opengauss-jdbc-6.0.6.jar",
+        "class": "org.postgresql.Driver",
+        "url": "jdbc:opengauss://{host}:{port}/{db}?connectTimeout=8&socketTimeout=15",
+        "probe": "SELECT 1",
+        "list_sql": "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY 1",
+        "filter": (),
     },
     "oracle": {
         "jar": "ojdbc11-23.4.0.24.05.jar",
@@ -99,6 +110,56 @@ DRIVER_CONFIG = {
                      "ORDER BY 1"),
         # 注意：达梦的 SYSDBA 既是管理员又常被用作业务 schema，不能排除
         "filter": ("SYS", "SYSAUDITOR", "SYSSSO", "SYSDBAOPER", "CTISYS", "CJISYS"),
+    },
+    # ---------------- 2026-11-05 全库型驱动内置（Maven Central 官方包） ----------------
+    "clickhouse": {
+        "jar": "clickhouse-jdbc-0.3.2-patch11-all.jar",
+        "class": "com.clickhouse.jdbc.ClickHouseDriver",
+        "url": "jdbc:clickhouse://{host}:{port}/{db}",
+        "probe": "SELECT 1",
+        "list_sql": "SHOW DATABASES",
+        "filter": ("system", "INFORMATION_SCHEMA", "information_schema"),
+    },
+    "db2": {
+        "jar": "db2jcc-12.1.5.0.jar",
+        "class": "com.ibm.db2.jcc.DB2Driver",
+        "url": "jdbc:db2://{host}:{port}/{db}",
+        "probe": "SELECT 1 FROM SYSIBM.SYSDUMMY1",
+        "list_sql": "SELECT schemaname FROM syscat.schemata WHERE schemaname NOT LIKE 'SYS%' ORDER BY 1",
+        "filter": (),
+    },
+    "tdengine": {
+        # RestfulDriver 纯 Java（HTTP 6041），离线环境无需 libtaos.so 原生库
+        "jar": "taos-jdbcdriver-3.10.0.jar",
+        "class": "com.taosdata.jdbc.rs.RestfulDriver",
+        "url": "jdbc:TAOS-RS://{host}:{port}/",
+        "probe": "SELECT SERVER_VERSION()",
+        "list_sql": "SHOW DATABASES",
+        "filter": ("information_schema", "performance_schema", "log"),
+    },
+    "oceanbase": {
+        "jar": "oceanbase-client-2.4.19.jar",
+        "class": "com.oceanbase.jdbc.Driver",
+        "url": "jdbc:oceanbase://{host}:{port}/{db}",
+        "probe": "SELECT 1",
+        "list_sql": "SHOW DATABASES",
+        "filter": ("information_schema", "mysql", "sys", "oceanbase"),
+    },
+    "highgo": {
+        "jar": "HgdbJdbc-6.2.5.jar",
+        "class": "com.highgo.jdbc.Driver",
+        "url": "jdbc:highgo://{host}:{port}/{db}?connectTimeout=8&socketTimeout=15",
+        "probe": "SELECT 1",
+        "list_sql": "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY 1",
+        "filter": (),
+    },
+    "yashandb": {
+        "jar": "yashandb-jdbc-1.10.7.jar",
+        "class": "com.yashandb.jdbc.YasDriver",
+        "url": "jdbc:yasdb://{host}:{port}/{db}",
+        "probe": "SELECT 1 FROM DUAL",
+        "list_sql": "SELECT username FROM all_users ORDER BY 1",
+        "filter": ("SYS", "SYSTEM", "SYSAUDITOR", "SYSSSO"),
     },
 }
 
@@ -128,6 +189,10 @@ KNOWN_DRIVER_TEMPLATES = {
                  "url": DRIVER_CONFIG["kingbase"]["url"], "probe": "SELECT 1",
                  "list_sql": DRIVER_CONFIG["kingbase"]["list_sql"],
                  "filter": [], "fallback_to_pg": True},
+    "opengauss": {"label": "openGauss", "class": "org.postgresql.Driver",
+                  "url": DRIVER_CONFIG["opengauss"]["url"], "probe": "SELECT 1",
+                  "list_sql": DRIVER_CONFIG["opengauss"]["list_sql"],
+                  "filter": []},
     "oracle": {"label": "Oracle", "class": "oracle.jdbc.OracleDriver",
                "url": DRIVER_CONFIG["oracle"]["url"],
                "probe": "SELECT 1 FROM DUAL",
@@ -145,6 +210,52 @@ KNOWN_DRIVER_TEMPLATES = {
                   "list_sql": ("SELECT name FROM sys.databases "
                                "WHERE database_id > 4 ORDER BY 1"),
                   "filter": []},
+    "clickhouse": {"label": "ClickHouse", "class": "com.clickhouse.jdbc.ClickHouseDriver",
+                   "url": DRIVER_CONFIG["clickhouse"]["url"], "probe": "SELECT 1",
+                   "list_sql": DRIVER_CONFIG["clickhouse"]["list_sql"],
+                   "filter": list(DRIVER_CONFIG["clickhouse"]["filter"])},
+    "db2": {"label": "Db2", "class": "com.ibm.db2.jcc.DB2Driver",
+            "url": DRIVER_CONFIG["db2"]["url"], "probe": DRIVER_CONFIG["db2"]["probe"],
+            "list_sql": DRIVER_CONFIG["db2"]["list_sql"], "filter": []},
+    "tdengine": {"label": "TDengine", "class": "com.taosdata.jdbc.rs.RestfulDriver",
+                 "url": DRIVER_CONFIG["tdengine"]["url"],
+                 "probe": DRIVER_CONFIG["tdengine"]["probe"],
+                 "list_sql": DRIVER_CONFIG["tdengine"]["list_sql"], "filter": []},
+    "oceanbase": {"label": "OceanBase", "class": "com.oceanbase.jdbc.Driver",
+                  "url": DRIVER_CONFIG["oceanbase"]["url"], "probe": "SELECT 1",
+                  "list_sql": DRIVER_CONFIG["oceanbase"]["list_sql"],
+                  "filter": list(DRIVER_CONFIG["oceanbase"]["filter"])},
+    "highgo": {"label": "瀚高 HighGo", "class": "com.highgo.jdbc.Driver",
+               "url": DRIVER_CONFIG["highgo"]["url"], "probe": "SELECT 1",
+               "list_sql": DRIVER_CONFIG["highgo"]["list_sql"], "filter": []},
+    "yashandb": {"label": "崖山 YashanDB", "class": "com.yashandb.jdbc.YasDriver",
+                 "url": DRIVER_CONFIG["yashandb"]["url"],
+                 "probe": DRIVER_CONFIG["yashandb"]["probe"],
+                 "list_sql": DRIVER_CONFIG["yashandb"]["list_sql"],
+                 "filter": list(DRIVER_CONFIG["yashandb"]["filter"])},
+    # ---------------- 协议复用型（无独立官方 JDBC，用协议兼容驱动） ----------------
+    "gbase8a": {"label": "GBase 8a（MySQL 协议）", "class": "com.gbase.jdbc.Driver",
+                "url": "jdbc:gbase://{host}:{port}/{db}?useSSL=false&characterEncoding=utf8",
+                "probe": "SELECT 1", "list_sql": "SHOW DATABASES",
+                "filter": ["information_schema", "performance_schema", "mysql", "sys"]},
+    "gbase8s": {"label": "GBase 8s", "class": "com.gbasedbt.jdbc.Driver",
+                "url": "jdbc:gbasedbt-sqli://{host}:{port}/{db}:informixserver=gbaseserver",
+                "probe": "SELECT 1 FROM systables WHERE tabid = 1",
+                "list_sql": "SELECT name FROM sysmaster:sysdatabases",
+                "filter": []},
+    "greenplum": {"label": "Greenplum（PG 协议）", "class": "org.postgresql.Driver",
+                  "url": "jdbc:postgresql://{host}:{port}/{db}", "probe": "SELECT 1",
+                  "list_sql": DRIVER_CONFIG["postgresql"]["list_sql"], "filter": []},
+    "ivorysql": {"label": "IvorySQL（PG 协议）", "class": "org.postgresql.Driver",
+                 "url": "jdbc:postgresql://{host}:{port}/{db}", "probe": "SELECT 1",
+                 "list_sql": DRIVER_CONFIG["postgresql"]["list_sql"], "filter": []},
+    "tidb": {"label": "TiDB（MySQL 协议）", "class": "com.mysql.cj.jdbc.Driver",
+             "url": DRIVER_CONFIG["mysql"]["url"], "probe": "SELECT 1",
+             "list_sql": DRIVER_CONFIG["mysql"]["list_sql"],
+             "filter": ["information_schema", "performance_schema", "mysql", "sys"]},
+    "uxdb": {"label": "优炫 UXDB（PG 协议）", "class": "org.postgresql.Driver",
+             "url": "jdbc:postgresql://{host}:{port}/{db}", "probe": "SELECT 1",
+             "list_sql": DRIVER_CONFIG["postgresql"]["list_sql"], "filter": []},
 }
 
 USER_REGISTRY_PATH = Path(__file__).resolve().parent.parent / "instance" / "jdbc_user_registry.json"
@@ -248,9 +359,22 @@ DEFAULT_PORTS = {
     "mariadb": 3306,
     "postgresql": 5432,
     "kingbase": 54321,
+    "opengauss": 26000,
     "oracle": 1521,
     "dameng": 5236,
     "sqlserver": 1433,
+    "clickhouse": 8123,
+    "db2": 50000,
+    "tdengine": 6041,
+    "oceanbase": 2881,
+    "highgo": 5866,
+    "yashandb": 1688,
+    "gbase8a": 5258,
+    "gbase8s": 9088,
+    "greenplum": 5432,
+    "ivorysql": 5432,
+    "tidb": 4000,
+    "uxdb": 5432,
 }
 
 
@@ -430,7 +554,12 @@ def _ensure_jvm():
             raise RuntimeError(
                 "未找到 JDK/JRE 运行时。请安装 Java（JDK 8+）并设置 JAVA_HOME，"
                 "或让平台自动探测（已尝试常见安装路径 / .jdks / PATH）。")
+        # 顶层 = 数据库驱动 jar（>100KB 防损坏/错误页）；drivers/jdbc/ = 依赖库
+        # （jackson/httpclient/slf4j 等，小文件用 >10KB 防损坏），随 classpath 一起加载，
+        # 且不进驱动管理页列表（页面只展示数据库驱动，避免噪音行）。
         jars = [str(p) for p in DRIVERS_DIR.glob("*.jar") if p.stat().st_size > 100000]
+        jars += [str(p) for p in (DRIVERS_DIR / "jdbc").glob("*.jar")
+                 if p.stat().st_size > 10000]
         if not jars:
             raise RuntimeError(f"drivers/ 目录下未发现 JDBC 驱动 jar：{DRIVERS_DIR}")
         import jpype

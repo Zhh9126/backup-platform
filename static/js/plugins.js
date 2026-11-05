@@ -630,11 +630,24 @@
         const n = (name || "").toLowerCase();
         if (/mssql|sqlserver|sql-jdbc/.test(n)) return "sqlserver";
         if (/mariadb/.test(n)) return "mariadb";
+        if (/tidb/.test(n)) return "tidb";
         if (/mysql/.test(n)) return "mysql";
-        if (/postgres|pgjdbc|pg-/.test(n)) return "postgresql";
+        if (/opengauss/.test(n)) return "opengauss";
+        if (/greenplum/.test(n)) return "greenplum";
+        if (/ivorysql/.test(n)) return "ivorysql";
+        if (/uxdb|uxsino/.test(n)) return "uxdb";
+        if (/highgo|hgdb/.test(n)) return "highgo";
         if (/kingbase/.test(n)) return "kingbase";
+        if (/postgres|pgjdbc|pg-/.test(n)) return "postgresql";
         if (/ojdbc|oracle/.test(n)) return "oracle";
-        if (/dmjdbc|dameng/.test(n)) return "dameng";
+        if (/dmjdbc|dameng|^dm/.test(n)) return "dameng";
+        if (/yashandb|yasdb/.test(n)) return "yashandb";
+        if (/oceanbase/.test(n)) return "oceanbase";
+        if (/gbase8a|gbase-connector/.test(n)) return "gbase8a";
+        if (/gbasedbt|gbase8s/.test(n)) return "gbase8s";
+        if (/clickhouse/.test(n)) return "clickhouse";
+        if (/db2jcc|jcc|^db2/.test(n)) return "db2";
+        if (/taos|tdengine/.test(n)) return "tdengine";
         return "";
       };
       body.innerHTML = list.map((d) => {

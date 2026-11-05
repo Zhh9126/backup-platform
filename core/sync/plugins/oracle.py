@@ -36,13 +36,13 @@ class OracleSourceReader(SourceReader):
             try:
                 return oracledb.connect(user=cfg.src_username,
                                         password=cfg.src_password, dsn=dsn,
-                                        tcp_connect_timeout=15)
+                                        tcp_connect_timeout=8)
             except TypeError:
                 return oracledb.connect(user=cfg.src_username,
                                         password=cfg.src_password, dsn=dsn)
             except Exception as e:
                 last = e
-                time.sleep(2 * (attempt + 1))
+                time.sleep(1 * (attempt + 1))
         raise last
 
     def list_tables(self) -> List[str]:
@@ -146,7 +146,7 @@ class OracleSinkWriter(SinkWriter):
             try:
                 conn = oracledb.connect(user=cfg.tgt_username,
                                         password=cfg.tgt_password, dsn=dsn,
-                                        tcp_connect_timeout=15)
+                                        tcp_connect_timeout=8)
                 break
             except TypeError:
                 conn = oracledb.connect(user=cfg.tgt_username,

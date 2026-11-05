@@ -186,6 +186,10 @@ class LibvirtSSHProvider(VMProvider):
                             % (shlex.quote(name), shlex.quote(snap)), timeout=300)
             if r["rc"] != 0:
                 raise VMProviderError("创建外部快照失败: %s" % (r["err"] or r["out"])[:400])
+        except Exception:
+            # 快照创建失败：stage 目录尚未承载产物，直接清理后抛出（防残留累积）
+            self._run("rm -rf %s" % shlex.quote(stage), timeout=120)
+            raise
         finally:
             if frozen:
                 self._virsh("domfsthaw %s" % shlex.quote(name), timeout=120)
@@ -219,6 +223,17 @@ class LibvirtSSHProvider(VMProvider):
         for d in vm.disks:
             if d.excluded:
                 continue
+            # pivot 前记录 overlay 路径：成功切回基盘后 domblklist 不再显示
+            # overlay，之后必须按记录直接删除，否则每次全量备份残留一份
+            # 与基盘同量级的孤儿文件（磁盘泄漏）。
+            blk = self._virsh("domblklist %s --details" % shlex.quote(name), timeout=60)
+            overlay = ""
+            for line in (blk.get("out") or "").splitlines()[2:]:
+                parts = line.split()
+                # 列序：Type Device Target Source
+                if len(parts) >= 4 and parts[2] == d.key:
+                    overlay = parts[3]
+                    break
             self._virsh("blockcommit %s %s --active --pivot --verbose"
                         % (shlex.quote(name), shlex.quote(d.key)), timeout=600)
             # 等待块作业结束
@@ -228,14 +243,24 @@ class LibvirtSSHProvider(VMProvider):
                 if "No current block job" in (j.get("out") or "") or j["rc"] != 0:
                     break
                 time.sleep(2)
+            # pivot 成功（磁盘源已切回基盘）→ 删除 overlay 孤儿文件
+            if overlay and overlay != d.path:
+                self._run("rm -f %s" % shlex.quote(overlay), timeout=120)
 
     def _cleanup_snapshots(self, name: str, snap: str) -> None:
-        """清理 --no-metadata 外部快照遗留的 overlay 文件。"""
+        """异常兜底：检查 overlay 是否仍被 VM 使用。
+
+        注意：若 overlay 仍出现在 domblklist 中（pivot 未完成/失败），
+        文件正被 qemu 使用，**绝不能删除**（删了会破坏运行中的 VM 磁盘链）。
+        正常路径的 overlay 清理由 _commit_overlays 在 pivot 成功后完成。
+        """
         blk = self._virsh("domblklist %s --details" % shlex.quote(name), timeout=60)
         for line in (blk.get("out") or "").splitlines()[2:]:
             parts = line.split()
             if len(parts) >= 4 and snap in parts[3]:
-                self._run("rm -f %s" % shlex.quote(parts[3]), timeout=300)
+                self.log("overlay %s 仍被虚拟机使用（blockcommit 未完成），保留待人工处理",
+                         parts[3])
+                return
 
     def _new_checkpoint(self, name: str) -> str:
         """建立持久化 dirty bitmap，作为后续增量的起点。"""

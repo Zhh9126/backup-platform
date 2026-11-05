@@ -11,11 +11,11 @@
 解决**人工运维效率低、备份失效难发现、故障排查慢、异构数据适配难**等行业痛点，
 真正实现数据灾备的**智能化、自动化、安全化、全域化**。
 
-Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦） · SQL Server · openGauss · Redis · MongoDB · Neo4j · 文件
+Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦） · SQL Server · openGauss · 磐维 · Redis · MongoDB · Neo4j · 向量库（Qdrant/Chroma） · 文件 · 虚拟机（KVM/PVE/ESXi/Hyper-V） · 自定义适配器（TDengine/CouchDB 已实证）
 
-**备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 预校验 · 克隆 · 演练 · 巡检 · AI 告警**
+**备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 容灾切换 · 恢复演练 · 预校验 · 克隆（VDB） · 不可变备份 · 巡检 · 监控 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v2.0.0-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v2.2.0-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -25,7 +25,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 ---
 
-> **最新动态**：[readme_20261015.md](readme_20261015.md)——2026-10-14 ~ 10-15 两天更新（数据迁移/同步真机 E2E 闭环、恢复点安全检测、备份/恢复预检、数据对比 3 缺陷修复、全站分页、AI 助手版本策略、离线交付包）。
+> **最新动态**：v2.2.0（2026-11-05）已发布——近两个月主线：AI 大模型数据备份（v2.0.0 起版）、多表并行迁移与对象迁移三批（v2.1.0）、池复制两地三中心、容灾自动切换与真实恢复演练、不可变备份四层防护、坏块检测与应急接管、数据对比银行校验体系、自定义适配器双实证（TDengine/CouchDB）、虚拟机备份 libvirt 真机验证。历史动态归档：[readme_20261015.md](readme_20261015.md)。
 
 > **部署到离线环境（不可联网、不可随意改代码）前请先阅读**：
 > [产品功能固化清单](docs/feature_manifest_20260917.md)（功能全集、各引擎真实验证状态、能力边界）
@@ -33,6 +33,20 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 > · [产品设计说明书](docs/product_design_spec_20260916.md)（领域模型与产品化差距清单 G1–G13）
 
 > **二次开发 / 排障前先读**：[代码图谱](docs/code_graph.md)（由 `scripts/gen_code_graph.py` 自动生成，零第三方依赖）——分层架构与模块依赖、枢纽模块与循环/越层依赖体检、**332 条 REST 路由索引**、页面→JS→接口链路、元数据库表访问热点、关键业务链路，以及「想改 X 先看哪些文件」。重生成：`python scripts/gen_code_graph.py`（结构漂移用 `--diff`，CI 卡口用 `--strict`）。
+
+## 能力全景（白皮书速览）
+
+| 能力域 | 覆盖范围 | 验证口径 |
+|---|---|---|
+| 数据库备份 | 20+ 库型：内置 10 引擎 + 国产 8 家（达梦/金仓/openGauss/磐维/瀚高/优炫/TiDB/OceanBase）+ 向量库（Qdrant/Chroma）+ 自定义适配器无限扩展 | 多库型真机矩阵（170/171 双机、129/168 Oracle/openGauss） |
+| 数据恢复 | 异名库/异主机恢复、单表切片、PITR（binlog/WAL/LogMiner/dmrman）、事务级精准还原、应急接管 | 恢复后中文数据逐值硬核对，impdp/RMAN 真实校验 |
+| 数据迁移与同步 | 一站式迁移（预检→结构→全量→对象→校验）、多表并行、非表对象三批、实时轮询 CDC 水位续传 | 170/171 双机 7 条迁移链 + 6 条同步链 + realtime 闭环 |
+| 容灾（DR） | failover/failback 引擎（Fencing/GTID 分叉拦截/DNS 牵引）、自动切换策略、两地三中心池复制、真实恢复演练 | 三机真机 RTO 15s 级，切换期写入零丢失 |
+| 数据安全 | 不可变备份四层防护、恢复点安全检测（勒索启发式）、AES-256-GCM/SM4 加密、高危操作验证码、主机保护硬闸 | 删除路径四路拦截测试、篡改产物检出实证 |
+| 数据质量 | 恢复校验（策略化真恢复）、备份后自动校验、数据对比（银行校验体系）、坏块检测、克隆 VDB 秒级验证 | 三级别对比 9/9、坏块真机检测 |
+| 虚拟机 | KVM/PVE/ESXi/Hyper-V 整机备份、克隆、原位还原、TTL 回收 | libvirt 通道真机端到端（业务无停机） |
+| 智能运维 | 任务监控分诊、报表中心、巡检、数据价值挖掘（GB/T 43697 分级）、AI 助手（商业版）、AI 告警 | 失败分诊真机检出、报表导出三格式 |
+| 平台化 | RBAC（24 权限点/3 角色）、可插拔元数据库（SQLite/PG/MySQL）、完全离线交付、外部 API、Webhook 事件中心 | 全站冒烟 0 命中 5xx |
 
 ## 平台特色
 
@@ -47,6 +61,10 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 - **迁移前预校验**：类型映射矩阵、数据级试写、字符集冲突、容量预估、主键/外键检查——结构或数据不合适在启动前拦截。
 - **可插拔数据库类型**：除内置 10 种引擎外，界面就能"新增一种数据库"——填脚本模板 + 能力声明，即刻获得与内置引擎同等的备份/恢复/调度/存储能力，无需改代码。
 - **多用户与权限管控**：24 个权限点 × 3 档内置角色（admin / operator / viewer），菜单按权限自动收敛，API 层二次校验，适配多人协作与运维审计要求。
+- **容灾切换与自动监控**：failover/failback 全流程引擎（Fencing 防双写 → 备库提升 → DNS 牵引 → 解析回读验证 → 旧主以从库身份重加入），GTID 分叉检测拦截数据丢失风险；健康探测连续失败自动触发切换（可人工确认闸），RTO 实测 15s 级；两地三中心池复制编排（serial 级联 / parallel 扇出 / 逐站重试 / 副本分布视图 / 异地取回）。
+- **真实恢复演练**：不止元数据评估——真恢复到临时库 → 逐表行数校验 → 评分（100 分制，RPO 阈值扣分）→ 兜底销毁，支持 weekly/monthly/quarterly 排程；克隆服务可把备份拉起为可查询的虚拟数据库（VDB）。
+- **不可变备份（防勒索纵深）**：保留锁定（只许延长不许缩短、强制审计）→ 产物 chmod 写保护 → sha256 基线周期复检 → 删除路径四路拦截；叠加恢复点安全检测三查（体积突变/熵值/结构嗅探）。
+- **自定义适配器（无限扩展库型）**：界面新增数据库类型 + 脚本模板即刻获得与内置引擎同等的备份/恢复/调度能力——已以 TDengine（时序库，taosdump/REST 双通道）与 CouchDB（文档库，_bulk_docs 回放）完成端到端实证；平台同机（回环）任务免 SSH 直接执行。
 
 ---
 
@@ -62,13 +80,19 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 | 达梦物理增量备份 | 联机 `BACKUP INCREMENT BACKUPSET`，增量备份集自动拉回 |
 | 调度 | cron 表达式 / 固定间隔（APScheduler）|
 | 保留策略 | 按天数 + 按份数双重清理（GFS）|
+| **不可变备份四层防护** | 保留锁定（0=永久、只许延长、强制审计）→ 产物写保护 → sha256 基线周期复检 → 清理/保留/删除四路硬拦截；任务级 `retention_lock_days` 备份成功自动上锁，存储池级 `pool_policy.lock_days` 兜底 |
+| **池复制（两地三中心）** | 多站点编排（serial 级联中断 / parallel 扇出），逐站重试与副本日志；本地/MinIO/S3/磁带零新增通道；备份成功自动触发、副本分布视图、异地副本取回 |
+| **源端去重** | 文件级指纹（远端 sha256 清单）只传变更，实测第二轮节省 95.5%；rsync delta 增量拉取（DB 单文件通道）；失败安全回退流式 |
+| **备份前坏块检测** | MySQL/MariaDB CHECK TABLE、Oracle fast（视图级）/full（RMAN VALIDATE CHECK LOGICAL）；corrupt 阻断备份，failed=检测失败如实区分 |
+| **Oracle 非归档应急热备** | sqlplus BEGIN/END BACKUP 热拷贝数据文件（SSH 通道，失败兜底 END BACKUP 防悬挂）|
+| **SQL 图表化监控** | 自定义 SQL 指标定时采集（多列结果智能取值），折线图呈现 |
 | 自定义备份/恢复脚本 | 全数据库类型通用，平台注入 `PLATFORM_*` 环境变量，SFTP 拉回产物并计算 sha256 |
 | 三级存储 | L1 MinIO（热）/ L2 S3（冷）/ L3 本地导出，备份后自动并行复制 |
 | 生命周期 | L1→L2 按龄/按容量下沉、到期清理 |
 | 全局重删 | 内容 sha256 索引 + 引用计数 |
 | 存储池加密 | AES-256-GCM 信封式，密钥来源：环境变量 / 系统设置托管 / 外部 KMS |
 | 备份插件 | 服务端插件市场（XtraBackup / MariaDB Backup / pgBackRest / MongoDB Tools 等），支持离线包安装 |
-| 虚拟机备份（整机） | PVE / KVM(libvirt) / ESXi / Hyper-V 纳管 → 保护策略 → 恢复点（PITR）→ 原地还原 / 克隆新 VM / 自动恢复验证（SureBackup 式）；复用平台既有调度、保留、存储分层与告警 |
+| 虚拟机备份（整机） | PVE / KVM(libvirt) / ESXi / Hyper-V 纳管 → 保护策略 → 恢复点 → 原地还原 / 克隆新 VM（新 UUID/MAC/隔离网络/TTL 回收）/ 自动恢复验证；libvirt 通道已真机端到端验证（外部快照→convert→blockcommit 回切业务无停机、克隆、原位还原），libvirt ≥6.0 支持真块级增量，低版本诚实回退全量；复用平台既有调度、保留、存储分层与告警 |
 | 可插拔数据库类型 | 「数据库类型」页界面新增：填脚本模板（备份/增量/全实例/恢复/校验/列库/连通性）+ 能力声明，运行时渲染为 `CustomDBEngine` 注入引擎注册表，与内置引擎同一调度链路；`{{KEY}}` 占位渲染为 `${PLATFORM_KEY}`，脚本不落明文密码 |
 | 远端工具动态发现 | 数据库服务用户 profile → 登录 shell → 常见目录枚举 → find，不写死路径；支持 `tool_path` 手动兜底 |
 | 零安装执行 | SSH 远程优先（用数据库自带工具）→ 平台推送临时副本（/tmp 执行即清理）→ 回退平台服务端执行 |
@@ -87,6 +111,10 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 | 恢复校验 | 策略化对最近成功备份做可恢复性校验（Oracle 走 impdp SQLFILE / RMAN RESTORE VALIDATE），生成报告 |
 | 文件增量恢复 | 自动构建恢复链（最近全量 → 按时间应用增量）|
 | PITR 时间点恢复 | MySQL binlog / PostgreSQL WAL 持续捕获；达梦 dmrman RESTORE/RECOVER（还原到指定目录，自动对齐源实例页大小/簇大小）|
+| **单表/逻辑表直接恢复** | 从全实例 tar / 单库 dump 中按表锚点切片直接恢复到异名库（头部净化剔除 USE/CREATE DATABASE 防误灌回源库），不必整库恢复；PG -Fc 走 pg_restore --table |
+| **Oracle 事务级精准还原** | LogMiner 捕获（含 XID）→ 事务时间轴浏览 → UNDO 反向回滚计划 → 验证码双闸执行，逐条独立提交错误隔离 |
+| **应急接管检查** | 克隆/恢复目标一键「接管检查」：连通性 → 表数量 → 首表行数抽样，通过即具备承载业务读流量条件（写切换需应用侧换连接串，如实标注）|
+| **数据对比（银行校验体系）** | 结构/元数据校验（列类型归一/可空/主键逐列比对）+ 行数 + checksum + 随机抽样 PK 定位核验 + PK 分块归并；quick/standard/deep 三级校验；行数不一致自动路由精确 missing 定位 |
 
 ### 2.1 备份后自动校验（记录列表的「校验✓」验的是什么）
 
@@ -196,7 +224,12 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 | 能力 | 说明 |
 |---|---|
 | 巡检 | 连通性/调度/上次状态三维体检，fail 即告警；巡检记录可导出、可调度 |
-| 恢复演练 | RTO/RPO 评估，趋势/基线/季度排程 |
+| 恢复演练 | 元数据级 RTO/RPO 评估（趋势/基线/季度排程）+ **真实恢复演练**（真恢复到临时库→逐表行数校验→评分→销毁，MySQL/MariaDB）|
+| **容灾切换（DR 引擎）** | failover（Fencing 冻结旧主→备库提升→DNS 牵引→解析回读验证）/ failback（旧主追平重加入→现主降级从）；GTID 分叉如实拦截；健康快照 + SVG 拓扑 + 切换历史时间线；RTO 实测 15s 级 |
+| **自动切换策略** | 主备健康探测（连续 N 次失败触发）+ 告警/自动 failover 双模式（可人工确认闸）；30s 轮询持久化状态 |
+| **任务监控** | 今日执行概览 + 失败任务分诊（连续失败/调度逾期/启用未跑/长期未成功四类原因）+ 最近执行流 |
+| **报表中心** | 备份/恢复/同步/迁移全景统计 + 备份明细分页（拉 2000 条前端分页）+ 数据库 IP 列，导出 CSV/DOCX/PDF |
+| **高危操作防护** | 恢复/清理/删除验证码二次确认（一次性 4 位码 5 分钟有效防重放）；主机「受保护」标记，恢复到受保护主机硬闸拦截 |
 | 通知告警 | Webhook/钉钉/企微/飞书/邮件，成功失败分别开关 |
 | AI 智能助手 | 对话式运维助手，支持平台内工具调用（查任务/查报告/触发操作），LLM 不可用时本地规则兜底 |
 | AI 智能告警 | 规则分析 + 故障归因，降低告警噪音 |
@@ -222,6 +255,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 | 能力 | 说明 |
 |---|---|
 | 数据价值挖掘 | 资产盘点 → 敏感发现与国标分级（GB/T 43697-2024）→ 价值评估与冷数据治理 → 合规概览（PIPL/等保）→ 脱敏导出，把冷备份变成可治理、可举证、可外发的数据资产 |
+| **AI 大模型数据备份** | 向量数据库备份/恢复（Qdrant / Chroma）：快照导出 + 集合级恢复（v2.0.0 起版能力）|
 | 全局重删 | 参照鼎甲迪备全局重删：块级去重，节省存储 |
 | 自动合成全量 | 增量链自动合并为合成全量（永久增量体系）|
 | 对象级恢复 | 从备份中精准提取指定表/对象，不必整库恢复 |
@@ -237,6 +271,8 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 | 同一调度链路 | 渲染为 `CustomDBEngine` 实例注入引擎注册表，cron 调度、保留策略、三级存储、全局重删、恢复校验、告警全部自动复用 |
 | 动态类型发现 | `/api/meta` 的 `db_types` / `db_type_meta` / `default_ports` 运行时合并自定义类型，任务表单下拉无需改代码 |
 | 安全与治理 | 删除被备份任务引用的适配器会被拒绝（提示引用任务数）；支持停用/启用、远端连通性测试、从内置模板复制 |
+| **同机任务免 SSH** | 数据库与平台同机（回环地址）时本机 bash 直接执行脚本，与 SSH 通道同一套 PLATFORM_* 注入与产物拉回语义 |
+| **真机实证** | TDengine（时序库）：taosdump 官方通道 + REST（taosAdapter 6041）兜底双通道，恢复异名库中文逐值一致，重复恢复幂等；CouchDB（文档库）：`_all_docs` 导出 / `_bulk_docs` 回放，多库 `r_` 前缀，conflict 幂等跳过——两种范式完全不同的库型在同一契约下跑通全链路 |
 
 ### 14. 用户与角色管理（RBAC）
 
@@ -338,8 +374,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v2.0.0    # 固定版本（可回滚）
-# 当前最新版本：v2.0.0（2026-11-03，起版大版本：AI 大模型数据备份支持）
+docker pull ghcr.io/zhh9126/backup-platform:v2.2.0    # 固定版本（可回滚）
+# 当前最新版本：v2.2.0（2026-11-05，池复制修复 + 报表中心备份明细增强）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -362,14 +398,13 @@ python tools/check_env.py
 ### 离线导入
 
 ```bash
-# 交付包（推荐）：aidbm-v1.4.17-offline.tar.gz（784MB，含 AI 智能助手）
-docker load -i aidbm-v1.4.17-offline.tar.gz
-docker tag aidbm:1.4.17 ghcr.io/zhh9126/backup-platform:v1.4.17   # 可选：对齐文档命令
+# 交付包（推荐）：aidbm_2.2.0_offline.tar.gz（923MB，含 AI 智能助手 + 全部备份工具）
+docker load -i aidbm_2.2.0_offline.tar.gz
 
 # 自行导出
-docker save ghcr.io/zhh9126/backup-platform:v1.4.17 -o aidbm-v1.4.17.tar
+docker save ghcr.io/zhh9126/backup-platform:v2.2.0 -o aidbm_2.2.0.tar
 # 内网机器导入
-docker load -i aidbm-v1.4.17.tar
+docker load -i aidbm_2.2.0.tar
 ```
 
 ### 运行
@@ -391,17 +426,17 @@ docker run -d --name backup-platform \
 
 ```bash
 # 1. 导入新版本镜像（离线环境在有网机器 docker save 后拷入）
-docker load -i aidbm-v1.4.17.tar
+docker load -i aidbm_2.2.0.tar
 
 # 2. 停止并删除旧容器（备份数据在 backup-data 卷中，不受影响）
 docker stop backup-platform
 docker rm backup-platform
 
 # 3. 用新版本镜像启动（命令与首次部署完全一致，仅换镜像 tag）
-docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v1.4.17
+docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.2.0
 
 # 4.（可选）删除旧版本镜像释放空间
-docker rmi ghcr.io/zhh9126/backup-platform:v1.4.15
+docker rmi ghcr.io/zhh9126/backup-platform:v2.1.0
 ```
 
 > 升级不丢数据：元数据库、备份产物、日志都在 `backup-data` 卷（`/data`），
@@ -416,7 +451,7 @@ docker stop backup-platform
 docker rm backup-platform
 
 # 2. 删除镜像
-docker rmi ghcr.io/zhh9126/backup-platform:v1.4.17
+docker rmi ghcr.io/zhh9126/backup-platform:v2.2.0
 
 # 3.（谨慎）删除数据卷 —— 会清掉全部备份产物与元数据，操作前务必
 #    先把备份文件拷贝转移！
@@ -541,7 +576,53 @@ docker build -t backup-platform:local .
 
 ## 更新日志
 
-### v1.4.18（待发布，main 已合入，离线镜像已随包交付）
+### v2.3.0（待发布，工作区已交付）
+
+**（2026-11-04 ~ 11-05）**——对齐 DSG/鼎甲/银行校验体系的收官轮：
+
+- **数据对比升级为银行校验体系**：结构/元数据校验（列类型同族归一/可空/主键逐列比对，MySQL·PG·Oracle·达梦三分支）+ **随机抽样 PK 定位核验**（异构时间列归一防误报）+ **分层校验级别** quick/standard/deep + 场景路由（行数不一致自动走 PK 分块精确 missing 定位）；E2E 9/9（一致/篡改/删行三场景）。
+- **备份前坏块检测**：MySQL/MariaDB `CHECK TABLE QUICK` 逐表抽样、Oracle fast（视图级）/full（RMAN VALIDATE CHECK LOGICAL，171 真机 3.5GB 21s）；预检联动 corrupt 阻断备份。
+- **应急接管检查（对标鼎甲一键激活）**：克隆用途标记（emergency/test/dev/staging）+ 接管检查（连通性/表数量/行数抽样）+ 应急徽章；修复克隆 VDB 密码丢失、克隆目标端口写死 3306/5432 两个真缺陷。
+- **Oracle 非归档应急热备（hot_copy）**：sqlplus BEGIN/END BACKUP 热拷贝数据文件/控制文件，SSH 通道拉回，失败兜底 END BACKUP 防悬挂（171 真机两轮验证）。
+- **任务监控改造**：今日概览 + 失败任务分诊（连续失败/调度逾期/启用未跑/长期未成功）+ 最近执行流。
+- **JDBC 驱动页面注册**：上传 jar 页面选库型注册/替换/解除（无需改代码），按文件名智能推荐库型。
+- **自定义适配器真机实证 ×2**：TDengine（taosdump/REST 双通道）与 CouchDB（REST 导出/回放）端到端跑通；**修复平台同机（回环）任务强制要求 SSH 的缺口**。
+- **虚拟机备份 libvirt 真机验证**：全量（快照→convert→blockcommit 回切业务无停机）/增量诚实回退/克隆新 VM/原位还原全链路通过；**修复 3 个磁盘泄漏真缺陷**（overlay 孤儿文件永不清理、恢复/克隆回推副本不清理、失败 stage 目录残留）与 pivot 失败误删在用 overlay 的危险逻辑。
+- **MySQL binlog 实时完善 + 分区表全库型支持**：rt 开启前 binlog 预检、trigger_now 真实轮转封存、PITR 多段回放与 zstd 产物、Oracle 分区级 expdp/impdp（129 真机 7/7）。
+- 其余：报表中心备份明细 2000 条分页 + 数据库 IP 列、存储池类型抽象 + 池级锁定策略、克隆 Oracle 校验通道、i18n 第四批、全站 HTML no-cache 根治「改了没生效」。
+
+### v2.2.0（2026-11-05）
+
+- **池复制修复**：`api/pool.py` 自动解析 `record_id` 产物路径（修复池复制作业在记录维度触发时找不到产物文件）。
+- 镜像 ghcr.io/zhh9126/backup-platform 三 tag（v2.2.0 / v2.2.0-20261105 / latest，回拉容器实测 version 与修复在位）；离线包 `aidbm_2.2.0_offline.tar.gz`（923MB）。
+
+### v2.1.0（2026-11-04）
+
+- **多表并行迁移**：`SyncConfig.parallel_tables`（1-8），全库迁移 + 多表 full 同步双路径，每 worker 独立配置隔离；单表失败如实不阻断；170 真机 120 行中文保真。
+- **对象迁移第三批**：同义词 / 程序包 / 自定义类型（Oracle↔达梦同族直通重建，异构导出源码进报告标注人工适配）；修复 Oracle 对象 owner 语义。
+- **报表中心**：/reports 全景统计 + 导出（CSV/DOCX/PDF）。
+- 修复：`sync_tasks.type_mapping` 列缺失；任务级限速时段窗口 `rate_limit_window`（窗口内限速窗外全速，支持跨零点）。
+
+### v2.0.1（2026-11-04）
+
+- **自定义类型映射覆盖（对标金仓 KDTS）**：`SyncConfig.type_mapping`（源类型→目标类型直取，大小写不敏感/裸类型名匹配）+ 迁移向导 JSON 输入 + 同步任务存储/解析全链路。
+
+### v2.0.0（2026-11-03）
+
+**起版大版本：AI 大模型数据备份支持。**
+
+- **向量数据库备份/恢复**：Qdrant / Chroma 引擎接入（快照导出 + 集合级恢复），Qdrant HTTP 层改标准库 urllib（零 requests 依赖，离线自足）。
+- 元数据可插拔后端、迁移兼容性顾问（DM8 七坑）、物理备份 openEuler 修复等 v1.4.x 能力全部延续。
+
+### v1.4.20（2026-11-03）
+
+> 说明：v1.4.19 未发布（版本号直接从 v1.4.18 跳到 v1.4.20，与 Git Tags 一致）。
+
+- **170/171 双机全库型真实 E2E**：数据迁移一站式（MySQL→PG）、数据同步（full→增量→水位续传）、容灾 failover/failback 全步骤（RTO 15.2s/15.6s）。
+- **容灾引擎两真缺陷修复**：failback 复制账号密码未解密（密文入 CHANGE SOURCE 报 3056）；追平判定把 `Seconds_Behind=NULL` 误判为已追平（切换期写入丢失）——改必须 IO/SQL=Yes 且 behind=0。
+- 环境修复：170 MySQL systemd unit 配置错误导致每 ~2 分钟杀一次 mysqld（累计 666 次）。
+
+### v1.4.18（2026-10-27，main 已合入，离线镜像已随包交付）
 
 **（2026-10-15）**：
 

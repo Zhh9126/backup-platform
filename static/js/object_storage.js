@@ -430,7 +430,7 @@
 
   async function deleteTask(id) {
     const t = TASK_BY_ID[id];
-    const label = t ? ("「" + (t.name || ("#" + id)) + "」") : "已删除任务";
+    const label = t ? ("「" + (t.name || ("任务 " + id)) + "」") : "已删除任务";
     if (!window.confirm("确认删除备份任务 " + label + " 及其全部备份记录？此操作不可撤销。")) return;
     try {
       await api("DELETE", "/api/tasks/" + id);

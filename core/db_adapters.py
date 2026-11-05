@@ -93,12 +93,20 @@ def _pack(data: dict) -> dict:
         v = data[k]
         if k in ("backup_modes", "client_tools"):
             if isinstance(v, str):
-                v = json.loads(v) if v.strip() else []
+                try:
+                    v = json.loads(v) if v.strip() else []
+                except ValueError:
+                    # 前端弹窗为「逗号分隔」输入框（如 "dexp,dmrman"），
+                    # 非 JSON 字符串按逗号拆分，而不是报 Expecting value 400
+                    v = [s.strip() for s in v.replace("，", ",").split(",") if s.strip()]
             v = v or []
             out[k] = json.dumps(list(v), ensure_ascii=False)
         elif k == "params":
             if isinstance(v, str):
-                v = json.loads(v) if v.strip() else {}
+                try:
+                    v = json.loads(v) if v.strip() else {}
+                except ValueError:
+                    v = {}
             out[k] = json.dumps(v or {}, ensure_ascii=False)
         elif k in _BOOL_FIELDS:
             out[k] = 1 if v not in (0, False, "0", None, "") else 0
@@ -341,11 +349,15 @@ class CustomDBEngine(BackupEngine):
                 success=False, status=BackupStatus.FAILED,
                 message=f"自定义适配器未提供 {tmpl_kind} 脚本模板")
         ssh_host = remote_dump.resolve_ssh_host(self.task)
-        if not ssh_host:
-            return BackupResult(
-                success=False, status=BackupStatus.FAILED,
-                message="自定义适配器需要在数据库服务器上执行脚本：请纳管 SSH 主机或在任务中指定")
-        return self._backup_custom_remote(ssh_host, backup_type, self._build_extra(script))
+        if ssh_host:
+            return self._backup_custom_remote(ssh_host, backup_type, self._build_extra(script))
+        from core.engines.base import _is_local_task
+        if _is_local_task(self.task):
+            # 数据库与平台同机（回环地址/本机名）：无需纳管 SSH，本机 bash 执行
+            return self._backup_custom_local(backup_type, self._build_extra(script))
+        return BackupResult(
+            success=False, status=BackupStatus.FAILED,
+            message="自定义适配器需要在数据库服务器上执行脚本：请纳管 SSH 主机或在任务中指定")
 
     def restore(self, backup_path: str, **kwargs) -> BackupResult:
         from core import remote_dump
@@ -356,6 +368,10 @@ class CustomDBEngine(BackupEngine):
                 message="自定义适配器未提供 restore 脚本模板")
         ssh_host = kwargs.get("target_host_info") or remote_dump.resolve_ssh_host(self.task)
         if not ssh_host:
+            from core.engines.base import _is_local_task
+            if _is_local_task(self.task):
+                return self._restore_custom_local(
+                    backup_path, script, self._build_restore_extra(script), **kwargs)
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,
                 message="自定义适配器恢复需要在数据库服务器上执行脚本：恢复表单需选择目标 SSH 主机")

@@ -332,10 +332,10 @@
       const msg = escape(r.message || "");
       const tags = [];
       if (r.task_id) {
-        tags.push(`<span class="rel-tag" data-fill="task" data-val="${r.task_id}">任务#${r.task_id}</span>`);
+        tags.push(`<span class="rel-tag" data-fill="task" data-val="${r.task_id}">任务 ${r.task_id}</span>`);
       }
       if (r.record_id) {
-        tags.push(`<span class="rel-tag" data-fill="record" data-val="${r.record_id}">记录#${r.record_id}</span>`);
+        tags.push(`<span class="rel-tag" data-fill="record" data-val="${r.record_id}">记录 ${r.record_id}</span>`);
       }
       const ops = [];
       if (r.detail) {
@@ -545,8 +545,8 @@
       if (!r || !r.ok) { toast("读取失败", "danger"); return; }
       const rec = r.record || {};
       openViewer({
-        title:`备份记录 #${recId} - 详细日志`,
-        meta:`任务#${rec.task_id || "-"} · ${rec.db_type || "-"} · ${rec.backup_type || "-"} · 状态 ${rec.status || "-"}`,
+        title:`${rec.task_name || ("备份记录 " + recId)} - 详细日志`,
+        meta:`任务 ${rec.task_id || "-"} · ${rec.db_type || "-"} · ${rec.backup_type || "-"} · 状态 ${rec.status || "-"}`,
         content: r.content || "（该记录暂无独立操作日志）"
       });
     } catch (e) {

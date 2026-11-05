@@ -287,8 +287,8 @@ class VMBackupEngine(BackupEngine):
                     live=bool(kwargs.get("live", False)),
                     regenerate_mac=bool(kwargs.get("regenerate_mac", True)),
                     ttl_hours=int(kwargs.get("ttl_hours") or 0))
-                cres = provider.clone_to_new_vm(vm["vm_ref"], self._ensure_remote(
-                    provider, chain), spec)
+                remotes = self._ensure_remote(provider, chain)
+                cres = provider.clone_to_new_vm(vm["vm_ref"], remotes, spec)
                 if cres.ok:
                     _settle("ready", cres.message,
                             target_ref=cres.target_ref or "",
@@ -299,6 +299,8 @@ class VMBackupEngine(BackupEngine):
                             result_json=_json_dump(cres.to_dict()))
                 else:
                     _settle("failed", cres.message or "克隆失败")
+                # 作业结束：清理回推到数据源侧的产物副本（平台侧永远保留原件）
+                self._cleanup_pushed(provider, remotes)
                 return BackupResult(success=cres.ok,
                                     status=BackupStatus.SUCCESS if cres.ok
                                     else BackupStatus.FAILED,
@@ -307,6 +309,7 @@ class VMBackupEngine(BackupEngine):
             rchain = self._ensure_remote(provider, chain)
             ok, message = provider.restore_in_place(vm["vm_ref"], rchain)
             _settle("ready" if ok else "failed", message)
+            self._cleanup_pushed(provider, rchain)
             return BackupResult(success=bool(ok),
                                 status=BackupStatus.SUCCESS if ok
                                 else BackupStatus.FAILED,
@@ -340,6 +343,20 @@ class VMBackupEngine(BackupEngine):
                 raise VMProviderError("恢复点 #%s 产物不可达（本地与远端均缺失）" % rp["id"])
             out.append(remote)
         return out
+
+    @staticmethod
+    def _cleanup_pushed(provider, remotes: list) -> None:
+        """恢复/克隆/验证作业结束后，清理 _ensure_remote 回推的数据源侧副本。
+
+        只删回推产生的临时副本；平台侧落盘原件不受影响。逐个容错，
+        清理失败不影响作业结论（下次同名覆盖，不累积）。
+        """
+        from core.vm.types import BackupArtifact
+        for p in remotes or []:
+            try:
+                provider.cleanup_artifact(BackupArtifact(path=p))
+            except Exception:
+                continue
 
     # ---------------- 合成全量 ----------------
     def synthesize_full(self) -> BackupResult:

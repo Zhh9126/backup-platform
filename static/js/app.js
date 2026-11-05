@@ -463,7 +463,7 @@
           const mode = r.backup_mode_display || r.backup_mode || "-";
           const modeCls = r.backup_mode === "physical" ? "mode-chip physical" : "mode-chip";
           return `<tr>
-            <td class="col-name" title="#${esc(r.task_id ?? "")}">${esc(r.task_name || "-")}</td>
+            <td class="col-name" title="备份记录 ${esc(r.task_id ?? "")}">${esc(r.task_name || "-")}</td>
             <td>${esc(r.biz_system || "-")}</td>
             <td><span class="badge bg-light text-dark border">${esc(r.backup_type_display || r.backup_type || "-")}</span></td>
             <td><code>${esc(r.host_ip || "-")}</code></td>
@@ -2446,7 +2446,7 @@
         <div class="modal-dialog modal-lg">
           <div class="modal-content">
             <div class="modal-header py-2">
-              <h6 class="modal-title">恢复点安全检测 #${id} ${badge}</h6>
+              <h6 class="modal-title">恢复点安全检测（记录 ${id}）${badge}</h6>
               <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
@@ -2724,7 +2724,7 @@
         <td>${pgv.startNo + vi}</td>
         <td><code>${esc(v.name)}</code></td>
         <td>${esc(v.db_type)}</td>
-        <td>#${v.source_record_id || '-'}</td>
+        <td>${v.source_record_id ? ("备份记录 " + v.source_record_id) : '-'}</td>
         <td>${v.port || '-'}</td>
         <td><code class="small">${esc(conn)}</code></td>
         <td>${statusBadge}</td>
@@ -4080,7 +4080,7 @@
       wrap.className = "modal fade";
       wrap.innerHTML = `
         <div class="modal-dialog modal-dialog-centered modal-dialog-scrollable"><div class="modal-content">
-          <div class="modal-header"><h6 class="modal-title"><i class="bi bi-layers"></i> 同步版本（任务 #${id}）</h6>
+          <div class="modal-header"><h6 class="modal-title"><i class="bi bi-layers"></i> 同步版本（任务 ${id}）</h6>
             <button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
           <div class="modal-body small">
             ${vs.length ? '<table class="table table-sm"><thead><tr><th>版本</th><th>文件数</th><th>大小</th></tr></thead><tbody>' +
@@ -4476,7 +4476,7 @@
     $("deployTable").innerHTML = pg.list.map((d, di) =>
       `<tr>
         <td>${pg.startNo + di}</td><td>${esc(d.name)}</td><td>${esc(d.db_type)}</td>
-        <td>${esc(d.host_display || (d.host_id ? '#'+d.host_id : d.direct_host) || '-')}</td>
+        <td>${esc(d.host_display || (d.host_id ? "主机 " + d.host_id : d.direct_host) || '-')}</td>
         <td class="text-truncate" style="max-width:150px" title="${esc(d.base_dir||'')}">${esc(d.base_dir || '-')}</td>
         <td>${d.port || '-'}</td>
         <td>${d.progress_pct ? `<div class="progress" style="height:6px"><div class="progress-bar bg-teal" style="width:${d.progress_pct}%"></div></div><small>${d.progress_pct}%</small>` : '-'}</td>
@@ -5800,7 +5800,7 @@
             const fails = (res.results || []).filter((x) => !x.ok);
             box.innerHTML = `<div class="alert ${r.ok ? "alert-success" : "alert-danger"} small py-2">
                 回滚完成：执行 ${res.executed} 条 / 失败 ${res.failed} 条 · 耗时 ${res.duration_sec}s</div>` +
-              (fails.length ? '<div class="small text-danger">' + fails.slice(0, 10).map((f) => `#${f.seq} ${esc(f.table)}: ${esc(f.error || "")}`).join("<br>") + "</div>" : "");
+              (fails.length ? '<div class="small text-danger">' + fails.slice(0, 10).map((f) => `第${f.seq}项 ${esc(f.table)}: ${esc(f.error || "")}`).join("<br>") + "</div>" : "");
           } catch (e) {
             box.innerHTML = '<div class="alert alert-danger small py-2">执行失败: ' + esc(e.message) + "</div>";
             execBtn.disabled = false;
@@ -6584,7 +6584,7 @@
             ? `${esc(ch.last_run_at.slice(0, 16).replace("T", " "))} · ` +
               (lr && lr.ok ? '<span class="badge badge-ok">全站成功</span>'
                 : '<span class="badge badge-fail">存在失败</span>') +
-              `（记录 #${(lr && lr.record_id) || "-"}）`
+              `（备份记录 ${(lr && lr.record_id) || "-"}）`
             : '<span class="text-muted">未执行</span>';
           return `<tr>
             <td><strong>${esc(ch.name)}</strong>${ch.enabled ? "" : ' <span class="badge bg-secondary">停用</span>'}</td>
@@ -6734,7 +6734,7 @@
     wrap.className = "modal fade";
     wrap.innerHTML = `
       <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable"><div class="modal-content">
-        <div class="modal-header"><h6 class="modal-title"><i class="bi bi-collection"></i> 副本分布（记录 #${recordId}）</h6>
+        <div class="modal-header"><h6 class="modal-title"><i class="bi bi-collection"></i> 副本分布（备份记录 ${recordId}）</h6>
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
         <div class="modal-body small"><div class="text-muted">加载中…</div></div>
       </div></div>`;
@@ -7464,7 +7464,7 @@
           ? '<span class="badge badge-ok">已校验</span>'
           : '<span class="badge bg-secondary">未校验</span>';
         const golden = p.golden_backup_record_id ? String(p.golden_backup_record_id) : '-';
-        const taskLabel = p.task_id ? (esc(p.task_name || ('# ' + p.task_id))) : '-';
+        const taskLabel = p.task_id ? (esc(p.task_name || ("任务 " + p.task_id))) : '-';
         return '<tr>' +
           '<td>' + (pg.startNo + pi) + '</td>' +
           '<td>' + taskLabel + '</td>' +
@@ -7915,7 +7915,7 @@
           vdb = '<code title="' + esc((c.vdb_username || '') + '@' + (c.vdb_host || '127.0.0.1') + ':' + (c.vdb_port || '-') + '/' + c.vdb_dbname) + '">' +
             esc((c.vdb_host || '127.0.0.1') + ':' + (c.vdb_port || '-') + '/' + c.vdb_dbname) + '</code>';
         } else if (c.vdb_instance_id) {
-          vdb = '#' + c.vdb_instance_id;
+          vdb = "实例 " + c.vdb_instance_id;
         }
         const actions = [];
         if (c.status === 'failed') {
@@ -8652,7 +8652,7 @@
     const link = (DR_LINKS || []).find((l) => l.id === id);
     if (!link) { toast("链路数据未加载，请刷新后重试", "warning"); return; }
     if (!drTopoModalInst) drTopoModalInst = new bootstrap.Modal($("drTopoModal"));
-    $("drTopoName").textContent = "· " + (link.name || ("#" + id));
+    $("drTopoName").textContent = "· " + (link.name || ("链路 " + id));
     drTopoModalInst.show();
     $("drTopoBody").innerHTML = '<div class="text-muted small py-4 text-center">' +
       '<span class="spinner-border spinner-border-sm me-2"></span>正在探测主库/备库/DNS…</div>';

@@ -101,7 +101,7 @@
       tbody.innerHTML = '<tr><td colspan="10" class="text-center text-muted">暂无同步任务</td></tr>';
       return;
     }
-    const pg = Pager.slice("syncPage", tasks);
+    const pg = Pager.slice("syncPage", tasks, 13);
     tbody.innerHTML = pg.list.map(function (t, ti) {
       // 实时任务运行徽章：进程内 runner 真实状态（rt_running 由后端注入）
       let statusCell;
@@ -536,17 +536,39 @@
   }
 
   // -------------- 外部暴露 --------------
+  // 按钮忙态：慢操作（预检/校验/启动对离线库型要探测 10-30 秒）必须有即时
+  // 视觉反馈，否则用户体感"点了没反应"。返回恢复函数；非按钮触发时为空操作。
+  function btnBusy(label) {
+    var btn = (typeof window.event !== "undefined") && window.event &&
+              window.event.target;
+    if (!btn || btn.tagName !== "BUTTON") return function () {};
+    var orig = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = label;
+    return function () {
+      try {
+        btn.disabled = false;
+        btn.textContent = orig;
+      } catch (e) { /* 节点已被重渲染，忽略 */ }
+    };
+  }
+
   window.SYNC = {
     editTask: async function (id) {
+      var done = btnBusy("加载中…");
       try {
         const res = await api("GET", "/api/sync-tasks/" + id);
         if (!res.success) throw new Error(res.message);
         openModal(res.data);
       } catch (e) {
         toast("加载任务失败：" + e.message, "danger");
+      } finally {
+        done();
       }
     },
     runTask: async function (id) {
+      var done = btnBusy("启动中…");
+      toast("正在启动：先执行预检探测，离线库型可能需要 10-30 秒…", "info");
       try {
         // 迁移前预校验：字段/结构不合适直接拒绝启动
         const pc = await api("POST", "/api/sync-tasks/" + id + "/precheck", {});
@@ -569,15 +591,21 @@
           return;
         }
         toast("启动失败：" + e.message, "danger");
+      } finally {
+        done();
       }
     },
     precheckTask: async function (id) {
+      var done = btnBusy("预检中…");
+      toast("正在预检：源/目标库连通与结构探测中，离线库型可能需要 10-30 秒…", "info");
       try {
         const pc = await api("POST", "/api/sync-tasks/" + id + "/precheck", {});
         if (!pc.success) throw new Error(pc.message || "预校验执行失败");
         SYNC.showPrecheckReport(pc, pc.passed === false);
       } catch (e) {
         toast("预校验失败：" + e.message, "danger");
+      } finally {
+        done();
       }
     },
     showPrecheckReport: function (pc, blocked) {
@@ -637,6 +665,8 @@
       }
     },
     validateTask: async function (id) {
+      var done = btnBusy("校验中…");
+      toast("正在执行结构校验：探测源/目标表结构，离线库型可能较慢…", "info");
       try {
         const res = await api("POST", "/api/sync-tasks/" + id + "/validate", {});
         if (res.success && res.validated) {
@@ -662,6 +692,8 @@
         }
       } catch (e) {
         toast("校验失败：" + e.message, "danger");
+      } finally {
+        done();
       }
     },
     verifyTask: async function (id) {
@@ -729,7 +761,7 @@
     renderDetail: async function () {
       const t = detailTaskData || {};
       const esc = window.esc || function (s) { return s; };
-      $("detailTitle").textContent = "同步详情 · " + (t.name || ("#" + t.id));
+      $("detailTitle").textContent = "同步详情 · " + (t.name || ("任务 " + t.id));
       $("detailRtBadge").innerHTML = (t.sync_mode === "realtime")
         ? (t.rt_running
           ? '<span class="badge badge-run">实时运行中</span>'

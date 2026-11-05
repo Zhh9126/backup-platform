@@ -93,7 +93,7 @@
     // 探测可能 10s+，只 toast 一闪而过会被误认为无响应）
     const modal = ensureModal();
     document.getElementById("precheckTitle").innerHTML =
-      `备份预检 · 任务 #${esc(taskId)} <span class="badge bg-secondary">检测中…</span>`;
+      `备份预检 <span class="badge bg-secondary">检测中…</span>`;
     document.getElementById("precheckBody").innerHTML =
       '<div class="text-center py-4"><div class="spinner-border text-primary"></div>' +
       '<div class="text-muted mt-2">正在探测：任务配置 / SSH 通道 / 源库连通 / 备份工具 / 存储空间' +
@@ -106,7 +106,7 @@
       res = await api("POST", `/api/tasks/${taskId}/precheck`);
     } catch (e) {
       document.getElementById("precheckTitle").innerHTML =
-        `备份预检 · 任务 #${esc(taskId)} <span class="badge bg-danger">失败</span>`;
+        `备份预检 <span class="badge bg-danger">失败</span>`;
       document.getElementById("precheckBody").innerHTML =
         '<div class="alert alert-danger mb-0">预检失败: ' + esc(e.message || String(e)) + "</div>";
       return;

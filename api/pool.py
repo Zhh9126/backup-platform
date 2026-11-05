@@ -67,14 +67,24 @@ def api_pool_delete(chain_id):
 @api_bp.route("/pool/chains/<int:chain_id>/run", methods=["POST"])
 @login_required
 def api_pool_run(chain_id):
-    """手动执行一次链复制（对指定备份记录）。"""
+    """手动执行一次链复制（对指定备份记录）。
+
+    backup_path 缺省时自动从备份记录解析产物路径（2026-11-04 巡检发现：
+    只传 record_id 必然报"备份产物不存在: "——调用方不应被要求自己查库取路径）。
+    """
     data = request.get_json(force=True, silent=True) or {}
     record_id = data.get("record_id")
     if not record_id:
         return jsonify({"error": "record_id 必填"}), 400
+    backup_path = data.get("backup_path") or ""
+    if not backup_path:
+        from core import db as _db
+        rec = _db.query_one(
+            "SELECT backup_path FROM backup_records WHERE id=?", (int(record_id),))
+        backup_path = (rec or {}).get("backup_path") or ""
     try:
         result = pool_replication.run_chain(
-            chain_id, int(record_id), data.get("backup_path") or "")
+            chain_id, int(record_id), backup_path)
     except pool_replication.PoolError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:

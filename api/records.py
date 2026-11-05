@@ -101,11 +101,12 @@ def list_records():
     # db_type 过滤：专页（如对象存储备份页）只关心自己这一类记录，
     # 避免前端拉全量再逐条过滤（历史上前后端都存在这种低效写法）。
     db_type = (request.args.get("db_type") or "").strip() or None
-    # 统一分页（规范 page/size，兼容 limit/offset，上限 500）；
+    # 统一分页（规范 page/size，兼容 limit/offset，上限 2000——
+    # 报表中心备份明细一次拉最近 2000 条做前端分页，其余调用方不受影响）；
     # v1 默认 100/页，兼容路径沿用历史默认 500 以免影响已有前端。
     default_size = 100 if request.path.startswith(contract.V1_PREFIX) else 500
     _page, size, offset = contract.pagination_args(default_size=default_size,
-                                                   max_size=500)
+                                                   max_size=2000)
     rows = models.list_records(task_id=task_id, keyword=keyword, policy_id=policy_id,
                                db_type=db_type, limit=size, offset=offset)
     for r in rows:

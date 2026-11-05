@@ -44,10 +44,10 @@
 </div>
 
 <div class="page-card p-3 mt-3">
-  <div class="card-section-title"><i class="bi bi-list-ul"></i> 备份明细（导出文件含完整明细行）</div>
+  <div class="card-section-title"><i class="bi bi-list-ul"></i> 备份明细（导出文件含完整明细行，每页 10 条）</div>
   <div class="table-responsive"><table class="table table-sm table-hover mb-0">
-    <thead><tr><th>#</th><th>开始时间</th><th>任务</th><th>库型</th><th>类型</th><th>状态</th><th>大小</th><th>耗时</th></tr></thead>
-    <tbody id="rcDetail"><tr><td colspan="8" class="text-muted">加载中…</td></tr></tbody>
+    <thead><tr><th>#</th><th>开始时间</th><th>任务</th><th>数据库 IP</th><th>库型</th><th>类型</th><th>状态</th><th>大小</th><th>耗时</th></tr></thead>
+    <tbody id="rcDetail"><tr><td colspan="9" class="text-muted">加载中…</td></tr></tbody>
   </table></div>
 </div>
 
@@ -83,21 +83,15 @@
             "</td><td>" + x.failed_count + "</td><td class=\"text-muted\">" +
             esc((x.last_failed_at || "").slice(0, 19)) + "</td></tr>").join("")
         : '<tr><td colspan="3" class="text-muted">窗口内无失败记录</td></tr>';
-      // 明细走 records API（前 20 条预览；完整明细见导出）
+      // 明细走 records API（最近 2000 条，前端 Pager 每页 10 条分页；完整明细见导出）
       try {
-        const recs = await B.api("GET", "/api/records?limit=20");
-        const list = recs.data ? recs.data : recs;
-        document.getElementById("rcDetail").innerHTML = (list || []).length
-          ? list.map((x, i) => "<tr><td>" + (i + 1) + "</td><td class=\"text-muted\">" +
-              esc((x.started_at || "").slice(0, 19)) + "</td><td>" + esc(x.task_name || "-") +
-              "</td><td>" + esc(x.db_type || "-") + "</td><td>" + esc(x.backup_type || "-") +
-              "</td><td>" + B.statusBadge(x.status) + "</td><td>" +
-              esc(x.size_human || "-") + "</td><td>" + esc(x.duration_sec ?? "-") +
-              "</td></tr>").join("")
-          : '<tr><td colspan="8" class="text-muted">无记录</td></tr>';
+        const recs = await B.api("GET", "/api/records?limit=2000");
+        const all = recs.data ? recs.data : recs;
+        window.__rcDetailRows = all || [];
+        renderRcDetailPage();
       } catch (e) {
         document.getElementById("rcDetail").innerHTML =
-          '<tr><td colspan="8" class="text-muted">明细加载失败：' + esc(e.message) + '</td></tr>';
+          '<tr><td colspan="9" class="text-muted">明细加载失败：' + esc(e.message) + '</td></tr>';
       }
     } catch (e) { B.toast(e.message, "danger"); }
   };
@@ -105,6 +99,25 @@
   window.exportReport = function (fmt) {
     const days = parseInt(document.getElementById("rcDays").value) || 7;
     window.open("/api/report-center/export?fmt=" + fmt + "&days=" + days, "_blank");
+  };
+
+  // 备份明细分页渲染（每页 10 条，连续行号跨页递增）
+  window.renderRcDetailPage = function () {
+    const B = window.BKP;
+    const esc = B.esc;
+    const rows = window.__rcDetailRows || [];
+    const pg = Pager.slice("rcDetail", rows, 10);
+    document.getElementById("rcDetail").innerHTML = pg.list.length
+      ? pg.list.map((x, i) => "<tr><td>" + (pg.startNo + i) + "</td><td class=\"text-muted\">" +
+          esc((x.started_at || "").slice(0, 19)) + "</td><td>" + esc(x.task_name || "-") +
+          "</td><td class=\"text-muted\">" + esc(x.host_ip || "-") +
+          "</td><td>" + esc(x.db_type || "-") + "</td><td>" + esc(x.backup_type || "-") +
+          "</td><td>" + B.statusBadge(x.status) + "</td><td>" +
+          esc(x.size_human || "-") + "</td><td>" + esc(x.duration_sec ?? "-") +
+          "</td></tr>").join("")
+      : '<tr><td colspan="9" class="text-muted">无记录</td></tr>';
+    Pager.attach("rcDetail", document.getElementById("rcDetail"),
+                 pg.page, pg.pages, pg.total, renderRcDetailPage);
   };
 
   document.getElementById("rcDays").addEventListener("change", loadReportCenter);

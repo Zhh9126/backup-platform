@@ -613,6 +613,7 @@
         JDBC_TEMPLATES = reg.templates;
         fillJdbcTestTypes();
       }
+      window.__jdbcEff = (reg && reg.effective) || {};
       const userReg = (reg && reg.user_registry) || {};
       const list = data.drivers || [];
       const cnt = $("jdbcDriverCount");
@@ -624,6 +625,18 @@
       const tmplOpts = (selected) => JDBC_TEMPLATES.map((t) =>
         '<option value="' + esc(t.db_type) + '"' + (t.db_type === selected ? " selected" : "")
         + ">" + esc(t.label) + "</option>").join("");
+      // 按文件名智能推荐库型（mssql→SQL Server、mysql→MySQL 等），默认选中推荐项
+      const recommendType = (name) => {
+        const n = (name || "").toLowerCase();
+        if (/mssql|sqlserver|sql-jdbc/.test(n)) return "sqlserver";
+        if (/mariadb/.test(n)) return "mariadb";
+        if (/mysql/.test(n)) return "mysql";
+        if (/postgres|pgjdbc|pg-/.test(n)) return "postgresql";
+        if (/kingbase/.test(n)) return "kingbase";
+        if (/ojdbc|oracle/.test(n)) return "oracle";
+        if (/dmjdbc|dameng/.test(n)) return "dameng";
+        return "";
+      };
       body.innerHTML = list.map((d) => {
         const size = (d.size >= 1048576) ? (d.size / 1048576).toFixed(1) + " MB" : (d.size / 1024).toFixed(1) + " KB";
         const bound = d.bound_db_types || [];
@@ -639,12 +652,14 @@
               ? ' <button class="btn btn-sm btn-outline-secondary border-0 text-muted p-0 ms-1" data-unreg="'
                 + esc(bound.find((bt) => userReg[bt])) + '" title="解除页面注册绑定（内置库型回退内置配置）">解除</button>'
               : "")
-          : '<span class="badge bg-secondary">未注册</span>';
+          : '<span class="badge bg-secondary" title="该 jar 尚未绑定数据库类型：在下方选择库型并点「注册」后即可用于 JDBC 直连测试">未注册 · 请选择库型注册</span>';
+        const recommended = recommendType(d.name);
         const regCtl = d.registered ? "" :
           ' <span class="d-inline-flex gap-1 align-items-center ms-1">'
-          + '<select class="form-select form-select-sm" style="width:110px;" data-reg-sel="' + esc(d.name) + '">'
-          + tmplOpts("sqlserver") + "</select>"
-          + '<button class="btn btn-sm btn-outline-success" data-reg="' + esc(d.name) + '" title="把该 jar 绑定到所选数据库类型（覆盖该类型现有绑定）"><i class="bi bi-check-lg"></i> 注册</button></span>';
+          + '<select class="form-select form-select-sm" style="width:110px;" data-reg-sel="' + esc(d.name) + '"'
+          + (recommended ? ' title="已根据文件名推荐：' + esc(recommended) + '"' : '') + ">"
+          + tmplOpts(recommended) + "</select>"
+          + '<button class="btn btn-sm btn-outline-success" data-reg="' + esc(d.name) + '" title="把该 jar 绑定到所选数据库类型（若该类型已有绑定将替换）"><i class="bi bi-check-lg"></i> 注册</button></span>';
         return '<tr>'
           + '<td><i class="bi bi-filetype-jar text-info me-1"></i>' + esc(d.name) + "</td>"
           + "<td>" + size + "</td>"
@@ -674,6 +689,18 @@
           const sel = body.querySelector('select[data-reg-sel="' + CSS.escape(name) + '"]');
           const dbType = sel ? sel.value : "";
           if (!dbType) { toast("请先选择要绑定的数据库类型", "warning"); return; }
+          // 目标库型已有绑定（内置或用户注册）→ 明确提示将被替换
+          const eff = ((window.__jdbcEff || {})[dbType]) || {};
+          if (eff.jar && eff.jar !== name) {
+            const ok = await (window.confirmDialog
+              ? confirmDialog({ title: "替换驱动绑定", message:
+                  "数据库类型 " + dbType + " 当前使用 " + eff.jar +
+                  "。注册后将替换为本 jar（原 jar 仍保留在列表中）。确定替换？",
+                confirmText: "替换并注册", danger: false })
+              : Promise.resolve(confirm("数据库类型 " + dbType + " 当前使用 " + eff.jar +
+                  "。注册后将替换为本 jar，确定？")));
+            if (!ok) return;
+          }
           try {
             const r = await api("POST", "/api/jdbc/drivers/" + encodeURIComponent(name) + "/register",
                                 { db_type: dbType });

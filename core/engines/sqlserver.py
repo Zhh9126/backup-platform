@@ -202,9 +202,106 @@ class SQLServerEngine(BackupEngine):
     # 备份（BACKUP DATABASE/LOG TO DISK → SFTP 拉回）
     # ------------------------------------------------------------------
     def backup(self, backup_type: BackupType) -> BackupResult:
+        # 逻辑备份 = JDBC 拉取通道（免安装免 SSH，纯 1433）；
+        # 物理/差异/日志 = BACKUP DATABASE T-SQL（需 SSH 通道执行 sqlcmd）。
+        if self.backup_mode == BackupMode.LOGICAL:
+            return self._backup_jdbc_logical()
         from core import remote_dump
         ssh_host = remote_dump.resolve_ssh_host(self.task)
         return self._backup_remote(ssh_host, backup_type)
+
+    # ------------------------------------------------------------------
+    # JDBC 逻辑备份/恢复（Windows 主机未开 SSH 时的完整替代通道）
+    # ------------------------------------------------------------------
+    def _backup_jdbc_logical(self) -> BackupResult:
+        start = time.time()
+        db_name = (self.task.get("db_name") or "").strip()
+        if not db_name:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                simulated=False,
+                                message="JDBC 逻辑备份必须指定库名（db_name）")
+        try:
+            from core import sqlserver_jdbc
+            tables = None
+            try:
+                extra = self.extra or {}
+                raw_tables = extra.get("tables")
+                if raw_tables:
+                    import json as _json
+                    tables = (_json.loads(raw_tables)
+                              if isinstance(raw_tables, str) else list(raw_tables))
+            except Exception:
+                tables = None
+            ts = self._timestamp()
+            tid = int(self.task.get("id") or 0)
+            out_dir = self._output_dir()
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(
+                out_dir, f"{db_name}_jdbc_logic_t{tid}_{ts}.sql.gz")
+            stats = sqlserver_jdbc.export_db(self.task, out_path, tables=tables)
+            checksum = db.sha256_file(out_path)
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=out_path, size_bytes=stats["size_bytes"],
+                duration_sec=round(time.time() - start, 2), simulated=False,
+                checksum=checksum,
+                message=(f"JDBC 逻辑备份完成: {stats['tables']} 表 / "
+                         f"{stats['rows']} 行（表结构+数据，免安装免 SSH；"
+                         f"不含存储过程/触发器/视图/索引）"))
+        except Exception as e:
+            from core.engines.base import _err_text
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED, simulated=False,
+                message=f"JDBC 逻辑备份失败（1433 连通性/账号密码/库名）: "
+                        f"{_err_text(e)}")
+
+    def _restore_jdbc_logical(self, backup_path: str, kwargs: dict) -> BackupResult:
+        target_db = (kwargs.get("target_db") or self.task.get("db_name") or "").strip()
+        if not target_db:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path, simulated=False,
+                message="JDBC 逻辑恢复必须指定目标库名（target_db）")
+        try:
+            from core import sqlserver_jdbc
+            stats = sqlserver_jdbc.replay_artifact(self.task, backup_path, target_db)
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS,
+                backup_path=backup_path, simulated=False,
+                message=(f"JDBC 逻辑恢复完成: 目标库 [{target_db}]，"
+                         f"执行 {stats['stmts']} 段（建表 {stats['tables']}，"
+                         f"INSERT 批 {stats['inserts']}）"))
+        except Exception as e:
+            from core.engines.base import _err_text
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path, simulated=False,
+                message=f"JDBC 逻辑恢复失败: {_err_text(e)}")
+
+    def preflight(self) -> (bool, str):
+        """预检：逻辑模式真实测一次 JDBC 连接（免 sqlcmd/免 SSH），
+        其余模式（物理/自定义脚本）交给基类。"""
+        try:
+            if self.backup_mode == BackupMode.LOGICAL and not (
+                    self._parse_task_extra() or {}).get("custom_script"):
+                try:
+                    from core import sqlserver_jdbc
+                    conn = sqlserver_jdbc._connect(self.task)
+                    try:
+                        cur = conn.cursor()
+                        cur.execute("SELECT 1")
+                        cur.fetchall()
+                        cur.close()
+                    finally:
+                        conn.close()
+                    return True, "ok（JDBC 逻辑通道连接成功，免安装免 SSH）"
+                except Exception as e:
+                    from core.engines.base import _err_text
+                    return False, ("JDBC 逻辑通道连接失败（检查 1433 监听/"
+                                   "TCP/IP 已启用/账号密码）: " + _err_text(e))
+        except Exception:
+            pass
+        return super().preflight()
 
     def _backup_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
         from core.engines.file import _ssh_exec_pipe
@@ -427,6 +524,9 @@ class SQLServerEngine(BackupEngine):
     # 恢复（SFTP 推送 → RESTORE FILELISTONLY → RESTORE DATABASE WITH MOVE/REPLACE）
     # ------------------------------------------------------------------
     def restore(self, backup_path: str, **kwargs) -> BackupResult:
+        # JDBC 逻辑产物（.sql/.sql.gz）回放：无需 SSH
+        if backup_path and backup_path.endswith((".sql", ".sql.gz")):
+            return self._restore_jdbc_logical(backup_path, kwargs)
         from core import remote_dump
         ssh_host = remote_dump.resolve_ssh_host(self.task)
         if not ssh_host:

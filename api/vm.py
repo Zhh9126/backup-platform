@@ -121,8 +121,12 @@ def api_vm_hypervisor_vms(hv_id):
 @api_bp.route("/vm/protect", methods=["POST"])
 @login_required
 def api_vm_protect():
+    from core import license as license_mod
     try:
+        license_mod.check_quota("vm")
         return jsonify(_svc().protect(_json())), 201
+    except license_mod.QuotaExceededError as qe:
+        return jsonify({"error": str(qe), "quota_exceeded": True}), 403
     except Exception as e:
         return _err(e)
 

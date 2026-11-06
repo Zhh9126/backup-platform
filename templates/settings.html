@@ -25,6 +25,294 @@
   </div>
 </div>
 
+<!-- 系统商业授权与纳管配额管理 -->
+<div class="page-card mb-3" id="licenseCard">
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <div class="card-section-title mb-0">
+      <i class="bi bi-shield-lock-fill text-warning"></i> 系统商业授权与纳管配额
+    </div>
+    <span id="licBadgeTop" class="badge bg-secondary">检测中...</span>
+  </div>
+  <p class="form-text-hint mb-3">
+    社区免费版默认各项备份与纳管功能（网络设备、数据库、文件、对象存储、虚拟机、AI 模型）最多支持纳管 <b>5 个</b> 设备/任务。
+    激活绑定本机物理 MAC 地址的永久企业授权码后，将全量解除限制，支持无上限纳管。
+  </p>
+
+  <!-- 状态概览区域 -->
+  <div class="row g-3 mb-3">
+    <div class="col-md-6">
+      <div class="p-3 border rounded" style="background: rgba(255,255,255,0.03);">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <span class="text-muted small">服务器物理网卡 MAC 地址（用于生成授权）</span>
+          <button class="btn btn-sm btn-outline-primary py-0 px-2" type="button" id="copyMacBtn">
+            <i class="bi bi-clipboard"></i> 复制 MAC 地址
+          </button>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+          <code class="fs-5 fw-bold text-info font-monospace" id="licPrimaryMac">检测中...</code>
+        </div>
+        <div class="text-muted" style="font-size: 0.78rem; margin-top: 6px;">
+          <i class="bi bi-info-circle"></i> 提示：授权码是由发号管理中心根据此 MAC 地址进行唯一加密绑定的，防范授权码被私自挪用。
+        </div>
+      </div>
+    </div>
+    <div class="col-md-6">
+      <div class="p-3 border rounded" style="background: rgba(255,255,255,0.03);">
+        <div class="text-muted small mb-1">当前运行授权模式</div>
+        <div class="d-flex align-items-center gap-2">
+          <span class="fs-5 fw-bold" id="licEditionText">社区免费版</span>
+          <span id="licEditionPill" class="badge bg-secondary small">限额 5 台</span>
+        </div>
+        <div class="text-muted small mt-2" id="licCustomerText">
+          未激活商业授权 · 受控备份任务与网络设备上限为 5
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 6 大模块配额监控面板 -->
+  <div class="card-section-title fs-6 mb-2"><i class="bi bi-speedometer2"></i> 受控备份与纳管功能配额状态</div>
+  <div class="row g-3 mb-3" id="quotaGrid">
+    <!-- 动态渲染 -->
+    <div class="col-12 text-muted small py-2">正在获取配额状态...</div>
+  </div>
+
+  <!-- 激活区域 -->
+  <div class="border-top pt-3 mt-3" id="licActivateArea">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <label class="form-label fw-bold mb-0">
+        <i class="bi bi-key-fill text-warning"></i> 录入永久企业授权码
+      </label>
+      <span class="text-muted small">格式：<code>AIDBM-LIC1-...</code></span>
+    </div>
+    <div class="input-group mb-2">
+      <input type="text" class="form-control font-monospace" id="licCodeInput" placeholder="在此粘贴从授权发号平台生成的完整授权码...">
+      <button class="btn btn-primary" id="licActivateBtn" type="button">
+        <i class="bi bi-patch-check"></i> 验证并激活永久授权
+      </button>
+    </div>
+    <div id="licActiveDetails" class="alert alert-success d-none mb-2">
+      <div class="d-flex justify-content-between align-items-center">
+        <div>
+          <strong><i class="bi bi-check-circle-fill"></i> 企业永久授权已生效！</strong>
+          <div class="small mt-1" id="licDetailText">已全量解锁，所有备份与网络设备无上限纳管。</div>
+        </div>
+        <button class="btn btn-sm btn-outline-danger" id="licDeactivateBtn" type="button">
+          <i class="bi bi-x-circle"></i> 注销当前授权
+        </button>
+      </div>
+    </div>
+    <div id="licMsg" class="form-text"></div>
+  </div>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  let currentMac = "";
+  let isCurrentlyLicensed = false;
+
+  async function loadLicenseStatus() {
+    try {
+      const resp = await fetch("/api/system/license", { credentials: "include" });
+      const res = await resp.json();
+      if (res.code === 0) {
+        renderLicenseUI(res.data.license, res.data.quotas);
+      }
+    } catch (e) {
+      console.error("加载授权失败:", e);
+    }
+  }
+
+  function renderLicenseUI(lic, quotas) {
+    isCurrentlyLicensed = !!lic.is_licensed;
+    currentMac = lic.primary_mac || "";
+    document.getElementById("licPrimaryMac").textContent = currentMac || "未检测到物理网卡";
+
+    const badgeTop = document.getElementById("licBadgeTop");
+    const edText = document.getElementById("licEditionText");
+    const edPill = document.getElementById("licEditionPill");
+    const custText = document.getElementById("licCustomerText");
+    const actInput = document.getElementById("licCodeInput");
+    const actBtn = document.getElementById("licActivateBtn");
+    const activeDetails = document.getElementById("licActiveDetails");
+    const brandBadge = document.getElementById("brandEditionBadge");
+
+    if (isCurrentlyLicensed) {
+      badgeTop.className = "badge bg-warning text-dark";
+      badgeTop.innerHTML = '<i class="bi bi-shield-fill-check"></i> 企业永久版';
+      edText.textContent = "企业永久版 (终身)";
+      edText.className = "fs-5 fw-bold text-warning";
+      edPill.className = "badge bg-success";
+      edPill.textContent = "无限制纳管";
+      custText.innerHTML = `授权客户: <b>${escapeHtml(lic.customer || '-')}</b> | 绑定 MAC: <code>${lic.license_mac}</code> | 激活时间: ${(lic.activated_at || '').substring(0, 19)}`;
+
+      actInput.classList.add("d-none");
+      actBtn.classList.add("d-none");
+      activeDetails.classList.remove("d-none");
+      document.getElementById("licDetailText").innerHTML =
+        `授权主体：<b>${escapeHtml(lic.customer)}</b>（永久有效） · 绑定 MAC：<code>${lic.license_mac}</code> · 全模块纳管配额已解除限制！`;
+
+      if (brandBadge) {
+        brandBadge.className = "brand-edition brand-edition-enterprise";
+        brandBadge.innerHTML = '<i class="bi bi-shield-fill-check"></i> 企业永久版';
+      }
+    } else {
+      badgeTop.className = "badge bg-info text-dark";
+      badgeTop.innerHTML = '<i class="bi bi-box"></i> 社区免费版';
+      edText.textContent = "社区免费版";
+      edText.className = "fs-5 fw-bold text-info";
+      edPill.className = "badge bg-secondary";
+      edPill.textContent = "每类限额 5 台";
+      custText.textContent = "未激活商业授权 · 截图中的各项备份任务与网络设备上限为 5";
+
+      actInput.classList.remove("d-none");
+      actBtn.classList.remove("d-none");
+      activeDetails.classList.add("d-none");
+
+      if (brandBadge) {
+        brandBadge.className = "brand-edition";
+        brandBadge.innerHTML = '<i class="bi bi-box"></i> 社区版';
+      }
+    }
+
+    // 渲染 6 大模块配额
+    renderQuotas(quotas, isCurrentlyLicensed);
+  }
+
+  function renderQuotas(quotas, licensed) {
+    const grid = document.getElementById("quotaGrid");
+    if (!quotas) return;
+
+    const icons = {
+      netdev: "bi-router",
+      database: "bi-list-check",
+      file: "bi-folder2-open",
+      object_storage: "bi-cloud-arrow-up",
+      vm: "bi-pc-display-horizontal",
+      ai_plan: "bi-cpu",
+    };
+
+    let html = "";
+    for (const key of Object.keys(quotas)) {
+      const q = quotas[key];
+      const icon = icons[key] || "bi-hdd-network";
+      const used = q.used || 0;
+      const limit = licensed ? "无限制" : (q.limit || 5);
+      const pct = licensed ? 15 : Math.min(100, Math.round((used / (q.limit || 5)) * 100));
+      const barColor = licensed ? "bg-info" : (used >= 5 ? "bg-danger" : (used >= 4 ? "bg-warning" : "bg-success"));
+
+      html += `
+        <div class="col-md-4 col-sm-6">
+          <div class="p-2 border rounded" style="background: rgba(255,255,255,0.02);">
+            <div class="d-flex justify-content-between align-items-center mb-1">
+              <span class="small fw-semibold"><i class="bi ${icon} me-1"></i> ${escapeHtml(q.label)}</span>
+              <span class="badge ${licensed ? 'bg-success' : (used >= 5 ? 'bg-danger' : 'bg-secondary')} small">
+                ${used} / ${limit}
+              </span>
+            </div>
+            <div class="progress" style="height: 6px;">
+              <div class="progress-bar ${barColor}" role="progressbar" style="width: ${pct}%"></div>
+            </div>
+            <div class="d-flex justify-content-between align-items-center mt-1" style="font-size: 0.72rem; color: #94a3b8;">
+              <span>已纳管: ${used}</span>
+              <span>${licensed ? '终身不限' : (used >= 5 ? '已达上限' : '剩余: ' + (5 - used))}</span>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+    grid.innerHTML = html;
+  }
+
+  // 复制 MAC
+  document.getElementById("copyMacBtn")?.addEventListener("click", () => {
+    if (!currentMac) return;
+    navigator.clipboard.writeText(currentMac).then(() => {
+      alert("✓ 物理 MAC 地址已复制到剪贴板：" + currentMac + "\n请将此 MAC 提供给授权系统以生成永久授权码。");
+    }).catch(() => {
+      const ta = document.createElement("textarea");
+      ta.value = currentMac;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      alert("✓ 物理 MAC 地址已复制到剪贴板：" + currentMac);
+    });
+  });
+
+  // 激活
+  document.getElementById("licActivateBtn")?.addEventListener("click", async () => {
+    const code = document.getElementById("licCodeInput").value.trim();
+    const msg = document.getElementById("licMsg");
+    if (!code) {
+      msg.className = "form-text text-danger";
+      msg.textContent = "请输入授权码后再执行激活";
+      return;
+    }
+
+    const btn = document.getElementById("licActivateBtn");
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner-border spinner-border-sm"></span> 正在校验防伪签名...`;
+
+    try {
+      const resp = await fetch("/api/system/license/activate", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ license_code: code }),
+      });
+      const res = await resp.json();
+      if (res.code === 0) {
+        msg.className = "form-text text-success";
+        msg.textContent = "✓ " + res.msg;
+        alert("🎉 永久企业版授权激活成功！\n\n已解除网络设备、数据库、文件、对象存储、虚拟机、AI 模型全部模块的纳管限制。");
+        renderLicenseUI(res.data, res.quotas);
+      } else {
+        msg.className = "form-text text-danger";
+        msg.textContent = "激活失败: " + (res.error || res.message || "未知错误");
+      }
+    } catch (e) {
+      msg.className = "form-text text-danger";
+      msg.textContent = "激活请求异常: " + e;
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = `<i class="bi bi-patch-check"></i> 验证并激活永久授权`;
+    }
+  });
+
+  // 注销
+  document.getElementById("licDeactivateBtn")?.addEventListener("click", async () => {
+    if (!confirm("确定要注销当前商业授权吗？注销后系统将回退为社区免费版，各模块重新受限最多纳管 5 个设备/任务。")) {
+      return;
+    }
+    try {
+      const resp = await fetch("/api/system/license/deactivate", {
+        method: "POST",
+        credentials: "include",
+      });
+      const res = await resp.json();
+      if (res.code === 0) {
+        alert("已注销商业授权，系统恢复为社区免费版。");
+        renderLicenseUI(res.data, res.quotas);
+      } else {
+        alert("注销失败: " + (res.error || "未知异常"));
+      }
+    } catch (e) {
+      alert("注销请求错误: " + e);
+    }
+  });
+
+  function escapeHtml(str) {
+    if (!str) return "";
+    return String(str).replace(/[&<>"']/g, function(m) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[m];
+    });
+  }
+
+  loadLicenseStatus();
+});
+</script>
+
 <div class="page-card">
   <div class="card-section-title"><i class="bi bi-bell"></i> 通知配置</div>
   <p class="form-text-hint mb-3">备份/同步失败、巡检异常时，通过以下渠道第一时间告警。邮件渠道使用 SMTP 发送。</p>

@@ -129,14 +129,17 @@ def create_app() -> Flask:
     def _inject_bkp_meta():
         try:
             from api.system import build_meta
+            from core import license as license_mod
             return {"bkp_meta": build_meta(),
                     "platform_version": config.PLATFORM_VERSION,
-                    "has_ai_agent": _has_ai_agent()}
+                    "has_ai_agent": _has_ai_agent(),
+                    "license_info": license_mod.get_license_info()}
         except Exception as e:  # noqa: BLE001 - 注入失败不能影响页面渲染
             print(f"[startup] bkp_meta 注入失败（前端将回退到 /api/meta）: {e}")
             return {"bkp_meta": {},
                     "platform_version": config.PLATFORM_VERSION,
-                    "has_ai_agent": _has_ai_agent()}
+                    "has_ai_agent": _has_ai_agent(),
+                    "license_info": {}}
 
     app.config["BACKUP_ROOT"] = str(config.get_backup_root())
     _root_info = config.backup_root_info()
@@ -344,6 +347,12 @@ def create_app() -> Flask:
     @login_required
     def file_backup_page():
         return render_template("file_backup.html", page="file_backup")
+
+    @app.route("/netdev")
+    @login_required
+    def netdev_page():
+        """网络设备配置备份（交换机 / 路由器 / 防火墙，自定义指令，SSH 探测与远程 FTP 存储）。"""
+        return render_template("netdev.html", page="netdev")
 
     @app.route("/sync")
     @login_required

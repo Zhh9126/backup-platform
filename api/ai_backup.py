@@ -19,10 +19,14 @@ def list_ai_plans():
 @api_bp.route("/ai-plans", methods=["POST"])
 @login_required
 def create_ai_plan():
+    from core import license as license_mod
     data = request.get_json(force=True, silent=True) or {}
     try:
+        license_mod.check_quota("ai_plan")
         pid = ai_protection.create_plan(data)
         return jsonify({"ok": True, "id": pid})
+    except license_mod.QuotaExceededError as qe:
+        return jsonify({"error": str(qe), "quota_exceeded": True}), 403
     except ai_protection.PlanError as e:
         return jsonify({"error": str(e)}), 400
 

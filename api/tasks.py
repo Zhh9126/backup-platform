@@ -345,7 +345,11 @@ def create_task():
         return jsonify({"error": err}), 400
     if data.get("extra_options"):
         data["extra_options"] = _secure_ssh_cred(data["extra_options"])
-    tid = models.create_task(data)
+    from core import license as license_mod
+    try:
+        tid = models.create_task(data)
+    except license_mod.QuotaExceededError as qe:
+        return jsonify({"error": str(qe), "quota_exceeded": True}), 403
     scheduler.reload_scheduler()
     return jsonify({"id": tid, "ok": True}), 201
 
@@ -565,6 +569,9 @@ def import_tasks():
         try:
             models.create_task(data)
             created += 1
+        except license_mod.QuotaExceededError as qe:
+            errors.append(f"【社区版配额达到上限】第{i}行({name})未能导入并终止后续导入: {qe}")
+            break
         except Exception as e:
             errors.append(f"第{i}行({name}): {e}")
     scheduler.reload_scheduler()

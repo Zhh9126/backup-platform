@@ -30,6 +30,12 @@
     @media (prefers-reduced-motion: reduce) {
       .content-inner { animation: none; }
     }
+    .brand .brand-edition-enterprise {
+      color: #fbbf24 !important;
+      background: rgba(245, 158, 11, .15) !important;
+      border: 1px solid rgba(245, 158, 11, .45) !important;
+      box-shadow: 0 0 8px rgba(245, 158, 11, .25);
+    }
   </style>
   <link href="/static/css/bootstrap.min.css?v=2026080210" rel="stylesheet">
   <link href="/static/vendor/bootstrap-icons/bootstrap-icons-inline.css?v=2026110401" rel="stylesheet">
@@ -63,7 +69,11 @@
         <span class="brand-text">
           <span class="brand-name" title="AIDBM · AI 原生智能数据库灾备管理平台">AIDBM</span>
           <span class="brand-sub">智能灾备管理平台</span>
-            <span class="brand-edition">社区版</span>
+          {% if license_info and license_info.is_licensed %}
+            <span class="brand-edition brand-edition-enterprise" id="brandEditionBadge" title="已激活永久商业授权（客户: {{ license_info.customer }}）"><i class="bi bi-shield-fill-check"></i> 企业永久版</span>
+          {% else %}
+            <span class="brand-edition" id="brandEditionBadge" title="社区免费版（每类受控功能最多纳管 5 个）"><i class="bi bi-box"></i> 社区版</span>
+          {% endif %}
         </span>
         <button class="sidebar-toggle" id="sidebarToggle" type="button" title="收起 / 展开侧边栏" aria-label="收起或展开侧边栏">
           <i class="bi bi-list"></i>
@@ -76,6 +86,7 @@
         <div class="nav-group-label">备份管理</div>
         <a class="nav-link {% if page=='tasks' %}active{% endif %}" href="/tasks" title="数据库备份" data-perm="backup.task.view"><i class="bi bi-list-check"></i> <span class="nav-label">数据库备份</span></a>
         <a class="nav-link {% if page=='file_backup' %}active{% endif %}" href="/file_backup" title="文件备份" data-perm="backup.task.view"><i class="bi bi-folder2-open"></i> <span class="nav-label">文件备份</span></a>
+        <a class="nav-link {% if page=='netdev' %}active{% endif %}" href="/netdev" title="网络设备备份（交换机 / 路由器配置备份 / SSH / 远程 FTP）" data-perm="backup.task.view"><i class="bi bi-router"></i> <span class="nav-label">网络设备备份</span></a>
         <a class="nav-link {% if page=='object_storage' %}active{% endif %}" href="/object_storage" title="对象存储备份（MinIO / 阿里云 OSS / 腾讯云 COS / S3 兼容，桶级保护，桶侧零安装）" data-perm="backup.task.view"><i class="bi bi-cloud-arrow-up"></i> <span class="nav-label">对象存储备份</span></a>
         <a class="nav-link {% if page=='vm' %}active{% endif %}" href="/vm" title="虚拟机备份（整机恢复点 / 永久增量 / 克隆新 VM）"><i class="bi bi-pc-display-horizontal"></i> <span class="nav-label">虚拟机备份</span></a>
         <a class="nav-link {% if page=='ai_backup' %}active{% endif %}" href="/ai_backup" title="AI 模型备份：模型权重/检查点、向量索引（Qdrant/Chroma）、训练数据集与元数据的跨层一致性保护计划"><i class="bi bi-cpu"></i> <span class="nav-label">AI 模型备份</span></a>

@@ -1,0 +1,1821 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title"><i class="bi bi-router text-primary me-2"></i>网络设备配置备份</div>
+    <div class="page-sub">纳管交换机、路由器等网络设备，支持凭据令牌复用、Excel 批量导入、自定义指令、定时自动备份与远程 FTP 存储</div>
+  </div>
+  <div class="d-flex flex-wrap gap-2">
+    <!-- 定时自动备份设置 -->
+    <button class="btn btn-outline-primary btn-sm" onclick="openScheduleModal()" title="设置全局或设备定时自动备份排程">
+      <i class="bi bi-alarm"></i> 定时备份设置
+    </button>
+    <!-- Excel 批量导入 -->
+    <button class="btn btn-outline-success btn-sm" onclick="openImportModal()" title="通过 Excel 文件批量导入网络设备">
+      <i class="bi bi-file-earmark-excel"></i> Excel 导入
+    </button>
+    <!-- 批量探测 -->
+    <button class="btn btn-outline-secondary btn-sm" onclick="testAllDevices()" title="对所有设备批量进行 SSH 连通性探测">
+      <i class="bi bi-broadcast"></i> 探测连接
+    </button>
+    <button class="btn btn-outline-secondary btn-sm" onclick="refreshAll()" title="刷新">
+      <i class="bi bi-arrow-clockwise"></i> 刷新
+    </button>
+    <button class="btn btn-primary" onclick="openDeviceModal()"><i class="bi bi-plus-lg"></i> 添加网络设备</button>
+  </div>
+</div>
+
+<!-- 统计指标卡片 -->
+<div class="row g-3 mb-4">
+  <div class="col-6 col-md-3">
+    <div class="page-card h-100 p-3 d-flex align-items-center">
+      <div class="rounded-3 p-3 bg-primary bg-opacity-10 text-primary me-3 fs-3">
+        <i class="bi bi-hdd-network"></i>
+      </div>
+      <div>
+        <div class="text-muted small">纳管设备总数</div>
+        <div class="fs-4 fw-bold" id="statTotalDev">0</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="page-card h-100 p-3 d-flex align-items-center">
+      <div class="rounded-3 p-3 bg-success bg-opacity-10 text-success me-3 fs-3">
+        <i class="bi bi-check-circle"></i>
+      </div>
+      <div>
+        <div class="text-muted small">SSH 在线 (已连接)</div>
+        <div class="fs-4 fw-bold text-success" id="statConnectedDev">0</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="page-card h-100 p-3 d-flex align-items-center">
+      <div class="rounded-3 p-3 bg-danger bg-opacity-10 text-danger me-3 fs-3">
+        <i class="bi bi-x-circle"></i>
+      </div>
+      <div>
+        <div class="text-muted small">SSH 离线 (连接失败)</div>
+        <div class="fs-4 fw-bold text-danger" id="statDisconnectedDev">0</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="page-card h-100 p-3 d-flex align-items-center">
+      <div class="rounded-3 p-3 bg-info bg-opacity-10 text-info me-3 fs-3">
+        <i class="bi bi-file-earmark-code"></i>
+      </div>
+      <div>
+        <div class="text-muted small">累计备份配置</div>
+        <div class="fs-4 fw-bold text-info" id="statTotalBackups">0</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 标签页：设备纳管 / 凭据令牌 / 备份历史 / 配置比对 -->
+<div class="page-card">
+  <ul class="nav nav-tabs mb-3" id="netdevTabs" role="tablist">
+    <li class="nav-item">
+      <button class="nav-link active" id="devices-tab" data-bs-toggle="tab" data-bs-target="#tabDevices" type="button">
+        <i class="bi bi-hdd-stack me-1"></i> 网络设备纳管
+      </button>
+    </li>
+    <li class="nav-item">
+      <button class="nav-link" id="tokens-tab" data-bs-toggle="tab" data-bs-target="#tabTokens" type="button">
+        <i class="bi bi-key me-1"></i> 统一凭据令牌管理
+      </button>
+    </li>
+    <li class="nav-item">
+      <button class="nav-link" id="backups-tab" data-bs-toggle="tab" data-bs-target="#tabBackups" type="button">
+        <i class="bi bi-clock-history me-1"></i> 配置备份记录
+      </button>
+    </li>
+    <li class="nav-item">
+      <button class="nav-link" id="diff-tab" data-bs-toggle="tab" data-bs-target="#tabDiff" type="button">
+        <i class="bi bi-file-diff me-1"></i> 配置版本比对 (Diff)
+      </button>
+    </li>
+  </ul>
+
+  <div class="tab-content" id="netdevTabContent">
+    <!-- Tab 1: 设备纳管列表 -->
+    <div class="tab-pane fade show active" id="tabDevices" role="tabpanel">
+      <!-- 批量操作栏 -->
+      <div id="batchActionBar"
+        class="alert alert-info py-2 px-3 d-flex justify-content-between align-items-center mb-3 d-none">
+        <div>
+          <i class="bi bi-check2-square text-primary me-2"></i>
+          已选择 <strong id="selectedDevCount">0</strong> 台设备
+          <span class="text-muted small ms-2">（系统自动过滤未连通的设备，保障备份可靠性）</span>
+        </div>
+        <div class="d-flex gap-2">
+          <button class="btn btn-sm btn-success" onclick="doBatchBackup()">
+            <i class="bi bi-play-circle me-1"></i> 批量执行备份
+          </button>
+          <button class="btn btn-sm btn-outline-primary" onclick="doBatchTest()">
+            <i class="bi bi-shield-check me-1"></i> 批量测试连接
+          </button>
+          <button class="btn btn-sm btn-outline-secondary" onclick="clearDevSelection()">
+            取消选择
+          </button>
+        </div>
+      </div>
+
+      <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+        <div class="text-muted small">
+          <i class="bi bi-info-circle me-1"></i>
+          说明：<strong>只有 SSH 远程连接测试成功的设备才允许触发备份</strong>。勾选左侧复选框可进行批量备份。
+        </div>
+        <div class="d-flex gap-2">
+          <div class="input-group input-group-sm" style="max-width: 260px;">
+            <span class="input-group-text"><i class="bi bi-search"></i></span>
+            <input type="text" class="form-control" id="searchDevInput" placeholder="按设备名/IP过滤..."
+              oninput="renderDeviceTable()">
+          </div>
+        </div>
+      </div>
+
+      <div class="table-responsive">
+        <table class="table table-hover align-middle mb-0">
+          <thead class="table-light">
+            <tr>
+              <th style="width: 40px;">
+                <input class="form-check-input" type="checkbox" id="selectAllDevCheckbox"
+                  onchange="toggleSelectAllDev(this)">
+              </th>
+              <th>设备名称</th>
+              <th>类型 / 厂商</th>
+              <th>IP 地址 & 端口</th>
+              <th>认证凭据 / 令牌</th>
+              <th>SSH 连接状态</th>
+              <th>备份存储目标</th>
+              <th>定时排程</th>
+              <th>最近备份状态</th>
+              <th class="text-end" style="min-width: 200px;">操作</th>
+            </tr>
+          </thead>
+          <tbody id="netdevTableBody">
+            <tr>
+              <td colspan="10" class="text-center text-muted py-4"><span
+                  class="spinner-border spinner-border-sm me-2"></span>加载网络设备数据...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Tab 2: 统一凭据令牌管理 -->
+    <div class="tab-pane fade" id="tabTokens" role="tabpanel">
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <div class="text-muted small">
+          <i class="bi bi-shield-lock me-1"></i>
+          通过统一凭据令牌，无需在每台交换机/路由器上重复输入用户名与密码。新增设备时直接选择对应令牌即可继承。
+        </div>
+        <button class="btn btn-sm btn-primary" onclick="openTokenModal()">
+          <i class="bi bi-plus-lg"></i> 添加凭据令牌
+        </button>
+      </div>
+
+      <div class="table-responsive">
+        <table class="table table-hover align-middle mb-0">
+          <thead class="table-light">
+            <tr>
+              <th style="width: 50px;">#</th>
+              <th>令牌名称</th>
+              <th>认证方式</th>
+              <th>SSH 用户名</th>
+              <th>特权/Enable 密码</th>
+              <th>备注说明</th>
+              <th>更新时间</th>
+              <th class="text-end" style="width: 140px;">操作</th>
+            </tr>
+          </thead>
+          <tbody id="tokensTableBody">
+            <tr>
+              <td colspan="8" class="text-center text-muted py-4">加载中...</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Tab 3: 配置备份记录 -->
+    <div class="tab-pane fade" id="tabBackups" role="tabpanel">
+      <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+        <div class="d-flex align-items-center gap-2">
+          <label class="small text-muted mb-0">筛选设备：</label>
+          <select class="form-select form-select-sm" id="filterDeviceSelect" onchange="loadBackups()"
+            style="min-width: 180px;">
+            <option value="">全部网络设备</option>
+          </select>
+        </div>
+        <button class="btn btn-sm btn-outline-secondary" onclick="loadBackups()">
+          <i class="bi bi-arrow-clockwise"></i> 刷新记录
+        </button>
+      </div>
+
+      <div class="table-responsive">
+        <table class="table table-hover align-middle mb-0">
+          <thead class="table-light">
+            <tr>
+              <th style="width: 50px;">#</th>
+              <th>备份时间</th>
+              <th>设备名称</th>
+              <th>设备类型</th>
+              <th>存储类型 & 位置</th>
+              <th>产物文件名</th>
+              <th>大小</th>
+              <th>状态</th>
+              <th>耗时</th>
+              <th>操作人</th>
+              <th class="text-end" style="min-width: 160px;">操作</th>
+            </tr>
+          </thead>
+          <tbody id="backupsTableBody">
+            <tr>
+              <td colspan="11" class="text-center text-muted py-4">暂无备份记录</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Tab 4: 配置版本比对 (Diff) -->
+    <div class="tab-pane fade" id="tabDiff" role="tabpanel">
+      <div class="p-3 bg-light rounded-3 mb-3 border">
+        <div class="row g-3 align-items-end">
+          <div class="col-md-3">
+            <label class="form-label small fw-bold">选择网络设备</label>
+            <select class="form-select form-select-sm" id="diffDevSelect" onchange="updateDiffBackupsSelect()">
+              <option value="">-- 请选择设备 --</option>
+            </select>
+          </div>
+          <div class="col-md-3">
+            <label class="form-label small fw-bold">基准备份版本 (旧)</label>
+            <select class="form-select form-select-sm" id="diffBackup1Select">
+              <option value="">-- 请选择备份 --</option>
+            </select>
+          </div>
+          <div class="col-md-3">
+            <label class="form-label small fw-bold">对比备份版本 (新)</label>
+            <select class="form-select form-select-sm" id="diffBackup2Select">
+              <option value="">-- 请选择备份 --</option>
+            </select>
+          </div>
+          <div class="col-md-3">
+            <button class="btn btn-primary btn-sm w-100" onclick="doDiff()">
+              <i class="bi bi-file-diff me-1"></i> 开始比对配置差异
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div id="diffResultContainer" class="d-none">
+        <div class="d-flex justify-content-between align-items-center mb-2">
+          <span class="fw-bold small text-muted"><i class="bi bi-code-square me-1"></i>差异对比结果</span>
+          <span class="badge bg-secondary" id="diffMetaBadge">Unified Diff</span>
+        </div>
+        <pre id="diffPre" class="p-3 bg-dark text-white rounded-3 font-monospace small"
+          style="max-height: 520px; overflow: auto; white-space: pre-wrap; word-break: break-all;"></pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== 模态框：添加 / 编辑网络设备 ==================== -->
+<div class="modal fade" id="deviceModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="deviceModalTitle"><i class="bi bi-router text-primary me-2"></i>添加网络设备</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <form id="deviceForm">
+          <input type="hidden" id="dev_id">
+
+          <h6 class="fw-bold text-primary mb-3 border-bottom pb-2"><i class="bi bi-info-circle me-1"></i> 设备基本信息</h6>
+          <div class="row g-3 mb-3">
+            <div class="col-md-6">
+              <label class="form-label">设备名称 *</label>
+              <input type="text" class="form-control" id="dev_name" placeholder="如：核心交换机-A01" required>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">设备类型 *</label>
+              <select class="form-select" id="dev_type" required>
+                <option value="switch">交换机 (Switch)</option>
+                <option value="router">路由器 (Router)</option>
+                <option value="firewall">防火墙 (Firewall)</option>
+                <option value="other">其他网络设备 (Other)</option>
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">厂商系统预设</label>
+              <select class="form-select" id="dev_vendor" onchange="onVendorPresetChange()">
+                <option value="huawei">华为 (Huawei VRP)</option>
+                <option value="h3c">华三 (H3C Comware)</option>
+                <option value="cisco">思科 (Cisco IOS / NX-OS)</option>
+                <option value="ruijie">锐捷 (Ruijie RGOS)</option>
+                <option value="juniper">瞻博 (Juniper Junos)</option>
+                <option value="linux">Linux 网关 / 软路由</option>
+                <option value="custom">自定义设备</option>
+              </select>
+              <div class="form-text">切换厂商将自动填充对应推荐的终端初始化与备份指令</div>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">备注信息</label>
+              <input type="text" class="form-control" id="dev_remark" placeholder="如：机房 A 区 102 机柜">
+            </div>
+          </div>
+
+          <h6 class="fw-bold text-primary mb-3 border-bottom pb-2"><i class="bi bi-shield-lock me-1"></i> 认证凭据与令牌绑定</h6>
+          <div class="row g-3 mb-3">
+            <div class="col-md-12">
+              <label class="form-label fw-bold text-dark"><i class="bi bi-key text-success me-1"></i>选择凭据令牌
+                (Token)</label>
+              <div class="input-group">
+                <select class="form-select" id="dev_token_id" onchange="onDeviceTokenSelectChange()">
+                  <option value="">-- 独立凭据（手动输入账号密码） --</option>
+                </select>
+                <button class="btn btn-outline-secondary" type="button" onclick="openTokenModalFromDevModal()">
+                  <i class="bi bi-plus-lg"></i> 新建令牌
+                </button>
+              </div>
+              <div class="form-text" id="devTokenHintText">选择已有令牌后，设备将自动继承该令牌的 SSH 用户名、密码及特权密码，密码变更无需逐台修改。</div>
+            </div>
+
+            <div class="col-md-8">
+              <label class="form-label">主机 IP / 地址 *</label>
+              <input type="text" class="form-control" id="dev_host" placeholder="如：192.168.1.1" required>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">SSH 端口 *</label>
+              <input type="number" class="form-control" id="dev_port" value="22" required>
+            </div>
+
+            <div class="col-md-6 dev-custom-cred-field">
+              <label class="form-label">认证模式</label>
+              <select class="form-select" id="dev_auth_mode" onchange="onAuthModeChange()">
+                <option value="password">用户名 / 密码认证</option>
+                <option value="key">SSH 私钥认证</option>
+              </select>
+            </div>
+            <div class="col-md-6 dev-custom-cred-field">
+              <label class="form-label">SSH 用户名 <span id="devUserReqStar">*</span></label>
+              <input type="text" class="form-control" id="dev_username" placeholder="如：admin">
+            </div>
+            <div class="col-md-6 dev-password-field dev-custom-cred-field">
+              <label class="form-label">SSH 登录密码</label>
+              <input type="password" class="form-control" id="dev_password" placeholder="若不修改留空">
+            </div>
+            <div class="col-md-6 dev-custom-cred-field">
+              <label class="form-label">特权/Enable 密码 (可选)</label>
+              <input type="password" class="form-control" id="dev_enable_password" placeholder="某些厂商提权需要，可选">
+            </div>
+            <div class="col-12 dev-key-field dev-custom-cred-field d-none">
+              <label class="form-label">SSH 私钥内容 (PEM 格式)</label>
+              <textarea class="form-control font-monospace small" id="dev_private_key" rows="3"
+                placeholder="-----BEGIN RSA PRIVATE KEY-----..."></textarea>
+            </div>
+          </div>
+
+          <h6 class="fw-bold text-primary mb-3 border-bottom pb-2"><i class="bi bi-terminal me-1"></i> 自定义备份指令配置</h6>
+          <div class="row g-3 mb-3">
+            <div class="col-12">
+              <label class="form-label">自定义备份指令 * (支持多行，每行一条指令)</label>
+              <textarea class="form-control font-monospace" id="dev_backup_commands" rows="3"
+                placeholder="display current-configuration" required></textarea>
+              <div class="form-text">用户可自定义任何采集指令（如
+                <code>display current-configuration</code>、<code>show running-config</code> 等），执行备份时平台将逐行下发并采集输出。</div>
+            </div>
+            <div class="col-12">
+              <label class="form-label">终端交互前置指令 (如禁用分页，可选)</label>
+              <textarea class="form-control font-monospace" id="dev_init_commands" rows="2"
+                placeholder="screen-length 0 temporary"></textarea>
+              <div class="form-text">在执行备份指令前发送（如华为/华三 <code>screen-length 0 temporary</code>，思科
+                <code>terminal length 0</code>），避免终端 --More-- 截断输出。</div>
+            </div>
+          </div>
+
+          <h6 class="fw-bold text-primary mb-3 border-bottom pb-2"><i class="bi bi-alarm me-1"></i> 设备独立定时自动备份排程 (可选)
+          </h6>
+          <div class="row g-3 mb-3">
+            <div class="col-12">
+              <div class="form-check form-switch">
+                <input class="form-check-input" type="checkbox" id="dev_schedule_enabled"
+                  onchange="onDevScheduleToggle()">
+                <label class="form-check-label fw-bold" for="dev_schedule_enabled">开启该设备的独立定时自动备份</label>
+              </div>
+            </div>
+            <div class="col-md-6 dev-sched-options d-none">
+              <label class="form-label small">定时排程模式</label>
+              <select class="form-select form-select-sm" id="dev_schedule_type" onchange="onDevSchedTypeChange()">
+                <option value="daily">每天指定时间备份 (Daily)</option>
+                <option value="interval">固定间隔备份 (Interval)</option>
+              </select>
+            </div>
+            <div class="col-md-6 dev-sched-options d-none">
+              <label class="form-label small" id="devSchedExprLabel">每日执行时间 (HH:MM)</label>
+              <input type="text" class="form-control form-control-sm" id="dev_schedule_expr" value="02:00"
+                placeholder="如 02:00">
+            </div>
+          </div>
+
+          <h6 class="fw-bold text-primary mb-3 border-bottom pb-2"><i class="bi bi-hdd me-1"></i> 备份存储目标 (本地路径 / 远程 FTP)
+          </h6>
+          <div class="row g-3">
+            <div class="col-12">
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="dev_target_type" id="target_type_local" value="local"
+                  checked onchange="onTargetTypeChange()">
+                <label class="form-check-label fw-bold" for="target_type_local"><i class="bi bi-folder2 me-1"></i>
+                  备份到本地目标路径</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="radio" name="dev_target_type" id="target_type_ftp" value="ftp"
+                  onchange="onTargetTypeChange()">
+                <label class="form-check-label fw-bold" for="target_type_ftp"><i class="bi bi-cloud-arrow-up me-1"></i>
+                  备份到远程 FTP 服务器</label>
+              </div>
+            </div>
+
+            <!-- 本地目标路径设置 -->
+            <div class="col-12 dev-target-local-panel">
+              <label class="form-label">指定本地目标存储路径 (可选)</label>
+              <input type="text" class="form-control" id="dev_target_path"
+                placeholder="留空则使用默认路径 backups/netdev/{设备名称}/">
+              <div class="form-text">可指定本地挂载目录或专用备份路径（如 <code>/data/backups/network/</code>）</div>
+            </div>
+
+            <!-- 远程 FTP 设置 -->
+            <div class="col-12 dev-target-ftp-panel d-none">
+              <div class="p-3 bg-light rounded-3 border">
+                <div class="row g-2">
+                  <div class="col-md-8">
+                    <label class="form-label small fw-bold">FTP 服务器地址 *</label>
+                    <input type="text" class="form-control form-control-sm" id="dev_ftp_host"
+                      placeholder="如：192.168.10.200">
+                  </div>
+                  <div class="col-md-4">
+                    <label class="form-label small fw-bold">FTP 端口 *</label>
+                    <input type="number" class="form-control form-control-sm" id="dev_ftp_port" value="21">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-bold">FTP 用户名</label>
+                    <input type="text" class="form-control form-control-sm" id="dev_ftp_user" placeholder="如：ftpuser">
+                  </div>
+                  <div class="col-md-6">
+                    <label class="form-label small fw-bold">FTP 密码</label>
+                    <input type="password" class="form-control form-control-sm" id="dev_ftp_password"
+                      placeholder="若不修改留空">
+                  </div>
+                  <div class="col-md-8">
+                    <label class="form-label small fw-bold">FTP 远程目录路径</label>
+                    <input type="text" class="form-control form-control-sm" id="dev_ftp_path" value="/netdev_backups/">
+                  </div>
+                  <div class="col-md-4 d-flex align-items-end">
+                    <button type="button" class="btn btn-sm btn-outline-info w-100" onclick="testModalFtp()">
+                      <i class="bi bi-link-45deg"></i> 测试 FTP 连接
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer justify-content-between">
+        <div>
+          <button type="button" class="btn btn-outline-secondary" onclick="testModalSsh()">
+            <i class="bi bi-shield-check"></i> 测试 SSH 连接
+          </button>
+          <span id="modalTestResult" class="ms-2 small"></span>
+        </div>
+        <div>
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+          <button type="button" class="btn btn-primary" onclick="saveDevice()">保存设备</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== 模态框：凭据令牌管理 (Token Modal) ==================== -->
+<div class="modal fade" id="tokenModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="tokenModalTitle"><i class="bi bi-key text-primary me-2"></i>添加凭据令牌</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <form id="tokenForm">
+          <input type="hidden" id="tok_id">
+          <div class="mb-3">
+            <label class="form-label">令牌名称 *</label>
+            <input type="text" class="form-control" id="tok_name" placeholder="如：核心机房华为交换机统一凭据" required>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">认证模式</label>
+            <select class="form-select" id="tok_auth_mode" onchange="onTokenAuthModeChange()">
+              <option value="password">用户名 / 密码认证</option>
+              <option value="key">SSH 私钥认证</option>
+            </select>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">SSH 用户名 *</label>
+            <input type="text" class="form-control" id="tok_username" placeholder="如：admin" required>
+          </div>
+          <div class="mb-3 tok-password-field">
+            <label class="form-label">SSH 登录密码</label>
+            <input type="password" class="form-control" id="tok_password" placeholder="若不修改留空">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">特权/Enable 密码 (可选)</label>
+            <input type="password" class="form-control" id="tok_enable_password" placeholder="某些厂商提权需要，可选">
+          </div>
+          <div class="mb-3 tok-key-field d-none">
+            <label class="form-label">SSH 私钥内容 (PEM 格式)</label>
+            <textarea class="form-control font-monospace small" id="tok_private_key" rows="3"
+              placeholder="-----BEGIN RSA PRIVATE KEY-----..."></textarea>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">备注说明</label>
+            <input type="text" class="form-control" id="tok_remark" placeholder="如：适用所有 192.168.1.0/24 网段交换机">
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn btn-primary" onclick="saveToken()">保存令牌</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== 模态框：定时自动备份配置 ==================== -->
+<div class="modal fade" id="scheduleModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-alarm text-primary me-2"></i>全局网络设备自动备份设置</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="alert alert-info py-2 small mb-3">
+          <i class="bi bi-info-circle me-1"></i>
+          开启后，平台后台调度器将在指定时间自动对所有已连接成功的网络设备执行配置采集与备份归档。
+        </div>
+
+        <div class="form-check form-switch mb-3">
+          <input class="form-check-input" type="checkbox" id="sched_enabled">
+          <label class="form-check-label fw-bold" for="sched_enabled">启用全局网络设备定时自动备份</label>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label">定时排程类型</label>
+          <select class="form-select" id="sched_type" onchange="onSchedTypeChange()">
+            <option value="daily">每天指定时间执行 (Daily)</option>
+            <option value="cron">自定义 Cron 表达式 (Cron)</option>
+          </select>
+        </div>
+
+        <div class="mb-3" id="sched_daily_panel">
+          <label class="form-label">每日备份时间 (HH:MM)</label>
+          <input type="time" class="form-control" id="sched_time" value="02:00">
+          <div class="form-text">推荐设置在业务低峰期，例如凌晨 02:00。</div>
+        </div>
+
+        <div class="mb-3 d-none" id="sched_cron_panel">
+          <label class="form-label">Cron 表达式</label>
+          <input type="text" class="form-control font-monospace" id="sched_cron" value="0 2 * * *">
+          <div class="form-text">标准 5 字段 Cron 表达式，如 <code>0 2 * * *</code> 表示每天凌晨 2 点。</div>
+        </div>
+
+        <div class="border-top pt-3 text-muted small">
+          <div>上次全局自动备份触发时间：<span id="schedLastRun" class="fw-bold">-</span></div>
+        </div>
+      </div>
+      <div class="modal-footer justify-content-between">
+        <button type="button" class="btn btn-outline-secondary btn-sm" onclick="triggerScheduledNow()">
+          <i class="bi bi-lightning-charge"></i> 立即测试触发
+        </button>
+        <div>
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+          <button type="button" class="btn btn-primary" onclick="saveScheduleConfig()">保存配置</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== 模态框：Excel 批量导入 ==================== -->
+<div class="modal fade" id="importModal" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title"><i class="bi bi-file-earmark-excel text-success me-2"></i>Excel 批量导入网络设备</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="d-flex justify-content-between align-items-center mb-3 p-3 bg-light rounded-3 border">
+          <div>
+            <div class="fw-bold small">标准模板下载</div>
+            <div class="text-muted small">包含格式规范、示例数据及厂商预设说明</div>
+          </div>
+          <a class="btn btn-sm btn-outline-success" href="/api/netdev/template/excel">
+            <i class="bi bi-download me-1"></i> 下载 Excel 模板
+          </a>
+        </div>
+
+        <div class="mb-3">
+          <label class="form-label fw-bold">选择填写好的 Excel 文件 (.xlsx) *</label>
+          <input type="file" class="form-control" id="importFileInput" accept=".xlsx, .xls">
+        </div>
+
+        <div class="form-check mb-3">
+          <input class="form-check-input" type="checkbox" id="importAutoTestCheck" checked>
+          <label class="form-check-label small" for="importAutoTestCheck">
+            导入后立即对设备进行 SSH 连通性测试并标记状态
+          </label>
+        </div>
+
+        <div id="importResultBox" class="alert d-none small mb-0"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button type="button" class="btn btn-success" id="startImportBtn" onclick="doImportExcel()">
+          <i class="bi bi-upload me-1"></i> 开始导入
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== 模态框：查看配置文本 ==================== -->
+<div class="modal fade" id="configViewModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <div>
+          <h5 class="modal-title" id="configModalTitle"><i class="bi bi-file-earmark-code text-primary me-2"></i>配置备份内容
+          </h5>
+          <div class="small text-muted" id="configModalSub"></div>
+        </div>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body p-0">
+        <pre id="configModalPre" class="p-3 bg-dark text-light mb-0 font-monospace small"
+          style="min-height: 480px; max-height: 70vh; overflow: auto; white-space: pre-wrap; word-break: break-all;"></pre>
+      </div>
+      <div class="modal-footer justify-content-between">
+        <span class="small text-muted" id="configModalSize"></span>
+        <div class="d-flex gap-2">
+          <button type="button" class="btn btn-outline-secondary" onclick="copyConfigContent()">
+            <i class="bi bi-clipboard"></i> 复制到剪贴板
+          </button>
+          <button type="button" class="btn btn-primary" id="configModalDownloadBtn">
+            <i class="bi bi-download"></i> 下载配置文件
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 页面专用脚本 -->
+<script>
+  let devicesCache = [];
+  let tokensCache = [];
+  let backupsCache = [];
+  let presetsCache = {};
+  let selectedDeviceIds = new Set();
+
+  document.addEventListener("DOMContentLoaded", function () {
+    loadPresets();
+    refreshAll();
+  });
+
+  function refreshAll() {
+    loadTokens();
+    loadDevices();
+    loadBackups();
+  }
+
+  // 加载预设
+  async function loadPresets() {
+    try {
+      const res = await fetch("/api/netdev/presets");
+      presetsCache = await res.json();
+    } catch (e) {
+      console.warn("加载预设失败:", e);
+    }
+  }
+
+  // =========================================================================
+  // 统一凭据令牌管理逻辑
+  // =========================================================================
+
+  async function loadTokens() {
+    try {
+      const res = await fetch("/api/netdev/tokens");
+      tokensCache = await res.json();
+      renderTokensTable();
+      updateDeviceModalTokenSelect();
+    } catch (e) {
+      document.getElementById("tokensTableBody").innerHTML = `
+      <tr><td colspan="8" class="text-center text-danger py-4">加载令牌失败: ${e.message}</td></tr>
+    `;
+    }
+  }
+
+  function renderTokensTable() {
+    const tbody = document.getElementById("tokensTableBody");
+    if (!tokensCache.length) {
+      tbody.innerHTML = `<tr><td colspan="8" class="text-center text-muted py-4">暂无凭据令牌，点击上方「添加凭据令牌」创建。</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = tokensCache.map((t, idx) => {
+      return `
+      <tr>
+        <td>${idx + 1}</td>
+        <td>
+          <strong><i class="bi bi-key text-warning me-1"></i>${escapeHtml(t.name)}</strong>
+        </td>
+        <td><span class="badge bg-light text-dark border">${t.auth_mode === 'key' ? '私钥认证' : '密码认证'}</span></td>
+        <td><code>${escapeHtml(t.username)}</code></td>
+        <td>${t.has_enable_password ? '<span class="badge bg-success-subtle text-success">已配置</span>' : '<span class="text-muted small">无</span>'}</td>
+        <td><small class="text-muted">${escapeHtml(t.remark || '-')}</small></td>
+        <td><small class="text-muted">${(t.updated_at || t.created_at || '').replace('T', ' ').substring(0, 19)}</small></td>
+        <td class="text-end">
+          <div class="btn-group btn-group-sm">
+            <button class="btn btn-outline-secondary" onclick="openTokenModal(${t.id})" title="编辑令牌">
+              <i class="bi bi-pencil"></i>
+            </button>
+            <button class="btn btn-outline-danger" onclick="deleteToken(${t.id}, '${escapeHtml(t.name)}')" title="删除令牌">
+              <i class="bi bi-trash"></i>
+            </button>
+          </div>
+        </td>
+      </tr>
+    `;
+    }).join("");
+  }
+
+  function updateDeviceModalTokenSelect() {
+    const select = document.getElementById("dev_token_id");
+    if (!select) return;
+    const curVal = select.value;
+    const opts = tokensCache.map(t => `<option value="${t.id}">[令牌] ${escapeHtml(t.name)} (${escapeHtml(t.username)})</option>`).join("");
+    select.innerHTML = `<option value="">-- 独立凭据（手动输入账号密码） --</option>` + opts;
+    select.value = curVal;
+  }
+
+  function openTokenModal(id = null) {
+    const form = document.getElementById("tokenForm");
+    form.reset();
+    document.getElementById("tok_id").value = id || "";
+
+    if (id) {
+      document.getElementById("tokenModalTitle").innerHTML = `<i class="bi bi-pencil-square text-primary me-2"></i>编辑凭据令牌`;
+      const tok = tokensCache.find(t => t.id === id);
+      if (tok) {
+        document.getElementById("tok_name").value = tok.name || "";
+        document.getElementById("tok_auth_mode").value = tok.auth_mode || "password";
+        document.getElementById("tok_username").value = tok.username || "";
+        document.getElementById("tok_remark").value = tok.remark || "";
+        document.getElementById("tok_private_key").value = tok.private_key || "";
+      }
+    } else {
+      document.getElementById("tokenModalTitle").innerHTML = `<i class="bi bi-key text-primary me-2"></i>添加凭据令牌`;
+    }
+
+    onTokenAuthModeChange();
+    new bootstrap.Modal(document.getElementById("tokenModal")).show();
+  }
+
+  function openTokenModalFromDevModal() {
+    openTokenModal();
+  }
+
+  function onTokenAuthModeChange() {
+    const mode = document.getElementById("tok_auth_mode").value;
+    if (mode === "key") {
+      document.querySelector(".tok-password-field").classList.add("d-none");
+      document.querySelector(".tok-key-field").classList.remove("d-none");
+    } else {
+      document.querySelector(".tok-password-field").classList.remove("d-none");
+      document.querySelector(".tok-key-field").classList.add("d-none");
+    }
+  }
+
+  async function saveToken() {
+    const id = document.getElementById("tok_id").value;
+    const name = document.getElementById("tok_name").value.trim();
+    const username = document.getElementById("tok_username").value.trim();
+
+    if (!name || !username) {
+      alert("令牌名称和 SSH 用户名为必填项！");
+      return;
+    }
+
+    const payload = {
+      name: name,
+      auth_mode: document.getElementById("tok_auth_mode").value,
+      username: username,
+      password: document.getElementById("tok_password").value,
+      enable_password: document.getElementById("tok_enable_password").value,
+      private_key: document.getElementById("tok_private_key").value,
+      remark: document.getElementById("tok_remark").value.trim()
+    };
+
+    const url = id ? `/api/netdev/tokens/${id}` : "/api/netdev/tokens";
+    const method = id ? "PUT" : "POST";
+
+    try {
+      const res = await fetch(url, {
+        method: method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (data.ok) {
+        bootstrap.Modal.getInstance(document.getElementById("tokenModal")).hide();
+        await loadTokens();
+        alert("凭据令牌保存成功！");
+      } else {
+        alert("保存失败: " + (data.error || "未知错误"));
+      }
+    } catch (e) {
+      alert("请求异常: " + e.message);
+    }
+  }
+
+  async function deleteToken(id, name) {
+    if (!confirm(`确认删除凭据令牌 [${name}] 吗？已绑定该令牌的设备将自动解除关联。`)) {
+      return;
+    }
+    try {
+      const res = await fetch(`/api/netdev/tokens/${id}`, { method: "DELETE" });
+      const data = await res.json();
+      if (data.ok) {
+        loadTokens();
+        loadDevices();
+      } else {
+        alert("删除失败: " + (data.error || "未知错误"));
+      }
+    } catch (e) {
+      alert("删除异常: " + e.message);
+    }
+  }
+
+  function onDeviceTokenSelectChange() {
+    const tokenId = document.getElementById("dev_token_id").value;
+    const hintEl = document.getElementById("devTokenHintText");
+    const credFields = document.querySelectorAll(".dev-custom-cred-field");
+    const userStar = document.getElementById("devUserReqStar");
+
+    if (tokenId) {
+      const tok = tokensCache.find(t => String(t.id) === String(tokenId));
+      hintEl.innerHTML = `<span class="text-success"><i class="bi bi-check-circle-fill me-1"></i>已绑定令牌：${escapeHtml(tok ? tok.name : '')}（用户名: ${escapeHtml(tok ? tok.username : '')}），下方账号密码可留空直接继承。</span>`;
+      credFields.forEach(el => el.classList.add("opacity-50"));
+      userStar.classList.add("d-none");
+      if (tok && !document.getElementById("dev_username").value) {
+        document.getElementById("dev_username").value = tok.username || "";
+      }
+    } else {
+      hintEl.textContent = "选择已有令牌后，设备将自动继承该令牌的 SSH 用户名、密码及特权密码，密码变更无需逐台修改。";
+      credFields.forEach(el => el.classList.remove("opacity-50"));
+      userStar.classList.remove("d-none");
+    }
+  }
+
+  // =========================================================================
+  // 网络设备列表与批量操作
+  // =========================================================================
+
+  async function loadDevices() {
+    try {
+      const res = await fetch("/api/netdev/devices");
+      devicesCache = await res.json();
+      renderDeviceTable();
+      updateStats();
+      updateFilterSelects();
+    } catch (e) {
+      document.getElementById("netdevTableBody").innerHTML = `
+      <tr><td colspan="10" class="text-center text-danger py-4">加载网络设备失败: ${e.message}</td></tr>
+    `;
+    }
+  }
+
+  function updateStats() {
+    const total = devicesCache.length;
+    let connected = 0;
+    let disconnected = 0;
+    devicesCache.forEach(d => {
+      if (d.status === "connected") connected++;
+      else if (d.status === "disconnected") disconnected++;
+    });
+    document.getElementById("statTotalDev").textContent = total;
+    document.getElementById("statConnectedDev").textContent = connected;
+    document.getElementById("statDisconnectedDev").textContent = disconnected;
+  }
+
+  function renderDeviceTable() {
+    const kw = (document.getElementById("searchDevInput").value || "").toLowerCase().trim();
+    const filtered = devicesCache.filter(d => {
+      if (!kw) return true;
+      return (d.name || "").toLowerCase().includes(kw) || (d.host || "").toLowerCase().includes(kw);
+    });
+
+    const tbody = document.getElementById("netdevTableBody");
+    if (!filtered.length) {
+      tbody.innerHTML = `<tr><td colspan="10" class="text-center text-muted py-4">暂无网络设备数据，请点击上方「添加网络设备」或「Excel 导入」</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = filtered.map((d, idx) => {
+      let icon = "bi-hdd-network";
+      if (d.device_type === "router") icon = "bi-signpost-split";
+      else if (d.device_type === "firewall") icon = "bi-shield";
+
+      let statusBadge = "";
+      if (d.status === "connected") {
+        statusBadge = `<span class="badge bg-success-subtle text-success border border-success" title="${escapeHtml(d.last_status_msg || 'SSH 连接正常')}"><i class="bi bi-check-circle-fill me-1"></i>已连接 (在线)</span>`;
+      } else if (d.status === "disconnected") {
+        statusBadge = `<span class="badge bg-danger-subtle text-danger border border-danger" title="${escapeHtml(d.last_status_msg || '连接失败')}"><i class="bi bi-x-circle-fill me-1"></i>连接失败 (离线)</span>`;
+      } else {
+        statusBadge = `<span class="badge bg-secondary-subtle text-secondary border border-secondary"><i class="bi bi-question-circle me-1"></i>未测试</span>`;
+      }
+
+      let targetBadge = "";
+      if (d.target_type === "ftp") {
+        targetBadge = `<span class="badge bg-info-subtle text-info border border-info" title="FTP: ${escapeHtml(d.ftp_host)}"><i class="bi bi-cloud-arrow-up me-1"></i>远程 FTP</span>`;
+      } else {
+        targetBadge = `<span class="badge bg-light text-dark border" title="${escapeHtml(d.target_path || '默认本地路径')}"><i class="bi bi-folder2 me-1"></i>本地路径</span>`;
+      }
+
+      let schedBadge = `<span class="text-muted small">未开启</span>`;
+      if (d.schedule_enabled) {
+        schedBadge = `<span class="badge bg-primary-subtle text-primary border border-primary"><i class="bi bi-alarm me-1"></i>${escapeHtml(d.schedule_expr || '每天')}</span>`;
+      }
+
+      let backupState = '<span class="text-muted small">从未备份</span>';
+      if (d.last_backup_at) {
+        const isOk = d.last_backup_status === "success";
+        const cls = isOk ? "text-success" : "text-danger";
+        const iconCls = isOk ? "bi-check-circle" : "bi-exclamation-circle";
+        backupState = `<span class="${cls} small"><i class="${iconCls} me-1"></i>${d.last_backup_at.replace('T', ' ').substring(0, 19)}</span>`;
+      }
+
+      // 凭据显示
+      let credLabel = `<span>${escapeHtml(d.username || '-')}</span>`;
+      if (d.token_name) {
+        credLabel = `<div><span class="badge bg-warning-subtle text-dark border border-warning" title="已绑定令牌"><i class="bi bi-key-fill me-1"></i>${escapeHtml(d.token_name)}</span></div><small class="text-muted">${escapeHtml(d.username || d.token_username || '')}</small>`;
+      }
+
+      const canBackup = d.status === "connected";
+      const backupBtnTitle = canBackup ? "立即执行配置备份" : "只有 SSH 远程连接成功的设备才可执行备份，请先点击「测试」验证连通！";
+      const backupBtnClass = canBackup ? "btn-success" : "btn-secondary disabled";
+      const isChecked = selectedDeviceIds.has(d.id) ? "checked" : "";
+
+      return `
+      <tr>
+        <td>
+          <input class="form-check-input dev-row-checkbox" type="checkbox" value="${d.id}" ${isChecked} onchange="onDevCheckboxChange(${d.id}, this.checked)">
+        </td>
+        <td>
+          <div class="fw-bold"><i class="bi ${icon} text-primary me-1"></i>${escapeHtml(d.name)}</div>
+          ${d.remark ? `<div class="small text-muted">${escapeHtml(d.remark)}</div>` : ''}
+        </td>
+        <td>
+          <span class="badge bg-light text-dark border">${d.device_type_label || '交换机'}</span>
+          <div class="small text-muted mt-1">${d.vendor_label || d.vendor || ''}</div>
+        </td>
+        <td>
+          <code>${escapeHtml(d.host)}:${d.port || 22}</code>
+        </td>
+        <td>${credLabel}</td>
+        <td>${statusBadge}</td>
+        <td>${targetBadge}</td>
+        <td>${schedBadge}</td>
+        <td>${backupState}</td>
+        <td class="text-end">
+          <div class="btn-group btn-group-sm">
+            <button class="btn btn-outline-primary" onclick="testDeviceSsh(${d.id}, this)" title="探测 SSH 连通性">
+              <i class="bi bi-shield-check"></i> 测试
+            </button>
+            <button class="btn ${backupBtnClass}" onclick="${canBackup ? `runDeviceBackup(${d.id}, '${escapeHtml(d.name)}')` : 'void(0)'}" title="${backupBtnTitle}">
+              <i class="bi bi-play-circle"></i> 备份
+            </button>
+            <button class="btn btn-outline-secondary" onclick="openDeviceModal(${d.id})" title="编辑设备">
+              <i class="bi bi-pencil"></i>
+            </button>
+            <button class="btn btn-outline-danger" onclick="deleteDevice(${d.id}, '${escapeHtml(d.name)}')" title="删除设备">
+              <i class="bi bi-trash"></i>
+            </button>
+          </div>
+        </td>
+      </tr>
+    `;
+    }).join("");
+
+    updateBatchActionBar();
+  }
+
+  // 批量勾选控制
+  function onDevCheckboxChange(id, checked) {
+    if (checked) selectedDeviceIds.add(id);
+    else selectedDeviceIds.delete(id);
+    updateBatchActionBar();
+  }
+
+  function toggleSelectAllDev(masterCheckbox) {
+    const isChecked = masterCheckbox.checked;
+    const checkboxes = document.querySelectorAll(".dev-row-checkbox");
+    checkboxes.forEach(cb => {
+      cb.checked = isChecked;
+      const id = parseInt(cb.value);
+      if (isChecked) selectedDeviceIds.add(id);
+      else selectedDeviceIds.delete(id);
+    });
+    updateBatchActionBar();
+  }
+
+  function clearDevSelection() {
+    selectedDeviceIds.clear();
+    document.getElementById("selectAllDevCheckbox").checked = false;
+    document.querySelectorAll(".dev-row-checkbox").forEach(cb => cb.checked = false);
+    updateBatchActionBar();
+  }
+
+  function updateBatchActionBar() {
+    const bar = document.getElementById("batchActionBar");
+    const countEl = document.getElementById("selectedDevCount");
+    countEl.textContent = selectedDeviceIds.size;
+    if (selectedDeviceIds.size > 0) {
+      bar.classList.remove("d-none");
+    } else {
+      bar.classList.add("d-none");
+    }
+  }
+
+  // 批量执行备份
+  async function doBatchBackup() {
+    if (!selectedDeviceIds.size) return;
+
+    const ids = Array.from(selectedDeviceIds);
+    const selectedDevs = devicesCache.filter(d => ids.includes(d.id));
+    const onlineDevs = selectedDevs.filter(d => d.status === "connected");
+    const offlineDevs = selectedDevs.filter(d => d.status !== "connected");
+
+    let confirmMsg = `已选中 ${ids.length} 台设备进行批量配置备份。\n\n`;
+    if (offlineDevs.length > 0) {
+      confirmMsg += `【注意】其中有 ${offlineDevs.length} 台设备当前处于离线/未测试状态。\n根据安全规则，系统将仅对 ${onlineDevs.length} 台在线设备执行备份。\n\n确认立即开始吗？`;
+    } else {
+      confirmMsg += `所有选中的 ${ids.length} 台设备均为在线状态，确认立即开始批量备份吗？`;
+    }
+
+    if (!confirm(confirmMsg)) return;
+
+    // 仅对在线设备备份
+    const targetIds = onlineDevs.map(d => d.id);
+    if (!targetIds.length) {
+      alert("所选设备均未连接成功，无法执行备份！请先进行 SSH 连接探测。");
+      return;
+    }
+
+    try {
+      const res = await fetch("/api/netdev/devices/batch-backup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_ids: targetIds })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        alert(`【批量备份完成】\n共提交: ${data.total} 台\n成功: ${data.success_count} 台\n失败: ${data.failed_count} 台`);
+        clearDevSelection();
+        loadDevices();
+        loadBackups();
+      } else {
+        alert("批量备份异常: " + (data.error || "未知错误"));
+      }
+    } catch (e) {
+      alert("网络请求异常: " + e.message);
+    }
+  }
+
+  // 批量测试连接
+  async function doBatchTest() {
+    if (!selectedDeviceIds.size) return;
+    const ids = Array.from(selectedDeviceIds);
+
+    try {
+      const res = await fetch("/api/netdev/devices/batch-test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_ids: ids })
+      });
+      const data = await res.json();
+      if (data.ok) {
+        alert(`【批量连通性探测完成】\n探测总数: ${data.total} 台\n连通在线: ${data.connected_count} 台\n离线失败: ${data.total - data.connected_count} 台`);
+        loadDevices();
+      } else {
+        alert("探测失败: " + (data.error || "未知错误"));
+      }
+    } catch (e) {
+      alert("请求异常: " + e.message);
+    }
+  }
+
+  // =========================================================================
+  // 定时自动备份设置 (Schedule Config Modal)
+  // =========================================================================
+
+  async function openScheduleModal() {
+    try {
+      const res = await fetch("/api/netdev/schedule/config");
+      const cfg = await res.json();
+      document.getElementById("sched_enabled").checked = boolVal(cfg.enabled);
+      document.getElementById("sched_type").value = cfg.schedule_type || "daily";
+      document.getElementById("sched_time").value = cfg.schedule_time || "02:00";
+      document.getElementById("sched_cron").value = cfg.cron_expr || "0 2 * * *";
+      document.getElementById("schedLastRun").textContent = cfg.last_run ? cfg.last_run.replace('T', ' ') : "从未执行";
+      onSchedTypeChange();
+      new bootstrap.Modal(document.getElementById("scheduleModal")).show();
+    } catch (e) {
+      alert("加载配置失败: " + e.message);
+    }
+  }
+
+  function onSchedTypeChange() {
+    const type = document.getElementById("sched_type").value;
+    if (type === "cron") {
+      document.getElementById("sched_daily_panel").classList.add("d-none");
+      document.getElementById("sched_cron_panel").classList.remove("d-none");
+    } else {
+      document.getElementById("sched_daily_panel").classList.remove("d-none");
+      document.getElementById("sched_cron_panel").classList.add("d-none");
+    }
+  }
+
+  async function saveScheduleConfig() {
+    const payload = {
+      enabled: document.getElementById("sched_enabled").checked,
+      schedule_type: document.getElementById("sched_type").value,
+      schedule_time: document.getElementById("sched_time").value,
+      cron_expr: document.getElementById("sched_cron").value.trim()
+    };
+
+    try {
+      const res = await fetch("/api/netdev/schedule/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (data.ok) {
+        bootstrap.Modal.getInstance(document.getElementById("scheduleModal")).hide();
+        alert("定时自动备份配置保存成功！系统调度器将按计划自动执行备份。");
+      } else {
+        alert("保存失败");
+      }
+    } catch (e) {
+      alert("请求异常: " + e.message);
+    }
+  }
+
+  async function triggerScheduledNow() {
+    if (!confirm("确认立即执行一次定时自动备份排程检查吗？系统将对所有连通设备执行备份。")) return;
+    try {
+      const res = await fetch("/api/netdev/schedule/trigger", { method: "POST" });
+      const data = await res.json();
+      if (data.ok) {
+        alert(`排程检查完成！共触发 ${data.triggered} 台设备备份。`);
+        loadDevices();
+        loadBackups();
+      }
+    } catch (e) {
+      alert("触发异常: " + e.message);
+    }
+  }
+
+  // =========================================================================
+  // Excel 导入逻辑
+  // =========================================================================
+
+  function openImportModal() {
+    document.getElementById("importFileInput").value = "";
+    const box = document.getElementById("importResultBox");
+    box.classList.add("d-none");
+    box.textContent = "";
+    new bootstrap.Modal(document.getElementById("importModal")).show();
+  }
+
+  async function doImportExcel() {
+    const fileInput = document.getElementById("importFileInput");
+    if (!fileInput.files.length) {
+      alert("请先选择要上传的 Excel 文件 (.xlsx)！");
+      return;
+    }
+
+    const btn = document.getElementById("startImportBtn");
+    const originalHtml = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span> 正在解析导入...`;
+
+    const formData = new FormData();
+    formData.append("file", fileInput.files[0]);
+    formData.append("auto_test", document.getElementById("importAutoTestCheck").checked ? "true" : "false");
+
+    const box = document.getElementById("importResultBox");
+    box.classList.add("d-none");
+
+    try {
+      const res = await fetch("/api/netdev/import", {
+        method: "POST",
+        body: formData
+      });
+      const data = await res.json();
+      if (data.ok) {
+        box.className = "alert alert-success small mb-0";
+        let msg = `【导入成功】已导入 ${data.imported} 台设备，跳过 ${data.skipped} 条。`;
+        if (data.errors && data.errors.length) {
+          msg += `<br>部分提示：<br>` + data.errors.slice(0, 5).join("<br>");
+        }
+        box.innerHTML = msg;
+        box.classList.remove("d-none");
+        await loadDevices();
+      } else {
+        box.className = "alert alert-danger small mb-0";
+        box.textContent = "导入失败: " + (data.error || "未知错误");
+        box.classList.remove("d-none");
+      }
+    } catch (e) {
+      box.className = "alert alert-danger small mb-0";
+      box.textContent = "网络请求失败: " + e.message;
+      box.classList.remove("d-none");
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = originalHtml;
+    }
+  }
+
+  // =========================================================================
+  // 表单字段联动与模态框
+  // =========================================================================
+
+  function onVendorPresetChange() {
+    const vendor = document.getElementById("dev_vendor").value;
+    const presets = presetsCache.vendor_presets || {};
+    if (presets[vendor]) {
+      document.getElementById("dev_backup_commands").value = presets[vendor].backup_commands || "";
+      document.getElementById("dev_init_commands").value = presets[vendor].init_commands || "";
+    }
+  }
+
+  function onAuthModeChange() {
+    const mode = document.getElementById("dev_auth_mode").value;
+    if (mode === "key") {
+      document.querySelector(".dev-password-field").classList.add("d-none");
+      document.querySelector(".dev-key-field").classList.remove("d-none");
+    } else {
+      document.querySelector(".dev-password-field").classList.remove("d-none");
+      document.querySelector(".dev-key-field").classList.add("d-none");
+    }
+  }
+
+  function onDevScheduleToggle() {
+    const on = document.getElementById("dev_schedule_enabled").checked;
+    const options = document.querySelectorAll(".dev-sched-options");
+    options.forEach(el => on ? el.classList.remove("d-none") : el.classList.add("d-none"));
+  }
+
+  function onDevSchedTypeChange() {
+    const type = document.getElementById("dev_schedule_type").value;
+    const label = document.getElementById("devSchedExprLabel");
+    const input = document.getElementById("dev_schedule_expr");
+    if (type === "daily") {
+      label.textContent = "每日执行时间 (HH:MM)";
+      if (!input.value || input.value.includes("分钟")) input.value = "02:00";
+    } else {
+      label.textContent = "间隔周期 (分钟数)";
+      input.value = "720";
+    }
+  }
+
+  function onTargetTypeChange() {
+    const isFtp = document.getElementById("target_type_ftp").checked;
+    if (isFtp) {
+      document.querySelector(".dev-target-ftp-panel").classList.remove("d-none");
+      document.querySelector(".dev-target-local-panel").classList.add("d-none");
+    } else {
+      document.querySelector(".dev-target-ftp-panel").classList.add("d-none");
+      document.querySelector(".dev-target-local-panel").classList.remove("d-none");
+    }
+  }
+
+  function openDeviceModal(id = null) {
+    const form = document.getElementById("deviceForm");
+    form.reset();
+    document.getElementById("dev_id").value = id || "";
+    document.getElementById("modalTestResult").textContent = "";
+
+    updateDeviceModalTokenSelect();
+
+    if (id) {
+      document.getElementById("deviceModalTitle").innerHTML = `<i class="bi bi-pencil-square text-primary me-2"></i>编辑网络设备`;
+      const dev = devicesCache.find(d => d.id === id);
+      if (dev) {
+        document.getElementById("dev_name").value = dev.name || "";
+        document.getElementById("dev_type").value = dev.device_type || "switch";
+        document.getElementById("dev_vendor").value = dev.vendor || "custom";
+        document.getElementById("dev_host").value = dev.host || "";
+        document.getElementById("dev_port").value = dev.port || 22;
+        document.getElementById("dev_token_id").value = dev.token_id || "";
+        document.getElementById("dev_username").value = dev.username || "";
+        document.getElementById("dev_auth_mode").value = dev.auth_mode || "password";
+        document.getElementById("dev_private_key").value = dev.private_key || "";
+        document.getElementById("dev_backup_commands").value = dev.backup_commands || "";
+        document.getElementById("dev_init_commands").value = dev.init_commands || "";
+        document.getElementById("dev_remark").value = dev.remark || "";
+        document.getElementById("dev_target_path").value = dev.target_path || "";
+        document.getElementById("dev_ftp_host").value = dev.ftp_host || "";
+        document.getElementById("dev_ftp_port").value = dev.ftp_port || 21;
+        document.getElementById("dev_ftp_user").value = dev.ftp_user || "";
+        document.getElementById("dev_ftp_path").value = dev.ftp_path || "/";
+
+        document.getElementById("dev_schedule_enabled").checked = boolVal(dev.schedule_enabled);
+        document.getElementById("dev_schedule_type").value = dev.schedule_type || "daily";
+        document.getElementById("dev_schedule_expr").value = dev.schedule_expr || "02:00";
+
+        if (dev.target_type === "ftp") {
+          document.getElementById("target_type_ftp").checked = true;
+        } else {
+          document.getElementById("target_type_local").checked = true;
+        }
+      }
+    } else {
+      document.getElementById("deviceModalTitle").innerHTML = `<i class="bi bi-router text-primary me-2"></i>添加网络设备`;
+      document.getElementById("dev_vendor").value = "huawei";
+      onVendorPresetChange();
+      document.getElementById("target_type_local").checked = true;
+    }
+
+    onAuthModeChange();
+    onTargetTypeChange();
+    onDeviceTokenSelectChange();
+    onDevScheduleToggle();
+    new bootstrap.Modal(document.getElementById("deviceModal")).show();
+  }
+
+  async function testModalSsh() {
+    const host = document.getElementById("dev_host").value.trim();
+    const username = document.getElementById("dev_username").value.trim();
+    const tokenId = document.getElementById("dev_token_id").value;
+
+    if (!host) {
+      alert("请先填写主机 IP！");
+      return;
+    }
+    if (!username && !tokenId) {
+      alert("请填写 SSH 用户名或选择已有凭据令牌！");
+      return;
+    }
+
+    const resultEl = document.getElementById("modalTestResult");
+    resultEl.innerHTML = `<span class="spinner-border spinner-border-sm text-primary"></span> 测试中...`;
+
+    const payload = {
+      host: host,
+      port: parseInt(document.getElementById("dev_port").value) || 22,
+      token_id: tokenId ? parseInt(tokenId) : null,
+      username: username,
+      password: document.getElementById("dev_password").value,
+      auth_mode: document.getElementById("dev_auth_mode").value,
+      private_key: document.getElementById("dev_private_key").value,
+    };
+
+    try {
+      const res = await fetch("/api/netdev/test-ssh", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (data.ok) {
+        resultEl.innerHTML = `<span class="text-success"><i class="bi bi-check-circle-fill me-1"></i>${escapeHtml(data.message)}</span>`;
+      } else {
+        resultEl.innerHTML = `<span class="text-danger"><i class="bi bi-x-circle-fill me-1"></i>${escapeHtml(data.message)}</span>`;
+      }
+    } catch (e) {
+      resultEl.innerHTML = `<span class="text-danger">${e.message}</span>`;
+    }
+  }
+
+  async function testModalFtp() {
+    const ftp_host = document.getElementById("dev_ftp_host").value.trim();
+    if (!ftp_host) {
+      alert("请先填写 FTP 服务器地址！");
+      return;
+    }
+
+    const payload = {
+      ftp_host: ftp_host,
+      ftp_port: parseInt(document.getElementById("dev_ftp_port").value) || 21,
+      ftp_user: document.getElementById("dev_ftp_user").value.trim(),
+      ftp_password: document.getElementById("dev_ftp_password").value,
+      ftp_path: document.getElementById("dev_ftp_path").value.trim() || "/",
+    };
+
+    try {
+      const res = await fetch("/api/netdev/test-ftp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (data.ok) {
+        alert(`【FTP 连接成功】\n${data.message}`);
+      } else {
+        alert(`【FTP 连接失败】\n${data.message}`);
+      }
+    } catch (e) {
+      alert(`测试异常: ${e.message}`);
+    }
+  }
+
+  async function saveDevice() {
+    const id = document.getElementById("dev_id").value;
+    const name = document.getElementById("dev_name").value.trim();
+    const host = document.getElementById("dev_host").value.trim();
+    const username = document.getElementById("dev_username").value.trim();
+    const tokenId = document.getElementById("dev_token_id").value;
+    const backup_commands = document.getElementById("dev_backup_commands").value.trim();
+
+    if (!name || !host) {
+      alert("设备名称和主机 IP 为必填项！");
+      return;
+    }
+    if (!username && !tokenId) {
+      alert("请填写 SSH 用户名或绑定凭据令牌！");
+      return;
+    }
+    if (!backup_commands) {
+      alert("请至少填写一条备份指令！");
+      return;
+    }
+
+    const target_type = document.getElementById("target_type_ftp").checked ? "ftp" : "local";
+    const payload = {
+      name: name,
+      device_type: document.getElementById("dev_type").value,
+      vendor: document.getElementById("dev_vendor").value,
+      host: host,
+      port: parseInt(document.getElementById("dev_port").value) || 22,
+      token_id: tokenId ? parseInt(tokenId) : null,
+      username: username,
+      password: document.getElementById("dev_password").value,
+      enable_password: document.getElementById("dev_enable_password").value,
+      auth_mode: document.getElementById("dev_auth_mode").value,
+      private_key: document.getElementById("dev_private_key").value,
+      backup_commands: backup_commands,
+      init_commands: document.getElementById("dev_init_commands").value.trim(),
+      target_type: target_type,
+      target_path: document.getElementById("dev_target_path").value.trim(),
+      ftp_host: document.getElementById("dev_ftp_host").value.trim(),
+      ftp_port: parseInt(document.getElementById("dev_ftp_port").value) || 21,
+      ftp_user: document.getElementById("dev_ftp_user").value.trim(),
+      ftp_password: document.getElementById("dev_ftp_password").value,
+      ftp_path: document.getElementById("dev_ftp_path").value.trim() || "/",
+      schedule_enabled: document.getElementById("dev_schedule_enabled").checked,
+      schedule_type: document.getElementById("dev_schedule_type").value,
+      schedule_expr: document.getElementById("dev_schedule_expr").value.trim(),
+      remark: document.getElementById("dev_remark").value.trim(),
+      auto_test: true
+    };
+
+    const url = id ? `/api/netdev/devices/${id}` : "/api/netdev/devices";
+    const method = id ? "PUT" : "POST";
+
+    try {
+      const res = await fetch(url, {
+        method: method,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      if (data.ok) {
+        bootstrap.Modal.getInstance(document.getElementById("deviceModal")).hide();
+        await loadDevices();
+        alert("设备信息保存成功！已自动更新 SSH 连通性状态。");
+      } else {
+        if (data.quota_exceeded) {
+          if (confirm(`【社区版纳管配额已达上限】\n\n${data.error}\n\n是否立即前往【系统设置】进行永久商业授权激活？`)) {
+            window.location.href = "/settings";
+          }
+        } else {
+          alert(`保存失败: ${data.error || '未知错误'}`);
+        }
+      }
+    } catch (e) {
+      alert(`请求异常: ${e.message}`);
+    }
+  }
+
+  async function deleteDevice(id, name) {
+    if (!confirm(`确认彻底删除网络设备 [${name}] 及其所有备份历史记录吗？此操作无法撤销！`)) {
+      return;
+    }
+    try {
+      const res = await fetch(`/api/netdev/devices/${id}`, { method: "DELETE" });
+      const data = await res.json();
+      if (data.ok) {
+        selectedDeviceIds.delete(id);
+        loadDevices();
+        loadBackups();
+      } else {
+        alert("删除失败: " + (data.error || "未知错误"));
+      }
+    } catch (e) {
+      alert("删除请求失败: " + e.message);
+    }
+  }
+
+  async function testAllDevices() {
+    if (!devicesCache.length) {
+      alert("暂无可探测的设备");
+      return;
+    }
+    const btn = event.target.closest("button");
+    const originalHtml = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner-border spinner-border-sm me-1"></span> 探测中...`;
+
+    let okCount = 0;
+    for (const d of devicesCache) {
+      try {
+        const res = await fetch(`/api/netdev/devices/${d.id}/test`, { method: "POST" });
+        const data = await res.json();
+        if (data.ok) okCount++;
+      } catch (e) { }
+    }
+
+    btn.disabled = false;
+    btn.innerHTML = originalHtml;
+    await loadDevices();
+    alert(`探测完成！在线连通: ${okCount} 台，离线/失败: ${devicesCache.length - okCount} 台`);
+  }
+
+  async function testDeviceSsh(id, btn) {
+    const originalHtml = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner-border spinner-border-sm"></span>`;
+
+    try {
+      const res = await fetch(`/api/netdev/devices/${id}/test`, { method: "POST" });
+      const data = await res.json();
+      if (data.ok) {
+        alert(`【SSH 连接成功】\n${data.message}`);
+      } else {
+        alert(`【SSH 连接失败】\n${data.message}`);
+      }
+    } catch (e) {
+      alert(`网络请求异常: ${e.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = originalHtml;
+      loadDevices();
+    }
+  }
+
+  async function runDeviceBackup(id, name) {
+    if (!confirm(`确认立即对网络设备 [${name}] 执行配置备份吗？\n\n系统将自动通过 SSH 采集配置指令输出并保存。`)) {
+      return;
+    }
+
+    try {
+      const res = await fetch(`/api/netdev/devices/${id}/backup`, { method: "POST" });
+      const data = await res.json();
+      if (data.ok) {
+        alert(`【配置备份成功】\n设备: ${name}\n文件名: ${data.file_name}\n文件大小: ${data.file_size_human}\n目标: ${data.target_type}\n耗时: ${data.duration_sec} 秒`);
+        loadDevices();
+        loadBackups();
+      } else {
+        alert(`【备份失败】\n${data.error || '未知错误'}`);
+        loadDevices();
+        loadBackups();
+      }
+    } catch (e) {
+      alert(`备份请求异常: ${e.message}`);
+    }
+  }
+
+  // =========================================================================
+  // 备份记录与比对
+  // =========================================================================
+
+  async function loadBackups() {
+    const devId = document.getElementById("filterDeviceSelect").value;
+    let url = "/api/netdev/backups";
+    if (devId) url += `?device_id=${devId}`;
+
+    try {
+      const res = await fetch(url);
+      backupsCache = await res.json();
+      renderBackupsTable();
+      document.getElementById("statTotalBackups").textContent = backupsCache.length;
+      updateDiffBackupsSelect();
+    } catch (e) {
+      document.getElementById("backupsTableBody").innerHTML = `
+      <tr><td colspan="11" class="text-center text-danger py-4">加载备份记录失败: ${e.message}</td></tr>
+    `;
+    }
+  }
+
+  function renderBackupsTable() {
+    const tbody = document.getElementById("backupsTableBody");
+    if (!backupsCache.length) {
+      tbody.innerHTML = `<tr><td colspan="11" class="text-center text-muted py-4">暂无配置备份记录</td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = backupsCache.map((b, idx) => {
+      const isOk = b.status === "success";
+      const statusBadge = isOk
+        ? `<span class="badge bg-success-subtle text-success border border-success"><i class="bi bi-check-circle me-1"></i>成功</span>`
+        : `<span class="badge bg-danger-subtle text-danger border border-danger" title="${escapeHtml(b.error_message || '')}"><i class="bi bi-x-circle me-1"></i>失败</span>`;
+
+      const targetBadge = b.target_type === "ftp"
+        ? `<span class="badge bg-info-subtle text-info border border-info">FTP</span> <span class="small font-monospace" title="${escapeHtml(b.target_location)}">${escapeHtml(b.target_location || '')}</span>`
+        : `<span class="badge bg-light text-dark border">本地</span> <span class="small font-monospace" title="${escapeHtml(b.target_location)}">${escapeHtml(b.target_location || '')}</span>`;
+
+      return `
+      <tr>
+        <td>${idx + 1}</td>
+        <td><small>${(b.created_at || '').replace('T', ' ').substring(0, 19)}</small></td>
+        <td><strong>${escapeHtml(b.device_name || '')}</strong></td>
+        <td><span class="badge bg-light text-dark border">${b.device_type_label || '交换机'}</span></td>
+        <td style="max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${targetBadge}</td>
+        <td><code>${escapeHtml(b.file_name || '-')}</code></td>
+        <td>${b.file_size_human || '0 B'}</td>
+        <td>${statusBadge}</td>
+        <td><small>${b.duration_sec ? b.duration_sec + 's' : '-'}</small></td>
+        <td><small>${escapeHtml(b.created_by || 'admin')}</small></td>
+        <td class="text-end">
+          <div class="btn-group btn-group-sm">
+            ${isOk ? `
+              <button class="btn btn-outline-primary" onclick="viewConfigContent(${b.id})" title="在线查看配置">
+                <i class="bi bi-eye"></i> 查看
+              </button>
+              <a class="btn btn-outline-success" href="/api/netdev/backups/${b.id}/download" title="下载配置">
+                <i class="bi bi-download"></i>
+              </a>
+            ` : ''}
+            <button class="btn btn-outline-danger" onclick="deleteBackup(${b.id})" title="删除记录">
+              <i class="bi bi-trash"></i>
+            </button>
+          </div>
+        </td>
+      </tr>
+    `;
+    }).join("");
+  }
+
+  function updateFilterSelects() {
+    const filterSelect = document.getElementById("filterDeviceSelect");
+    const diffDevSelect = document.getElementById("diffDevSelect");
+    const opts = devicesCache.map(d => `<option value="${d.id}">${escapeHtml(d.name)} (${d.host})</option>`).join("");
+    filterSelect.innerHTML = `<option value="">全部网络设备</option>` + opts;
+    diffDevSelect.innerHTML = `<option value="">-- 请选择设备 --</option>` + opts;
+  }
+
+  async function viewConfigContent(backupId) {
+    try {
+      const res = await fetch(`/api/netdev/backups/${backupId}/content`);
+      const data = await res.json();
+      if (!data.ok) {
+        alert(data.error || "读取配置失败");
+        return;
+      }
+      document.getElementById("configModalTitle").innerHTML = `<i class="bi bi-file-earmark-code text-primary me-2"></i>${escapeHtml(data.file_name || '配置文件')}`;
+      document.getElementById("configModalSub").textContent = `设备: ${data.device_name || '-'} | 备份时间: ${(data.created_at || '').replace('T', ' ')}`;
+      document.getElementById("configModalPre").textContent = data.content;
+      document.getElementById("configModalSize").textContent = `字符数: ${data.content.length.toLocaleString()}`;
+      document.getElementById("configModalDownloadBtn").onclick = function () {
+        window.location.href = `/api/netdev/backups/${backupId}/download`;
+      };
+      new bootstrap.Modal(document.getElementById("configViewModal")).show();
+    } catch (e) {
+      alert("请求配置内容失败: " + e.message);
+    }
+  }
+
+  function copyConfigContent() {
+    const text = document.getElementById("configModalPre").textContent;
+    navigator.clipboard.writeText(text).then(() => {
+      alert("已复制配置内容到剪贴板！");
+    }).catch(() => {
+      alert("复制失败，请手动选择复制。");
+    });
+  }
+
+  async function deleteBackup(backupId) {
+    if (!confirm("确认删除该条网络设备备份记录与本地备份文件吗？")) {
+      return;
+    }
+    try {
+      const res = await fetch(`/api/netdev/backups/${backupId}`, { method: "DELETE" });
+      const data = await res.json();
+      if (data.ok) {
+        loadBackups();
+      } else {
+        alert("删除失败");
+      }
+    } catch (e) {
+      alert("删除异常: " + e.message);
+    }
+  }
+
+  function updateDiffBackupsSelect() {
+    const devId = document.getElementById("diffDevSelect").value;
+    const s1 = document.getElementById("diffBackup1Select");
+    const s2 = document.getElementById("diffBackup2Select");
+
+    if (!devId) {
+      s1.innerHTML = `<option value="">-- 请先选择设备 --</option>`;
+      s2.innerHTML = `<option value="">-- 请先选择设备 --</option>`;
+      return;
+    }
+
+    const devBackups = backupsCache.filter(b => String(b.device_id) === String(devId) && b.status === "success");
+    if (!devBackups.length) {
+      s1.innerHTML = `<option value="">-- 该设备暂无备份 --</option>`;
+      s2.innerHTML = `<option value="">-- 该设备暂无备份 --</option>`;
+      return;
+    }
+
+    const opts = devBackups.map(b => `<option value="${b.id}">#${b.id} - ${(b.created_at || '').replace('T', ' ').substring(0, 19)} (${b.file_size_human})</option>`).join("");
+    s1.innerHTML = opts;
+    s2.innerHTML = opts;
+
+    if (devBackups.length > 1) {
+      s1.selectedIndex = 1;
+      s2.selectedIndex = 0;
+    }
+  }
+
+  async function doDiff() {
+    const id1 = document.getElementById("diffBackup1Select").value;
+    const id2 = document.getElementById("diffBackup2Select").value;
+    if (!id1 || !id2) {
+      alert("请选择需要对比的两个备份记录！");
+      return;
+    }
+    if (id1 === id2) {
+      alert("所选的两个备份为同一版本，内容完全一致！");
+      return;
+    }
+
+    try {
+      const res = await fetch("/api/netdev/backups/diff", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ backup_id1: id1, backup_id2: id2 })
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        alert("比对失败: " + (data.error || "未知错误"));
+        return;
+      }
+
+      const container = document.getElementById("diffResultContainer");
+      const pre = document.getElementById("diffPre");
+      container.classList.remove("d-none");
+      if (!data.diff || !data.diff.trim()) {
+        pre.textContent = "【两份配置完全相同，没有任何变更】";
+      } else {
+        pre.textContent = data.diff;
+      }
+    } catch (e) {
+      alert("比对请求异常: " + e.message);
+    }
+  }
+
+  function boolVal(v) {
+    return v === true || v === 1 || v === "1" || v === "true";
+  }
+
+  function escapeHtml(str) {
+    if (!str) return "";
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+</script>
+{% endblock %}

@@ -1625,6 +1625,29 @@ def _register_rt_backup(sched) -> None:
         _logger.exception("[rt] 调度集成 RtSupervisor 异常")
 
 
+# ------------------------- 网络设备自动备份调度 -------------------------
+def _netdev_backup_job_wrapper():
+    """周期性网络设备自动备份检查与触发。"""
+    try:
+        from core import netdev
+        netdev.run_scheduled_backups()
+    except Exception:
+        _logger.exception("网络设备自动备份执行异常")
+
+
+def _register_netdev_backup(sched):
+    """注册网络设备自动备份检查 job（每分钟轮询排程）。"""
+    from apscheduler.triggers.interval import IntervalTrigger
+    try:
+        sched.remove_job("netdev_auto_backup")
+    except Exception:
+        pass
+    sched.add_job(_netdev_backup_job_wrapper, IntervalTrigger(minutes=1),
+                  id="netdev_auto_backup", replace_existing=True,
+                  misfire_grace_time=300)
+    _logger.info("[netdev] 已注册网络设备自动备份周期任务（每分钟轮询）")
+
+
 def start_scheduler():
     global _scheduler
     if _scheduler is not None:
@@ -1670,6 +1693,7 @@ def start_scheduler():
     _register_rt_backup(_scheduler)
     _register_dr_monitor(_scheduler)
     _register_file_sync(_scheduler)
+    _register_netdev_backup(_scheduler)
     _scheduler.start()
     # 实时同步任务自动恢复（重启前处于 running 的实时任务重新拉起）
     _resume_realtime_sync_tasks()
@@ -1740,6 +1764,7 @@ def _reload_scheduler_locked():
     _register_immutable_check(_scheduler)
     _register_dr_monitor(_scheduler)
     _register_file_sync(_scheduler)
+    _register_netdev_backup(_scheduler)
     # RT 周期任务幂等重注册；Supervisor 主循环 tick 已保留，不重启守护
     if config.RT_BACKUP_ENABLED:
         _register_rt_periodic_jobs(_scheduler)

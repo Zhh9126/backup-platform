@@ -45,6 +45,16 @@ def _normalize_json_fields(data: dict) -> dict:
 
 
 def create_task(data: dict) -> int:
+    # 商业授权与配额强校验（社区免费版每类限 5 个）
+    from core import license as license_mod
+    _dt = data.get("db_type")
+    if _dt == "file":
+        license_mod.check_quota("file")
+    elif _dt == "object_storage":
+        license_mod.check_quota("object_storage")
+    else:
+        license_mod.check_quota("database")
+
     data = {k: data.get(k) for k in TASK_FIELDS}
     data = _normalize_json_fields(data)
     # 压缩级 1~29（对标 DBackup：1-8 gzip / 9-22 zstd / 23-29 zstd 高档）

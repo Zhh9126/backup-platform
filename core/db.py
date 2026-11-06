@@ -1298,6 +1298,83 @@ CREATE TABLE IF NOT EXISTS vm_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_vm_jobs_status ON vm_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_vm_jobs_vm ON vm_jobs(vm_id);
+
+-- ========== 网络设备备份（core/netdev 子系统）==========
+-- 凭据/令牌管理（交换机、路由器常用账号密码集中统一管理）
+CREATE TABLE IF NOT EXISTS netdev_tokens (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                TEXT NOT NULL,                      -- 令牌名称（如：核心机房华为交换机统一凭据）
+    auth_mode           TEXT DEFAULT 'password',            -- password | key
+    username            TEXT NOT NULL,
+    password            TEXT,                               -- db.encrypt_secret 加密存储
+    enable_password     TEXT,                               -- 特权/super 密码，加密存储
+    private_key         TEXT,
+    remark              TEXT DEFAULT '',
+    created_at          TEXT,
+    updated_at          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_netdev_tokens_name ON netdev_tokens(name);
+
+-- 交换机、路由器等网络设备纳管与配置备份（SSH / 远程 FTP）
+CREATE TABLE IF NOT EXISTS netdev_devices (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    name                TEXT NOT NULL,
+    device_type         TEXT NOT NULL DEFAULT 'switch',     -- switch | router | firewall | other
+    vendor              TEXT DEFAULT 'general',             -- huawei | h3c | cisco | ruijie | juniper | linux | custom
+    host                TEXT NOT NULL,
+    port                INTEGER DEFAULT 22,
+    token_id            INTEGER,                            -- 关联的凭据令牌 netdev_tokens.id（可选）
+    username            TEXT NOT NULL,
+    password            TEXT,                               -- db.encrypt_secret 加密存储
+    auth_mode           TEXT DEFAULT 'password',            -- password | key
+    private_key         TEXT,
+    enable_password     TEXT,                               -- 特权/super 密码，加密存储
+    backup_commands     TEXT DEFAULT 'display current-configuration', -- 自定义备份指令（换行分隔）
+    init_commands       TEXT DEFAULT 'screen-length 0 temporary',     -- 交互前置指令（如禁用分页）
+    target_type         TEXT DEFAULT 'local',               -- local | ftp
+    target_path         TEXT DEFAULT '',                    -- 本地备份目标路径
+    ftp_host            TEXT DEFAULT '',
+    ftp_port            INTEGER DEFAULT 21,
+    ftp_user            TEXT DEFAULT '',
+    ftp_password        TEXT DEFAULT '',                    -- 加密存储
+    ftp_path            TEXT DEFAULT '/',                   -- FTP 远程路径
+    status              TEXT DEFAULT 'untested',            -- connected | disconnected | untested
+    last_status_msg     TEXT DEFAULT '',
+    last_check_at       TEXT,
+    last_backup_at      TEXT,
+    last_backup_status  TEXT,                               -- success | failed
+    schedule_enabled    INTEGER DEFAULT 0,                  -- 定时自动备份开关：0=关闭 1=开启
+    schedule_type       TEXT DEFAULT 'none',                -- none | daily | cron | interval
+    schedule_expr       TEXT DEFAULT '02:00',               -- 每天指定时间(02:00) 或 cron(0 2 * * *)
+    last_scheduled_run  TEXT DEFAULT '',                    -- 上次定时触发时间
+    enabled             INTEGER DEFAULT 1,
+    remark              TEXT DEFAULT '',
+    created_at          TEXT,
+    updated_at          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_netdev_status ON netdev_devices(status);
+
+CREATE TABLE IF NOT EXISTS netdev_backups (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id           INTEGER NOT NULL,
+    device_name         TEXT,
+    device_ip           TEXT,
+    device_type         TEXT,
+    vendor              TEXT,
+    target_type         TEXT DEFAULT 'local',               -- local | ftp
+    target_location     TEXT,                               -- 本地路径或 ftp://...
+    file_name           TEXT,
+    file_size           INTEGER DEFAULT 0,                  -- 字节
+    sha256              TEXT,
+    status              TEXT DEFAULT 'success',             -- success | failed
+    error_message       TEXT,
+    duration_sec        REAL DEFAULT 0,
+    commands_run        TEXT,
+    content_preview     TEXT,                               -- 配置预览（前部或完整）
+    created_by          TEXT,
+    created_at          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_netdev_backups_dev ON netdev_backups(device_id, created_at DESC);
 """
 
 # ------------------------- 连接与执行 -------------------------
@@ -2067,6 +2144,35 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                                ("locked_until", "TEXT")):
                 try:
                     conn.execute(f"ALTER TABLE users ADD COLUMN {_col} {_def}")
+                except Exception:
+                    pass
+
+            # 迁移：网络设备令牌管理表与自动备份扩展列
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS netdev_tokens ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "name TEXT NOT NULL, "
+                    "auth_mode TEXT DEFAULT 'password', "
+                    "username TEXT NOT NULL, "
+                    "password TEXT, "
+                    "enable_password TEXT, "
+                    "private_key TEXT, "
+                    "remark TEXT DEFAULT '', "
+                    "created_at TEXT, updated_at TEXT)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_netdev_tokens_name ON netdev_tokens(name)")
+            except Exception:
+                pass
+
+            for _col, _def in (
+                ("token_id", "INTEGER"),
+                ("schedule_enabled", "INTEGER DEFAULT 0"),
+                ("schedule_type", "TEXT DEFAULT 'none'"),
+                ("schedule_expr", "TEXT DEFAULT '02:00'"),
+                ("last_scheduled_run", "TEXT DEFAULT ''"),
+            ):
+                try:
+                    conn.execute(f"ALTER TABLE netdev_devices ADD COLUMN {_col} {_def}")
                 except Exception:
                     pass
 

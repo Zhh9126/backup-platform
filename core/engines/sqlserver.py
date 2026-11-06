@@ -278,29 +278,77 @@ class SQLServerEngine(BackupEngine):
                 backup_path=backup_path, simulated=False,
                 message=f"JDBC 逻辑恢复失败: {_err_text(e)}")
 
-    def preflight(self) -> (bool, str):
-        """预检：逻辑模式真实测一次 JDBC 连接（免 sqlcmd/免 SSH），
-        其余模式（物理/自定义脚本）交给基类。"""
+    def _probe_ssh_channel(self):
+        """SSH 通道探测：返回 (ssh_host|None, 就绪 bool)。"""
         try:
-            if self.backup_mode == BackupMode.LOGICAL and not (
-                    self._parse_task_extra() or {}).get("custom_script"):
-                try:
-                    from core import sqlserver_jdbc
-                    conn = sqlserver_jdbc._connect(self.task)
-                    try:
-                        cur = conn.cursor()
-                        cur.execute("SELECT 1")
-                        cur.fetchall()
-                        cur.close()
-                    finally:
-                        conn.close()
-                    return True, "ok（JDBC 逻辑通道连接成功，免安装免 SSH）"
-                except Exception as e:
-                    from core.engines.base import _err_text
-                    return False, ("JDBC 逻辑通道连接失败（检查 1433 监听/"
-                                   "TCP/IP 已启用/账号密码）: " + _err_text(e))
+            from core import remote_dump
+            return remote_dump.resolve_ssh_host(self.task)
+        except Exception:
+            return None
+
+    def _probe_jdbc_channel(self) -> (bool, str):
+        """JDBC 通道探测：真实连接一次。"""
+        try:
+            from core import sqlserver_jdbc
+            conn = sqlserver_jdbc._connect(self.task)
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.fetchall()
+                cur.close()
+            finally:
+                conn.close()
+            return True, ""
+        except Exception as e:
+            from core.engines.base import _err_text
+            return False, _err_text(e)
+
+    def preflight(self) -> (bool, str):
+        """SQL Server 双通道预检（二选一）：
+
+        - 逻辑备份 = JDBC 通道（免安装免 SSH，纯 1433）：真实测连接；
+        - 物理备份 = SSH + sqlcmd（BACKUP DATABASE）：SSH 不可达时给出
+          明确的二选一指引（改用逻辑备份），不做静默降级；
+        - 差异/日志备份（增量语义）仅物理通道支持，JDBC 不可替代；
+        - 自定义脚本模式交给基类。
+        """
+        try:
+            if (self._parse_task_extra() or {}).get("custom_script"):
+                return super().preflight()
         except Exception:
             pass
+
+        ssh_host = self._probe_ssh_channel()
+        ssh_note = ("SSH 通道就绪（%s）" % (ssh_host or {}).get("host_key", "")) \
+            if ssh_host else "SSH 通道未配置/不可达"
+
+        if self.backup_mode == BackupMode.LOGICAL:
+            ok, err = self._probe_jdbc_channel()
+            if ok:
+                msg = "ok（JDBC 逻辑通道连接成功，免安装免 SSH）"
+                if not ssh_host:
+                    msg += "；提示：配置 SSH 后可用物理备份（BACKUP DATABASE，含存储过程/索引等完整对象）"
+                return True, msg
+            # JDBC 失败但 SSH 可达：物理通道仍可工作，不阻断
+            if ssh_host:
+                self.logger.warning(
+                    "[%s] JDBC 逻辑通道不可用（%s），SSH 物理通道就绪可继续",
+                    self.task_name, err)
+                return True, ("ok（JDBC 逻辑通道不可用: %s；SSH 物理通道就绪，"
+                              "物理/差异/日志备份不受影响）" % err[:120])
+            return False, ("两条通道均不可用 → JDBC: %s | SSH: 未配置。"
+                           "Windows SQL Server 修复路径：① 检查 1433 TCP/IP 监听与账号"
+                           "密码（JDBC）；② 或启用 OpenSSH Server 并纳管（物理备份）"
+                           % err[:150])
+
+        # 物理模式（BACKUP DATABASE / 差异 / 日志）
+        if not ssh_host:
+            return False, (
+                "物理备份需要 SSH 通道在数据库服务器上执行 sqlcmd，当前未配置。"
+                "二选一：① 改用逻辑备份（JDBC 通道，免安装免 SSH，表结构+数据；"
+                "备份方式选「逻辑备份」）；② 或启用 Windows 自带 OpenSSH Server"
+                "（设置→可选功能）并纳管后使用物理备份（含存储过程/索引等完整对象，"
+                "支持差异/日志备份）")
         return super().preflight()
 
     def _backup_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:

@@ -1088,6 +1088,13 @@
       sel.value = "logical";
       if (typeof toast === "function") toast("该数据库类型不支持物理备份，已切换为逻辑备份");
     }
+    // SQL Server 双通道文案：物理=SSH+sqlcmd（BACKUP DATABASE，完整对象/
+    // 差异/日志）；逻辑=JDBC 拉取（免安装免 SSH，表结构+数据）
+    if (t === "sqlserver") {
+      const lo = Array.prototype.find.call(sel.options, (o) => o.value === "logical");
+      if (lo) lo.textContent = "逻辑备份（JDBC · 免 SSH）";
+      if (phys) phys.textContent = "物理备份（SSH · 完整对象/差异/日志）";
+    }
     // hot_copy 仅 Oracle 支持非归档应急热备
     const hc = Array.prototype.find.call(sel.options, (o) => o.value === "hot_copy");
     if (hc) {

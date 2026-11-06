@@ -139,10 +139,11 @@ def api_task_live_log(task_id):
     tail, src, truncated = "", rec.get("log_path") or "", False
     if not src or not os.path.isfile(src):
         # 兜底：按任务号在操作日志目录找最新的现场文件
+        # （尊重 LOG_DIR 环境变量——容器部署常把日志挂到 /data/logs）
         import glob
+        from config import LOG_DIR as _log_dir
         cands = glob.glob(os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "logs", "operations", "*", f"backup_t{task_id}_*.log"))
+            str(_log_dir), "operations", "*", f"backup_t{task_id}_*.log"))
         if cands:
             src = max(cands, key=os.path.getmtime)
     if src and os.path.isfile(src):
@@ -159,9 +160,13 @@ def api_task_live_log(task_id):
             tail = f"日志文件读取失败: {e}"
     elif rec["status"] == "running":
         tail = "（操作日志文件尚未生成，稍后自动刷新…）"
+    progress, stage = 100, ""
+    if rec["status"] == "running":
+        from core.oplog import OperationLog
+        progress, stage = OperationLog.progress_from_tail(tail)
     return jsonify({"record_id": rec["id"], "status": rec["status"],
                     "started_at": rec["started_at"], "log_path": src,
-                    "log_tail": tail})
+                    "log_tail": tail, "progress": progress, "stage": stage})
 
 
 @api_bp.route("/tasks/<int:task_id>/precheck", methods=["POST"])
@@ -308,8 +313,28 @@ def list_tasks():
     # running 记录为准，否则点了「停止」后端却报「当前没有运行中的备份任务」。
     running_ids = {int(r["task_id"]) for r in db.query(
         "SELECT DISTINCT task_id FROM backup_records WHERE status='running'")}
+    # 运行中任务的实时进度：读最近 running 记录的日志尾解析阶段进度
+    #（running 通常只有个位数，逐个读 16KB tail 成本可忽略）
+    from core.oplog import OperationLog as _OpLog
+    _recs = {int(r["task_id"]): r for r in db.query(
+        "SELECT task_id, log_path FROM backup_records WHERE status='running' "
+        "ORDER BY id DESC")}
     for t in tasks:
-        t["_running"] = int(t.get("id") or 0) in running_ids
+        tid = int(t.get("id") or 0)
+        t["_running"] = tid in running_ids
+        t["_progress"], t["_stage"] = (None, "")
+        if t["_running"]:
+            _src = (_recs.get(tid) or {}).get("log_path") or ""
+            try:
+                _tail = ""
+                if _src and os.path.isfile(_src):
+                    with open(_src, "rb") as _f:
+                        _sz = _f.seek(0, 2)
+                        _f.seek(max(0, _sz - 16 * 1024))
+                        _tail = _f.read().decode("utf-8", "replace")
+                t["_progress"], t["_stage"] = _OpLog.progress_from_tail(_tail)
+            except Exception:
+                t["_progress"], t["_stage"] = 5, "初始化"
     # 统一分页：v1 默认 100/页；兼容路径默认返回全量（历史行为不变）
     default_size = 100 if request.path.startswith(contract.V1_PREFIX) else len(tasks) or 1
     _page, size, offset = contract.pagination_args(default_size=default_size,

@@ -126,7 +126,8 @@ class SQLServerEngine(BackupEngine):
                              f"sqlcmd -S 127.0.0.1,{port} -U {user} -W -b{sep_arg} "
                              f"-Q \"{tsql}\"")
                     out, err, rc = _ssh_exec_pipe(
-                        client, remote_dump._wrap_login(inner), timeout=timeout)
+                        client, remote_dump._wrap_login(inner, windows=True),
+                        timeout=timeout)
                     return rc, _to_text(out), _to_text(err)
                 # Linux
                 sqlcmd = remote_dump.resolve_remote_tool(
@@ -248,6 +249,20 @@ class SQLServerEngine(BackupEngine):
 
         # 确保目录存在（Linux 归属 mssql 用户，避免“操作系统错误 5/访问被拒绝”）
         stage_note = ""
+        if ssh_host and win:
+            from core import remote_dump as _rd
+            client = _rd._connect(ssh_host)
+            try:
+                prep = f'if not exist "{bdir}" mkdir "{bdir}"'
+                _ssh_exec_pipe(client, _rd._wrap_login(prep, windows=True),
+                               timeout=60)
+            except Exception:
+                pass
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
         if ssh_host and not win:
             from core import remote_dump as _rd
             client = _rd._connect(ssh_host)
@@ -333,7 +348,8 @@ class SQLServerEngine(BackupEngine):
                         check = (f"stat -c %s {_sh(disk_path)} 2>/dev/null "
                                  f"|| echo missing")
                     _, out2, _rc2 = _ssh_exec_pipe(
-                        client, remote_dump._wrap_login(check), timeout=60)
+                        client,
+                        remote_dump._wrap_login(check, windows=win), timeout=60)
                     txt = _to_text(out2).strip()
                     size = 0 if txt == "missing" else int(txt or 0)
                     # 写远端完成标记：下次重试据此复用，**不重跑 BACKUP**
@@ -514,7 +530,9 @@ class SQLServerEngine(BackupEngine):
                                f"-ErrorAction SilentlyContinue\"")
                 else:
                     cleanup = f"rm -f {_sh(disk_path)}"
-                _ssh_exec_pipe(client, remote_dump._wrap_login(cleanup), timeout=60)
+                _ssh_exec_pipe(client,
+                               remote_dump._wrap_login(cleanup, windows=win),
+                               timeout=60)
             finally:
                 try:
                     client.close()

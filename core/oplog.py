@@ -237,6 +237,48 @@ class OperationLog:
         return str(self.path)
 
     # ---------------- 读取 ----------------
+
+    # 阶段名 → 进度百分比下限（按 scheduler 备份主流程的 step 顺序推进）。
+    _STAGE_PROGRESS = {
+        "备份前置检查": 15,
+        "执行备份": 45,
+        "备份校验": 80,
+        "恢复前置检查": 20,
+        "执行恢复": 50,
+    }
+
+    @classmethod
+    def progress_from_tail(cls, tail: str) -> tuple:
+        """从操作日志尾部解析执行进度，返回 (progress 0-100, 当前阶段名)。
+
+        - 以最后一条「>>> 阶段开始」为准查表得区间下限 lo；区间上限为
+          下一个已知锚点 - 5（无则 95）；
+        - 长阶段内按该阶段开始后的日志行数做活跃度渐进（逼近 hi-2），
+          让用户看到进度在动；
+        - 无阶段标记视为 5%（初始化中）。
+        """
+        if not tail:
+            return 5, "初始化"
+        starts = []
+        lines = tail.splitlines()
+        for i, ln in enumerate(lines):
+            if ">>> 阶段开始: " in ln:
+                starts.append((i, ln.split(">>> 阶段开始: ", 1)[1].strip()))
+        if not starts:
+            return 5, "初始化"
+        line_no, stage = starts[-1]
+        base = cls._STAGE_PROGRESS.get(stage)
+        if base is None:
+            lo, hi = 40, 70
+        else:
+            lo = base
+            nxt = [cls._STAGE_PROGRESS[s] for _i, s in starts
+                   if s in cls._STAGE_PROGRESS
+                   and cls._STAGE_PROGRESS[s] > base]
+            hi = (min(nxt) - 5) if nxt else 95
+        lines_after = len(lines) - line_no - 1
+        bump = min(hi - 2 - lo, lines_after // 5) if hi > lo + 2 else 0
+        return min(99, lo + bump), stage
     def read(self, tail: int = 0) -> str:
         """读取日志内容；tail>0 时只取末尾 N 行。"""
         try:

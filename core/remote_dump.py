@@ -295,10 +295,15 @@ def task_env_export(task: dict) -> str:
 # _wrap_login 读取并注入到所有远程 SSH 命令（覆盖全部引擎与自定义脚本）。
 _task_env_export_cv: contextvars.ContextVar = contextvars.ContextVar(
     "bp_task_env_export", default="")
+# 同一上下文的原始 env dict（Windows cmd set 前缀注入用——export 串是 bash
+# 形态，Windows 通道需原始键值重排）。
+_task_env_dict_cv: contextvars.ContextVar = contextvars.ContextVar(
+    "bp_task_env_dict", default={})
 
 
-def set_task_env_export(export_str: str):
+def set_task_env_export(export_str: str, env_dict: dict = None):
     """设置当前上下文的任务环境变量前缀，返回 token 供 reset。"""
+    _task_env_dict_cv.set(dict(env_dict or {}))
     return _task_env_export_cv.set(export_str or "")
 
 
@@ -322,6 +327,24 @@ def remote_has_tool(ssh_host: dict, tool: str, check_user: str = None,
     client = None
     try:
         client = _connect_isolated(ssh_host)
+        # Windows 目标：默认 shell 是 cmd，bash -lc / command -v 均无效——
+        # 用 where 探测 + 任务级 tool_path（; 分隔，Windows 路径含冒号）
+        # 逐目录 if exist 兜底（SQL Server Windows 主机纳管场景）。
+        if str((ssh_host or {}).get("os_type") or "").lower() == "windows":
+            from core.engines.file import _ssh_exec_pipe
+            exe = f"{tool}.exe"
+            _o, _e, rc = _ssh_exec_pipe(client, f"where {tool}", timeout=30)
+            if rc == 0:
+                return True
+            for d in (re.split(r"[;,]", extra_paths) if extra_paths else []):
+                d = d.strip().strip('"')
+                if not d:
+                    continue
+                _o, _e, rc = _ssh_exec_pipe(
+                    client, f'if exist "{d}\\{exe}" exit /b 0', timeout=30)
+                if rc == 0:
+                    return True
+            return False
         tp_export = _tool_path_export(extra_paths)
         if check_user:
             inner = tp_export + f"command -v {shlex.quote(tool)} >/dev/null 2>&1"
@@ -581,7 +604,29 @@ def _remote_pv_throttle(task: dict) -> str:
     return f" | pv -L {bw * 1024}"
 
 
-def _wrap_login(shell_cmd: str) -> str:
+def _task_env_set_prefix() -> str:
+    """任务环境变量的 Windows cmd 形态前缀（set K=V&& ...）。
+
+    Windows OpenSSH 默认 shell 是 cmd，export 语法无效；set 变量以 && 串联。
+    PATH 特殊：cmd 下用 set PATH=<user>;%PATH% 前缀合并。
+    """
+    task = _task_env_export_cv.get()
+    # _task_env_export_cv 里存的是 bash export 串，Windows 通道需要原始键值；
+    # 为避免二次解析，这里直接从当前上下文任务重取不可行——
+    # 约定：set_task_env_export 时同时保存原始 env dict。
+    env = dict(_task_env_dict_cv.get() or {})
+    if not env:
+        return ""
+    parts = []
+    user_path = env.pop("PATH", None)
+    for k, v in env.items():
+        parts.append(f"set {k}={str(v)}&& ")
+    if user_path:
+        parts.append(f"set PATH={user_path};%PATH%&& ")
+    return "".join(parts)
+
+
+def _wrap_login(shell_cmd: str, windows: bool = False) -> str:
     """将远程 shell 命令用 `bash -lc` 包裹。
 
     必要性：paramiko 的 exec_command 默认使用非交互、非登录 shell，
@@ -591,7 +636,12 @@ def _wrap_login(shell_cmd: str) -> str:
 
     用 `bash -lc '...'` 强制作为 login shell 启动，加载 /etc/profile 后
     再执行命令。注意：必须把 shell_cmd 包成单引号字符串传入。
+
+    windows=True：Windows OpenSSH 默认 shell 是 cmd，bash -lc 与 export
+    均无效——不做 bash 包裹，环境变量改用 `set K=V&& ` 前缀注入。
     """
+    if windows:
+        return _task_env_set_prefix() + shell_cmd
     # 任务级自定义环境变量（extra_options.env_vars）统一注入：
     # 覆盖所有引擎的远程命令与自定义脚本，且不影响工具探测的 PATH 前缀逻辑
     prefix = _task_env_export_cv.get() or ""

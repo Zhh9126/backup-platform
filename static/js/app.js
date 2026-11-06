@@ -1845,13 +1845,17 @@
         <td>${esc(t.backup_type_display || t.backup_type)}</td>
         <td>${esc(t.backup_mode_display || (t.backup_mode === "physical" ? "物理备份" : "逻辑备份"))}</td>
         <td>${scheduleCell(t)}</td>
-        <td>${t.enabled ? statusBadge(t.last_status || "never") : '<span class="badge bg-secondary">' + T("已停用") + '</span>'}</td>
+        <td>${t.enabled ? statusBadge(t.last_status || "never") : '<span class="badge bg-secondary">' + T("已停用") + '</span>'}${t._running && t._progress != null
+          ? `<div class="progress mt-1" style="height:6px;min-width:96px"><div class="progress-bar progress-bar-striped progress-bar-animated" style="width:${t._progress}%;background:#0d9488"></div></div><div class="small text-muted mt-1" style="font-size:11px">${esc(t._stage || "")} ${t._progress}%</div>`
+          : ""}</td>
         <td>${fmtTime(t.last_run_at) || "-"}</td>
         <td class="text-end" style="white-space:nowrap">
           ${t._running
             ? `<button class="btn-row btn-row-danger" onclick="stopTask(${t.id})" title="停止运行中的备份（协作式取消：传输块边界生效，断点保留可续传）"><i class="bi bi-stop-circle"></i> ${T("停止")}</button>
           <button class="btn-row" onclick="liveLog(${t.id})" title="实时查看本次备份的操作日志（2.5s 自动刷新）"><i class="bi bi-terminal"></i> ${T("实时日志")}</button>`
-            : `<button class="btn-row btn-row-primary" onclick="runTask(${t.id})" title="${T("立即备份")}"><i class="bi bi-play-circle"></i> ${T("立即备份")}</button>
+            : `${(t.last_status === "success" || t.last_status === "failed" || t.last_status === "cancelled")
+          ? `<button class="btn-row" onclick="liveLog(${t.id})" title="查看最近一次备份的操作日志与结论"><i class="bi bi-terminal"></i> ${T("日志")}</button>` : ""}
+          <button class="btn-row btn-row-primary" onclick="runTask(${t.id})" title="${T("立即备份")}"><i class="bi bi-play-circle"></i> ${T("立即备份")}</button>
           <button class="btn-row" onclick="BKP.runBackupPrecheck(${t.id})" title="备份预检：先探测配置/通道/源库/工具/空间能否支持本次备份"><i class="bi bi-clipboard-check"></i> ${T("预检")}</button>`}
           <button class="btn-row" onclick="editTask(${t.id})" title="${T("编辑")}"><i class="bi bi-pencil"></i> ${T("编辑")}</button>
           <button class="btn-row btn-row-danger" onclick="delTask(${t.id})" title="${T("删除")}"><i class="bi bi-trash"></i> ${T("删除")}</button>
@@ -1976,6 +1980,14 @@
               <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
+              <div id="liveLogProgressWrap" style="display:none" class="mb-2">
+                <div class="d-flex justify-content-between small text-muted mb-1">
+                  <span id="liveLogStage">-</span><span id="liveLogPct">0%</span>
+                </div>
+                <div class="progress" style="height:8px">
+                  <div id="liveLogBar" class="progress-bar progress-bar-striped progress-bar-animated" style="width:0%;background:#0d9488"></div>
+                </div>
+              </div>
               <pre id="liveLogPre" style="max-height:60vh;overflow:auto;background:#0b1220;color:#d1e3ff;"
                    class="p-3 rounded small font-monospace mb-0">加载中…</pre>
               <div class="small text-muted mt-2">每 2.5 秒自动刷新；任务结束后停止刷新。</div>
@@ -2001,11 +2013,24 @@
           r.status === "cancelled" ? "bg-secondary" : "bg-danger");
         pre.textContent = r.log_tail || "（暂无日志输出）";
         pre.scrollTop = pre.scrollHeight;
+        const wrap = $("liveLogProgressWrap");
+        if (wrap) {
+          const p = Number(r.progress || 0);
+          if (r.status === "running" && p > 0) {
+            wrap.style.display = "block";
+            $("liveLogBar").style.width = p + "%";
+            $("liveLogPct").textContent = p + "%";
+            $("liveLogStage").textContent = r.stage || "-";
+          } else { wrap.style.display = "none"; }
+        }
         if (r.status !== "running" && _liveLogTimer) {
           clearInterval(_liveLogTimer); _liveLogTimer = null;
           await loadTasks();
         }
-      } catch (e) { /* 静默：下一轮重试 */ }
+      } catch (e) {
+        const pre2 = $("liveLogPre");
+        if (pre2 && !pre2.textContent.trim()) pre2.textContent = "日志加载失败: " + (e && e.message ? e.message : e) + "（2.5 秒后自动重试）";
+      }
     };
     await pull();
     if (_liveLogTimer) clearInterval(_liveLogTimer);

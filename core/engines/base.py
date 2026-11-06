@@ -757,6 +757,19 @@ class BackupEngine:
                 return True, msg2
             return False, msg2
 
+        # 无 SSH 通道且本机无客户端：按库型给出可执行的解决路径
+        if self.db_type == "sqlserver":
+            return False, (
+                "平台本机未检测到 sqlcmd，且任务未配置 SSH 通道。"
+                "Windows SQL Server 的修复路径：① 在数据库服务器上启用 "
+                "OpenSSH Server（设置→可选功能，或 PowerShell: "
+                "Add-WindowsCapability -Online -Name OpenSSH.Server~~~0.0.1.0"
+                " 并 Start-Service sshd）；② 平台【SSH 主机】页纳管该服务器"
+                "（操作系统类型选 windows）；③ 编辑本任务选择该 SSH 主机。"
+                "之后 sqlcmd 由数据库服务器自带执行，平台零安装。"
+                "注意：自定义环境变量在 Windows cmd 通道按 set 注入，"
+                "工具路径兜底请用任务高级选项的「工具路径」（多目录用分号分隔）。"
+            )
         return False, detail
 
     def verify_record(self, record: dict, options: dict = None) -> BackupResult:

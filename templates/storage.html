@@ -236,6 +236,7 @@
                 <option value="">— 请选择 —</option>
                 <option value="minio">MinIO 热存储 (L1)</option>
                 <option value="s3">S3 冷存储 (L2)</option>
+                <option value="sftp">SFTP / NAS (L2)</option>
                 <option value="local">本地存储 (L3)</option>
                 <option value="tape">磁带库 (D2T 归档)</option>
               </select>
@@ -251,6 +252,44 @@
                        placeholder="/data/backups 或 C:\backups"
                        value="./backups">
                 <div class="form-text">备份文件的本地根目录，需确保进程有读写权限。</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- SFTP/NAS 专用字段 -->
+          <div id="st_fields_sftp" class="storage-type-fields d-none">
+            <div class="row g-3">
+              <div class="col-md-8">
+                <label class="form-label">SSH 主机地址 *</label>
+                <input type="text" class="form-control font-code" id="st_endpoint_sftp"
+                       placeholder="192.168.1.10 或 nas.example.com">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">SSH 端口</label>
+                <input type="number" class="form-control" id="st_port_sftp" value="22" min="1">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">SSH 用户名 *</label>
+                <input type="text" class="form-control" id="st_user_sftp" value="root" placeholder="root">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">SSH 密码</label>
+                <input type="password" class="form-control" id="st_secret_key" autocomplete="new-password"
+                       placeholder="新建必填；编辑留空=不修改">
+              </div>
+              <div class="col-12">
+                <label class="form-label">远端备份根目录 *</label>
+                <input type="text" class="form-control font-code" id="st_bucket_sftp"
+                       placeholder="/volume1/backup（群晖共享文件夹对应的实际路径）">
+                <div class="form-text">
+                  对接群晖 NAS：控制面板 → 终端机和 SNMP → 启用 SSH（DSM 7 默认禁止 root 直连，
+                  请使用 admin 等管理员账号）；目录需对该账号可写。同样适用于任何开启 SSH 的 Linux/NAS 主机。
+                </div>
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">子路径前缀（可选）</label>
+                <input type="text" class="form-control font-code" id="st_prefix_sftp"
+                       placeholder="aidbm">
               </div>
             </div>
           </div>

@@ -6955,6 +6955,14 @@
           $("st_tape_max_gb").value = d.extra_options.max_tape_gb || 0;
         }
       }
+      else if (d.type === "sftp") {
+        $("st_endpoint_sftp").value = d.endpoint || "";
+        $("st_user_sftp").value = d.username || d.access_key || "root";
+        $("st_bucket_sftp").value = d.bucket || "";
+        $("st_prefix_sftp").value = d.prefix || "";
+        const ex = (d.extra_options && typeof d.extra_options === "object") ? d.extra_options : {};
+        $("st_port_sftp").value = ex.port || 22;
+      }
       else {
         $("st_endpoint_s3").value = d.endpoint || "";
         $("st_region").value = d.region || "";
@@ -6976,6 +6984,7 @@
     document.querySelectorAll(".storage-type-fields").forEach(el => el.classList.add("d-none"));
     if (type === "local") $("st_fields_local").classList.remove("d-none");
     else if (type === "tape") $("st_fields_tape").classList.remove("d-none");
+    else if (type === "sftp") $("st_fields_sftp").classList.remove("d-none");
     else if (type === "minio" || type === "s3") {
       $("st_fields_s3_compat").classList.remove("d-none");
       if (type === "s3") $("st_fields_s3_extra").classList.remove("d-none");
@@ -7002,6 +7011,13 @@
 
     if (type === "local") {
       data.endpoint = $("st_endpoint_local").value.trim() || "./backups";
+    } else if (type === "sftp") {
+      data.endpoint = $("st_endpoint_sftp").value.trim();
+      data.username = $("st_user_sftp").value.trim() || "root";
+      data.bucket = $("st_bucket_sftp").value.trim();
+      data.prefix = $("st_prefix_sftp").value.trim();
+      data.secret_key = $("st_secret_key").value;  // 留空=不修改
+      data.extra_options = { port: parseInt($("st_port_sftp").value || "22", 10) || 22 };
     } else {
       data.endpoint = $("st_endpoint_s3").value.trim();
       data.region = $("st_region").value.trim();

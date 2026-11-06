@@ -10,6 +10,7 @@ from .local import LocalStorageBackend
 from .minio import MinIOStorageBackend
 from .s3 import S3StorageBackend
 from .tape import TapeStorageBackend
+from .sftp import SFTPStorageBackend, _HAS_PARAMIKO as _HAS_SFTP_DEP
 
 # 类型 → 类 映射
 BACKEND_REGISTRY: dict[type[StorageBackend]] = {
@@ -17,6 +18,7 @@ BACKEND_REGISTRY: dict[type[StorageBackend]] = {
     "minio": MinIOStorageBackend,
     "s3": S3StorageBackend,
     "tape": TapeStorageBackend,
+    "sftp": SFTPStorageBackend,
 }
 
 # Tier 显示名
@@ -32,6 +34,7 @@ TYPE_META = {
     "minio": {"name": "MinIO", "icon": "bi-cloud-arrow-up", "tier": 1, "desc": "热数据对象存储（S3 兼容），备份第一落点"},
     "s3": {"name": "S3", "icon": "bi-cloud-check", "tier": 2, "desc": "冷数据归档存储（AWS S3 / 兼容服务）"},
     "tape": {"name": "磁带库 (D2T)", "icon": "bi-layers", "tier": 3, "desc": "磁带归档：真实设备 /dev/nst*（mt+tar）或目录模拟带库；顺序写入，适合离线长期保存"},
+    "sftp": {"name": "SFTP / NAS", "icon": "bi-hdd-network", "tier": 2, "desc": "SFTP 存储（群晖 NAS 等 SSH 主机）：目标侧开启 SSH 即可作为备份仓库，数据库/存储端零安装"},
 }
 
 
@@ -81,6 +84,7 @@ def check_dependencies() -> dict[str, bool]:
         "minio": False,
         "s3": False,
         "tape": True,   # mt/tar（设备模式）；目录模式无依赖
+        "sftp": _HAS_SFTP_DEP,
     }
     try:
         import minio

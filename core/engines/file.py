@@ -2495,12 +2495,36 @@ class FileBackupEngine(BackupEngine):
         from core import cross_host
         from core import db as _db
         kwargs = kwargs or {}
-        try:
-            chain = self._build_restore_chain(
-                backup_path, chain_override=kwargs.get("chain_override"))
-        except Exception as e:
-            self.logger.warning("[%s] 构建恢复链失败，仅恢复当前归档: %s", self.task_name, e)
-            chain = []
+        # 镜像备份目录产物（mirror_full_*/mirror_inc_*/mirror_latest）：跨主机
+        # 不能像本机那样整树复制 → 本地 tar 打包为临时归档，复用下方
+        # 「SFTP 推送 + 远程解压」链路；打包排除 .deleted.txt（镜像树已是
+        # 最终视图，删除清单已应用过，不能再次应用）。
+        tmp_pack = None
+        if os.path.isdir(backup_path):
+            import tarfile as _tarfile
+            import tempfile
+            tmp_pack = os.path.join(
+                tempfile.gettempdir(), "mirror_push_%s.tar.gz"
+                % time.strftime("%Y%m%d%H%M%S"))
+            self.logger.info("[%s] 镜像目录产物跨主机恢复: 打包 %s -> %s",
+                             self.task_name, backup_path, tmp_pack)
+            with _tarfile.open(tmp_pack, "w:gz") as tf:
+                for root, _dirs, files in os.walk(backup_path):
+                    for f in files:
+                        if f == ".deleted.txt":
+                            continue
+                        full = os.path.join(root, f)
+                        tf.add(full, arcname=os.path.relpath(full, backup_path))
+            chain = [tmp_pack]
+        else:
+            try:
+                chain = self._build_restore_chain(
+                    backup_path, chain_override=kwargs.get("chain_override"))
+            except Exception as e:
+                self.logger.warning("[%s] 构建恢复链失败，仅恢复当前归档: %s",
+                                    self.task_name, e)
+                chain = []
+
         if not chain:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,
@@ -2551,6 +2575,13 @@ class FileBackupEngine(BackupEngine):
                 backup_path=backup_path, message=f"跨主机恢复失败: {e}",
             )
         finally:
+            # 清理镜像目录打包的临时归档
+            if tmp_pack and os.path.exists(tmp_pack):
+                try:
+                    os.remove(tmp_pack)
+                except OSError:
+                    pass
+
             if client:
                 try:
                     if remote_tmp_files:

@@ -12,7 +12,7 @@
 </ul>
 <div class="tab-content" id="tasksTabsContent">
 <div class="tab-pane fade show active" id="tabTasks" role="tabpanel">
-<div class="toolbar">
+<div class="toolbar" id="taskListToolbar">
   <div>
     <div class="page-title" data-i18n="数据库备份">数据库备份</div>
     <div class="page-sub" data-i18n="配置数据库连接、备份类型与调度策略">配置数据库连接、备份类型与调度策略</div>
@@ -34,7 +34,7 @@
     <table class="table table-hover align-middle mb-0">
       <thead><tr>
         <th>#</th><th data-i18n="业务系统">业务系统</th><th data-i18n="名称">名称</th><th data-i18n="类型">类型</th><th data-i18n="备份 IP">备份 IP</th><th data-i18n="端口/库">端口/库</th><th data-i18n="备份类型">备份类型</th><th data-i18n="备份模式">备份模式</th>
-        <th data-i18n="调度">调度</th><th data-i18n="状态">状态</th><th data-i18n="上次运行">上次运行</th><th class="text-end" data-i18n="操作">操作</th>
+        <th data-i18n="调度">调度</th><th data-i18n="状态">状态</th><th data-i18n="上次运行">上次运行</th><th data-i18n="下次备份时间">下次备份时间</th><th data-i18n="上次成功执行">上次成功执行</th><th class="text-end" data-i18n="操作">操作</th>
       </tr></thead>
       <tbody id="taskTable"></tbody>
     </table>
@@ -47,22 +47,27 @@
 </div>
 </div><!-- /tasksTabsContent -->
 
-<!-- 任务编辑模态框 -->
-<div class="modal fade" id="taskModal" tabindex="-1">
-  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+<!-- 任务向导：页内整屏区块（点新建=整页展开，对标英方；关闭回到列表） -->
+<div class="task-page d-none" id="taskModal">
+  <div class="task-page-inner">
     <div class="modal-content">
       <div class="modal-header">
         <h5 class="modal-title" id="taskModalTitle">新建备份任务</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        <button type="button" class="btn-close" onclick="closeTaskWizard()" title="关闭并返回任务列表"></button>
       </div>
       <div class="modal-body">
         <form id="taskForm" onsubmit="return false">
           <input type="hidden" id="t_id">
-          <ul class="nav nav-tabs mb-3" id="taskTabs" role="tablist">
-            <li class="nav-item"><a class="nav-link active" href="#tab_basic" data-bs-toggle="tab" role="tab">基本信息</a></li>
-            <li class="nav-item"><a class="nav-link" href="#tab_advanced" data-bs-toggle="tab" role="tab">高级选项</a></li>
-            <li class="nav-item"><a class="nav-link" href="#tab_extra" data-bs-toggle="tab" role="tab">类型参数</a></li>
-          </ul>
+          <!-- 向导步骤条（对标英方：基本参数→备份内容→高级设置→确认提交） -->
+          <div class="wiz-steps mb-3" id="taskWizSteps">
+            <div class="wiz-step active" data-step="1"><span class="wiz-dot">1</span><span class="wiz-label">基本参数</span></div>
+            <div class="wiz-arrow"></div>
+            <div class="wiz-step" data-step="2"><span class="wiz-dot">2</span><span class="wiz-label">备份内容&对象</span></div>
+            <div class="wiz-arrow"></div>
+            <div class="wiz-step" data-step="3"><span class="wiz-dot">3</span><span class="wiz-label">高级设置</span></div>
+            <div class="wiz-arrow"></div>
+            <div class="wiz-step" data-step="4"><span class="wiz-dot"><i class="bi bi-check-lg"></i></span><span class="wiz-label">确认&提交</span></div>
+          </div>
           <div class="tab-content">
             <div class="tab-pane fade show active" id="tab_basic" role="tabpanel">
               <div class="row g-3">
@@ -173,7 +178,14 @@
                 </div>
                 <div class="col-md-6">
                   <label class="form-label">数据库 / 实例名</label>
-                  <input class="form-control" id="t_db_name" placeholder="留空 = 全实例备份（备份实例内全部业务库；无业务库时自动含系统库）">
+                  <div class="input-group">
+                    <input class="form-control" id="t_db_name" placeholder="留空 = 全实例备份（备份实例内全部业务库；无业务库时自动含系统库）">
+                    <button class="btn btn-outline-primary" type="button" id="t_test_conn_btn"
+                            title="按当前表单参数真实连接一次数据库（全数据库类型通用；编辑时密码留空则用已存密码）">
+                      <i class="bi bi-plug"></i> 测试连接
+                    </button>
+                  </div>
+                  <div class="form-text" id="t_test_conn_msg" style="display:none"></div>
                   <div class="form-text text-muted">全实例 = 不填库名；只备份单个库请填库名。系统库默认排除，可在「高级选项」勾选包含。</div>
                 </div>
                 <div class="col-md-3 d-flex align-items-end">
@@ -596,12 +608,22 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
                 <div class="form-text">高级 / 透传参数，例如 <code>--set-gtid-purged=OFF</code> 填 <code>{"extra_args": "--set-gtid-purged=OFF"}</code>；自定义脚本的环境变量在「基本配置」页填写</div>
               </div>
             </div>
+
+            <!-- 步骤 4：确认&提交 -->
+            <div class="tab-pane fade" id="tab_confirm" role="tabpanel">
+              <div class="alert alert-light py-2 small text-muted mb-3">
+                <i class="bi bi-info-circle"></i> 请核对以下配置摘要，确认无误后点击「保存」。带 <span class="text-danger">*</span> 为必填项，返回对应步骤可修改。
+              </div>
+              <div id="taskConfirmBody"></div>
+            </div>
           </div>
         </form>
       </div>
       <div class="modal-footer">
-        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-        <button class="btn btn-primary" id="taskSaveBtn">保存</button>
+        <button class="btn btn-secondary" onclick="closeTaskWizard()">取消</button>
+        <button class="btn btn-outline-secondary" id="taskWizPrev" type="button" style="display:none"><i class="bi bi-arrow-left"></i> 上一步</button>
+        <button class="btn btn-primary" id="taskWizNext" type="button">下一步 <i class="bi bi-arrow-right"></i></button>
+        <button class="btn btn-success" id="taskSaveBtn" style="display:none"><i class="bi bi-check-lg"></i> 保存</button>
       </div>
     </div>
   </div>

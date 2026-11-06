@@ -335,6 +335,20 @@ def list_tasks():
                 t["_progress"], t["_stage"] = _OpLog.progress_from_tail(_tail)
             except Exception:
                 t["_progress"], t["_stage"] = 5, "初始化"
+    # 对标英方列表列：下次备份时间 + 上次成功执行（一次分组 SQL，随列表批量注入）
+    _succ = {}
+    try:
+        _succ = {int(r["task_id"]): str(r["ls"] or "")[:19] for r in db.query(
+            "SELECT task_id, MAX(started_at) AS ls FROM backup_records "
+            "WHERE status='success' GROUP BY task_id")}
+    except Exception:
+        _succ = {}
+    for t in tasks:
+        try:
+            t["next_run_at"] = scheduler.next_run_display(t) or ""
+        except Exception:
+            t["next_run_at"] = ""
+        t["last_success_at"] = _succ.get(int(t.get("id") or 0), "")
     # 统一分页：v1 默认 100/页；兼容路径默认返回全量（历史行为不变）
     default_size = 100 if request.path.startswith(contract.V1_PREFIX) else len(tasks) or 1
     _page, size, offset = contract.pagination_args(default_size=default_size,
@@ -601,3 +615,113 @@ def import_tasks():
             errors.append(f"第{i}行({name}): {e}")
     scheduler.reload_scheduler()
     return jsonify({"created": created, "skipped": skipped, "errors": errors})
+
+# ---------------- 测试连接（任务表单，全数据库类型通用） ----------------
+
+# 协议兼容库型 → 复用基础探测实现（与引擎注册同族映射）
+_TEST_CONN_FAMILY = {
+    "mariadb": "mysql",
+    "highgo": "postgresql",
+    "uxdb": "postgresql",
+    "opengauss": "postgresql",
+    "panwei": "postgresql",
+    "tidb": "mysql",
+    "oceanbase": "mysql",
+}
+
+
+@api_bp.route("/tasks/test-connection", methods=["POST"])
+@login_required
+def test_task_connection():
+    """按表单当前参数探测数据库连通性（不落库、纯探测）。
+
+    body: {db_type, host, port, username, password, db_name, task_id?}
+    - password 为空且提供 task_id（编辑态未改密码）→ 用任务已存密码探测；
+    - 平台内置探测未覆盖的库型（sqlserver 等）自动走 JDBC 兜底。
+    """
+    body = request.get_json(silent=True) or {}
+    db_type = (body.get("db_type") or "").strip()
+    host = (body.get("host") or "").strip()
+    port = body.get("port")
+    username = (body.get("username") or "").strip()
+    password = body.get("password") or ""
+    db_name = (body.get("db_name") or "").strip()
+
+    if not db_type:
+        return jsonify({"ok": False, "message": "请先选择数据库类型"}), 400
+    if not host:
+        return jsonify({"ok": False, "message": "请填写主机地址"}), 400
+
+    # 编辑态密码留空 → 复用任务已存密码；其余留空字段同样回填任务值
+    task_id = body.get("task_id")
+    if task_id:
+        try:
+            t = models.get_task(int(task_id), include_secret=True)
+            if t:
+                if not password:
+                    password = t.get("password") or ""
+                if not host:
+                    host = t.get("host") or ""
+                if not port:
+                    port = t.get("port")
+                if not username:
+                    username = t.get("username") or ""
+                if not db_name:
+                    db_name = t.get("db_name") or ""
+        except (TypeError, ValueError):
+            pass
+
+    from core import probe
+    probe_type = _TEST_CONN_FAMILY.get(db_type, db_type)
+    ok, message = probe.probe_db_connection(
+        probe_type, host, port, username, password, db_name, timeout=8)
+
+    # 内置探测未覆盖（ok=None 且类型未知）→ JDBC 兜底（驱动随平台内置，零安装）
+    if ok is None and "未知数据库类型" in str(message):
+        ok, message = probe._probe_via_jdbc(db_type, host, port, username, password, 8)
+
+    result = {"ok": bool(ok) if ok is not None else False,
+              "known": ok is not None,
+              "db_type": db_type, "host": host, "port": port,
+              "message": message or ("连接正常" if ok else "连接失败")}
+    if ok is True:
+        result["detail"] = "连接成功"
+    elif ok is False:
+        result["detail"] = "连接失败，请核对地址/端口/账号密码"
+    else:
+        result["detail"] = "无法确认（平台侧驱动/客户端缺失），可保存后用预检进一步验证"
+    return jsonify(result)
+
+@api_bp.route("/tasks/<int:task_id>/clone", methods=["POST"])
+@login_required
+def clone_task(task_id):
+    """克隆任务（对标英方「克隆」）：复制全部配置，名称加「-克隆」后缀，默认停用。
+
+    克隆体 enabled=0：避免与源任务双跑同一目标；用户核对配置后再手动启用。
+    """
+    src = models.get_task(task_id, include_secret=True)
+    if not src:
+        return jsonify({"error": f"任务不存在: {task_id}"}), 404
+    from core.models import TASK_FIELDS
+    data = {}
+    for k in TASK_FIELDS:
+        if k in ("id", "enabled", "demo_only"):
+            continue
+        v = src.get(k)
+        if v is not None:
+            data[k] = v
+    data["name"] = f"{src.get('name') or '任务'}-克隆"
+    data["enabled"] = 0
+    try:
+        new_id = models.create_task(data)
+    except Exception as e:
+        # 配额超限等业务性失败给出可读原因（与批量导入同口径）
+        msg = str(e)
+        if "Quota" in msg or "配额" in msg:
+            return jsonify({"error": f"克隆失败（社区版配额限制）: {msg}"}), 400
+        return jsonify({"error": f"克隆失败: {msg}"}), 400
+    try:
+        scheduler.reload_scheduler()
+    except Exception:
+        pass
+    return jsonify({"ok": True, "id": new_id, "message": f"已克隆为任务 #{new_id}（默认停用，请核对后启用）"})

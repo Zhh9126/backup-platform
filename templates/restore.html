@@ -40,8 +40,16 @@
 
 <div class="page-card mb-3">
   <form id="restoreForm" onsubmit="event.preventDefault();submitRestore();">
+    <!-- 恢复向导步骤条（与新建任务向导同款式，对标英方） -->
+    <div class="wiz-steps mb-3">
+      <div class="wiz-step active" onclick="document.getElementById('r_sec1').scrollIntoView({behavior:'smooth',block:'center'})"><span class="wiz-dot">1</span><span class="wiz-label">选择备份类型</span></div>
+      <div class="wiz-arrow"></div>
+      <div class="wiz-step" onclick="document.getElementById('r_sec2').scrollIntoView({behavior:'smooth',block:'center'})"><span class="wiz-dot">2</span><span class="wiz-label">选择备份记录</span></div>
+      <div class="wiz-arrow"></div>
+      <div class="wiz-step" onclick="document.getElementById('r_sec3').scrollIntoView({behavior:'smooth',block:'center'})"><span class="wiz-dot">3</span><span class="wiz-label">恢复参数&执行</span></div>
+    </div>
     <!-- 步骤 1：选择备份类型 -->
-    <h6 class="border-bottom pb-2 mb-3"><i class="bi bi-1-circle"></i> 选择备份类型</h6>
+    <h6 class="border-bottom pb-2 mb-3" id="r_sec1"><i class="bi bi-1-circle"></i> 选择备份类型</h6>
     <div class="row g-3 mb-3">
       <div class="col-md-12">
         <div class="btn-group btn-group-lg w-100" role="group">
@@ -62,7 +70,7 @@
     </div>
 
     <!-- 步骤 2：选择备份记录 -->
-    <h6 class="border-bottom pb-2 mb-3"><i class="bi bi-2-circle"></i> 选择备份记录</h6>
+    <h6 class="border-bottom pb-2 mb-3" id="r_sec2"><i class="bi bi-2-circle"></i> 选择备份记录</h6>
     <div class="row g-3 mb-3">
       <div class="col-md-8">
         <label class="form-label">搜索（业务系统名称 / IP）</label>
@@ -95,7 +103,7 @@
     </div>
 
     <!-- 步骤 3：恢复参数 -->
-    <h6 class="border-bottom pb-2 mb-3"><i class="bi bi-3-circle"></i> 恢复参数</h6>
+    <h6 class="border-bottom pb-2 mb-3" id="r_sec3"><i class="bi bi-3-circle"></i> 恢复参数</h6>
 
     <!-- ===== 数据库恢复模式选择 ===== -->
     <div class="row g-3 mb-3" id="r_mode_db_row">

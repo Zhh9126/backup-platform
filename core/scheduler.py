@@ -812,6 +812,65 @@ def _make_trigger(task: dict, st_key: str = "schedule_type", expr_key: str = "cr
     return None
 
 
+def _next_fire_naive(task: dict, st_key: str, expr_key: str, minutes_key: str,
+                     days_key, last_run):
+    """单个子调度的下次触发时间（归一为本地 naive datetime；不可算返回 None）。
+
+    与真实调度注册同语义（复用 _make_trigger），任何解析失败静默返回 None，
+    绝不影响任务列表。
+    """
+    import datetime as _dt
+    try:
+        trig = _make_trigger(task, st_key=st_key, expr_key=expr_key,
+                             minutes_key=minutes_key, days_key=days_key)
+        if not trig:
+            return None
+        tz = getattr(trig, "timezone", None)
+        now = _dt.datetime.now(tz) if tz is not None else _dt.datetime.now()
+        prev = None
+        if last_run:
+            raw = str(last_run)[:19]
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    prev = _dt.datetime.strptime(raw, fmt)
+                    break
+                except ValueError:
+                    continue
+        nft = trig.get_next_fire_time(prev, now)
+        if nft is None:
+            return None
+        if nft.tzinfo is not None:
+            nft = nft.astimezone().replace(tzinfo=None)
+        return nft
+    except Exception:
+        return None
+
+
+def next_run_display(task: dict) -> str:
+    """任务的下次备份时间（尽早的子调度），返回 'MM-DD HH:MM'；不可算返回空串。
+
+    覆盖：主调度（cron/interval）；组合任务取 全量/增量 两个子调度中最早者。
+    """
+    import datetime as _dt
+    if task.get("mixed_backup"):
+        candidates = [
+            ("full_schedule_type", "full_schedule_expr", "full_schedule_expr",
+             "full_schedule_days"),
+            ("incremental_schedule_type", "incremental_schedule_expr",
+             "incremental_schedule_expr", "incremental_schedule_days"),
+        ]
+    else:
+        candidates = [("schedule_type", "cron_expr", "interval_minutes", None)]
+    best = None
+    for st, ex, mi, dk in candidates:
+        nft = _next_fire_naive(task, st, ex, mi, dk, task.get("last_run_at"))
+        if nft is not None and (best is None or nft < best):
+            best = nft
+    if best is None:
+        return ""
+    return best.strftime("%m-%d %H:%M")
+
+
 # 物理备份的标志文件：出现其一即证明产物是"数据库可识别的物理备份"，
 # 而不是碰巧非空的普通目录。
 _PHYS_MARKERS = (

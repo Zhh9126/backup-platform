@@ -1037,13 +1037,13 @@
     } catch (e) { /* ignore */ }
     // 根据备份类型切换按天调度区显示
     refreshScheduleByDayBox();
-    // 防御：确保模态框实例存在（即使 init 阶段因故未创建也能自愈，避免 taskModal 为 null 时抛错）
+    // 防御：确保向导入口可用（自愈；taskModal 已整页化，不再使用 bootstrap Modal）
     if (!taskModal) {
-      const el = document.getElementById("taskModal");
-      if (el && window.bootstrap && bootstrap.Modal) taskModal = new bootstrap.Modal(el);
+      taskModal = { show: openTaskWizardPage, hide: closeTaskWizardPage };
     }
+    taskWizShow(1); // 向导复位到第一步（对标英方：每次打开都从基本参数开始）
     if (taskModal) taskModal.show();
-    else console.error("[openTaskModal] taskModal 实例缺失，无法弹出编辑框");
+    else console.error("[openTaskModal] taskModal 实例缺失，无法打开向导");
   }
 
   // 数据库选择器（schema/table 多选）：mysql/mariadb/postgresql/kingbase/oracle/dameng 显示
@@ -1214,6 +1214,43 @@
     }
   }
 
+  // 通用测试连接（任务表单，全数据库类型：原生驱动探测优先，JDBC 兜底）
+  async function testTaskConnection() {
+    const btn = $("t_test_conn_btn");
+    const msg = $("t_test_conn_msg");
+    if (!btn || !msg) return;
+    const body = {
+      db_type: ($("t_db_type") || {}).value || "",
+      host: ($("t_host") || {}).value || "",
+      port: ($("t_port") || {}).value || "",
+      username: ($("t_username") || {}).value || "",
+      password: ($("t_password") || {}).value || "",
+      db_name: ($("t_db_name") || {}).value || "",
+      task_id: ($("t_id") || {}).value || "",
+    };
+    msg.style.display = "";
+    if (!body.db_type || !body.host) {
+      msg.className = "form-text text-warning";
+      msg.innerHTML = '<i class="bi bi-exclamation-triangle"></i> 请先选择数据库类型并填写主机地址后再测试。';
+      return;
+    }
+    btn.disabled = true;
+    msg.className = "form-text text-info";
+    msg.innerHTML = '<i class="bi bi-plug"></i> 正在连接 ' + esc(body.host) + ":" + esc(String(body.port || "")) + " ...";
+    try {
+      const r = await api("POST", "/api/tasks/test-connection", body);
+      const ok = !!r.ok;
+      msg.className = "form-text " + (ok ? "text-success" : "text-danger");
+      const icon = ok ? "bi-check-circle-fill" : "bi-x-circle-fill";
+      msg.innerHTML = '<i class="bi ' + icon + '"></i> ' + esc(r.message || r.detail || (ok ? "连接成功" : "连接失败"));
+    } catch (e) {
+      msg.className = "form-text text-danger";
+      msg.innerHTML = '<i class="bi bi-x-circle-fill"></i> 测试请求失败: ' + esc(e.message || e);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
   // 更新已选数
   function updatePickCount() {
     const sel = $("t_pick_list");
@@ -1260,6 +1297,11 @@
     if (jdbcBtn && !jdbcBtn._bound) {
       jdbcBtn._bound = true;
       jdbcBtn.onclick = jdbcTestConnection;
+    }
+    const tcBtn = $("t_test_conn_btn");
+    if (tcBtn && !tcBtn._bound) {
+      tcBtn._bound = true;
+      tcBtn.onclick = testTaskConnection;
     }
     const allBtn = $("t_pick_all");
     if (allBtn && !allBtn._bound) {
@@ -1683,6 +1725,117 @@
     }
   }
 
+  // ---------- 任务向导（对标英方：①基本参数 → ②备份内容&对象 → ③高级设置 → ④确认&提交） ----------
+  const TASK_WIZ = [
+    { step: 1, pane: "tab_basic" },
+    { step: 2, pane: "tab_extra" },
+    { step: 3, pane: "tab_advanced" },
+    { step: 4, pane: "tab_confirm" },
+  ];
+  let taskWizCur = 1;
+
+  function taskWizShow(step) {
+    taskWizCur = Math.min(4, Math.max(1, step));
+    TASK_WIZ.forEach((s) => {
+      const pane = document.getElementById(s.pane);
+      if (pane) pane.classList.toggle("show", s.step === taskWizCur), pane.classList.toggle("active", s.step === taskWizCur), pane.classList.toggle("d-none", s.step !== taskWizCur);
+      const dot = document.querySelector('#taskWizSteps .wiz-step[data-step="' + s.step + '"]');
+      if (dot) {
+        dot.classList.toggle("active", s.step === taskWizCur);
+        dot.classList.toggle("done", s.step < taskWizCur);
+      }
+    });
+    const prev = document.getElementById("taskWizPrev");
+    const next = document.getElementById("taskWizNext");
+    const save = document.getElementById("taskSaveBtn");
+    if (prev) prev.style.display = taskWizCur > 1 ? "" : "none";
+    if (next) next.style.display = taskWizCur < 4 ? "" : "none";
+    if (save) save.style.display = taskWizCur === 4 ? "" : "none";
+    if (taskWizCur === 4) taskWizRenderSummary();
+  }
+
+  function taskWizValidate(step) {
+    if (step !== 1) return true;
+    const need = [
+      ["t_biz_system", "业务系统"],
+      ["t_name", "任务名称"],
+      ["t_host", "主机地址"],
+      ["t_port", "端口"],
+    ];
+    for (const [id, label] of need) {
+      const el = document.getElementById(id);
+      if (!el || !String(el.value || "").trim()) {
+        toast("请先填写" + label + "，再进入下一步", "danger");
+        if (el) { try { el.focus(); } catch (e) { /* ignore */ } }
+        return false;
+      }
+    }
+    return true;
+  }
+
+  function _wizRow(k, v) {
+    return '<div class="k">' + esc(k) + '</div><div class="v">' + (v === "" || v == null ? "-" : v) + "</div>";
+  }
+  function _wizSection(title) {
+    return '<div class="wiz-confirm-section"><i class="bi bi-bookmark-check"></i> ' + esc(title) + "</div>";
+  }
+
+  function taskWizRenderSummary() {
+    const box = document.getElementById("taskConfirmBody");
+    if (!box) return;
+    const val = (id) => { const el = document.getElementById(id); return el ? String(el.value || "").trim() : ""; };
+    const sel = (id) => { const el = document.getElementById(id); return el && el.selectedOptions[0] ? el.selectedOptions[0].textContent.trim() : ""; };
+    const dbType = val("t_db_type");
+    const dbNames = { mysql: "MySQL", mariadb: "MariaDB", postgresql: "PostgreSQL", oracle: "Oracle", kingbase: "Kingbase", dameng: "DM 达梦", sqlserver: "SQL Server", redis: "Redis", mongodb: "MongoDB", neo4j: "Neo4j" };
+    const btNames = { full: "全量备份", incremental: "增量备份", mixed: "组合（全量+增量）" };
+    const bmNames = { logical: "逻辑备份", physical: "物理备份", custom: "自定义脚本", hot_copy: "在线热备（Oracle 非归档应急）" };
+    const daysSel = (cbBase, timeId) => {
+      const names = ["一", "二", "三", "四", "五", "六", "日"];
+      const picked = [];
+      for (let d = 0; d < 7; d++) {
+        const c = document.getElementById(cbBase + d);
+        if (c && c.checked) picked.push(names[d]);
+      }
+      const t = timeId ? (val(timeId) || "") : "";
+      return picked.length ? "每周 " + picked.join("、") + " " + t + "（不勾选星期 = 不自动调度，仅手动）" : "不自动调度（仅手动触发）";
+    };
+    const mixed = val("t_backup_type") === "mixed";
+    let html = "";
+    html += _wizSection("基本参数");
+    html += _wizRow("业务系统", esc(val("t_biz_system")));
+    html += _wizRow("任务名称", esc(val("t_name")));
+    html += _wizRow("数据库类型", esc(dbNames[dbType] || dbType || "-"));
+    html += _wizRow("备份方式", esc(bmNames[val("t_backup_mode")] || val("t_backup_mode") || "-"));
+    html += _wizRow("备份类型", esc(btNames[val("t_backup_type")] || val("t_backup_type") || "-"));
+    html += _wizRow("备份文件格式", esc(sel("t_dump_format")));
+    html += _wizSection("连接与对象");
+    html += _wizRow("主机 / 端口", esc(val("t_host")) + " : " + esc(val("t_port")));
+    html += _wizRow("用户名", esc(val("t_username")));
+    html += _wizRow("数据库 / 实例名", val("t_db_name") ? esc(val("t_db_name")) : '<span class="text-muted">留空 = 全实例备份</span>');
+    html += _wizRow("密码", val("t_password") ? "已填写" : (val("t_id") ? "沿用已存密码" : '<span class="text-danger">未填写</span>'));
+    html += _wizSection("备份计划");
+    const bType = val("t_backup_type");
+    if (mixed) {
+      html += _wizRow("全量调度", daysSel("t_full_d", "t_full_time"));
+      html += _wizRow("增量调度", daysSel("t_inc_d", "t_incremental_time"));
+    } else if (bType === "incremental") {
+      html += _wizRow("调度方式", daysSel("t_inc_d", "t_incremental_time"));
+    } else {
+      html += _wizRow("调度方式", daysSel("t_full_d", "t_full_time"));
+    }
+    html += _wizSection("高级设置");
+    const eo = val("t_extra_options");
+    html += _wizRow("类型参数 (JSON)", eo ? '<code class="small">' + esc(eo.length > 200 ? eo.slice(0, 200) + "…" : eo) + "</code>" : "默认");
+    html += _wizRow("启用状态", document.getElementById("t_enabled") && document.getElementById("t_enabled").checked ? "启用" : "停用");
+    box.innerHTML = '<div class="wiz-confirm-grid">' + html + "</div>";
+  }
+
+  window.taskWizGo = function (delta) {
+    const target = taskWizCur + delta;
+    if (delta > 0 && !taskWizValidate(taskWizCur)) return;
+    taskWizShow(target);
+  };
+
   async function saveTask() {
     // 全面防御：编辑/新建时，模态框的某些字段可能不在当前 tab/不存在，
     // 任何 $(id) 为 null 都会让 .value 抛 TypeError，导致点保存完全无反应。
@@ -1834,7 +1987,8 @@
   }
 
   async function loadTasks() {
-    // 下钻支持：/tasks?db_type=mysql 只看该类型任务
+    // 下钻支持：/tasks?db_type=mysql 只看该类型任务（首页分布下钻）；
+    // 常规视图 = 纯数据库任务（文件任务独立在「文件备份」页管理，不混排）。
     const qDbType = new URLSearchParams(location.search).get("db_type");
     const url = qDbType
       ? "/api/tasks?db_type=" + encodeURIComponent(qDbType)
@@ -1856,6 +2010,8 @@
           ? `<div class="progress mt-1" style="height:6px;min-width:96px"><div class="progress-bar progress-bar-striped progress-bar-animated" style="width:${t._progress}%;background:#0d9488"></div></div><div class="small text-muted mt-1" style="font-size:11px">${esc(t._stage || "")} ${t._progress}%</div>`
           : ""}</td>
         <td>${fmtTime(t.last_run_at) || "-"}</td>
+        <td>${t.next_run_at ? esc(t.next_run_at) : "-"}</td>
+        <td>${fmtTime(t.last_success_at) || "-"}</td>
         <td class="text-end" style="white-space:nowrap">
           ${t._running
             ? `<button class="btn-row btn-row-danger" onclick="stopTask(${t.id})" title="停止运行中的备份（协作式取消：传输块边界生效，断点保留可续传）"><i class="bi bi-stop-circle"></i> ${T("停止")}</button>
@@ -1865,10 +2021,11 @@
           <button class="btn-row btn-row-primary" onclick="runTask(${t.id})" title="${T("立即备份")}"><i class="bi bi-play-circle"></i> ${T("立即备份")}</button>
           <button class="btn-row" onclick="BKP.runBackupPrecheck(${t.id})" title="备份预检：先探测配置/通道/源库/工具/空间能否支持本次备份"><i class="bi bi-clipboard-check"></i> ${T("预检")}</button>`}
           <button class="btn-row" onclick="editTask(${t.id})" title="${T("编辑")}"><i class="bi bi-pencil"></i> ${T("编辑")}</button>
+          <button class="btn-row" onclick="cloneTask(${t.id})" title="克隆任务：复制全部配置，默认停用，核对后启用"><i class="bi bi-copy"></i> ${T("克隆")}</button>
           <button class="btn-row btn-row-danger" onclick="delTask(${t.id})" title="${T("删除")}"><i class="bi bi-trash"></i> ${T("删除")}</button>
         </td>
       </tr>`).join("") ||
-      '<tr><td colspan="11"><div class="empty-state"><i class="bi bi-inboxes"></i>'
+      '<tr><td colspan="13"><div class="empty-state"><i class="bi bi-inboxes"></i>'
       + '<div class="empty-title">' + T("还没有备份任务") + '</div>'
       + T('点击右上角「新建任务」，一分钟配置第一个数据库备份') + '</div></td></tr>';
     renderTaskKpi(tasks);
@@ -1942,6 +2099,44 @@
       toast("打开编辑失败：" + (e && e.message ? e.message : String(e)), "danger");
     }
   };
+  // ---------- 任务向导整页切换（列表 ⇄ 向导，对标英方跳转体验） ----------
+  const _TASK_LIST_IDS = ["tasksTabs", "tasksTabsContent", "taskListToolbar"];
+  function openTaskWizardPage() {
+    _TASK_LIST_IDS.forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.classList.add("d-none");
+    });
+    const pg = document.getElementById("taskModal");
+    if (pg) pg.classList.remove("d-none");
+    window.scrollTo({ top: 0 });
+  }
+  window.closeTaskWizard = closeTaskWizardPage;
+  function closeTaskWizardPage() {
+    const pg = document.getElementById("taskModal");
+    if (pg) pg.classList.add("d-none");
+    _TASK_LIST_IDS.forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.classList.remove("d-none");
+    });
+  }
+
+  window.cloneTask = async (id) => {
+    const ok = await confirmDialog({
+      title: "确认克隆该任务？",
+      message: "将复制该任务的全部配置（连接/备份方式/调度/高级选项），生成一个默认停用的副本，核对配置后再启用。",
+      confirmText: "克隆",
+      danger: false,
+    });
+    if (!ok) return;
+    try {
+      const r = await api("POST", `/api/tasks/${id}/clone`);
+      toast(r.message || "已克隆", "success");
+      await loadTasks();
+    } catch (e) {
+      toast("克隆失败: " + e.message, "danger", 5000);
+    }
+  };
+
   window.delTask = async (id) => {
     const ok = await confirmDialog({
       title: "确认删除该任务？",
@@ -2051,10 +2246,31 @@
       if (dbTypeSel) fillDbTypeSelect(dbTypeSel, ["file"]);
       bindTaskFormEvents();
       bindDbPickerEvents();  // 绑定库选择器按钮
+      // 任务向导整页化：taskModal 不再是 bootstrap Modal，而是页内区块。
+      // 用同签名 dummy 对象接管 show/hide，全部既有调用点（openTaskModal/
+      // saveTask/editTask）零改动。
       const modalEl = $("taskModal");
-      if (modalEl) taskModal = new bootstrap.Modal(modalEl);
+      if (modalEl) {
+        taskModal = {
+          show: openTaskWizardPage,
+          hide: closeTaskWizardPage,
+        };
+      }
       const saveBtn = $("taskSaveBtn");
       if (saveBtn) saveBtn.onclick = saveTask;
+      const wizPrev = $("taskWizPrev");
+      if (wizPrev) wizPrev.onclick = () => taskWizGo(-1);
+      const wizNext = $("taskWizNext");
+      if (wizNext) wizNext.onclick = () => taskWizGo(1);
+      // 已完成步骤可点击回跳
+      const wizBar = document.getElementById("taskWizSteps");
+      if (wizBar && !wizBar._bound) {
+        wizBar._bound = true;
+        wizBar.addEventListener("click", (ev) => {
+          const item = ev.target.closest(".wiz-step.done");
+          if (item) taskWizShow(Number(item.dataset.step));
+        });
+      }
       const newBtn = $("newTaskBtn");
       if (newBtn) newBtn.onclick = () => openTaskModal(null);
       try { window.DB_HOSTS = await api("GET", "/api/hosts"); } catch (e) { window.DB_HOSTS = []; }
@@ -3534,6 +3750,156 @@
   let hostModal = null;
   let FILE_HOSTS = [];
 
+  // ---------- 文件任务向导（整页 4 步：基本参数→源与目标→备份选项→计划&确认） ----------
+  const _FILE_LIST_IDS = ["fileToolbar", "fileHostsCard", "fileTasksCard", "fileSyncCard"];
+  function openFileWizardPage() {
+    _FILE_LIST_IDS.forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.classList.add("d-none");
+    });
+    const pg = document.getElementById("fileTaskModal");
+    if (pg) pg.classList.remove("d-none");
+    window.scrollTo({ top: 0 });
+  }
+  window.closeFileTaskWizard = closeFileWizardPage;
+  function closeFileWizardPage() {
+    const pg = document.getElementById("fileTaskModal");
+    if (pg) pg.classList.add("d-none");
+    _FILE_LIST_IDS.forEach((id) => {
+      const el = document.getElementById(id);
+      if (el) el.classList.remove("d-none");
+    });
+  }
+
+  let fileWizCur = 1;
+  function fileWizShow(step) {
+    fileWizCur = Math.min(4, Math.max(1, step));
+    document.querySelectorAll("#fileTaskModal .fwiz-pane").forEach((pane) => {
+      pane.classList.toggle("d-none", Number(pane.dataset.step) !== fileWizCur);
+    });
+    document.querySelectorAll("#fileWizSteps .wiz-step").forEach((dot) => {
+      const s = Number(dot.dataset.step);
+      dot.classList.toggle("active", s === fileWizCur);
+      dot.classList.toggle("done", s < fileWizCur);
+    });
+    const prev = document.getElementById("fileWizPrev");
+    const next = document.getElementById("fileWizNext");
+    const save = document.getElementById("fileTaskSaveBtn");
+    if (prev) prev.style.display = fileWizCur > 1 ? "" : "none";
+    if (next) next.style.display = fileWizCur < 4 ? "" : "none";
+    if (save) save.style.display = fileWizCur === 4 ? "" : "none";
+    if (fileWizCur === 4) fileWizRenderSummary();
+  }
+  function fileWizValidate(step) {
+    const need = step === 1
+      ? [["f_biz_system", "业务系统"], ["f_name", "任务名称"]]
+      : step === 2
+        ? [["f_source_paths", "源路径"], ["f_target_path", "目标路径"]]
+        : [];
+    for (const [id, label] of need) {
+      const el = document.getElementById(id);
+      if (!el || !String(el.value || "").trim()) {
+        toast("请先填写" + label + "，再进入下一步", "danger");
+        if (el) { try { el.focus(); } catch (e) { /* ignore */ } }
+        return false;
+      }
+    }
+    return true;
+  }
+  function fileWizRenderSummary() {
+    const box = document.getElementById("fileWizSummary");
+    if (!box) return;
+    const val = (id) => { const el = document.getElementById(id); return el ? String(el.value || "").trim() : ""; };
+    const selText = (id) => { const el = document.getElementById(id); return el && el.selectedOptions[0] ? el.selectedOptions[0].textContent.trim() : ""; };
+    const chk = (id) => { const el = document.getElementById(id); return !!(el && el.checked); };
+    const rows = (k, v) => '<div class="k">' + esc(k) + '</div><div class="v">' + (v || "-") + "</div>";
+    const srcType = val("f_source_type");
+    const tgtType = val("f_target_type");
+    let html = "";
+    html += '<div class="wiz-confirm-section"><i class="bi bi-bookmark-check"></i> 基本参数</div>';
+    html += rows("业务系统", esc(val("f_biz_system")));
+    html += rows("任务名称", esc(val("f_name")));
+    html += rows("备份类型", esc(selText("f_backup_type")));
+    html += '<div class="wiz-confirm-section"><i class="bi bi-bookmark-check"></i> 源与目标</div>';
+    html += rows("源类型", esc(selText("f_source_type")));
+    if (srcType === "remote") html += rows("远程主机", esc(selText("f_remote_host")));
+    html += rows("源路径", val("f_source_paths").split("\n").map((s) => esc(s)).join(" / "));
+    html += rows("目标类型", esc(selText("f_target_type")));
+    if (tgtType === "remote") html += rows("目标远程主机", esc(selText("f_target_host")));
+    html += rows("目标路径", esc(val("f_target_path")));
+    html += rows("排除规则", val("f_exclude_patterns") ? esc(val("f_exclude_patterns").split("\n").join(", ")) : '<span class="text-muted">无</span>');
+    html += '<div class="wiz-confirm-section"><i class="bi bi-bookmark-check"></i> 备份选项</div>';
+    html += rows("镜像备份模式", chk("f_mirror_mode") ? "开启" : '<span class="text-muted">关闭</span>');
+    if (srcType === "remote") html += rows("源端传输去重", chk("f_source_dedup") ? "开启" : '<span class="text-muted">关闭</span>');
+    html += rows("保留天数", esc(val("f_retention_days") || "30") + " 天");
+    html += rows("流量控制", val("f_bandwidth_limit") === "0" || !val("f_bandwidth_limit") ? "不限速" : esc(val("f_bandwidth_limit")) + " KB/s");
+    html += rows("压缩级别", val("f_compress_level") === "0" || !val("f_compress_level") ? "跟随引擎默认" : esc(val("f_compress_level")));
+    html += rows("存储池加密", chk("f_encrypt_pool") ? "开启（AES-256-GCM）" : '<span class="text-muted">关闭</span>');
+    html += rows("启用状态", chk("f_enabled") ? "启用" : "停用");
+    html += '<div class="wiz-confirm-section"><i class="bi bi-bookmark-check"></i> 备份计划</div>';
+    const daysSel = (boxId, timeId) => {
+      const names = ["一", "二", "三", "四", "五", "六", "日"];
+      const boxEl = document.getElementById(boxId);
+      const picked = [];
+      if (boxEl) Array.from(boxEl.querySelectorAll("input[type=checkbox]")).forEach((c) => {
+        if (c.checked) picked.push(names[Number(c.value)] || "");
+      });
+      return picked.length ? "每周 " + picked.filter(Boolean).join("、") + " " + (val(timeId) || "") + "（不勾选 = 不自动调度）" : "不自动调度（仅手动触发）";
+    };
+    const bt = val("f_backup_type");
+    if (bt === "mixed") {
+      html += rows("全量调度", daysSel("f_full_days", "f_full_time"));
+      html += rows("增量调度", daysSel("f_incremental_days", "f_incremental_time"));
+    } else if (bt === "incremental") {
+      html += rows("调度方式", daysSel("f_incremental_days", "f_incremental_time"));
+    } else {
+      html += rows("调度方式", daysSel("f_full_days", "f_full_time"));
+    }
+    box.innerHTML = html;
+  }
+  function bindFileWizard() {
+    const prev = document.getElementById("fileWizPrev");
+    if (prev) prev.onclick = () => fileWizShow(fileWizCur - 1);
+    const next = document.getElementById("fileWizNext");
+    if (next) next.onclick = () => {
+      if (!fileWizValidate(fileWizCur)) return;
+      fileWizShow(fileWizCur + 1);
+    };
+    const bar = document.getElementById("fileWizSteps");
+    if (bar && !bar._bound) {
+      bar._bound = true;
+      bar.addEventListener("click", (ev) => {
+        const item = ev.target.closest(".wiz-step.done");
+        if (item) fileWizShow(Number(item.dataset.step));
+      });
+    }
+  }
+
+  // 一键发现 NAS（群晖 DSM/通用 Linux）共享目录并填入源路径
+  window.discoverShares = async function () {
+    const btn = document.getElementById("f_discover_shares_btn");
+    const hostSel = $("f_remote_host");
+    if (!hostSel || !String(hostSel.value || "").trim()) {
+      toast("请先把「源类型」切换为远程主机 并选择 NAS 主机", "warning", 5000);
+      return;
+    }
+    if (btn) { btn.disabled = true; btn.innerHTML = '<i class="bi bi-hourglass-split"></i> 枚举中…'; }
+    try {
+      const r = await api("POST", "/api/hosts/" + hostSel.value + "/list-shares");
+      const shares = r.shares || [];
+      if (!shares.length) {
+        toast("未发现共享目录（该主机 /volume* 下没有业务目录）", "warning", 5000);
+        return;
+      }
+      $("f_source_paths").value = shares.join("\n");
+      toast("发现 " + shares.length + " 个共享目录，已填入源路径（可删减）", "success", 6000);
+    } catch (e) {
+      toast("枚举失败: " + e.message, "danger", 6000);
+    } finally {
+      if (btn) { btn.disabled = false; btn.innerHTML = '<i class="bi bi-search"></i> 发现 NAS 共享目录'; }
+    }
+  };
+
   function bindFileTaskFormEvents() {
     $("f_source_type").onchange = () => {
       document.querySelectorAll(".f-remote-only").forEach((el) =>
@@ -3648,13 +4014,14 @@
     $("f_source_type").dispatchEvent(new Event("change"));
     $("f_target_type").dispatchEvent(new Event("change"));
     $("f_backup_type").dispatchEvent(new Event("change"));
-    // 防御：确保文件备份模态框实例存在（自愈，避免 fileTaskModal 为 null 时抛错）
+    fileWizShow(1); // 向导复位第一步（每次打开从基本参数开始）
+    // 防御：确保向导入口可用（自愈，避免 fileTaskModal 为 null 时抛错）
     if (!fileTaskModal) {
-      const el = document.getElementById("fileTaskModal");
-      if (el && window.bootstrap && bootstrap.Modal) fileTaskModal = new bootstrap.Modal(el);
+      fileTaskModal = { show: openFileWizardPage, hide: closeFileWizardPage };
+      bindFileWizard();
     }
     if (fileTaskModal) fileTaskModal.show();
-    else console.error("[openFileTaskModal] fileTaskModal 实例缺失，无法弹出编辑框");
+    else console.error("[openFileTaskModal] fileTaskModal 实例缺失，无法打开向导");
   }
 
   function cleanFilePath(path) {
@@ -4129,7 +4496,10 @@
 
   async function initFileBackup() {
     const ftmEl = document.getElementById("fileTaskModal");
-    if (ftmEl) fileTaskModal = new bootstrap.Modal(ftmEl);
+    if (ftmEl) {
+      fileTaskModal = { show: openFileWizardPage, hide: closeFileWizardPage };
+      bindFileWizard();
+    }
     const hmEl = document.getElementById("hostModal");
     if (hmEl) hostModal = new bootstrap.Modal(hmEl);
     bindFileTaskFormEvents();
@@ -5201,6 +5571,11 @@
     }
     const recover = document.getElementById("rtRecoverBtn");
     if (recover && !hasTask) recover.disabled = true;
+    const delBtn = document.getElementById("rtDeleteBtn");
+    if (delBtn) {
+      delBtn.disabled = !hasTask;
+      delBtn.title = hasTask ? "删除当前选中的实时保护任务（连同其备份记录，不可恢复）" : "请先选择一个实时保护任务";
+    }
   }
 
   // ---------- 任务列表 ----------
@@ -5698,6 +6073,28 @@
       } catch (e) { toast("触发失败：" + e.message, "danger"); }
       await rtLoadTimeline();
       await rtLoadHealth();
+    });
+    $("rtDeleteBtn").addEventListener("click", async () => {
+      const tid = Number(RT.taskId);
+      if (!tid) { toast("请先选择任务", "danger"); return; }
+      const picked = (RT.tasks || []).filter(function (t) { return Number(t.id) === tid; })[0] || {};
+      const ok = await confirmDialog({
+        title: "确认删除该实时保护任务？",
+        message: "任务「" + esc(picked.name || ("#" + tid)) + "」将被删除，连同其全部备份记录与实时恢复点，此操作不可恢复。",
+        confirmText: "删除",
+        danger: true,
+      });
+      if (!ok) return;
+      try {
+        await verifyGate((code) =>
+          api("DELETE", "/api/tasks/" + tid, code ? { verify_code: code } : undefined));
+        toast("任务已删除");
+        RT.taskId = 0; RT.cursorTs = ""; RT.plan = null;
+        await rtLoadDaemon();
+        await rtLoadTasks();
+        await rtLoadHealth();
+        await rtLoadTimeline();
+      } catch (e) { toast("删除失败：" + e.message, "danger", 5000); }
     });
     $("rtRecoverBtn").addEventListener("click", () => rtOpenRecoverModal());
     $("rtTxnBtn").addEventListener("click", () => rtOpenTxnModal());

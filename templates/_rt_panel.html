@@ -194,7 +194,7 @@
         <option value="">— 加载中 —</option>
       </select>
     </div>
-    <div class="col-md-3">
+    <div class="col-md-2">
       <label class="form-label">时间范围</label>
       <select class="form-select" id="rtRangeSelect">
         <option value="3600">最近 1 小时</option>
@@ -205,7 +205,7 @@
         <option value="0">全部可恢复窗口</option>
       </select>
     </div>
-    <div class="col-md-3">
+    <div class="col-md-2">
       <label class="form-label">分桶精度</label>
       <select class="form-select" id="rtBucketSelect">
         <option value="60">60 格（粗）</option>
@@ -215,6 +215,9 @@
     </div>
     <div class="col-md-2">
       <button class="btn btn-outline-secondary w-100" id="rtTriggerBtn" type="button" title="对当前任务立即捕获一次"><i class="bi bi-lightning-charge"></i> 立即捕获</button>
+    </div>
+    <div class="col-md-2">
+      <button class="btn btn-outline-danger w-100" id="rtDeleteBtn" type="button" title="删除当前选中的实时保护任务（连同其备份记录，不可恢复）"><i class="bi bi-trash"></i> 删除</button>
     </div>
   </div>
 

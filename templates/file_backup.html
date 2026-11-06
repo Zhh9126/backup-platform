@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block content %}
 <!-- ============ 主机纳管 ============ -->
-<div class="toolbar">
+<div class="toolbar" id="fileToolbar">
   <div>
     <div class="page-title">文件备份</div>
     <div class="page-sub">无需安装 Agent，基于 SSH 直连实现文件 / 目录的实时备份与恢复</div>
@@ -12,7 +12,7 @@
   <button class="btn btn-outline-success btn-sm" onclick="importFileTasksCsv()" title="批量导入CSV"><i class="bi bi-upload"></i> 导入</button>
 </div>
 
-<div class="page-card">
+<div class="page-card" id="fileHostsCard">
   <div class="card-section-title"><i class="bi bi-server"></i> 已纳管主机</div>
   <div class="table-responsive" style="flex:1">
     <table class="table table-hover align-middle mb-0">
@@ -26,7 +26,7 @@
 </div>
 
 <!-- ============ 文件备份任务 ============ -->
-<div class="page-card mt-4">
+<div class="page-card mt-4" id="fileTasksCard">
   <div class="card-section-title d-flex justify-content-between align-items-center">
     <span><i class="bi bi-folder2-open"></i> 文件备份任务</span>
     <button class="btn btn-sm btn-primary" id="newFileTaskBtn"><i class="bi bi-plus-lg"></i> 新建任务</button>
@@ -43,7 +43,7 @@
 </div>
 
 <!-- ============ P1-4：文件推送式实时同步（零 Agent） ============ -->
-<div class="page-card mt-4">
+<div class="page-card mt-4" id="fileSyncCard">
   <div class="card-section-title d-flex justify-content-between align-items-center">
     <span><i class="bi bi-broadcast-pin"></i> 文件实时同步（指纹轮询 · 零 Agent）
       <span class="text-muted small ms-2">源端零安装：平台周期只读指纹扫描，仅拉取变更文件，版本化保留</span></span>
@@ -62,17 +62,30 @@
   </div>
 </div>
 
-<!-- ============ 文件备份任务 模态框 ============ -->
-<div class="modal fade" id="fileTaskModal" tabindex="-1">
-  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+<!-- ============ 文件备份任务 整页向导（对标英方；点新建=整页展开） ============ -->
+<div class="task-page d-none" id="fileTaskModal">
+  <div class="task-page-inner">
     <div class="modal-content">
       <div class="modal-header">
         <h5 class="modal-title" id="fileTaskModalTitle">新建文件备份任务</h5>
-        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        <button type="button" class="btn-close" onclick="closeFileTaskWizard()" title="关闭并返回列表"></button>
       </div>
       <div class="modal-body">
         <form id="fileTaskForm">
           <input type="hidden" id="f_id">
+          <!-- 向导步骤条 -->
+          <div class="wiz-steps mb-3" id="fileWizSteps">
+            <div class="wiz-step active" data-step="1"><span class="wiz-dot">1</span><span class="wiz-label">基本参数</span></div>
+            <div class="wiz-arrow"></div>
+            <div class="wiz-step" data-step="2"><span class="wiz-dot">2</span><span class="wiz-label">源与目标</span></div>
+            <div class="wiz-arrow"></div>
+            <div class="wiz-step" data-step="3"><span class="wiz-dot">3</span><span class="wiz-label">备份选项</span></div>
+            <div class="wiz-arrow"></div>
+            <div class="wiz-step" data-step="4"><span class="wiz-dot"><i class="bi bi-check-lg"></i></span><span class="wiz-label">备份计划&确认</span></div>
+          </div>
+
+          <!-- 步骤 1：基本参数 -->
+          <div class="fwiz-pane" data-step="1">
           <div class="row g-3">
             <div class="col-md-6">
               <label class="form-label">业务系统 *</label>
@@ -91,7 +104,12 @@
                 <option value="mixed">组合（全量+增量）</option>
               </select>
             </div>
+          </div>
+          </div>
 
+          <!-- 步骤 2：源与目标 -->
+          <div class="fwiz-pane d-none" data-step="2">
+          <div class="row g-3">
             <div class="col-md-6">
               <label class="form-label">源类型</label>
               <select class="form-select" id="f_source_type">
@@ -104,8 +122,15 @@
               <select class="form-select" id="f_remote_host"></select>
             </div>
             <div class="col-12">
-              <label class="form-label">源路径（每行一个）</label>
-              <textarea class="form-control" id="f_source_paths" rows="2" placeholder="/data/app&#10;/etc/nginx/conf.d"></textarea>
+              <div class="d-flex align-items-center justify-content-between">
+                <label class="form-label mb-1">源路径（每行一个）</label>
+                <button class="btn btn-outline-primary btn-sm" type="button" id="f_discover_shares_btn"
+                        onclick="discoverShares()" title="SSH 只读枚举 NAS 全部共享目录（自动过滤 @ 系统目录），一键填入源路径——用于备份 NAS 全部数据">
+                  <i class="bi bi-search"></i> 发现 NAS 共享目录
+                </button>
+              </div>
+              <textarea class="form-control" id="f_source_paths" rows="4" placeholder="/data/app&#10;/etc/nginx/conf.d&#10;（群晖：点上方按钮自动枚举 /volume1/video、/volume1/photo 等）"></textarea>
+              <div class="form-text">备份 NAS 全部数据：源类型选「远程主机」，选好群晖主机后点「发现 NAS 共享目录」自动填入全部共享文件夹。</div>
             </div>
 
             <div class="col-md-6">
@@ -127,6 +152,12 @@
               <label class="form-label">排除规则（每行一个，支持通配符）</label>
               <textarea class="form-control" id="f_exclude_patterns" rows="2" placeholder="*.tmp&#10;*.log&#10;__pycache__"></textarea>
             </div>
+          </div>
+          </div>
+
+          <!-- 步骤 3：备份选项 -->
+          <div class="fwiz-pane d-none" data-step="3">
+          <div class="row g-3">
             <div class="col-12">
               <div class="form-check">
                 <input class="form-check-input" type="checkbox" id="f_mirror_mode">
@@ -148,9 +179,49 @@
               <label class="form-label">保留天数</label>
               <input class="form-control" id="f_retention_days" type="number" value="30">
             </div>
+            <div class="col-md-4">
+              <label class="form-label">流量控制（限速）</label>
+              <div class="input-group input-group-sm">
+                <input type="number" class="form-control" id="f_bandwidth_limit" min="0" value="0">
+                <span class="input-group-text">KB/s</span>
+              </div>
+              <div class="form-text">0 = 不限速；Linux 部署机需安装 pv 才能生效</div>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">压缩级别</label>
+              <div class="input-group input-group-sm">
+                <input type="number" class="form-control" id="f_compress_level" min="0" max="22" value="0">
+                <span class="input-group-text">0=默认</span>
+              </div>
+              <div class="form-text">0 跟随引擎默认（zstd 10）；1~22 自定义压缩级别</div>
+            </div>
+
+            <div class="col-12">
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="checkbox" id="f_enabled" checked>
+                <label class="form-check-label">启用</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="checkbox" id="f_demo_only">
+                <label class="form-check-label">演示模式（生成仿真占位备份）</label>
+              </div>
+              <div class="form-check form-check-inline">
+                <input class="form-check-input" type="checkbox" id="f_encrypt_pool">
+                <label class="form-check-label">存储池加密（AES-256-GCM）</label>
+              </div>
+              <div class="form-text">需在服务端设置环境变量 BACKUP_POOL_KEY；否则备份时自动跳过加密</div>
+            </div>
+          </div>
+          </div>
+
+          <!-- 步骤 4：备份计划 & 确认 -->
+          <div class="fwiz-pane d-none" data-step="4">
+            <div class="alert alert-light py-2 small text-muted mb-3">
+              <i class="bi bi-info-circle"></i> 设置调度计划并核对配置摘要，确认无误后点击「保存」。
+            </div>
 
             <!-- 按天选择调度区 -->
-            <div class="col-12 d-none" id="f_mixed_schedule_box">
+            <div class="d-none" id="f_mixed_schedule_box">
               <div class="alert alert-light py-2 mb-2 small text-muted" id="f_schedule_tip">
                 组合备份：分别设置「全量」与「增量」的运行星期与时间。不勾选任何星期 = 该子任务不自动调度（可手动触发）。
               </div>
@@ -190,44 +261,15 @@
               </div>
             </div>
 
-            <div class="col-12">
-              <div class="form-check form-check-inline">
-                <input class="form-check-input" type="checkbox" id="f_enabled" checked>
-                <label class="form-check-label">启用</label>
-              </div>
-              <div class="form-check form-check-inline">
-                <input class="form-check-input" type="checkbox" id="f_demo_only">
-                <label class="form-check-label">演示模式（生成仿真占位备份）</label>
-              </div>
-              <div class="form-check form-check-inline">
-                <input class="form-check-input" type="checkbox" id="f_encrypt_pool">
-                <label class="form-check-label">存储池加密（AES-256-GCM）</label>
-              </div>
-              <div class="form-text">需在服务端设置环境变量 BACKUP_POOL_KEY；否则备份时自动跳过加密</div>
-            </div>
-
-            <div class="col-md-4">
-              <label class="form-label">流量控制（限速）</label>
-              <div class="input-group input-group-sm">
-                <input type="number" class="form-control" id="f_bandwidth_limit" min="0" value="0">
-                <span class="input-group-text">KB/s</span>
-              </div>
-              <div class="form-text">0 = 不限速；Linux 部署机需安装 pv 才能生效</div>
-            </div>
-            <div class="col-md-4">
-              <label class="form-label">压缩级别</label>
-              <div class="input-group input-group-sm">
-                <input type="number" class="form-control" id="f_compress_level" min="0" max="22" value="0">
-                <span class="input-group-text">0=默认</span>
-              </div>
-              <div class="form-text">0 跟随引擎默认（zstd 10）；1~22 自定义压缩级别</div>
-            </div>
+            <div class="wiz-confirm-grid" id="fileWizSummary"></div>
           </div>
         </form>
       </div>
       <div class="modal-footer">
-        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-        <button class="btn btn-primary" id="fileTaskSaveBtn">保存</button>
+        <button class="btn btn-secondary" onclick="closeFileTaskWizard()">取消</button>
+        <button class="btn btn-outline-secondary" id="fileWizPrev" type="button" style="display:none"><i class="bi bi-arrow-left"></i> 上一步</button>
+        <button class="btn btn-primary" id="fileWizNext" type="button">下一步 <i class="bi bi-arrow-right"></i></button>
+        <button class="btn btn-success" id="fileTaskSaveBtn" style="display:none"><i class="bi bi-check-lg"></i> 保存</button>
       </div>
     </div>
   </div>

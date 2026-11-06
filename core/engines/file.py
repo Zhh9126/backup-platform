@@ -1141,7 +1141,7 @@ class FileBackupEngine(BackupEngine):
         return {
             "type": self.extra.get("target_type", "local"),
             "path": self._clean_path(self.extra.get("target_path", "")),
-            "host": self.extra.get("target_host", ""),
+            "host": self._resolve_host_ref(self.extra.get("target_host", "")),
         }
 
     def _parse_source(self) -> dict:
@@ -1149,8 +1149,27 @@ class FileBackupEngine(BackupEngine):
         return {
             "type": self.extra.get("source_type", "local"),
             "paths": self._source_paths(),
-            "host": self.extra.get("source_host", ""),
+            "host": self._resolve_host_ref(self.extra.get("source_host", "")),
         }
+
+    @staticmethod
+    def _resolve_host_ref(ref) -> str:
+        """主机引用归一：前端下拉传纳管主机 id（纯数字）→ 查库拼成
+        "user@hostname:port" host_key（_get_ssh_client 按 host_key 自动查密码）。
+        已是 host_key 字符串 / 主机名 / 空值原样返回，行为不变。"""
+        s = str(ref or "").strip()
+        if not s or "@" in s:
+            return s
+        if s.isdigit():
+            try:
+                from core import ssh_hosts
+                h = ssh_hosts.get_host(int(s), include_secret=True)
+                if h:
+                    return "%s@%s:%s" % (h.get("username"), h.get("hostname"),
+                                         h.get("port") or 22)
+            except Exception:
+                pass
+        return s
 
     def _resolve_src_pairs(self, src: dict) -> List[Tuple[str, str]]:
         """探测源路径类型（带缓存），返回 [(路径, 'dir'|'file')]。

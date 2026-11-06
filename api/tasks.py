@@ -5,7 +5,7 @@ import io
 import os
 from flask import request, jsonify, make_response
 
-from auth import login_required
+from auth import login_required, verify_code_gate
 from core import models, scheduler, db
 from core.engines import supported_types, get_engine
 from . import api_bp, contract

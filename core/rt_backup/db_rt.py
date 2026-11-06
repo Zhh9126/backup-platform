@@ -328,6 +328,13 @@ class DbRtCapture:
             self.last_error = str(exc)
             return {"ok": False, "task_id": self.task_id, "message": str(exc)}
         points = self._register_segments(segments)
+        if points:
+            # 手动/排程触发封存成功 → 复位停滞计数与降级提示（否则健康灯
+            # 在下一个 tick 前仍显示"连续 N 个周期无新段"，与刚产生的
+            # 恢复点自相矛盾；170 task=32 实测命中）
+            self.stall_ticks = 0
+            self.degrade_reason = ""
+            self.daemon_status = STATUS_RUNNING
         return {
             "ok": True, "task_id": self.task_id, "mode": "sync",
             "recovery_points": [p.to_dict() for p in points],

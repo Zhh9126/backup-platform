@@ -181,6 +181,29 @@ class MySQLBinlogDaemon(CDCDaemon):
             start_file = str(src.get("binlog_file") or "")
             if src.get("binlog_pos"):
                 self.position["binlog_pos"] = int(src["binlog_pos"])
+        else:
+            # 位点越界兜底（170 task=32 实测）：续传文件不在源库现有 binlog
+            # 列表中（封存后尚未轮转出新文件，或文件已被 purge）时，
+            # mysqlbinlog --stop-never 会立即报 1236
+            # （Could not find first log file name in binary log index file）
+            # 退出，健康灯转 red、要等下一次轮转+重试才自愈。这里直接与源库
+            # SHOW BINARY LOGS 比对，越界即回退当前位点并如实记录缺口。
+            src_now = self.source_position()
+            cur_file = str(src_now.get("binlog_file") or "")
+            if cur_file and cur_file != start_file:
+                _cmp = self._binlog_file_cmp(start_file, cur_file)
+                if _cmp != 0:
+                    gap_note = ("续传位点 %s 已被源库越过/清理" % start_file
+                                if _cmp < 0 else
+                                "续传位点 %s 尚未在源库产生（等待轮转期间重启）" % start_file)
+                    self.position["binlog_file"] = cur_file
+                    self.position["binlog_pos"] = int(src_now.get("binlog_pos") or 4)
+                    start_file = cur_file
+                    self.logger.warning(
+                        "[rt.cdc] task=%s %s，回退源库当前位点 %s:%s 继续（中间缺口以"
+                        "既有已封存段为准，不虚构数据）",
+                        self.task_id, gap_note, cur_file,
+                        self.position.get("binlog_pos"))
         if not start_file:
             # 拿不到起始文件名就无法拉流，交由工厂/Supervisor 降级
             self.last_error = "无法获取源库当前 binlog 文件名（SHOW MASTER STATUS 失败）"
@@ -216,6 +239,20 @@ class MySQLBinlogDaemon(CDCDaemon):
         db.add_log("info", "rt.cdc",
                    f"任务 {self.task_name} 启动 binlog 流式捕获（起始 {start_file}）")
         return True
+
+    @staticmethod
+    def _binlog_file_cmp(a: str, b: str) -> int:
+        """按数字后缀比较两个 binlog 文件名；无法解析时按字符串比较。"""
+        import re as _re
+
+        def _num(name):
+            m = _re.search(r"(\d+)$", str(name or ""))
+            return int(m.group(1)) if m else None
+
+        na, nb = _num(a), _num(b)
+        if na is not None and nb is not None:
+            return (na > nb) - (na < nb)
+        return (str(a) > str(b)) - (str(a) < str(b))
 
     def _auth_env(self) -> dict:
         """密码走 MYSQL_PWD，不进命令行。"""

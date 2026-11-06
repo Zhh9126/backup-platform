@@ -46,6 +46,7 @@ import re
 from typing import Any, List, Tuple
 
 from .polling_base import PollingLogMinerDaemon
+import time
 
 # 模块级驱动缓存（共享知识 #7：惰性 import，避免每次 tick 重复导入）
 _ORACLE_DRIVER: Any = None
@@ -264,6 +265,28 @@ class OracleLogMinerDaemon(PollingLogMinerDaemon):
     def _dsn(self) -> str:
         """Easy Connect 串：``host:port/service``。"""
         return f"{self.host}:{self.port or self.DEFAULT_PORT}/{self.service_name}"
+
+    def force_seal(self) -> list:
+        """促成归档切换并封存就绪段（db_rt.trigger_now 调用）。
+
+        LogMiner 只消费归档日志；对源库执行 SWITCH LOGFILE + ARCHIVE LOG
+        CURRENT 促成当前联机日志归档，随后立即封存就绪段。
+        """
+        try:
+            conn = self._connect()
+            cur = conn.cursor()
+            for sql in ("ALTER SYSTEM SWITCH LOGFILE",
+                        "ALTER SYSTEM ARCHIVE LOG CURRENT"):
+                try:
+                    cur.execute(sql)
+                except Exception:
+                    pass
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+        time.sleep(3)
+        return self.seal_ready_segments(force=True)
 
     def _connect(self):
         """建立 Oracle 连接。

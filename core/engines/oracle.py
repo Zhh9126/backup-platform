@@ -504,17 +504,28 @@ class OracleEngine(BackupEngine):
                                     message="远端未找到 impdp，无法执行 SQLFILE 校验")
             mode_args = self._dp_mode_args(for_import=True)[0]
             verify_conn = f"{username}/{self._quote_password(pw)}@//{self._db_host_for_remote(ssh_host)}:{port}/{service}"
-            inner = (f"export PATH=$ORACLE_HOME/bin:$PATH; "
-                     f"{shlex.quote(impdp_bin)} {shlex.quote(verify_conn)} "
-                     f"DUMPFILE=platform_verify_{ts}.dmp SQLFILE={sqlfile} "
-                     # DIRECTORY 为必填：缺省时报 ORA-39145（目录对象不能为空）
-                     f"DIRECTORY=DATA_PUMP_DIR NOLOGFILE=Y {mode_args} </dev/null")
-            shell = (f"su - {self._resolve_check_user(ssh_host)} -c "
-                     f"{shlex.quote(inner)}")
+            def _sqlfile_shell(conn_str):
+                _inner = (f"export PATH=$ORACLE_HOME/bin:$PATH; "
+                          f"{shlex.quote(impdp_bin)} {shlex.quote(conn_str)} "
+                          f"DUMPFILE=platform_verify_{ts}.dmp SQLFILE={sqlfile} "
+                          # DIRECTORY 为必填：缺省时报 ORA-39145（目录对象不能为空）
+                          f"DIRECTORY=DATA_PUMP_DIR NOLOGFILE=Y {mode_args} </dev/null")
+                return (f"su - {self._resolve_check_user(ssh_host)} -c "
+                        f"{shlex.quote(_inner)}")
+
             start = _time.time()
             out, err, rc = _ssh_exec_pipe(
-                client, remote_dump._wrap_login(shell),
+                client, remote_dump._wrap_login(_sqlfile_shell(verify_conn)),
                 timeout=config.BACKUP_TIMEOUT if hasattr(config, "BACKUP_TIMEOUT") else 3600)
+            _fb_note = ""
+            if rc != 0:
+                _probe = ((out.decode("utf-8", "replace") if isinstance(out, bytes)
+                           else (out or "")) + (err or ""))
+                if any(p in _probe for p in ("01017", "12154", "12514", "12541", "12170")):
+                    out, err, rc = _ssh_exec_pipe(
+                        client, remote_dump._wrap_login(_sqlfile_shell("'/ as sysdba'")),
+                        timeout=config.BACKUP_TIMEOUT if hasattr(config, "BACKUP_TIMEOUT") else 3600)
+                    _fb_note = "（主连接认证失败，已以 / as sysdba 兜底校验）"
             duration = round(_time.time() - start, 3)
             out_text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
 
@@ -546,7 +557,7 @@ class OracleEngine(BackupEngine):
 
             n_stmt = sql_head.upper().count("CREATE")
             msg = (f"Oracle 逻辑备份恢复校验通过：impdp SQLFILE 成功从 dmp 解析出 "
-                   f"DDL（预览含 {n_stmt} 处 CREATE 语句），dmp 可正常导入")
+                   f"DDL（预览含 {n_stmt} 处 CREATE 语句），dmp 可正常导入{_fb_note}")
             self.logger.info("[%s] %s", self.task_name, msg)
             return BackupResult(success=True, status=BackupStatus.SUCCESS,
                                 duration_sec=duration, stdout=out_text,
@@ -1742,13 +1753,16 @@ class OracleEngine(BackupEngine):
                 mode_args = self._dp_mode_args(
                     self._restore_extra_with_tables(extra, kwargs),
                     for_import=True)[0]
-                inner = (f"export PATH=$ORACLE_HOME/bin:$PATH; "
-                         f"{shlex.quote(impdp_bin)} {shlex.quote(restore_conn)} "
-                         f"DUMPFILE={dmp_name} LOGFILE={log_name} </dev/null "
-                         f"DIRECTORY=DATA_PUMP_DIR "
-                         f"TABLE_EXISTS_ACTION=REPLACE {mode_args}")
-                shell = (f"su - {self._resolve_check_user(target_host_info)} -c "
-                         f"{shlex.quote(inner)}")
+                def _impdp_shell(conn_str):
+                    _inner = (f"export PATH=$ORACLE_HOME/bin:$PATH; "
+                              f"{shlex.quote(impdp_bin)} {shlex.quote(conn_str)} "
+                              f"DUMPFILE={dmp_name} LOGFILE={log_name} </dev/null "
+                              f"DIRECTORY=DATA_PUMP_DIR "
+                              f"TABLE_EXISTS_ACTION=REPLACE {mode_args}")
+                    return (f"su - {self._resolve_check_user(target_host_info)} -c "
+                            f"{shlex.quote(_inner)}")
+
+                shell = _impdp_shell(restore_conn)
                 start = time.time()
                 out, err, rc = _ssh_exec_pipe(
                     client, remote_dump._wrap_login(shell),
@@ -1770,6 +1784,23 @@ class OracleEngine(BackupEngine):
                     out, err, rc = _ssh_exec_pipe(
                         client, remote_dump._wrap_login(shell),
                         timeout=config.BACKUP_TIMEOUT if hasattr(config, "BACKUP_TIMEOUT") else 3600)
+                # sysdba 兜底（171 19c 实测）：口令含 @ 等特殊字符时，
+                # Data Pump 连接串无法通过认证/解析（ORA-01017/12154/12514），
+                # expdp 路径已有 / as sysdba 兜底；impdp 同样兜底一次。
+                _fb_note = ""
+                if rc != 0:
+                    _probe = ((out.decode("utf-8", "replace") if isinstance(out, bytes)
+                               else (out or "")) + (err or ""))
+                    if any(p in _probe for p in ("01017", "12154", "12514", "12541", "12170")):
+                        self.logger.warning(
+                            "[%s] impdp 主连接认证/解析失败，尝试 / as sysdba 兜底导入",
+                            self.task_name)
+                        # Data Pump 位置参数要求字面单引号包裹（expdp 同款写法），
+                        # 直传 "/ as sysdba" 报 LRM-00108（171 19c 实测）
+                        out, err, rc = _ssh_exec_pipe(
+                            client, remote_dump._wrap_login(_impdp_shell("'/ as sysdba'")),
+                            timeout=config.BACKUP_TIMEOUT if hasattr(config, "BACKUP_TIMEOUT") else 3600)
+                        _fb_note = "（主连接认证失败，已以 / as sysdba 兜底导入）"
                 duration = round(time.time() - start, 3)
 
                 def _dec_impdp_bytes(b):
@@ -1859,7 +1890,7 @@ class OracleEngine(BackupEngine):
                 msg = (f"Oracle 逻辑恢复(impdp)成功：dmp 已推回数据库服务器 "
                        f"{target_host_info.get('host_key', '')} 并导入 "
                        f"{service}（TABLE_EXISTS_ACTION=REPLACE，"
-                       f"耗时 {duration}s）{note}")
+                       f"耗时 {duration}s）{note}{_fb_note}")
                 if log_tail:
                     msg += "；导入日志尾部已记录于 stdout"
                 self.logger.info("[%s] %s", self.task_name, msg)

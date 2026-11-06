@@ -39,6 +39,7 @@ _MAX_POINT_LIMIT = 2000
 # 前者是"用户填的配置"，后者是"守护进程读取的运行参数"，两边必须同步，
 # 否则会出现"页面已保存但实时保护不生效"的问题（UX-20260801 模块 B）。
 _RT_CONFIG_TO_TASK_COLUMN = {
+    "rt_enabled": "enabled",
     "rt_mode": "rt_mode",
     "rt_interval_sec": "capture_interval",
     "rt_log_retention_days": "db_log_retention_days",

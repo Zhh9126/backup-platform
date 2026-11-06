@@ -437,7 +437,17 @@ function ReportModal({ report, onClose, onRepaired }) {
         <div class="modal-content">
           <div class="modal-header">
             <h5 class="modal-title">对比报告明细</h5>
-            <button type="button" class="btn-close" data-bs-dismiss="modal" onClick=${() => hideThen(ref, onClose)}></button>
+            <div class="ms-auto d-flex gap-1">
+              <a class="btn btn-sm btn-outline-success" title="导出 Excel（概要/表级/差异三工作表）"
+                 href={"/api/data-compare-reports/" + report.id + "/export?format=xlsx"}>
+                <i class="bi bi-file-earmark-excel me-1"></i>导出 Excel
+              </a>
+              <a class="btn btn-sm btn-outline-secondary" title="导出 CSV（差异优先）"
+                 href={"/api/data-compare-reports/" + report.id + "/export?format=csv"}>
+                <i class="bi bi-filetype-csv me-1"></i>导出 CSV
+              </a>
+              <button type="button" class="btn-close align-self-center" data-bs-dismiss="modal" onClick=${() => hideThen(ref, onClose)}></button>
+            </div>
           </div>
           <div class="modal-body">
             <div class="mb-2">

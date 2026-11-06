@@ -1079,6 +1079,29 @@ def _tar_fail_msg(stage: str, rc: int, err, cmd: str, extra: str = "") -> str:
     return "%s | 实际命令: %s" % (msg, cmd)
 
 
+def _probe_remote_paths_windows(client, paths):
+    """Windows 远端源路径探测：cmd `if exist` 判定目录/文件/不存在。
+
+    探测是真实执行的（与 Linux 通道同一语义）：路径不存在直接报 missing，
+    宁可失败得明明白白，也不打出一个空包冒充成功。
+    """
+    kinds = {}
+    for p in paths:
+        q = str(p).replace('"', "")
+        out, _err, rc = _ssh_exec(
+            client,
+            'if exist "%s\\*" (echo DIR) else (if exist "%s" (echo FILE) '
+            'else (echo MISSING))' % (q, q), timeout=30)
+        text = (out or "").strip().upper()
+        if text.endswith("DIR"):
+            kinds[str(p)] = "dir"
+        elif text.endswith("FILE"):
+            kinds[str(p)] = "file"
+        else:
+            kinds[str(p)] = "missing"
+    return kinds
+
+
 def _build_tar_cmd(pairs, excludes=None) -> str:
     """按路径类型生成远程打包命令（GNU/BSD tar 通用）。
 
@@ -1187,6 +1210,8 @@ class FileBackupEngine(BackupEngine):
         where = "备份平台本机" if src_type == "local" else ("主机 %s" % src.get("host"))
         if src_type == "local":
             kinds = _probe_local_paths(paths)
+        elif self._ssh_host_is_windows(src.get("host") or ""):
+            kinds = _probe_remote_paths_windows(_get_ssh_client(src["host"]), paths)
         else:
             kinds = _probe_remote_paths(_get_ssh_client(src["host"]), paths)
 
@@ -1477,7 +1502,9 @@ class FileBackupEngine(BackupEngine):
         algo = self._resolve_compress_algo()
         checksum = db.sha256_file(final) if size > 0 else ""
         # 保存快照作为下次增量基准，并记录本次全量归档路径供恢复链使用
-        self._save_snapshot(sf, full_path=final)
+        # （Windows 通道 v1 无指纹清单：不保存空快照，防止增量误判"全部删除"）
+        if sf or not self._ssh_host_is_windows(src.get("host") or ""):
+            self._save_snapshot(sf, full_path=final)
 
         message = f"全量备份完成 | {len(paths)} 个源 | {db.human_size(size)}"
         ds_stats = getattr(self, "_dedup_stats", None)
@@ -2247,6 +2274,9 @@ class FileBackupEngine(BackupEngine):
         任务开启 extra.source_dedup 时优先走**源端传输去重**通道（远端分块
         指纹，仅新块走网络）；任何失败安全回退本流式通道（正确性不受影响）。
         """
+        if self._ssh_host_is_windows(src.get("host") or ""):
+            self._tar_windows_to_local(src, archive_path)
+            return
         if self.extra.get("source_dedup"):
             try:
                 self._tar_remote_to_local_dedup(src, archive_path)
@@ -2283,6 +2313,71 @@ class FileBackupEngine(BackupEngine):
                 "远程打包", r.get("rc") or -1, r.get("err"), cmd,
                 extra="源主机: %s" % src["host"]))
         self.logger.info("[%s] [3/3] 归档落盘完成: %s", self.task_name, archive_path)
+
+    def _ssh_host_is_windows(self, host_key: str) -> bool:
+        """SSH 主机是否 Windows（ssh_hosts.os_type=windows）。"""
+        try:
+            row = db.query_one(
+                "SELECT os_type FROM ssh_hosts WHERE host_key=? LIMIT 1", (host_key,))
+            return bool(row) and str(row["os_type"] or "").lower() == "windows"
+        except Exception:
+            return False
+
+    def _tar_windows_to_local(self, src: dict, archive_path: str):
+        """Windows 远端 → 本地：Windows 内置 tar.exe 打包 → SFTP 断点续传拉回。
+
+        - 零客户端：tar.exe 是 Win10 1803+/Server 2019+ 系统自带（bsdtar，
+          UTF-8 文件名），仅需系统组件 OpenSSH Server；
+        - 拉取统一走 SFTP（客户端什么都不装）；
+        - v1 全量语义：Windows 无 find/sha256sum，增量基线快照与源端去重
+          通道不支持，后续版本补 PowerShell 指纹清单。
+        """
+        client = _get_ssh_client(src["host"])
+        pairs = self._resolve_src_pairs(src)
+        paths = [p for p, _k in pairs]
+
+        # 1) 探测 Windows 内置 tar.exe
+        ver_out, _err, ver_rc = _ssh_exec(client, "tar --version", timeout=30)
+        if ver_rc != 0 or "bsdtar" not in (ver_out or "").lower():
+            raise RuntimeError(
+                "Windows 主机未检测到内置 tar.exe（Win10 1803+/Server 2019+ 自带）。"
+                "请确认系统版本后重试。")
+
+        # 2) 远端暂存目录 + 打包（cmd 语法，路径双引号包裹）
+        stage_dir = "C:/Windows/Temp/aidbm_stage"
+        _ssh_exec(client, 'if not exist "%s" mkdir "%s"'
+                  % (stage_dir, stage_dir.replace("/", "\\")), timeout=30)
+        stage_file = "%s/aidbm_%d.tar.gz" % (stage_dir, int(time.time()))
+        stage_file_cmd = stage_file.replace("/", "\\")
+        excludes = self._excludes() or []
+        cmd = "tar -a -cf %s" % stage_file_cmd
+        for e in excludes:
+            cmd += ' --exclude "%s"' % str(e).replace('"', "")
+        for p in paths:
+            cmd += ' "%s"' % str(p).replace('"', "")
+        self.logger.info("[%s] [1/3] Windows 远端打包: %s", self.task_name, cmd)
+        out, err, rc = _ssh_exec(client, cmd, timeout=7200)
+        if rc != 0:
+            raise RuntimeError(_tar_fail_msg(
+                "Windows 打包", rc, err, cmd, extra="源主机: %s" % src["host"]))
+
+        # 3) SFTP 断点续传拉回（Windows OpenSSH SFTP 接受正斜杠路径）
+        from core import remote_dump as _rd
+        self.logger.info("[%s] [2/3] SFTP 拉回 Windows 打包产物: %s",
+                         self.task_name, stage_file)
+        t0 = time.time()
+        res = _rd.sftp_pull_resumable(
+            client, stage_file, archive_path, task=self.task,
+            key="file.win.tar", db_type="file_win", host_key=src["host"],
+            stable_secs=3, label="Windows tar 包", min_size=1)
+        self.logger.info("[%s] [3/3] 归档落盘完成: %s (%s, %.1fs, resumed=%s)",
+                         self.task_name, archive_path,
+                         db.human_size(res.get("size") or 0),
+                         time.time() - t0, res.get("resumed"))
+
+        # 4) 清理远端暂存（零残留）
+        _ssh_exec(client, 'if exist "%s" del /f /q "%s"'
+                  % (stage_file_cmd, stage_file_cmd), timeout=30)
 
     def _tar_remote_to_local_dedup(self, src: dict, archive_path: str) -> dict:
         """源端传输去重通道（远程 → 本地，文件级）：重复文件不走网络。
@@ -2551,6 +2646,9 @@ class FileBackupEngine(BackupEngine):
             )
         target = dict(target_host_info)
         target["password"] = _db.decrypt_secret(target.get("password") or "")
+        # Windows 恢复目标：tar.exe 解包（cmd 语法），SFTP 推送路径用 C:/ 形态
+        is_win_target = str((target_host_info or {}).get("os_type") or ""
+                            ).lower() == "windows"
 
         def log(msg):
             self.logger.info("[%s] %s", self.task_name, msg)
@@ -2561,19 +2659,35 @@ class FileBackupEngine(BackupEngine):
             client = cross_host._build_ssh(target)
             for idx, item in enumerate(chain, 1):
                 base = os.path.basename(item)
-                remote_tmp = (f"/tmp/bk_restore_{time.strftime('%Y%m%d%H%M%S')}_{idx}_{base}")
-                log(f"SFTP 上传 {idx}/{len(chain)}: {item} -> {remote_tmp}")
-                cross_host._sftp_upload(client, item, remote_tmp, log)
-                remote_tmp_files.append(remote_tmp)
-                cmd = (f"mkdir -p '{target_dir}' && tar -xzf '{remote_tmp}' -C '{target_dir}' "
-                       f"--exclude='.deleted.txt' --exclude='.rt_deleted.txt' "
-                       f"&& echo 'OK {idx} {base}'")
-                _o, _e, rc = cross_host._remote_exec_logged(client, cmd, timeout=3600, log=log)
-                if rc != 0:
-                    raise RuntimeError(
-                        f"远程解压失败(rc={rc}): {(_e or b'').decode('utf-8', 'replace')[:200]}")
-                # 应用增量删除清单（若归档含 .deleted.txt）
-                del_cmd = self._remote_deleted_cmd(remote_tmp, target_dir)
+                if is_win_target:
+                    remote_tmp = ("C:/Windows/Temp/bk_restore_%s_%d_%s"
+                                  % (time.strftime('%Y%m%d%H%M%S'), idx, base))
+                    log(f"SFTP 上传 {idx}/{len(chain)}: {item} -> {remote_tmp}")
+                    cross_host._sftp_upload(client, item, remote_tmp, log)
+                    remote_tmp_files.append(remote_tmp)
+                    tdir = str(target_dir).replace("/", "\\")
+                    cmd = (f'if not exist "{tdir}" mkdir "{tdir}" & '
+                           f'tar -xf "{remote_tmp}" -C "{tdir}" & echo OK {idx}')
+                    _o, _e, rc = cross_host._remote_exec_logged(
+                        client, cmd, timeout=3600, log=log)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Windows 远程解压失败(rc={rc}): "
+                            f"{(_e or b'').decode('utf-8', 'replace')[:200]}")
+                else:
+                    remote_tmp = (f"/tmp/bk_restore_{time.strftime('%Y%m%d%H%M%S')}_{idx}_{base}")
+                    log(f"SFTP 上传 {idx}/{len(chain)}: {item} -> {remote_tmp}")
+                    cross_host._sftp_upload(client, item, remote_tmp, log)
+                    remote_tmp_files.append(remote_tmp)
+                    cmd = (f"mkdir -p '{target_dir}' && tar -xzf '{remote_tmp}' -C '{target_dir}' "
+                           f"--exclude='.deleted.txt' --exclude='.rt_deleted.txt' "
+                           f"&& echo 'OK {idx} {base}'")
+                    _o, _e, rc = cross_host._remote_exec_logged(client, cmd, timeout=3600, log=log)
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"远程解压失败(rc={rc}): {(_e or b'').decode('utf-8', 'replace')[:200]}")
+                # 应用增量删除清单（若归档含 .deleted.txt；Windows 通道 v1 无增量语义）
+                del_cmd = None if is_win_target else self._remote_deleted_cmd(remote_tmp, target_dir)
                 if del_cmd:
                     _o2, _e2, rc2 = cross_host._remote_exec_logged(
                         client, del_cmd, timeout=600, log=log)
@@ -2604,9 +2718,14 @@ class FileBackupEngine(BackupEngine):
             if client:
                 try:
                     if remote_tmp_files:
-                        rm_cmd = " ".join(f"'{p}'" for p in remote_tmp_files)
+                        if is_win_target:
+                            rm_cmd = " & ".join(
+                                f'if exist "{p}" del /f /q "{p}"' for p in remote_tmp_files)
+                        else:
+                            rm_cmd = " ".join(f"'{p}'" for p in remote_tmp_files)
+                            rm_cmd = f"rm -f {rm_cmd} 2>/dev/null; true"
                         cross_host._remote_exec_logged(
-                            client, f"rm -f {rm_cmd} 2>/dev/null; true",
+                            client, rm_cmd,
                             timeout=120, log=lambda x: None)
                 except Exception:
                     pass

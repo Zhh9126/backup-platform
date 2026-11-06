@@ -42,6 +42,7 @@ PostgreSQL 自身的**行为契约逐字不变**：候选列表只含 ``pg_recei
 from __future__ import annotations
 
 import os
+import time
 import re
 import shutil
 import subprocess
@@ -129,6 +130,16 @@ class PostgresWALDaemon(CDCDaemon):
         for name in cls.RECEIVE_CLIENT_CANDIDATES:
             if shutil.which(name):
                 return name, ""
+        # PATH 未命中 → 常见安装目录扫描（平台 PATH 不含 PG 客户端目录是常态；
+        # /pgdb/pgsql/bin 实测有 pg_receivewal）。返回绝对路径，调用方直接作 argv[0]。
+        import glob as _glob
+        for name in cls.RECEIVE_CLIENT_CANDIDATES:
+            for pat in ("/pgdb/pgsql/bin/%s", "/usr/pgsql-*/bin/%s",
+                        "/usr/local/pgsql/bin/%s", "/opt/database/bin/%s",
+                        "/opt/pg/*/bin/%s"):
+                hits = sorted(_glob.glob(pat % name))
+                if hits:
+                    return hits[-1], ""
         return "", f"缺少客户端工具: {', '.join(cls.RECEIVE_CLIENT_CANDIDATES)}"
 
     @classmethod
@@ -137,6 +148,13 @@ class PostgresWALDaemon(CDCDaemon):
         for name in cls.QUERY_CLIENT_CANDIDATES:
             if shutil.which(name):
                 return name
+        import glob as _glob
+        for name in cls.QUERY_CLIENT_CANDIDATES:
+            for pat in ("/pgdb/pgsql/bin/%s", "/usr/pgsql-*/bin/%s",
+                        "/usr/local/pgsql/bin/%s", "/opt/database/bin/%s"):
+                hits = sorted(_glob.glob(pat % name))
+                if hits:
+                    return hits[-1]
         return ""
 
     @classmethod
@@ -257,6 +275,12 @@ class PostgresWALDaemon(CDCDaemon):
         if self.password:
             for key in self.PASSWORD_ENV:
                 env[key] = str(self.password)
+        # 流复制客户端 libpq 版本对齐：/opt/database/bin 下的 pg_receivewal 16
+        # 链接系统老 libpq（<10，不支持 SCRAM）会报 "SCRAM authentication
+        # requires libpq version 10 or above"；用 /pgdb/pgsql/lib 的 libpq
+        # （14，支持 SCRAM，可连 PG16/金仓 V9）前置覆盖。
+        env["LD_LIBRARY_PATH"] = "/pgdb/pgsql/lib" + (
+            ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
         return env
 
     def _ensure_slot(self) -> None:
@@ -286,6 +310,38 @@ class PostgresWALDaemon(CDCDaemon):
     # ------------------------------------------------------------------
     # 封存：.partial 段绝不封存
     # ------------------------------------------------------------------
+    def force_seal(self) -> list:
+        """促成一轮 WAL 轮转并封存就绪段（db_rt.trigger_now 调用）。
+
+        pg_receivewal 的活跃段只有在源库轮转后才成为"完整段"；这里对源库
+        执行 pg_switch_wal()（金仓 V9 同语法），随后立即封存就绪段。
+        """
+        client = self._resolve_query_client()
+        if client:
+            cmd = [client, "-h", str(self.host), "-p", str(self.port),
+                   "-U", str(self.username), "-d", str(self.db_name),
+                   "-tAc", "SELECT pg_switch_wal();"]
+            try:
+                subprocess.run(cmd, env=self._auth_env(), capture_output=True,
+                               text=True, timeout=20)
+            except (OSError, subprocess.SubprocessError):
+                pass
+        else:
+            # 命令行客户端缺失：走 Python 驱动兜底执行
+            try:
+                conn = self._import_driver().connect(
+                    host=str(self.host), port=int(self.port or 5432),
+                    dbname=str(self.db_name), user=str(self.username),
+                    password=str(self.password or ""))
+                cur = conn.cursor()
+                cur.execute("SELECT pg_switch_wal();")
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+        time.sleep(2)
+        return self.seal_ready_segments(force=True)
+
     def seal_ready_segments(self, force: bool = False) -> list:
         """只封存**已完成**的 WAL 段（文件名为 24 位十六进制）。
 

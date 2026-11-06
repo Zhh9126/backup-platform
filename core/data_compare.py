@@ -94,6 +94,17 @@ def _qident(db_type: str, *parts: str) -> str:
     parts = [str(p) for p in parts if p]
     if db_type in ("mysql", "mariadb"):
         return ".".join("`" + p.replace("`", "``") + "`" for p in parts)
+    if db_type in ("oracle", "dameng"):
+        # Oracle/DM 标识符未加引号时不区分大小写（自动解析为大写）。来自源端
+        # 清单的小写名（如 mysql 的 id/name）若带引号引用会保留小写 →
+        # ORA-00904/00942。安全字符集内一律不带引号并统一大写；其余回退带引号。
+        out = []
+        for p in parts:
+            if _SAFE_IDENT.match(p):
+                out.append(p.upper())
+            else:
+                out.append('"' + p.replace('"', '""') + '"')
+        return ".".join(out)
     return ".".join('"' + p.replace('"', '""') + '"' for p in parts)
 
 
@@ -294,7 +305,7 @@ def _sample_sql(db_type: str, ref: str, order_col: str, n: int) -> str:
 # ---------------------------------------------------------------------------
 _TYPE_FAMILIES = (
     # (家族, 匹配正则)——跨库型同义类型归一（oracle number ↔ mysql decimal 等）
-    ("int", r"^(tinyint|smallint|mediumint|int|integer|bigint|binary_integer|pls_integer)"),
+    ("int", r"^(tinyint|smallint|mediumint|int|integer|bigint|binary_integer|pls_integer|number)"),
     ("decimal", r"^(decimal|numeric|number)"),
     ("float", r"^(float|double|real|binary_double|binary_float)"),
     ("varchar", r"^(varchar|varchar2|nvarchar|character varying|varying character|text|clob|longtext|mediumtext|tinytext|nclob)"),

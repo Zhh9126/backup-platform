@@ -215,8 +215,19 @@ class KingbaseEngine(BackupEngine):
 
     def _backup_logical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
         """在 SSH 备份机/数据库服务器上执行 sys_dump，远端落盘 + 断点续传拉回。"""
-        return self._backup_logical_remote_file(
-            ssh_host, backup_type, "kingbase", "sys_dump", "sys_dumpall")
+        # 增量/差异透明回退说明（与本地分支及 PG 远端分支对齐：此前远端静默按全量跑）
+        fb_note = ""
+        if backup_type in (BackupType.INCREMENTAL, BackupType.DIFFERENTIAL):
+            fb_note = ("（incremental/differential 逻辑备份无真正增量，本次按 full 执行；"
+                       "若需增量/差异，请改用 WAL 归档 或 物理备份方案）")
+
+        def _with_note(res):
+            if fb_note and res is not None and getattr(res, "message", None):
+                res.message = res.message + " " + fb_note
+            return res
+
+        return _with_note(self._backup_logical_remote_file(
+            ssh_host, backup_type, "kingbase", "sys_dump", "sys_dumpall"))
 
     def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:
         """逻辑备份：sys_dump（沿用原有实现）。"""

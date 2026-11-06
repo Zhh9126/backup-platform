@@ -40,6 +40,7 @@ import importlib
 from typing import Any, List, Tuple
 
 from .polling_base import PollingLogMinerDaemon
+import time
 
 # 模块级驱动缓存（共享知识 #7）
 _DM_DRIVER: Any = None
@@ -158,6 +159,23 @@ class DamengLogMnrDaemon(PollingLogMinerDaemon):
     def _import_driver(cls) -> Tuple[Any, str]:
         """dmPython 惰性导入。绝不抛异常。"""
         return _import_dmpython()
+
+    def force_seal(self) -> list:
+        """促成归档切换并封存就绪段（db_rt.trigger_now 调用）。
+
+        达梦 DB_LOGMNR 只消费已归档的日志；对源库执行 SWITCH LOGFILE 促成
+        当前联机日志归档，随后立即封存就绪段。
+        """
+        try:
+            conn = self._connect()
+            cur = conn.cursor()
+            cur.execute("ALTER SYSTEM SWITCH LOGFILE")
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+        time.sleep(3)
+        return self.seal_ready_segments(force=True)
 
     def _connect(self):
         """建立达梦连接。

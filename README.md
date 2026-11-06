@@ -15,7 +15,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 容灾切换 · 恢复演练 · 预校验 · 克隆（VDB） · 不可变备份 · 巡检 · 监控 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v2.2.0-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v2.3.3-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -25,7 +25,12 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 ---
 
-> **最新动态**：v2.2.0（2026-11-05）已发布——近两个月主线：AI 大模型数据备份（v2.0.0 起版）、多表并行迁移与对象迁移三批（v2.1.0）、池复制两地三中心、容灾自动切换与真实恢复演练、不可变备份四层防护、坏块检测与应急接管、数据对比银行校验体系、自定义适配器双实证（TDengine/CouchDB）、虚拟机备份 libvirt 真机验证。历史动态归档：[readme_20261015.md](readme_20261015.md)。
+> **最新动态**：v2.3.3（2026-11-07）已发布 + 2026-11-07 四库型（Oracle/PostgreSQL/金仓/达梦）全功能深度测试收官——
+> 每库覆盖「预检 → 逻辑备份 → 恢复（硬核对）→ 数据对比 → 物理备份 → 恢复校验 → 实时备份闭环」，
+> 其中 SQL Server 双通道（物理 SSH+sqlcmd / 逻辑 JDBC 免 SSH）、Windows 文件备份（内置 tar.exe 打包 + SFTP 拉取，零插件）、
+> 五库互对比矩阵 10/10 配对一致与对比报告导出（Excel/CSV）
+> 已在 Windows 真机（中文文件名/中文数据逐项核对）实证；实时备份全引擎支持触发式立即封存（force_seal）。
+v2.2.0（2026-11-05）——近两个月主线：AI 大模型数据备份（v2.0.0 起版）、多表并行迁移与对象迁移三批（v2.1.0）、池复制两地三中心、容灾自动切换与真实恢复演练、不可变备份四层防护、坏块检测与应急接管、数据对比银行校验体系、自定义适配器双实证（TDengine/CouchDB）、虚拟机备份 libvirt 真机验证。历史动态归档：[readme_20261015.md](readme_20261015.md)。
 
 > **部署到离线环境（不可联网、不可随意改代码）前请先阅读**：
 > [产品功能固化清单](docs/feature_manifest_20260917.md)（功能全集、各引擎真实验证状态、能力边界）
@@ -75,6 +80,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 | 能力 | 说明 |
 |---|---|
 | 11 个数据库备份引擎 + 文件备份 | MySQL / MariaDB / PostgreSQL / Kingbase / DM / SQL Server / Oracle / openGauss / Redis / MongoDB / Neo4j + 文件（本地 + 远程 SSH 无 Agent）|
+| **Windows 支持（零插件）** | Windows 文件备份：系统内置 OpenSSH + tar.exe 打包 → SFTP 断点续传拉取，恢复时 SFTP 推回 + tar.exe 解包，中文文件名全程保真（真机实证）；SQL Server on Windows：物理备份走 SSH（cmd + sqlcmd），逻辑备份走 JDBC 1433 直连免 SSH，真机双通道实证 |
 | 备份类型 | 全量 / 增量 / 差异（SQL Server）/ 快照 / 合成全量 / 组合（全量+增量双调度）|
 | MySQL 物理增量备份与增量链恢复 | XtraBackup 增量备份；恢复时基备 prepare → 逐层合并增量 → 临时实例校验，自动处理压缩产物与增量链 |
 | 达梦物理增量备份 | 联机 `BACKUP INCREMENT BACKUPSET`，增量备份集自动拉回 |
@@ -187,16 +193,22 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 | 同库/异库对比 | MySQL、PostgreSQL、DM（达梦）、Oracle、Kingbase 互为源目标 |
 | 多库型校验和 | MySQL CRC32 / PG hashtext / Oracle·达梦 ORA_HASH / SQL Server CHECKSUM_AGG |
 | 大小写不敏感 | 表清单与列名自动归一匹配 |
+| 三级校验级别 | quick（行数+结构）/ standard（校验和+随机抽样）/ deep（主键全量归并）；行数不等自动路由 pk_chunk 精确 missing |
+| 真机深度验证 | 备份→恢复→对比闭环：MySQL170/Oracle171/金仓170/达梦170 源库 vs 恢复库全部一致；篡改检出（changed 含改后值）、删行检出（missing_in_target）|
+| **五库互对比矩阵** | MySQL↔PostgreSQL↔金仓↔达梦↔Oracle 两两跨库对比 **10/10 配对一致**（2026-11-07 真机矩阵，跨名表映射 + 跨库类型族归一：oracle number ↔ int/decimal 等）|
+| **报告导出** | 报告明细一键导出 **Excel**（概要/表级明细/差异明细三工作表）或 **CSV**（差异优先，UTF-8 BOM），页面「对比报告明细」弹窗直接下载 |
 
 ### 7. 实时备份（RT / CDP）
 
 | 能力 | 说明 |
 |---|---|
-| MySQL binlog 流式捕获 + PITR | `mysqlbinlog --read-from-remote-server --raw --stop-never` |
-| PostgreSQL WAL 流式捕获 | `pg_receivewal` |
-| Oracle LogMiner / 达梦 LogMNR | 日志解析轨道 |
-| Kingbase WAL | 缺 sys_receivewal 时降级采样 |
-| 文件实时捕获 | watchdog / polling 双模式 |
+| MySQL binlog 流式捕获 + PITR | `mysqlbinlog --read-from-remote-server --raw --stop-never`；位点越界自动回退当前位点（不虚构数据） |
+| PostgreSQL WAL 流式捕获 | `pg_receivewal`；**客户端版本须 ≥ 服务端大版本**（PG16 服务器需 16 版 pg_receivewal，平台已部署并真机验证） |
+| Oracle LogMiner / 达梦 LogMNR | 日志解析轨道；达梦需 `RLOG_APPEND_LOGIC=2`（平台自动探测并提示） |
+| Kingbase WAL | `pg_receivewal` 流式接收（金仓 V9 兼容 PG 协议），真机封存 16MB WAL 段实证 |
+| 触发式立即封存（force_seal） | 全引擎支持：MySQL FLUSH binlog / PG·金仓 `pg_switch_wal()` / 达梦·Oracle 日志切换，手动触发立即产出完整段与恢复点，不再等段填满 |
+| 真机闭环验证 | MySQL170 / PG170 / Oracle171（LogMiner）/ 金仓170 / 达梦170 五引擎「变更 → 轮转 → 封存 → 恢复点」闭环真机实证 |
+| 能力边界（如实） | SQL Server 暂无 CDC 日志流通道，开启实时保护会如实报错（不降级仿真）；文件实时捕获 watchdog / polling 双模式 |
 
 ### 8. 数据库部署
 
@@ -374,8 +386,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v2.2.0    # 固定版本（可回滚）
-# 当前最新版本：v2.2.0（2026-11-05，池复制修复 + 报表中心备份明细增强）
+docker pull ghcr.io/zhh9126/backup-platform:v2.3.3    # 固定版本（可回滚）
+# 当前最新版本：v2.3.3（2026-11-07，五库对比矩阵+报告导出+实时触发式封存）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -402,7 +414,7 @@ python tools/check_env.py
 docker load -i aidbm_2.2.0_offline.tar.gz
 
 # 自行导出
-docker save ghcr.io/zhh9126/backup-platform:v2.2.0 -o aidbm_2.2.0.tar
+docker save ghcr.io/zhh9126/backup-platform:v2.3.3 -o aidbm_2.3.3.tar
 # 内网机器导入
 docker load -i aidbm_2.2.0.tar
 ```
@@ -433,7 +445,7 @@ docker stop backup-platform
 docker rm backup-platform
 
 # 3. 用新版本镜像启动（命令与首次部署完全一致，仅换镜像 tag）
-docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.2.0
+docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.3.3
 
 # 4.（可选）删除旧版本镜像释放空间
 docker rmi ghcr.io/zhh9126/backup-platform:v2.1.0
@@ -451,7 +463,7 @@ docker stop backup-platform
 docker rm backup-platform
 
 # 2. 删除镜像
-docker rmi ghcr.io/zhh9126/backup-platform:v2.2.0
+docker rmi ghcr.io/zhh9126/backup-platform:v2.3.3
 
 # 3.（谨慎）删除数据卷 —— 会清掉全部备份产物与元数据，操作前务必
 #    先把备份文件拷贝转移！
@@ -576,7 +588,37 @@ docker build -t backup-platform:local .
 
 ## 更新日志
 
-### v2.3.0（待发布，工作区已交付）
+### v2.3.3（2026-11-07，已发布）
+
+**数据对比多库矩阵 + 报告导出 + 实时全引擎触发式封存**：
+
+- 数据对比报告一键导出 **Excel**（概要/表级明细/差异明细三工作表）与 **CSV**（差异优先，UTF-8 BOM）——页面「对比报告明细」弹窗直接下载。
+- **五库互对比矩阵**：MySQL/PostgreSQL/金仓/达梦/Oracle 两两跨库对比 10/10 配对一致（跨名表映射 + 跨库类型族归一：oracle `number` ↔ 各家 `int`）；修复 Oracle/达梦标识符大小写引用（ORA-00904/00942）。
+- **实时备份 force_seal 全引擎覆盖**：PG/金仓（`pg_switch_wal()`）、达梦（`SWITCH LOGFILE`）、Oracle（`SWITCH LOGFILE + ARCHIVE LOG CURRENT`）触发式立即封存；修复 pg_wal 客户端解析、pg_receivewal libpq 版本对齐（SCRAM）、rt 配置 `rt_enabled→enabled` 同步、MySQL binlog 位点越界回退、封存后健康灯复位。
+- **Windows 能力**：文件备份（内置 tar.exe 打包 + SFTP 断点续传拉取，中文保真）、SQL Server 物理（SSH+sqlcmd）与逻辑（JDBC 免 SSH）双通道，真机实证。
+- 170/171 全量+增量真实备份恢复收尾：MySQL 真 LSN 增量链（62.4MB 全量 + 69.3KB 增量）合并恢复 9 行中文硬核对；Oracle RMAN `impdp`/SQLFILE 恢复补 `/ as sysdba` 兜底（口令含 @ 场景）；金仓远端增量回退如实说明。
+
+### v2.3.2（2026-11-06，已发布）
+
+**SQL Server 双通道优化**：
+
+- 物理备份走 SSH（cmd + sqlcmd `BACKUP DATABASE`），逻辑备份走 **JDBC 1433 直连免 SSH**（表结构 + 数据整库 .sql.gz，单引号状态机解析 GO 分段恢复），Windows 真机（笔记本 192.168.1.x）6/6 端到端：种子库 → 备份 → 删库 → 异名恢复 → 中文硬核对。
+- 预检双通道探测（SSH 物理通道 / JDBC 逻辑通道状态都透出、不静默降级）；备份方式选项按 SQL Server 专属文案区分。
+
+### 四库型与 Windows 深度测试（2026-11-06 ~ 11-07）
+
+- **四库型全功能矩阵**（Oracle 171 / PostgreSQL 170 / 金仓 170 / 达梦 170）：每库覆盖「预检（6 项 0 fail）→ 逻辑备份 → 恢复（中文硬核对）→ 数据对比（源 vs 恢复库一致）→ 物理备份 → 恢复校验 → 实时备份闭环」，共 29+ 项通过；唯一如实失败为达梦物理备份（170 磁盘余量不足达梦自身 4.4G 备份预算）。
+- **实时备份全引擎触发式封存（force_seal）**：新增 PG/金仓（`pg_switch_wal()`）、达梦（`SWITCH LOGFILE`）、Oracle（`SWITCH LOGFILE + ARCHIVE LOG CURRENT`）触发式立即封存，与 MySQL FLUSH binlog 对齐；五引擎「变更 → 轮转 → 封存 → 恢复点」闭环真机实证。
+- **修复 6 个实时/对比真缺陷**：① pg_wal 客户端解析只查 PATH；② pg_receivewal 16 链接老 libpq 报 SCRAM（`_auth_env` 对齐 libpq 版本，**PG 流式客户端大版本必须 ≥ 服务端**）；③ rt 配置映射缺 `rt_enabled→enabled` 导致守护永不启动（rt 任务要求备份任务 enabled=1）；④ MySQL binlog 续传位点越界 1236 崩溃（回退当前位点，不虚构数据）；⑤ 触发封存后健康灯不复位；⑥ 新增四个守护的 force_seal。
+- **数据对比深度验证**：篡改检出（changed 含改后值）、删行检出（pk_chunk missing_in_target）、异构对比（MySQL↔PG）全部命中；对比任务字段为 `source_database/target_database`。
+- **Windows 真机**：文件备份（中文文件名/3MB 二进制逐项核对一致）+ SQL Server 物理与逻辑双通道备份恢复（数据逐值一致）。
+- 环境配套：达梦 `RLOG_APPEND_LOGIC=2`、Oracle system 解锁 + 登录失败不锁定、金仓/PG 流复制授权（pg_hba/sys_hba）。
+
+### v2.3.1（2026-11-06，已发布）
+
+- 池复制修复（`api/pool.py` 自动解析 record_id 产物路径）；镜像三 tag 与离线包均已发布。
+
+### v2.3.0（2026-11-04 ~ 11-05，已发布）
 
 **（2026-11-04 ~ 11-05）**——对齐 DSG/鼎甲/银行校验体系的收官轮：
 

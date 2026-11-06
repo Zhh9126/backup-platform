@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 """数据对比（恢复数据 vs 生产库）API。"""
+import io
+import json
 import threading
 
-from flask import request, jsonify
+import json
+from flask import request, jsonify, send_file
 
 from . import api_bp
 from core import models
@@ -108,6 +111,115 @@ def dc_list_reports():
     return jsonify({"success": True,
                     "data": models.list_data_compare_reports(task_id=task_id,
                                                              limit=limit)})
+
+
+@api_bp.route("/data-compare-reports/<int:report_id>/export", methods=["GET"])
+@login_required
+def dc_export_report(report_id: int):
+    """导出对比报告：?format=xlsx（默认，三工作表）| csv（差异优先，utf-8 BOM）。"""
+    report = models.get_data_compare_report(report_id)
+    if not report:
+        return jsonify({"success": False, "message": "报告不存在"}), 404
+    fmt = (request.args.get("format") or "xlsx").strip().lower()
+    tables = report.get("tables_json") or []
+    if isinstance(tables, str):
+        try:
+            tables = json.loads(tables)
+        except Exception:
+            tables = []
+    tables = tables if isinstance(tables, list) else []
+
+    def _diffs(tb):
+        out = tb.get("diffs") or tb.get("sample_diffs") or []
+        return out if isinstance(out, list) else []
+
+    task_name = ""
+    try:
+        tk = models.get_data_compare_task(int(report.get("task_id") or 0))
+        task_name = (tk or {}).get("name") or ""
+    except Exception:
+        pass
+    stamp = (report.get("created_at") or "").replace(":", "").replace("-", "").replace(" ", "_")[:15]
+    base = "数据对比报告_%s_%s" % (task_name or ("任务%s" % report.get("task_id")), stamp)
+
+    if fmt == "csv":
+        import csv as _csv
+        buf = io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(["对比报告", base])
+        w.writerow(["状态", report.get("status"), "说明", report.get("message")])
+        w.writerow([])
+        w.writerow(["表级明细"])
+        w.writerow(["表", "状态", "源行数", "目标行数", "行数一致", "校验和一致", "模式", "说明"])
+        all_diffs = []
+        for tb in tables:
+            w.writerow([tb.get("table"), tb.get("status"),
+                        tb.get("source_rows"), tb.get("target_rows"),
+                        tb.get("rows_match"), tb.get("checksum_match"),
+                        tb.get("mode"), tb.get("message")])
+            for d in _diffs(tb):
+                all_diffs.append((tb.get("table"), d))
+        w.writerow([])
+        w.writerow(["差异明细"])
+        w.writerow(["表", "类型", "主键/定位", "详情"])
+        for tbl, d in all_diffs:
+            w.writerow([tbl, d.get("op") or d.get("type"),
+                        json.dumps(d.get("pk"), ensure_ascii=False) if d.get("pk") else "",
+                        json.dumps(d, ensure_ascii=False)[:500]])
+        data = io.BytesIO(b"\ufeff" + buf.getvalue().encode("utf-8"))
+        return send_file(data, mimetype="text/csv; charset=utf-8", as_attachment=True,
+                         download_name=base + ".csv")
+
+    # 默认 xlsx
+    try:
+        from openpyxl import Workbook
+    except Exception as exc:
+        return jsonify({"success": False,
+                        "message": "服务器缺少 openpyxl，无法导出 Excel；可改用 format=csv"}), 500
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "概要"
+    ws.append(["对比报告", base])
+    ws.append(["状态", report.get("status")])
+    ws.append(["说明", report.get("message")])
+    ws.append(["创建时间", report.get("created_at")])
+    ws.append(["耗时(秒)", report.get("duration_sec")])
+    s = report.get("summary_json") or {}
+    if isinstance(s, str):
+        try:
+            s = json.loads(s)
+        except Exception:
+            s = {}
+    for k in ("tables_total", "tables_matched", "tables_mismatched", "tables_failed"):
+        if k in s:
+            ws.append([k, s[k]])
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 60
+
+    ws2 = wb.create_sheet("表级明细")
+    ws2.append(["表", "状态", "源行数", "目标行数", "行数一致", "校验和一致",
+                "抽样方式", "抽样行数", "抽样差异数", "说明"])
+    all_diffs = []
+    for tb in tables:
+        ws2.append([tb.get("table"), tb.get("status"),
+                    tb.get("source_rows"), tb.get("target_rows"),
+                    tb.get("rows_match"), tb.get("checksum_match"),
+                    tb.get("sample_mode"), tb.get("sampled_rows"),
+                    tb.get("sample_diff_count"), tb.get("message")])
+        all_diffs.extend((tb.get("table"), d) for d in _diffs(tb))
+
+    ws3 = wb.create_sheet("差异明细")
+    ws3.append(["表", "类型", "主键/定位", "详情"])
+    for tbl, d in all_diffs:
+        ws3.append([tbl, d.get("op") or d.get("type"),
+                    json.dumps(d.get("pk"), ensure_ascii=False) if d.get("pk") else "",
+                    json.dumps(d, ensure_ascii=False)[:800]])
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return send_file(out, as_attachment=True,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                     download_name=base + ".xlsx")
 
 
 @api_bp.route("/data-compare-reports/<int:report_id>", methods=["GET"])

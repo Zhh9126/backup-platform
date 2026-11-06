@@ -144,7 +144,7 @@ class PostgreSQLEngine(BackupEngine):
         out_dir = self._output_dir()
         # 逐 tar 包断点续传拉回（大实例 base.tar.gz 可能数十 GB，断链不必重传）。
         # P1-5：extra.parallel_pull 开启时多包并行拉回。
-        _extra = self._parse_extra() or {}
+        _extra = self._extra_dict() or {}
         _pp = str(_extra.get("parallel_pull") or "").lower() in ("1", "true", "yes", "on")
         pieces = remote_dump._pull_remote_tars(
             client, res["remote_dir"], out_dir, task=self.task,

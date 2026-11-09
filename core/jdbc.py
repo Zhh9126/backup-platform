@@ -111,6 +111,18 @@ DRIVER_CONFIG = {
         # 注意：达梦的 SYSDBA 既是管理员又常被用作业务 schema，不能排除
         "filter": ("SYS", "SYSAUDITOR", "SYSSSO", "SYSDBAOPER", "CTISYS", "CJISYS"),
     },
+    "sqlserver": {
+        # 内置注册：离线包全新部署时 instance/ 为空（无页面注册表），
+        # 缺此条目会使 SQL Server JDBC 逻辑备份报「暂不支持 JDBC 连接类型」
+        "jar": "mssql-jdbc-13.4.0.jre11.jar",
+        "class": "com.microsoft.sqlserver.jdbc.SQLServerDriver",
+        "url": ("jdbc:sqlserver://{host}:{port};databaseName={db};"
+                "encrypt=false;trustServerCertificate=true;"
+                "loginTimeout=8;socketTimeout=15"),
+        "probe": "SELECT 1",
+        "list_sql": "SELECT name FROM sys.databases WHERE database_id > 4 ORDER BY 1",
+        "filter": (),
+    },
     # ---------------- 2026-11-05 全库型驱动内置（Maven Central 官方包） ----------------
     "clickhouse": {
         "jar": "clickhouse-jdbc-0.3.2-patch11-all.jar",

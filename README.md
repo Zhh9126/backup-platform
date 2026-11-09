@@ -15,7 +15,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 容灾切换 · 恢复演练 · 预校验 · 克隆（VDB） · 不可变备份 · 巡检 · 监控 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v2.3.3-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v2.3.4-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -25,7 +25,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 ---
 
-> **最新动态**：v2.3.3（2026-11-07）已发布 + 2026-11-07 四库型（Oracle/PostgreSQL/金仓/达梦）全功能深度测试收官——
+> **最新动态**：v2.3.4（2026-11-09）已发布（修复离线包全新部署时 SQL Server JDBC 逻辑备份不可用）+ 2026-11-07 四库型（Oracle/PostgreSQL/金仓/达梦）全功能深度测试收官——
 > 每库覆盖「预检 → 逻辑备份 → 恢复（硬核对）→ 数据对比 → 物理备份 → 恢复校验 → 实时备份闭环」，
 > 其中 SQL Server 双通道（物理 SSH+sqlcmd / 逻辑 JDBC 免 SSH）、Windows 文件备份（内置 tar.exe 打包 + SFTP 拉取，零插件）、
 > 五库互对比矩阵 10/10 配对一致与对比报告导出（Excel/CSV）
@@ -386,8 +386,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v2.3.3    # 固定版本（可回滚）
-# 当前最新版本：v2.3.3（2026-11-07，五库对比矩阵+报告导出+实时触发式封存）
+docker pull ghcr.io/zhh9126/backup-platform:v2.3.4    # 固定版本（可回滚）
+# 当前最新版本：v2.3.4（2026-11-07，五库对比矩阵+报告导出+实时触发式封存）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -414,7 +414,7 @@ python tools/check_env.py
 docker load -i aidbm_2.2.0_offline.tar.gz
 
 # 自行导出
-docker save ghcr.io/zhh9126/backup-platform:v2.3.3 -o aidbm_2.3.3.tar
+docker save ghcr.io/zhh9126/backup-platform:v2.3.4 -o aidbm_2.3.4.tar
 # 内网机器导入
 docker load -i aidbm_2.2.0.tar
 ```
@@ -445,7 +445,7 @@ docker stop backup-platform
 docker rm backup-platform
 
 # 3. 用新版本镜像启动（命令与首次部署完全一致，仅换镜像 tag）
-docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.3.3
+docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.3.4
 
 # 4.（可选）删除旧版本镜像释放空间
 docker rmi ghcr.io/zhh9126/backup-platform:v2.1.0
@@ -463,7 +463,7 @@ docker stop backup-platform
 docker rm backup-platform
 
 # 2. 删除镜像
-docker rmi ghcr.io/zhh9126/backup-platform:v2.3.3
+docker rmi ghcr.io/zhh9126/backup-platform:v2.3.4
 
 # 3.（谨慎）删除数据卷 —— 会清掉全部备份产物与元数据，操作前务必
 #    先把备份文件拷贝转移！
@@ -587,6 +587,20 @@ docker build -t backup-platform:local .
 - 默认账号请立即修改（首登会标记 `must_change_password`）；生产环境建议限制来源 IP
 
 ## 更新日志
+
+### v2.3.4（2026-11-09，已发布）
+
+修复离线交付包的阻断缺陷：全新部署（`instance/` 无 JDBC 用户注册表）时，
+SQL Server 逻辑备份报「暂不支持 JDBC 连接类型: sqlserver」，而物理备份需 SSH
+通道，导致两条备份通道都不可用。
+
+- `core/jdbc.py`：`DRIVER_CONFIG` 内置 sqlserver（mssql-jdbc jar 本就随镜像交付），
+  全新部署无需页面注册即可使用 JDBC 逻辑备份；用户注册表仍可覆盖内置绑定。
+- `core/backup_precheck.py`：SQL Server 逻辑模式的「原生直连失败」「远端暂存目录」
+  两条不适用提示改为 skip，预检结论不再误导。
+- 新增回归单测 `tests/test_jdbc_builtin_sqlserver.py`（5 项，含空注册表回退）。
+- 真机验证：SQL Server 逻辑备份（1 表 3 行）→ 异名库恢复 → 中文 3 行硬核对一致；
+  打包容器（无注册表）同样真实备份成功，生产服务预检从 warn 收敛为 pass。
 
 ### v2.3.3（2026-11-07，已发布）
 

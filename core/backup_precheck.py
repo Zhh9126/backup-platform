@@ -126,11 +126,19 @@ def precheck_backup(task: dict) -> dict:
             _add(items, "source_connectivity", "pass",
                  "源库连通（原生驱动直连成功）")
         except Exception as e:
-            # 原生直连失败不代表引擎链路必然失败（某些库型走驱动器/JDBC/SSH
-            # 通道），标 warn 并给出行内提示
-            _add(items, "source_connectivity", "warn",
-                 "原生直连失败（%s）——若该库型走 SSH/JDBC 通道可忽略此项，"
-                 "但请确认凭据正确" % str(e)[:120])
+            _err = str(e)
+            if "暂不支持直连类型" in _err:
+                # 该库型本就不走原生驱动（如 SQL Server 走 JDBC 逻辑通道），
+                # 连通性由「备份工具就绪」项真实探测，不应误报 warn
+                _add(items, "source_connectivity", "skip",
+                     "该库型不经原生驱动直连（%s）；连通性由「备份工具就绪」"
+                     "项真实探测" % _err[:120])
+            else:
+                # 原生直连失败不代表引擎链路必然失败（某些库型走驱动器/
+                # JDBC/SSH 通道），标 warn 并给出行内提示
+                _add(items, "source_connectivity", "warn",
+                     "原生直连失败（%s）——若该库型走 SSH/JDBC 通道可忽略此项，"
+                     "但请确认凭据正确" % _err[:120])
 
     # 4) 备份工具就绪（复用引擎 preflight：本机 PATH / 远端 su 探测 / 自带插件）
     try:
@@ -233,18 +241,24 @@ def precheck_backup(task: dict) -> dict:
     # 5.5) 远端暂存目录（FIX-2026-001 延伸，全库型）：备份会在数据库服务器
     # 本地写入整库大小的临时产物，默认 /tmp 常在根分区
     try:
-        _eo2 = task.get("extra_options")
-        _extra2 = json.loads(_eo2) if isinstance(_eo2, str) else (_eo2 or {})
-        _bsd = str(_extra2.get("backup_stage_dir") or "").strip()
-        if _bsd:
-            _add(items, "remote_stage", "pass",
-                 f"远端暂存目录（任务级）: {_bsd}；执行前将按上次成功备份大小"
-                 f"做空间预算检查，与根分区同盘会告警")
+        if db_type == "sqlserver" and not is_phys:
+            # JDBC 逻辑通道在平台侧直接生成 .sql.gz，不占用数据库服务器
+            # 的暂存目录，该提示不适用
+            _add(items, "remote_stage", "skip",
+                 "JDBC 逻辑通道产物直接写平台侧，无需数据库服务器暂存目录")
         else:
-            _add(items, "remote_stage", "warn",
-                 "远端暂存目录未配置（默认 /tmp/bk_stage，常在根分区）——"
-                 "整库大小的临时产物可能占满数据库服务器根分区，"
-                 "建议在任务高级选项配置到独立挂载分区")
+            _eo2 = task.get("extra_options")
+            _extra2 = json.loads(_eo2) if isinstance(_eo2, str) else (_eo2 or {})
+            _bsd = str(_extra2.get("backup_stage_dir") or "").strip()
+            if _bsd:
+                _add(items, "remote_stage", "pass",
+                     f"远端暂存目录（任务级）: {_bsd}；执行前将按上次成功备份大小"
+                     f"做空间预算检查，与根分区同盘会告警")
+            else:
+                _add(items, "remote_stage", "warn",
+                     "远端暂存目录未配置（默认 /tmp/bk_stage，常在根分区）——"
+                     "整库大小的临时产物可能占满数据库服务器根分区，"
+                     "建议在任务高级选项配置到独立挂载分区")
     except Exception as e:
         _add(items, "remote_stage", "unknown", "暂存目录预检异常: %s" % str(e)[:100])
 

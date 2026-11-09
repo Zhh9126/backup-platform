@@ -2170,7 +2170,10 @@
   let _liveLogTimer = null;
   window.liveLog = async (id) => {
     // 实时日志弹窗：2.5s 轮询，任务终态后停止轮询
-    let modal = $("liveLogModal");
+    // BKP.$ 对缺失元素返回万能 Proxy（真值），不能用它判断 DOM 存在与否：
+    // 否则动态弹窗永不插入，new bootstrap.Modal(Proxy) 静默失败 → 点击日志无反应。
+    const byId = (x) => document.getElementById(x);
+    let modal = byId("liveLogModal");
     if (!modal) {
       document.body.insertAdjacentHTML("beforeend", `
       <div class="modal fade" id="liveLogModal" tabindex="-1">
@@ -2197,16 +2200,21 @@
           </div>
         </div>
       </div>`);
-      modal = $("liveLogModal");
+      modal = byId("liveLogModal");
       modal.addEventListener("hidden.bs.modal", () => {
         if (_liveLogTimer) { clearInterval(_liveLogTimer); _liveLogTimer = null; }
       });
     }
-    new bootstrap.Modal(modal).show();
+    try {
+      new bootstrap.Modal(modal).show();
+    } catch (e) {
+      toast("日志弹窗打开失败: " + (e && e.message ? e.message : e), "danger");
+      return;
+    }
     const pull = async () => {
       try {
         const r = await api("GET", `/api/tasks/${id}/live-log`);
-        const badge = $("liveLogStatus"), pre = $("liveLogPre");
+        const badge = byId("liveLogStatus"), pre = byId("liveLogPre");
         if (!badge || !pre) return;
         badge.textContent = r.status;
         badge.className = "badge ms-2 " + (
@@ -2215,14 +2223,14 @@
           r.status === "cancelled" ? "bg-secondary" : "bg-danger");
         pre.textContent = r.log_tail || "（暂无日志输出）";
         pre.scrollTop = pre.scrollHeight;
-        const wrap = $("liveLogProgressWrap");
+        const wrap = byId("liveLogProgressWrap");
         if (wrap) {
           const p = Number(r.progress || 0);
           if (r.status === "running" && p > 0) {
             wrap.style.display = "block";
-            $("liveLogBar").style.width = p + "%";
-            $("liveLogPct").textContent = p + "%";
-            $("liveLogStage").textContent = r.stage || "-";
+            byId("liveLogBar").style.width = p + "%";
+            byId("liveLogPct").textContent = p + "%";
+            byId("liveLogStage").textContent = r.stage || "-";
           } else { wrap.style.display = "none"; }
         }
         if (r.status !== "running" && _liveLogTimer) {
@@ -2230,7 +2238,7 @@
           await loadTasks();
         }
       } catch (e) {
-        const pre2 = $("liveLogPre");
+        const pre2 = byId("liveLogPre");
         if (pre2 && !pre2.textContent.trim()) pre2.textContent = "日志加载失败: " + (e && e.message ? e.message : e) + "（2.5 秒后自动重试）";
       }
     };
@@ -2656,6 +2664,10 @@
       else if (r.wal_lsn) cdc = r.wal_lsn;
       $("rl_cdc").textContent = cdc;
       $("rl_duration").textContent = r.duration_sec ? fmtDuration(r.duration_sec) : "-";
+      if (!document.getElementById("recordLogModal")) {
+        toast("日志详情弹窗未加载，请刷新页面后重试", "danger");
+        return;
+      }
       if (!recordLogModal) {
         recordLogModal = new bootstrap.Modal(document.getElementById("recordLogModal"));
       }

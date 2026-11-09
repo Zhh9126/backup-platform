@@ -170,6 +170,7 @@
         <option value="oracle">Oracle</option>
         <option value="dameng">达梦</option>
         <option value="kingbase">KingbaseES</option>
+        <option value="sqlserver">SQL Server</option>
       </select>
       <input id="jdbcTestHost" class="form-control form-control-sm" style="width:140px;" placeholder="主机 127.0.0.1">
       <input id="jdbcTestPort" class="form-control form-control-sm" style="width:90px;" placeholder="端口">
@@ -179,6 +180,11 @@
       <button class="btn btn-primary btn-sm" id="jdbcTestBtn"><i class="bi bi-lightning-fill"></i> 测试连接</button>
     </div>
     <div id="jdbcTestResult" class="small mt-2 d-none"></div>
+    <div class="small text-muted mt-1">
+      说明：SQL Server 走 JDBC 逻辑通道（免 SSH），库名请留空或填 <code>master</code>（不是用户名）；
+      驱动绑定请核对是否为 <code>mssql-jdbc-*.jar</code>。该测试仅诊断连通性，
+      SQL Server 备份能力在「备份任务 → 新建任务 → 逻辑备份（JDBC）」。
+    </div>
   </div>
 </div>
 

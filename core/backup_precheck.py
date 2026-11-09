@@ -131,8 +131,9 @@ def precheck_backup(task: dict) -> dict:
                 # 该库型本就不走原生驱动（如 SQL Server 走 JDBC 逻辑通道），
                 # 连通性由「备份工具就绪」项真实探测，不应误报 warn
                 _add(items, "source_connectivity", "skip",
-                     "该库型不经原生驱动直连（%s）；连通性由「备份工具就绪」"
-                     "项真实探测" % _err[:120])
+                     "该库型不经原生 Python 驱动直连（SQL Server 等走 JDBC/"
+                     "SSH 通道），属通道差异而非能力缺失；连通性由「备份工具"
+                     "就绪」项真实探测")
             else:
                 # 原生直连失败不代表引擎链路必然失败（某些库型走驱动器/
                 # JDBC/SSH 通道），标 warn 并给出行内提示

@@ -118,7 +118,7 @@ DRIVER_CONFIG = {
         "class": "com.microsoft.sqlserver.jdbc.SQLServerDriver",
         "url": ("jdbc:sqlserver://{host}:{port};databaseName={db};"
                 "encrypt=false;trustServerCertificate=true;"
-                "loginTimeout=8;socketTimeout=15"),
+                "loginTimeout=8;socketTimeout=600000"),
         "probe": "SELECT 1",
         "list_sql": "SELECT name FROM sys.databases WHERE database_id > 4 ORDER BY 1",
         "filter": (),
@@ -217,7 +217,7 @@ KNOWN_DRIVER_TEMPLATES = {
                   "class": "com.microsoft.sqlserver.jdbc.SQLServerDriver",
                   "url": ("jdbc:sqlserver://{host}:{port};databaseName={db};"
                           "encrypt=false;trustServerCertificate=true;"
-                          "loginTimeout=8;socketTimeout=15"),
+                          "loginTimeout=8;socketTimeout=600000"),
                   "probe": "SELECT 1",
                   "list_sql": ("SELECT name FROM sys.databases "
                                "WHERE database_id > 4 ORDER BY 1"),
@@ -290,13 +290,32 @@ def _save_user_registry(reg: dict) -> None:
         json.dumps(reg, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+_SQLSERVER_SOCKET_TIMEOUT_MS = 600000
+
+
+def _normalize_sqlserver_timeout(cfg: dict) -> dict:
+    """兼容历史页面注册：SQL Server JDBC 的 socketTimeout 单位是毫秒，
+    早期模板误写成 15（=15 ms），任何真实连接都会在 20 ms 内超时。
+    统一收敛到 600000 ms（与 core/sqlserver_jdbc.py 备份通道一致）。
+    """
+    if not cfg or "sqlserver" not in str(cfg.get("url") or ""):
+        return cfg
+    m = re.search(r"socketTimeout=(\d+)", cfg["url"])
+    if m and int(m.group(1)) < 1000:
+        cfg = dict(cfg)
+        cfg["url"] = (cfg["url"][:m.start(1)]
+                      + str(_SQLSERVER_SOCKET_TIMEOUT_MS)
+                      + cfg["url"][m.end(1):])
+    return cfg
+
+
 def effective_config(db_type: str) -> dict:
     """合并视图：用户页面注册覆盖内置 DRIVER_CONFIG。"""
     reg = _load_user_registry().get(db_type)
     if reg:
-        return dict(reg)
+        return _normalize_sqlserver_timeout(dict(reg))
     cfg = DRIVER_CONFIG.get(db_type)
-    return dict(cfg) if cfg else {}
+    return _normalize_sqlserver_timeout(dict(cfg)) if cfg else {}
 
 
 def effective_db_types() -> tuple:
@@ -680,8 +699,16 @@ def test_connection(db_type, host, port, db, user, password, timeout=15):
         return True, f"JDBC 连接成功（{ms} ms），驱动: {info['driver_class']}", info
     except Exception as e:
         ms = int((time.monotonic() - t0) * 1000)
-        # 两者都失败时优先返回原生通道的错误（更贴近真实原因）
-        return False, f"连接失败（{ms} ms）: {native_err or e}", None
+        jdbc_err = str(e) or type(e).__name__
+        if "暂不支持直连类型" in (native_err or ""):
+            # 该库型（如 SQL Server）本就不走原生 Python 驱动，原生报的
+            # 「不支持直连」只是通道不适用，不是失败原因。必须透出 JDBC 的
+            # 真实错误，否则用户会误以为平台不支持该库型。
+            return False, (
+                f"JDBC 连接失败（{ms} ms）: {jdbc_err}"
+                f"（{db_type} 走 JDBC 通道，原生直连不适用）"), None
+        # 两条通道都失败时优先返回原生通道的错误（更贴近真实原因）
+        return False, f"连接失败（{ms} ms）: {native_err or jdbc_err}", None
 
 
 def list_databases(db_type, host, port, db, user, password, timeout=30):
@@ -693,6 +720,11 @@ def list_databases(db_type, host, port, db, user, password, timeout=30):
             db_type, host, port, db, user, password, timeout=timeout)
     except native_conn.DriverUnavailable:
         pass
+    except ValueError as e:
+        # 原生驱动不支持该库型（如 SQL Server 走 JDBC）时继续走 JDBC 兜底，
+        # 不能把「暂不支持直连类型」当成能力缺失抛给前端
+        if "暂不支持直连类型" not in str(e):
+            raise
     _, _, _, _, list_sql, filters = _resolve_config(db_type)
     conn = connect(db_type, host, port, db, user, password, timeout=timeout)
     try:

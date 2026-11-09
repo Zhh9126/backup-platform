@@ -151,6 +151,17 @@ def _list_tables(conn, db_type: str, database: str, schema: str) -> list:
                     "AND tablename NOT LIKE 'pg\\_%' "
                     "AND tablename NOT LIKE 'xx\\_%' "
                     "ORDER BY tablename")
+        elif db_type == "sqlserver":
+            # SQL Server（JDBC 通道）：sys.tables 列当前库基础表，
+            # 排除 ms_shipped 系统对象；schema 默认 dbo，白名单校验后内联
+            sch = schema or "dbo"
+            if not _SAFE_IDENT.match(sch):
+                raise ValueError(f"非法 schema: {sch!r}")
+            cur.execute(
+                "SELECT t.name FROM sys.tables t "
+                "JOIN sys.schemas s ON s.schema_id = t.schema_id "
+                f"WHERE s.name = '{sch}' AND t.is_ms_shipped = 0 "
+                "ORDER BY t.name")
         elif db_type in ("oracle", "dameng"):
             owner = (schema or _user_of(conn) or "").upper()
             if not owner:

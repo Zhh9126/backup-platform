@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import http.client
 import os
+import re
 import socket
 import ssl
 import time
@@ -401,26 +402,120 @@ class ObjectStoreClient:
             conn.close()
 
     def download_to_file(self, bucket: str, key: str, dest: str,
-                         version_id: str = "") -> int:
-        """流式下载到文件，返回写入字节数（内存占用与对象大小无关）。"""
+                         version_id: str = "", resume: bool = False,
+                         expected_size: int | None = None,
+                         max_retries: int = 3, on_chunk=None) -> int:
+        """流式下载到文件，返回**落盘总字节数**（含续传复用的字节）。
+
+        ``resume=True`` 时以 ``dest + .aidbm_part`` 暂存：每次请求前按该文件
+        实际大小发 ``Range: bytes=N-``，服务端回 206 且 Content-Range 起点吻合
+        才追加；回 200（服务端忽略 Range）则截断从头重写。传输中断会在本次
+        调用内按新 offset 继续，未完成的 part 也会被保留到下次备份重跑续传。
+        ``on_chunk(total)`` 每个块回调，供上层在块边界检查用户取消。
+        """
         os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         query = {"versionId": version_id} if version_id else None
-        resp, conn = self._request("GET", bucket, key, query=query)
-        try:
-            if resp.status >= 400:
-                body = resp.read()
-                raise self._make_error(resp, body)
-            written = 0
-            with open(dest, "wb") as f:
-                while True:
-                    chunk = resp.read(_CHUNK)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    written += len(chunk)
-            return written
-        finally:
-            conn.close()
+        if not resume:
+            resp, conn = self._request("GET", bucket, key, query=query)
+            try:
+                if resp.status >= 400:
+                    body = resp.read()
+                    raise self._make_error(resp, body)
+                written = 0
+                with open(dest, "wb") as f:
+                    while True:
+                        chunk = resp.read(_CHUNK)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        written += len(chunk)
+                        if on_chunk:
+                            on_chunk(written)
+                return written
+            finally:
+                conn.close()
+
+        from . import resume as resume_mod
+        part = resume_mod.part_path(dest)
+        attempts = max(0, int(max_retries))
+        for attempt in range(attempts + 1):
+            offset = os.path.getsize(part) if os.path.isfile(part) else 0
+            if expected_size is not None:
+                exp = int(expected_size)
+                if offset > exp:
+                    # 源变小或上轮残件写坏，绝不拼接，丢弃重来
+                    try:
+                        os.remove(part)
+                    except OSError:
+                        pass
+                    offset = 0
+                elif offset > 0 and offset == exp:
+                    os.replace(part, dest)
+                    return offset
+            headers = {"range": "bytes=%d-" % offset} if offset else None
+            conn = None
+            try:
+                resp, conn = self._request("GET", bucket, key, query=query,
+                                           headers=headers)
+                if resp.status >= 400:
+                    body = resp.read()
+                    raise self._make_error(resp, body)
+                append = False
+                if offset:
+                    if resp.status == 206:
+                        cr = resp.getheader("content-range") or ""
+                        m = re.match(r"\s*bytes\s+(\d+)\s*-\s*(\d+)", cr)
+                        if not m or int(m.group(1)) != offset:
+                            # 起点不吻合还继续拼会产出「大小对、内容错位」的假文件
+                            resp.read()
+                            conn.close()
+                            conn = None
+                            try:
+                                os.remove(part)
+                            except OSError:
+                                pass
+                            continue
+                        append = True
+                    elif resp.status == 200:
+                        offset = 0        # 服务端不支持 Range，整包重发
+                    else:
+                        raise ObjectStoreError(
+                            "Range 续传返回非预期状态 %d" % resp.status,
+                            status=resp.status)
+                total = offset
+                with open(part, "ab" if append else "wb") as f:
+                    while True:
+                        chunk = resp.read(_CHUNK)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        total += len(chunk)
+                        if on_chunk:
+                            on_chunk(total)
+                total = os.path.getsize(part)
+                if expected_size is not None and total != int(expected_size):
+                    raise ObjectStoreError(
+                        "断点续传后落盘大小不一致（源 %s / 盘 %d，断点 %d）"
+                        % (expected_size, total, offset))
+                os.replace(part, dest)
+                return total
+            except (socket.timeout, TimeoutError, ConnectionError,
+                    http.client.HTTPException, ssl.SSLError, OSError) as e:
+                # part 已写字节保留；下一轮按新的 offset 继续。
+                # CancelledError 不在捕获列表，直接穿透给调度器标记 cancelled。
+                if attempt >= attempts:
+                    kept = os.path.getsize(part) if os.path.isfile(part) else 0
+                    raise ObjectStoreError(
+                        "对象下载中断（已保留断点 %d 字节，重跑可续传）: %s"
+                        % (kept, str(e)[:200]), detail=str(e)[:300])
+                time.sleep(min(2 ** attempt, 4))
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        raise ObjectStoreError("对象下载失败: 重试次数已耗尽")
 
     @staticmethod
     def sha256_file(path: str) -> str:

@@ -1738,6 +1738,27 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
             except Exception:
                 pass
 
+            # Windows 客户端目录防护规则（零安装：仅下发 DSM/Defender 自带策略）
+            try:
+                from core import win_protect as _wp
+                _wp.init_table(conn)
+            except Exception:
+                pass
+
+            # 群晖 DSM 设备纳管（凭据集中存储，供备份引擎按 device_id 引用）
+            try:
+                from core.synology import devices as _syndev
+                _syndev.init_table(conn)
+            except Exception:
+                pass
+
+            # 异地容灾：云侧推对象存储 + 平台出站拉取（来源配置 / 拉取日志）
+            try:
+                from core import remote_pull as _rp
+                _rp.init_table(conn)
+            except Exception:
+                pass
+
             # 迁移：准 CDP 实时备份（Phase RT）—— backup_tasks 追加 6 列
             for col, typedef in [
                 ("rt_enabled", "INTEGER DEFAULT 0"),

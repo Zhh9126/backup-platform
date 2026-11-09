@@ -77,6 +77,31 @@
     <div class="col-12 text-muted small py-2">正在获取配额状态...</div>
   </div>
 
+  <!-- 按授权服务器数计量（distinct host 视图） -->
+  <div class="border-top pt-3 mt-2">
+    <div class="card-section-title fs-6 mb-2">
+      <i class="bi bi-hdd-rack"></i> 按授权服务器数计量
+      <span class="text-muted small fw-normal ms-2">同一台服务器上的多个库/文件任务只占 1 个名额；平台自身（127.0.0.1）不计入</span>
+    </div>
+    <div class="row g-3 mb-2">
+      <div class="col-md-4"><div class="p-2 border rounded h-100">
+        <div class="text-muted small">已保护服务器（去重）</div>
+        <div class="fs-5 fw-semibold" id="licServerUsed">-</div>
+        <div class="text-muted" style="font-size:0.72rem" id="licServerLimit">-</div>
+      </div></div>
+      <div class="col-md-8"><div class="p-2 border rounded h-100">
+        <div class="text-muted small">计量口径</div>
+        <div class="small" id="licServerNote">加载中…</div>
+      </div></div>
+    </div>
+    <div class="table-responsive">
+      <table class="table table-sm table-hover align-middle mb-0">
+        <thead><tr><th style="width:45px">#</th><th>主机</th><th>来源</th><th>备份任务数</th><th>库型</th><th>计入授权</th></tr></thead>
+        <tbody id="licServerTable"><tr><td colspan="6" class="text-muted">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- 激活区域 -->
   <div class="border-top pt-3 mt-3" id="licActivateArea">
     <div class="d-flex justify-content-between align-items-center mb-2">
@@ -117,6 +142,7 @@ document.addEventListener("DOMContentLoaded", function () {
       const res = await resp.json();
       if (res.code === 0) {
         renderLicenseUI(res.data.license, res.data.quotas);
+        if (res.data.server_view) renderServerView(res.data.server_view);
       }
     } catch (e) {
       console.error("加载授权失败:", e);
@@ -307,6 +333,38 @@ document.addEventListener("DOMContentLoaded", function () {
     return String(str).replace(/[&<>"']/g, function(m) {
       return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[m];
     });
+  }
+
+  function renderServerView(v) {
+    const used = document.getElementById("licServerUsed");
+    const lim = document.getElementById("licServerLimit");
+    const note = document.getElementById("licServerNote");
+    const tb = document.getElementById("licServerTable");
+    if (!used || !tb) return;
+    used.textContent = v.billable_count + " 台";
+    lim.textContent = v.is_unlimited ? "企业授权 · 无限制"
+      : ("上限 " + v.limit + " 台 · 剩余 " + v.remaining + " 台"
+         + (v.metering_enabled ? " · 已启用按主机强校验" : " · 当前仅展示，未启用强校验"));
+    note.textContent = v.note || "";
+    const rows = v.servers || [];
+    if (!rows.length) {
+      tb.innerHTML = '<tr><td colspan="6" class="text-muted">尚无被保护主机</td></tr>';
+      return;
+    }
+    const srcNames = {
+      backup_task: "备份任务", ssh_host: "SSH 主机", synology_device: "群晖设备",
+      vm_hypervisor: "虚拟化平台", netdev_device: "网络设备"
+    };
+    tb.innerHTML = rows.map(function (s, i) {
+      return '<tr><td>' + (i + 1) + '</td>'
+        + '<td><code>' + escapeHtml(s.host) + '</code></td>'
+        + '<td class="small">' + (s.sources || []).map(function (x) { return srcNames[x] || x; }).join("、") + '</td>'
+        + '<td>' + s.task_count + '</td>'
+        + '<td class="small">' + escapeHtml((s.db_types || []).join("、") || "-") + '</td>'
+        + '<td>' + (s.is_platform_self
+            ? '<span class="badge bg-secondary">平台自身 · 不计</span>'
+            : '<span class="badge bg-info">计入</span>') + '</td></tr>';
+    }).join("");
   }
 
   loadLicenseStatus();

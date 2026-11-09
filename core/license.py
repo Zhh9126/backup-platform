@@ -24,6 +24,8 @@ logger = logging.getLogger("aidbm.license")
 PUB_KEY_PATH = Path(__file__).resolve().parent / "license_public.pem"
 FREE_MAX_QUOTA = 5
 LICENSE_CONFIG_KEY = "system_license"
+# 按「授权服务器数」计量的开关（默认关，零破坏：存量仍按任务条数计配额）
+SERVER_METERING_KEY = "license_server_metering"
 
 CATEGORY_NAMES = {
     "netdev": "网络设备备份",
@@ -219,6 +221,7 @@ def get_license_info() -> Dict[str, Any]:
             "local_macs": local_macs,
             "max_devices": FREE_MAX_QUOTA,
             "quota_limit": FREE_MAX_QUOTA,
+            "max_servers": FREE_MAX_QUOTA,
             "activated_at": "",
             "issued_at": "",
             "license_code": "",
@@ -240,6 +243,8 @@ def get_license_info() -> Dict[str, Any]:
             "local_macs": local_macs,
             "max_devices": -1,  # -1 表示无限制
             "quota_limit": -1,
+            # 授权码可显式限定服务器数；未指定则无限制
+            "max_servers": int(payload.get("max_servers") or -1),
             "activated_at": saved_data.get("activated_at", ""),
             "issued_at": payload.get("issued_at", ""),
             "license_code": code,
@@ -258,6 +263,7 @@ def get_license_info() -> Dict[str, Any]:
             "local_macs": local_macs,
             "max_devices": FREE_MAX_QUOTA,
             "quota_limit": FREE_MAX_QUOTA,
+            "max_servers": FREE_MAX_QUOTA,
             "activated_at": "",
             "issued_at": "",
             "license_code": "",
@@ -402,3 +408,130 @@ def check_quota(category: str, delta: int = 1):
             f"【{label}】纳管数量已达社区免费版上限（最多 5 台设备/任务，当前已有 {used} 个，新增 {delta} 个将超出限制）。"
             f"如需纳管更多设备与任务，请在【系统设置 -> 系统授权】中输入与当前服务器 MAC 绑定的永久商业授权码解锁限制！"
         )
+
+
+# ---------------- 按授权服务器数计量（distinct host 视图） ----------------
+# 招标/报价常见口径是「按被保护服务器台数授权」，而当前 check_quota 数的是
+# 「任务/设备行数」：一台服务器上跑 10 个库任务会占 10 个名额，与商业口径不符。
+# 这里补一张按主机去重的视图供授权页展示，并提供**可选**的按主机数配额校验
+# （system_config 开关，默认关，保证存量部署零破坏）。
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "0.0.0.0", ""}
+
+
+def normalize_host(raw) -> str:
+    """把 ``user@host:port`` / ``https://host:port/path`` 归一成可去重的主机名。"""
+    s = str(raw or "").strip().lower()
+    if not s:
+        return ""
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    if "@" in s:
+        s = s.split("@", 1)[1]
+    s = s.split("/", 1)[0].strip()
+    if s.startswith("["):                       # IPv6 [::1]:port
+        return s.split("]", 1)[0].lstrip("[")
+    if s.count(":") == 1:                       # host:port（含 IPv4）
+        s = s.split(":", 1)[0]
+    return s.strip()
+
+
+def is_loopback_host(host: str) -> bool:
+    """平台自身（回环地址）不计入被保护服务器授权数。"""
+    return str(host or "").strip().lower() in _LOOPBACK_HOSTS
+
+
+def _collect_servers() -> list:
+    """聚合所有被保护实体，按归一化主机去重。缺表/缺列一律跳过不报错。"""
+    hosts = {}
+
+    def add(raw, source, task=None):
+        h = normalize_host(raw)
+        if not h:
+            return
+        e = hosts.setdefault(h, {"sources": set(), "task_count": 0,
+                                 "db_types": set(), "task_ids": []})
+        e["sources"].add(source)
+        if task is not None:
+            e["task_count"] += 1
+            if task.get("db_type"):
+                e["db_types"].add(task["db_type"])
+            e["task_ids"].append(task.get("id"))
+
+    for t in db.query("SELECT id, host, db_type FROM backup_tasks"):
+        add(t.get("host"), "backup_task", t)
+    for table, col, source in (
+        ("ssh_hosts", "hostname", "ssh_host"),
+        ("synology_devices", "hostname", "synology_device"),
+        ("vm_hypervisors", "endpoint", "vm_hypervisor"),
+        ("netdev_devices", "host", "netdev_device"),
+    ):
+        try:
+            for r in db.query("SELECT %s AS h FROM %s" % (col, table)):
+                add(r.get("h"), source)
+        except Exception:
+            pass
+    out = []
+    for h in sorted(hosts):
+        e = hosts[h]
+        out.append({
+            "host": h,
+            "is_platform_self": is_loopback_host(h),
+            "sources": sorted(e["sources"]),
+            "task_count": e["task_count"],
+            "db_types": sorted(e["db_types"]),
+            "task_ids": [x for x in e["task_ids"] if x is not None][:20],
+        })
+    return out
+
+
+def metering_enabled() -> bool:
+    """是否启用「按服务器数」配额校验（默认关，仅视图展示）。"""
+    v = str(db.get_system_config(SERVER_METERING_KEY, "0") or "0").strip().lower()
+    return v in ("1", "true", "on", "yes")
+
+
+def server_view() -> dict:
+    """按 distinct host 的授权计量视图（只读，不改既有 6 类配额语义）。"""
+    info = get_license_info()
+    servers = _collect_servers()
+    billable = [s for s in servers if not s["is_platform_self"]]
+    licensed = bool(info.get("is_licensed"))
+    try:
+        limit = int(info.get("max_servers") or FREE_MAX_QUOTA)
+    except (TypeError, ValueError):
+        limit = FREE_MAX_QUOTA
+    unlimited = licensed and limit < 0
+    return {
+        "servers": servers,
+        "distinct_count": len(servers),
+        "billable_count": len(billable),
+        "platform_self_count": len(servers) - len(billable),
+        "limit": -1 if unlimited else limit,
+        "is_unlimited": unlimited,
+        "remaining": -1 if unlimited else max(0, limit - len(billable)),
+        "metering_enabled": metering_enabled(),
+        "note": ("按归一化主机去重：同一台服务器上的多个库/文件任务只占 1 个名额；"
+                 "回环地址代表平台自身，不计入授权服务器数。"
+                 "视图默认只读；开启 system_config 键 license_server_metering=1 后，"
+                 "新建任务引入新主机时才按服务器数强校验。"),
+    }
+
+
+def check_server_quota(new_host) -> None:
+    """可选：新建任务引入新主机时按授权服务器数校验（默认关闭，零破坏）。"""
+    if is_licensed() or not metering_enabled():
+        return
+    h = normalize_host(new_host)
+    if not h or is_loopback_host(h):
+        return
+    view = server_view()
+    if any(s["host"] == h for s in view["servers"]):
+        return                    # 已纳管的服务器，不新增名额
+    limit = view["limit"]
+    if limit >= 0 and view["billable_count"] + 1 > limit:
+        raise QuotaExceededError(
+            "按授权服务器数计量：已保护 %d 台服务器，上限 %d 台；新增主机「%s」将超限。"
+            "同一台服务器上的多个任务共用一个名额。如需更多服务器，请激活商业授权"
+            "或在系统配置中调整授权服务器数。"
+            % (view["billable_count"], limit, h))

@@ -174,6 +174,37 @@
                 </label>
               </div>
             </div>
+            <div class="col-12">
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="f_mirror_full_tree">
+                <label class="form-check-label" for="f_mirror_full_tree">
+                  增量镜像也生成与源完全一致的完整目录（默认增量目录只含变化文件；开启后增量目录为完整树，稀疏变化集另存 mirror_inc_changes_*）
+                </label>
+              </div>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">重复数据删除范围</label>
+              <select class="form-select form-select-sm" id="f_dedup_scope">
+                <option value="global">全局共享（跨任务/跨周期，最高节省率）</option>
+                <option value="cycle">周期内局部重删 · 跨周期不重删（提升数据安全）</option>
+              </select>
+              <div class="form-text">周期以最近一次成功全量备份为界；跨周期不复用旧字节可避免块库损坏扩散</div>
+            </div>
+
+            <div class="col-12 f-src-remote-box">
+              <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="f_win_hash_verify">
+                <label class="form-check-label" for="f_win_hash_verify">
+                  Windows 精确内容指纹（PowerShell Get-FileHash SHA256；默认仅按大小 + LastWriteTimeUtc 判变化）
+                </label>
+                <div class="form-text">开启后可识别「时间戳被还原但内容已改写」，代价是每轮对每个文件读盘算哈希；仅对 Windows 远程源生效，DSM 侧零安装。</div>
+              </div>
+            </div>
+            <div class="col-md-6 f-src-remote-box">
+              <label class="form-label">Windows 指纹清单上限（文件数）</label>
+              <input class="form-control form-control-sm" id="f_win_max_files" type="number" min="1" value="50000">
+              <div class="form-text">超限会中止增量并诚实回退全量，避免不完整清单被误判成「文件全部被删」</div>
+            </div>
 
             <div class="col-md-4">
               <label class="form-label">保留天数</label>
@@ -361,4 +392,57 @@
     </div>
   </div>
 </div>
+
+<!-- Windows 客户端防护（防删除 / 防勒索，零安装） -->
+<div class="page-card mt-3">
+  <div class="card-section-title"><i class="bi bi-shield-lock"></i> Windows 客户端防护</div>
+  <p class="form-text-hint mb-3">
+    通过已纳管的 Windows OpenSSH 主机下发 <b>Defender 受控文件夹访问</b>（防勒索加密）与
+    <b>NTFS 拒绝删除</b> 策略，被管机<b>不安装任何组件</b>。需管理员权限的账号；
+    下发后请点「核查状态」确认主机侧真实生效。此为源头加固，不替代备份侧不可变锁定。
+  </p>
+  <div class="row g-3">
+    <div class="col-md-3">
+      <label class="form-label">Windows 主机</label>
+      <select class="form-select" id="wp_host"></select>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label">防护模式</label>
+      <select class="form-select" id="wp_mode">
+        <option value="cfa">受控文件夹访问（推荐，防加密）</option>
+        <option value="acl_deny_delete">NTFS 拒绝删除（归档目录）</option>
+        <option value="both">双重防护</option>
+      </select>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label">受保护目录（每行一个）</label>
+      <textarea class="form-control" id="wp_paths" rows="3" placeholder="D:\data&#10;E:\备份"></textarea>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label">授权业务程序（可选，每行一个）</label>
+      <textarea class="form-control" id="wp_apps" rows="3" placeholder="C:\Program Files\app\app.exe"></textarea>
+    </div>
+  </div>
+  <div class="d-flex flex-wrap gap-2 align-items-center mt-2">
+    <button class="btn btn-primary btn-sm" onclick="wpApply()"><i class="bi bi-shield-check"></i> 下发防护</button>
+    <button class="btn btn-outline-secondary btn-sm" onclick="wpCheck()"><i class="bi bi-search"></i> 核查状态</button>
+    <button class="btn btn-outline-warning btn-sm" onclick="wpRemove()"><i class="bi bi-shield-slash"></i> 解除防护</button>
+    <button class="btn btn-outline-secondary btn-sm" onclick="wpSaveRule()"><i class="bi bi-save"></i> 保存为规则</button>
+    <div class="form-check form-check-inline ms-2">
+      <input class="form-check-input" type="checkbox" id="wp_apply_now">
+      <label class="form-check-label small" for="wp_apply_now">保存时立即下发</label>
+    </div>
+  </div>
+  <div class="d-none mt-3">
+    <pre class="small bg-light p-2 rounded" id="wp_result" style="max-height:260px;overflow:auto"></pre>
+  </div>
+  <div class="table-responsive mt-3">
+    <table class="table table-sm align-middle">
+      <thead><tr><th>主机 ID</th><th>目录</th><th>模式</th><th>状态</th><th class="text-end">操作</th></tr></thead>
+      <tbody id="wpRuleTable"></tbody>
+    </table>
+  </div>
+</div>
+<script src="/static/js/win_protect.js?v=2026111001"></script>
+
 {% endblock %}

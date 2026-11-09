@@ -86,6 +86,8 @@
         <div class="nav-group-label">备份管理</div>
         <a class="nav-link {% if page=='tasks' %}active{% endif %}" href="/tasks" title="数据库备份" data-perm="backup.task.view"><i class="bi bi-list-check"></i> <span class="nav-label">数据库备份</span></a>
         <a class="nav-link {% if page=='file_backup' %}active{% endif %}" href="/file_backup" title="文件备份" data-perm="backup.task.view"><i class="bi bi-folder2-open"></i> <span class="nav-label">文件备份</span></a>
+        <a class="nav-link {% if page=='synology' %}active{% endif %}" href="/synology" title="群晖 NAS 纳管：DSM 设备探活 / 共享文件夹资产 / 全量+增量备份任务 / iSCSI 场景边界" data-perm="backup.task.view"><i class="bi bi-hdd-network"></i> <span class="nav-label">群晖 NAS 纳管</span></a>
+        <a class="nav-link {% if page=='remote_pull' %}active{% endif %}" href="/remote-pull" title="异地容灾：云侧推对象存储 + 平台出站拉取，免公网 IP / 无 P2P 反向隧道" data-perm="backup.task.view"><i class="bi bi-cloud-arrow-down"></i> <span class="nav-label">异地容灾拉取</span></a>
         <a class="nav-link {% if page=='netdev' %}active{% endif %}" href="/netdev" title="网络设备备份（交换机 / 路由器配置备份 / SSH / 远程 FTP）" data-perm="backup.task.view"><i class="bi bi-router"></i> <span class="nav-label">网络设备备份</span></a>
         <a class="nav-link {% if page=='object_storage' %}active{% endif %}" href="/object_storage" title="对象存储备份（MinIO / 阿里云 OSS / 腾讯云 COS / S3 兼容，桶级保护，桶侧零安装）" data-perm="backup.task.view"><i class="bi bi-cloud-arrow-up"></i> <span class="nav-label">对象存储备份</span></a>
         <a class="nav-link {% if page=='vm' %}active{% endif %}" href="/vm" title="虚拟机备份（整机恢复点 / 永久增量 / 克隆新 VM）"><i class="bi bi-pc-display-horizontal"></i> <span class="nav-label">虚拟机备份</span></a>
@@ -175,7 +177,7 @@
   <script src="/static/js/bkp-core.js?v=2026110301"></script>
   <script src="/static/js/pager.js?v=2026110403"></script>
   <script src="/static/js/precheck.js?v=2026110610"></script>
-  <script src="/static/js/app.js?v=2026110901"></script>
+  <script src="/static/js/app.js?v=2026111002"></script>
   {% if has_ai_agent %}<script src="/static/js/ai-agent.js?v=2026101501"></script>{% endif %}
   <script>
     // 按权限隐藏菜单（每个 <a class="nav-link" data-perm="..."> 命中则可见）

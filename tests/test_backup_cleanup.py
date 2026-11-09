@@ -44,8 +44,21 @@ os.makedirs(_BACKUP_ROOT, exist_ok=True)
 config.BACKUP_ROOT = _BACKUP_ROOT
 db.init_schema()                                # noqa: E402
 
+import pytest                                   # noqa: E402
 import core.models as models                    # noqa: E402
 from core import backup_cleanup as bc           # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_cleanup_config():
+    """每个用例前把运行时 config 指回本模块固化的临时库/备份根。
+
+    config.META_DB_PATH / BACKUP_ROOT 是运行时读取的模块属性，pytest 同进程
+    收集多个测试模块后会被后导入者改写；不改产品代码，只消除跨模块污染。
+    """
+    config.META_DB_PATH = _MODULE_DB
+    config.BACKUP_ROOT = _BACKUP_ROOT
+    yield
 
 
 def _mk_task(name, retention_days=7, retention_count=0):

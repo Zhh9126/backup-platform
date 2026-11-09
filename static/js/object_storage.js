@@ -259,6 +259,8 @@
       if ($(id)) $(id).checked = false;
     });
     $("os_workers").value = 8;
+    if ($("os_resume")) $("os_resume").checked = true;
+    if ($("os_resume_ttl")) $("os_resume_ttl").value = 72;
     $("os_retention").value = 30;
     $("os_backup_type").value = "full";
     $("os_schedule").value = "none";
@@ -321,6 +323,11 @@
       os_include_versions: !!$("os_versions").checked,
       os_workers: parseInt($("os_workers").value, 10) || 8,
       os_allow_partial: !!$("os_allow_partial").checked,
+      os_resume: !!$("os_resume").checked,
+      os_resume_ttl_hours: (() => {
+        const n = parseInt($("os_resume_ttl").value, 10);
+        return Number.isNaN(n) ? 72 : n;
+      })(),
       os_restore_bucket: ($("os_restore_bucket_def").value || "").trim(),
       os_restore_prefix: ($("os_restore_prefix_def").value || "").trim(),
     };
@@ -390,6 +397,11 @@
     $("os_verify_ssl").checked = !!EDIT_EXTRA.os_verify_ssl;
     $("os_workers").value = EDIT_EXTRA.os_workers || 8;
     $("os_allow_partial").checked = !!EDIT_EXTRA.os_allow_partial;
+    const rv = EDIT_EXTRA.os_resume;
+    $("os_resume").checked = (rv === undefined || rv === null) ? true
+      : (rv === true || rv === 1 || rv === "1" || rv === "true");
+    $("os_resume_ttl").value = (EDIT_EXTRA.os_resume_ttl_hours != null
+      ? EDIT_EXTRA.os_resume_ttl_hours : 72);
     $("os_restore_bucket_def").value = EDIT_EXTRA.os_restore_bucket || "";
     $("os_restore_prefix_def").value = EDIT_EXTRA.os_restore_prefix || "";
     $("os_task_name").value = t.name || "";
@@ -426,6 +438,41 @@
     $("os_sk_hint").textContent = "留空表示沿用原 SecretKey";
     const card = $("osCfgCard");
     if (card && card.scrollIntoView) card.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  async function showResume(id) {
+    let st;
+    try {
+      st = await api("GET", V1 + "/tasks/" + id + "/resume-status");
+    } catch (e) {
+      toast("读取断点状态失败：" + errMsg(e), "danger", 6000);
+      return;
+    }
+    if (!st.resume_enabled) {
+      toast("该任务未启用断点续传（编辑任务可开启）", "info", 6000);
+      return;
+    }
+    if (st.expired) {
+      toast("断点已过期，下次备份将自动从头校验重传", "warning", 6000);
+      return;
+    }
+    if (!st.valid || (!st.done_count && !st.part_count)) {
+      toast("当前没有可续传的断点：上次备份已正常完成，或从未中断", "info", 6000);
+      return;
+    }
+    const mb = (n) => (Number(n || 0) / 1048576).toFixed(2) + " MB";
+    const info = "已完成 " + st.done_count + "/" + st.plan_total + " 个对象（" + mb(st.done_bytes) + "）\n"
+      + "未完成分片 " + st.part_count + " 个（" + mb(st.part_bytes) + "）\n"
+      + "断点已存在 " + st.age_hours + " 小时，有效期 " + st.ttl_hours + " 小时\n"
+      + "重新发起备份会从断点继续，不重传已完成对象。";
+    if (window.confirm(info + "\n\n是否清除该断点，改为下次从头全量传输？")) {
+      try {
+        await api("DELETE", V1 + "/tasks/" + id + "/resume");
+        toast("断点已清除", "success");
+      } catch (e) {
+        toast("清除断点失败：" + errMsg(e), "danger", 6000);
+      }
+    }
   }
 
   async function deleteTask(id) {
@@ -522,6 +569,7 @@
           ? '<button class="btn btn-sm btn-outline-danger me-1" data-os-stop="' + t.id + '" title="停止运行中的备份（协作式取消，断点保留可续传）"><i class="bi bi-stop-circle"></i> 停止</button>' +
             '<button class="btn btn-sm btn-outline-secondary me-1" onclick="liveLog(' + t.id + ')" title="实时查看操作日志"><i class="bi bi-terminal"></i> 日志</button>'
           : '<button class="btn btn-sm btn-outline-primary me-1" data-os-run="' + t.id + '" title="立即执行一次备份"><i class="bi bi-play-fill"></i> 备份</button>') +
+        '<button class="btn btn-sm btn-outline-secondary me-1" data-os-resume="' + t.id + '" title="查看 / 清除断点（中断后重跑可续传）"><i class="bi bi-arrow-repeat"></i></button>' +
         '<button class="btn btn-sm btn-outline-secondary me-1" data-os-objs="' + t.id + '" title="最近一次成功备份的对象清单">' +
         '<i class="bi bi-list-ul"></i></button>' +
         '<button class="btn btn-sm btn-outline-secondary me-1" data-os-edit="' + t.id + '" title="编辑"><i class="bi bi-pencil"></i></button>' +
@@ -821,10 +869,12 @@
       const objs = btn.getAttribute("data-os-objs");
       const edit = btn.getAttribute("data-os-edit");
       const del = btn.getAttribute("data-os-del");
+      const resume = btn.getAttribute("data-os-resume");
       if (run) runBackup(parseInt(run, 10));
       else if (stop) stopTask(parseInt(stop, 10));
       else if (edit) editTask(parseInt(edit, 10));
       else if (del) deleteTask(parseInt(del, 10));
+      else if (resume) showResume(parseInt(resume, 10));
       else if (objs) {
         const rec = latestSuccessByTask()[parseInt(objs, 10)];
         if (rec) openObjects(rec.id);

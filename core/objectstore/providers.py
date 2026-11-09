@@ -204,10 +204,34 @@ def _extra(task: dict) -> dict:
         return {}
 
 
+def _flag(value, default: bool = False) -> bool:
+    """容错解析表单/JSON 里的布尔开关（"0"/"false" 也算关）。"""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(value)
+
+
 def task_cfg(task: dict) -> dict:
     """把备份任务翻译成对象存储作业配置（含备份/恢复的目标参数）。"""
     ex = _extra(task)
+    # 0 是有效语义（TTL=0 不过期 / retries=0 不重试），不能用 `or 默认值` 吃掉
+    _ttl_raw = ex.get("os_resume_ttl_hours")
+    try:
+        ttl_h = 72.0 if _ttl_raw is None or _ttl_raw == "" else float(_ttl_raw)
+    except (TypeError, ValueError):
+        ttl_h = 72.0
+    _retry_raw = ex.get("os_resume_max_retries")
+    try:
+        retries = 3 if _retry_raw is None or _retry_raw == "" else int(_retry_raw)
+    except (TypeError, ValueError):
+        retries = 3
     return {
+        # 断点续传默认开启：既有任务无需改配置即可获得「中断后重跑接着传」
+        "resume": _flag(ex.get("os_resume"), True),
+        "resume_ttl_hours": max(0.0, min(ttl_h, 720.0)),
+        "resume_max_retries": max(0, min(retries, 10)),
         "provider": (ex.get("os_provider") or ex.get("provider") or "minio"),
         "endpoint": task.get("host") or ex.get("os_endpoint") or "",
         "port": task.get("port"),

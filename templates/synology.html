@@ -1,0 +1,209 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex flex-wrap justify-content-between align-items-start mb-3 gap-2">
+  <div>
+    <h4 class="mb-1"><i class="bi bi-hdd-network"></i> 群晖 NAS 全面纳管</h4>
+    <div class="text-muted small">
+      DSM 设备集中纳管 → 真实探活与能力发现 → 共享文件夹资产 → 一键生成
+      <strong>全量 + 增量</strong>备份任务。只调用 DSM 自带 Web API，
+      <strong>DSM 侧零安装、零 Agent</strong>；凭据集中在设备表（SM4 加密），备份任务按 ID 引用。
+    </div>
+  </div>
+  <div class="d-flex gap-2">
+    <button class="btn btn-outline-secondary btn-sm" id="synRefreshBtn"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+    <button class="btn btn-primary btn-sm" id="synNewDeviceBtn" data-perm="backup.task.manage"><i class="bi bi-plus-lg"></i> 纳管 DSM 设备</button>
+  </div>
+</div>
+
+<div class="row g-3 mb-3">
+  <div class="col-6 col-lg-3"><div class="card h-100"><div class="card-body py-3">
+    <div class="text-muted small">已纳管设备</div><div class="fs-5 fw-semibold" id="synKpiDevices">-</div>
+  </div></div></div>
+  <div class="col-6 col-lg-3"><div class="card h-100"><div class="card-body py-3">
+    <div class="text-muted small">在线 / 探活通过</div><div class="fs-5 fw-semibold" id="synKpiOnline">-</div>
+  </div></div></div>
+  <div class="col-6 col-lg-3"><div class="card h-100"><div class="card-body py-3">
+    <div class="text-muted small">共享文件夹（当前设备）</div><div class="fs-5 fw-semibold" id="synKpiShares">-</div>
+  </div></div></div>
+  <div class="col-6 col-lg-3"><div class="card h-100"><div class="card-body py-3">
+    <div class="text-muted small">群晖备份任务</div><div class="fs-5 fw-semibold" id="synKpiTasks">-</div>
+  </div></div></div>
+</div>
+
+<!-- 已纳管设备 -->
+<div class="card mb-3">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span><i class="bi bi-hdd-rack"></i> 已纳管 DSM 设备
+      <span class="text-muted small ms-2">探测状态与能力来自真实 DSM Web API，非公开接口只展示命中情况</span></span>
+    <span class="badge bg-secondary" id="synDeviceCount">0</span>
+  </div>
+  <div class="card-body">
+    <div class="table-responsive">
+      <table class="table table-sm table-hover align-middle mb-0">
+        <thead><tr>
+          <th style="width:48px">#</th><th>名称</th><th>地址 / 协议</th><th>DSM 版本 / 型号</th>
+          <th>能力</th><th>状态</th><th style="width:270px">操作</th>
+        </tr></thead>
+        <tbody id="synDeviceTable"><tr><td colspan="7" class="text-muted">加载中…</td></tr></tbody>
+      </table>
+    </div>
+    <div id="synDevicePager"></div>
+  </div>
+</div>
+
+<!-- 资产 + 一键保护 -->
+<div class="card mb-3">
+  <div class="card-header"><i class="bi bi-folder2-open"></i> 共享文件夹资产与一键保护
+    <span class="text-muted small ms-2">SYNO.FileStation.List（官方公开 API）；勾选路径后生成全量 + 增量任务</span>
+  </div>
+  <div class="card-body">
+    <div class="row g-3">
+      <div class="col-md-4">
+        <label class="form-label">选择设备</label>
+        <select class="form-select form-select-sm" id="synAssetDevice"></select>
+        <div class="form-text">切换设备会重新拉取共享文件夹清单</div>
+      </div>
+      <div class="col-md-8">
+        <label class="form-label">共享文件夹 <span class="text-muted small" id="synAssetHint"></span></label>
+        <div id="synAssetList" class="border rounded p-2" style="max-height:220px;overflow:auto">
+          <div class="text-muted small">请先选择设备并加载资产</div>
+        </div>
+        <div class="form-text">勾选要保护的目录；路径为 DSM 内部绝对路径，备份按 size + mtime 做文件级增量。</div>
+      </div>
+    </div>
+    <hr class="my-3">
+    <div class="row g-3">
+      <div class="col-md-4"><label class="form-label">任务名称</label>
+        <input class="form-control form-control-sm" id="syn_qt_name" placeholder="群晖-共享目录保护"></div>
+      <div class="col-md-4"><label class="form-label">业务系统 <span class="text-danger">*</span></label>
+        <input class="form-control form-control-sm" id="syn_qt_biz" placeholder="默认取设备名称"></div>
+      <div class="col-md-4"><label class="form-label">备份策略</label>
+        <select class="form-select form-select-sm" id="syn_qt_strategy">
+          <option value="mixed">全量 + 增量（组合策略，推荐）</option>
+          <option value="full">仅全量</option>
+        </select></div>
+      <div class="col-md-3"><label class="form-label">全量 cron</label>
+        <input class="form-control form-control-sm" id="syn_qt_full_cron" value="0 2 * * 0">
+        <div class="form-text">默认每周日 02:00</div></div>
+      <div class="col-md-3"><label class="form-label">增量间隔（分钟）</label>
+        <input type="number" class="form-control form-control-sm" id="syn_qt_inc_min" min="1" value="60">
+        <div class="form-text">平台下限 60 秒（1 分钟）</div></div>
+      <div class="col-md-3"><label class="form-label">保留天数</label>
+        <input type="number" class="form-control form-control-sm" id="syn_qt_retention" min="1" value="30"></div>
+      <div class="col-md-8"><label class="form-label">排除规则</label>
+        <input class="form-control form-control-sm" id="syn_qt_excludes"
+               placeholder="逗号分隔，如 *.tmp, backup/@tmp（匹配文件名或 DSM 相对路径及其子目录）">
+        <div class="form-text">命中规则的整棵子目录会被跳过，统计写入产物 manifest</div></div>
+      <div class="col-md-3 d-flex flex-column justify-content-end gap-1">
+        <div class="form-check"><input class="form-check-input" type="checkbox" id="syn_qt_enabled" checked>
+          <label class="form-check-label small" for="syn_qt_enabled">创建后启用调度</label></div>
+        <div class="form-check"><input class="form-check-input" type="checkbox" id="syn_qt_run_now">
+          <label class="form-check-label small" for="syn_qt_run_now">立即跑一次全量</label></div>
+      </div>
+    </div>
+    <div class="mt-3 d-flex gap-2">
+      <button class="btn btn-primary btn-sm" id="synQuickTaskBtn" data-perm="backup.task.manage">
+        <i class="bi bi-shield-plus"></i> 一键生成备份任务</button>
+      <button class="btn btn-outline-secondary btn-sm" id="synAssetsStatBtn">
+        <i class="bi bi-list-ul"></i> 递归统计选中目录</button>
+    </div>
+    <div id="synQuickResult" class="small mt-2"></div>
+  </div>
+</div>
+
+<!-- 关联任务 -->
+<div class="card mb-3">
+  <div class="card-header"><i class="bi bi-list-check"></i> 群晖备份任务
+    <span class="text-muted small ms-2">结果同样出现在「数据库备份 / 备份记录」页，可统一管理与恢复</span></div>
+  <div class="card-body">
+    <div class="table-responsive">
+      <table class="table table-sm table-hover align-middle mb-0">
+        <thead><tr>
+          <th style="width:48px">#</th><th>任务</th><th>业务系统</th><th>保护路径</th>
+          <th>策略</th><th>状态</th><th>最近运行</th>
+        </tr></thead>
+        <tbody id="synTaskTable"><tr><td colspan="7" class="text-muted">加载中…</td></tr></tbody>
+      </table>
+    </div>
+    <div id="synTaskPager"></div>
+  </div>
+</div>
+
+<!-- 场景矩阵 -->
+<div class="card mb-3">
+  <div class="card-header" data-bs-toggle="collapse" data-bs-target="#synScenarioBody" style="cursor:pointer">
+    <i class="bi bi-diagram-3"></i> 场景矩阵与能力边界
+    <span class="text-muted small ms-2">iSCSI / SAN Manager / Initiator / 集群红线 / 文件协议差异 / 交付信息模板（点击展开）</span>
+  </div>
+  <div class="collapse" id="synScenarioBody"><div class="card-body" id="synScenarios">
+    <div class="text-muted small">加载中…</div>
+  </div></div>
+</div>
+
+<!-- 设备表单 -->
+<div class="modal fade" id="synDeviceModal" tabindex="-1">
+  <div class="modal-dialog modal-lg"><div class="modal-content">
+    <div class="modal-header"><h6 class="modal-title" id="synDeviceModalTitle">纳管 DSM 设备</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body">
+      <input type="hidden" id="syn_d_id">
+      <div class="row g-3">
+        <div class="col-md-6"><label class="form-label">设备名称 <span class="text-danger">*</span></label>
+          <input class="form-control form-control-sm" id="syn_d_name" placeholder="如：机房 A - DS3622xs+"></div>
+        <div class="col-md-6"><label class="form-label">DSM 地址 <span class="text-danger">*</span></label>
+          <input class="form-control form-control-sm" id="syn_d_hostname" placeholder="192.168.1.10 或 nas.example.com">
+          <div class="form-text">只填 IP / 域名，不要带 http://</div></div>
+        <div class="col-md-3"><label class="form-label">端口</label>
+          <input type="number" class="form-control form-control-sm" id="syn_d_port" value="5000"></div>
+        <div class="col-md-3"><label class="form-label">超时（秒）</label>
+          <input type="number" class="form-control form-control-sm" id="syn_d_timeout" value="15"></div>
+        <div class="col-md-6 d-flex flex-column justify-content-center gap-1">
+          <div class="form-check"><input class="form-check-input" type="checkbox" id="syn_d_secure">
+            <label class="form-check-label small" for="syn_d_secure">使用 HTTPS（端口通常为 5001）</label></div>
+          <div class="form-check"><input class="form-check-input" type="checkbox" id="syn_d_verify_ssl">
+            <label class="form-check-label small" for="syn_d_verify_ssl">校验证书（自签名环境请留空）</label></div>
+        </div>
+        <div class="col-md-6"><label class="form-label">DSM 账号 <span class="text-danger">*</span></label>
+          <input class="form-control form-control-sm" id="syn_d_username" placeholder="建议专用最小权限账号">
+          <div class="form-text">不要用默认 admin；自动化任务请用未开启 2FA 的专用账号</div></div>
+        <div class="col-md-6"><label class="form-label">密码</label>
+          <input type="password" class="form-control form-control-sm" id="syn_d_password" autocomplete="new-password"
+                 placeholder="编辑时留空表示不修改">
+          <div class="form-text">SM4-GCM 加密入库，列表/详情不回显</div></div>
+        <div class="col-md-6"><label class="form-label">两步验证码（仅本次探测用）</label>
+          <input class="form-control form-control-sm" id="syn_d_otp" placeholder="OTP 不落库">
+          <div class="form-text">一次性验证码，绝不写入数据库</div></div>
+        <div class="col-md-6"><label class="form-label">备注</label>
+          <input class="form-control form-control-sm" id="syn_d_remark" placeholder="机型 / 用途 / 责任人"></div>
+        <div class="col-12 form-check">
+          <input class="form-check-input" type="checkbox" id="syn_d_enabled" checked>
+          <label class="form-check-label small" for="syn_d_enabled">启用该设备</label></div>
+      </div>
+      <div class="alert alert-light border mt-3 mb-0 small">
+        <strong>能力边界</strong>：FileStation 为官方公开 API；Storage / Snapshot / SAN Manager
+        属非公开接口，仅如实展示命中情况，不调用、不承诺可编排。SAN Manager 输出的是裸 LUN，
+        平台不直接读裸块、不做块级增量/CBT；iSCSI 场景请纳管挂载 LUN 的业务主机并备份其挂载点。
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn btn-outline-secondary btn-sm" id="synTestFormBtn"><i class="bi bi-plug"></i> 先测试连接</button>
+      <button class="btn btn-outline-secondary btn-sm" data-bs-dismiss="modal">取消</button>
+      <button class="btn btn-primary btn-sm" id="synSaveDeviceBtn">保存</button>
+    </div>
+  </div></div>
+</div>
+
+<!-- 探测结果 -->
+<div class="modal fade" id="synProbeModal" tabindex="-1">
+  <div class="modal-dialog modal-lg"><div class="modal-content">
+    <div class="modal-header"><h6 class="modal-title">DSM 探测结果</h6>
+      <button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body" id="synProbeBody"></div>
+    <div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">关闭</button></div>
+  </div></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/synology.js?v=2026111002"></script>
+{% endblock %}

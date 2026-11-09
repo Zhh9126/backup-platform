@@ -232,8 +232,12 @@ def remote_free_space_ok(exec_fn: Callable[[str], Tuple[str, str, int]],
 FILE_STORE_SUBDIR = "files"  # .dedup_store/files/<sha>（与 4MB 块库分区）
 
 
-def _file_store_dir() -> str:
-    d = os.path.join(_store_dir(), FILE_STORE_SUBDIR)
+def _file_store_dir(cycle_id: str | None = None) -> str:
+    """文件库位置。cycle_id 非空时按备份周期隔离，实现「周期内局部重删、
+    跨周期不重删」；为空则沿用全局库（历史默认行为，不改存量任务）。"""
+    base = _store_dir()
+    d = (os.path.join(base, "cycles", cycle_id, FILE_STORE_SUBDIR)
+         if cycle_id else os.path.join(base, FILE_STORE_SUBDIR))
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -329,7 +333,8 @@ def _excluded(rel: str, excludes: List[str]) -> bool:
 
 
 def pull_files_dedup(client, manifest: Dict, task_id=None,
-                     excludes: Optional[List[str]] = None) -> Tuple[Dict, Dict]:
+                     excludes: Optional[List[str]] = None,
+                     cycle_id: str | None = None) -> Tuple[Dict, Dict]:
     """文件级源端去重拉取：每个文件按内容哈希比对文件库
     （.dedup_store/files/<sha>），命中 → 本地读；未命中 → SFTP 拉取并入库。
 
@@ -337,7 +342,7 @@ def pull_files_dedup(client, manifest: Dict, task_id=None,
     返回 ({rel_path: 本地库路径}, 统计)。只有新/变文件走网络。
     """
     sftp = client.open_sftp()
-    store = _file_store_dir()
+    store = _file_store_dir(cycle_id)
     local_map: Dict[str, str] = {}
     transferred = 0
     hits = 0

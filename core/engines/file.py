@@ -1284,6 +1284,24 @@ class FileBackupEngine(BackupEngine):
         self._post_process(result)
         return result
 
+    def _dedup_cycle_id(self) -> str | None:
+        """完整备份周期 ID：以本任务最近一次成功的全量备份为界。
+
+        extra.dedup_scope="cycle" 时启用：同一周期内复用文件库，一旦产生
+        新的全量基线即切换新周期，跨周期绝不复用旧字节（提升数据安全）。
+        默认 "global" 保持既有全局共享语义，存量任务零行为变化。
+        """
+        if (self.extra.get("dedup_scope") or "global") != "cycle":
+            return None
+        try:
+            r = db.query_one(
+                "SELECT id FROM backup_records WHERE task_id=? "
+                "AND backup_type='full' AND status='success' "
+                "ORDER BY id DESC LIMIT 1", (self.task_id,))
+            return "c%s" % ((r or {}).get("id") or 0)
+        except Exception:
+            return "c0"
+
     def _mirror_postprocess(self, result: BackupResult, out_dir: str,
                             backup_type: BackupType) -> BackupResult:
         """把 tar 产物镜像化为目录树（源结构一致）并合并 mirror_latest。
@@ -1356,6 +1374,31 @@ class FileBackupEngine(BackupEngine):
                         except OSError:
                             pass
 
+        # 清单「全备和增量备份目录夹都和源完全一致」：
+        # 默认 mirror_inc_ 是稀疏变化集（复制该目录即增量恢复）；
+        # 开启 mirror_full_tree 后把 latest 完整视图复制为本次增量目录，
+        # 稀疏集另存 mirror_inc_changes_<ts>/ 供快速恢复。
+        full_tree_note = ""
+        if (self.extra.get("mirror_full_tree")
+                and backup_type == BackupType.INCREMENTAL):
+            changes = os.path.join(out_dir, "mirror_inc_changes_%s" % ts)
+            try:
+                os.rename(mirror_dir, changes)
+                shutil.copytree(latest, mirror_dir, dirs_exist_ok=True)
+                total, n_files = 0, 0
+                for root, _dirs, files in os.walk(mirror_dir):
+                    for f in files:
+                        try:
+                            total += os.path.getsize(os.path.join(root, f))
+                            n_files += 1
+                        except OSError:
+                            pass
+                full_tree_note = (" | 增量完整树: 与源一致"
+                                 "（稀疏变化集: %s）" % os.path.basename(changes))
+            except Exception as e:
+                self.logger.warning("[%s] 增量完整树生成失败，保留稀疏目录: %s",
+                                    self.task_name, e)
+
         result.backup_path = mirror_dir
         result.size_bytes = total
         result.checksum = ""
@@ -1363,6 +1406,7 @@ class FileBackupEngine(BackupEngine):
         result.message = (f"{base_msg} | 镜像模式: {n_files} 文件 "
                           f"{db.human_size(total)}（目录树与源一致，可复制/挂载即恢复）"
                           f" | 最新视图: {latest}")
+        result.message += full_tree_note
         self.logger.info("[%s] 镜像化完成: %s（latest=%s）",
                          self.task_name, mirror_dir, latest)
         return result
@@ -1469,12 +1513,36 @@ class FileBackupEngine(BackupEngine):
         # （多源任务仍以第一个源作为快照基准，与既有增量语义一致。）
         base = pairs[0][0] if pairs else "/"
         sf = {}
+        _win_hashes = None
+        _win_scan_ok = False
         if src_type == "local":
             sf = _get_local_file_list(base, self._excludes())
+            _win_scan_ok = True
+        elif self._ssh_host_is_windows(src.get("host") or ""):
+            # Windows 通道：PowerShell Get-ChildItem / Get-FileHash 指纹清单。
+            # 失败时 **不保存空快照**，否则下次增量会把「清单没拿到」误判成
+            # 「文件全被删了」并在恢复时真去删文件。
+            try:
+                from core.engines import win_file as _wf
+                _ex = self.extra or {}
+                client = _get_ssh_client(src["host"])
+                sf, _win_hashes, _wmeta = _wf.scan_windows(
+                    client, base, excludes=self._excludes(),
+                    hash_mode=bool(_ex.get("win_hash_verify")),
+                    max_files=int(_ex.get("win_max_files") or _wf.DEFAULT_MAX_FILES))
+                _win_scan_ok = True
+                if _wmeta.get("unreadable"):
+                    self.logger.warning("[%s] Windows 有 %s 个目录无权限已跳过",
+                                        self.task_name, _wmeta["unreadable"])
+            except Exception as e:
+                self.logger.warning("[%s] Windows 指纹清单获取失败，本次全量不建立增量基线: %s",
+                                    self.task_name, str(e) or type(e).__name__)
+                sf, _win_scan_ok = {}, False
         else:
             try:
                 client = _get_ssh_client(src["host"])
                 sf = _get_remote_file_list(client, base, self._excludes()) or {}
+                _win_scan_ok = True
             except Exception as e:
                 self.logger.warning("[%s] 获取远程源文件列表失败: %s",
                                     self.task_name, str(e) or type(e).__name__)
@@ -1501,10 +1569,11 @@ class FileBackupEngine(BackupEngine):
         ratio = round(size / original, 6) if (original and size) else 0.0
         algo = self._resolve_compress_algo()
         checksum = db.sha256_file(final) if size > 0 else ""
-        # 保存快照作为下次增量基准，并记录本次全量归档路径供恢复链使用
-        # （Windows 通道 v1 无指纹清单：不保存空快照，防止增量误判"全部删除"）
-        if sf or not self._ssh_host_is_windows(src.get("host") or ""):
-            self._save_snapshot(sf, full_path=final)
+        # 保存快照作为下次增量基准，并记录本次全量归档路径供恢复链使用。
+        # Windows 通道现在有真实 PowerShell 指纹清单，只要清单获取成功就建立
+        # 基线；失败（_win_scan_ok=False）时绝不保存空快照。
+        if _win_scan_ok:
+            self._save_snapshot(sf, full_path=final, hashes=_win_hashes)
 
         message = f"全量备份完成 | {len(paths)} 个源 | {db.human_size(size)}"
         ds_stats = getattr(self, "_dedup_stats", None)
@@ -1594,8 +1663,14 @@ class FileBackupEngine(BackupEngine):
             self.logger.warning("[%s] 加载快照元数据失败: %s", self.task_name, e)
             return {}
 
+    def _load_snapshot_hashes(self, namespace: str = None) -> dict:
+        """读取精确模式保存的 SHA256 指纹（无则空字典）。"""
+        meta = self._load_snapshot_meta(namespace)
+        h = meta.get("hashes")
+        return h if isinstance(h, dict) else {}
+
     def _save_snapshot(self, snapshot: Dict[str, Tuple[int, int]], full_path: str = None,
-                       namespace: str = None) -> None:
+                       namespace: str = None, hashes: dict = None) -> None:
         """保存当前源文件状态快照，并在全量备份时记录对应的全量归档路径。"""
         path = self._snapshot_path(namespace)
         try:
@@ -1605,6 +1680,12 @@ class FileBackupEngine(BackupEngine):
             # 记下本次快照使用的排除规则：下次增量据此判断"规则是否变化"，
             # 避免把规则变化误当成大量文件被删除。
             meta["excludes"] = [str(x) for x in (self._excludes() or [])]
+            # 精确模式（Windows Get-FileHash）指纹；关闭模式时清掉旧值，
+            # 避免残留指纹参与后续比对造成误判。
+            if hashes is not None:
+                meta["hashes"] = hashes
+            else:
+                meta.pop("hashes", None)
             if full_path:
                 meta["last_full_path"] = full_path
             with open(path, "w", encoding="utf-8") as f:
@@ -1647,8 +1728,23 @@ class FileBackupEngine(BackupEngine):
         ex = self._excludes()
 
         # 1) 获取源文件列表（与打包同一套排除规则，保证"快照 == 归档里有什么"）
+        _win = src_type != "local" and self._ssh_host_is_windows(src.get("host") or "")
+        _win_hashes = None
         if src_type == "local":
             sf = _get_local_file_list(base, ex)
+        elif _win:
+            from core.engines import win_file as _wf
+            _ex = self.extra or {}
+            try:
+                client = _get_ssh_client(src["host"])
+                sf, _win_hashes, _wmeta = _wf.scan_windows(
+                    client, base, excludes=ex,
+                    hash_mode=bool(_ex.get("win_hash_verify")),
+                    max_files=int(_ex.get("win_max_files") or _wf.DEFAULT_MAX_FILES))
+            except Exception as e:
+                self.logger.warning("[%s] Windows 指纹清单获取失败，回退全量: %s",
+                                    self.task_name, str(e) or type(e).__name__)
+                return self._full_transfer(src, dst)
         else:
             client = _get_ssh_client(src["host"])
             sf = _get_remote_file_list(client, base, ex)
@@ -1664,6 +1760,12 @@ class FileBackupEngine(BackupEngine):
 
         # 3) 计算差异
         changed, deleted = self._diff_against_snapshot(sf, snapshot)
+        # 精确模式：size+mtime 没变但内容 SHA256 变了（时间戳被还原/改写）
+        # 的文件也要进入变化集，否则会漏备。
+        if _win and (self.extra or {}).get("win_hash_verify"):
+            from core.engines import win_file as _wf
+            changed = _wf.merge_hash_changes(
+                sf, _win_hashes or {}, changed, self._load_snapshot_hashes())
 
         # 排除规则一旦变化（含"旧快照还没有排除规则"），旧快照里那些被排除的文件
         # 会被 diff 误判成"已删除"，进而写进 .deleted.txt 在恢复时真被删掉。
@@ -1703,6 +1805,20 @@ class FileBackupEngine(BackupEngine):
         try:
             if src_type == "local":
                 self._tar_files_with_deleted(base, changed, deleted, archive_path)
+            elif _win:
+                # Windows 没有 tar -T 管道与 find：SFTP 逐文件拉到平台暂存，
+                # 平台侧用标准库 tarfile 打增量包（含 .deleted.txt）。
+                from core.engines import win_file as _wf
+                client = _get_ssh_client(src["host"])
+                stage = os.path.join(out_dir, ".win_inc_%s" % ts)
+                ok_list, failures = _wf.pull_changed(client, base, changed, stage)
+                if failures:
+                    shutil.rmtree(stage, ignore_errors=True)
+                    raise RuntimeError(
+                        "Windows 变化文件拉取失败 %d 个，首条：%s"
+                        % (len(failures), failures[0]))
+                _wf.tar_changed(stage, ok_list, deleted, archive_path)
+                shutil.rmtree(stage, ignore_errors=True)
             else:
                 self._tar_remote_files(changed, src, archive_path)
                 self._append_deleted_manifest(archive_path, deleted)
@@ -1715,7 +1831,7 @@ class FileBackupEngine(BackupEngine):
             return BackupResult(success=False, status=BackupStatus.FAILED, message=str(e))
 
         # 6) 保存新快照（作为下次增量基准）
-        self._save_snapshot(sf)
+        self._save_snapshot(sf, hashes=_win_hashes if _win else None)
 
         final = self._final_archive_path(archive_path)
         size = os.path.getsize(final) if os.path.exists(final) else 0
@@ -2329,8 +2445,9 @@ class FileBackupEngine(BackupEngine):
         - 零客户端：tar.exe 是 Win10 1803+/Server 2019+ 系统自带（bsdtar，
           UTF-8 文件名），仅需系统组件 OpenSSH Server；
         - 拉取统一走 SFTP（客户端什么都不装）；
-        - v1 全量语义：Windows 无 find/sha256sum，增量基线快照与源端去重
-          通道不支持，后续版本补 PowerShell 指纹清单。
+        - 本函数只负责「全量打包」；增量走 win_file.py 的 PowerShell
+          Get-ChildItem / Get-FileHash 指纹清单 + SFTP 拉变化文件通道
+          （见 _incremental_transfer 的 _win 分支）。
         """
         client = _get_ssh_client(src["host"])
         pairs = self._resolve_src_pairs(src)
@@ -2410,9 +2527,10 @@ class FileBackupEngine(BackupEngine):
 
         self.logger.info("[%s] [3/4] 清单就绪（%d 文件），比对文件库拉取差异…",
                          self.task_name, n_files)
+        cycle_id = self._dedup_cycle_id()
         local_map, stats = ds.pull_files_dedup(
             client, manifest, task_id=self.task.get("id"),
-            excludes=self._excludes())
+            excludes=self._excludes(), cycle_id=cycle_id)
 
         self.logger.info("[%s] [4/4] 平台重建 tar + 回读校验…", self.task_name)
         vr = ds.build_tar_from_manifest(manifest, local_map, archive_path,
@@ -2686,8 +2804,14 @@ class FileBackupEngine(BackupEngine):
                     if rc != 0:
                         raise RuntimeError(
                             f"远程解压失败(rc={rc}): {(_e or b'').decode('utf-8', 'replace')[:200]}")
-                # 应用增量删除清单（若归档含 .deleted.txt；Windows 通道 v1 无增量语义）
-                del_cmd = None if is_win_target else self._remote_deleted_cmd(remote_tmp, target_dir)
+                # 应用增量删除清单：Windows 目标无 python3，改用 PowerShell
+                # -EncodedCommand（纯 ASCII，中文路径不受代码页影响）。
+                if is_win_target:
+                    from core.engines import win_file as _wf
+                    del_cmd = _wf.win_delete_command(
+                        str(target_dir), _wf.read_deleted_manifest(item))
+                else:
+                    del_cmd = self._remote_deleted_cmd(remote_tmp, target_dir)
                 if del_cmd:
                     _o2, _e2, rc2 = cross_host._remote_exec_logged(
                         client, del_cmd, timeout=600, log=log)

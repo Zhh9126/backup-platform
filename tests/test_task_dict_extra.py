@@ -16,7 +16,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core import db as _db  # noqa: E402
 _db.init_schema()
 
+import pytest  # noqa: E402
 import core.models as models  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _clean_shared_tasks():
+    """隔离共享元库残留：本文件只验证 dict→JSON 归一，不关心存量任务数。
+
+    config.META_DB_PATH 是运行时读的模块属性，pytest 同进程收集多个测试模块
+    时后导入者的 env 不会改写已固化的 config；其它模块留下的备份任务会触发
+    社区版 5 个配额上限，导致这里无故 QuotaExceededError。
+    """
+    try:
+        _db.execute("DELETE FROM backup_tasks")
+    except Exception:
+        pass
+    yield
 
 
 def test_create_task_with_dict_extra_options():

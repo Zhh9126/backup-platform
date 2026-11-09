@@ -15,7 +15,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 容灾切换 · 恢复演练 · 预校验 · 克隆（VDB） · 不可变备份 · 巡检 · 监控 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v2.3.4-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v2.3.6-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -25,7 +25,14 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 ---
 
-> **最新动态**：v2.3.4（2026-11-09）已发布（修复离线包全新部署时 SQL Server JDBC 逻辑备份不可用）+ 2026-11-07 四库型（Oracle/PostgreSQL/金仓/达梦）全功能深度测试收官——
+> **v2.3.6 本轮要点**：群晖 DSM 全面纳管（设备/探活/共享文件夹资产/一键全量+增量任务/
+> 场景矩阵 S1–S11）、群晖文件级全量+增量引擎（HTTP Range 断点续传 + 恢复链 SHA256 硬核对）、
+> Windows 文件增量（PowerShell `Get-FileHash`/`LastWriteTimeUtc` 指纹清单，零安装）、
+> 异地容灾「云侧推对象存储 + 平台出站拉取」（免公网 IP，非 P2P 隧道）、
+> 按授权服务器数计量的 `distinct host` 视图、对象存储断点续传、AXUS 17 项对齐补齐。
+> Windows 真机（192.168.41.3 / SQL Server 2022）与真实 HTTP S3 推拉闭环均已实测。
+>
+> **最新动态**：v2.3.6（2026-11-09）已发布（修复离线包全新部署时 SQL Server JDBC 逻辑备份不可用）+ 2026-11-07 四库型（Oracle/PostgreSQL/金仓/达梦）全功能深度测试收官——
 > 每库覆盖「预检 → 逻辑备份 → 恢复（硬核对）→ 数据对比 → 物理备份 → 恢复校验 → 实时备份闭环」，
 > 其中 SQL Server 双通道（物理 SSH+sqlcmd / 逻辑 JDBC 免 SSH）、Windows 文件备份（内置 tar.exe 打包 + SFTP 拉取，零插件）、
 > 五库互对比矩阵 10/10 配对一致与对比报告导出（Excel/CSV）
@@ -386,8 +393,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v2.3.4    # 固定版本（可回滚）
-# 当前最新版本：v2.3.4（2026-11-07，五库对比矩阵+报告导出+实时触发式封存）
+docker pull ghcr.io/zhh9126/backup-platform:v2.3.6    # 固定版本（可回滚）
+# 当前最新版本：v2.3.6（2026-11-07，五库对比矩阵+报告导出+实时触发式封存）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -414,7 +421,7 @@ python tools/check_env.py
 docker load -i aidbm_2.2.0_offline.tar.gz
 
 # 自行导出
-docker save ghcr.io/zhh9126/backup-platform:v2.3.4 -o aidbm_2.3.4.tar
+docker save ghcr.io/zhh9126/backup-platform:v2.3.6 -o aidbm_2.3.4.tar
 # 内网机器导入
 docker load -i aidbm_2.2.0.tar
 ```
@@ -445,7 +452,7 @@ docker stop backup-platform
 docker rm backup-platform
 
 # 3. 用新版本镜像启动（命令与首次部署完全一致，仅换镜像 tag）
-docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.3.4
+docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.3.6
 
 # 4.（可选）删除旧版本镜像释放空间
 docker rmi ghcr.io/zhh9126/backup-platform:v2.1.0
@@ -463,7 +470,7 @@ docker stop backup-platform
 docker rm backup-platform
 
 # 2. 删除镜像
-docker rmi ghcr.io/zhh9126/backup-platform:v2.3.4
+docker rmi ghcr.io/zhh9126/backup-platform:v2.3.6
 
 # 3.（谨慎）删除数据卷 —— 会清掉全部备份产物与元数据，操作前务必
 #    先把备份文件拷贝转移！
@@ -587,6 +594,32 @@ docker build -t backup-platform:local .
 - 默认账号请立即修改（首登会标记 `must_change_password`）；生产环境建议限制来源 IP
 
 ## 更新日志
+
+### v2.3.6（2026-11-10，已发布）
+
+- **群晖 DSM 全面纳管**：`synology_devices` 设备表（凭据 SM4 加密、OTP 不落库）、
+  CRUD / 真实探活 / 共享文件夹资产 / 递归清单、`/synology` 页面、一键生成
+  `mixed_backup` 全量+增量任务；场景矩阵 S1–S11 覆盖 SMB/NFS/WebDAV 与 iSCSI 差异、
+  SAN Manager Target/LUN/CHAP/3260、三类 Initiator、单 LUN 多主机集群红线与交付信息模板。
+- **群晖全量+增量备份引擎**（`db_type=synology`）：FileStation Web API 文件级差分、
+  HTTP Range 断点续传、删除事件回放、恢复链逐文件 SHA256 硬核对；不承诺块级增量/CBT。
+- **Windows 文件增量**：PowerShell 指纹清单（UTF-8→Base64 绕开代码页），
+  可选 SHA256 内容指纹；清单失败/超限诚实回退全量且不保存空快照；删除清单 PowerShell 回放。
+- **异地容灾出站拉取**：`/remote-pull` 页 + `core/remote_pull.py`，云侧推摆渡包到对象存储、
+  平台出站拉取校验并登记 `backup_records`，幂等、可预览、周期调度；`push_record()` 为云侧参考实现。
+  明确不是 P2P 反向隧道，需双方都能出站访问同一对象存储。
+- **按授权服务器数计量**：`distinct host` 视图（5 类实体归一去重、平台自身不计入），
+  `/api/system/license/servers` 与设置页；可选强校验默认关闭，存量部署零破坏。
+- **AXUS 17 项对齐补齐**：Windows 客户端防勒索/防删除（零安装）、周期内局部重删、
+  备份结束通知默认启用且异步、最小间隔 60 秒、增量镜像完整树、排除规则真实生效。
+- **对象存储断点续传**：`.aidbm_part` + checkpoint TTL + scope digest + sha256 复验，
+  真实 HTTP S3 协议 E2E 36/36。
+- **真实验证**：Windows 192.168.41.3 真机 9/9（SSH/PowerShell、ACL 防护闭环、
+  SQL Server 2022 sa 登录与库清单、1433 直连）；真实 HTTP S3 推→拉闭环 12/12
+  （含中文逐字节硬核对）；跨模块回归 205 passed。
+- **诚实边界**：Defender CFA 在该真机上报 `0x800106ba`（服务未运行/第三方接管），
+  平台如实返回 `cfa=unknown`，ACL 通道独立可用；群晖/Windows 增量尚未跑各自真机全链路，
+  快照与块级增量未实现。
 
 ### v2.3.4（2026-11-09，已发布）
 

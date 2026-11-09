@@ -550,7 +550,7 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
     except Exception as e:
         _logger.warning("render_backup_result 失败，回退为纯文本: %s", e)
         html = None
-    notifier.Notifier(task, _logger).notify(
+    notifier.Notifier(task, _logger).notify_async(
         "success" if result.success else "failure", title, text=text, html=html)
     db.add_log("INFO" if result.success else "ERROR", "scheduler",
                f"task={task['id']} {task['name']} -> {status} ({db.human_size(size)})",
@@ -1282,6 +1282,31 @@ def _register_ferry(sched):
     _logger.info("[ferry] 已注册摆渡收件箱扫描任务（10 分钟）")
 
 
+# ------------------------- 异地容灾：出站拉取 -------------------------
+def _remote_pull_job_wrapper():
+    """调度触发的异地容灾出站拉取（各来源自带 interval 节流）。"""
+    try:
+        from core import remote_pull
+        stat = remote_pull.run_due_sources()
+        if stat.get("checked"):
+            _logger.info("[remote-pull] 本轮出站拉取: %s", stat)
+    except Exception:
+        _logger.exception("[remote-pull] 出站拉取异常")
+
+
+def _register_remote_pull(sched):
+    """注册出站拉取周期任务（默认每 10 分钟一轮，start 与 reload 都要注册）。"""
+    from apscheduler.triggers.interval import IntervalTrigger
+    try:
+        sched.remove_job("remote_pull_tick")
+    except Exception:
+        pass
+    sched.add_job(_remote_pull_job_wrapper, IntervalTrigger(minutes=10),
+                  id="remote_pull_tick", replace_existing=True,
+                  misfire_grace_time=3600)
+    _logger.info("[remote-pull] 已注册出站拉取周期任务（10 分钟）")
+
+
 # ------------------------- 备份产物保留策略定期清理 -------------------------
 def _cleanup_job_wrapper():
     """调度触发的备份保留清理：运行 core.backup_cleanup.run_cleanup()。
@@ -1747,6 +1772,7 @@ def start_scheduler():
     _register_synthesize(_scheduler)
     _register_gfs(_scheduler)
     _register_ferry(_scheduler)
+    _register_remote_pull(_scheduler)
     _register_cleanup(_scheduler)
     _register_immutable_check(_scheduler)
     _register_rt_backup(_scheduler)
@@ -1819,6 +1845,7 @@ def _reload_scheduler_locked():
     # 这里补齐，保证 reload_scheduler 后各周期 job 依然存在。
     _register_gfs(_scheduler)
     _register_ferry(_scheduler)
+    _register_remote_pull(_scheduler)
     _register_cleanup(_scheduler)
     _register_immutable_check(_scheduler)
     _register_dr_monitor(_scheduler)

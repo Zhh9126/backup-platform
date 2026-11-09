@@ -1858,6 +1858,8 @@
       const fullSched = _buildMixedSub("t_full") || { type: "none", cron_expr: "", days: "" };
       const incSched  = _buildMixedSub("t_inc")  || { type: "none", cron_expr: "", days: "" };
       let schedule_type = "none", cron_expr = "", interval_minutes = null;
+      const _ivEl = $("t_interval_minutes");
+      if (_ivEl && _ivEl.value) interval_minutes = Math.max(1, parseInt(_ivEl.value, 10) || 1);
       if (backupType === "full") {
         schedule_type = fullSched.type || "none";
         cron_expr = fullSched.cron_expr || "";
@@ -2094,6 +2096,8 @@
         return;
       }
       openTaskModal(t);
+      const _ivBack = $("t_interval_minutes");
+      if (_ivBack) _ivBack.value = t.interval_minutes || 60;
     } catch (e) {
       console.error("[editTask]", e);
       toast("打开编辑失败：" + (e && e.message ? e.message : String(e)), "danger");
@@ -3985,6 +3989,10 @@
       $("f_exclude_patterns").value = (extra.exclude_patterns || []).join("\n");
       if ($("f_mirror_mode")) $("f_mirror_mode").checked = !!extra.file_mirror;
       if ($("f_source_dedup")) $("f_source_dedup").checked = !!extra.source_dedup;
+      if ($("f_dedup_scope")) $("f_dedup_scope").value = extra.dedup_scope || "global";
+      if ($("f_mirror_full_tree")) $("f_mirror_full_tree").checked = !!extra.mirror_full_tree;
+      if ($("f_win_hash_verify")) $("f_win_hash_verify").checked = !!extra.win_hash_verify;
+      if ($("f_win_max_files")) $("f_win_max_files").value = extra.win_max_files || 50000;
       // 按天调度回填：单任务主 schedule 映射到对应子区；mixed 同时回填两套
       const bt = task.backup_type || "full";
       if (bt === "full") {
@@ -4060,6 +4068,10 @@
       exclude_patterns: $("f_exclude_patterns").value.split("\n").map((s) => s.trim()).filter(Boolean),
       file_mirror: !!($("f_mirror_mode") && $("f_mirror_mode").checked),
       source_dedup: !!($("f_source_dedup") && $("f_source_dedup").checked),
+      dedup_scope: ($("f_dedup_scope") ? $("f_dedup_scope").value : "global"),
+      mirror_full_tree: !!($("f_mirror_full_tree") && $("f_mirror_full_tree").checked),
+      win_hash_verify: !!($("f_win_hash_verify") && $("f_win_hash_verify").checked),
+      win_max_files: Math.max(1, parseInt(($("f_win_max_files") || {}).value, 10) || 50000),
       follow_symlinks: false,
       encrypt_pool: !!($("f_encrypt_pool")?.checked),
     };

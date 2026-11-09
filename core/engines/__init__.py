@@ -31,6 +31,7 @@ from core.engines.mongodb import MongoEngine
 from core.engines.neo4j import Neo4jEngine
 from core.engines.file import FileBackupEngine
 from core.engines.object_storage import ObjectStorageEngine
+from core.engines.synology import SynologyEngine
 from core.engines.qdrant import QdrantEngine
 from core.engines.chroma import ChromaEngine
 from core.engines.highgo import HighGoEngine
@@ -73,6 +74,7 @@ ENGINE_REGISTRY = {
     "neo4j": Neo4jEngine,
     "file": FileBackupEngine,
     "object_storage": ObjectStorageEngine,
+    "synology": SynologyEngine,
     "qdrant": QdrantEngine,
     "chroma": ChromaEngine,
     # 国产数据库协议兼容层（PG 系 / MySQL 系复用既有引擎）
@@ -90,7 +92,7 @@ ENGINE_DISPLAY["vm"] = "虚拟机"
 # peripheral_api : 外围引擎以 API 集成封装为主（逻辑导出 + 远程调用）
 _CORE_SELF = ("oracle", "kingbase", "dameng")
 _PERIPHERAL_API = ("mysql", "mariadb", "postgresql", "sqlserver",
-                   "redis", "mongodb", "neo4j", "file", "vm", "object_storage",
+                   "redis", "mongodb", "neo4j", "file", "vm", "object_storage", "synology",
                    "qdrant", "chroma", "highgo", "uxdb", "tidb", "oceanbase")
 for _name in _CORE_SELF:
     if _name in ENGINE_REGISTRY:
@@ -148,6 +150,16 @@ _ENGINE_META_OVERRIDE = {
         "backup_modes": ["logical"],
         # 增量仅企业版「在线 backup」通道原生支持（--type=DIFF），
         # 其余通道由引擎诚实回退为全量并给出说明。
+        "supports_incremental": True,
+        "supports_full_instance": False,
+        "supports_sync": False,
+    },
+    "synology": {
+        "icon": "bi-hdd-network",
+        "description": "群晖 NAS（DSM）：FileStation Web API 文件级全量 + "
+                       "size/mtime 增量，HTTP Range 断点续传，DSM 侧零安装；"
+                       "SAN Manager 裸 LUN 不直接读取，iSCSI 场景请备份业务主机挂载点",
+        "backup_modes": ["logical"],
         "supports_incremental": True,
         "supports_full_instance": False,
         "supports_sync": False,

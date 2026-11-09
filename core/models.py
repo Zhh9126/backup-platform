@@ -44,19 +44,46 @@ def _normalize_json_fields(data: dict) -> dict:
     return data
 
 
+def _clamp_interval(data: dict) -> dict:
+    """调度间隔下限 60 秒：interval_minutes 最小 1，组合子调度同理。
+
+    APScheduler 的 IntervalTrigger(minutes=0) 会抛异常，负数会被当成
+    立即反复触发；这里在任何写入口统一钳制，保证「最小间隔 60 秒」。
+    """
+    v = data.get("interval_minutes")
+    if v == "":
+        data["interval_minutes"] = None
+    elif v is not None:
+        try:
+            data["interval_minutes"] = max(1, int(v))
+        except (TypeError, ValueError):
+            data["interval_minutes"] = None
+    for expr_key, type_key in (("full_schedule_expr", "full_schedule_type"),
+                               ("incremental_schedule_expr", "incremental_schedule_type")):
+        if str(data.get(type_key) or "") == "interval" and data.get(expr_key) not in (None, ""):
+            try:
+                data[expr_key] = str(max(1, int(data[expr_key])))
+            except (TypeError, ValueError):
+                pass
+    return data
+
+
 def create_task(data: dict) -> int:
     # 商业授权与配额强校验（社区免费版每类限 5 个）
     from core import license as license_mod
     _dt = data.get("db_type")
-    if _dt == "file":
+    if _dt in ("file", "synology"):
+        # 群晖是 NAS 文件级备份，归入 file 配额，不挤占数据库任务名额
         license_mod.check_quota("file")
     elif _dt == "object_storage":
         license_mod.check_quota("object_storage")
     else:
         license_mod.check_quota("database")
+    # 可选「按授权服务器数计量」：默认关闭，开启后同一主机多任务只占一个名额
+    license_mod.check_server_quota(data.get("host"))
 
     data = {k: data.get(k) for k in TASK_FIELDS}
-    data = _normalize_json_fields(data)
+    data = _clamp_interval(_normalize_json_fields(data))
     # 压缩级 1~29（对标 DBackup：1-8 gzip / 9-22 zstd / 23-29 zstd 高档）
     try:
         _cl = int(data.get("compress_level") or 0)
@@ -101,7 +128,7 @@ def update_task(task_id: int, data: dict) -> bool:
     data = {k: v for k, v in data.items() if k in TASK_FIELDS}
     if not data:
         return False
-    data = _normalize_json_fields(data)
+    data = _clamp_interval(_normalize_json_fields(data))
     data["updated_at"] = db.now_iso()
     sets = []
     params = []
@@ -526,6 +553,12 @@ def create_record(data: dict) -> int:
     fields = ["task_id", "db_type", "backup_type", "started_at", "finished_at",
               "duration_sec", "status", "size_bytes", "backup_path", "checksum",
               "is_simulated", "message"]
+    # backup_records 表没有 note 列。ferry_inbox.ingest_one 等导入通道传 note
+    # 作为「摆渡导入 / 异地副本」的来源标记，以前被白名单静默丢弃，导致导入
+    # 记录与正常备份无法区分。成功导入时 message 通常为空，映射到它保留审计。
+    if data.get("note") and not data.get("message"):
+        data = dict(data)
+        data["message"] = data["note"]
     data = {k: data.get(k) for k in fields}
     cols = list(data.keys())
     sql = "INSERT INTO backup_records ({}) VALUES ({})".format(

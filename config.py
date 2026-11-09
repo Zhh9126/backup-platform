@@ -23,7 +23,7 @@ else:
 # ---------- 产品标识 ----------
 # 产品正式名称与版本（对外 API 文档、健康检查、报告落款统一取这里，避免各处硬编码）。
 PLATFORM_NAME = os.environ.get("AIDBM_NAME", "AIDBM")
-PLATFORM_VERSION = os.environ.get("AIDBM_VERSION", "2.3.5")
+PLATFORM_VERSION = os.environ.get("AIDBM_VERSION", "2.3.6")
 
 # ---------- 路径 ----------
 BACKUP_ROOT = os.environ.get("BACKUP_ROOT", str(BASE_DIR / "backups"))
@@ -169,7 +169,7 @@ DEFAULT_PORTS = {
     "opengauss": 26000,
     "panwei": 12800,  # 磐维集中式常用默认端口，任务中可改（分布式以实际 CN 端口为准）
     "dameng": 5236, "sqlserver": 1433, "redis": 6379, "mongodb": 27017,
-    "neo4j": 7687, "object_storage": 9000,
+    "neo4j": 7687, "object_storage": 9000, "synology": 5000,
 }
 
 # 各类型显示名
@@ -180,6 +180,7 @@ DB_DISPLAY_NAMES = {
     "dameng": "DM 达梦", "sqlserver": "SQL Server",
     "redis": "Redis", "mongodb": "MongoDB", "file": "文件",
     "neo4j": "Neo4j", "vm": "虚拟机", "object_storage": "对象存储",
+    "synology": "群晖 NAS（DSM）",
     # 国产数据库协议兼容层（2026-11-03）
     "highgo": "HighGo（瀚高）", "uxdb": "UXDB（优炫）",
     "tidb": "TiDB", "oceanbase": "OceanBase",
@@ -209,8 +210,8 @@ BACKUP_STATUS_DISPLAY_NAMES = {
 
 # ---------- 通知默认（任务级可覆盖） ----------
 NOTIFY_DEFAULTS = {
-    "enabled": os.environ.get("NOTIFY_ENABLED", "false").lower() == "true",
-    "on_success": os.environ.get("NOTIFY_ON_SUCCESS", "false").lower() == "true",
+    "enabled": os.environ.get("NOTIFY_ENABLED", "true").lower() == "true",
+    "on_success": os.environ.get("NOTIFY_ON_SUCCESS", "true").lower() == "true",
     "on_failure": os.environ.get("NOTIFY_ON_FAILURE", "true").lower() == "true",
     "channels": [],  # [{"type":"webhook|dingtalk|wechat|feishu|email", ...}]
 }

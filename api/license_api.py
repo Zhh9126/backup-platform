@@ -22,11 +22,23 @@ def get_system_license():
             "data": {
                 "license": info,
                 "quotas": quotas,
+                "server_view": license.server_view(),
             }
         })
     except Exception as e:
         logger.error("获取授权状态失败: %s", e)
         return jsonify({"code": 500, "error": f"获取授权信息异常: {e}"}), 500
+
+
+@api_bp.route("/system/license/servers", methods=["GET"])
+@login_required
+def get_license_servers():
+    """按 distinct host 的授权计量视图（同一服务器多任务只占一个名额）。"""
+    try:
+        return jsonify({"code": 0, "data": license.server_view()})
+    except Exception as e:
+        logger.error("获取服务器计量视图失败: %s", e)
+        return jsonify({"code": 500, "error": str(e)}), 500
 
 
 @api_bp.route("/system/license/mac", methods=["GET"])

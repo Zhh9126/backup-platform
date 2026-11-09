@@ -121,6 +121,22 @@
         </div>
       </div>
 
+      <div class="col-md-4">
+        <label class="form-label d-block">断点续传</label>
+        <div class="d-flex align-items-center gap-2 flex-wrap">
+          <div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="os_resume" checked>
+            <label class="form-check-label" for="os_resume">中断 / 停止后重跑接着传</label>
+          </div>
+          <label class="small text-muted mb-0" for="os_resume_ttl">有效期</label>
+          <input class="form-control form-control-sm" id="os_resume_ttl" type="number"
+                 min="0" max="720" value="72" style="width:78px"
+                 title="超过该小时数后断点自动作废并重新校验源对象；0 表示不过期">
+          <span class="small text-muted">小时</span>
+        </div>
+        <div class="small text-muted mt-1">单对象用 HTTP Range 从已下载字节续传；已完成对象按 ETag / 大小 / 修改时间 / 版本逐一校验后跳过，绝不复用错字节。</div>
+      </div>
+
       <div class="col-12"><hr class="my-1"></div>
 
       <div class="col-md-3">
@@ -325,5 +341,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/js/object_storage.js?v=2026110309"></script>
+<script src="/static/js/object_storage.js?v=2026110902"></script>
 {% endblock %}

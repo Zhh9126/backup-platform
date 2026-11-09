@@ -14,7 +14,7 @@
 | 5 | 文件镜像备份（目录与源端完全一致） | file_mirror 镜像模式 + mirror_latest 最新视图（直接挂载可用） | 🟢 对齐 |
 | 6 | 重复数据删除（周期内局部重删，跨周期不重删） | **不同实现且更强**：源端传输去重（文件级，实测 95.5% 节省带宽）+ 全局块级去重（引用计数+损坏自动重拉兜底）。对方"跨周期不重删"是怕块库损坏全灭——AIDBM 用校验+兜底重拉+不可变存储解决同一安全问题 | 🟢 实现不同/能力更强 |
 | 7 | 全备+增量 | 文件增量 `_incremental_transfer`（diff/打包/快照）+ DB 增量链 | 🟢 |
-| 8 | 客户端平台 Windows/Linux | **零 Agent**：Linux SSH 原生；Windows 文件源经 SMB/共享目录挂载路径支持（无 Windows agent，不做桌面级） | 🟡 定位不同（诚实标注） |
+| 8 | 客户端平台 Windows/Linux | **零 Agent**：Linux 走 SSH + tar；Windows 走用户已启用的 OpenSSH + 系统内置 tar.exe → SFTP 断点续传拉回（真机 2026-11-06 已验证）。**SMB/共享目录挂载路径当前未实现**，属群晖/NAS 适配待办 | 🟡 定位不同（诚实标注） |
 | 9 | **一键备份** | **原缺失 → 本轮已实现**：任务页「一键备份」按钮（bi-lightning），对全部启用任务逐个异步触发全量，POST /api/tasks/quick-backup 返回逐任务受理结果 | 🟢 已补齐 |
 | 10 | 备份间隔最小 60 秒 | interval_minutes 分钟粒度（最小 1 分钟）；秒级间隔由 rt_enabled CDP（秒级 RPO）覆盖 | 🟢 语义等效 |
 | 11 | 邮件通知 | core/notifier.py + email_template.py（备份结果邮件卡片）+ SMTP 配置 | 🟢 |

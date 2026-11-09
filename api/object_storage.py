@@ -252,3 +252,48 @@ def api_os_restore():
         "granular": bool(payload.get("keys")),
         "stderr": res.stderr or "",
     }), 201 if res.success else 500
+
+
+def _resume_context(task_id: int):
+    """构造某任务的断点目录与 scope，供查询/清除共用。"""
+    from core import models
+    from core.engines import get_engine
+    from core.objectstore.providers import task_cfg
+    from core.objectstore import resume as osr
+    import config
+    task = models.get_task(task_id)
+    if not task or task.get("db_type") != "object_storage":
+        raise LookupError("对象存储备份任务不存在: %s" % task_id)
+    cfg = task_cfg(task)
+    engine = get_engine("object_storage", task, config.BACKUP_ROOT)
+    bt = "incremental" if task.get("backup_type") == "incremental" else "full"
+    scope = osr.scope_digest(task_id, task.get("name"), cfg, bt)
+    return engine._output_dir(), scope, cfg, osr
+
+
+@api_bp.route("/object-storage/tasks/<int:task_id>/resume-status", methods=["GET"])
+@login_required
+def api_os_resume_status(task_id):
+    """断点现状：已完成对象数、已下载字节、part 残件、TTL 与是否可续。"""
+    try:
+        out_dir, scope, cfg, osr = _resume_context(task_id)
+    except LookupError as e:
+        return contract.error_response(_NOT_FOUND, str(e))
+    st = osr.status(out_dir, scope, cfg.get("resume_ttl_hours") or 72)
+    st.update({"ok": True, "task_id": task_id,
+               "resume_enabled": bool(cfg.get("resume", True)),
+               "scope": scope})
+    return jsonify(st)
+
+
+@api_bp.route("/object-storage/tasks/<int:task_id>/resume", methods=["DELETE"])
+@login_required
+def api_os_resume_clear(task_id):
+    """放弃断点：清空 stage，下次备份从头全量传输。"""
+    try:
+        out_dir, _scope, _cfg, osr = _resume_context(task_id)
+    except LookupError as e:
+        return contract.error_response(_NOT_FOUND, str(e))
+    osr.clear(osr.stage_path(out_dir))
+    return jsonify({"ok": True, "task_id": task_id,
+                    "message": "断点已清除，下次备份将从头开始"})

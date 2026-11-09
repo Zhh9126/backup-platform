@@ -35,9 +35,26 @@ db.init_schema()                                # noqa: E402
 # 固化，运行期一律用这里的常量（跨模块共享全局 config 的已知污染规避）
 _BACKUP_ROOT = os.environ["BACKUP_ROOT"]
 
+import pytest                                   # noqa: E402
 import core.models as models                    # noqa: E402
 from core import immutability as imm            # noqa: E402
 from core.immutability import ImmutabilityViolation  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolate_meta_db():
+    """本文件在 import 时固化了自己的临时元库，但 config.META_DB_PATH 是运行时
+    读的模块属性：pytest 同进程收集其它测试模块后会被改写，导致这里落到别的库，
+    残留任务触发社区版 5 个配额上限（HEAD 基线同样如此）。每个用例前把连接
+    指回本文件的库并清掉存量任务，保持用例独立、不改变被测行为。
+    """
+    config.META_DB_PATH = _MODULE_DB
+    config.BACKUP_ROOT = _BACKUP_ROOT
+    try:
+        db.execute("DELETE FROM backup_tasks")
+    except Exception:
+        pass
+    yield
 
 
 def _sha(path: str) -> str:

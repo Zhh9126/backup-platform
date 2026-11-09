@@ -348,6 +348,18 @@ def create_app() -> Flask:
     def file_backup_page():
         return render_template("file_backup.html", page="file_backup")
 
+    @app.route("/synology")
+    @login_required
+    def synology_page():
+        """群晖 DSM 全面纳管：设备/探活/共享文件夹资产/一键全量+增量备份任务。"""
+        return render_template("synology.html", page="synology")
+
+    @app.route("/remote-pull")
+    @login_required
+    def remote_pull_page():
+        """异地容灾：云侧推对象存储 + 平台出站拉取（免公网 IP / 零反向隧道）。"""
+        return render_template("remote_pull.html", page="remote_pull")
+
     @app.route("/netdev")
     @login_required
     def netdev_page():

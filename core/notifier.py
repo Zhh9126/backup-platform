@@ -139,6 +139,13 @@ class Notifier:
         if event == "failure" and not self.cfg.get("on_failure"):
             return
         channels = self.cfg.get("channels") or []
+        if not channels:
+            # 默认「备份结束即通知」已开启；未配置渠道时不静默吞掉，
+            # 留一条可追溯提示引导管理员去系统设置配 SMTP。
+            self.logger.info("备份结束通知已启用但未配置渠道，跳过外发"
+                             "（系统设置 → 通知配置）")
+            db.add_log("INFO", "notify", "备份结束通知未配置渠道，未外发")
+            return
         for ch in channels:
             ctype = ch.get("type")
             try:
@@ -159,3 +166,23 @@ class Notifier:
                            f"{ctype} {event} -> ok={ok} {detail}")
             except Exception as e:
                 self.logger.error("通知失败[%s]: %s", ctype, e)
+
+    def notify_async(self, event: str, title: str, text: str,
+                     html: str = None) -> None:
+        """备份结束通知异步发送：SMTP/Webhook 抖动不拖慢备份主链路。
+
+        线程为 daemon，服务常驻期间可正常送达；通知失败只记日志，绝不
+        改变备份结果。调用方仍可同步调用 notify() 做即时测试。
+        """
+        import threading
+
+        def _run():
+            try:
+                self.notify(event, title, text, html=html)
+            except Exception as e:
+                try:
+                    self.logger.error("异步通知异常[%s]: %s", event, e)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_run, daemon=True, name="aidbm-notify").start()

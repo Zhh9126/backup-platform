@@ -490,7 +490,9 @@ def api_trigger_replicate(record_id):
         return jsonify({"error": "关联任务不存在"}), 404
 
     try:
-        result = tier_replication.replicate_to_tiers(path, task, record_id)
+        # manual=True：界面「立即复制」在「仅手动触发」策略下仍可执行
+        result = tier_replication.replicate_to_tiers(path, task, record_id,
+                                                     manual=True)
         return jsonify({"ok": True, "result": result})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500

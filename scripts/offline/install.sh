@@ -61,6 +61,18 @@ if [[ "$MODE" == "docker" ]]; then
   mkdir -p "$INSTALL_DIR"
   # 备份产物持久化目录：容器内落盘 /data/backups，映射到 ${INSTALL_DIR}/data（宿主持久卷）
   mkdir -p "$INSTALL_DIR/data/backups" "$INSTALL_DIR/data/instance" "$INSTALL_DIR/data/logs"
+  # 磁带库 / 机械手设备透传：TAPE_DEVICES="/dev/tape/by-id/xxx-nst /dev/sg2"
+  # 必须用 --device 等价的 devices: 同时创建节点并放行设备 cgroup；
+  # 单纯挂载 /dev 目录会被 cgroup 拦截。未设置时不生成任何设备条目（零影响）。
+  tape_device_block=""
+  if [[ -n "${TAPE_DEVICES:-}" ]]; then
+    tape_device_block="    devices:"
+    for dev in $TAPE_DEVICES; do
+      [[ -e "$dev" ]] || log "提示: 磁带设备 $dev 当前不存在，仍写入 compose（硬件接入后重启容器生效）"
+      tape_device_block="${tape_device_block}
+      - ${dev}:${dev}:rwm"
+    done
+  fi
   cat > "$INSTALL_DIR/docker-compose.yml" <<EOF
 services:
   backup-platform:
@@ -75,6 +87,7 @@ services:
       - BACKUP_ROOT=/data/backups
     volumes:
       - ${INSTALL_DIR}/data:/data
+${tape_device_block}
     restart: unless-stopped
 EOF
   if [[ $WITH_MINIO -eq 1 ]]; then

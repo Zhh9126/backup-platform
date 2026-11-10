@@ -79,6 +79,10 @@ RUN apt-get update \
        libdbi-perl \
        libdbd-mysql-perl \
        postgresql-client \
+       mt-st \
+       mtx \
+       lsscsi \
+       sg3-utils \
     && ln -fs /usr/share/zoneinfo/$TZ /etc/localtime \
     && rm -rf /var/lib/apt/lists/*
 

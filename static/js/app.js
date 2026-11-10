@@ -18,6 +18,36 @@
   var META = BKP.META;
   var taskModal = null;
 
+  // ---- 任务多选（跨分页保留选中集合；一键备份按勾选清单并行提交）----
+  window.taskSel = window.taskSel || new Set();
+  function _updateTaskSelCount() {
+    const el = document.getElementById("taskSelCount");
+    if (el) el.textContent = window.taskSel.size ? `已选 ${window.taskSel.size} 项` : "";
+    const all = document.getElementById("taskSelAll");
+    if (all) {
+      const boxes = Array.from(document.querySelectorAll("#taskTable .task-sel"));
+      all.checked = boxes.length > 0 && boxes.every(b => b.checked);
+      all.indeterminate = !all.checked && boxes.some(b => b.checked);
+    }
+  }
+  // 事件委托：表格重渲染/翻页后依然有效（不能绑在行上）
+  document.addEventListener("change", function (e) {
+    const t = e.target;
+    if (!t || !t.matches) return;
+    if (t.id === "taskSelAll") {
+      document.querySelectorAll("#taskTable .task-sel").forEach(b => {
+        const tid = Number(b.getAttribute("data-task-id"));
+        b.checked = t.checked;
+        if (t.checked) window.taskSel.add(tid); else window.taskSel.delete(tid);
+      });
+      _updateTaskSelCount();
+    } else if (t.matches(".task-sel")) {
+      const tid = Number(t.getAttribute("data-task-id"));
+      if (t.checked) window.taskSel.add(tid); else window.taskSel.delete(tid);
+      _updateTaskSelCount();
+    }
+  });
+
   // ---- 备份记录统一展示（四要素）：业务系统 + IP + 备份类型 + 备份时间 ----
   var fmtRecordLabel = function (r) {
     if (!r) return "-";
@@ -1999,6 +2029,7 @@
     const pg = Pager.slice("tasks", tasks);
     $("taskTable").innerHTML = pg.list.map((t, ti) =>
       `<tr data-task-id="${t.id}">
+        <td><input type="checkbox" class="task-sel" data-task-id="${t.id}" ${window.taskSel.has(t.id) ? "checked" : ""}></td>
         <td>${pg.startNo + ti}</td>
         <td>${esc(t.biz_label || "-")}</td>
         <td>${esc(t.name)}</td>
@@ -2027,11 +2058,12 @@
           <button class="btn-row btn-row-danger" onclick="delTask(${t.id})" title="${T("删除")}"><i class="bi bi-trash"></i> ${T("删除")}</button>
         </td>
       </tr>`).join("") ||
-      '<tr><td colspan="13"><div class="empty-state"><i class="bi bi-inboxes"></i>'
+      '<tr><td colspan="14"><div class="empty-state"><i class="bi bi-inboxes"></i>'
       + '<div class="empty-title">' + T("还没有备份任务") + '</div>'
       + T('点击右上角「新建任务」，一分钟配置第一个数据库备份') + '</div></td></tr>';
     renderTaskKpi(tasks);
     Pager.attach("tasks", $("taskTable"), pg.page, pg.pages, pg.total, loadTasks);
+    _updateTaskSelCount();
     _focusTaskRow();
   }
 
@@ -2077,15 +2109,19 @@
   window.runTask = async (id) => {
     const ok = await confirmDialog({
       title: "确认立即备份？",
-      message: "将对该任务执行一次手动备份，确认继续？",
+      message: "将把该任务提交到并行执行队列，可连续对多个任务发起备份，确认继续？",
       confirmText: "立即备份",
       danger: false,
     });
     if (!ok) return;
     try {
-      const r = await api("POST", `/api/tasks/${id}/run`);
-      toast("备份完成：" + r.status);
+      // 统一走异步队列：不再同步等待整个备份跑完，多任务可同时发起
+      const r = await api("POST", `/api/tasks/${id}/run`, { async: true });
+      toast(r && r.accepted
+        ? "已提交并行执行队列，可在备份记录页查看进度"
+        : "备份完成：" + ((r && r.status) || "-"));
       await loadTasks();
+      setTimeout(loadTasks, 2000);
     } catch (e) { toast(e.message, "danger"); }
   };
   window.editTask = async (id) => {
@@ -2318,15 +2354,19 @@
     if ($("cl_scan_btn")) $("cl_scan_btn").onclick = () => cleanupPlan();
     if ($("cl_run_btn")) $("cl_run_btn").onclick = cleanupRun;
     if ($("cl_save_btn")) $("cl_save_btn").onclick = cleanupSaveConfig;
-    // 一键备份（对标中科热备）：对全部启用任务立即触发一次全量备份
+    // 一键备份（对标中科热备）：勾选则并行提交勾选任务，未勾选则全部启用任务
     if ($("quickBackupBtn")) {
       $("quickBackupBtn").onclick = () => {
-        if (!confirm("一键备份：立即对全部启用任务执行一次全量备份？\n" +
-            "任务将逐个异步触发，可在备份记录页查看进度。")) return;
+        const ids = Array.from(window.taskSel || []);
+        const title = ids.length
+          ? `一键备份：立即对勾选的 ${ids.length} 个任务并行执行全量备份？`
+          : "一键备份：立即对全部启用任务并行执行全量备份？";
+        if (!confirm(title +
+            "\n任务将同时提交并行执行队列，可在备份记录页查看进度。")) return;
         apiFetch("/api/tasks/quick-backup", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
+          body: JSON.stringify(ids.length ? { task_ids: ids } : {}),
         }).then(r => {
           if (!r.ok && !r.body) throw new Error(r.error || "HTTP " + r.status);
           const d = r.body || {};
@@ -2556,7 +2596,13 @@
         actions.unshift(`<button class="btn btn-sm btn-outline-secondary" onclick="viewRecordLog(${r.id})" title="查看详细日志"><i class="bi bi-file-text"></i></button>`);
       }
       if (canRestore) {
-        actions.push(`<button class="btn btn-sm btn-outline-warning" onclick="runSecurityCheck(${r.id})" title="恢复点安全检测（体积突变/熵值/结构嗅探，启发式，非病毒查杀）"><i class="bi bi-shield-check"></i></button>`);
+        if (r.locked) {
+          actions.push(`<button class="btn btn-sm btn-outline-warning" onclick="unlockRecord(${r.id})" title="解除保留锁定（需安全权限并填写原因，留 critical 审计）"><i class="bi bi-unlock"></i></button>`);
+        } else {
+          actions.push(`<button class="btn btn-sm btn-outline-secondary" onclick="lockRecord(${r.id})" title="施加保留锁定（WORM，禁止清理/删除产物）"><i class="bi bi-lock"></i></button>`);
+        }
+        actions.push(`<button class="btn btn-sm btn-outline-secondary" onclick="verifyRecordIntegrity(${r.id})" title="完整性复检：重算 sha256 与基线比对，漂移将触发防勒索隔离"><i class="bi bi-fingerprint"></i></button>`);
+        actions.push(`<button class="btn btn-sm btn-outline-warning" onclick="runSecurityCheck(${r.id})" title="恢复点安全检测（体积突变/熵值/结构嗅探，启发式，非病毒查杀；结论落库）"><i class="bi bi-shield-check"></i></button>`);
         actions.push(`<button class="btn btn-sm btn-outline-info" onclick="BKP.runRestorePrecheck(${r.id})" title="恢复预检：先探测产物/完整性/目标端/工具/空间能否支持恢复"><i class="bi bi-clipboard2-check"></i></button>`);
         actions.push(`<button class="btn btn-sm btn-outline-secondary" onclick="openPoolReplicas(${r.id})" title="副本分布：该备份在两地三中心各池的副本与取回"><i class="bi bi-collection"></i></button>`);
       }
@@ -2565,6 +2611,11 @@
         actions.push(`<button class="btn btn-sm btn-outline-primary" onclick="openPitrModal(${r.id})" title="任意时间点恢复">PITR</button>`);
         actions.push(`<button class="btn btn-sm btn-outline-info" onclick="openObjectModal(${r.id})" title="表级/对象级精准恢复（从备份产物勾选单表直接恢复）">对象</button>`);
       }
+      const secBadge = r.quarantined
+        ? '<span class="badge bg-danger" title="已被防勒索隔离：禁止恢复与下载">已隔离</span>'
+        : (r.security_level === "suspect"
+          ? '<span class="badge bg-warning" title="安全检测发现可疑特征，需人工复核">可疑</span>'
+          : (r.locked ? '<span class="badge bg-success" title="保留锁定中：禁止清理/删除">锁定</span>' : ""));
       const checked = window.recordSel.has(r.id) ? " checked" : "";
       return `<tr>
         <td><input type="checkbox" class="form-check-input rec-sel" data-id="${r.id}"${checked}></td>
@@ -2574,7 +2625,7 @@
         <td>${esc(r.db_type_display || r.db_type || "-")}</td>
         <td>${fmtTime(r.started_at)}</td>
         <td>${esc(fmtDuration(r.duration_sec))}</td>
-        <td>${statusBadge(r.status)} ${verifyBadge}</td>
+        <td>${statusBadge(r.status)} ${verifyBadge} ${secBadge}</td>
         <td>${esc(r.size_human || "")}</td>
         <td class="text-truncate" style="max-width:150px" title="${esc(r.checksum || "")}">${esc((r.checksum || "").slice(0, 12) || "-")}</td>
         <td>${cdc}</td>
@@ -2679,6 +2730,38 @@
     } catch (e) {
       toast("加载日志失败: " + e.message, "danger");
     }
+  };
+
+  // ---- 防勒索：保留锁定 / 解锁 / 完整性复检 ----
+  window.lockRecord = async (id) => {
+    const reason = prompt(`对备份记录 #${id} 施加保留锁定（默认永久）？\n请填写原因（可留空）：`);
+    if (reason === null) return;
+    try {
+      const r = await api("POST", `/api/records/${id}/lock`,
+        { days: 0, reason: reason || "" });
+      toast(`已锁定：写保护 ${r.write_protected || 0} 个文件` +
+        (r.fs_immutable ? "，内核 immutable 已生效" : ""));
+      await loadRecords();
+    } catch (e) { toast("锁定失败: " + e.message, "danger"); }
+  };
+  window.unlockRecord = async (id) => {
+    const reason = prompt(`解除记录 #${id} 的保留锁定？\n这是抗勒索关键闸门，请填写原因（审计必填）：`);
+    if (!reason || !reason.trim()) return;
+    try {
+      await api("POST", `/api/records/${id}/unlock`, { reason });
+      toast("已解除保留锁定（已留 critical 审计）");
+      await loadRecords();
+    } catch (e) { toast("解锁失败: " + e.message, "danger"); }
+  };
+  window.verifyRecordIntegrity = async (id) => {
+    try {
+      const r = await api("POST", `/api/records/${id}/verify-integrity`, {});
+      const drift = r.status === "drift";
+      toast(`完整性复检：${r.message || r.status}` +
+        (drift ? "（已触发防勒索隔离与告警）" : ""),
+        drift ? "danger" : "success");
+      await loadRecords();
+    } catch (e) { toast("复检失败: " + e.message, "danger"); }
   };
 
   // ---- 恢复点安全检测（启发式：体积/熵值/结构，非病毒查杀）----
@@ -3149,9 +3232,38 @@
       if (resultBar && resultBar.classList) resultBar.classList.remove("d-none");
       await loadRestores(newId);
     } catch (e2) {
-      toast(e2.message, "danger");
-      restoreResultBar("danger", "恢复失败：" + e2.message);
-      if (resultBar && resultBar.classList) resultBar.classList.remove("d-none");
+      // 防勒索安全门拒绝：给出风险明细，并允许管理员显式二次确认强制恢复
+      if (e2 && e2.data && e2.data.security_blocked) {
+        const reasons = (e2.data.reasons || []).join("\n- ");
+        const ok = confirm(
+          "恢复安全门拒绝\n\n" + (e2.data.error || "") + "\n\n" +
+          (reasons ? "风险项：\n- " + reasons + "\n\n" : "") +
+          "仅在你已确认该产物未被勒索加密、且确实需要恢复时选择「确定」。\n" +
+          "继续将留 critical 审计并推送安全告警。是否强制恢复？");
+        if (!ok) {
+          toast("已取消恢复（产物仍处于安全拦截状态）", "secondary");
+        } else {
+          try {
+            const forced = Object.assign({}, body, {
+              force_unsafe_restore: true, confirm_unsafe: true });
+            const r2 = await verifyGate((code) =>
+              api("POST", "/api/restores",
+                code ? Object.assign({}, forced, { verify_code: code }) : forced)) || {};
+            toast("强制恢复已提交（已留 critical 审计）", "warning", 6000);
+            restoreResultBar("warning", "强制恢复：" + (r2.message || r2.status || "已提交"));
+            if (resultBar && resultBar.classList) resultBar.classList.remove("d-none");
+            await loadRestores(Number(r2.id || 0));
+          } catch (e3) {
+            toast("强制恢复失败: " + e3.message, "danger");
+            restoreResultBar("danger", "恢复失败：" + e3.message);
+            if (resultBar && resultBar.classList) resultBar.classList.remove("d-none");
+          }
+        }
+      } else {
+        toast(e2.message, "danger");
+        restoreResultBar("danger", "恢复失败：" + e2.message);
+        if (resultBar && resultBar.classList) resultBar.classList.remove("d-none");
+      }
     } finally {
       btn.disabled = false;
       btn.innerHTML = oldHtml;
@@ -7381,6 +7493,9 @@
         $("st_endpoint_tape").value = d.endpoint || "";
         if (d.extra_options && typeof d.extra_options === "object") {
           $("st_tape_max_gb").value = d.extra_options.max_tape_gb || 0;
+          $("st_tape_changer").value = d.extra_options.changer_device || "";
+          $("st_tape_block_kb").value = d.extra_options.block_kb || 64;
+          $("st_tape_staging").value = d.extra_options.staging_dir || "";
         }
       }
       else if (d.type === "sftp") {
@@ -7461,6 +7576,10 @@
       }
       if (type === "tape") {
         extraOpts.max_tape_gb = Number($("st_tape_max_gb").value) || 0;
+        extraOpts.changer_device = $("st_tape_changer").value.trim();
+        extraOpts.block_kb = Number($("st_tape_block_kb").value) || 64;
+        extraOpts.staging_dir = $("st_tape_staging").value.trim();
+        extraOpts.verify_after_write = 1;
       }
       data.extra_options = extraOpts;
     }
@@ -9905,5 +10024,58 @@
     try { await api("DELETE", `/api/ai-plans/${id}`); toast("已删除"); await loadAiPlans(); }
     catch (e) { toast(e.message, "danger"); }
   };
+
+  // ---- 首次登录口令治理：强制改密 / 出厂弱口令提示 ----
+  (function initPasswordGate() {
+    if (typeof fetch !== "function") return;
+    fetch("/api/rbac/me", { credentials: "same-origin" })
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (!d) return;
+        const required = !!d.password_change_required;
+        const weak = !!d.default_password_in_use && d.role === "admin";
+        if (!required && !weak) return;
+        if (!required && sessionStorage.getItem("aidbmPwdGateSkipped")) return;
+        const box = document.createElement("div");
+        box.id = "pwdGate";
+        box.style.cssText = "position:fixed;inset:0;z-index:1080;background:rgba(15,23,42,.55);display:flex;align-items:center;justify-content:center;padding:16px";
+        box.innerHTML =
+          '<div class="card shadow" style="max-width:440px;width:100%"><div class="card-body">' +
+          `<h5 class="mb-2"><i class="bi bi-shield-lock"></i> ${required ? "首次登录请先修改默认口令" : "安全提示：仍在使用出厂默认口令"}</h5>` +
+          `<p class="small text-muted mb-3">${required ? "当前账号使用出厂口令，修改完成后即可正常使用平台（此时其它操作会被暂时拦截）。" : "内置超管仍在使用 admin/admin123，建议立即修改；此提示不会影响当前操作。"}</p>` +
+          '<div class="mb-2"><label class="form-label small">原密码</label><input type="password" class="form-control form-control-sm" id="pgOld" autocomplete="current-password"></div>' +
+          '<div class="mb-3"><label class="form-label small">新密码（至少 6 位）</label><input type="password" class="form-control form-control-sm" id="pgNew" autocomplete="new-password"></div>' +
+          '<div id="pgErr" class="small text-danger mb-2"></div>' +
+          '<div class="d-flex gap-2 justify-content-end">' +
+          (required ? "" : '<button type="button" class="btn btn-outline-secondary btn-sm" id="pgSkip">稍后再说</button>') +
+          '<button type="button" class="btn btn-primary btn-sm" id="pgSave">修改密码</button>' +
+          '</div></div></div>';
+        document.body.appendChild(box);
+        const close = () => box.remove();
+        const skip = box.querySelector("#pgSkip");
+        if (skip) skip.onclick = () => {
+          sessionStorage.setItem("aidbmPwdGateSkipped", "1");
+          close();
+        };
+        box.addEventListener("click", e => { if (e.target === box && !required) close(); });
+        box.querySelector("#pgSave").onclick = async () => {
+          const err = box.querySelector("#pgErr");
+          const oldPassword = box.querySelector("#pgOld").value;
+          const newPassword = box.querySelector("#pgNew").value;
+          err.textContent = "";
+          if (!oldPassword || !newPassword) { err.textContent = "请填写原密码与新密码"; return; }
+          try {
+            await api("POST", "/api/rbac/me/password",
+              { old_password: oldPassword, new_password: newPassword });
+            toast("密码已修改", "success");
+            close();
+            if (required) setTimeout(() => location.reload(), 400);
+          } catch (e) {
+            err.textContent = (e && e.message) || "修改失败";
+          }
+        };
+      })
+      .catch(() => {});
+  })();
 
 })();

@@ -883,7 +883,85 @@ document.addEventListener("DOMContentLoaded", async function () {
   });
 });
 </script>
-{% endblock %}
+
+<!-- 并发配置 + 首次登录口令治理 -->
+<div class="page-card">
+  <div class="card-section-title"><i class="bi bi-speedometer2"></i> 并发与首次登录安全</div>
+  <div class="row g-3 align-items-start">
+    <div class="col-md-4">
+      <label class="form-label small">同时执行的备份任务上限（1-64，缺省 2）</label>
+      <div class="d-flex gap-2">
+        <input type="number" min="1" max="64" class="form-control form-control-sm" id="cc_limit">
+        <button class="btn btn-primary btn-sm" id="ccSaveBtn">保存</button>
+      </div>
+      <div class="form-text mt-1" id="cc_result"></div>
+    </div>
+    <div class="col-md-4">
+      <label class="form-label small">首次登录强制修改默认口令</label>
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" id="pcp_enabled">
+        <label class="form-check-label small" for="pcp_enabled">启用后须先改密才能使用平台</label>
+      </div>
+      <button class="btn btn-outline-primary btn-sm mt-2" id="pcpSaveBtn">保存策略</button>
+      <div class="form-text mt-1" id="pcp_result"></div>
+    </div>
+    <div class="col-md-4">
+      <div class="small text-muted" id="cc_stats">队列状态加载中…</div>
+    </div>
+  </div>
+  <p class="form-text-hint mb-0 mt-2">关闭强制改密时，存量 admin/admin123 登录行为完全不变；
+    开启后仅影响 must_change_password=1 的账号。并发上限修改后无需重启，下一次任务提交即生效。</p>
+</div>
+<script>
+document.addEventListener("DOMContentLoaded", async function () {
+  const $s = (id) => document.getElementById(id);
+  async function loadSec() {
+    try {
+      const r = await (await fetch("/api/system/concurrency", { credentials: "include" })).json();
+      if ($s("cc_limit")) $s("cc_limit").value = r.max_concurrent_backups || 2;
+      const st = r.stats || {};
+      if ($s("cc_stats")) $s("cc_stats").textContent =
+        "当前上限 " + (r.max_concurrent_backups || 2) + " · 队列中 " + (st.submitted || 0) +
+        " 个 · 线程池 " + (st.executor_workers || 0) + " 线程" +
+        (r.env_override ? " · 环境变量覆盖为 " + r.env_override : "");
+    } catch (e) { /* 保持默认展示 */ }
+    try {
+      const p = await (await fetch("/api/rbac/password-change-policy", { credentials: "include" })).json();
+      if ($s("pcp_enabled")) $s("pcp_enabled").checked = !!p.enabled;
+      if ($s("pcp_result") && p.default_password_in_use)
+        $s("pcp_result").textContent = "内置超管仍在使用出厂默认口令，建议开启并立即修改";
+    } catch (e) { /* 非超管无权限读取，忽略 */ }
+  }
+  loadSec();
+  $s("ccSaveBtn")?.addEventListener("click", async () => {
+    const res = $s("cc_result");
+    try {
+      const r = await (await fetch("/api/system/concurrency", {
+        method: "PUT", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ max_concurrent_backups: Number($s("cc_limit").value) }),
+      })).json();
+      res.textContent = r.error ? ("保存失败: " + r.error)
+        : ("已保存，实际生效上限 " + r.effective + "（无需重启）");
+      res.className = "form-text mt-1 " + (r.error ? "text-danger" : "text-success");
+      loadSec();
+    } catch (e) { res.textContent = "保存失败: " + e; }
+  });
+  $s("pcpSaveBtn")?.addEventListener("click", async () => {
+    const res = $s("pcp_result");
+    try {
+      const r = await (await fetch("/api/rbac/password-change-policy", {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: $s("pcp_enabled").checked }),
+      })).json();
+      res.textContent = r.error ? ("保存失败: " + r.error)
+        : ("已保存：" + (r.enabled ? "首次登录须先改密" : "恢复默认兼容行为"));
+      res.className = "form-text mt-1 " + (r.error ? "text-danger" : "text-success");
+    } catch (e) { res.textContent = "保存失败: " + e; }
+  });
+});
+</script>
 <script>
 document.addEventListener("DOMContentLoaded", async function () {
   const cb = document.getElementById("pp_enabled");
@@ -1027,3 +1105,5 @@ document.addEventListener("DOMContentLoaded", function () {
   });
 });
 </script>
+
+{% endblock %}

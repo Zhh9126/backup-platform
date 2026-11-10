@@ -21,7 +21,8 @@
     <button class="btn btn-outline-secondary btn-sm" id="cleanupBtn"
             title="按每个任务的备份保留天数/份数，定期清理过期备份产物"><i class="bi bi-eraser"></i> <span data-i18n="定期清理">定期清理</span></button>
     <button class="btn btn-success btn-sm" id="quickBackupBtn"
-            title="一键备份：对全部启用任务（或勾选任务）立即执行一次全量备份"><i class="bi bi-lightning-charge"></i> <span data-i18n="一键备份">一键备份</span></button>
+            title="一键备份：对勾选任务并行执行全量备份；未勾选时对全部启用任务"><i class="bi bi-lightning-charge"></i> <span data-i18n="一键备份">一键备份</span></button>
+    <span id="taskSelCount" class="small text-muted" title="勾选任务后一键备份只跑勾选的任务"></span>
     <button class="btn btn-outline-secondary btn-sm" onclick="refreshTasks()" title="刷新"><i class="bi bi-arrow-clockwise"></i> <span data-i18n="刷新">刷新</span></button>
     <button class="btn btn-outline-secondary btn-sm" onclick="importTasksCsv()" title="批量导入CSV"><i class="bi bi-upload"></i> <span data-i18n="导入">导入</span></button>
     <a class="btn btn-outline-secondary btn-sm" href="/api/tasks/template?type=db" title="下载CSV模板"><i class="bi bi-file-earmark-spreadsheet"></i> <span data-i18n="模板">模板</span></a>
@@ -33,6 +34,7 @@
   <div class="table-responsive" style="flex:1">
     <table class="table table-hover align-middle mb-0">
       <thead><tr>
+        <th style="width:34px"><input type="checkbox" id="taskSelAll" title="全选/取消本页任务"></th>
         <th>#</th><th data-i18n="业务系统">业务系统</th><th data-i18n="名称">名称</th><th data-i18n="类型">类型</th><th data-i18n="备份 IP">备份 IP</th><th data-i18n="端口/库">端口/库</th><th data-i18n="备份类型">备份类型</th><th data-i18n="备份模式">备份模式</th>
         <th data-i18n="调度">调度</th><th data-i18n="状态">状态</th><th data-i18n="上次运行">上次运行</th><th data-i18n="下次备份时间">下次备份时间</th><th data-i18n="上次成功执行">上次成功执行</th><th class="text-end" data-i18n="操作">操作</th>
       </tr></thead>

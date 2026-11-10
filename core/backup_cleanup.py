@@ -210,6 +210,12 @@ def build_plan(task_id: int = None, keep_min: int = None) -> list:
     返回每个任务的计划：总数 / 保留数 / 待清理清单（含大小与原因）。
     """
     km = KEEP_MIN_DEFAULT if keep_min is None else max(0, int(keep_min))
+    # 防勒索护栏：每个任务至少保留一个可信恢复点（配置关闭时为空集）
+    try:
+        from core.ransomware_guard import trusted_point_ids
+        trusted = trusted_point_ids()
+    except Exception:  # noqa: BLE001
+        trusted = set()
     if task_id:
         one = models.get_task(task_id)
         tasks = [one] if one else []
@@ -230,6 +236,7 @@ def build_plan(task_id: int = None, keep_min: int = None) -> list:
             continue
         items = []
         task_locked = 0
+        task_trusted = 0
         for idx, r in enumerate(rows):
             ts = _parse_ts(r.get("finished_at") or r.get("started_at"))
             age_days = (now - ts).days if ts else None
@@ -250,6 +257,11 @@ def build_plan(task_id: int = None, keep_min: int = None) -> list:
                 if is_active(r):
                     task_locked += 1
                     continue
+            # 护栏5（防勒索）：即使保留策略判该删，也不能把该任务最后一个
+            # 可信恢复点清掉——勒索场景常见手法是先删干净所有可恢复副本。
+            if r["id"] in trusted:
+                task_trusted += 1
+                continue
             path = r.get("backup_path") or ""
             items.append({
                 "record_id": r["id"],
@@ -278,6 +290,7 @@ def build_plan(task_id: int = None, keep_min: int = None) -> list:
             "free_bytes": sum(i["size_bytes"] for i in items if i["has_file"]),
             "ghost_bytes": sum(i["size_bytes"] for i in items if not i["has_file"]),
             "skipped_locked": task_locked,
+            "skipped_trusted": task_trusted,
             "items": items,
         })
     return plans
@@ -310,6 +323,11 @@ def run_cleanup(task_id: int = None, dry_run: bool = False,
     cfg = get_config()
     do_purge = cfg["purge_records"] if purge_records is None else bool(purge_records)
     plans = build_plan(task_id=task_id, keep_min=keep_min)
+    try:
+        from core.ransomware_guard import trusted_point_ids
+        trusted = trusted_point_ids()
+    except Exception:  # noqa: BLE001
+        trusted = set()
     report = {
         "dry_run": bool(dry_run),
         "tasks": len(plans),
@@ -319,6 +337,7 @@ def run_cleanup(task_id: int = None, dry_run: bool = False,
         "missing_files": 0,
         "skipped_outside": 0,
         "skipped_locked": 0,
+        "skipped_trusted": 0,
         "failed": 0,
         "purge_records": bool(do_purge),
         "details": [],
@@ -333,6 +352,13 @@ def run_cleanup(task_id: int = None, dry_run: bool = False,
             if path and path in _locked_paths_safe():
                 report["skipped_locked"] += 1
                 detail["failed"].append("#%s 产物处于保留锁保护期，已跳过删除"
+                                        % item["record_id"])
+                continue
+            # 防勒索第二道硬护栏：计划与执行之间若最新备份被判定可疑，
+            # 该记录可能刚成为/失去可信恢复点身份，执行时重新核对。
+            if item["record_id"] in trusted:
+                report["skipped_trusted"] += 1
+                detail["failed"].append("#%s 是该任务最后可信恢复点，已跳过删除"
                                         % item["record_id"])
                 continue
             if dry_run:

@@ -93,6 +93,7 @@
         <a class="nav-link {% if page=='vm' %}active{% endif %}" href="/vm" title="虚拟机备份（整机恢复点 / 永久增量 / 克隆新 VM）"><i class="bi bi-pc-display-horizontal"></i> <span class="nav-label">虚拟机备份</span></a>
         <a class="nav-link {% if page=='ai_backup' %}active{% endif %}" href="/ai_backup" title="AI 模型备份：模型权重/检查点、向量索引（Qdrant/Chroma）、训练数据集与元数据的跨层一致性保护计划"><i class="bi bi-cpu"></i> <span class="nav-label">AI 模型备份</span></a>
         <a class="nav-link {% if page=='storage' %}active{% endif %}" href="/storage" title="存储管理" data-perm="backup.storage.manage"><i class="bi bi-hdd-rack"></i> <span class="nav-label">存储管理</span></a>
+        <a class="nav-link {% if page=='tape' %}active{% endif %}" href="/tape" title="磁带库与介质管理：设备识别 / 机械手 / 介质轮换 / 写后校验" data-perm="backup.storage.manage"><i class="bi bi-cassette"></i> <span class="nav-label">磁带库</span></a>
         <a class="nav-link {% if page=='protection' %}active{% endif %}" href="/protection" title="备份策略" data-perm="backup.policy.manage"><i class="bi bi-shield-lock"></i> <span class="nav-label">备份策略</span></a>
         <a class="nav-link {% if page=='agentless' %}active{% endif %}" href="/agentless" title="Agent 管理：无 Agent（SSH 通道）与有 Agent（执行器插件）两种备份方式，插件一键安装到主机"><i class="bi bi-shield-check"></i> <span class="nav-label">Agent 管理</span></a>
         <a class="nav-link {% if page=='plugins' %}active{% endif %}" href="/plugins" title="备份依赖插件（一键安装 xtrabackup / percona / mariabackup 等）" data-perm="backup.plugins.manage"><i class="bi bi-plug"></i> <span class="nav-label">备份插件</span></a>
@@ -104,6 +105,7 @@
         <a class="nav-link {% if page=='deploy' %}active{% endif %}" href="/deploy" title="数据库部署" data-perm="deploy.manage"><i class="bi bi-rocket-takeoff"></i> <span class="nav-label">数据库部署</span></a>
         <div class="nav-group-label">记录</div>
         <a class="nav-link {% if page=='records' %}active{% endif %}" href="/records" title="备份记录" data-perm="backup.task.view"><i class="bi bi-archive"></i> <span class="nav-label">备份记录</span></a>
+        <a class="nav-link {% if page=='ransomware' %}active{% endif %}" href="/ransomware" title="防勒索保护：自动检测 / 保留锁定 / 恢复安全门 / 最后可信恢复点" data-perm="backup.task.view"><i class="bi bi-shield-exclamation"></i> <span class="nav-label">防勒索保护</span></a>
         <a class="nav-link {% if page=='restore_records' %}active{% endif %}" href="/restore_records" title="恢复记录" data-perm="restore.run"><i class="bi bi-clock-history"></i> <span class="nav-label">恢复记录</span></a>
         <div class="nav-group-label">灾备管理</div>
         <a class="nav-link {% if page=='migration' %}active{% endif %}" href="/migration" title="数据迁移" data-perm="dr.migration.manage"><i class="bi bi-arrow-repeat"></i> <span class="nav-label">数据迁移</span></a>
@@ -177,7 +179,7 @@
   <script src="/static/js/bkp-core.js?v=2026110301"></script>
   <script src="/static/js/pager.js?v=2026110403"></script>
   <script src="/static/js/precheck.js?v=2026110610"></script>
-  <script src="/static/js/app.js?v=2026111002"></script>
+  <script src="/static/js/app.js?v=2026111005"></script>
   {% if has_ai_agent %}<script src="/static/js/ai-agent.js?v=2026101501"></script>{% endif %}
   <script>
     // 按权限隐藏菜单（每个 <a class="nav-link" data-perm="..."> 命中则可见）

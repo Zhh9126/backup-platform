@@ -115,7 +115,11 @@ class TestApiContract(unittest.TestCase):
         from api import records as R
         src = inspect.getsource(R)
         self.assertIn("/records/<int:record_id>/security-check", src)
-        self.assertIn("check_record_by_id", src)
+        # 防勒索加固后：API 走统一编排（落库 + 自动隔离），
+        # 启发式检测内核仍由 backup_anomaly.check_record_by_id 提供。
+        self.assertIn("ransomware_guard.scan_record", src)
+        from core import ransomware_guard as G
+        self.assertIn("check_record_by_id", inspect.getsource(G))
 
 
 if __name__ == "__main__":

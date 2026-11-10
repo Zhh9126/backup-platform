@@ -552,7 +552,12 @@ CREATE TABLE IF NOT EXISTS backup_records (
     write_protected INTEGER DEFAULT 0,           -- 产物文件 chmod 只读已生效
     checksum_verified_at TEXT,                   -- 最近一次完整性复检时间
     checksum_ok   INTEGER,                       -- 复检结果 1=一致 0=漂移
-    lock_note     TEXT                           -- 锁定/解锁操作者与原因
+    lock_note     TEXT,                          -- 锁定/解锁操作者与原因
+    security_level TEXT,                         -- 防勒索检测结论 clean/suspect/unknown
+    security_checked_at TEXT,                    -- 最近一次安全检测时间
+    security_detail TEXT,                        -- 检测逐项结果(JSON)
+    quarantined   INTEGER DEFAULT 0,             -- 可疑产物逻辑隔离（禁止恢复/下载）
+    fs_immutable  INTEGER DEFAULT 0              -- 内核级 chattr +i 是否生效
 );
 
 CREATE TABLE IF NOT EXISTS restore_records (
@@ -1574,6 +1579,12 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                 ("checksum_verified_at", "TEXT"),
                 ("checksum_ok", "INTEGER"),
                 ("lock_note", "TEXT"),
+                # 防勒索闭环：检测结论 / 隔离 / 内核级不可变
+                ("security_level", "TEXT"),
+                ("security_checked_at", "TEXT"),
+                ("security_detail", "TEXT"),
+                ("quarantined", "INTEGER DEFAULT 0"),
+                ("fs_immutable", "INTEGER DEFAULT 0"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE backup_records ADD COLUMN {col} {typedef}")

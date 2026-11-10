@@ -23,7 +23,7 @@ else:
 # ---------- 产品标识 ----------
 # 产品正式名称与版本（对外 API 文档、健康检查、报告落款统一取这里，避免各处硬编码）。
 PLATFORM_NAME = os.environ.get("AIDBM_NAME", "AIDBM")
-PLATFORM_VERSION = os.environ.get("AIDBM_VERSION", "2.3.6")
+PLATFORM_VERSION = os.environ.get("AIDBM_VERSION", "2.3.7")
 
 # ---------- 路径 ----------
 BACKUP_ROOT = os.environ.get("BACKUP_ROOT", str(BASE_DIR / "backups"))
@@ -106,6 +106,37 @@ WEB_USERNAME = os.environ.get("WEB_USERNAME", "admin")
 # 生产环境务必通过环境变量 WEB_PASSWORD 或 config.json 覆盖默认口令
 WEB_PASSWORD = os.environ.get("WEB_PASSWORD", "admin123")
 SESSION_TIMEOUT = int(os.environ.get("SESSION_TIMEOUT", "28800"))  # 秒
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    """环境整数配置：非法值回落默认，绝不让脏环境变量打断服务启动。"""
+    try:
+        return int(os.environ.get(name, str(default)) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = (os.environ.get(name) or "").strip().lower()
+    if not val:
+        return default
+    return val in ("1", "true", "on", "yes")
+
+
+# ---------- 并发：多个备份任务同时发起 ----------
+# 0 = 交给 system_config.max_concurrent_backups（缺省 2，界面可热改，无需重启）。
+# 运维可用 AIDBM_MAX_CONCURRENT_BACKUPS 强制覆盖（1-64）。
+MAX_CONCURRENT_BACKUPS = _env_int("AIDBM_MAX_CONCURRENT_BACKUPS", 0)
+# 并行执行队列线程池大小；0 = max(8, 并发上限×2)。
+BACKUP_WORKERS = _env_int("AIDBM_BACKUP_WORKERS", 0)
+
+# ---------- 首次登录口令治理（默认全部关闭，存量部署零破坏） ----------
+# 开启后：users.must_change_password=1 的账号登录被强制改密；
+# 关闭时仅在启动日志与 /api/rbac/me 给出弱口令告警。
+FORCE_PASSWORD_CHANGE = _env_bool("AIDBM_FORCE_PASSWORD_CHANGE", False)
+# 首次部署（users 表为空）用随机口令替换 admin123，明文落 instance/initial_admin_password.txt。
+# 仅当用户显式开启；已有部署不受影响。
+RANDOM_ADMIN_PASSWORD = _env_bool("AIDBM_RANDOM_ADMIN_PASSWORD", False)
 
 # ---------- 物理备份工具路径（只装平台侧，数据库服务器零安装） ----------
 # 版本匹配原则：MySQL 5.5-5.7 → xtrabackup 2.4；MySQL 8.0+ → xtrabackup 8.0；

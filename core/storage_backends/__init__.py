@@ -5,6 +5,7 @@
 提供 get_backend(type, config) 工厂函数，根据存储类型返回对应后端实例。
 """
 import logging
+import shutil
 from .base import StorageBackend
 from .local import LocalStorageBackend
 from .minio import MinIOStorageBackend
@@ -83,7 +84,10 @@ def check_dependencies() -> dict[str, bool]:
         "local": True,  # 无额外依赖
         "minio": False,
         "s3": False,
-        "tape": True,   # mt/tar（设备模式）；目录模式无依赖
+        # 这里只判「磁带后端能否工作」：目录模拟模式只需 tar。
+        # 真实设备模式的工具链/设备/cgroup 就绪度由 tape_library.runtime_hint()
+        # 与 /api/tape/devices 明确报告（旧实现恒 True 会掩盖容器缺 mt-st）。
+        "tape": bool(shutil.which("tar")),
         "sftp": _HAS_SFTP_DEP,
     }
     try:

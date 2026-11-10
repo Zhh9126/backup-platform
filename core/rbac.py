@@ -247,6 +247,7 @@ def set_password(uid: int, new_password: str) -> bool:
         "UPDATE users SET password_hash=?, password_algo='pbkdf2_sha256', "
         "must_change_password=0, updated_at=? WHERE id=?",
         (hash_password(new_password), db.now_iso(), uid))
+    _DEFAULT_PWD_CACHE["value"] = None   # 口令已改：告警状态立即失效
     return True
 
 
@@ -304,6 +305,20 @@ def seed_admin_if_empty() -> Optional[dict]:
         return get_by_username(config.WEB_USERNAME or "admin")
     username = (config.WEB_USERNAME or "admin").strip()
     password = config.WEB_PASSWORD or "admin123"
+    # 显式开启 AIDBM_RANDOM_ADMIN_PASSWORD 时，首次部署不再使用出厂口令，
+    # 随机口令以 0600 落盘供部署人员首次登录（已有部署不受影响）。
+    if getattr(config, "RANDOM_ADMIN_PASSWORD", False) and password == "admin123":
+        generated = secrets.token_urlsafe(16)
+        try:
+            target = config.INSTANCE_DIR / "initial_admin_password.txt"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(f"{username} / {generated}\n")
+            password = generated
+            print(f"[startup] rbac: 已生成随机初始超管口令，见 {target}（登录后请立即修改）")
+        except Exception as exc:  # noqa: BLE001 —— 落盘失败则退回默认口令，绝不阻断启动
+            print(f"[startup] rbac: 随机口令落盘失败，沿用默认口令: {exc}")
     try:
         create({
             "username": username,
@@ -432,3 +447,62 @@ def validate_password(plain: str) -> tuple:
     if not re.search(r"\d", plain):
         return False, "强口令策略：密码需包含数字"
     return True, ""
+
+
+# ============== 首次登录口令治理（默认全关，存量部署零破坏） ==============
+
+def force_password_change_enabled() -> bool:
+    """是否强制 must_change_password 账号先改密再使用平台。
+
+    env AIDBM_FORCE_PASSWORD_CHANGE 优先；其次 system_config.force_password_change。
+    默认 False：现网登录、E2E 脚本、离线交付包的 admin/admin123 行为不变；
+    开启后仅改密/读自身信息的端点可用，其余 API 返回 428。
+    """
+    if getattr(config, "FORCE_PASSWORD_CHANGE", False):
+        return True
+    try:
+        val = (db.get_system_config("force_password_change") or "").strip().lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return val in _PASSWORD_POLICY_TRUE
+
+
+def set_force_password_change(on: bool) -> None:
+    db.set_system_config("force_password_change", "1" if on else "0")
+
+
+# 弱口令检测要做一次 PBKDF2(200k)，前端每页都会拉 /api/rbac/me；
+# 缓存 30s 避免"每次打开页面都白等一次哈希计算"。改密后由 set_password 清缓存。
+_DEFAULT_PWD_CACHE = {"ts": 0.0, "value": None}
+
+
+def default_admin_password_in_use() -> bool:
+    """内置超管是否仍在使用出厂口令 admin123（仅供告警，绝不自动改密）。"""
+    if (config.WEB_PASSWORD or "") != "admin123":
+        return False
+    import time
+    now = time.monotonic()
+    cached = _DEFAULT_PWD_CACHE
+    if cached["value"] is not None and now - cached["ts"] < 30:
+        return cached["value"]
+    try:
+        u = get_by_username(config.WEB_USERNAME or "admin")
+    except Exception:  # noqa: BLE001
+        return False
+    val = bool(u and verify_password("admin123", u.get("password_hash") or ""))
+    cached["value"] = val
+    cached["ts"] = now
+    return val
+
+
+def external_auth_role() -> str:
+    """外部认证（API Token / AccessKey 签名）的等效角色。
+
+    默认 admin，保持存量外部调用方零破坏；可按需把
+    system_config.api_token_role 设为 operator/viewer 等收紧令牌权限。
+    """
+    try:
+        role = (db.get_system_config("api_token_role") or "admin").strip().lower()
+    except Exception:  # noqa: BLE001
+        return "admin"
+    return role if role in VALID_ROLES else "admin"

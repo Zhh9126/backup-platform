@@ -101,6 +101,12 @@ def create_app() -> Flask:
         u = _rbac.seed_admin_if_empty()
         if u:
             print(f"[startup] rbac: 已就绪内置管理员 {u.get('username')} (role={u.get('role')})")
+        if _rbac.default_admin_password_in_use():
+            _warn = ("[安全告警] 内置超管仍在使用出厂口令 admin/admin123："
+                     "请在「用户管理」修改，或设置 WEB_PASSWORD 环境变量、"
+                     "或为首次部署启用 AIDBM_RANDOM_ADMIN_PASSWORD 环境变量")
+            print("[startup] rbac: " + _warn)
+            logging.getLogger("aidbm").warning(_warn)
     except Exception as e:
         print(f"[startup] rbac 初始化失败（不影响主流程）: {e}")
     # 本地备份存储位置（L1 落点）：界面配置 > 环境变量/config.json > 默认（程序目录）
@@ -285,6 +291,16 @@ def create_app() -> Flask:
                     "role": user_row.get("role") or "admin",
                 }
                 session.permanent = True
+                # 首次登录口令治理：默认关闭，仅显式开启时把账号锁在改密流程。
+                must_change = bool(user_row.get("must_change_password"))
+                try:
+                    from core import rbac as _rbac_policy
+                    if must_change and _rbac_policy.force_password_change_enabled():
+                        session["pwd_change_required"] = 1
+                    else:
+                        session.pop("pwd_change_required", None)
+                except Exception:
+                    pass
                 # 记录登录（仅 DB 用户；内置账号无 id）
                 try:
                     if user_row.get("id"):
@@ -294,7 +310,10 @@ def create_app() -> Flask:
                 except Exception:
                     pass
                 if is_json:
-                    return jsonify({"ok": True, "user": session["user"]})
+                    return jsonify({"ok": True, "user": session["user"],
+                                    "must_change_password": must_change,
+                                    "password_change_required":
+                                        bool(session.get("pwd_change_required"))})
                 return redirect(url_for("dashboard_page"))
             _register_login_fail(ip)
             if is_json:
@@ -424,10 +443,20 @@ def create_app() -> Flask:
     def storage_page():
         return render_template("storage.html", page="storage")
 
+    @app.route("/tape")
+    @login_required
+    def tape_page():
+        return render_template("tape.html", page="tape")
+
     @app.route("/protection")
     @login_required
     def protection_page():
         return render_template("protection.html", page="protection")
+
+    @app.route("/ransomware")
+    @login_required
+    def ransomware_page():
+        return render_template("ransomware.html", page="ransomware")
 
     @app.route("/migration")
     @login_required

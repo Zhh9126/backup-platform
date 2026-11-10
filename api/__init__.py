@@ -20,53 +20,77 @@ def _is_public_path(path: str) -> bool:
     return path in PUBLIC_API_PATHS
 
 
+# 首次登录强制改密期间仍允许访问的端点（仅自助读/改密与元信息）
+_PASSWORD_CHANGE_PATHS = frozenset({
+    "/api/rbac/me", "/api/rbac/me/password", "/api/rbac/permissions",
+    "/api/meta", "/api/health",
+})
+
+
 @api_bp.before_request
 def _api_security_gate():
     """API 全局安全钩子（必须在嵌套蓝图注册前声明）。
 
     1) 鉴权兜底：任何 API 都要求已登录或持有有效外部调用令牌（白名单除外）。
-       即使个别路由遗漏 @login_required，也不会匿名可访问。
-       外部系统调用：Authorization: Bearer <token> / X-API-Token（api_tokens 表）。
-    2) CSRF 防护：写操作校验 Origin/Referer 同源。
-       无 Origin/Referer 头（如本机 curl/脚本）且已登录时放行；
-       令牌认证的请求（非浏览器）不适用 CSRF，直接放行写操作。
-    3) 只读角色（viewer / audit_admin）写操作兜底拦截，探测/预览/导出等
-       无写副作用的 POST 仍放行；admin/operator/三员中的写角色不受影响。
+       Bearer / X-API-Token（api_tokens 表）与 AccessKey HMAC 签名均受支持。
+    2) 首次登录强制改密：默认关闭（零破坏），开启后 must_change_password
+       账号只能访问自助端点，其余 API 返回 428。
+    3) CSRF 防护：浏览器会话写操作校验 Origin/Referer 严格同源。
+       外部令牌认证不是浏览器请求，不适用 CSRF。
+    4) 写端点权限点映射：239 个写端点统一经 api/perm_map.py 映射到 RBAC
+       权限点，替代逐端点手写装饰器与"只读角色子串白名单"兜底。
+       探测/预览/校验与自助改密走精确豁免；已有 @permission_required
+       的端点保有更细粒度判定。
     """
-    from auth import _extract_bearer_token, _valid_api_token
+    from auth import (_extract_bearer_token, _valid_api_token,
+                      _valid_ak_signature, _current_user_dict)
+    from core import rbac as _rbac
+    from . import perm_map
 
+    path = request.path
+    if _is_public_path(path):
+        return None
+
+    # 1) 鉴权兜底；_current_user_dict 兼容旧字符串 session，避免 AttributeError
+    user = _current_user_dict()
     token_auth = False
-    if "user" not in session:
+    if not user:
         token = _extract_bearer_token()
-        if not _is_public_path(request.path):
-            if not token or not _valid_api_token(token):
-                return jsonify({"success": False,
-                                "error": "未登录或会话已过期（外部调用请携带 "
-                                         "Authorization: Bearer <token>）"}), 401
-            token_auth = True
-    if request.method in ("POST", "PUT", "DELETE", "PATCH") and not token_auth:
+        if not (_valid_api_token(token) or _valid_ak_signature()):
+            return jsonify({"success": False,
+                            "error": "未登录或会话已过期（外部调用请携带 "
+                                     "Authorization: Bearer <token>）"}), 401
+        token_auth = True
+        # 外部令牌按可配置等效角色校验（默认 admin，兼容存量外部调用方）
+        user = {"id": 0, "username": "external-token",
+                "role": _rbac.external_auth_role(), "_external": True}
+
+    # 2) 首次登录强制改密闸
+    if session.get("pwd_change_required") and not token_auth:
+        p = perm_map.normalize((path or "").rstrip("/") or "/")
+        if p not in _PASSWORD_CHANGE_PATHS:
+            return jsonify({"success": False,
+                            "error": "首次登录需先修改默认口令",
+                            "password_change_required": True}), 428
+
+    if request.method not in perm_map.WRITE_METHODS:
+        return None
+
+    # 3) CSRF：Origin: null / 缺 netloc 不能当作同源
+    if not token_auth:
         origin = (request.headers.get("Origin") or request.headers.get("Referer") or "").strip()
         if origin:
             o = urlparse(origin)
-            # Origin: null / 缺 netloc 不能当作同源；必须带协议且 host 完全匹配
             if not o.scheme or not o.netloc or o.netloc != request.host:
                 return jsonify({"success": False, "error": "CSRF 校验失败：跨站请求被拒绝"}), 403
-        # 3) 只读角色写操作兜底：viewer / audit_admin 不应能创建任务、
-        #    执行恢复、改配置。全站 400+ 写端点逐个补装饰器不现实，
-        #    这里在蓝图钩子统一兜底；带「探测/预览/导出/自助」语义的
-        #    POST 仍放行（它们不产生写副作用）。
-        role = (session.get("user") or {}).get("role") or ""
-        if role in ("viewer", "audit_admin"):
-            read_semantic = (
-                "precheck", "preview", "/test", "probe", "scan", "dry-run",
-                "export", "download", "security-check", "verify-code",
-                "change-password", "/query", "/search", "/check", "list-",
-                "/resolve", "/analyze", "/compare", "/estimate",
-            )
-            path = request.path.lower()
-            if not any(h in path for h in read_semantic):
-                return jsonify({"success": False,
-                                "error": "当前角色为只读角色，无权执行写操作"}), 403
+
+    # 4) 统一写端点权限映射（豁免返回 perm=None）
+    perm, _reason = perm_map.resolve(path, request.method)
+    if perm and not _rbac.has_permission(user, perm):
+        return jsonify({"success": False,
+                        "error": f"权限不足：缺少 {perm}",
+                        "required_permission": perm}), 403
+    return None
 
 
 def safe_download_path(path: str):
@@ -100,7 +124,7 @@ from . import (tasks, records, restore, system, hosts, sync, inspection, deploy,
                 agentless, object_storage, backup_cleanup, meta_db,
                 agents, op_guard, oracle_txn, pool, file_sync, ai_backup,
                 report_center, access_key, snmp, job_monitor, netdev, license_api,
-                win_protect, synology, remote_pull)  # noqa: E402,F401
+                win_protect, synology, remote_pull, ransomware)  # noqa: E402,F401
 
 # AI 助手（收费功能）：镜像/离线交付包中不含 core/ai_agent 与 api/ai_agent.py，
 # 这里必须容错注册——缺失时平台其余功能不受影响（2026-09-19 用户决定）。

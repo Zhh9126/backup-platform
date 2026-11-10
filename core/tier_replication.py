@@ -24,7 +24,8 @@ _logger = db.get_logger("tier_replication")
 
 
 def replicate_to_tiers(backup_path: str, task: dict, record_id: int,
-                       logger: logging.Logger = None) -> dict:
+                       logger: logging.Logger = None,
+                       manual: bool = False) -> dict:
     """对已完成的备份执行三级复制（根据用户配置的策略）。
 
     Args:
@@ -37,7 +38,8 @@ def replicate_to_tiers(backup_path: str, task: dict, record_id: int,
         各层级复制结果 {"local": bool, "minio": bool|None, "s3": bool|None}
     """
     log = logger or _logger
-    result = {"minio": None, "s3": None, "local": None}
+    result = {"minio": None, "s3": None, "local": None,
+              "tape": None, "tape_details": []}
     if not backup_path or not os.path.exists(backup_path):
         log.warning("[TierReplicate] 备份文件不存在，跳过三级复制: %s", backup_path)
         return result
@@ -65,6 +67,14 @@ def replicate_to_tiers(backup_path: str, task: dict, record_id: int,
     strategy = _get_replication_strategy(log)
 
     timing = strategy.get("timing", "immediate")
+    if timing == "manual" and not manual:
+        log.info("[TierReplicate] 复制策略为「仅手动触发」，自动复制跳过")
+        if packed_tmp and os.path.exists(packed_tmp):
+            try:
+                os.unlink(packed_tmp)
+            except OSError:
+                pass
+        return result
     if timing != "immediate":
         delay_map = {"delay_5min": 300, "delay_30min": 1800, "delay_1hour": 3600}
         delay_secs = delay_map.get(timing, 0)
@@ -127,14 +137,19 @@ def replicate_to_tiers(backup_path: str, task: dict, record_id: int,
     # D2T 磁带归档（P2 落地）：启用中的 tape 目标自动参与每次备份复制。
     # 磁带作为离线长期保存层，独立于 L1/L2/L3 互斥策略之外。
     tape_targets = [x for x in targets if x.get("type") == "tape"]
+    tape_details = []
     for tt in tape_targets:
         ok = _replicate_with_retry(backup_path, tt, object_key_base, log,
                                    tier_label=f"D2T-{tt.get('name')}",
                                    max_retries=max_retries,
                                    retry_interval=retry_interval)
-        result["tape"] = ok
+        tape_details.append({"target_id": tt.get("id"),
+                             "name": tt.get("name"), "ok": bool(ok)})
         if not ok:
             log.warning("[TierReplicate] D2T 磁带归档失败: %s", tt.get("name"))
+    # 多磁带目标：任一成功即算归档成功，明细单独保留（旧实现结果互相覆盖）
+    result["tape"] = any(d["ok"] for d in tape_details) if tape_details else None
+    result["tape_details"] = tape_details
 
     tiers_achieved = [k for k in ("minio", "s3", "local", "tape") if result.get(k)]
     final_tier = "+".join(tiers_achieved) if tiers_achieved else "local"
@@ -155,7 +170,7 @@ def _get_enabled_targets(logger: logging.Logger = None) -> list:
     try:
         rows = db.query(
             "SELECT * FROM storage_targets WHERE enabled=1 "
-            "AND type IN ('minio','s3','local','tape') ORDER BY tier"
+            "AND type IN ('minio','s3','local','tape','sftp') ORDER BY tier"
         )
         targets = []
         for r in rows:
@@ -248,6 +263,7 @@ def get_replication_status(record_id: int) -> dict:
             "local": "local" in (row.get("storage_tier") or ""),
             "minio": "minio" in (row.get("storage_tier") or ""),
             "s3": "s3" in (row.get("storage_tier") or ""),
+            "tape": "tape" in (row.get("storage_tier") or ""),
         },
     }
 

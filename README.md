@@ -15,7 +15,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 容灾切换 · 恢复演练 · 预校验 · 克隆（VDB） · 不可变备份 · 巡检 · 监控 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v2.3.6-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v2.3.7-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -25,14 +25,18 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 ---
 
-> **v2.3.6 本轮要点**：群晖 DSM 全面纳管（设备/探活/共享文件夹资产/一键全量+增量任务/
-> 场景矩阵 S1–S11）、群晖文件级全量+增量引擎（HTTP Range 断点续传 + 恢复链 SHA256 硬核对）、
-> Windows 文件增量（PowerShell `Get-FileHash`/`LastWriteTimeUtc` 指纹清单，零安装）、
-> 异地容灾「云侧推对象存储 + 平台出站拉取」（免公网 IP，非 P2P 隧道）、
-> 按授权服务器数计量的 `distinct host` 视图、对象存储断点续传、AXUS 17 项对齐补齐。
-> Windows 真机（192.168.41.3 / SQL Server 2022）与真实 HTTP S3 推拉闭环均已实测。
+> **v2.3.7 本轮要点**：防勒索保护闭环（安全检测结论落库 → 可疑自动隔离 → 恢复/下载安全门 →
+> 可信恢复点与定期清理护栏 → 全流程审计与强制恢复二次确认）、磁带库 / 可移动介质工程化接入
+> （`lsscsi -g` 设备发现、持久化 `/dev/tape/by-id` 命名、`mtx` 机械手库存与装载、`mt` 非回绕流式写、
+> 介质台账 / 出库归库 / 退役、写后 sha256 校验、容器 `--device` 透传、离线安装脚本设备段）、
+> 全站安全审计整改（RCE / SSRF / 注入 / 路径穿越及 5 类运行时缺陷）、分层复制与生命周期孤儿副本防护。
+> 目录模拟带库全链路 28/28、防勒索专项 11/11、发版回归 97 passed；
+> 真实磁带库 / 机械手 / LTO WORM 尚无真机验证报告（见下方「诚实边界」）。
 >
-> **最新动态**：v2.3.6（2026-11-10）已发布（修复离线包全新部署时 SQL Server JDBC 逻辑备份不可用）+ 2026-11-07 四库型（Oracle/PostgreSQL/金仓/达梦）全功能深度测试收官——
+> **最新动态**：v2.3.7（2026-11-10）已发布（防勒索闭环 / 磁带库接入 / 安全审计整改）；
+> 上一版本完成群晖 DSM 全面纳管、Windows 文件增量、异地容灾出站拉取、授权服务器数计量，
+> 并修复离线包全新部署时 SQL Server JDBC 逻辑备份不可用；
+> 2026-11-07 四库型（Oracle/PostgreSQL/金仓/达梦）全功能深度测试收官——
 > 每库覆盖「预检 → 逻辑备份 → 恢复（硬核对）→ 数据对比 → 物理备份 → 恢复校验 → 实时备份闭环」，
 > 其中 SQL Server 双通道（物理 SSH+sqlcmd / 逻辑 JDBC 免 SSH）、Windows 文件备份（内置 tar.exe 打包 + SFTP 拉取，零插件）、
 > 五库互对比矩阵 10/10 配对一致与对比报告导出（Excel/CSV）
@@ -64,7 +68,7 @@ v2.2.0（2026-11-05）——近两个月主线：AI 大模型数据备份（v2.0
 
 - **AI 原生**：AI 助手可自然语言驱动备份/巡检/查询，自动做根因分析、修复建议与告警降噪；预校验与类型映射由 AI 辅助，把"备份失效"和"异构不兼容"挡在发生之前。
   > **版本说明（如实标注）**：AI 智能助手随**商业/离线交付版**内置（离线镜像开箱即用）；本开源仓库不含 AI 助手代码，页面自动隐藏相关入口，其余全部功能不受影响。
-- **恢复点安全检测（勒索防护）**：对标 Veeam Secure Restore——备份产物三查（体积突变 vs 历史中位数 / 熵值≈8.0 疑似勒索二次加密 / 结构嗅探+压缩可解性），离线无病毒库，**诚实标注"启发式检测、非病毒查杀"**，可疑仅告警不拦截恢复。
+- **恢复点安全检测（勒索防护）**：对标 Veeam Secure Restore——备份产物三查（体积突变 vs 历史中位数 / 熵值≈8.0 疑似勒索二次加密 / 结构嗅探+压缩可解性），离线无病毒库，**诚实标注"启发式检测、非病毒查杀"**；检测结论落库，可疑产物自动隔离并阻断恢复/下载，强制恢复需显式二次确认并留 critical 审计。
 - **备份/恢复预检**：发起前先探测"能不能成功"——备份预检（配置/SSH 通道/源库直连/备份工具/存储空间），恢复预检（产物 sha256 基线/结构/目标端可达/恢复工具/解包空间），逐项 pass/warn/fail，问题挡在执行前。
 - **服务端插件化，客户端零安装**：所有驱动/插件/工具只装在平台服务端；用户客户端机器与被管理的数据库服务器**什么都不安装**、无需任何 Agent。
 - **完全离线运行**：所有依赖随平台包自带（JDBC 驱动、JRE、原生驱动、备份工具离线包），运行时零联网。部署后运行 `python scripts/check_offline.py` 自检。
@@ -116,7 +120,7 @@ v2.2.0（2026-11-05）——近两个月主线：AI 大模型数据备份（v2.0
 |---|---|
 | 一键恢复 | 备份记录 → 目标实例（库级）或目标目录（文件级）|
 | 恢复预检 | 发起前逐项探测产物完整性（sha256 基线）/结构/目标端可达/恢复工具/解包空间，问题挡在执行前 |
-| 恢复点安全检测 | 启发式三查（体积突变/熵值/结构嗅探）识别勒索加密等可疑恢复点，仅告警不拦截（离线无病毒库，如实标注非查杀）|
+| 恢复点安全检测 | 启发式三查（体积突变/熵值/结构嗅探）识别勒索加密等可疑恢复点；结论落库、自动隔离、阻断恢复/下载，强制恢复留 critical 审计（离线无病毒库，如实标注非查杀）|
 | 表级并行导入 | MySQL 逻辑备份恢复自动拆分 dump 并行导入（`RESTORE_PARALLEL` 可调）|
 | 物理恢复并行化 | XtraBackup `--prepare` 附带 `--parallel` |
 | 增量链物理恢复 | 自动识别增量产物，定位全量基备，逐层应用后临时实例校验 |
@@ -393,8 +397,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v2.3.6    # 固定版本（可回滚）
-# 当前最新版本：v2.3.6（2026-11-10，群晖纳管 / Windows 文件增量 / 异地容灾出站拉取 / 授权服务器数计量）
+docker pull ghcr.io/zhh9126/backup-platform:v2.3.7    # 固定版本（可回滚）
+# 当前最新版本：v2.3.7（2026-11-10，防勒索闭环 / 磁带库接入 / 安全审计整改）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -417,17 +421,17 @@ python tools/check_env.py
 ### 离线导入
 
 ```bash
-# 交付包：aidbm_2.3.6_offline.tar.gz（约 1.3GB，gzip 压缩的完整镜像，含全部运行依赖与备份工具）
-docker load -i aidbm_2.3.6_offline.tar.gz
+# 交付包：aidbm_2.3.7_offline.tar.gz（约 1.3GB，gzip 压缩的完整镜像，含全部运行依赖与备份工具）
+docker load -i aidbm_2.3.7_offline.tar.gz
 
 # 导入后确认镜像名（离线环境不会自动去公网拉取）
 docker images | grep -E 'backup-platform|aidbm'
 ```
 
 > **导入后可用 4 个镜像名（同一镜像 ID，任选其一启动，全程零联网）**：
-> `ghcr.io/zhh9126/backup-platform:v2.3.6`、`ghcr.io/zhh9126/backup-platform:latest`、
-> `aidbm:2.3.6`、`aidbm:latest`。
-> **v2.3.6 交付包已把这 4 个 tag 全部打进 `manifest.json` 的 `RepoTags`**，
+> `ghcr.io/zhh9126/backup-platform:v2.3.7`、`ghcr.io/zhh9126/backup-platform:latest`、
+> `aidbm:2.3.7`、`aidbm:latest`。
+> **v2.3.7 交付包已把这 4 个 tag 全部打进 `manifest.json` 的 `RepoTags`**，
 > `docker load` 时会输出 4 行 `Loaded image:`，直接 `docker run` 任一名字都不会访问公网。
 >
 > 若遇到 `Unable to find image 'xxx' locally` 后跟着
@@ -435,19 +439,80 @@ docker images | grep -E 'backup-platform|aidbm'
 > 说明**启动命令用的镜像名不在包内 tag 里**（Docker 找不到本地镜像就会去公网），
 > 不是包损坏。先 `docker images` 查实际 tag，或补一条：
 > ```bash
-> docker tag ghcr.io/zhh9126/backup-platform:v2.3.6 aidbm:2.3.6
+> docker tag ghcr.io/zhh9126/backup-platform:v2.3.7 aidbm:2.3.7
 > ```
 
 自行导出（有网机器上**先打齐 tag 再 save**，否则包内只带单个 tag）：
 
 ```bash
-docker pull ghcr.io/zhh9126/backup-platform:v2.3.6
-docker tag ghcr.io/zhh9126/backup-platform:v2.3.6 ghcr.io/zhh9126/backup-platform:latest
-docker tag ghcr.io/zhh9126/backup-platform:v2.3.6 aidbm:2.3.6
-docker tag ghcr.io/zhh9126/backup-platform:v2.3.6 aidbm:latest
-docker save ghcr.io/zhh9126/backup-platform:v2.3.6 ghcr.io/zhh9126/backup-platform:latest aidbm:2.3.6 aidbm:latest | gzip > aidbm_2.3.6_offline.tar.gz
-gzip -t aidbm_2.3.6_offline.tar.gz    # 必须输出 OK，否则包被截断不可交付
+docker pull ghcr.io/zhh9126/backup-platform:v2.3.7
+docker tag ghcr.io/zhh9126/backup-platform:v2.3.7 ghcr.io/zhh9126/backup-platform:latest
+docker tag ghcr.io/zhh9126/backup-platform:v2.3.7 aidbm:2.3.7
+docker tag ghcr.io/zhh9126/backup-platform:v2.3.7 aidbm:latest
+docker save ghcr.io/zhh9126/backup-platform:v2.3.7 ghcr.io/zhh9126/backup-platform:latest aidbm:2.3.7 aidbm:latest | gzip > aidbm_2.3.7_offline.tar.gz
+gzip -t aidbm_2.3.7_offline.tar.gz    # 必须输出 OK，否则包被截断不可交付
 ```
+
+### 磁带库 / 可移动介质接入（离线容器部署）
+
+镜像已内置 `mt-st`（`mt`）、`mtx`、`lsscsi`、`sg3-utils`、`tar`，运行时零安装。
+真实设备要**先在宿主机识别，再透传给容器**；无硬件时可用目录模拟目标做全流程演练。
+
+**1) 物理连接与系统识别（宿主机）**：SAS/FC 接 HBA 并做 Zoning，iSCSI 配 Initiator/Target；
+建议先启动带库再启动服务器，避免识别顺序问题。确认 HBA 驱动正常后扫描 SCSI 总线：
+
+```bash
+rescan-scsi-bus.sh                                   # sg3_utils 提供
+# 或：for h in /sys/class/scsi_host/host*; do echo "- - -" > "$h/scan"; done
+lsscsi -g | grep -E 'tape|mediumx'
+# [1:0:0:0] mediumx ATL 1500 3.01  /dev/sch0 /dev/sg2   ← 机械手，mtx 用 /dev/sg2
+# [1:0:0:1] tape    HP  Ultrium    /dev/st0  /dev/sg3   ← 磁带机，写入用 /dev/nst1
+dmesg | grep -i scsi                                 # 未识别时查内核日志
+```
+
+> `mtx` 只作用于 **generic SCSI `/dev/sgN`**，`/dev/sch0` 不是它的目标。
+> 优先使用 udev 持久化命名 `/dev/tape/by-id/...-nst`，避免 `/dev/nst0` 在重启/换 HBA 后漂移；
+> 写入必须用**非回绕**设备，否则每段 tar 结束自动倒带覆盖前一段。
+
+**2) 验证设备与控制（宿主机）**：
+
+```bash
+mtx -f /dev/sg2 status        # Storage Changer ... 2 Drives, 10 Slots；含槽位/条码
+mt  -f /dev/nst0 status       # 确认 ONLINE、未 WR_PROT
+mt  -f /dev/nst0 rewind && tar cvf /dev/nst0 /etc/hostname \
+  && mt -f /dev/nst0 rewind && tar tvf /dev/nst0
+```
+
+> 读写测试会覆盖磁带内容，仅在空白/可废弃介质上执行。
+
+**3) 让容器访问设备**：`--device` 同时创建设备节点并放行设备 cgroup，
+单纯 `-v /dev:/dev` 会被 cgroup 拦截。
+
+```bash
+docker run -d --name aidbm -p 8080:8080 \
+  --device /dev/tape/by-id/scsi-XXXX-nst:/dev/tape/by-id/scsi-XXXX-nst:rwm \
+  --device /dev/sg2:/dev/sg2:rwm \
+  -v /opt/backup-platform/data:/data \
+  -e BACKUP_ROOT=/data/backups -e TZ=Asia/Shanghai \
+  aidbm:2.3.7
+```
+
+离线安装脚本支持 `TAPE_DEVICES="/dev/tape/by-id/scsi-XXXX-nst /dev/sg2" ./install.sh`，
+自动生成 compose 的 `devices:` 段；未设置时零影响。
+
+**4) 平台侧配置**：「存储管理 → 磁带库」填设备节点、机械手 `/dev/sgN`、
+流式块大小（LTO 建议 256KB 对齐，减少 shoeshining）、暂存目录、单盘容量上限。
+「磁带库」页可查看设备识别与容器接入就绪度、读取 `mtx status` 库存（槽位/驱动器/条码）、
+装载/卸载、介质出库（气隙保管）/归库/退役、写入目录与写后校验。
+
+**工程口径**：同一设备写入按独占锁串行（防分层复制与池复制双线程 `rewind/eod` 互踩），
+大块流式 `tar`；目录模拟模式写后立即回读比对 sha256，真实带库写后校验走显式「校验」
+作业（自动全带 rewind 扫描会扰动带位，故不默认自动执行）。顺序介质不支持随机删除，
+到期清理遇到删不掉的介质会**保留元数据并告警**，不产生无人知晓的孤儿副本。
+
+**诚实边界**：仓库内为目录模拟带库的完整自动化验证（写/列/回迁/校验/台账/退役），
+**尚无真实磁带库、机械手、多驱动并行、LTO WORM 介质的真机验证报告**；
+现场首次接入请先用上述 1–2 步核验设备，再以小额测试备份走一遍平台全链路。
 
 ### 运行
 
@@ -457,11 +522,11 @@ docker run -d --name backup-platform \
   -v backup-data:/data \
   -e BACKUP_ROOT=/data/backups \
   --restart unless-stopped \
-  ghcr.io/zhh9126/backup-platform:v2.3.6
+  ghcr.io/zhh9126/backup-platform:v2.3.7
 ```
 
 > 离线环境请用**固定版本 tag**（不要用 `:latest` 指代"从公网拉最新"）。
-> 交付包内 `aidbm:2.3.6`、`aidbm:latest`、`ghcr.io/zhh9126/backup-platform:latest`
+> 交付包内 `aidbm:2.3.7`、`aidbm:latest`、`ghcr.io/zhh9126/backup-platform:latest`
 > 均与上面这个镜像名指向同一个镜像 ID，替换使用完全等效。
 
 > **备份文件存在哪？** 镜像默认把备份产物写到容器内 `/data/backups`（布局 `<该路径>/<数据库类型>/<任务ID_任务名>/`）。
@@ -472,14 +537,14 @@ docker run -d --name backup-platform \
 
 ```bash
 # 1. 导入新版本镜像（把交付包拷入离线机器）
-docker load -i aidbm_2.3.6_offline.tar.gz
+docker load -i aidbm_2.3.7_offline.tar.gz
 
 # 2. 停止并删除旧容器（备份数据在 backup-data 卷中，不受影响）
 docker stop backup-platform
 docker rm backup-platform
 
 # 3. 用新版本镜像启动（命令与首次部署完全一致，仅换镜像 tag）
-docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.3.6
+docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.3.7
 
 # 4.（可选）删除旧版本镜像释放空间
 docker rmi ghcr.io/zhh9126/backup-platform:v2.3.5
@@ -497,7 +562,7 @@ docker stop backup-platform
 docker rm backup-platform
 
 # 2. 删除镜像
-docker rmi ghcr.io/zhh9126/backup-platform:v2.3.6
+docker rmi ghcr.io/zhh9126/backup-platform:v2.3.7
 
 # 3.（谨慎）删除数据卷 —— 会清掉全部备份产物与元数据，操作前务必
 #    先把备份文件拷贝转移！
@@ -621,6 +686,28 @@ docker build -t backup-platform:local .
 - 默认账号请立即修改（首登会标记 `must_change_password`）；生产环境建议限制来源 IP
 
 ## 更新日志
+
+### v2.3.7（2026-11-10，已发布）
+
+- **防勒索保护闭环**：新增 `core/ransomware_guard.py`，把恢复点安全检测结论落库、
+  可疑自动隔离、恢复/下载安全门、可信恢复点与定期清理护栏、全流程审计及强制恢复二次确认
+  串成一条链；`/ransomware` 态势页 + `api/ransomware.py`。修复 `trusted_point_ids()`
+  把产物已丢失的幽灵记录当作可信恢复点、导致清理计划被整体跳过的回归缺陷。
+- **磁带库 / 可移动介质工程化接入**：`core/tape_library.py`（`lsscsi -g` 设备发现、
+  `/dev/tape/by-id` 持久化命名、`mtx` 库存与机械手装载、介质台账 / 出库归库 / 退役）、
+  `core/storage_backends/tape.py` 重写（设备白名单防 `/dev/sda` 被当磁带覆写、非回绕设备、
+  可配流式块、写后 sha256 校验、每设备独占锁、唯一暂存目录）、`/tape` 管理页、
+  `api/tape.py` 十二端点、Dockerfile 内置 `mt-st / mtx / lsscsi / sg3-utils`、
+  离线安装脚本 `TAPE_DEVICES` 设备透传。
+- **存储可靠性**：分层复制多磁带目标结果不再互相覆盖、`timing=manual` 真实生效、
+  状态视图补 `tape`、SFTP 目标补选；`core/lifecycle.py` 删不掉顺序介质时保留元数据并告警，
+  不再产生孤儿副本；修复磁带后端 `config_json` / `extra_options` 配置断链。
+- **全站安全审计整改**：RCE / SSRF / 注入 / 路径穿越及 5 类运行时缺陷修复、
+  口令治理、API 权限映射（`api/perm_map.py`）与并发一致性。
+- **真实验证**：磁带专项 28/28、防勒索专项 11/11、组合回归 144 passed、
+  发版回归 97 passed、365 条 GET 路由冒烟 0 个 5xx。
+- **诚实边界**：真实磁带库 / 机械手 / 多驱动并行 / LTO WORM 介质尚无真机验证报告；
+  顺序介质不支持随机删除；真实设备不默认自动全带 rewind 校验（会扰动带位）。
 
 ### v2.3.6（2026-11-10，已发布）
 

@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+  <h4 class="page-title"><i class="bi bi-shield-exclamation"></i> 防勒索保护</h4>
+  <p class="text-muted mb-0">检测 → 保护 → 响应 → 可观测：自动安全检测、保留锁定、恢复安全门、最后可信恢复点</p>
+</div>
+
+<div class="alert alert-info py-2 small">
+  <b>诚实边界</b>：完全离线环境无病毒库，检测采用启发式（体积突变 / 熵值 / 结构嗅探）+ sha256 完整性基线，
+  <b>不是病毒查杀</b>；「可疑」表示需人工复核而非确诊。应用层锁与 <code>chmod</code> 防误删，
+  <code>root</code> 仍可强删；真正的物理不可变需内核 immutable 或 S3 Object Lock。
+</div>
+
+<div id="rwNotice" class="alert d-none py-2 small"></div>
+<div class="row g-3 mb-3" id="rwKpi"></div>
+
+<div class="row g-3">
+  <div class="col-lg-7">
+    <div class="page-card mb-3">
+      <div class="card-section-title"><i class="bi bi-toggles"></i> 防护措施</div>
+      <div class="row g-2" id="rwConfig"></div>
+      <div class="d-flex gap-2 mt-3 flex-wrap">
+        <button class="btn btn-primary btn-sm" id="rwSaveCfg"><i class="bi bi-check2"></i> 保存配置</button>
+        <button class="btn btn-outline-secondary btn-sm" id="rwScanRecent"><i class="bi bi-search"></i> 补扫存量备份</button>
+        <button class="btn btn-outline-secondary btn-sm" id="rwRefresh"><i class="bi bi-arrow-clockwise"></i> 刷新态势</button>
+      </div>
+      <p class="form-text-hint mb-0 mt-2">默认开启的能力不会影响正常备份与恢复；仅当产物被判定可疑、
+        完整性漂移或被隔离时，才会拦截恢复与下载。</p>
+    </div>
+
+    <div class="page-card mb-3">
+      <div class="card-section-title"><i class="bi bi-exclamation-octagon"></i> 可疑 / 已隔离产物</div>
+      <div class="table-responsive">
+        <table class="table table-sm table-hover mb-0">
+          <thead><tr><th>#</th><th>任务</th><th>类型</th><th>检测</th><th>隔离</th><th>锁定</th><th>操作</th></tr></thead>
+          <tbody id="rwSuspects"><tr><td colspan="7" class="text-muted">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-5">
+    <div class="page-card mb-3">
+      <div class="card-section-title"><i class="bi bi-hdd-rack"></i> 物理不可变能力</div>
+      <div id="rwFs" class="small">检测中…</div>
+    </div>
+    <div class="page-card mb-3">
+      <div class="card-section-title"><i class="bi bi-clock-history"></i> 最近安全事件</div>
+      <div class="table-responsive" style="max-height:340px;overflow:auto">
+        <table class="table table-sm mb-0">
+          <thead><tr><th>时间</th><th>事件</th><th>说明</th></tr></thead>
+          <tbody id="rwEvents"><tr><td colspan="3" class="text-muted">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/ransomware.js?v=2026111001"></script>
+{% endblock %}

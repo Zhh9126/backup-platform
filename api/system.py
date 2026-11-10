@@ -1242,3 +1242,47 @@ def api_revoke_token(token_id):
     if not ok:
         return jsonify({"error": "令牌不存在"}), 404
     return jsonify({"success": True, "message": "令牌已吊销"})
+
+
+# ---------------- 并发配置：多个备份任务同时发起 ----------------
+
+@api_bp.route("/system/concurrency", methods=["GET"])
+@login_required
+def api_get_concurrency():
+    """读取并行备份配置与实时队列状态。"""
+    try:
+        stats = scheduler.concurrency_stats()
+    except Exception as exc:  # noqa: BLE001
+        stats = {"error": str(exc)}
+    env_override = int(getattr(config, "MAX_CONCURRENT_BACKUPS", 0) or 0) or None
+    return jsonify({
+        "max_concurrent_backups": stats.get("max_concurrent_backups", 2),
+        "env_override": env_override or None,
+        "default": 2,
+        "range": [1, 64],
+        "stats": stats,
+    })
+
+
+@api_bp.route("/system/concurrency", methods=["PUT"])
+@login_required
+@permission_required("system.settings")
+def api_set_concurrency():
+    """修改并行备份上限（1-64），下一次任务提交即时生效，无需重启。"""
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        limit = int(data.get("max_concurrent_backups"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "max_concurrent_backups 必须是 1-64 的整数"}), 400
+    if not 1 <= limit <= 64:
+        return jsonify({"error": "max_concurrent_backups 必须在 1-64 之间"}), 400
+    stats = scheduler.set_concurrency_limit(limit)
+    env_override = int(getattr(config, "MAX_CONCURRENT_BACKUPS", 0) or 0)
+    return jsonify({
+        "ok": True,
+        "max_concurrent_backups": limit,
+        "effective": stats.get("max_concurrent_backups", limit),
+        "warning": ("环境变量 AIDBM_MAX_CONCURRENT_BACKUPS 优先级更高，"
+                    "界面配置当前不会生效") if env_override else None,
+        "stats": stats,
+    })

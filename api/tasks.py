@@ -475,6 +475,17 @@ def delete_task(task_id):
 def run_task(task_id):
     data = request.get_json(force=True, silent=True) or {}
     backup_type = data.get("backup_type")
+    # 显式异步：所有库型统一投递并行队列，多个任务的「立即备份」可同时发起。
+    # 不传 async 时保持原有同步语义（兼容 E2E / 调度 / 存量调用方）。
+    if data.get("async") or data.get("run_async"):
+        rec = scheduler.submit_task_now(task_id, backup_type=backup_type,
+                                        operator="run-async")
+        if not rec.get("accepted"):
+            status = 409 if rec.get("duplicate") else 404
+            return jsonify(rec), status
+        return jsonify(rec), 202
+    if scheduler.is_task_submitted(task_id):
+        return jsonify({"error": "该任务已在并行执行队列中，请等待本次完成"}), 409
     record = scheduler.run_task_now(task_id, backup_type=backup_type)
     if not record:
         return jsonify({"error": "任务不存在"}), 404
@@ -490,35 +501,49 @@ def quick_backup():
     """一键备份（对标中科热备"一键备份"）：批量立即执行备份。
 
     body: {"task_ids": [..]} 可选——缺省对**全部启用任务**触发；给了则按
-    勾选清单触发。每个任务跑一次 full（异步，逐任务独立，失败互不影响）。
+    勾选清单触发。每个任务跑一次 full，统一投递并行队列同时发起（真实并行度
+    由 max_concurrent_backups 控制），逐任务独立，失败互不影响。
     返回触发计数与逐任务受理结果，前端 toast 汇报即可。
     """
     data = request.get_json(force=True, silent=True) or {}
     ids = data.get("task_ids") or []
+    if ids and not isinstance(ids, (list, tuple)):
+        return jsonify({"error": "task_ids 必须是整数列表"}), 400
+    try:
+        wanted = set(int(i) for i in ids)
+    except (TypeError, ValueError):
+        return jsonify({"error": "task_ids 必须是整数列表"}), 400
     tasks = models.list_tasks(include_secret=False) or []
     enabled = [t for t in tasks if t.get("enabled")]
-    targets = ([t for t in enabled if int(t.get("id")) in set(int(i) for i in ids)]
-               if ids else enabled)
+    targets = ([t for t in enabled if int(t.get("id")) in wanted]
+               if wanted else enabled)
     if not targets:
         return jsonify({"error": "没有可备份的启用任务"}), 400
     results = []
     for t in targets:
         tid = int(t["id"])
         try:
-            rec = scheduler.run_task_now(tid, backup_type="full",
-                                         operator="quick-backup")
-            ok = bool(rec) and (rec.get("status") in ("running", "success")
-                                or rec.get("accepted"))
+            # 并行提交：此处只做投递（毫秒级），不再同步等待整个备份跑完，
+            # 因此 N 个任务可在同一批里同时发起。
+            rec = scheduler.submit_task_now(tid, backup_type="full",
+                                            operator="quick-backup")
             results.append({"task_id": tid, "task_name": t.get("name"),
-                            "ok": ok,
-                            "message": (rec or {}).get("message", "")[:120]})
+                            "ok": bool(rec.get("accepted")),
+                            "duplicate": bool(rec.get("duplicate")),
+                            "message": (rec.get("message") or rec.get("error")
+                                        or "")[:120]})
         except Exception as exc:  # 单任务失败不影响其余
             results.append({"task_id": tid, "task_name": t.get("name"),
                             "ok": False, "message": str(exc)[:120]})
     triggered = sum(1 for r in results if r["ok"])
+    try:
+        stats = scheduler.concurrency_stats()
+    except Exception:
+        stats = {}
     return jsonify({"ok": True, "triggered": triggered,
                     "total": len(targets), "results": results,
-                    "message": f"一键备份已触发 {triggered}/{len(targets)} 个任务"})
+                    "parallel": True, "concurrency": stats,
+                    "message": f"已并行提交 {triggered}/{len(targets)} 个备份任务"})
 
 
 @api_bp.route("/tasks/<int:task_id>/discover", methods=["POST"])

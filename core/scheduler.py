@@ -7,9 +7,18 @@
 
 文件类型任务(db_type=file)的立即执行会放入后台线程，API 立即返回 202，
 前端通过轮询 /api/tasks/<id> 获取最新状态。
+
+并发模型（v2.3.7）
+------------------
+- run_task_now() 保持同步语义，兼容既有调用方（调度器、E2E、单任务 API）。
+- submit_task_now() 是统一异步入口：所有库型均可提交到有界线程池，支持
+  多个任务同时排队执行；实际并行度仍由 max_concurrent_backups 信号量控制。
+- _RUNNING_TASKS 为进程内提交去重集合，防止同一任务被重复投递。
 """
+import os
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
@@ -27,33 +36,65 @@ _scheduler = None
 class _ConcurrencyController:
     """全局并发控制器：限制同时执行的备份数量。
 
-    上限来自 system_config.max_concurrent_backups（缺省 2，保守不破坏旧串行行为）。
-    配置变更时下次获取自动重建信号量。
+    上限优先级：环境变量 AIDBM_MAX_CONCURRENT_BACKUPS（运维覆盖）>
+    system_config.max_concurrent_backups（界面可改）> 缺省 2。
+    配置变更时下次获取自动重建信号量；acquire() 返回实际获取的信号量对象，
+    release() 只释放该对象——避免"执行中配置变更重建信号量"把 permit
+    还到新信号量上（旧 permit 永久泄漏 → 并发度越跑越小）。
     """
+
+    _CONFIG_TTL = 1.0  # 配置读取节流：高并发提交时避免每次 acquire 都查 SQLite
 
     def __init__(self):
         self._limit = None
         self._sem = None
+        self._checked = 0.0
+        self._lock = threading.Lock()
 
-    def _ensure(self):
+    def limit(self) -> int:
+        # config 在启动时统一解析环境变量（非法值已回落 0），此处只读一次
+        env_limit = int(getattr(config, "MAX_CONCURRENT_BACKUPS", 0) or 0)
+        if env_limit > 0:
+            return max(1, min(env_limit, 64))
         try:
             limit = int(db.get_system_config("max_concurrent_backups") or 2)
         except Exception:
             limit = 2
-        limit = max(1, limit)
-        if self._sem is None or self._limit != limit:
-            self._limit = limit
-            self._sem = threading.Semaphore(limit)
+        return max(1, min(limit, 64))
+
+    def _ensure(self):
+        now = time.monotonic()
+        with self._lock:
+            if self._sem is not None and now - self._checked < self._CONFIG_TTL:
+                return
+            self._checked = now
+            limit = self.limit()
+            if self._sem is None or self._limit != limit:
+                self._limit = limit
+                self._sem = threading.Semaphore(limit)
 
     def acquire(self):
         self._ensure()
-        self._sem.acquire()
+        with self._lock:
+            sem = self._sem
+        sem.acquire()
+        return sem
 
-    def release(self):
+    def release(self, sem=None):
+        if sem is None:
+            with self._lock:
+                sem = self._sem
+        if sem is None:
+            return
         try:
-            self._sem.release()
+            sem.release()
         except Exception:
             pass
+
+    def invalidate(self):
+        """配置刚被修改：立即让下次 acquire 重读上限（跳过 1s 节流）。"""
+        with self._lock:
+            self._checked = 0.0
 
 
 class _BandwidthGovernor:
@@ -139,6 +180,63 @@ def _peak_govern(task: dict, size_bytes: int) -> None:
 _CONCURRENCY = _ConcurrencyController()
 _BANDWIDTH = _BandwidthGovernor()
 
+# ---- 并行执行器（多任务同时发起） ----
+_EXECUTOR_LOCK = threading.Lock()
+_BACKUP_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_RUNNING_LOCK = threading.Lock()
+_RUNNING_TASKS: set = set()          # 已提交但尚未结束的 task_id（进程内去重）
+_RUNNING_IDS: dict = {}              # task_id -> 提交时间（可观测）
+
+
+def _backup_executor() -> ThreadPoolExecutor:
+    """懒创建有界线程池：提交不阻塞，真实并行度由 _CONCURRENCY 信号量控制。"""
+    global _BACKUP_EXECUTOR
+    if _BACKUP_EXECUTOR is None:
+        with _EXECUTOR_LOCK:
+            if _BACKUP_EXECUTOR is None:
+                workers = int(getattr(config, "BACKUP_WORKERS", 0) or 0)
+                if workers <= 0:
+                    workers = max(8, _CONCURRENCY.limit() * 2)
+                _BACKUP_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=min(64, workers),
+                    thread_name_prefix="aidbm-backup")
+                _logger.info("[concurrency] 备份线程池已创建 workers=%s limit=%s",
+                             min(64, workers), _CONCURRENCY.limit())
+    return _BACKUP_EXECUTOR
+
+
+def set_concurrency_limit(limit: int) -> dict:
+    """持久化并发上限并让下一次 acquire 立即生效（无需重启服务）。"""
+    n = max(1, min(int(limit), 64))
+    db.set_system_config("max_concurrent_backups", n)
+    _CONCURRENCY.invalidate()
+    return concurrency_stats()
+
+
+def is_task_submitted(task_id: int) -> bool:
+    """该任务当前是否已投递到并行队列（供同步入口防重复触发）。"""
+    try:
+        key = int(task_id)
+    except (TypeError, ValueError):
+        return False
+    with _RUNNING_LOCK:
+        return key in _RUNNING_TASKS
+
+
+def concurrency_stats() -> dict:
+    """并发状态快照（供系统设置页/任务监控展示）。"""
+    with _RUNNING_LOCK:
+        running = sorted(_RUNNING_TASKS)
+        pending = dict(_RUNNING_IDS)
+    return {
+        "max_concurrent_backups": _CONCURRENCY.limit(),
+        "submitted": len(running),
+        "running_task_ids": running,
+        "submitted_at": {str(k): v for k, v in pending.items()},
+        "executor_workers": (getattr(_BACKUP_EXECUTOR, "_max_workers", 0)
+                             if _BACKUP_EXECUTOR is not None else 0),
+    }
+
 
 def _duration_sec(start_iso: str, end_iso: str) -> float:
     try:
@@ -221,20 +319,9 @@ def _previous_checksum(task_id: int, exclude_record_id: int = None) -> str:
     return ""
 
 
-def run_task_now(task_id: int, backup_type: str = None,
-                 operator: str = None) -> Optional[dict]:
-    """立即执行一次备份（API 手动触发或调度触发）。返回生成的备份记录。
-
-    文件备份(db_type=file)在后台线程异步执行，API 立即返回 {"accepted": True}；
-    其他类型同步执行并返回完整 record。
-    """
-    task = models.get_task(task_id, include_secret=True)
-    if not task:
-        _logger.warning("任务不存在: %s", task_id)
-        return None
-
-    # 新建库自动纳管（对标 AXUS「备新建库」）：任务开启后每次执行前发现新库，
-    # 单库任务自动克隆新任务；失败安全，不影响本次备份
+def _auto_discover_for_task(task: dict, operator: str = None) -> None:
+    """新建库自动纳管（对标 AXUS「备新建库」）：失败绝不阻断本次备份。"""
+    task_id = task.get("id")
     try:
         _eo = task.get("extra_options") or {}
         if isinstance(_eo, str):
@@ -249,30 +336,89 @@ def run_task_now(task_id: int, backup_type: str = None,
             if dr.get("discovered"):
                 _logger.info("[auto_discover] 任务 #%s: %s", task_id,
                              dr.get("message", ""))
-    except Exception as _dexc:  # noqa: BLE001 —— 发现失败绝不阻断备份
+    except Exception as _dexc:  # noqa: BLE001
         _logger.warning("[auto_discover] 任务 #%s 发现失败(不阻断): %s",
                         task_id, _dexc)
 
-    # 文件/目录备份可能耗时很长(SSH传输大目录)，放入后台线程
-    if task.get("db_type") == "file":
-        t = threading.Thread(target=_bg_execute_backup,
-                             args=(task, backup_type, operator),
-                             daemon=True,
-                             name=f"file-backup-{task_id}")
-        t.start()
-        _logger.info("[async] 文件任务 #%s 已提交后台线程执行", task_id)
-        return {"accepted": True, "task_id": task_id, "status": "running"}
 
+def submit_task_now(task_id: int, backup_type: str = None,
+                    operator: str = None) -> dict:
+    """异步提交一次备份（所有库型通用），API 立即返回受理结果。
+
+    多个任务可连续调用本函数同时发起：任务投递到有界线程池排队，真实并行度
+    仍由 max_concurrent_backups 控制。进程内按 task_id 去重，避免重复投递。
+    """
+    task = models.get_task(task_id, include_secret=True)
+    if not task:
+        _logger.warning("任务不存在: %s", task_id)
+        return {"accepted": False, "task_id": task_id, "error": "任务不存在"}
+    tid = int(task["id"])
+    with _RUNNING_LOCK:
+        if tid in _RUNNING_TASKS:
+            return {"accepted": False, "duplicate": True, "task_id": tid,
+                    "status": "running",
+                    "message": "任务已在并行执行队列中，请勿重复提交"}
+        _RUNNING_TASKS.add(tid)
+        _RUNNING_IDS[tid] = db.now_iso()
+    try:
+        # 自动发现放到 worker 内执行，批量提交时入口零阻塞
+        _backup_executor().submit(_bg_execute_backup, task, backup_type,
+                                  operator, True)
+    except Exception as exc:  # noqa: BLE001 —— 线程池拒绝等异常必须回滚去重标记
+        with _RUNNING_LOCK:
+            _RUNNING_TASKS.discard(tid)
+            _RUNNING_IDS.pop(tid, None)
+        _logger.exception("[concurrency] 任务 #%s 提交失败", tid)
+        return {"accepted": False, "task_id": tid,
+                "message": f"提交并行队列失败: {exc}"[:200]}
+    _logger.info("[concurrency] 任务 #%s 已提交并行队列(operator=%s)",
+                 tid, operator or "manual")
+    return {"accepted": True, "task_id": tid, "status": "running",
+            "async": True, "message": "已提交并行执行队列"}
+
+
+def run_task_now(task_id: int, backup_type: str = None,
+                 operator: str = None) -> Optional[dict]:
+    """立即执行一次备份（API 手动触发或调度触发）。返回生成的备份记录。
+
+    文件备份(db_type=file)走异步队列，API 立即返回 {"accepted": True}；
+    其他类型保持同步执行并返回完整 record（兼容既有 E2E/调度/API 契约）。
+    需要并行发起多个任务请改用 submit_task_now() / 一键备份接口。
+    """
+    task = models.get_task(task_id, include_secret=True)
+    if not task:
+        _logger.warning("任务不存在: %s", task_id)
+        return None
+
+    # 文件/目录备份可能耗时很长(SSH 传输大目录)，统一走并行队列
+    if task.get("db_type") == "file":
+        return submit_task_now(task_id, backup_type=backup_type,
+                                operator=operator)
+
+    _auto_discover_for_task(task, operator)
     return _execute_backup(task, backup_type, operator)
 
 
 def _bg_execute_backup(task: dict, backup_type: str = None,
-                       operator: str = None) -> None:
-    """后台线程执行文件备份（捕获所有异常，防止线程崩溃）。"""
+                       operator: str = None,
+                       do_discover: bool = False) -> None:
+    """并行队列 worker：捕获所有异常，并在 finally 释放去重标记。"""
+    tid = task.get("id")
     try:
+        if do_discover:
+            _auto_discover_for_task(task, operator)
         _execute_backup(task, backup_type, operator)
     except Exception:
-        _logger.exception("[async] 后台文件任务 #%s 执行异常", task.get("id"))
+        _logger.exception("[concurrency] 后台任务 #%s 执行异常", tid)
+    finally:
+        if tid is not None:
+            try:
+                key = int(tid)
+            except (TypeError, ValueError):
+                key = tid
+            with _RUNNING_LOCK:
+                _RUNNING_TASKS.discard(key)
+                _RUNNING_IDS.pop(key, None)
 
 
 def _normalize_backup_type(value):
@@ -296,12 +442,13 @@ def _execute_backup(task: dict, backup_type: str = None,
                     operator: str = None) -> dict:
     from core.engines.base import BackupType, BackupResult
     bt = _normalize_backup_type(backup_type or task.get("backup_type") or "full")
-    # 全局并发控制：限制同时执行的备份数量（缺省保守，不破坏旧串行行为）
-    _CONCURRENCY.acquire()
+    # 全局并发控制：限制同时执行的备份数量（缺省保守，不破坏旧串行行为）。
+    # release 必须作用于 acquire 时拿到的那个信号量，配置热变更重建不串味。
+    sem = _CONCURRENCY.acquire()
     try:
         return _execute_backup_core(task, bt, operator)
     finally:
-        _CONCURRENCY.release()
+        _CONCURRENCY.release(sem)
 
 
 def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
@@ -470,6 +617,17 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
         except Exception as e:
             models.mark_record_verified(rec_id, False, f"verify exception: {e}")
 
+    # 防勒索闭环 ①：备份成功即做启发式安全检测并落库。
+    # suspect 自动隔离 + 取证锁定 + 告警；检测失败绝不把备份判成失败。
+    if result.success and not is_sim and path:
+        try:
+            from core import ransomware_guard
+            ransomware_guard.after_backup(rec_id, task,
+                                          operator=operator or "")
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("[ransomware_guard] 自动安全检测异常 record=%s: %s",
+                            rec_id, e)
+
     # 自动保留锁定（G13 不可变备份）：任务 extra_options.retention_lock_days
     # > 0 时备份成功即上锁（备份即上锁的防勒索默认姿势）
     if result.success and not is_sim and path:
@@ -608,7 +766,8 @@ def run_restore_now(record_id: int, target_host: str = None,
                     target_time: str = None,
                     pitr_restore_dir: str = None,
                     tables: list = None,
-                    restore_options: dict = None) -> Optional[dict]:
+                    restore_options: dict = None,
+                    force_unsafe_restore: bool = False) -> Optional[dict]:
     """立即执行一次恢复。
 
     ``restore_options`` 是**对象存储恢复**的专有参数（目标桶 / 前缀 / 覆盖
@@ -619,6 +778,12 @@ def run_restore_now(record_id: int, target_host: str = None,
     rec = models.get_record(record_id)
     if not rec:
         return None
+    # 防勒索闭环 ②：恢复统一安全门（覆盖 API / 调度 / 演练 / CLI 全部入口）。
+    # 可疑/漂移/隔离产物默认拒绝；RansomwareBlocked 是 ValueError 子类，
+    # 既有调用方的业务异常捕获仍生效，但会带结构化原因。
+    from core import ransomware_guard
+    verdict = ransomware_guard.assert_restorable(
+        rec, force=bool(force_unsafe_restore), operator=operator or "")
     task = models.get_task(rec["task_id"], include_secret=True)
     from core.engines.base import BackupResult, BackupStatus
     started = db.now_iso()
@@ -630,6 +795,12 @@ def run_restore_now(record_id: int, target_host: str = None,
                         f"[开始] 目标库: {target_db or '-'}",
                         f"[开始] 操作人: {operator or '-'}",
                         f"[开始] 启动时间: {started}"]
+    if verdict.get("forced"):
+        detail_log_lines.append(
+            "[安全门] 人工强制恢复高风险产物：" +
+            "；".join(verdict.get("reasons") or []))
+    elif verdict.get("level"):
+        detail_log_lines.append(f"[安全门] 已核验：{verdict['level']}")
     if target_host_id:
         from core import ssh_hosts as ssh_mod
         target_host_info = ssh_mod.get_host(target_host_id, include_secret=True)

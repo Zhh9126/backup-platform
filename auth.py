@@ -25,6 +25,11 @@ def _valid_ak_signature() -> bool:
     头：X-AK-Access-Key / X-AK-Timestamp / X-AK-Signature
     签名=hex(HMAC_SHA256(SK, METHOD+"\n"+path+"\n"+ts))，±300s 防重放。
     """
+    # 请求级缓存：全局 API 钩子与 @login_required 都会验签，
+    # 避免同一请求重复写 last_used_at（SQLite 单写锁竞争）。
+    if getattr(g, "_ak_checked", False):
+        return bool(getattr(g, "ak_auth", None))
+    g._ak_checked = True
     ak = (request.headers.get("X-AK-Access-Key") or "").strip()
     if not ak:
         return False
@@ -96,9 +101,12 @@ def permission_required(perm: str):
         @wraps(f)
         def wrapper(*args, **kwargs):
             u = _current_user_dict()
-            # 外部 API Token 视为超管（兼容既有外部调用方）
-            if g.get("api_token"):
-                return f(*args, **kwargs)
+            # 外部认证（API Token / AccessKey 签名）按可配置等效角色校验。
+            # 默认 admin 与存量行为一致；配置为 viewer/operator 后不再无条件超管。
+            if g.get("api_token") or g.get("ak_auth"):
+                import core.rbac as _rbac_ext
+                u = {"id": 0, "username": "external-token",
+                     "role": _rbac_ext.external_auth_role(), "_external": True}
             if not u:
                 if request.path.startswith("/api/"):
                     return jsonify({"error": "未登录"}), 401

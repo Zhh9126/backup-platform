@@ -302,14 +302,33 @@
                 <input type="text" class="form-control font-code" id="st_endpoint_tape"
                        placeholder="/dev/nst0（真实磁带）或 /data/tapelibrary（目录模拟）">
                 <div class="form-text">
-                  真实磁带：填 Linux 非回流设备（/dev/nst0），需安装 mt-st（mt+tar 顺序写入）。
-                  目录模拟：填一个目录路径，每盘带为 tape_NNN.tar（容量满自动开新带）。
+                  真实磁带：优先填 <code>/dev/tape/by-id/...-nst</code> 持久化非回绕节点
+                  （或 <code>/dev/nst0</code>）；容器部署需 <code>--device</code> 透传并自带 mt-st/mtx/lsscsi。
+                  目录模拟：填一个目录，每盘带为 tape_NNN.tar（容量满自动开新带）。
                 </div>
               </div>
-              <div class="col-md-4">
+              <div class="col-md-3">
                 <label class="form-label">单盘容量上限 (GB)</label>
                 <input type="number" class="form-control" id="st_tape_max_gb" value="0" min="0">
-                <div class="form-text">仅目录模拟模式生效；0=不限。真实磁带由介质容量决定。</div>
+                <div class="form-text">仅目录模拟模式生效；0=不限。</div>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label">机械手设备 (mtx)</label>
+                <input type="text" class="form-control font-code" id="st_tape_changer"
+                       placeholder="/dev/sg2 或 /dev/tape/by-id/...">
+                <div class="form-text">lsscsi -g 中 mediumx 行的 /dev/sgN；留空=单驱无机械手。</div>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label">流式块大小 (KB)</label>
+                <input type="number" class="form-control" id="st_tape_block_kb"
+                       value="64" min="1" max="2048">
+                <div class="form-text">LTO 建议 256KB 对齐，减少磁带反复启停。</div>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label">暂存目录</label>
+                <input type="text" class="form-control font-code" id="st_tape_staging"
+                       placeholder="留空=自动">
+                <div class="form-text">写带/回迁临时目录，需足够空间。</div>
               </div>
             </div>
           </div>

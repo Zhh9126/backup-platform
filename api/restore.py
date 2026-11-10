@@ -5,6 +5,7 @@ from flask import request, jsonify
 import core.db as db
 from auth import login_required, verify_code_gate, permission_required
 from core import models, scheduler
+from core.ransomware_guard import RansomwareBlocked
 from . import api_bp
 
 
@@ -90,7 +91,17 @@ def create_restore():
             pitr_restore_dir=data.get("pitr_restore_dir"),
             tables=data.get("tables"),
             restore_options=restore_options or None,
+            # 强制恢复必须同时带显式确认，避免误点绕过安全门
+            force_unsafe_restore=bool(data.get("force_unsafe_restore"))
+            and str(data.get("confirm_unsafe") or "").lower()
+            in ("1", "true", "yes", "on"),
         )
+    except RansomwareBlocked as e:
+        return jsonify({
+            "error": str(e), "security_blocked": True,
+            "record_id": e.record_id, "reasons": e.reasons,
+            "hint": "如确需恢复，请勾选「已知风险，强制恢复」并重试（将留 critical 审计）",
+        }), 403
     except ValueError as e:
         # 受保护主机 / 其他业务前置校验拒绝（P0-2）
         return jsonify({"error": str(e), "protected_target": "受保护" in str(e)}), 400

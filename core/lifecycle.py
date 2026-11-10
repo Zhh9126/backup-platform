@@ -264,14 +264,25 @@ class LifecycleEngine:
         from core import tier_replication
         from core.storage_backends import get_backend
         targets = tier_replication._get_enabled_targets(self.logger)
+        blocked = []
         for t in targets:
             try:
                 backend = get_backend(t["type"], t, self.logger)
                 if object_key and backend.file_exists(object_key):
-                    backend.delete_file(object_key)
+                    # 顺序介质（磁带）不支持随机删除：delete_file 返回 False 时
+                    # 绝不能继续删元数据，否则带内副本变成无人知晓的孤儿数据。
+                    if not backend.delete_file(object_key):
+                        blocked.append(f"{t.get('type')}/{t.get('name')}")
             except Exception as e:
                 self.logger.warning("[lifecycle] 删除 L%s 对象失败: %s",
                                      t.get("tier"), e)
+                blocked.append(f"{t.get('type')}/{t.get('name')}: {e}")
+        if blocked:
+            self.logger.warning(
+                "[lifecycle] set#%s 保留元数据：后端对象未能删除（%s）；"
+                "顺序介质请走介质整体退役/覆写流程，避免产生孤儿副本",
+                bset.get("id"), ", ".join(blocked))
+            return False
         models.delete_backup_set(bset["id"])
         self.logger.info("[lifecycle] set#%s 已到期清理", bset.get("id"))
         return True

@@ -41,13 +41,20 @@ def me():
     u = session.get("user") or {}
     uid = u.get("id") if isinstance(u, dict) else 0
     row = rbac.get_by_id(uid) if uid else None
+    role = (row or {}).get("role") or (u.get("role") if isinstance(u, dict) else "admin")
     payload = {
         "username": (row or {}).get("username") or (u.get("username") if isinstance(u, dict) else ""),
         "display_name": (row or {}).get("display_name") or (u.get("display_name") if isinstance(u, dict) else ""),
-        "role": (row or {}).get("role") or (u.get("role") if isinstance(u, dict) else "admin"),
+        "role": role,
         "permissions": sorted(rbac.effective_permissions(
             row if row else (u if isinstance(u, dict) else {}))),
         "must_change_password": (row or {}).get("must_change_password", 0),
+        "password_change_required": bool(session.get("pwd_change_required")),
+        "force_password_change_enabled": rbac.force_password_change_enabled(),
+        # 出厂口令告警只透给超管自己，避免把安全状态扩散给只读账号
+        "default_password_in_use": (
+            rbac.default_admin_password_in_use()
+            if role == "admin" else False),
     }
     return jsonify(payload)
 
@@ -75,7 +82,9 @@ def change_my_password():
         rbac.set_password(uid, new)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
-    return jsonify({"ok": True})
+    # 改密成功即解除首次登录闸门（set_password 已清 must_change_password）
+    session.pop("pwd_change_required", None)
+    return jsonify({"ok": True, "password_change_required": False})
 
 
 # --------------- 用户 CRUD ---------------
@@ -155,3 +164,29 @@ def password_policy():
                     f"强口令策略已{'开启' if data.get('enabled') else '关闭'}"
                     f"（操作者 {(session.get('user') or {}).get('username', '')}）")
     return jsonify({"enabled": rbac.password_policy_enabled()})
+
+
+# --------------- 首次登录强制改密（默认关闭，存量部署零破坏） ---------------
+@api_bp.route("/rbac/password-change-policy", methods=["GET", "POST"])
+@login_required
+@permission_required("security.manage")
+def password_change_policy():
+    """开关 must_change_password 账号的强制改密流程。
+
+    关闭时 admin/admin123 等存量账号登录行为完全不变；开启后首次登录
+    只能访问自助端点，其余 API 返回 428，改密成功后自动解锁。
+    env AIDBM_FORCE_PASSWORD_CHANGE=1 可强制开启（优先级最高）。
+    """
+    if request.method == "POST":
+        data = request.get_json(force=True, silent=True) or {}
+        rbac.set_force_password_change(bool(data.get("enabled")))
+        import core.db as _db
+        _db.add_log("warning", "auth",
+                    f"首次登录强制改密已{'开启' if data.get('enabled') else '关闭'}"
+                    f"（操作者 {(session.get('user') or {}).get('username', '')}）")
+    import config as _cfg
+    return jsonify({
+        "enabled": rbac.force_password_change_enabled(),
+        "env_override": bool(getattr(_cfg, "FORCE_PASSWORD_CHANGE", False)),
+        "default_password_in_use": rbac.default_admin_password_in_use(),
+    })

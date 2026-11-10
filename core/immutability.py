@@ -133,20 +133,32 @@ def lock_record(record_id: int, days: int, operator: str = "",
             else record["retention_until"]
 
     protected, protect_failed = apply_write_protection(paths)
+    # 内核级不可变（可选、默认关）：能力不可用时如实回落 chmod，不伪造成功
+    fs_ok, fs_failed = [], []
+    try:
+        from core import ransomware_guard
+        fs_ok, fs_failed = ransomware_guard.apply_fs_immutable(paths)
+    except Exception as fs_exc:  # noqa: BLE001
+        fs_failed = [(p, str(fs_exc)) for p in paths]
+    fs_note = (f"；内核 immutable {len(fs_ok)}/{len(paths)} 个文件" if fs_ok
+               else (f"；内核 immutable 不可用/未启用：{fs_failed[0][1][:80]}"
+                     if fs_failed else "；内核 immutable 未启用"))
     note = (f"锁定 by {operator or 'unknown'}：{reason or '未填写原因'}"
             + (f"（永久）" if days == 0 else f"（{days} 天，至 {until}）"))
     if record.get("lock_note"):
         note = record["lock_note"] + " | " + note
     db.execute(
         "UPDATE backup_records SET locked=1, locked_at=?, retention_until=?, "
-        "write_protected=?, lock_note=? WHERE id=?",
-        (now_iso(), until or None, 1 if protected else 0, note, record_id))
+        "write_protected=?, lock_note=?, fs_immutable=? WHERE id=?",
+        (now_iso(), until or None, 1 if protected else 0, note,
+         1 if fs_ok else 0, record_id))
     db.add_log("WARNING", _log_target,
                f"备份记录 #{record_id} 保留锁定：{note}；"
-               f"写保护 {len(protected)}/{len(paths)} 个文件"
-               + (f"，失败 {protect_failed}" if protect_failed else ""))
+               f"写保护 {len(protected)}/{len(paths)} 个文件" + fs_note
+               + (f"，chmod 失败 {protect_failed}" if protect_failed else ""))
     return {"record_id": record_id, "locked": True, "retention_until": until,
             "write_protected": len(protected), "protect_failed": protect_failed,
+            "fs_immutable": len(fs_ok), "fs_failed": fs_failed,
             "note": note}
 
 
@@ -160,12 +172,18 @@ def unlock_record(record_id: int, operator: str = "", reason: str = "") -> dict:
     if not record.get("locked"):
         return {"record_id": record_id, "locked": False, "note": "未锁定"}
     paths = _artifact_paths(record)
+    # immutable 必须先撤，否则 chmod/删除都会被内核拒绝
+    try:
+        from core import ransomware_guard
+        ransomware_guard.release_fs_immutable(paths)
+    except Exception:  # noqa: BLE001
+        pass
     release_write_protection(paths)
     note = (record.get("lock_note") or "") + \
         f" | 解锁 by {operator or 'unknown'}：{reason}"
     db.execute(
         "UPDATE backup_records SET locked=0, retention_until=NULL, "
-        "write_protected=0, lock_note=? WHERE id=?",
+        "write_protected=0, fs_immutable=0, lock_note=? WHERE id=?",
         (note, record_id))
     db.add_log("WARNING", _log_target,
                f"备份记录 #{record_id} 解除保留锁定 by {operator or 'unknown'}："
@@ -243,6 +261,16 @@ def recheck_all() -> dict:
         st = res.get("status")
         if st in report:
             report[st] += 1
+        if st == "drift":
+            # 防勒索闭环 ③：校验和漂移立即升级为 suspect + 隔离 + 告警 +
+            # 恢复拦截，不再只写一条 ERROR 日志了事
+            try:
+                from core import ransomware_guard
+                ransomware_guard.on_integrity_drift(
+                    r["id"], res.get("checksum") or "")
+            except Exception as e:  # noqa: BLE001
+                db.add_log("ERROR", _log_target,
+                           f"备份记录 #{r['id']} 漂移响应失败: {e}")
     if report["drift"]:
         db.add_log("ERROR", _log_target,
                    f"完整性复检发现 {report['drift']} 个产物校验和不一致，"

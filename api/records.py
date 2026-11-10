@@ -5,7 +5,7 @@ import json
 from collections import Counter
 from flask import request, jsonify, send_file, Response
 
-from auth import login_required
+from auth import login_required, permission_required
 from core import models, db, reports
 from . import api_bp, contract, safe_download_path
 
@@ -134,6 +134,10 @@ def download_record(record_id):
     rec = models.get_record(record_id)
     if not rec or not rec.get("backup_path"):
         return jsonify({"error": "无备份文件可下载"}), 404
+    # 防勒索：被隔离的可疑产物禁止下载（防止把疑似加密/篡改产物扩散出去）
+    if rec.get("quarantined"):
+        return jsonify({"error": "该备份产物已被防勒索隔离，禁止下载；"
+                                 "请先排查，再由管理员在防勒索页解除隔离"}), 403
     # 安全整改：仅允许下载备份根目录内的文件，防路径穿越/任意文件读取
     safe_path = safe_download_path(rec["backup_path"])
     if safe_path is None:
@@ -383,14 +387,23 @@ def api_lock_record(record_id):
 
 @api_bp.route("/records/<int:record_id>/unlock", methods=["POST"])
 @login_required
+@permission_required("security.manage")
 def api_unlock_record(record_id):
-    """解除保留锁定。body: {reason: str 必填}（解锁强制审计）"""
+    """解除保留锁定。body: {reason: str 必填}（解锁强制审计 + 安全权限）。"""
     from core import immutability
     body = request.get_json(silent=True) or {}
     try:
         res = immutability.unlock_record(
             record_id, operator=_operator_name(),
             reason=body.get("reason") or "")
+        # 防勒索：解锁是抗勒索体系最关键的绕过点，独立留 critical 审计 + 告警
+        from core import ransomware_guard
+        rec = models.get_record(record_id) or {}
+        ransomware_guard.audit(
+            "unlock", "critical",
+            f"解除保留锁定：{body.get('reason') or ''}；"
+            f"原到期 {rec.get('retention_until') or '永久'}",
+            record_id, rec.get("task_id"), _operator_name())
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
@@ -405,6 +418,12 @@ def api_verify_record_integrity(record_id):
     from core import immutability
     try:
         res = immutability.verify_integrity(record_id)
+        if res.get("status") == "drift":
+            # 手工复检发现漂移同样进入防勒索响应链（隔离 + 告警 + 拦截恢复）
+            from core import ransomware_guard
+            ransomware_guard.on_integrity_drift(
+                record_id, res.get("checksum") or "",
+                operator=_operator_name())
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
     except Exception as e:
@@ -437,13 +456,15 @@ def api_restore_precheck(record_id):
 @api_bp.route("/records/<int:record_id>/security-check", methods=["POST"])
 @login_required
 def api_security_check_record(record_id):
-    """恢复点安全检测（启发式：体积突变/熵值/结构嗅探）。
+    """恢复点安全检测（启发式：体积突变/熵值/结构嗅探）+ 结论落库。
 
-    离线无病毒库，不做病毒查杀；suspect 仅提示与审计，不拦截恢复。
+    离线无病毒库，不做病毒查杀。suspect 会按配置自动隔离（禁止恢复/下载）
+    并触发告警；返回结构保持 {level, checks} 兼容既有前端。
     """
-    from core import backup_anomaly
+    from core import ransomware_guard
     try:
-        res = backup_anomaly.check_record_by_id(record_id)
+        res = ransomware_guard.scan_record(
+            record_id, operator=_operator_name())
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
     except Exception as e:

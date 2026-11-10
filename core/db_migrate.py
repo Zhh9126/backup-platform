@@ -1155,6 +1155,10 @@ class DbMigrationEngine:
         try:
             cur = src_conn.cursor()
             if src_t == "dameng":
+                # 达梦 dmPython 用 ? 占位符；此前分支引用了未定义的 sql，
+                # 会导致达梦源同义词迁移直接 NameError（被 except 吞成 skipped）。
+                sql = ("SELECT synonym_name, table_owner, table_name, db_link "
+                       "FROM all_synonyms WHERE owner=? AND ROWNUM <= ?")
                 cur.execute(sql, (self._syn_schema(), self._OBJECT_LIMIT))
             else:
                 cur.execute(
@@ -1814,7 +1818,12 @@ class DbMigrationEngine:
         补执行）；连接失败如实返回原因。
         """
         schema = (plan.get("tgt_username") or plan.get("tgt_db_name") or ""
-                  ).replace("'", "").upper()
+                  ).strip().upper()
+        # 安全整改：CALL 语句是字符串拼接，schema 来自迁移计划，
+        # 必须限定为合法标识符，仅剔除引号不足以阻止 SQL 注入。
+        import re
+        if not re.fullmatch(r"[A-Za-z0-9_$#]+", schema or ""):
+            return {"executed": False, "reason": "目标模式名含非法字符，已跳过统计收集"}
         if not schema or not tables:
             return {"executed": False, "reason": "缺少模式名或表清单"}
         try:
@@ -1838,8 +1847,10 @@ class DbMigrationEngine:
         collected, failed = [], []
         try:
             for t in tables:
-                tbl = (t or "").replace('"', "").upper()
-                if not tbl:
+                tbl = (t or "").strip().upper()
+                # 与 schema 同口径：表名必须是合法标识符，拒绝含引号/SQL
+                # 片段的清单项（best-effort，跳过不影响迁移主结论）。
+                if not tbl or not re.fullmatch(r"[A-Za-z0-9_$#]+", tbl):
                     continue
                 try:
                     cur = conn.cursor()

@@ -56,7 +56,12 @@ def emit(event: str, data: dict) -> int:
         "event": event, "time": db.now_iso(), "data": data,
     }, ensure_ascii=False, default=str).encode("utf-8")
     ok = 0
+    from core import net_guard
     for url in urls:
+        vok, reason = net_guard.validate_url(url)
+        if not vok:
+            _log().warning("[webhooks] 地址被安全策略拒绝 %s: %s", url, reason)
+            continue
         delays = [0, 2, 4, 8]
         for i, d in enumerate(delays):
             if d:

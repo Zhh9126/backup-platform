@@ -262,9 +262,16 @@ def _select_strategy_for_os(manifest: dict, os_name: str,
 # ----------------------------------------------------------------------------
 def _run_command(cmd: str, pid: str, host_key: str = "local",
                  timeout: int = 1800) -> dict:
-    """在子进程中执行 shell 命令字符串，捕获 stdout/stderr 与退出码。
+    """在子进程执行内置清单命令，捕获 stdout/stderr 与退出码。
 
-    出于安全考虑：仅在受信任的内置清单命令中调用，绝不 shell=True。
+    实现说明（如实）：清单命令含 ``&&`` / 管道 / heredoc / 环境变量赋值
+    （见 core/plugins/manifests/*.json），因此必须经 shell 执行；安全性由
+    **命令来源**保证——只允许 core/plugin_catalog 读取的内置清单命令，
+    调用点不得传入任何请求参数或用户可控字符串。平台无自定义安装命令
+    端点（api/plugins.py 只接受 pid/host_id）。
+
+    若将来开放自定义命令，必须改为参数列表 + shell=False + 可执行文件
+    白名单，不能沿用本函数。
     """
     _append_log(pid, f"$ {cmd}", host_key=host_key)
     try:
@@ -459,15 +466,16 @@ def _download_and_extract(strategy: dict, pid: str,
         _append_log(pid, f"downloaded: {tmp_path.stat().st_size} bytes",
                      host_key=host_key)
 
-    # 按扩展名选择解压方式
+    # 按扩展名选择解压方式（归档来自外部包，必须过滤路径穿越与链接成员）
     try:
+        from core import archive_guard
         if real_suffix in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz",
                            ".tbz2", ".txz", ".gz", ".bz2", ".xz", ".tar"):
             with tarfile.open(tmp_path, "r:*") as tf:
-                tf.extractall(extract_path)
+                archive_guard.safe_extract_tar(tf, extract_path)
         elif real_suffix == ".zip":
             with zipfile.ZipFile(tmp_path, "r") as zf:
-                zf.extractall(extract_path)
+                archive_guard.safe_extract_zip(zf, extract_path)
         else:
             return {"ok": False, "message": f"不支持的压缩格式: {real_suffix} (URL: {url})"}
 

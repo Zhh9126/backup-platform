@@ -86,8 +86,9 @@ def ingest_one(pkg_path: str) -> dict:
                             f"{task_id}_{t.get('name', 'task')}")
     os.makedirs(task_dir, exist_ok=True)
     try:
+        from core import archive_guard
         with tarfile.open(pkg_path, "r:gz") as tf:
-            tf.extractall(task_dir)  # noqa: S202（离线受控来源）
+            archive_guard.safe_extract_tar(tf, task_dir)
     except Exception as e:
         return {"ok": False, "message": "解包失败: " + str(e)}
 

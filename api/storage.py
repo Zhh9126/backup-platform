@@ -114,7 +114,11 @@ def api_set_local_root():
         return jsonify({"error": "请填写绝对路径，例如 /data/backups"}), 400
 
     new_path = os.path.abspath(os.path.expanduser(raw))
-    if new_path.rstrip("/") in _FORBIDDEN_ROOTS:
+    _SYSTEM_PREFIXES = ("/etc", "/root", "/usr", "/bin", "/sbin", "/proc",
+                        "/sys", "/dev", "/boot", "/var/lib/docker")
+    if new_path.rstrip("/") in _FORBIDDEN_ROOTS or any(
+            new_path == p or new_path.startswith(p + "/")
+            for p in _SYSTEM_PREFIXES):
         return jsonify({"error": f"不允许将备份目录设置为系统目录：{new_path}"}), 400
     if os.path.isfile(new_path):
         return jsonify({"error": "该路径已是一个文件，请填写目录路径"}), 400

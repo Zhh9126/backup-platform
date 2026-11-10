@@ -3,7 +3,7 @@
 from flask import request, jsonify
 
 import core.db as db
-from auth import login_required, verify_code_gate
+from auth import login_required, verify_code_gate, permission_required
 from core import models, scheduler
 from . import api_bp
 
@@ -134,15 +134,33 @@ def api_record_tables(record_id):
 
 @api_bp.route("/webhooks", methods=["GET", "POST"])
 @login_required
+@permission_required("security.manage")
 def api_webhooks():
     """Webhooks 事件中心配置：urls（逗号/换行分隔）+ secret（HMAC 签名）。"""
     from core import webhooks as wh
     if request.method == "GET":
         urls, secret = wh._urls_and_secret()
-        return jsonify({"urls": ",".join(urls), "secret": secret})
+        # 安全整改：HMAC 密钥不回显，避免低权限用户读取后伪造平台事件
+        return jsonify({"urls": ",".join(urls), "has_secret": bool(secret)})
     data = request.get_json(silent=True) or {}
-    db.set_system_config("webhook_urls", data.get("urls", ""))
-    db.set_system_config("webhook_secret", data.get("secret", ""))
+    from core import net_guard
+    urls_raw = data.get("urls", "")
+    bad = []
+    for u in str(urls_raw).replace("\n", ",").split(","):
+        u = u.strip()
+        if not u:
+            continue
+        ok, reason = net_guard.validate_url(u)
+        if not ok:
+            bad.append("%s（%s）" % (u[:80], reason))
+    if bad:
+        return jsonify({"ok": False,
+                        "error": "Webhook 地址被拒绝: " + "; ".join(bad[:5])}), 400
+    db.set_system_config("webhook_urls", urls_raw)
+    # 留空表示保持原密钥不变（GET 已不再回显明文）
+    secret = (data.get("secret") or "").strip()
+    if secret:
+        db.set_system_config("webhook_secret", secret)
     test = data.get("test")
     if test:
         sent = wh.emit("webhook.test", {"message": "hello from backup-platform"})

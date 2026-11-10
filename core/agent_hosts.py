@@ -61,7 +61,13 @@ def create_host(data: dict) -> int:
     if not hostname:
         raise ValueError("hostname 必填")
     port = int(data.get("port") or 8466)
+    # token 会写进 systemd unit 与安装脚本：换行可注入 ExecStartPre，
+    # shell 元字符可注入安装命令。这里强制字符集白名单（生成值天然合规）。
+    import re
     token = (data.get("token") or "").strip() or crypto.generate_token()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", token):
+        raise ValueError("token 必须为 16-128 位字母/数字/下划线/连字符，"
+                         "不允许空格、换行或 shell 元字符")
     now = _now()
     return db.execute(
         "INSERT INTO agent_hosts(name, host_key, hostname, port, token, "

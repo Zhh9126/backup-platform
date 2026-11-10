@@ -108,6 +108,17 @@ def _resolve_kms_passphrase(cfg: dict) -> Optional[bytes]:
     secret = cfg.get("kms_secret")
     if not endpoint or not key_id:
         return None
+    # 安全整改：endpoint 由页面配置传入，未校验会把 kms_secret/access_key
+    # POST 到攻击者地址，也可借平台进程访问内网服务（SSRF）。
+    try:
+        from core import net_guard
+        ok, reason = net_guard.validate_url(endpoint)
+        if not ok:
+            logger.warning("KMS endpoint 被安全策略拒绝: %s", reason)
+            return None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("KMS endpoint 校验失败: %s", e)
+        return None
     try:
         import requests
     except ImportError:

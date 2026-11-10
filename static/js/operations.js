@@ -95,9 +95,9 @@
       return;
     }
     const pgLongRunning = Pager.slice("opsLongRunning", rows);
-    tb.innerHTML = pgLongRunning.list.map(r => `
+    tb.innerHTML = pgLongRunning.list.map((r, ri) => `
       <tr>
-        <td>${esc(r.id)}</td>
+        <td>${pgLongRunning.startNo + ri}</td>
         <td>${fmtTime(r.started_at)}</td>
         <td>${esc(dbTypeLabel(r.db_type))}</td>
         <td>${esc(r.task_name || r.task_id || "—")}</td>
@@ -107,7 +107,7 @@
         <td>${esc(r.reason || "—")}</td>
         <td>${window.BKP.statusBadge ? window.BKP.statusBadge(r.status) : esc(r.status || "")}</td>
       </tr>`).join("");
-    Pager.attach("opsLongRunning", tb, pgLongRunning.page, pgLongRunning.pages, pgLongRunning.total, null);
+    Pager.attach("opsLongRunning", tb, pgLongRunning.page, pgLongRunning.pages, pgLongRunning.total, () => renderLongRunning(rows));
   }
 
   function renderFrequency(rows) {
@@ -126,7 +126,7 @@
         <td>${fmtTime(g.window_end)}</td>
         <td>${esc((g.record_ids || []).join(", "))}</td>
       </tr>`).join("");
-    Pager.attach("opsFrequency", tb, pgFrequency.page, pgFrequency.pages, pgFrequency.total, null);
+    Pager.attach("opsFrequency", tb, pgFrequency.page, pgFrequency.pages, pgFrequency.total, () => renderFrequency(rows));
   }
 
   /* ---------- 阈值 modal ---------- */

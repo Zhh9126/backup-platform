@@ -832,7 +832,9 @@ document.addEventListener("DOMContentLoaded", async function () {
   try {
     const cfg = await (await fetch("/api/webhooks", { credentials: "include" })).json();
     document.getElementById("wh_urls").value = cfg.urls || "";
-    document.getElementById("wh_secret").value = cfg.secret || "";
+    const whSecret = document.getElementById("wh_secret");
+    whSecret.value = "";  // 服务端不再回显 HMAC 密钥，留空表示保持原值
+    whSecret.placeholder = cfg.has_secret ? "已配置，留空保持不变" : "可选：HMAC 签名密钥";
   } catch (e) { /* 忽略 */ }
   const save = async (test) => {
     const body = {

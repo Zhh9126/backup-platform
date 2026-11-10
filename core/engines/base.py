@@ -987,8 +987,9 @@ class BackupEngine:
         """解开 tar(.gz) 到 dest_dir，返回实际目录路径。"""
         import tarfile
         os.makedirs(dest_dir, exist_ok=True)
+        from core import archive_guard
         with tarfile.open(tar_path, "r:*") as tar:
-            tar.extractall(dest_dir)
+            archive_guard.safe_extract_tar(tar, dest_dir)
         return dest_dir
 
     def _new_dump_path(self, backup_type: BackupType, ext: str) -> str:

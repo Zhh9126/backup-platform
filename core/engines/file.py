@@ -2724,6 +2724,11 @@ class FileBackupEngine(BackupEngine):
     def _try_file_cross_host_restore(self, backup_path: str, target_host_info: dict,
                                      target_dir: str, kwargs: dict = None) -> BackupResult:
         """文件跨主机链式恢复：SFTP 推送恢复链(全量+增量) → 远程依次解压 → 应用删除清单。"""
+        # 记录缺产物路径时 os.path.isdir(None) 会抛 TypeError 掩盖真实原因
+        if not backup_path:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message="恢复失败：备份记录缺少产物路径（backup_path 为空）")
         from core import cross_host
         from core import db as _db
         kwargs = kwargs or {}

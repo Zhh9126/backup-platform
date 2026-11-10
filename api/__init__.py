@@ -30,6 +30,8 @@ def _api_security_gate():
     2) CSRF 防护：写操作校验 Origin/Referer 同源。
        无 Origin/Referer 头（如本机 curl/脚本）且已登录时放行；
        令牌认证的请求（非浏览器）不适用 CSRF，直接放行写操作。
+    3) 只读角色（viewer / audit_admin）写操作兜底拦截，探测/预览/导出等
+       无写副作用的 POST 仍放行；admin/operator/三员中的写角色不受影响。
     """
     from auth import _extract_bearer_token, _valid_api_token
 
@@ -46,8 +48,25 @@ def _api_security_gate():
         origin = (request.headers.get("Origin") or request.headers.get("Referer") or "").strip()
         if origin:
             o = urlparse(origin)
-            if o.netloc and o.netloc != request.host:
+            # Origin: null / 缺 netloc 不能当作同源；必须带协议且 host 完全匹配
+            if not o.scheme or not o.netloc or o.netloc != request.host:
                 return jsonify({"success": False, "error": "CSRF 校验失败：跨站请求被拒绝"}), 403
+        # 3) 只读角色写操作兜底：viewer / audit_admin 不应能创建任务、
+        #    执行恢复、改配置。全站 400+ 写端点逐个补装饰器不现实，
+        #    这里在蓝图钩子统一兜底；带「探测/预览/导出/自助」语义的
+        #    POST 仍放行（它们不产生写副作用）。
+        role = (session.get("user") or {}).get("role") or ""
+        if role in ("viewer", "audit_admin"):
+            read_semantic = (
+                "precheck", "preview", "/test", "probe", "scan", "dry-run",
+                "export", "download", "security-check", "verify-code",
+                "change-password", "/query", "/search", "/check", "list-",
+                "/resolve", "/analyze", "/compare", "/estimate",
+            )
+            path = request.path.lower()
+            if not any(h in path for h in read_semantic):
+                return jsonify({"success": False,
+                                "error": "当前角色为只读角色，无权执行写操作"}), 403
 
 
 def safe_download_path(path: str):

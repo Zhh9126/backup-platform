@@ -215,6 +215,12 @@ def create_app() -> Flask:
         except Exception:
             pass
         msg = str(e) or e.__class__.__name__
+        try:
+            # 异常文本可能含连接串/口令，回显客户端前统一脱敏
+            from core.logging_setup import mask_secrets
+            msg = mask_secrets(msg)
+        except Exception:
+            pass
         if e.__class__.__name__ == "IntegrityError" or "UNIQUE constraint" in msg \
                 or "Duplicate entry" in msg:
             return jsonify(error_codes.make_payload(

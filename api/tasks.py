@@ -575,6 +575,7 @@ def import_tasks():
     except Exception:
         return jsonify({"error": "无法读取文件，请确认是 UTF-8 编码的 CSV"}), 400
     reader = csv.DictReader(io.StringIO(content))
+    from core import license as license_mod  # 配额异常在下方 except 中使用
     created, skipped = 0, 0
     errors = []
     for i, row in enumerate(reader, start=2):
@@ -720,8 +721,17 @@ def clone_task(task_id):
         if "Quota" in msg or "配额" in msg:
             return jsonify({"error": f"克隆失败（社区版配额限制）: {msg}"}), 400
         return jsonify({"error": f"克隆失败: {msg}"}), 400
+    warning = ""
     try:
         scheduler.reload_scheduler()
-    except Exception:
-        pass
-    return jsonify({"ok": True, "id": new_id, "message": f"已克隆为任务 #{new_id}（默认停用，请核对后启用）"})
+    except Exception as e:  # noqa: BLE001
+        # 不能静默吞掉：调度没重载时任务启用后不会执行，且排查无日志线索
+        warning = "调度重载失败: %s" % (str(e) or type(e).__name__)
+        try:
+            import core.db as _db
+            _db.get_logger("tasks").warning(
+                "克隆任务 #%s 后调度重载失败: %s", new_id, e)
+        except Exception:
+            pass
+    return jsonify({"ok": True, "id": new_id, "warning": warning,
+                    "message": f"已克隆为任务 #{new_id}（默认停用，请核对后启用）"})

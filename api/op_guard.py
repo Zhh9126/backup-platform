@@ -7,10 +7,14 @@
 
 高危端点（恢复执行 / 备份清理 / 删除任务 / 删除主机）在开关开启时要求
 请求体携带 verify_code，由 auth.verify_code_gate 统一校验。
+
+安全整改：关闭防护属于安全配置变更，必须带 security.manage 权限点，
+否则任意登录用户（含 viewer）都能先关闸再执行高危动作。
 """
 from flask import jsonify, request
 
-from auth import issue_verify_code, op_verify_enabled, set_op_verify_enabled, login_required
+from auth import (issue_verify_code, op_verify_enabled, permission_required,
+                  set_op_verify_enabled, login_required)
 from . import api_bp
 
 
@@ -28,6 +32,7 @@ def api_op_guard_config():
 
 @api_bp.route("/op-guard/config", methods=["POST"])
 @login_required
+@permission_required("security.manage")
 def api_op_guard_save_config():
     data = request.get_json(silent=True) or {}
     set_op_verify_enabled(bool(data.get("verify_code_enabled")))

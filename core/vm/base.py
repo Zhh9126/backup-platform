@@ -152,7 +152,7 @@ class VMProvider:
           power_on      —— VM 是否进入运行态
           ping:<ip>     —— 平台侧 ICMP/TCP 探测（优先 TCP 22/3389 回退）
           tcp:<ip>:<p>  —— 平台侧建连探测
-          exec:<shell>  —— 在 Hypervisor 宿主机上执行脚本（rc=0 视为通过）
+          exec:<cmd>    —— 默认禁用（安全策略），开启后仅允许白名单命令的参数列表执行
         """
         from core.vm import verify as vmverify
         out: List[HealthCheckResult] = []

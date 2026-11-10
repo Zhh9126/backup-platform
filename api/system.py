@@ -9,7 +9,7 @@ import json
 
 logger = logging.getLogger("api.system")
 
-from auth import login_required
+from auth import login_required, permission_required
 from core import models, scheduler, db
 from core.engines import supported_types, ENGINE_DISPLAY, engine_meta_map
 import config
@@ -1117,6 +1117,7 @@ def get_pool_crypto():
 
 @api_bp.route("/pool-crypto", methods=["POST"])
 @login_required
+@permission_required("security.manage")
 def save_pool_crypto():
     """保存存储池加密密钥配置（本地密钥库 / KMS）。
 
@@ -1160,6 +1161,11 @@ def save_pool_crypto():
         }
         if not cfg["kms_endpoint"] or not cfg["kms_key_id"]:
             return jsonify({"ok": False, "error": "KMS 模式需填写 endpoint 与 key_id"}), 400
+        from core import net_guard
+        ok, reason = net_guard.validate_url(cfg["kms_endpoint"])
+        if not ok:
+            return jsonify({"ok": False,
+                            "error": "KMS endpoint 被拒绝: " + reason}), 400
     db.set_system_config("pool_crypto", json.dumps(cfg, ensure_ascii=False))
     # 保存后立即自检：用测试文件加密→解密，验证密钥真实可用
     try:

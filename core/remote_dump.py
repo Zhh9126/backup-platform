@@ -1237,7 +1237,8 @@ def _remote_mysql_dump(task: dict, ssh_host: dict, compress: int, extra_args: st
     user = task.get("username") or "root"
     pw = db.decrypt_secret(task.get("password") or "")
     # 用二进制写，避免 Windows \r\n 被传到远端导致 mysql 客户端解析失败
-    with open(cnf_local, "wb") as f:
+    fd = os.open(cnf_local, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
         f.write(f"[client]\nuser={user}\npassword={pw}\n".encode("utf-8"))
     remote_cnf = "/tmp/bk_rdump.cnf"
     try:
@@ -1644,8 +1645,10 @@ def _pg_family_dumpall_stream(client, cfg: dict,
     shell = _pg_family_dumpall_shell(client, cfg, user, pw, port, tool_path)
     out, err, rc = _ssh_exec_pipe(client, _wrap_login(shell), timeout=7200)
     if rc != 0:
+        # dumpall_bin 只存在于 _pg_family_dumpall_shell 内，此处引用会抛
+        # NameError 并吞掉远端真实 stderr；错误消息只保留可判定的 rc/err。
         raise RuntimeError(
-            f"远程 dumpall 失败(rc={rc}, bin={dumpall_bin}): {err[:600]}")
+            f"远程 dumpall 失败(rc={rc}): {err[:600]}")
     return out
 
 
@@ -2840,7 +2843,8 @@ def _remote_mysql_dump_to_file(task: dict, ssh_host: dict, final_path: str,
     cnf_local = tempfile.mktemp(suffix=".cnf")
     user = task.get("username") or "root"
     pw = db.decrypt_secret(task.get("password") or "")
-    with open(cnf_local, "wb") as f:
+    fd = os.open(cnf_local, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
         f.write(f"[client]\nuser={user}\npassword={pw}\n".encode("utf-8"))
     remote_cnf = "/tmp/bk_rdump.cnf"
     sftp.put(cnf_local, remote_cnf)
@@ -3638,7 +3642,8 @@ def _remote_list_mysql_databases(task: dict, ssh_host: dict) -> list:
     cnf_local = tempfile.mktemp(suffix=".cnf")
     user = task.get("username") or "root"
     pw = db.decrypt_secret(task.get("password") or "")
-    with open(cnf_local, "wb") as f:
+    fd = os.open(cnf_local, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
         f.write(f"[client]\nuser={user}\npassword={pw}\n".encode("utf-8"))
     remote_cnf = "/tmp/bk_list.cnf"
     try:
@@ -3748,7 +3753,8 @@ def _remote_mysql_restore(task: dict, ssh_host: dict, dump_bytes: bytes) -> None
     user = task.get("username") or "root"
     pw = db.decrypt_secret(task.get("password") or "")
     # 用二进制写，避免 Windows \r\n 传到远端导致 mysql 客户端解析失败
-    with open(cnf_local, "wb") as f:
+    fd = os.open(cnf_local, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
         f.write(f"[client]\nuser={user}\npassword={pw}\n".encode("utf-8"))
     remote_cnf = "/tmp/bk_rrestore.cnf"
     try:
@@ -3926,7 +3932,8 @@ def _remote_mysql_restore_tar(task: dict, ssh_host: dict, dump_bytes: bytes) -> 
 
     # 密码走临时 cnf，不进 argv/环境
     cnf_local = tempfile.mktemp(suffix=".cnf")
-    with open(cnf_local, "wb") as f:
+    fd = os.open(cnf_local, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
         f.write(f"[client]\nuser={user}\npassword={pw}\n".encode("utf-8"))
     remote_cnf = "/tmp/bp_mysql_restore.cnf"
     sftp = client.open_sftp()
@@ -4018,20 +4025,32 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
                 f"远端主机未找到 SQL 客户端（{'/'.join(cfg['query_candidates'])}），无法恢复。")
         maint = _pg_family_detect_maint_db(client, cfg, psql_tool, user, pw, port)
         safe_db = db_name.replace('"', '""')
+        # 安全整改：目标库名来自恢复请求 / 任务配置。
+        # 1) SQL 字面量内的单引号必须转义（否则可闭合字符串注入 SQL）；
+        # 2) -c 参数统一用 shlex.quote 包裹，原双引号包裹会让 $(...) /
+        #    反引号在远端 shell 展开，构成命令注入。
+        safe_db_lit = db_name.replace("'", "''")
+        psql_base = (f"{psql_tool} -h 127.0.0.1 -p {port} "
+                     f"-U {shlex.quote(user)}{wpass} -d {shlex.quote(maint)} ")
+        q_drop_force = shlex.quote(
+            f'DROP DATABASE IF EXISTS "{safe_db}" WITH (FORCE);')
+        q_term_sys = shlex.quote(
+            "SELECT sys_terminate_backend(pid) FROM sys_stat_activity "
+            f"WHERE datname = '{safe_db_lit}';")
+        q_term_pg = shlex.quote(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            f"WHERE datname = '{safe_db_lit}';")
+        q_drop = shlex.quote(f'DROP DATABASE IF EXISTS "{safe_db}";')
+        q_create = shlex.quote(f'CREATE DATABASE "{safe_db}";')
         # DROP ... WITH (FORCE) 需 PG13+/金仓较新版本；openGauss/PG9.2 系不支持，
         # 老版本先杀连接再 DROP（pg_terminate_backend 在 openGauss 同样可用）
         prep = (
             f"set -o pipefail; {env} "
-            f"{psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} -d {shlex.quote(maint)} "
-            f"-c 'DROP DATABASE IF EXISTS \"{safe_db}\" WITH (FORCE);' "
-            f"|| {{ {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} -d {shlex.quote(maint)} "
-            f"-c \"SELECT sys_terminate_backend(pid) FROM sys_stat_activity WHERE datname = '{db_name}';\" "
-            f"|| {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} -d {shlex.quote(maint)} "
-            f"-c \"SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{db_name}';\" ; "
-            f"{psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} -d {shlex.quote(maint)} "
-            f"-c 'DROP DATABASE IF EXISTS \"{safe_db}\";' ; }} "
-            f"&& {psql_tool} -h 127.0.0.1 -p {port} -U {shlex.quote(user)}{wpass} -d {shlex.quote(maint)} "
-            f"-c 'CREATE DATABASE \"{safe_db}\";'"
+            f"{psql_base} -c {q_drop_force} "
+            f"|| {{ {psql_base} -c {q_term_sys} "
+            f"|| {psql_base} -c {q_term_pg} ; "
+            f"{psql_base} -c {q_drop} ; }} "
+            f"&& {psql_base} -c {q_create}"
         )
         _out, perr, prc = _ssh_exec_pipe(
             client, _wrap_login(prep), input_data=b"", timeout=300)

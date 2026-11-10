@@ -29,7 +29,7 @@ def run_platform_check(item: str, ip_hint: str = "") -> HealthCheckResult:
         ping / ping:<ip>          —— ICMP 探测（失败回退 TCP 22/3389）
         tcp:<ip>:<port>           —— TCP 建连探测
         url:<http(s)://...>       —— HTTP(S) 请求，状态码 <400 视为通过
-        exec:<shell>              —— 平台本机执行脚本（rc=0 视为通过）
+        exec:<cmd>                —— 默认禁用；仅当开启 vm_allow_exec_checks 且命中白名单命令时执行
     """
     name = str(item or "").strip()
     started = time.monotonic()
@@ -40,8 +40,30 @@ def run_platform_check(item: str, ip_hint: str = "") -> HealthCheckResult:
 
     try:
         if name.startswith("exec:"):
-            cmd = name[len("exec:"):]
-            p = subprocess.run(cmd, shell=True, capture_output=True, timeout=300)
+            # 安全整改：检查项可由 API 请求体 / 任务 extra 传入，不能把请求
+            # 内容交给 shell=True（等于任意命令执行）。默认禁用；显式开启时
+            # 也只允许白名单二进制 + 参数列表，并拒绝所有 shell 元字符。
+            cmd = name[len("exec:"):].strip()
+            try:
+                import core.db as _cfg_db
+                allow = str(_cfg_db.get_system_config(
+                    "vm_allow_exec_checks") or "").lower() in ("1", "true", "on")
+            except Exception:
+                allow = False
+            if not allow:
+                return _done(False, "exec: 检查项已禁用（平台不允许执行任意命令）")
+            import shlex
+            if any(ch in cmd for ch in (";", "|", "&", "$", "`", ">", "<",
+                                        "\n", "\r")):
+                return _done(False, "exec: 含 shell 元字符，已拒绝执行")
+            try:
+                argv = shlex.split(cmd)
+            except ValueError as e:
+                return _done(False, "exec: 命令解析失败: %s" % e)
+            allowed = ("ping", "curl", "nc", "true", "test")
+            if not argv or argv[0].rsplit("/", 1)[-1] not in allowed:
+                return _done(False, "exec: 仅允许白名单命令 %s" % ", ".join(allowed))
+            p = subprocess.run(argv, shell=False, capture_output=True, timeout=300)
             tail = (p.stdout.decode("utf-8", "ignore") +
                     p.stderr.decode("utf-8", "ignore")).strip()[-200:]
             return _done(p.returncode == 0,
@@ -49,6 +71,12 @@ def run_platform_check(item: str, ip_hint: str = "") -> HealthCheckResult:
 
         if name.startswith("url:"):
             url = name[len("url:"):].strip()
+            # 内网私网目标允许（VM 健康检查常见），但回环/元数据/非 http(s)
+            # 一律拒绝，避免借平台进程探测本机服务或读取云元数据。
+            from core import net_guard
+            ok, reason = net_guard.validate_url(url)
+            if not ok:
+                return _done(False, "url: 目标被拒绝（%s）" % reason)
             from core.vm import http as vmhttp
             r = vmhttp.request("GET", url, timeout=30)
             return _done(r["ok"], "HTTP %s %s" % (r.get("status"), url))
@@ -59,6 +87,10 @@ def run_platform_check(item: str, ip_hint: str = "") -> HealthCheckResult:
                 return _done(False, "tcp 检查格式应为 tcp:<ip>:<port>")
             host = parts[1] or ip_hint
             port = int(parts[2])
+            from core import net_guard
+            ok, reason = net_guard.validate_tcp_target(host, port)
+            if not ok:
+                return _done(False, "tcp: 目标被拒绝（%s）" % reason)
             return _tcp_check(_done, host, port)
 
         if name == "ping" or name.startswith("ping:"):

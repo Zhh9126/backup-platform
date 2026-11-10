@@ -32,7 +32,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 > 按授权服务器数计量的 `distinct host` 视图、对象存储断点续传、AXUS 17 项对齐补齐。
 > Windows 真机（192.168.41.3 / SQL Server 2022）与真实 HTTP S3 推拉闭环均已实测。
 >
-> **最新动态**：v2.3.6（2026-11-09）已发布（修复离线包全新部署时 SQL Server JDBC 逻辑备份不可用）+ 2026-11-07 四库型（Oracle/PostgreSQL/金仓/达梦）全功能深度测试收官——
+> **最新动态**：v2.3.6（2026-11-10）已发布（修复离线包全新部署时 SQL Server JDBC 逻辑备份不可用）+ 2026-11-07 四库型（Oracle/PostgreSQL/金仓/达梦）全功能深度测试收官——
 > 每库覆盖「预检 → 逻辑备份 → 恢复（硬核对）→ 数据对比 → 物理备份 → 恢复校验 → 实时备份闭环」，
 > 其中 SQL Server 双通道（物理 SSH+sqlcmd / 逻辑 JDBC 免 SSH）、Windows 文件备份（内置 tar.exe 打包 + SFTP 拉取，零插件）、
 > 五库互对比矩阵 10/10 配对一致与对比报告导出（Excel/CSV）
@@ -394,7 +394,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
 docker pull ghcr.io/zhh9126/backup-platform:v2.3.6    # 固定版本（可回滚）
-# 当前最新版本：v2.3.6（2026-11-07，五库对比矩阵+报告导出+实时触发式封存）
+# 当前最新版本：v2.3.6（2026-11-10，群晖纳管 / Windows 文件增量 / 异地容灾出站拉取 / 授权服务器数计量）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -417,13 +417,36 @@ python tools/check_env.py
 ### 离线导入
 
 ```bash
-# 交付包（推荐）：aidbm_2.2.0_offline.tar.gz（923MB，含 AI 智能助手 + 全部备份工具）
-docker load -i aidbm_2.2.0_offline.tar.gz
+# 交付包：aidbm_2.3.6_offline.tar.gz（约 1.3GB，gzip 压缩的完整镜像，含全部运行依赖与备份工具）
+docker load -i aidbm_2.3.6_offline.tar.gz
 
-# 自行导出
-docker save ghcr.io/zhh9126/backup-platform:v2.3.6 -o aidbm_2.3.4.tar
-# 内网机器导入
-docker load -i aidbm_2.2.0.tar
+# 导入后确认镜像名（离线环境不会自动去公网拉取）
+docker images | grep -E 'backup-platform|aidbm'
+```
+
+> **导入后可用 4 个镜像名（同一镜像 ID，任选其一启动，全程零联网）**：
+> `ghcr.io/zhh9126/backup-platform:v2.3.6`、`ghcr.io/zhh9126/backup-platform:latest`、
+> `aidbm:2.3.6`、`aidbm:latest`。
+> **v2.3.6 交付包已把这 4 个 tag 全部打进 `manifest.json` 的 `RepoTags`**，
+> `docker load` 时会输出 4 行 `Loaded image:`，直接 `docker run` 任一名字都不会访问公网。
+>
+> 若遇到 `Unable to find image 'xxx' locally` 后跟着
+> `Get "https://registry-1.docker.io/v2/": context deadline exceeded`，
+> 说明**启动命令用的镜像名不在包内 tag 里**（Docker 找不到本地镜像就会去公网），
+> 不是包损坏。先 `docker images` 查实际 tag，或补一条：
+> ```bash
+> docker tag ghcr.io/zhh9126/backup-platform:v2.3.6 aidbm:2.3.6
+> ```
+
+自行导出（有网机器上**先打齐 tag 再 save**，否则包内只带单个 tag）：
+
+```bash
+docker pull ghcr.io/zhh9126/backup-platform:v2.3.6
+docker tag ghcr.io/zhh9126/backup-platform:v2.3.6 ghcr.io/zhh9126/backup-platform:latest
+docker tag ghcr.io/zhh9126/backup-platform:v2.3.6 aidbm:2.3.6
+docker tag ghcr.io/zhh9126/backup-platform:v2.3.6 aidbm:latest
+docker save ghcr.io/zhh9126/backup-platform:v2.3.6 ghcr.io/zhh9126/backup-platform:latest aidbm:2.3.6 aidbm:latest | gzip > aidbm_2.3.6_offline.tar.gz
+gzip -t aidbm_2.3.6_offline.tar.gz    # 必须输出 OK，否则包被截断不可交付
 ```
 
 ### 运行
@@ -434,8 +457,12 @@ docker run -d --name backup-platform \
   -v backup-data:/data \
   -e BACKUP_ROOT=/data/backups \
   --restart unless-stopped \
-  ghcr.io/zhh9126/backup-platform:latest
+  ghcr.io/zhh9126/backup-platform:v2.3.6
 ```
+
+> 离线环境请用**固定版本 tag**（不要用 `:latest` 指代"从公网拉最新"）。
+> 交付包内 `aidbm:2.3.6`、`aidbm:latest`、`ghcr.io/zhh9126/backup-platform:latest`
+> 均与上面这个镜像名指向同一个镜像 ID，替换使用完全等效。
 
 > **备份文件存在哪？** 镜像默认把备份产物写到容器内 `/data/backups`（布局 `<该路径>/<数据库类型>/<任务ID_任务名>/`）。
 > **必须把 `/data` 挂载到宿主机持久化卷**，否则备份会写进容器可写层（`docker inspect` 的 UpperDir 里能看到，重建容器即丢失）。
@@ -444,8 +471,8 @@ docker run -d --name backup-platform \
 ### 升级（旧版本 → 新版本）
 
 ```bash
-# 1. 导入新版本镜像（离线环境在有网机器 docker save 后拷入）
-docker load -i aidbm_2.2.0.tar
+# 1. 导入新版本镜像（把交付包拷入离线机器）
+docker load -i aidbm_2.3.6_offline.tar.gz
 
 # 2. 停止并删除旧容器（备份数据在 backup-data 卷中，不受影响）
 docker stop backup-platform
@@ -455,7 +482,7 @@ docker rm backup-platform
 docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.3.6
 
 # 4.（可选）删除旧版本镜像释放空间
-docker rmi ghcr.io/zhh9126/backup-platform:v2.1.0
+docker rmi ghcr.io/zhh9126/backup-platform:v2.3.5
 ```
 
 > 升级不丢数据：元数据库、备份产物、日志都在 `backup-data` 卷（`/data`），
@@ -620,6 +647,14 @@ docker build -t backup-platform:local .
 - **诚实边界**：Defender CFA 在该真机上报 `0x800106ba`（服务未运行/第三方接管），
   平台如实返回 `cfa=unknown`，ACL 通道独立可用；群晖/Windows 增量尚未跑各自真机全链路，
   快照与块级增量未实现。
+- **离线交付包重打（2026-11-10）**：修复 `docker load` 后执行
+  `docker run ... aidbm:2.3.6` 报 `Unable to find image 'aidbm:2.3.6' locally` 并访问公网超时——
+  根因是旧包 `manifest.json` 的 `RepoTags` 只有 `ghcr.io/zhh9126/backup-platform:v2.3.6`，
+  与启动命令所用镜像名不一致（**包未损坏**）。现包一次导出 4 个 tag
+  （`ghcr.io/...:v2.3.6` / `ghcr.io/...:latest` / `aidbm:2.3.6` / `aidbm:latest`），
+  `gzip -t` 通过；实测撤销全部 tag 后重新 `docker load` 自动恢复 4 个 tag，
+  按用户原命令形态启动容器 `/login` 返回 200、调度器注册 17 个任务、镜像内版本 2.3.6。
+  README 的离线导入 / 运行 / 升级命令已统一到 `aidbm_2.3.6_offline.tar.gz` 与固定版本 tag。
 
 ### v2.3.4（2026-11-09，已发布）
 

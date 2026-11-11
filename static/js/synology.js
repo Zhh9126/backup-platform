@@ -138,7 +138,7 @@
   }
 
   function openDeviceModal(d) {
-    $("synDeviceModalTitle").textContent = d ? "编辑 DSM 设备 #" + d.id : "纳管 DSM 设备";
+    $("synDeviceModalTitle").textContent = d ? "编辑 DSM 设备 " + d.id : "纳管 DSM 设备";
     $("syn_d_id").value = d ? d.id : "";
     $("syn_d_name").value = d ? d.name : "";
     $("syn_d_hostname").value = d ? d.hostname : "";
@@ -296,7 +296,7 @@
     try {
       const out = await api("POST", BASE + "/devices/" + id + "/quick-task", payload);
       $("synQuickResult").innerHTML =
-        '<div class="alert alert-success py-2 mb-0">已创建备份任务 <strong>#' + out.id +
+        '<div class="alert alert-success py-2 mb-0">已创建备份任务 <strong>' + out.id +
         "</strong>（" + (out.strategy === "mixed" ? "全量 " + esc(out.full_cron) +
           " + 每 " + out.incremental_minutes + " 分钟增量" : "仅全量") + "）：" +
         esc(out.paths.join("、")) + "。<br><span class='text-muted'>" + esc(out.note || "") +
@@ -317,7 +317,7 @@
     tb.innerHTML = rows.map((t, i) =>
       "<tr><td>" + (startNo + i) + "</td>" +
       "<td><a href='/tasks?focus=" + t.id + "'><strong>" + esc(t.name) + "</strong></a>" +
-        '<div class="text-muted small">#' + t.id + "</div></td>" +
+        '<div class="text-muted small">任务 ID ' + t.id + "</div></td>" +
       "<td>" + esc(t.biz_system || "-") + "</td>" +
       "<td><code>" + esc((t.paths || []).join("、") || "-") + "</code></td>" +
       "<td>" + (t.mixed_backup ? badge("全量+增量", "bg-info") : badge("仅全量", "bg-secondary")) +

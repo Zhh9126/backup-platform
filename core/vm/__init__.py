@@ -49,7 +49,7 @@ def provider_for(hv_row: dict, logger=None):
 def _hv_secret(hv_id: int) -> dict:
     hv = models.get_vm_hypervisor(int(hv_id), include_secret=True)
     if not hv:
-        raise VMProviderError("虚拟化平台 #%s 不存在" % hv_id)
+        raise VMProviderError("虚拟化平台 %s 不存在" % hv_id)
     return hv
 
 
@@ -220,7 +220,7 @@ def list_protected() -> list:
 def get_protected(vm_id: int) -> dict:
     vm = models.get_vm_protected(int(vm_id))
     if not vm:
-        raise VMProviderError("受保护虚拟机 #%s 不存在" % vm_id)
+        raise VMProviderError("受保护虚拟机 %s 不存在" % vm_id)
     rows = models.list_vm_recovery_points(vm["id"])
     vm["rps"] = rows
     try:
@@ -235,7 +235,7 @@ def get_protected(vm_id: int) -> dict:
 def update_protected(vm_id: int, data: dict) -> dict:
     vm = models.get_vm_protected(int(vm_id))
     if not vm:
-        raise VMProviderError("受保护虚拟机 #%s 不存在" % vm_id)
+        raise VMProviderError("受保护虚拟机 %s 不存在" % vm_id)
     models.update_vm_protected(int(vm_id), data)
     if vm.get("task_id"):
         patch = {}
@@ -268,7 +268,7 @@ def trigger_backup(vm_id: int, backup_type: str = "incremental") -> dict:
     """人工触发一次虚拟机备份（走平台既有调度器入口）。"""
     vm = models.get_vm_protected(int(vm_id))
     if not vm:
-        raise VMProviderError("受保护虚拟机 #%s 不存在" % vm_id)
+        raise VMProviderError("受保护虚拟机 %s 不存在" % vm_id)
     if not vm.get("task_id"):
         raise VMProviderError("该虚拟机未关联备份任务")
     from core import scheduler
@@ -347,9 +347,9 @@ def _start_job(vm_id: int, rp_id: int, mode: str, spec: dict, operator: str = ""
 def restore_in_place(vm_id: int, rp_id: int, operator: str = "") -> dict:
     vm = models.get_vm_protected(int(vm_id))
     if not vm:
-        raise VMProviderError("受保护虚拟机 #%s 不存在" % vm_id)
+        raise VMProviderError("受保护虚拟机 %s 不存在" % vm_id)
     if not models.get_vm_recovery_point(int(rp_id)):
-        raise VMProviderError("恢复点 #%s 不存在" % rp_id)
+        raise VMProviderError("恢复点 %s 不存在" % rp_id)
     return {"job_id": _start_job(vm_id, rp_id, "restore_in_place", {}, operator),
             "status": "running",
             "message": "原位还原作业已提交（将覆盖原虚拟机，请确认业务已停止）"}
@@ -358,9 +358,9 @@ def restore_in_place(vm_id: int, rp_id: int, operator: str = "") -> dict:
 def clone_from_rp(vm_id: int, rp_id: int, spec: dict, operator: str = "") -> dict:
     vm = models.get_vm_protected(int(vm_id))
     if not vm:
-        raise VMProviderError("受保护虚拟机 #%s 不存在" % vm_id)
+        raise VMProviderError("受保护虚拟机 %s 不存在" % vm_id)
     if not models.get_vm_recovery_point(int(rp_id)):
-        raise VMProviderError("恢复点 #%s 不存在" % rp_id)
+        raise VMProviderError("恢复点 %s 不存在" % rp_id)
     spec = spec or {}
     if int(spec.get("ttl_hours") or 0) <= 0:
         spec["ttl_hours"] = int(spec.get("ttl_hours") or 0)
@@ -372,7 +372,7 @@ def clone_from_rp(vm_id: int, rp_id: int, spec: dict, operator: str = "") -> dic
 def verify_rp(vm_id: int, rp_id: int, spec: dict = None, operator: str = "") -> dict:
     vm = models.get_vm_protected(int(vm_id))
     if not vm:
-        raise VMProviderError("受保护虚拟机 #%s 不存在" % vm_id)
+        raise VMProviderError("受保护虚拟机 %s 不存在" % vm_id)
     return {"job_id": _start_job(vm_id, rp_id, "verify", spec or {}, operator),
             "status": "running",
             "message": "自动恢复验证已提交（隔离网络拉起 → 健康检查 → 自动销毁）"}
@@ -385,7 +385,7 @@ def list_jobs(limit: int = 100) -> list:
 def get_job(job_id: int) -> dict:
     job = models.get_vm_job(int(job_id))
     if not job:
-        raise VMProviderError("作业 #%s 不存在" % job_id)
+        raise VMProviderError("作业 %s 不存在" % job_id)
     return job
 
 
@@ -393,7 +393,7 @@ def delete_clone_target(job_id: int) -> dict:
     """销毁某次克隆/验证产生的目标 VM（到期回收 / 手动回收）。"""
     job = models.get_vm_job(int(job_id))
     if not job:
-        raise VMProviderError("作业 #%s 不存在" % job_id)
+        raise VMProviderError("作业 %s 不存在" % job_id)
     if not job.get("target_ref"):
         return {"ok": False, "message": "该作业没有可销毁的目标 VM"}
     vm = models.get_vm_protected(job["vm_id"])
@@ -438,7 +438,7 @@ def list_recovery_points(vm_id: int = None, limit: int = 200) -> list:
 def delete_recovery_point(rp_id: int) -> dict:
     rp = models.get_vm_recovery_point(int(rp_id))
     if not rp:
-        raise VMProviderError("恢复点 #%s 不存在" % rp_id)
+        raise VMProviderError("恢复点 %s 不存在" % rp_id)
     dependents = [r for r in models.list_vm_recovery_points(rp["vm_id"], limit=1000)
                   if int(r.get("parent_rp_id") or 0) == int(rp_id)]
     if dependents:
@@ -468,7 +468,7 @@ def plan_report(vm_id: int) -> dict:
     """下次备份决策（为什么会全量/增量）——可解释性，避免「黑盒策略」。"""
     vm = models.get_vm_protected(int(vm_id))
     if not vm:
-        raise VMProviderError("受保护虚拟机 #%s 不存在" % vm_id)
+        raise VMProviderError("受保护虚拟机 %s 不存在" % vm_id)
     hv = _hv_secret(vm["hypervisor_id"])
     import json as _json
     extra = hv.get("extra_config")

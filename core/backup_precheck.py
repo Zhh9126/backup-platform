@@ -458,7 +458,7 @@ def precheck_backup_by_id(task_id: int) -> dict:
         raise ValueError("任务不存在: %s" % task_id)
     res = precheck_backup(task)
     res["task_id"] = task_id
-    res["task_name"] = task.get("name") or ("任务 #%s" % task_id)
+    res["task_name"] = task.get("name") or ("任务 %s" % task_id)
     return res
 
 
@@ -479,7 +479,7 @@ def precheck_restore_by_id(record_id: int, target_host_id: int = None,
         from core import models as _m
         _t = _m.get_task(rec.get("task_id")) or {}
         res["biz_label"] = (_t.get("biz_label") or _t.get("name")
-                            or ("记录 #%s" % record_id))
+                            or ("记录 %s" % record_id))
     except Exception:
-        res["biz_label"] = "记录 #%s" % record_id
+        res["biz_label"] = "记录 %s" % record_id
     return res

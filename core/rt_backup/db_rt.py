@@ -393,7 +393,7 @@ class DbRtCapture:
         with self._state_lock:
             self.last_rp_id = point.id
             self.last_rp_at = point.pit_at
-        self.logger.info("[rt.cdc] task=%s 链头 db-full #%s %s",
+        self.logger.info("[rt.cdc] task=%s 链头 db-full %s %s",
                          self.task_id, point.id, norm_path(archive))
         return point
 
@@ -412,7 +412,7 @@ class DbRtCapture:
         if row and row.get("backup_path") and os.path.isfile(row["backup_path"]):
             return (row["backup_path"],
                     bool(row.get("status") == "simulated"),
-                    f"复用最近一次全量备份记录 #{row.get('id')} 作为恢复链头")
+                    f"复用最近一次全量备份记录 {row.get('id')} 作为恢复链头")
 
         # ② 真实环境下尝试立刻做一次全量
         if config.DEMO_MODE != "on" and not self.task.get("demo_only"):
@@ -684,7 +684,7 @@ class DbRtCapture:
             self._last_rpo_alert_ts = now
             reason = health.degrade_reason or health.last_error or "恢复点延迟增长"
             msg = (
-                f"[实时保护] 任务#{self.task_id} RPO 超出目标："
+                f"[实时保护] 任务{self.task_id} RPO 超出目标："
                 f"当前 {health.rpo_actual_sec}s > 目标 {self.rt.rpo_target_sec}s"
                 f"（健康灯 {health.health}，{reason}）"
             )

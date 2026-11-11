@@ -246,7 +246,7 @@ def check_record_by_id(record_id: int) -> dict:
             bad = [(c["item"], c["message"]) for c in res["checks"]
                    if c["level"] == "suspect"]
             db.add_log("WARNING", "backup_anomaly",
-                       "恢复点安全检测发现异常: record#%s task#%s path=%s checks=%s"
+                       "恢复点安全检测发现异常: record%s task%s path=%s checks=%s"
                        % (record_id, rec.get("task_id"),
                           rec.get("backup_path"), bad))
         except Exception:

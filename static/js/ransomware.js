@@ -136,17 +136,17 @@
   window.rwRescan = async function (id) {
     try {
       const r = await api("POST", `/api/ransomware/scan/${id}`, {});
-      notice(`记录 #${id} 检测完成：${r.level}${r.quarantined ? "（已自动隔离）" : ""}`, true);
+      notice(`记录 ${id} 检测完成：${r.level}${r.quarantined ? "（已自动隔离）" : ""}`, true);
       load();
     } catch (e) { notice("重扫失败: " + e.message, false); }
   };
 
   window.rwRelease = async function (id) {
-    const reason = prompt(`解除记录 #${id} 的隔离？请填写原因（审计必填）：`);
+    const reason = prompt(`解除记录 ${id} 的隔离？请填写原因（审计必填）：`);
     if (!reason || !reason.trim()) return;
     try {
       await api("POST", `/api/ransomware/release/${id}`, { reason });
-      notice(`记录 #${id} 已解除隔离，请重新检测后再恢复`, true);
+      notice(`记录 ${id} 已解除隔离，请重新检测后再恢复`, true);
       load();
     } catch (e) { notice("解除失败: " + e.message, false); }
   };

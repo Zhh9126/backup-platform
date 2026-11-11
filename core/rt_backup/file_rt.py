@@ -454,7 +454,7 @@ class FileRtCapture:
             self.last_error = ""
             if not self.degrade_reason:
                 self.daemon_status = STATUS_RUNNING
-        self.logger.info("[rt.file] task=%s 恢复点 #%s 变化=%d 删除=%d %s",
+        self.logger.info("[rt.file] task=%s 恢复点 %s 变化=%d 删除=%d %s",
                          self.task_id, point.id, point.changed_files,
                          point.deleted_files, norm_path(archive))
         return point

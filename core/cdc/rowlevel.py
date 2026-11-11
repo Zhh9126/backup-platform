@@ -1044,7 +1044,7 @@ class RowCDCStream:
         db.execute("UPDATE cdc_streams SET status='running', last_error=NULL,"
                    " pid=?, updated_at=? WHERE id=?",
                    (self.proc.pid, db.now_iso(), self.stream_id))
-        db.add_log("INFO", "cdc", f"CDC 流 #{self.stream_id} 已启动"
+        db.add_log("INFO", "cdc", f"CDC 流 {self.stream_id} 已启动"
                    f"（{self.db_type} @ {self.cfg['host']}）")
         return True
 
@@ -1062,7 +1062,7 @@ class RowCDCStream:
                     pass
         db.execute("UPDATE cdc_streams SET status='stopped', pid=NULL,"
                    " updated_at=? WHERE id=?", (db.now_iso(), self.stream_id))
-        db.add_log("INFO", "cdc", f"CDC 流 #{self.stream_id} 已停止")
+        db.add_log("INFO", "cdc", f"CDC 流 {self.stream_id} 已停止")
 
     def is_alive(self) -> bool:
         return bool(self.proc and self.proc.poll() is None)
@@ -1115,7 +1115,7 @@ class RowCDCStream:
                         last_flush = time.time()
         except Exception as exc:
             self.last_error = f"CDC 读取异常: {exc}"
-            _LOG.exception("[cdc] 流 #%s 读取异常", self.stream_id)
+            _LOG.exception("[cdc] 流 %s 读取异常", self.stream_id)
         finally:
             # 收口：MySQL 收尾一条残留行事件；PG 收尾未提交事务
             try:
@@ -1143,7 +1143,7 @@ class RowCDCStream:
                 db.execute("UPDATE cdc_streams SET status='error', last_error=?,"
                            " updated_at=? WHERE id=?",
                            (err[:500], db.now_iso(), self.stream_id))
-                db.add_log("ERROR", "cdc", f"CDC 流 #{self.stream_id} 异常退出: {err[:200]}")
+                db.add_log("ERROR", "cdc", f"CDC 流 {self.stream_id} 异常退出: {err[:200]}")
 
     def _save_position(self, parser) -> None:
         pos = {}

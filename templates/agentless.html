@@ -85,9 +85,9 @@
         <div class="table-responsive">
           <table class="table table-sm table-hover align-middle mb-2">
             <thead><tr>
-              <th>主机</th><th>端口</th><th>通道模式</th><th>状态</th><th>版本/加密</th><th>最后探活</th><th>操作</th>
+              <th>主机</th><th>端口</th><th>通道模式</th><th>状态</th><th>版本/加密</th><th>最后检查</th><th>操作</th>
             </tr></thead>
-            <tbody id="agentRows"><tr><td colspan="6" class="text-muted small">加载中…</td></tr></tbody>
+            <tbody id="agentRows"><tr><td colspan="7" class="text-muted small">加载中…</td></tr></tbody>
           </table>
         </div>
         <button class="btn btn-sm btn-outline-secondary" onclick="loadAgents()">
@@ -234,7 +234,7 @@
       const chans = (r.channels || []).map((c) =>
         '<span class="badge bg-light text-dark border me-1" title="' + esc(c.reason || "") + '">' + esc(c.name) + " · " + esc(c.invasiveness) + "</span>").join("");
       const reqs = (r.requires_target_config || []).map((x) => esc(x.item)).join("；") || (r.realtime ? "（实时链路已启用，见该库型 CDC 前置要求）" : "无");
-      return "<tr><td>" + esc(r.task_name) + '<div class="text-muted small">#' + esc(r.task_id) + "</div></td>" +
+      return "<tr><td>" + esc(r.task_name) + '<div class="text-muted small">任务 ID ' + esc(r.task_id) + "</div></td>" +
         "<td>" + esc(r.db_type) + " / " + esc(r.backup_mode) + (r.realtime ? ' <span class="badge bg-info text-dark">实时</span>' : "") + "</td>" +
         '<td class="small">' + esc(r.target) + "</td>" +
         "<td>" + (chans || '<span class="text-muted">-</span>') + "</td>" +
@@ -290,12 +290,20 @@
         return;
       }
       tb.innerHTML = list.map((a) => {
-        const st = (a.last_status || "").startsWith("online")
-          ? '<span class="badge bg-success">在线</span>'
-          : '<span class="badge bg-secondary" title="' + esc(a.last_status || "") + '">离线/未知</span>';
+        const raw = a.last_status || "";
+        const online = raw.startsWith("online");
+        const refused = /refused|Errno 111|连接失败|timed out/i.test(raw);
+        let st;
+        if (online) st = '<span class="badge bg-success">在线</span>';
+        else if (refused) st = '<span class="badge bg-danger">服务未启动</span>';
+        else if (raw) st = '<span class="badge bg-secondary">离线/未知</span>';
+        else st = '<span class="badge bg-light text-dark border">未检查</span>';
+        const reason = (!online && raw)
+          ? '<div class="small text-muted mt-1" style="max-width:230px;word-break:break-all" title="' +
+            esc(raw) + '">' + esc(raw.slice(0, 80)) + "</div>" : "";
         return "<tr><td>" + esc(a.hostname) + "</td><td>" + esc(a.port) + "</td>" +
           '<td><span class="badge bg-light text-dark border">' + esc((a.transport || "auto").toUpperCase()) + "</span></td>" +
-          "<td>" + st + "</td><td class='small text-muted'>" + esc(a.agent_version || "-") + " / " + esc(a.enc_algo || "-") + "</td>" +
+          "<td>" + st + reason + "</td><td class='small text-muted'>" + esc(a.agent_version || "-") + " / " + esc(a.enc_algo || "-") + "</td>" +
           "<td class='small text-muted'>" + esc((a.last_check_at || "-").replace("T", " ").slice(0, 19)) + "</td>" +
           '<td class="text-nowrap">' +
           '<button class="btn btn-sm btn-outline-success me-1" onclick="probeAgent(' + a.id + ')" title="探活">探活</button>' +
@@ -351,6 +359,15 @@
     }
   };
 
+  function agentGuidance(msg) {
+    if (/refused|Errno 111|连接失败|timed out/i.test(String(msg))) {
+      return "目标机 Agent 端口未监听：执行器服务可能未启动或启动失败。" +
+        "请在目标机执行 systemctl status aidbm-agent 查看原因，" +
+        "或在右侧「安装并启动」重推执行器（离线环境零第三方依赖）。";
+    }
+    return String(msg || "");
+  }
+
   window.probeAgent = async function (id) {
     let ok = false, msg = "";
     try {
@@ -359,7 +376,7 @@
       if (ok) msg = "探活在线 · 版本 " + ((r.caps || {}).version || "-") +
                     " · 签名 " + ((r.caps || {}).algo || "-");
     } catch (e) { msg = String(e.message || e); }
-    alert(ok ? "✓ " + msg : "探活失败: " + msg);
+    alert(ok ? "✓ " + msg : "探活失败：" + agentGuidance(msg));
     await window.loadAgents();
   };
 
@@ -380,11 +397,29 @@
       const r = await api("POST", "/api/v1/agents/remote-install",
         { host_id: parseInt(hostId, 10),
           agent_port: parseInt(document.getElementById("ai_port").value || "8466", 10) });
-      box.innerHTML = r.ok
-        ? '<span class="text-success">安装成功，探活在线。</span> 任务添加时该主机会自动优先走 Agent 通道。'
-        : '<span class="text-danger">安装完成但探活失败：</span>' + esc(String((r.probe || {}).error || r.error || ""));
+      const ins = r.install || {}, pr = r.probe || {};
+      if (r.ok) {
+        box.innerHTML = '<span class="text-success">安装成功，探活在线。</span> 任务添加时该主机会自动优先走 Agent 通道。' +
+          '<div class="text-muted mt-1">载荷 ' + esc(ins.payload_format || "-") +
+          ' · Python ' + esc(ins.python || "-") + '</div>';
+      } else {
+        let html = '<span class="text-danger">' +
+          (ins.ok ? '执行器已推送，但探活未通过' : '安装未完成：服务启动失败') + '：</span>';
+        if (r.rolled_back) html += '<div class="text-muted">' + esc(r.rolled_back) + '</div>';
+        const hint = r.hint || (r.details && r.details.hint) || "";
+        if (hint) html += '<div class="mt-1">' + esc(hint) + '</div>';
+        else if (pr.error || r.error) html += '<div class="mt-1">' +
+          esc(agentGuidance(pr.error || r.error)) + '</div>';
+        if (ins.diagnostics) html += '<details class="mt-2">' +
+          '<summary class="small">查看远端服务日志</summary>' +
+          '<pre class="small mt-1 p-2 bg-light border rounded" style="max-height:220px;overflow:auto;white-space:pre-wrap">' +
+          esc(ins.diagnostics) + '</pre></details>';
+        box.innerHTML = html;
+      }
     } catch (e) {
-      box.innerHTML = '<span class="text-danger">安装失败：</span>' + esc(String(e.message || e));
+      const m = String(e.message || e);
+      box.innerHTML = '<span class="text-danger">安装失败：</span>' + esc(m) +
+        '<div class="mt-1 text-muted">' + esc(agentGuidance(m)) + '</div>';
     }
     btn.disabled = false;
     await window.loadAgents();

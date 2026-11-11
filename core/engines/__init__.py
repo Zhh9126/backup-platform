@@ -333,7 +333,7 @@ def synthesize_full_for_task(task_id: int, target_storage_tier: int = None,
             if logger:
                 mode = "物理合并" if not res.simulated else "逻辑重链(缺客户端)"
                 logger.info(
-                    "[synthesize] task=%s 合成全量 #%s (%s, 合并 %d 个增量, "
+                    "[synthesize] task=%s 合成全量 %s (%s, 合并 %d 个增量, "
                     "去重 %.1fMB, 校验%s)",
                     task_id, new_id, mode, len(chain) - 1,
                     dedup_saved / 1048576.0, "通过" if verified else "未通过")

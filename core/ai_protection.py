@@ -91,7 +91,7 @@ def _normalize_members(members) -> list:
         row = db.query_one(
             "SELECT id, name, db_type FROM backup_tasks WHERE id=?", (tid,))
         if not row:
-            raise PlanError(f"成员 {i} 的任务不存在: #{tid}")
+            raise PlanError(f"成员 {i} 的任务不存在: {tid}")
         layer = m.get("layer") if m.get("layer") in _VALID_LAYERS else "rdb_metadata"
         out.append({"task_id": tid, "layer": layer,
                     "task_name": row["name"], "db_type": row["db_type"]})
@@ -143,7 +143,7 @@ def create_plan(data: dict) -> int:
 
 def update_plan(plan_id: int, data: dict) -> bool:
     if not get_plan(plan_id):
-        raise PlanError(f"保护计划不存在: #{plan_id}")
+        raise PlanError(f"保护计划不存在: {plan_id}")
     sets, params = [], []
     if (data.get("name") or "").strip():
         sets.append("name=?"); params.append(data["name"].strip())
@@ -200,7 +200,7 @@ def run_plan(plan_id: int, operator: str = "") -> dict:
     """
     plan = get_plan(plan_id)
     if not plan:
-        raise PlanError(f"保护计划不存在: #{plan_id}")
+        raise PlanError(f"保护计划不存在: {plan_id}")
     from core import scheduler as sched
     started = time.time()
     results = []

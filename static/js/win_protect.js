@@ -68,7 +68,7 @@
     } catch (e) { toast("保存失败：" + (e.message || e), "danger"); }
   };
   window.wpDeleteRule = async function (id) {
-    if (!window.confirm("删除规则 #" + id + "？主机侧防护不会自动解除。")) return;
+    if (!window.confirm("删除规则 " + id + "？主机侧防护不会自动解除。")) return;
     try { await A("DELETE", "/api/win-protect/rules/" + id); await refresh(); }
     catch (e) { toast("删除失败：" + (e.message || e), "danger"); }
   };

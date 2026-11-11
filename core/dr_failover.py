@@ -481,7 +481,7 @@ def _acquire_link_lock(link_id: int):
     with _LOCK_GUARD:
         lk = _LINK_LOCKS.setdefault(link_id, _threading.Lock())
     if not lk.acquire(blocking=False):
-        raise FailoverError("链路 #%s 已有切换/回切在执行，请勿并发触发" % link_id)
+        raise FailoverError("链路 %s 已有切换/回切在执行，请勿并发触发" % link_id)
     return lk
 
 
@@ -495,7 +495,7 @@ def _attach_business_verification(result: dict, cfg: dict, phase: str,
     if v.get("configured") and not v.get("ok"):
         result["message"] = v.get("message")
         db.add_log("ERROR", "dr_failover",
-                   "链路 #%s %s：%s" % (link_id, phase, v.get("message")))
+                   "链路 %s %s：%s" % (link_id, phase, v.get("message")))
     return result
 
 

@@ -73,10 +73,26 @@ def _api_security_gate():
                             "error": "首次登录需先修改默认口令",
                             "password_change_required": True}), 428
 
+    # 3) 功能项按需启用 / 权限分离：GET 也要拦，不能只靠前端隐藏菜单。
+    #    未配置时 features.can_access 恒放行（零破坏）。
+    try:
+        from core import features as _features
+        feat_ok, feat_reason = _features.can_access(user, path)
+        if not feat_ok:
+            return jsonify({
+                "success": False,
+                "error": ("该功能项已被管理员停用" if feat_reason == "feature_disabled"
+                          else "当前账号未被授予该功能项"),
+                "feature_reason": feat_reason,
+                "path": path,
+            }), 403
+    except Exception:
+        pass
+
     if request.method not in perm_map.WRITE_METHODS:
         return None
 
-    # 3) CSRF：Origin: null / 缺 netloc 不能当作同源
+    # 4) CSRF：Origin: null / 缺 netloc 不能当作同源
     if not token_auth:
         origin = (request.headers.get("Origin") or request.headers.get("Referer") or "").strip()
         if origin:
@@ -84,7 +100,7 @@ def _api_security_gate():
             if not o.scheme or not o.netloc or o.netloc != request.host:
                 return jsonify({"success": False, "error": "CSRF 校验失败：跨站请求被拒绝"}), 403
 
-    # 4) 统一写端点权限映射（豁免返回 perm=None）
+    # 5) 统一写端点权限映射（豁免返回 perm=None）
     perm, _reason = perm_map.resolve(path, request.method)
     if perm and not _rbac.has_permission(user, perm):
         return jsonify({"success": False,

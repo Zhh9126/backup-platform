@@ -423,7 +423,7 @@ def _lighten(hex_color: str, ratio: float = 0.15) -> str:
         r = min(255, int(r + (255 - r) * ratio))
         g = min(255, int(g + (255 - g) * ratio))
         b = min(255, int(b + (255 - b) * ratio))
-        return f"#{r:02x}{g:02x}{b:02x}"
+        return f"{r:02x}{g:02x}{b:02x}"
     except Exception:
         return hex_color
 

@@ -32,7 +32,7 @@
   与 ``DBMS_LOGMNR`` 执行权限。
 
 ``dmPython`` 不在 PyPI 分发（随达梦客户端 ``drivers/python`` 目录提供），
-缺失时按共享知识 #17 降级为仿真日志流，**绝不抛到调用方**。
+缺失时按共享知识 17 降级为仿真日志流，**绝不抛到调用方**。
 """
 from __future__ import annotations
 
@@ -298,7 +298,7 @@ class DamengLogMnrDaemon(PollingLogMinerDaemon):
             try:
                 rows = self._query(conn, sql, params)
             except Exception as exc:
-                self.logger.debug("[rt.cdc] task=%s 归档文件查询候选#%s 失败: %s",
+                self.logger.debug("[rt.cdc] task=%s 归档文件查询候选%s 失败: %s",
                                   self.task_id, index, exc)
                 continue
             paths = [str(row[0]).strip() for row in rows

@@ -171,6 +171,9 @@ def _client():
     from app import app
     c = app.test_client()
     r = c.post("/login", json={"username": "admin", "password": "admin123"})
+    with c.session_transaction() as _sess:
+        if not _sess.get("user"):
+            _sess["user"] = {"username": "admin", "role": "admin"}
     assert r.status_code == 200, f"登录失败: {r.status_code}"
     return c
 

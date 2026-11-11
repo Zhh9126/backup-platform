@@ -432,7 +432,7 @@
     $("os_schedule").value = mode;
     syncScheduleBoxes();
 
-    $("osCfgMode").textContent = "编辑任务 #" + t.id;
+    $("osCfgMode").textContent = "编辑任务 " + t.id;
     $("osCfgMode").className = "badge bg-warning text-dark";
     $("osCancelEditBtn").classList.remove("d-none");
     $("os_sk_hint").textContent = "留空表示沿用原 SecretKey";
@@ -556,7 +556,7 @@
       return '<tr>' +
         '<td><div class="fw-bold">' + esc(t.name || "未命名任务") + "</div>" +
         '<div class="small text-muted">' + esc(t.biz_system || "-") +
-        ' <span class="badge bg-light text-dark border ms-1">#' + t.id + "</span>" +
+        ' <span class="badge bg-light text-dark border ms-1">' + t.id + "</span>" +
         (t.enabled ? "" : ' <span class="badge bg-secondary ms-1">已停用</span>') + "</div></td>" +
         "<td>" + bucketCell + "</td>" +
         '<td class="small">' + esc((t.host || "-") + (t.port ? ":" + t.port : "")) + "</td>" +
@@ -720,7 +720,7 @@
   function renderObjects() {
     const man = OBJ.manifest || {};
     const f = (v) => (v === null || v === undefined || v === "" ? "-" : v);
-    $("osObjSubtitle").textContent = "记录 #" + OBJ.recordId +
+    $("osObjSubtitle").textContent = "记录 " + OBJ.recordId +
       (man.bucket ? "　桶 " + man.bucket : "");
     $("osObjSummary").innerHTML =
       '<div class="col-6 col-lg-3"><div class="small text-muted">备份类型</div><div class="fw-semibold">' +
@@ -788,7 +788,7 @@
     $("os_restore_apply_deleted").checked = ex.os_restore_apply_deleted !== false;
     const granular = !!(keys && keys.length);
     $("osRestoreScope").innerHTML =
-      "恢复来源：记录 <b>#" + recordId + "</b>（" + esc(rec.task_name || "-") +
+      "恢复来源：记录 <b>" + recordId + "</b>（" + esc(rec.task_name || "-") +
       "，" + esc(rec.backup_type_display || rec.backup_type || "-") +
       "，" + esc(rec.size_human || "-") + "）" +
       "<br>恢复范围：" + (granular

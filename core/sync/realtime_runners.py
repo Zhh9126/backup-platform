@@ -53,6 +53,9 @@ def start_runner(task_id: int, fn: Callable[..., Any], *args, **kwargs) -> bool:
 
 def _wrap(task_id: int, fn: Callable[..., Any], *args, **kwargs) -> None:
     res = None
+    # 保存同一个 Event 引用：stop_runner 会 pop _RUNNERS，之后
+    # get_stop_event() 会新建一个未置位的 Event，导致误判为异常退出。
+    stop_ev = get_stop_event(task_id)
     try:
         try:
             res = fn(*args, **kwargs)
@@ -62,7 +65,7 @@ def _wrap(task_id: int, fn: Callable[..., Any], *args, **kwargs) -> None:
         # 线程退出时如实落终态：异常、失败返回（如源库不可达）、正常停止都
         # 不能遗留 running（2026-11-04 实测：resume 后源库不可达的任务
         # 返回失败 dict 退出，状态卡在 running 而 rt_running=False）
-        if not (res or {}).get("success", False):
+        if not (res or {}).get("success", False) and not stop_ev.is_set():
             try:
                 from .. import models  # noqa: PLC0415
 
@@ -93,7 +96,9 @@ def stop_runner(task_id: int, timeout: float = 15.0) -> Dict[str, Any]:
         r = _RUNNERS.pop(task_id, None)
         res = (r or {}).get("result")
     if not res:
-        res = {"success": True, "message": "实时同步已停止"}
+        # 线程未在超时内退出：如实报失败，避免「前端显示已停止、后台仍在写」
+        res = {"success": False, "timeout": True,
+               "message": f"实时同步停止超时（线程未在 {timeout}s 内退出）"}
     return res
 
 

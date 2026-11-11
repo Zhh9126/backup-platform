@@ -111,7 +111,7 @@ HEALTH_UNKNOWN = "unknown"
 
 
 def norm_path(path: str) -> str:
-    """路径归一化：统一正斜杠，便于日志输出与跨平台字典序比较（共享知识 #1）。"""
+    """路径归一化：统一正斜杠，便于日志输出与跨平台字典序比较（共享知识 1）。"""
     return (path or "").replace("\\", "/")
 
 

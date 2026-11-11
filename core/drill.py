@@ -27,7 +27,7 @@ def run_drill(drill_id: int) -> dict:
 
     if d.get("drill_type") == "real_restore":
         return _run_real_restore_drill(d, drill_id)
-    _logger.info("[drill] 开始演练 #%s: %s", drill_id, d.get("name"))
+    _logger.info("[drill] 开始演练 %s: %s", drill_id, d.get("name"))
 
     rto_start = time.time()
     issues = []
@@ -153,7 +153,7 @@ def run_drill(drill_id: int) -> dict:
             "issues_found": json.dumps(issues, ensure_ascii=False),
             "report": json.dumps(report, ensure_ascii=False),
         })
-        _logger.info("[drill] #%s 完成 status=%s score=%d rto=%.1fs rpo=%.1fs",
+        _logger.info("[drill] %s 完成 status=%s score=%d rto=%.1fs rpo=%.1fs",
                       drill_id, status, score, rto, rpo)
         return {"ok": True, "status": status, "score": score, "rto_sec": rto,
                 "rpo_sec": rpo, "issues": issues}
@@ -285,7 +285,7 @@ def _run_real_restore_drill(d: dict, drill_id: int) -> dict:
             "issues_found": json.dumps(issues_, ensure_ascii=False),
             "report": json.dumps(report_, ensure_ascii=False),
         })
-        _logger.info("[drill] 真实演练 #%s 完成 status=%s score=%s rto=%.1fs",
+        _logger.info("[drill] 真实演练 %s 完成 status=%s score=%s rto=%.1fs",
                      drill_id, status_, score_, rto)
         return {"ok": status_ == "success", "status": status_,
                 "score": score_, "rto_sec": rto, "issues": issues_}
@@ -392,7 +392,7 @@ def _run_real_restore_drill(d: dict, drill_id: int) -> dict:
         return _finish(max(score, 0), status, issues, report_extra)
 
     except Exception as e:
-        _logger.exception("[drill] 真实演练 #%s 异常", drill_id)
+        _logger.exception("[drill] 真实演练 %s 异常", drill_id)
         issues.append(f"演练异常: {e}")
         # 演练库兜底销毁（异常路径）
         try:

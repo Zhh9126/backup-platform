@@ -144,12 +144,27 @@ window.BKP = (function () {
   // ============== RBAC：权限缓存与可见性检查 ==============
   // 调用 BKP.loadPerms() 后 BKP.hasPerm('xxx.yyy') 返回布尔值。
   BKP._perms = null;
+  BKP._featureSet = null;
+  BKP._featureByPath = {};
   BKP._permsBy = function () {
     if (BKP._perms) return Promise.resolve(BKP._perms);
     return fetch("/api/rbac/me", { credentials: "same-origin" })
       .then(function (r) { return r.ok ? r.json() : {}; })
-      .then(function (d) { BKP._perms = new Set(d.permissions || []); return BKP._perms; })
-      .catch(function () { BKP._perms = new Set(); return BKP._perms; });
+      .then(function (d) {
+        BKP._perms = new Set(d.permissions || []);
+        BKP._featureSet = new Set(d.features || []);
+        var byPath = {};
+        (d.feature_catalog || []).forEach(function (f) {
+          (f.paths || []).forEach(function (p) { byPath[p] = f.id; });
+        });
+        BKP._featureByPath = byPath;
+        return BKP._perms;
+      })
+      .catch(function () {
+        BKP._perms = new Set();
+        BKP._featureSet = null;  // 拉取失败时不做功能隐藏，避免误伤
+        return BKP._perms;
+      });
   };
   BKP.hasPerm = function (perm) {
     if (!BKP._perms) return false;
@@ -168,6 +183,14 @@ window.BKP = (function () {
           any = true;
         }
       });
+      // 功能项按需启用 / 权限分离：按后端下发的功能项隐藏侧栏菜单，
+      // 与服务端页面闸一致，避免「菜单没了但输 URL 还能进」或反之。
+      if (BKP._featureSet) {
+        document.querySelectorAll(".sidebar a.nav-link[href]").forEach(function (a) {
+          var fid = BKP._featureByPath[a.getAttribute("href")];
+          if (fid && !BKP._featureSet.has(fid)) a.style.display = "none";
+        });
+      }
       return any;
     });
   };

@@ -1757,7 +1757,7 @@
       return;
     }
 
-    const opts = devBackups.map(b => `<option value="${b.id}">#${b.id} - ${(b.created_at || '').replace('T', ' ').substring(0, 19)} (${b.file_size_human})</option>`).join("");
+    const opts = devBackups.map(b => `<option value="${b.id}">${b.id} - ${(b.created_at || '').replace('T', ' ').substring(0, 19)} (${b.file_size_human})</option>`).join("");
     s1.innerHTML = opts;
     s2.innerHTML = opts;
 

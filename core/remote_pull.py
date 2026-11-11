@@ -510,6 +510,6 @@ def run_due_sources() -> dict:
             out["failed"] += int(r.get("failed") or 0)
         except Exception as e:
             out["failed"] += 1
-            out["errors"].append("#%s: %s" % (src["id"], str(e)[:200]))
+            out["errors"].append("%s: %s" % (src["id"], str(e)[:200]))
             _set_state(int(src["id"]), "error", str(e)[:500])
     return out

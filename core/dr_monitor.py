@@ -117,7 +117,7 @@ def check_once() -> list:
             item["app_unhealthy"] = True
             item["app_error"] = str(app.get("error") or app.get("status") or "")[:120]
             db.add_log("WARNING", "dr_monitor",
-                       "链路 #%s 应用探活失败（不触发数据库切换）: %s"
+                       "链路 %s 应用探活失败（不触发数据库切换）: %s"
                        % (link.get("id"), item["app_error"]))
         if primary_ok:
             if st.get("fails") or st.get("alerted") or st.get("auto_running"):

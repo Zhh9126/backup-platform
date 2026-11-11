@@ -241,8 +241,9 @@
       var list = Array.isArray(d) ? d : (d.items || d.data || []);
       $("sf_task").innerHTML = '<option value="">不使用任务（下方直填主机）</option>' +
         list.map(function (t) {
-          return '<option value="' + esc(t.id) + '">#' + esc(t.id) + " " +
-            esc(t.name || t.task_name || "-") + " · " + esc(t.host || "-") + "</option>";
+          return '<option value="' + esc(t.id) + '" title="任务 ID ' + esc(t.id) + '">' +
+            esc(t.name || t.task_name || ("任务 " + t.id)) + " · " +
+            esc(t.host || "-") + "</option>";
         }).join("");
     } catch (e) { /* 任务列表不可用仍可直填主机 */ }
   })();

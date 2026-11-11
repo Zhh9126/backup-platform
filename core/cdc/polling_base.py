@@ -16,12 +16,12 @@ Oracle LogMiner 与达梦 DM_LOGMNR 都是「驱动连接 + 周期查询」的**
 全部围绕 ``self.proc`` 设计，直接继承会让两个守护各写一遍生命周期逻辑。
 因此在**基类之下、具体实现之上**插入本层，统一承载：
 
-- ``_running`` 标志与 ``is_alive()`` 重写（共享知识 #19：不看 ``self.proc``）；
+- ``_running`` 标志与 ``is_alive()`` 重写（共享知识 19：不看 ``self.proc``）；
 - 「取位点 → 抽变更 → 原子写段 → 交给基类封存」的 ``tick()`` 骨架；
-- ``.jsonl`` 段命名、元信息头、原子写（共享知识 #2、#20）；
-- 位点结构统一走 ``wal_lsn`` / ``wal_end_lsn`` 两列（共享知识 #18 / CH-T06-2），
+- ``.jsonl`` 段命名、元信息头、原子写（共享知识 2、20）；
+- 位点结构统一走 ``wal_lsn`` / ``wal_end_lsn`` 两列（共享知识 18 / CH-T06-2），
   并用 ``position_kind`` 区分 ``scn`` / ``dm_lsn``；
-- 单轮抽取上限保护（共享知识 #21：``FETCH_LIMIT`` + ``MAX_SEGMENT_BYTES``）；
+- 单轮抽取上限保护（共享知识 21：``FETCH_LIMIT`` + ``MAX_SEGMENT_BYTES``）；
 - LogMiner 长会话周期重连（风险 R14 / 拍板 Q7：默认每 50 轮）。
 
 子类只需实现 5 个抽象钩子：``_import_driver`` / ``_connect`` / ``_probe_source``
@@ -71,8 +71,8 @@ class PollingLogMinerDaemon(CDCDaemon):
         POSITION_KIND: 位点语义 ``scn`` / ``dm_lsn``，供 UI 加前缀区分。
         POSITION_LABEL: UI 展示前缀（``SCN`` / ``LSN``）。
         POSITION_ROW_KEY: 变更行字典中承载位点的键名。
-        SEGMENT_EXT: 逻辑段扩展名，统一 ``.jsonl``（共享知识 #20）。
-        FETCH_LIMIT: 单轮最多抽取行数（共享知识 #21）。
+        SEGMENT_EXT: 逻辑段扩展名，统一 ``.jsonl``（共享知识 20）。
+        FETCH_LIMIT: 单轮最多抽取行数（共享知识 21）。
         MAX_SEGMENT_BYTES: 单段字节上限，超出即在本轮截断，余量留给下一轮。
     """
 
@@ -137,7 +137,7 @@ class PollingLogMinerDaemon(CDCDaemon):
     def start(self) -> bool:
         """建立连接并确定起始位点。
 
-        失败时 **raise RuntimeError**（共享知识 #17：仅 ``start()`` 允许抛），
+        失败时 **raise RuntimeError**（共享知识 17：仅 ``start()`` 允许抛），
         由 :meth:`core.rt_backup.db_rt.DbRtCapture.start` 既有 try 捕获并就地降级仿真。
 
         Returns:
@@ -206,7 +206,7 @@ class PollingLogMinerDaemon(CDCDaemon):
         self._close_stderr()
 
     def is_alive(self) -> bool:
-        """共享知识 #19：拉取式守护不依赖 ``self.proc``。"""
+        """共享知识 19：拉取式守护不依赖 ``self.proc``。"""
         return bool(self._running)
 
     # ------------------------------------------------------------------
@@ -474,8 +474,8 @@ class PollingLogMinerDaemon(CDCDaemon):
                        pos_to: str) -> Tuple[str, int, str]:
         """把变更行原子写成一个 ``.jsonl`` 段。
 
-        首行为 ``{"_meta": true, ...}`` 元信息（共享知识 #20），其后每行一条变更。
-        超过 ``MAX_SEGMENT_BYTES`` 时本轮截断，余量留给下一轮（共享知识 #21）。
+        首行为 ``{"_meta": true, ...}`` 元信息（共享知识 20），其后每行一条变更。
+        超过 ``MAX_SEGMENT_BYTES`` 时本轮截断，余量留给下一轮（共享知识 21）。
 
         Args:
             rows: 变更行列表，每行须含 ``POSITION_ROW_KEY`` 位点字段。
@@ -552,7 +552,7 @@ class PollingLogMinerDaemon(CDCDaemon):
         """惰性导入数据库驱动。
 
         Returns:
-            ``(module | None, 中文原因)``。**绝不抛异常**（共享知识 #17）。
+            ``(module | None, 中文原因)``。**绝不抛异常**（共享知识 17）。
         """
         raise NotImplementedError
 

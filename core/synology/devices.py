@@ -287,7 +287,7 @@ def create_device(data: dict) -> int:
         (d["hostname"], d.get("port") or 5000, d.get("secure") or 0))
     if dup:
         raise DeviceError(
-            "纳管记录重复：%s:%s 已登记为「%s」(#%s)，请直接编辑原记录"
+            "纳管记录重复：%s:%s 已登记为「%s」(%s)，请直接编辑原记录"
             % (d["hostname"], d.get("port") or 5000, dup.get("name"), dup.get("id")))
     now = db.now_iso()
     d.update({"created_at": now, "updated_at": now,

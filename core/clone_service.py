@@ -151,11 +151,11 @@ class CloneService:
             models.update_clone_request(req_id, {"itsm_ticket_id": ticket["id"]})
 
         if config.CLONE_AUTO_APPROVE:
-            self.logger.info("[clone] 申请 #%s 已提交，免审批直通拉起（env=%s, by=%s）",
+            self.logger.info("[clone] 申请 %s 已提交，免审批直通拉起（env=%s, by=%s）",
                              req_id, target_env, requested_by)
             self._provision_async(req_id)
         else:
-            self.logger.info("[clone] 申请 #%s 已提交，等待审批（env=%s, by=%s）",
+            self.logger.info("[clone] 申请 %s 已提交，等待审批（env=%s, by=%s）",
                              req_id, target_env, requested_by)
         return self.get_clone(req_id)
 
@@ -169,7 +169,7 @@ class CloneService:
                 if not req:
                     return
                 models.update_clone_request(request_id, {"status": STATUS_CREATING})
-                self.logger.info("[clone] 请求 #%s 开始拉起 VDB", request_id)
+                self.logger.info("[clone] 请求 %s 开始拉起 VDB", request_id)
                 vdb_id = self._launch_vdb(req)
                 ttl = _default_ttl_days()
                 expires = _compute_expires(ttl)
@@ -178,10 +178,10 @@ class CloneService:
                     "vdb_instance_id": vdb_id,
                     "expires_at": expires,
                 })
-                self.logger.info("[clone] 请求 #%s VDB #%s 已就绪，到期 %s",
+                self.logger.info("[clone] 请求 %s VDB %s 已就绪，到期 %s",
                                  request_id, vdb_id, expires)
             except Exception as exc:
-                self.logger.error("[clone] 请求 #%s 拉起失败: %s", request_id, exc)
+                self.logger.error("[clone] 请求 %s 拉起失败: %s", request_id, exc)
                 cur = self.get_clone(request_id) or {}
                 note = (cur.get("note") or "").strip()
                 models.update_clone_request(request_id, {
@@ -228,11 +228,11 @@ class CloneService:
         req["status"] = STATUS_CREATING
         models.update_clone_request(request_id, {"status": STATUS_CREATING,
                                                   "approved_by": approved_by})
-        self.logger.info("[clone] 请求 #%s 审批通过，开始拉起 VDB", request_id)
+        self.logger.info("[clone] 请求 %s 审批通过，开始拉起 VDB", request_id)
         try:
             vdb_id = self._launch_vdb(req)
         except Exception as exc:
-            self.logger.error("[clone] 请求 #%s 拉起失败: %s", request_id, exc)
+            self.logger.error("[clone] 请求 %s 拉起失败: %s", request_id, exc)
             cur = self.get_clone(request_id) or {}
             note = (cur.get("note") or "").strip()
             models.update_clone_request(request_id, {
@@ -247,7 +247,7 @@ class CloneService:
             "vdb_instance_id": vdb_id,
             "expires_at": expires,
         })
-        self.logger.info("[clone] 请求 #%s VDB #%s 已就绪，到期 %s",
+        self.logger.info("[clone] 请求 %s VDB %s 已就绪，到期 %s",
                          request_id, vdb_id, expires)
         return self.get_clone(request_id)
 
@@ -266,7 +266,7 @@ class CloneService:
                 self.logger.warning("[clone] 同步 ITSM 工单失败（忽略）: %s", e)
         models.update_clone_request(request_id, {
             "status": STATUS_REJECTED, "approved_by": by})
-        self.logger.info("[clone] 请求 #%s 已驳回（by=%s）", request_id, by)
+        self.logger.info("[clone] 请求 %s 已驳回（by=%s）", request_id, by)
         return self.get_clone(request_id)
 
     # ------------------------- 销毁 -------------------------
@@ -277,7 +277,7 @@ class CloneService:
             raise ValueError(f"克隆请求不存在: {request_id}")
         self._release_vdb(req)
         models.update_clone_request(request_id, {"status": STATUS_DELETED})
-        self.logger.info("[clone] 请求 #%s 已手动销毁", request_id)
+        self.logger.info("[clone] 请求 %s 已手动销毁", request_id)
         return self.get_clone(request_id)
 
     def expire_clone(self, request_id: int) -> dict:
@@ -289,7 +289,7 @@ class CloneService:
             return req
         self._release_vdb(req)
         models.update_clone_request(request_id, {"status": STATUS_EXPIRED})
-        self.logger.info("[clone] 请求 #%s 已到期自动销毁", request_id)
+        self.logger.info("[clone] 请求 %s 已到期自动销毁", request_id)
         return self.get_clone(request_id)
 
     def takeover_check(self, request_id: int, operator: str = "") -> dict:
@@ -404,7 +404,7 @@ class CloneService:
                 operator or "unknown")
         models.update_clone_request(request_id, {"note": note})
         db.add_log("INFO" if ok_all else "WARNING", "clone",
-                   "克隆 #%s 应急接管检查：%s" % (request_id, summary))
+                   "克隆 %s 应急接管检查：%s" % (request_id, summary))
         return {"ok": ok_all, "checks": [
             {"item": n, "pass": bool(ok), "message": m} for n, ok, m in checks],
             "duration_sec": dur, "summary": summary}
@@ -420,7 +420,7 @@ class CloneService:
             try:
                 result.append(self.expire_clone(r["id"]))
             except Exception as e:
-                self.logger.warning("[clone] 到期销毁 #%s 失败: %s", r["id"], e)
+                self.logger.warning("[clone] 到期销毁 %s 失败: %s", r["id"], e)
         if result:
             self.logger.info("[clone] 本次自动销毁 %d 个到期克隆", len(result))
         return result
@@ -624,7 +624,7 @@ class CloneService:
             vdb.get("port"), vdb.get("database_name"), vdb.get("username"),
             password=password,
             service=vdb.get("service") or "")
-        self.logger.info("[clone] 请求 #%s 校验: %s", request_id, res.get("message"))
+        self.logger.info("[clone] 请求 %s 校验: %s", request_id, res.get("message"))
         return res
 
     def _release_vdb(self, req: dict) -> None:
@@ -653,14 +653,14 @@ class CloneService:
                             port=vdb.get("port"),
                             mysql_password=password, pg_password=password)
                     if not res.get("ok"):
-                        self.logger.warning("[clone] 释放 VDB #%s 失败: %s",
+                        self.logger.warning("[clone] 释放 VDB %s 失败: %s",
                                             vdb_id, res.get("message"))
                 except Exception as e:
-                    self.logger.warning("[clone] 释放 VDB #%s 失败（忽略）: %s", vdb_id, e)
+                    self.logger.warning("[clone] 释放 VDB %s 失败（忽略）: %s", vdb_id, e)
             try:
                 models.delete_vdb(vdb_id)
             except Exception as e:
-                self.logger.warning("[clone] 删除 VDB 元数据 #%s 失败（忽略）: %s", vdb_id, e)
+                self.logger.warning("[clone] 删除 VDB 元数据 %s 失败（忽略）: %s", vdb_id, e)
 
 
     # ------------------------- VDB 快照（时间点 / 回滚 / 再克隆） -------------------------
@@ -730,7 +730,7 @@ class CloneService:
              meta["table_count"], meta["row_count"], "ready", "",
              db.now_iso(), created_by or "unknown"))
         db.add_log("INFO", "clone",
-                   "VDB 快照 #%s 创建：克隆 #%s，%s 表 / %s 行，%s 字节"
+                   "VDB 快照 %s 创建：克隆 %s，%s 表 / %s 行，%s 字节"
                    % (sid, request_id, meta["table_count"], meta["row_count"],
                       meta["size_bytes"]))
         return self._snapshot_row(sid)
@@ -743,7 +743,7 @@ class CloneService:
         _req, vdb, password = self._vdb_context(request_id)
         snap = self._snapshot_row(snapshot_id, request_id)
         if snap.get("status") != "ready":
-            raise ValueError("快照 #%s 不是就绪状态（%s），拒绝回滚"
+            raise ValueError("快照 %s 不是就绪状态（%s），拒绝回滚"
                              % (snapshot_id, snap.get("status")))
         try:
             actual = vs.sha256_file(snap["backup_path"])
@@ -754,7 +754,7 @@ class CloneService:
         res = vs.restore_snapshot(vdb, password, snap["backup_path"],
                                   drop_new_tables=drop_new_tables)
         db.add_log("WARNING", "clone",
-                   "VDB 快照回滚：克隆 #%s 回到快照 #%s，操作人 %s，%s"
+                   "VDB 快照回滚：克隆 %s 回到快照 %s，操作人 %s，%s"
                    % (request_id, snapshot_id, operator or "unknown",
                       res.get("message")))
         return {**res, "snapshot_id": snapshot_id}
@@ -770,7 +770,7 @@ class CloneService:
         req, vdb, password = self._vdb_context(request_id)
         snap = self._snapshot_row(snapshot_id, request_id)
         if snap.get("status") != "ready":
-            raise ValueError("快照 #%s 不是就绪状态，拒绝再克隆" % snapshot_id)
+            raise ValueError("快照 %s 不是就绪状态，拒绝再克隆" % snapshot_id)
         if not req.get("source_record_id"):
             raise ValueError("源克隆不是基于备份产物，无法再克隆")
         rec = models.get_record(req["source_record_id"]) or {}
@@ -801,10 +801,10 @@ class CloneService:
                 new_id, {"status": STATUS_FAILED,
                          "note": "快照再克隆失败: %s" % str(e)[:300]})
             db.add_log("WARNING", "clone",
-                       "快照 #%s 再克隆失败：%s" % (snapshot_id, str(e)[:200]))
+                       "快照 %s 再克隆失败：%s" % (snapshot_id, str(e)[:200]))
             raise ValueError("快照再克隆失败: %s" % e)
         db.add_log("INFO", "clone",
-                   "VDB 快照 #%s 再克隆为新克隆 #%s（VDB #%s）"
+                   "VDB 快照 %s 再克隆为新克隆 %s（VDB %s）"
                    % (snapshot_id, new_id, vdb_id))
         return {"ok": True, "clone_request_id": new_id,
                 "vdb_instance_id": vdb_id, "snapshot_id": snapshot_id,
@@ -819,7 +819,7 @@ class CloneService:
                    (db.now_iso(), "由 %s 删除" % (operator or "unknown"),
                     snapshot_id))
         db.add_log("INFO", "clone",
-                   "VDB 快照 #%s 已删除（产物保留）" % snapshot_id)
+                   "VDB 快照 %s 已删除（产物保留）" % snapshot_id)
         return {"ok": True, "snapshot_id": snapshot_id,
                 "status": "deleted", "backup_path": snap.get("backup_path")}
 

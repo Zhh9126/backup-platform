@@ -69,7 +69,7 @@ class VMBackupEngine(BackupEngine):
 
         hv = models.get_vm_hypervisor(vm["hypervisor_id"], include_secret=True)
         if not hv:
-            return None, "关联虚拟化平台 #%s 不存在" % vm.get("hypervisor_id")
+            return None, "关联虚拟化平台 %s 不存在" % vm.get("hypervisor_id")
         cls = get_provider_class(hv.get("provider") or "")
         if not cls:
             return None, "未知的虚拟化平台类型: %s" % (hv.get("provider") or "-")
@@ -340,7 +340,7 @@ class VMBackupEngine(BackupEngine):
                     local, os.path.dirname(remote) or provider.extra.get("work_dir")
                     or "/var/tmp/vmbk")
             if not remote:
-                raise VMProviderError("恢复点 #%s 产物不可达（本地与远端均缺失）" % rp["id"])
+                raise VMProviderError("恢复点 %s 产物不可达（本地与远端均缺失）" % rp["id"])
             out.append(remote)
         return out
 

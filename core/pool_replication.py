@@ -54,7 +54,7 @@ def normalize_sites(sites) -> list:
         row = db.query_one("SELECT id, name, type, enabled FROM storage_targets WHERE id=?",
                            (tid,))
         if not row:
-            raise PoolError(f"站点 {i} 的存储目标不存在: #{tid}")
+            raise PoolError(f"站点 {i} 的存储目标不存在: {tid}")
         out.append({
             "seq": i,
             "name": (s.get("name") or "").strip() or row["name"],
@@ -87,7 +87,7 @@ def create_chain(data: dict) -> int:
 def update_chain(chain_id: int, data: dict) -> bool:
     row = db.query_one("SELECT * FROM pool_chains WHERE id=?", (chain_id,))
     if not row:
-        raise PoolError(f"复制作业链不存在: #{chain_id}")
+        raise PoolError(f"复制作业链不存在: {chain_id}")
     sets, params = [], []
     if "name" in data and (data["name"] or "").strip():
         sets.append("name=?"); params.append(data["name"].strip())
@@ -150,7 +150,7 @@ def _decorate_chain(row: dict) -> dict:
 def _target_by_id(target_id: int) -> dict:
     row = db.query_one("SELECT * FROM storage_targets WHERE id=?", (target_id,))
     if not row:
-        raise PoolError(f"存储目标不存在: #{target_id}")
+        raise PoolError(f"存储目标不存在: {target_id}")
     t = dict(row)
     if t.get("secret_key"):
         t["secret_key"] = db.decrypt_secret(t["secret_key"])
@@ -218,12 +218,12 @@ def run_chain(chain_id: int, record_id: int, backup_path: str,
     """
     chain = get_chain(chain_id)
     if not chain:
-        raise PoolError(f"复制作业链不存在: #{chain_id}")
+        raise PoolError(f"复制作业链不存在: {chain_id}")
     if not backup_path or not os.path.exists(backup_path):
         raise PoolError(f"备份产物不存在: {backup_path}")
     rec = db.query_one("SELECT id FROM backup_records WHERE id=?", (record_id,))
     if not rec:
-        raise PoolError(f"备份记录不存在: #{record_id}")
+        raise PoolError(f"备份记录不存在: {record_id}")
     if not object_key:
         task_id = db.query_one(
             "SELECT task_id FROM backup_records WHERE id=?", (record_id,))
@@ -309,7 +309,7 @@ def replica_view(record_id: int) -> dict:
         "SELECT id, storage_tier, backup_path FROM backup_records WHERE id=?",
         (record_id,))
     if not rec:
-        raise PoolError(f"备份记录不存在: #{record_id}")
+        raise PoolError(f"备份记录不存在: {record_id}")
     logs = db.query(
         "SELECT l.*, c.name AS chain_name, c.mode AS chain_mode "
         "FROM pool_replica_logs l JOIN pool_chains c ON c.id=l.chain_id "

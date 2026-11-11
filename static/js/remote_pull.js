@@ -96,7 +96,7 @@
   }
 
   function openModal(s) {
-    $("rpModalTitle").textContent = s ? "编辑拉取来源 #" + s.id : "新增拉取来源";
+    $("rpModalTitle").textContent = s ? "编辑拉取来源 " + s.id : "新增拉取来源";
     $("rp_id").value = s ? s.id : "";
     $("rp_name").value = s ? s.name : "";
     $("rp_provider").value = s ? (s.provider || "minio") : "minio";
@@ -218,11 +218,11 @@
       return;
     }
     tb.innerHTML = rows.map((l, i) =>
-      "<tr><td>" + (startNo + i) + "</td><td>#" + esc(l.source_id) + "</td>" +
+      "<tr><td>" + (startNo + i) + "</td><td>" + esc(l.source_id) + "</td>" +
       "<td><code>" + esc(String(l.object_key || "").slice(-56)) + "</code></td>" +
       "<td>" + (l.status === "success" ? badge("已登记", "bg-success") : badge("失败", "bg-danger")) + "</td>" +
       "<td>" + esc(l.message || "-") + "</td>" +
-      "<td>" + (l.record_id ? "#" + esc(l.record_id) : "-") + "</td>" +
+      "<td>" + (l.record_id ? esc(l.record_id) : "-") + "</td>" +
       "<td>" + fmt(l.created_at) + "</td></tr>").join("");
   }
 

@@ -51,7 +51,7 @@ def _sync_source_item(row: dict) -> dict:
     return {
         "kind": "sync_task",
         "id": int(row.get("id") or 0),
-        "name": row.get("name") or f"同步任务 #{row.get('id')}",
+        "name": row.get("name") or f"同步任务 {row.get('id')}",
         "primary_site": _fmt_endpoint(row.get("src_host"), row.get("src_port"),
                                       row.get("src_db_name")),
         "dr_site": _fmt_endpoint(row.get("tgt_host"), row.get("tgt_port"),
@@ -115,7 +115,7 @@ def _rt_source_item(row: dict, state=None) -> dict:
     return {
         "kind": "rt_task",
         "id": task_id,
-        "name": row.get("name") or f"实时任务 #{row.get('id')}",
+        "name": row.get("name") or f"实时任务 {row.get('id')}",
         "primary_site": _fmt_endpoint(row.get("host"), row.get("port"),
                                       row.get("db_name")),
         "dr_site": dr_site,
@@ -203,7 +203,7 @@ def _normalize_source(data: dict, require_exists: bool = True):
     item = _load_source(kind, data["source_id"])
     if not item and require_exists:
         label = "同步任务" if kind == "sync_task" else "实时保护任务"
-        return (f"引用的{label} #{data['source_id']} 不存在", {})
+        return (f"引用的{label} {data['source_id']} 不存在", {})
 
     # 站点快照回填：用户未显式填写时才由数据源带出，避免覆盖手工修正值
     if item:

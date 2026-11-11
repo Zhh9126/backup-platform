@@ -37,7 +37,7 @@ Oracle LogMiner 日志捕获守护（T06）。
 
 任何驱动缺失 / 非归档模式 / 权限不足都由 :mod:`core.cdc` 工厂或
 :class:`core.rt_backup.db_rt.DbRtCapture` 降级到
-:class:`core.cdc.simulated.SimulatedCDCDaemon`，**绝不抛到调用方**（共享知识 #17）。
+:class:`core.cdc.simulated.SimulatedCDCDaemon`，**绝不抛到调用方**（共享知识 17）。
 """
 from __future__ import annotations
 

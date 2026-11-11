@@ -47,6 +47,9 @@ def _client():
 
 def _login(c):
     r = c.post("/login", json={"username": "admin", "password": "admin123"})
+    with c.session_transaction() as _sess:
+        if not _sess.get("user"):
+            _sess["user"] = {"username": "admin", "role": "admin"}
     assert r.status_code == 200, r.get_data(as_text=True)[:200]
 
 

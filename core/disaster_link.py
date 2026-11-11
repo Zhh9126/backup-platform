@@ -190,9 +190,9 @@ class DisasterLinkEngine:
         selected = usable[0]
         now = db.now_iso()
         db.add_log("INFO", "disaster_link",
-                   f"链路#{link_id} 智能选路 → {selected['provider']} "
+                   f"链路{link_id} 智能选路 → {selected['provider']} "
                    f"({selected['endpoint']}, {selected['latency_ms']}ms)")
-        self.logger.info("[disaster_link] #%s 选路 → %s (%sms)",
+        self.logger.info("[disaster_link] %s 选路 → %s (%sms)",
                          link_id, selected["provider"], selected["latency_ms"])
         return {
             "ok": True,
@@ -227,8 +227,8 @@ class DisasterLinkEngine:
                 msg = (f"主备 binlog 位点一致"
                        f"（已捕获 {real['end_file']}:{real['end_pos']}，"
                        f"源 {real['src_file']}:{real['src_pos']}），无需填补")
-                db.add_log("INFO", "disaster_link", f"链路#{link_id} 日志填补: {msg}")
-                self.logger.info("[disaster_link] #%s 日志填补: %s", link_id, msg)
+                db.add_log("INFO", "disaster_link", f"链路{link_id} 日志填补: {msg}")
+                self.logger.info("[disaster_link] %s 日志填补: %s", link_id, msg)
                 return {"ok": True, "link_id": link_id, "result": "no_gap",
                         "message": msg, "gap_files": 0, "gap_bytes": 0,
                         "filled_at": now, "real": True,
@@ -239,8 +239,8 @@ class DisasterLinkEngine:
                    f"已捕获 {real['end_file']}:{real['end_pos']}），"
                    f"实时捕获链路将自动追平；如需立即收敛可对源任务手动执行一次备份")
             models.set_disaster_link_status(link_id, "filling")
-            db.add_log("INFO", "disaster_link", f"链路#{link_id} 日志填补: {msg}")
-            self.logger.info("[disaster_link] #%s 日志填补: %s", link_id, msg)
+            db.add_log("INFO", "disaster_link", f"链路{link_id} 日志填补: {msg}")
+            self.logger.info("[disaster_link] %s 日志填补: %s", link_id, msg)
             return {"ok": True, "link_id": link_id, "primary_lsn": gap_lsn,
                     "dr_lsn": 0, "gap_lsn": gap_lsn, "gap_files": gap_files,
                     "gap_bytes": gap_bytes,
@@ -290,12 +290,12 @@ class DisasterLinkEngine:
                 if link.get("status") in ("filling", "standby") and result == "pass":
                     models.set_disaster_link_status(link_id, "active")
                 db.add_log("INFO", "disaster_link",
-                           f"链路#{link_id} 一致性校验(真实位点): {result} "
+                           f"链路{link_id} 一致性校验(真实位点): {result} "
                            f"(daemon={daemon}, 滞后 {real['gap_files']} 文件/"
                            f"{real['gap_bytes']} 字节, RPO={real['rpo_actual_sec']}s, "
                            f"源 {real['src_file']}:{real['src_pos']}, "
                            f"已捕获 {real['end_file']}:{real['end_pos']})")
-                self.logger.info("[disaster_link] #%s 一致性校验(真实位点): %s",
+                self.logger.info("[disaster_link] %s 一致性校验(真实位点): %s",
                                  link_id, result)
                 return {
                     "ok": True,
@@ -333,7 +333,7 @@ class DisasterLinkEngine:
             if link.get("status") in ("filling", "standby") and result == "pass":
                 models.set_disaster_link_status(link_id, "active")
             db.add_log("INFO", "disaster_link",
-                       f"链路#{link_id} 一致性校验(同步源探针): {result} "
+                       f"链路{link_id} 一致性校验(同步源探针): {result} "
                        f"(reachable={probe.get('reachable')}, "
                        f"last_sync={probe.get('last_sync_status')})")
             return {
@@ -369,7 +369,7 @@ class DisasterLinkEngine:
         last_route = db.query_one(
             "SELECT ts, message FROM system_logs WHERE source='disaster_link' "
             "AND message LIKE ? ORDER BY id DESC LIMIT 1",
-            (f"链路#{link_id} 智能选路%",))
+            (f"链路{link_id} 智能选路%",))
         return {
             "ok": True,
             "link": link,

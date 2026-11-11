@@ -68,7 +68,7 @@ class StorageBackend(abc.ABC):
             except Exception:
                 pass
             self.logger.info(
-                "[%s][dedup] 命中已存在对象(set#%s)，跳过写入，节省 %d 字节",
+                "[%s][dedup] 命中已存在对象(set%s)，跳过写入，节省 %d 字节",
                 self.display_name, existing.get("id"), size)
             return True
         return False

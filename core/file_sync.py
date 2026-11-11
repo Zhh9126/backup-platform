@@ -65,7 +65,7 @@ def create_task(data: dict) -> int:
     if host_id:
         from core import ssh_hosts
         if not ssh_hosts.get_host(int(host_id)):
-            raise FileSyncError(f"纳管主机不存在: #{host_id}")
+            raise FileSyncError(f"纳管主机不存在: {host_id}")
     now = db.now_iso()
     return db.execute(
         "INSERT INTO file_sync_tasks(name, ssh_host_id, src_paths, excludes, "
@@ -82,7 +82,7 @@ def create_task(data: dict) -> int:
 def update_task(task_id: int, data: dict) -> bool:
     row = db.query_one("SELECT * FROM file_sync_tasks WHERE id=?", (task_id,))
     if not row:
-        raise FileSyncError(f"同步任务不存在: #{task_id}")
+        raise FileSyncError(f"同步任务不存在: {task_id}")
     sets, params = [], []
     if (data.get("name") or "").strip():
         sets.append("name=?"); params.append(data["name"].strip())
@@ -154,7 +154,7 @@ def _ssh_client(task: dict):
         from core import remote_dump
         host = ssh_hosts.get_host(int(task["ssh_host_id"]), include_secret=True)
         if not host:
-            raise FileSyncError(f"纳管主机不存在: #{task['ssh_host_id']}")
+            raise FileSyncError(f"纳管主机不存在: {task['ssh_host_id']}")
         client = remote_dump._connect(host)
         return client
     # 本机：SSH 127.0.0.1 密钥认证（root）
@@ -222,7 +222,7 @@ def sync_once(task_id: int, force: bool = False) -> dict:
     from core.dedup_source import remote_file_manifest as _rfm
     row = db.query_one("SELECT * FROM file_sync_tasks WHERE id=?", (task_id,))
     if not row:
-        raise FileSyncError(f"同步任务不存在: #{task_id}")
+        raise FileSyncError(f"同步任务不存在: {task_id}")
     task = _decorate(dict(row))
     started = time.time()
     client = _ssh_client(task)

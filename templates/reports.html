@@ -79,7 +79,7 @@
             (x.failed ?? 0) + "</td><td>" + mb(x.size_bytes) + "</td></tr>").join("")
         : '<tr><td colspan="5" class="text-muted">窗口内无备份记录</td></tr>';
       document.getElementById("rcTopFail").innerHTML = (d.top_failed_tasks || []).length
-        ? d.top_failed_tasks.map((x) => "<tr><td>" + esc(x.name || ("任务 #" + x.task_id)) +
+        ? d.top_failed_tasks.map((x) => "<tr><td>" + esc(x.name || ("任务 " + x.task_id)) +
             "</td><td>" + x.failed_count + "</td><td class=\"text-muted\">" +
             esc((x.last_failed_at || "").slice(0, 19)) + "</td></tr>").join("")
         : '<tr><td colspan="3" class="text-muted">窗口内无失败记录</td></tr>';

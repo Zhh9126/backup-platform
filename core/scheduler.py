@@ -342,10 +342,10 @@ def _auto_discover_for_task(task: dict, operator: str = None) -> None:
             from core import auto_discover
             dr = auto_discover.discover_for_task(task_id, operator=operator or "")
             if dr.get("discovered"):
-                _logger.info("[auto_discover] 任务 #%s: %s", task_id,
+                _logger.info("[auto_discover] 任务 %s: %s", task_id,
                              dr.get("message", ""))
     except Exception as _dexc:  # noqa: BLE001
-        _logger.warning("[auto_discover] 任务 #%s 发现失败(不阻断): %s",
+        _logger.warning("[auto_discover] 任务 %s 发现失败(不阻断): %s",
                         task_id, _dexc)
 
 
@@ -376,10 +376,10 @@ def submit_task_now(task_id: int, backup_type: str = None,
         with _RUNNING_LOCK:
             _RUNNING_TASKS.discard(tid)
             _RUNNING_IDS.pop(tid, None)
-        _logger.exception("[concurrency] 任务 #%s 提交失败", tid)
+        _logger.exception("[concurrency] 任务 %s 提交失败", tid)
         return {"accepted": False, "task_id": tid,
                 "message": f"提交并行队列失败: {exc}"[:200]}
-    _logger.info("[concurrency] 任务 #%s 已提交并行队列(operator=%s)",
+    _logger.info("[concurrency] 任务 %s 已提交并行队列(operator=%s)",
                  tid, operator or "manual")
     return {"accepted": True, "task_id": tid, "status": "running",
             "async": True, "message": "已提交并行执行队列"}
@@ -417,7 +417,7 @@ def _bg_execute_backup(task: dict, backup_type: str = None,
             _auto_discover_for_task(task, operator)
         _execute_backup(task, backup_type, operator)
     except Exception:
-        _logger.exception("[concurrency] 后台任务 #%s 执行异常", tid)
+        _logger.exception("[concurrency] 后台任务 %s 执行异常", tid)
     finally:
         if tid is not None:
             try:
@@ -460,7 +460,7 @@ def _execute_backup(task: dict, backup_type: str = None,
         if guard.get("throttle_kbps"):
             task = dict(task)
             task["bandwidth_limit"] = guard["throttle_kbps"]
-            _logger.info("[source_guard] 任务 #%s 降级执行: %s",
+            _logger.info("[source_guard] 任务 %s 降级执行: %s",
                          task.get("id"), guard["verdict"].get("message"))
     except Exception as _ge:  # noqa: BLE001
         _logger.debug("[source_guard] 决策跳过（不阻断备份）: %s", _ge)
@@ -886,7 +886,7 @@ def run_restore_now(record_id: int, target_host: str = None,
         from core.engines import get_engine
         if not task.get("db_type"):
             raise ValueError(
-                f"备份记录 {record_id} 所属任务 #{rec.get('task_id')} 缺少数据库类型"
+                f"备份记录 {record_id} 所属任务 {rec.get('task_id')} 缺少数据库类型"
                 "（任务数据异常或已被异常修改），无法恢复")
         engine = get_engine(task["db_type"], task, config.BACKUP_ROOT, _logger)
         op.info("恢复引擎: %s", engine.__class__.__name__)

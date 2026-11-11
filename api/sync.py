@@ -21,6 +21,24 @@ from core.sync.engine import (
 
 sync_bp = Blueprint("sync", __name__)
 
+# 手动运行的进程内并发护栏：同一任务禁止重复起线程（调度 + 手动 / 连点）。
+# 进程重启后集合为空，残留 running 由 app.py 启动自愈清理。
+_RUNNING_SYNC = set()
+_RUN_LOCK = threading.Lock()
+
+
+def _claim_run(task_id: int) -> bool:
+    with _RUN_LOCK:
+        if task_id in _RUNNING_SYNC:
+            return False
+        _RUNNING_SYNC.add(task_id)
+        return True
+
+
+def _release_run(task_id: int) -> None:
+    with _RUN_LOCK:
+        _RUNNING_SYNC.discard(task_id)
+
 
 @sync_bp.route("/sync-tasks", methods=["GET"])
 @login_required
@@ -154,8 +172,18 @@ def run_task(task_id):
         })
         started = start_runner(task_id, run_sync_task, task_id)
         if not started:
+            # 启动失败必须回滚 running，否则任务永久显示「运行中」
+            models.update_sync_task(task_id, {
+                "status": "failed", "last_status": "failed",
+                "message": "实时同步线程启动失败",
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            })
             return jsonify({"success": False, "message": "实时同步线程启动失败"}), 500
         return jsonify({"success": True, "message": "实时同步已启动（Binlog CDC 监听中）"})
+
+    if not _claim_run(task_id):
+        return jsonify({"success": False,
+                        "message": "该同步任务正在执行中，请勿重复触发"}), 409
 
     # ---- 迁移前预校验（字段/结构不合适直接拒绝启动）----
     from core.sync.precheck import run_precheck
@@ -171,6 +199,7 @@ def run_task(task_id):
             "message": msg,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         })
+        _release_run(task_id)
         return jsonify({"success": False, "precheck": pre,
                         "message": msg}), 400
 
@@ -183,23 +212,36 @@ def run_task(task_id):
     })
 
     def _job():
-        res = run_sync_task(task_id)
-        finished_at = datetime.now().isoformat(timespec="seconds")
-        status = "success" if res.get("success") else "failed"
-        models.update_sync_task(task_id, {
-            "status": status,
-            "last_status": status,
-            "message": res.get("message", ""),
-            "updated_at": finished_at,
-        })
-        models.create_sync_record({
-            "sync_task_id": task_id,
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "status": status,
-            "rows_synced": res.get("total_write", 0),
-            "message": res.get("message", ""),
-        })
+        # 线程内任何异常都不能让任务永久停在 running
+        try:
+            res = run_sync_task(task_id)
+        except Exception as e:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).exception("sync task %s crashed", task_id)
+            res = {"success": False, "message": f"同步线程异常: {e}"}
+        finally:
+            finished_at = datetime.now().isoformat(timespec="seconds")
+            status = "success" if res.get("success") else "failed"
+            try:
+                models.update_sync_task(task_id, {
+                    "status": status,
+                    "last_status": status,
+                    "message": res.get("message", ""),
+                    "updated_at": finished_at,
+                })
+                models.create_sync_record({
+                    "sync_task_id": task_id,
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "status": status,
+                    "rows_synced": res.get("total_write", 0),
+                    "message": res.get("message", ""),
+                })
+            except Exception:  # noqa: BLE001
+                import logging
+                logging.getLogger(__name__).exception(
+                    "sync task %s 落终态失败", task_id)
+            _release_run(task_id)
 
     threading.Thread(target=_job, daemon=True).start()
     return jsonify({"success": True, "message": "同步任务已启动"})
@@ -219,15 +261,17 @@ def stop_task(task_id):
     if not is_running(task_id):
         return jsonify({"success": False, "message": "实时同步未在运行"}), 400
     res = stop_runner(task_id)
-    # 标记 stopped：区别于异常/重启中断（running），手动停止的任务
-    # 在服务重启后不会被自动恢复（2026-11-04 实时自启恢复机制）
+    # 停止超时 / 线程异常不能再无条件报 stopped（历史实现直接忽略 res）
+    ok = bool(res.get("success"))
+    status = "stopped" if ok else "failed"
+    msg = res.get("message") or ("实时同步已手动停止" if ok else "实时同步停止失败")
     models.update_sync_task(task_id, {
-        "status": "stopped",
-        "last_status": "stopped",
-        "message": "实时同步已手动停止（点击运行重新启动）",
+        "status": status,
+        "last_status": status,
+        "message": msg + ("（点击运行重新启动）" if ok else ""),
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     })
-    return jsonify({"success": True, "data": res, "message": res.get("message", "已停止")})
+    return jsonify({"success": ok, "data": res, "message": msg}), (200 if ok else 500)
 
 
 @sync_bp.route("/sync-tasks/<int:task_id>/test/<side>", methods=["POST"])

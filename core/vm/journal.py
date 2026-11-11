@@ -100,7 +100,7 @@ def resolve_chain(rows: List[dict], target_rp_id: int) -> List[dict]:
     """
     by_id = {int(r["id"]): r for r in rows}
     if int(target_rp_id) not in by_id:
-        raise ValueError("恢复点 #%s 不存在" % target_rp_id)
+        raise ValueError("恢复点 %s 不存在" % target_rp_id)
 
     chain = []
     seen = set()
@@ -108,14 +108,14 @@ def resolve_chain(rows: List[dict], target_rp_id: int) -> List[dict]:
     while True:
         cid = int(cur["id"])
         if cid in seen:
-            raise ValueError("恢复点链存在环：#%s 重复出现" % cid)
+            raise ValueError("恢复点链存在环：%s 重复出现" % cid)
         seen.add(cid)
         chain.append(cur)
         parent = cur.get("parent_rp_id")
         if not parent:
             break
         if int(parent) not in by_id:
-            raise ValueError("恢复点链断裂：#%s 的父节点 #%s 不存在（可能已被清理）"
+            raise ValueError("恢复点链断裂：%s 的父节点 %s 不存在（可能已被清理）"
                              % (cid, parent))
         cur = by_id[int(parent)]
     chain.reverse()
@@ -124,7 +124,7 @@ def resolve_chain(rows: List[dict], target_rp_id: int) -> List[dict]:
     root = chain[0]
     kind = (root.get("rp_type") or "full")
     if kind == "incremental":
-        raise ValueError("恢复点链缺少全量基座（最早节点 #%s 是增量）" % root["id"])
+        raise ValueError("恢复点链缺少全量基座（最早节点 %s 是增量）" % root["id"])
     return chain
 
 
@@ -134,7 +134,7 @@ def chain_artifacts(chain: List[dict]) -> List[str]:
     for rp in chain:
         p = rp.get("artifact_path") or ""
         if not p:
-            raise ValueError("恢复点 #%s 没有落盘产物，无法恢复" % rp["id"])
+            raise ValueError("恢复点 %s 没有落盘产物，无法恢复" % rp["id"])
         paths.append(p)
     return paths
 

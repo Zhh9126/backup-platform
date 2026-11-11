@@ -331,7 +331,7 @@ def assert_restorable(record: dict, force: bool = False,
                rid, rec.get("task_id"), operator)
         return {"allowed": True, "forced": True, "reasons": reasons}
     raise RansomwareBlocked(
-        f"恢复安全门拒绝：备份记录 #{rid} {detail}。"
+        f"恢复安全门拒绝：备份记录 {rid} {detail}。"
         "该产物可能已被勒索加密或篡改；请先排查、用「恢复点安全检测」复核，"
         "或由管理员在明确风险后显式强制恢复（会留 critical 审计）。",
         reasons=reasons, record_id=rid)

@@ -93,9 +93,9 @@ class InternalITSMAdapter(ITSMAdapter):
         })
         ticket = models.get_itsm_ticket(tid)
         if status == "approved":
-            _logger.info("[itsm] 内置工单 #%s 已自动审批（itsm_auto_approve）", tid)
+            _logger.info("[itsm] 内置工单 %s 已自动审批（itsm_auto_approve）", tid)
         else:
-            _logger.info("[itsm] 内置工单 #%s 已创建（ref=%s/%s）", tid, ref_type, ref_id)
+            _logger.info("[itsm] 内置工单 %s 已创建（ref=%s/%s）", tid, ref_type, ref_id)
         return ticket
 
     def query_status(self, ticket_id: int) -> str:
@@ -116,7 +116,7 @@ class InternalITSMAdapter(ITSMAdapter):
             "status": "approved",
             "payload": json.dumps(payload, ensure_ascii=False),
         })
-        _logger.info("[itsm] 工单 #%s 已审批（by=%s）", ticket_id, by)
+        _logger.info("[itsm] 工单 %s 已审批（by=%s）", ticket_id, by)
         return True
 
     def reject_ticket(self, ticket_id: int, by: str = "admin") -> bool:
@@ -133,7 +133,7 @@ class InternalITSMAdapter(ITSMAdapter):
             "status": "rejected",
             "payload": json.dumps(payload, ensure_ascii=False),
         })
-        _logger.info("[itsm] 工单 #%s 已驳回（by=%s）", ticket_id, by)
+        _logger.info("[itsm] 工单 %s 已驳回（by=%s）", ticket_id, by)
         return True
 
     def callback(self, ticket_no: str, status: str,
@@ -186,7 +186,7 @@ class _ExternalITSMStub(ITSMAdapter):
                 "payload": json.dumps(payload or {}, ensure_ascii=False),
             })
             ticket = models.get_itsm_ticket(tid)
-            _logger.info("[itsm] %s 工单 #%s 已创建（降级/DEMO，status=%s）",
+            _logger.info("[itsm] %s 工单 %s 已创建（降级/DEMO，status=%s）",
                          self.display_name, tid, status)
             return ticket
         # 真实环境下：在此调用对方 OpenAPI 创建工单并写入 ticket_no，此处仅占位
@@ -225,7 +225,7 @@ class _ExternalITSMStub(ITSMAdapter):
                 "status": status,
                 "payload": json.dumps(payload or {}, ensure_ascii=False),
             })
-            _logger.info("[itsm] %s callback 工单 #%s -> %s",
+            _logger.info("[itsm] %s callback 工单 %s -> %s",
                          self.display_name, rows[0]["id"], status)
 
 

@@ -932,6 +932,171 @@ class TestProviderPresets(unittest.TestCase):
         self.assertEqual(custom["endpoint"], "")
 
 
+class TestMomaProviderAndStreamNormalization(unittest.TestCase):
+    """回归：MoMA 等厂商配置不上、SSE 响应解析失败、测试连接覆盖不生效。
+
+    历史缺陷（2026-11-11 用户现场）：
+    1) _get_model_uri 的 provider 白名单漏 moma/zhipu/qwen/deepseek → 返回空 URI；
+    2) 该方法重新读库，忽略 _call_model 传入的 cfg（未保存先测试必失败）；
+    3) MoMA 网关即使 stream:false 也返回多行 data: SSE，整段 json.loads 必失败。
+    """
+
+    def setUp(self):
+        import core.db as db
+        from core.ai_alert import AIPredictor
+        self.db = db
+        self.p = AIPredictor()
+        self._saved = db.get_system_config("ai_alert_config")
+
+    def tearDown(self):
+        if self._saved is not None:
+            self.db.set_system_config("ai_alert_config", self._saved)
+
+    @staticmethod
+    def _moma_url():
+        return "http://moma.hq.cmcc/largemodel/moma/api/v3/chat/completions"
+
+    def test_all_preset_providers_resolve_uri(self):
+        """预设里每一家（除 local）都必须能解析出 URI，不能再有白名单漏网。"""
+        from core.ai_alert import PROVIDER_PRESETS
+        for name, preset in PROVIDER_PRESETS.items():
+            if name == "local":
+                continue
+            cfg = {"ai_model": {"provider": name,
+                                "endpoint": preset["endpoint"] or self._moma_url()}}
+            uri = self.p._get_model_uri(cfg)
+            self.assertTrue(uri, "%s 应能解析出模型 URI" % name)
+            self.assertTrue(uri.endswith("/chat/completions"), (name, uri))
+
+    def test_moma_full_url_not_double_appended(self):
+        """MoMA 完整端点应原样使用，不得再拼 /v1/chat/completions。"""
+        url = self._moma_url()
+        cfg = {"ai_model": {"provider": "moma", "endpoint": url}}
+        self.assertEqual(self.p._get_model_uri(cfg), url)
+
+    def test_local_provider_still_returns_empty(self):
+        cfg = {"ai_model": {"provider": "local", "endpoint": self._moma_url()}}
+        self.assertEqual(self.p._get_model_uri(cfg), "")
+
+    def test_uri_uses_passed_cfg_not_saved_config(self):
+        """未保存先测试：覆盖参数必须生效，不能回读到已保存的空端点。"""
+        self.p.save_config({"ai_model": {"endpoint": "", "provider": "moma"}})
+        url = "http://example.invalid/v3/chat/completions"
+        cfg = {"ai_model": {"provider": "moma", "endpoint": url,
+                            "api_key": "k", "model_name": "m"}}
+        self.assertEqual(self.p._get_model_uri(cfg), url)
+
+    def test_call_model_posts_to_override_endpoint(self):
+        """_call_model 必须把 cfg 透传给 URI 解析，且返回提取后的 content。"""
+        from unittest import mock
+        url = "http://example.invalid/v3/chat/completions"
+        cfg = {"ai_model": {"provider": "moma", "endpoint": url,
+                            "api_key": "k", "model_name": "m"}}
+        self.p.save_config({"ai_model": {"endpoint": "", "provider": "moma"}})
+        captured = {}
+
+        class _Resp:
+            status = 200
+
+            def read(self):
+                return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def _fake(req, timeout=None):
+            captured["url"] = req.full_url
+            return _Resp()
+
+        with mock.patch("urllib.request.urlopen", _fake):
+            out = self.p._call_model("hi", cfg)
+        self.assertTrue(out.get("ok"), out)
+        self.assertEqual(captured.get("url"), url)
+        self.assertEqual(out.get("content"), "ok")
+
+    @staticmethod
+    def _sse_body(chunks=None):
+        chunks = chunks or ["你", "好", "，", "测试", "成功"]
+        lines = []
+        for c in chunks:
+            lines.append("data: " + json.dumps(
+                {"id": "chat-1", "choices": [{"delta": {"content": c}, "index": 0}]},
+                ensure_ascii=False))
+            lines.append("")
+        lines.append("data: [DONE]")
+        return "\n".join(lines)
+
+    def test_extract_standard_json(self):
+        from core.ai_alert import extract_model_content
+        body = json.dumps({"choices": [{"message": {"content": "标准回答"}}]})
+        self.assertEqual(extract_model_content(body), "标准回答")
+
+    def test_extract_single_json_delta(self):
+        from core.ai_alert import extract_model_content
+        body = json.dumps({"choices": [
+            {"delta": {"content": "A"}}, {"delta": {"content": "B"}}]})
+        self.assertEqual(extract_model_content(body), "AB")
+
+    def test_extract_multiline_sse(self):
+        from core.ai_alert import extract_model_content
+        self.assertEqual(extract_model_content(self._sse_body()), "你好，测试成功")
+
+    def test_normalize_sse_body_is_parseable_json(self):
+        from core.ai_alert import normalize_model_body
+        normalized, content, changed = normalize_model_body(self._sse_body())
+        self.assertTrue(changed)
+        self.assertEqual(content, "你好，测试成功")
+        self.assertEqual(
+            json.loads(normalized)["choices"][0]["message"]["content"],
+            "你好，测试成功")
+
+    def test_call_model_normalizes_sse_response(self):
+        """端到端：MoMA 风格 SSE 返回后，下游 json.loads(response_body) 必须成功。"""
+        from unittest import mock
+        url = self._moma_url()
+        cfg = {"ai_model": {"provider": "moma", "endpoint": url,
+                            "api_key": "k", "model_name": "m"}}
+
+        class _Resp:
+            status = 200
+
+            def read(self):
+                return TestMomaProviderAndStreamNormalization._sse_body().encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with mock.patch("urllib.request.urlopen", lambda req, timeout=None: _Resp()):
+            out = self.p._call_model("hi", cfg)
+        self.assertTrue(out.get("ok"), out)
+        self.assertTrue(out.get("stream_normalized"), out)
+        self.assertEqual(out.get("content"), "你好，测试成功")
+        self.assertEqual(
+            json.loads(out["response_body"])["choices"][0]["message"]["content"],
+            "你好，测试成功")
+
+    def test_saving_other_fields_keeps_api_key_encrypted(self):
+        """只改端点、密钥框留空时，已保存的密钥不得明文落库。"""
+        import core.db as db
+        from core.ai_alert import AIPredictor
+        plain = "sk-probe-plaintext-123"
+        self.p.save_config({"ai_model": {"api_key": plain}})
+        first = json.loads(db.get_system_config("ai_alert_config"))["ai_model"]["api_key"]
+        self.assertTrue(first.startswith("aienc:"), first[:24])
+        self.p.save_config({"ai_model": {
+            "endpoint": "http://probe.invalid/v1/chat/completions"}})
+        second = json.loads(db.get_system_config("ai_alert_config"))["ai_model"]["api_key"]
+        self.assertTrue(second.startswith("aienc:"), second[:24])
+        self.assertNotIn(plain, second)
+        self.assertEqual(AIPredictor().get_config()["ai_model"]["api_key"], plain)
+
+
 def _main() -> int:
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromModule(sys.modules[__name__])

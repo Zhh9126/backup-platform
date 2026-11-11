@@ -1228,4 +1228,17 @@ document.addEventListener("DOMContentLoaded", function () {
 });
 </script>
 
+<!-- 功能项与权限：按需启用 + 权限分离（内容由下方脚本渲染） -->
+<div class="page-card">
+  <div class="card-section-title">
+    <i class="bi bi-toggles me-1"></i> 功能项与权限
+  </div>
+  <div id="faRoot"></div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<!-- 必须在 base.html 的 bkp-core.js 之后加载：本脚本依赖 BKP.api / BKP.esc -->
+<script src="/static/js/feature_access.js?v=2026111201"></script>
 {% endblock %}

@@ -37,6 +37,25 @@ ST_FAILED = "failed"
 
 _VALID_TYPES = ("structure", "full", "verify")
 
+# 取消请求（进程内）：_run_all 在阶段边界检查，避免中途 DROP/TRUNCATE 被打断
+_CANCELLED_PLANS = set()
+_CANCEL_LOCK = threading.Lock()
+
+
+def request_cancel(plan_id: int) -> None:
+    with _CANCEL_LOCK:
+        _CANCELLED_PLANS.add(int(plan_id))
+
+
+def is_cancelled(plan_id: int) -> bool:
+    with _CANCEL_LOCK:
+        return int(plan_id) in _CANCELLED_PLANS
+
+
+def clear_cancel(plan_id: int) -> None:
+    with _CANCEL_LOCK:
+        _CANCELLED_PLANS.discard(int(plan_id))
+
 
 def _sql_quote(v: str) -> str:
     """SQL 字符串字面量（单引号转义，PG/Oracle/达梦/金仓通用）。"""
@@ -204,9 +223,28 @@ class DbMigrationEngine:
         plan = self.get_plan(plan_id, hide_secret=False)
         if not plan:
             raise ValueError(f"迁移计划不存在: {plan_id}")
-        if plan["status"] in (ST_CHECKING, ST_MIGRATING, ST_VERIFYING):
+        # 原子 CAS 抢占：先写状态再起线程。历史实现「读状态 + 起线程」，
+        # 状态直到线程内才置 checking，双请求能同时拉起两份全量迁移。
+        affected = db.execute_rowcount(
+            "UPDATE db_migration_plans SET status=?, current_phase='precheck', "
+            "error_msg=NULL, finished_at=NULL, updated_at=? "
+            "WHERE id=? AND status NOT IN (?,?,?)",
+            (ST_CHECKING, db.now_iso(), int(plan_id),
+             ST_CHECKING, ST_MIGRATING, ST_VERIFYING))
+        if not affected:
             return {"ok": False, "message": "计划正在执行中，请勿重复触发"}
-        threading.Thread(target=self._run_all, args=(plan_id,), daemon=True,
+        # 失败续跑的 manifest 必须在抢占前取（抢占后 status 已是 checking）
+        old_phases = plan.get("phases_json") or {}
+        prev_manifest = ((old_phases.get("migrate") or {}).get("manifest")
+                         if plan.get("status") == ST_FAILED else None)
+        clear_cancel(int(plan_id))
+        # self._obj_plan 是实例属性：模块级 engine 单例会让并发计划
+        # 互相覆盖目标连接，对象 DDL 打到错误的库。每计划独立实例。
+        worker = DbMigrationEngine()
+        threading.Thread(target=worker._run_all,
+                         args=(plan_id,),
+                         kwargs={"prev_manifest": prev_manifest},
+                         daemon=True,
                          name=f"db-migrate-{plan_id}").start()
         return {"ok": True, "plan_id": plan_id, "status": ST_CHECKING}
 
@@ -221,14 +259,19 @@ class DbMigrationEngine:
         db.execute(f"UPDATE db_migration_plans SET {', '.join(sets)} WHERE id=?",
                    tuple(params))
 
-    def _run_all(self, plan_id: int) -> None:
+    def _run_all(self, plan_id: int, prev_manifest=None) -> None:
         plan = self.get_plan(plan_id, hide_secret=False)
         if not plan:
             return
         types = plan.get("migrate_types") or []
-        phases: Dict[str, Any] = plan.get("phases_json") or {}
+        # 每次执行重置阶段结论：重跑不带 verify 时，上一次的
+        # verify.ok=False / objects.error 会残留进新报告。
+        phases: Dict[str, Any] = (
+            {"migrate": {"manifest": prev_manifest}} if prev_manifest else {})
         started = time.monotonic()
         try:
+            if self._check_cancel(plan_id, phases, "precheck"):
+                return
             # ---------- 阶段 1：预检查 ----------
             self._set(plan_id, status=ST_CHECKING, current_phase="precheck",
                       error_msg=None)
@@ -240,13 +283,15 @@ class DbMigrationEngine:
                 return
 
             # ---------- 阶段 2：结构迁移 + 全量迁移 ----------
+            if self._check_cancel(plan_id, phases, "migrate"):
+                return
             if "structure" in types or "full" in types:
                 self._set(plan_id, status=ST_MIGRATING, current_phase="migrate")
                 # 断点续跑：上次执行失败且留有 manifest → 只补失败表
                 prev_manifest = (phases.get("migrate") or {}).get("manifest") or []
-                resume = bool(prev_manifest) and plan.get("status") == ST_FAILED
+                resume = bool(prev_manifest)
                 if resume:
-                    self.logger.info("[db_migrate] 计划 #%s 断点续跑：上次已成功 %s 张表将跳过",
+                    self.logger.info("[db_migrate] 计划 %s 断点续跑：上次已成功 %s 张表将跳过",
                                      plan_id,
                                      sum(1 for m in prev_manifest if m.get("status") == "ok"))
                 mig = self._phase_migrate(
@@ -268,12 +313,14 @@ class DbMigrationEngine:
                     phases["objects"] = obj
                     self._set(plan_id, phases_json=json.dumps(phases, ensure_ascii=False))
                 except Exception as exc:  # noqa: BLE001 - 对象阶段绝不阻断主迁移
-                    self.logger.exception("[db_migrate] 计划 #%s 对象迁移异常", plan_id)
+                    self.logger.exception("[db_migrate] 计划 %s 对象迁移异常", plan_id)
                     phases["objects"] = {"executed": False,
                                          "error": f"对象迁移异常: {str(exc)[:200]}"}
                     self._set(plan_id, phases_json=json.dumps(phases, ensure_ascii=False))
 
             # ---------- 阶段 3：数据校验 ----------
+            if self._check_cancel(plan_id, phases, "verify"):
+                return
             if "verify" in types:
                 self._set(plan_id, status=ST_VERIFYING, current_phase="verify")
                 ver = self._phase_verify(
@@ -300,21 +347,30 @@ class DbMigrationEngine:
                       phases_json=json.dumps(phases, ensure_ascii=False),
                       finished_at=db.now_iso())
             db.add_log("INFO", "db_migrate",
-                       f"迁移计划 #{plan_id} 完成（{plan['src_db_type']}"
+                       f"迁移计划 {plan_id} 完成（{plan['src_db_type']}"
                        f"{plan['src_db_name']} → {plan['tgt_db_type']}"
                        f"{plan['tgt_db_name']}，耗时 {duration}s）")
-            self.logger.info("[db_migrate] 计划 #%s 完成", plan_id)
+            self.logger.info("[db_migrate] 计划 %s 完成", plan_id)
         except Exception as exc:
-            self.logger.exception("[db_migrate] 计划 #%s 执行异常", plan_id)
+            self.logger.exception("[db_migrate] 计划 %s 执行异常", plan_id)
             self._fail(plan_id, phases, plan.get("current_phase") or "precheck",
                        f"执行异常: {exc}")
+        finally:
+            clear_cancel(plan_id)
 
     def _fail(self, plan_id: int, phases: dict, phase: str, message: str) -> None:
         phases[phase] = {**(phases.get(phase) or {}), "ok": False, "message": message}
         self._set(plan_id, status=ST_FAILED, current_phase=phase,
                   phases_json=json.dumps(phases, ensure_ascii=False),
                   error_msg=message[:500], finished_at=db.now_iso())
-        db.add_log("ERROR", "db_migrate", f"迁移计划 #{plan_id} 在 {phase} 阶段失败: {message}")
+        db.add_log("ERROR", "db_migrate", f"迁移计划 {plan_id} 在 {phase} 阶段失败: {message}")
+
+    def _check_cancel(self, plan_id: int, phases: dict, phase: str) -> bool:
+        """阶段边界检查取消请求；取消后写 failed，不残留 checking。"""
+        if not is_cancelled(plan_id):
+            return False
+        self._fail(plan_id, phases, phase, "迁移已被用户取消")
+        return True
 
     # ------------------------- 阶段实现 -------------------------
     def _phase_precheck(self, plan: dict) -> dict:
@@ -806,23 +862,25 @@ class DbMigrationEngine:
                 out["types"] = self._mig_types(src_conn, src_t, tgt_t)
             if cfg.get("routines"):
                 r = self._mig_routines(src_conn, src_t, src_schema)
-                out["routines"] = r if same_family else []
-                if not same_family:
-                    out["routines_export"] = r
+                # _mig_routines/_mig_triggers 只生成 DDL 文本、从不执行；
+                # 同族也不能标成「已迁移成功」，否则目标库没有对象却显示 ✅。
+                out["routines"] = []
+                out["routines_export"] = list(r or [])
             if cfg.get("triggers"):
                 r = self._mig_triggers(src_conn, src_t, src_schema)
-                out["triggers"] = r if same_family else []
-                if not same_family:
-                    if not isinstance(out.get("routines_export"), list):
-                        out["routines_export"] = []
-                    out["routines_export"] = out["routines_export"] + [
-                        {**x, "kind": "trigger"} for x in r]
+                out["triggers"] = []
+                if not isinstance(out.get("routines_export"), list):
+                    out["routines_export"] = []
+                out["routines_export"] = out["routines_export"] + [
+                    {**x, "kind": "trigger"} for x in (r or [])]
         finally:
             try:
                 src_conn.close()
             except Exception:
                 pass
         out["duration_sec"] = round(time.monotonic() - started, 1)
+        out["note"] = ("例程/触发器仅导出 DDL，未在目标端执行；"
+                       "请在目标库人工审核后执行（避免方言与依赖顺序误报成功）")
         _secs = ("views", "sequences", "comments", "synonyms", "packages", "types")
         n_ok = sum(1 for sec in _secs
                    for it in out[sec] if it.get("status") == "ok")
@@ -836,7 +894,7 @@ class DbMigrationEngine:
         out["summary"] = (f"对象迁移：成功 {n_ok}，失败 {n_fail}"
                           + (f"，导出待人工适配 {n_export} 个" if n_export else ""))
         db.add_log("warning" if n_fail else "info", "db_migrate",
-                   f"迁移计划 #{plan['id']} 对象迁移：{out['summary']}")
+                   f"迁移计划 {plan['id']} 对象迁移：{out['summary']}")
         return out
 
     def _exec_target(self, plan: dict, sql: str) -> tuple:

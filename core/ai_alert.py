@@ -60,7 +60,128 @@ PROVIDER_PRESETS = {
         "endpoint": "",
         "model_examples": [],
     },
+    # 下面 3 家前端下拉里有、历史预设缺失：端点留空由用户填写完整 URL，
+    # 只要有 endpoint 就按 OpenAI 兼容路径直接调用（见 _get_model_uri）。
+    "anthropic": {
+        "label": "Anthropic（OpenAI 兼容网关）",
+        "endpoint": "",
+        "model_examples": [],
+    },
+    "ollama": {
+        "label": "Ollama（本地服务）",
+        "endpoint": "",
+        "model_examples": ["qwen2.5:7b", "llama3.1:8b"],
+    },
+    "local": {
+        "label": "本地模型",
+        "endpoint": "",
+        "model_examples": [],
+    },
 }
+
+
+# ---- 模型响应解析：标准 JSON / 单包 delta / 多行 SSE data: 流 ----
+
+def _choice_content(choice) -> str:
+    """从单个 choice 取文本（message.content / delta.content / text）。"""
+    if not isinstance(choice, dict):
+        return ""
+    msg = choice.get("message")
+    if isinstance(msg, dict) and msg.get("content"):
+        return str(msg["content"])
+    delta = choice.get("delta")
+    if isinstance(delta, dict) and delta.get("content"):
+        return str(delta["content"])
+    if choice.get("text"):
+        return str(choice["text"])
+    return ""
+
+
+def extract_model_content(body: str) -> str:
+    """从模型响应体提取纯文本，兼容三种真实返回形态。
+
+    1) 标准非流式 JSON：{"choices":[{"message":{"content":"..."}}]}
+    2) 单包内多个 delta：{"choices":[{"delta":{"content":"..."}}, ...]}
+    3) 多行 SSE：data: {...}\\n\\ndata: {...}\\n\\ndata: [DONE]
+       —— 中国移动 MoMA 等网关即使请求 stream:false 也可能返回流格式，
+       历史实现直接 json.loads 整段文本必然失败并静默降级到规则引擎。
+    """
+    if not body:
+        return ""
+    text = str(body).strip()
+    if not text:
+        return ""
+    # 1) 标准 JSON（含顶层数组形态：部分网关返回 [{"choices": ...}]）
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            choices = obj.get("choices") or []
+            if isinstance(choices, list):
+                joined = "".join(p for p in (_choice_content(c) for c in choices) if p)
+                if joined:
+                    return joined
+            for k in ("content", "text", "answer", "response"):
+                v = obj.get(k)
+                if isinstance(v, str) and v:
+                    return v
+        elif isinstance(obj, list):
+            joined = "".join(
+                (_choice_content(c) if isinstance(c, dict)
+                 else (c if isinstance(c, str) else "")) for c in obj)
+            if joined:
+                return joined
+    except (ValueError, TypeError):
+        pass
+    # 2) SSE：逐行解析 data: 负载，拼接增量文本
+    parts = []
+    for line in text.splitlines():
+        raw_line = line.strip()
+        if not raw_line or raw_line.startswith(":"):
+            continue
+        if raw_line.lower().startswith("data:"):
+            payload = raw_line[5:].strip()
+        elif raw_line.startswith("{"):
+            payload = raw_line
+        else:
+            continue
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(payload)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(chunk, dict):
+            continue
+        choices = chunk.get("choices") or []
+        if isinstance(choices, list) and choices:
+            parts.append(_choice_content(choices[0]))
+        elif isinstance(chunk.get("content"), str):
+            parts.append(chunk["content"])
+    return "".join(parts)
+
+
+def normalize_model_body(body: str) -> tuple:
+    """把 SSE 响应归一成标准非流式 JSON。
+
+    返回 (归一化后的响应体, 提取到的文本, 是否归一化)。
+    归一化让 _parse_response / 测试连接 / AI 助手 / 自治诊断等所有
+    下游解析器零改动兼容流式返回。
+    """
+    content = extract_model_content(body or "")
+    if not content:
+        return body, "", False
+    text = str(body or "").strip()
+    # 已经是标准 JSON：保留原响应体，仅把文本作为附加字段返回
+    if text.startswith("{") or text.startswith("["):
+        try:
+            json.loads(text)
+            return body, content, False
+        except (ValueError, TypeError):
+            pass
+    normalized = json.dumps(
+        {"choices": [{"message": {"content": content},
+                      "finish_reason": "stop"}]}, ensure_ascii=False)
+    return normalized, content, True
 
 
 # 风险等级阈值（0-100 分）：左闭右开
@@ -289,7 +410,12 @@ class AIPredictor:
                 if not isinstance(cfg.get(sub), dict):
                     cfg[sub] = json.loads(json.dumps(DEFAULT_AI_CONFIG.get(sub, {})))
                 cfg[sub].update(data[sub])
-        # 存入数据库（api_key 已加密）
+        # 存库前重新加密：get_config() 已把 api_key 解密为明文，
+        # 若本次只改了端点等字段（密钥输入框留空），直接存会把用户
+        # 已保存的密钥以明文写进 system_config（真机实测暴露）。
+        stored_key = (cfg.get("ai_model") or {}).get("api_key")
+        if stored_key and not str(stored_key).startswith("aienc:"):
+            cfg["ai_model"]["api_key"] = encrypt_api_key(stored_key)
         db.set_system_config("ai_alert_config", json.dumps(cfg, ensure_ascii=False))
         # 返回时 api_key 仍为加密值，调用方需自行解密或用 get_safe_config
         return cfg
@@ -304,38 +430,34 @@ class AIPredictor:
         return decrypt_api_key(cipher)
 
     # ------------------------- 模型推理 -------------------------
-    def _get_model_uri(self) -> str:
+    def _get_model_uri(self, cfg: dict = None) -> str:
         """从配置拼装模型服务 URI。返回空字符串表示未配置。
 
+        cfg: 本次调用的配置（测试连接会带尚未保存的覆盖参数）；
+             None 时回退读取已保存配置，兼容既有调用方与单测。
         智能识别规则（避免路径双拼）：
-        1. 去除尾部斜杠后判断
-        2. 如果 endpoint 已包含 /chat/completions 结尾（大小写不敏感）→ 直接用原 URL
-        3. 如果 endpoint 已包含 /v1 结尾 → 只追加 /chat/completions（不重复 /v1）
-        4. 否则（基础 URL）→ 追加 /v1/chat/completions
-        5. endpoint 为空字符串 → 返回 ""
+        1. endpoint 已含 /chat/completions（大小写不敏感）→ 直接用原 URL
+        2. endpoint 以 /v1 结尾 → 只追加 /chat/completions
+        3. 否则（基础 URL）→ 追加 /v1/chat/completions
+        4. provider=local 或 endpoint 为空 → ""
+
+        除 local 外所有厂商（含 moma/zhipu/qwen/deepseek/anthropic/
+        ollama/custom）一律按 OpenAI 兼容路径处理：预设给的都是完整 URL，
+        自定义也只需填完整 /chat/completions 地址。历史实现按 provider
+        硬白名单分发，漏掉 moma 等 4 家，导致「模型端点未配置」。
         """
-        cfg = self.get_config()
-        ai_model = cfg.get("ai_model", {})
-        endpoint = ai_model.get("endpoint", "")
+        cfg = cfg if isinstance(cfg, dict) else self.get_config()
+        ai_model = cfg.get("ai_model", {}) or {}
+        endpoint = (ai_model.get("endpoint") or "").strip()
         provider = ai_model.get("provider", "openai")
-        if not endpoint:
+        if not endpoint or provider == "local":
             return ""
-        # 去除尾部斜杠
         base = endpoint.rstrip("/")
-        # local 不需要 URI
-        if provider == "local":
-            return ""
-        # openai / anthropic / ollama / custom：均用 OpenAI 兼容路径
-        if provider in ("openai", "anthropic", "ollama", "custom"):
-            # 规则 1：endpoint 已含 /chat/completions → 直接使用（避免双拼）
-            if base.lower().endswith("/chat/completions"):
-                return base
-            # 规则 2：endpoint 已含 /v1 → 只追加 /chat/completions
-            if base.lower().endswith("/v1"):
-                return f"{base}/chat/completions"
-            # 规则 3：基础 URL → 追加 /v1/chat/completions
-            return f"{base}/v1/chat/completions"
-        return ""
+        if base.lower().endswith("/chat/completions"):
+            return base
+        if base.lower().endswith("/v1"):
+            return base + "/chat/completions"
+        return base + "/v1/chat/completions"
 
     def _compose_prompt(self, metric: str, data: dict, cfg: dict) -> str:
         """构造发送给模型的提示词。受 max_input_chars 截断约束。"""
@@ -457,9 +579,11 @@ class AIPredictor:
                 self.logger.warning("[ai_alert] provider=local，本地模型路径不存在: %s", local_path)
                 return {"error": "本地模型路径不存在", "local_path_exists": False}
 
-        uri = self._get_model_uri()
+        uri = self._get_model_uri(cfg)
         if not uri:
-            return {"error": "模型端点未配置"}
+            return {"error": "模型端点未配置",
+                    "error_category": "endpoint",
+                    "hint": "请在【系统设置 → AI 模型接入配置】填写完整端点 URL（含 /chat/completions）并保存；本地模型请选「本地模型」并填写路径"}
 
         # 入口日志：记录请求关键信息（便于排查），api_key 脱敏显示前 6 位 + ***
         masked_key = (api_key[:6] + "***") if api_key and len(api_key) >= 6 else ("***" if api_key else "")
@@ -490,14 +614,19 @@ class AIPredictor:
         try:
             req = urllib.request.Request(uri, data=body, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=resolved_timeout) as resp:
-                resp_body = resp.read().decode("utf-8", errors="replace")
+                raw_body = resp.read().decode("utf-8", errors="replace")
+                resp_body, content, stream_normalized = normalize_model_body(raw_body)
                 latency_ms = round(time.time() * 1000 - start_ms, 1)
-                self.logger.info("[ai_alert] 模型调用成功: %s, latency=%.1fms", uri, latency_ms)
+                self.logger.info(
+                    "[ai_alert] 模型调用成功: %s, latency=%.1fms, sse_normalized=%s, content_len=%d",
+                    uri, latency_ms, stream_normalized, len(content))
                 return {
                     "ok": True,
                     "status_code": resp.status,
                     "latency_ms": latency_ms,
                     "response_body": resp_body,
+                    "content": content,
+                    "stream_normalized": stream_normalized,
                 }
         except urllib.error.HTTPError as e:
             latency_ms = round(time.time() * 1000 - start_ms, 1)
@@ -556,10 +685,17 @@ class AIPredictor:
                     "hint": "可能是远端排队中或网络抖动，请稍后重试",
                 }
             else:
+                dns_fail = any(w in reason_str.lower() for w in (
+                    "name or service not known", "nodename nor servname",
+                    "temporary failure in name resolution", "getaddrinfo failed",
+                    "name resolution", "errno -2", "[errno -2]"))
                 classified = {
                     "error_category": "network",
                     "error": f"网络连接失败（{reason_str}）",
-                    "hint": "请检查网络或 endpoint 是否可达",
+                    "hint": ("域名无法解析：请在平台机 /etc/hosts 配置该内网域名 IP，"
+                             "或改用可解析它的内网 DNS；容器部署请用 --add-host / "
+                             "compose extra_hosts 传入。")
+                    if dns_fail else "请检查网络或 endpoint 是否可达",
                 }
             self.logger.warning(
                 "[ai_alert] 模型调用 URL 错误: %s, category=%s, latency=%.1fms",
@@ -847,7 +983,7 @@ class AIPredictor:
             task = task_index.get(tid) or {}
             task_details.append({
                 "task_id": tid,
-                "task_name": task.get("name") or f"任务#{tid}",
+                "task_name": task.get("name") or f"任务 {tid}",
                 "db_type": task.get("db_type") or None,
                 "fail_7d": fail_7d,
                 "fail_30d": fail_30d,
@@ -1358,7 +1494,7 @@ class AIPredictor:
             task = task_index.get(tid) or {}
             task_details.append({
                 "task_id": tid,
-                "task_name": task.get("name") or f"任务#{tid}",
+                "task_name": task.get("name") or f"任务 {tid}",
                 "db_type": task.get("db_type") or None,
                 "fail_7d": fail_7d,
                 "fail_30d": fail_30d,
@@ -1550,16 +1686,16 @@ class AIPredictor:
             if kind == "sync_task":
                 src = models.get_sync_task(source_id)
                 if not src:
-                    return True, f"同步任务#{source_id}", "源同步任务已被删除"
-                name = src.get("name") or f"同步任务#{source_id}"
+                    return True, f"同步任务 {source_id}", "源同步任务已被删除"
+                name = src.get("name") or f"同步任务 {source_id}"
                 if str(src.get("last_status") or "").lower() == "failed":
                     return True, name, "源同步任务最近一次同步失败"
                 return False, name, ""
             if kind == "rt_task":
                 task = models.get_task(source_id)
                 if not task:
-                    return True, f"实时任务#{source_id}", "源实时保护任务已被删除"
-                name = task.get("name") or f"实时任务#{source_id}"
+                    return True, f"实时任务 {source_id}", "源实时保护任务已被删除"
+                name = task.get("name") or f"实时任务 {source_id}"
                 if str(task.get("last_status") or "").lower() == "failed":
                     return True, name, "源实时保护任务最近一次执行失败"
                 rt = models.get_rt_task(source_id)
@@ -1810,7 +1946,7 @@ class AIPredictor:
         rows = db.query(
             "SELECT COUNT(*) AS cnt FROM system_logs WHERE source='disaster_link' "
             "AND message LIKE ? AND ts >= ?",
-            (f"链路#{link_id} 智能选路%", cutoff))
+            (f"链路{link_id} 智能选路%", cutoff))
         return rows[0]["cnt"] if rows else 0
 
     def _parse_ts(self, ts):

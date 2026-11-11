@@ -153,7 +153,7 @@ def lock_record(record_id: int, days: int, operator: str = "",
         (now_iso(), until or None, 1 if protected else 0, note,
          1 if fs_ok else 0, record_id))
     db.add_log("WARNING", _log_target,
-               f"备份记录 #{record_id} 保留锁定：{note}；"
+               f"备份记录 {record_id} 保留锁定：{note}；"
                f"写保护 {len(protected)}/{len(paths)} 个文件" + fs_note
                + (f"，chmod 失败 {protect_failed}" if protect_failed else ""))
     return {"record_id": record_id, "locked": True, "retention_until": until,
@@ -186,7 +186,7 @@ def unlock_record(record_id: int, operator: str = "", reason: str = "") -> dict:
         "write_protected=0, fs_immutable=0, lock_note=? WHERE id=?",
         (note, record_id))
     db.add_log("WARNING", _log_target,
-               f"备份记录 #{record_id} 解除保留锁定 by {operator or 'unknown'}："
+               f"备份记录 {record_id} 解除保留锁定 by {operator or 'unknown'}："
                f"{reason}（原到期 {record.get('retention_until') or '永久'}）")
     return {"record_id": record_id, "locked": False, "note": note}
 
@@ -195,7 +195,7 @@ def assert_deletable(record: dict) -> None:
     """删除路径守卫：锁保护期内抛 ImmutabilityViolation。"""
     if is_active(record):
         raise ImmutabilityViolation(
-            f"备份记录 #{record['id']} 处于保留锁保护期"
+            f"备份记录 {record['id']} 处于保留锁保护期"
             f"（至 {record.get('retention_until') or '永久'}），禁止删除/覆盖；"
             f"如确需删除请先解锁（留审计）")
 
@@ -231,7 +231,7 @@ def verify_integrity(record_id: int) -> dict:
                "WHERE id=?", (1 if ok else 0, now_iso(), record_id))
     if not ok:
         db.add_log("ERROR", _log_target,
-                   f"备份记录 #{record_id} 完整性复检不一致（疑似篡改/损坏）："
+                   f"备份记录 {record_id} 完整性复检不一致（疑似篡改/损坏）："
                    f"基线 {baseline[:16]}… 实际 {digest[:16]}…")
     return {"record_id": record_id,
             "status": "match" if ok else "drift",
@@ -256,7 +256,7 @@ def recheck_all() -> dict:
         except Exception as e:  # noqa: BLE001
             report["error"] += 1
             db.add_log("ERROR", _log_target,
-                       f"备份记录 #{r['id']} 完整性复检异常: {e}")
+                       f"备份记录 {r['id']} 完整性复检异常: {e}")
             continue
         st = res.get("status")
         if st in report:
@@ -270,7 +270,7 @@ def recheck_all() -> dict:
                     r["id"], res.get("checksum") or "")
             except Exception as e:  # noqa: BLE001
                 db.add_log("ERROR", _log_target,
-                           f"备份记录 #{r['id']} 漂移响应失败: {e}")
+                           f"备份记录 {r['id']} 漂移响应失败: {e}")
     if report["drift"]:
         db.add_log("ERROR", _log_target,
                    f"完整性复检发现 {report['drift']} 个产物校验和不一致，"
@@ -307,7 +307,7 @@ def maybe_autolock(task: dict, record_id: int) -> dict:
                            reason=f"任务「{task.get('name')}」自动保留锁定")
     except Exception as e:  # noqa: BLE001 - 自动锁定失败不影响备份结果
         db.add_log("WARNING", _log_target,
-                   f"备份记录 #{record_id} 自动锁定失败: {e}")
+                   f"备份记录 {record_id} 自动锁定失败: {e}")
         return {"error": str(e)}
 
 

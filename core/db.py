@@ -2273,6 +2273,22 @@ def execute(sql: str, params: tuple = ()) -> int:
             conn.close()
 
 
+def execute_rowcount(sql: str, params: tuple = ()) -> int:
+    """执行写语句并返回真实影响行数（用于状态机 CAS 抢占）。
+
+    execute() 返回 lastrowid，无法区分「更新了 1 行」与「WHERE 条件未命中」；
+    SQLite 的 cursor.rowcount 对 UPDATE/DELETE 即为影响行数。
+    """
+    with _write_lock:
+        conn = get_conn()
+        try:
+            cur = conn.execute(sql, params)
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+
 def query(sql: str, params: tuple = ()) -> list[dict]:
     conn = get_conn()
     try:

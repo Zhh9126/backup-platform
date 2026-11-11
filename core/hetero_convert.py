@@ -50,15 +50,15 @@ class HeteroConvert:
             "status": "running",
             "note": note,
         })
-        self.logger.info("[hetero] 创建转换任务 #%s %s->%s (record=%s)",
+        self.logger.info("[hetero] 创建转换任务 %s %s->%s (record=%s)",
                          job_id, src_db_type, dst_db_type, src_record_id)
         try:
             result_path = self._run(job_id, src_db_type, dst_db_type, src_record_id)
             models.update_hetero_job(job_id, {
                 "status": "done", "result_path": result_path})
-            self.logger.info("[hetero] 任务 #%s 完成，产物: %s", job_id, result_path)
+            self.logger.info("[hetero] 任务 %s 完成，产物: %s", job_id, result_path)
         except Exception as e:
-            self.logger.exception("[hetero] 任务 #%s 失败: %s", job_id, e)
+            self.logger.exception("[hetero] 任务 %s 失败: %s", job_id, e)
             models.update_hetero_job(job_id, {"status": "failed", "note": str(e)})
         return job_id
 

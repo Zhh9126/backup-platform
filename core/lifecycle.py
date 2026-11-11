@@ -176,7 +176,7 @@ class LifecycleEngine:
                     if self._expire(s):
                         expired += 1
             except Exception as e:
-                self.logger.warning("[lifecycle] 处理 set#%s 异常: %s", s.get("id"), e)
+                self.logger.warning("[lifecycle] 处理 set%s 异常: %s", s.get("id"), e)
                 errors += 1
 
         summary = {
@@ -206,13 +206,13 @@ class LifecycleEngine:
         from core import tier_replication
         object_key = bset.get("object_key")
         if not object_key:
-            self.logger.warning("[lifecycle] set#%s 无 object_key，跳过流转", bset.get("id"))
+            self.logger.warning("[lifecycle] set%s 无 object_key，跳过流转", bset.get("id"))
             return False
         # 找到目标层级的启用存储目标
         targets = tier_replication._get_enabled_targets(self.logger)
         dest = next((t for t in targets if int(t.get("tier")) == target_tier), None)
         if not dest:
-            self.logger.info("[lifecycle] 无 tier=%s 存储目标，set#%s 暂不流转",
+            self.logger.info("[lifecycle] 无 tier=%s 存储目标，set%s 暂不流转",
                              target_tier, bset.get("id"))
             return False
         # 物化源对象到本地临时文件（跨存储拷贝前需先有本地文件）
@@ -224,7 +224,7 @@ class LifecycleEngine:
             tier_label=f"L{cur_tier}->L{target_tier}")
         if ok:
             models.update_backup_set(bset["id"], {"storage_tier": target_tier})
-            self.logger.info("[lifecycle] set#%s L%s->L%s 完成",
+            self.logger.info("[lifecycle] set%s L%s->L%s 完成",
                              bset.get("id"), cur_tier, target_tier)
         # 清理临时文件（仅当是临时拉取、非原始 L1 文件时）
         if src_path and src_path != object_key and os.path.exists(src_path):
@@ -255,7 +255,7 @@ class LifecycleEngine:
                 return None
             return tmp
         except Exception as e:
-            self.logger.warning("[lifecycle] 物化 set#%s 失败: %s", bset.get("id"), e)
+            self.logger.warning("[lifecycle] 物化 set%s 失败: %s", bset.get("id"), e)
             return None
 
     def _expire(self, bset: dict) -> bool:
@@ -279,10 +279,10 @@ class LifecycleEngine:
                 blocked.append(f"{t.get('type')}/{t.get('name')}: {e}")
         if blocked:
             self.logger.warning(
-                "[lifecycle] set#%s 保留元数据：后端对象未能删除（%s）；"
+                "[lifecycle] set%s 保留元数据：后端对象未能删除（%s）；"
                 "顺序介质请走介质整体退役/覆写流程，避免产生孤儿副本",
                 bset.get("id"), ", ".join(blocked))
             return False
         models.delete_backup_set(bset["id"])
-        self.logger.info("[lifecycle] set#%s 已到期清理", bset.get("id"))
+        self.logger.info("[lifecycle] set%s 已到期清理", bset.get("id"))
         return True

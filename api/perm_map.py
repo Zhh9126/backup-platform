@@ -121,6 +121,10 @@ FORCE_CHECK = tuple(re.compile(p) for p in (
     r"^/api/datamining/(export|scan|classify)$",
     # 磁带显式写后校验会 rewind/扫描物理带位，不是只读探测
     r"^/api/tape/verify$",
+    # 迁移的 verify / dry-run 会写 phases_json 或 verified 标记，不是只读探测
+    r"^/api/(migration|db-migrate|migration-plans|migration-protection-plans)/\d+/(verify|dry-run)$",
+    # 同步任务的 validate / verify 有写副作用，不能因动作词被豁免
+    r"^/api/sync-tasks/\d+/(validate|verify)$",
 ))
 
 # ---- 精确动作覆盖：按实际路径（数字 id）匹配 ----

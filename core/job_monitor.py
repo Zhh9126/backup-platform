@@ -125,7 +125,7 @@ def summary(limit: int = 50) -> dict:
     # 附任务名（一次查询映射）
     tnames = {t["id"]: t["name"] for t in tasks}
     for r in recent:
-        r["task_name"] = tnames.get(r["id"], "#%s" % r["id"])
+        r["task_name"] = tnames.get(r["id"], "%s" % r["id"])
 
     severity_rank = {"high": 0, "medium": 1}
     attention.sort(key=lambda a: (min(severity_rank.get(rr["severity"], 9)

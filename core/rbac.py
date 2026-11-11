@@ -288,9 +288,19 @@ def effective_permissions(user: dict) -> set:
 
 
 def has_permission(user: Optional[dict], perm: str) -> bool:
-    """是否拥有某个权限：admin 直接放行。"""
+    """是否拥有某个权限：先过功能项按需启用/分配闸，再按角色判定。
+
+    features.perm_allowed 在没有任何配置时恒为 True（零破坏），
+    因此既有角色矩阵、三员分立用例完全不受影响。
+    """
     if not user:
         return False
+    try:
+        from core import features
+        if not features.perm_allowed(user, perm):
+            return False
+    except Exception:
+        pass
     if user.get("role") == "admin":
         return True
     return perm in effective_permissions(user)

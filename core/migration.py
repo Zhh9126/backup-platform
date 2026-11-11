@@ -43,7 +43,7 @@ class MigrationPlan:
             "task_id": task_id, "stage": STAGE_PRE,
             "status": "created", "note": note,
         })
-        self.logger.info("[migration] 创建计划 #%s（task=%s）", pid, task_id)
+        self.logger.info("[migration] 创建计划 %s（task=%s）", pid, task_id)
         return pid
 
     def get_plan(self, plan_id: int) -> Optional[dict]:
@@ -109,7 +109,7 @@ class MigrationPlan:
             "stage": STAGE_PRE, "status": STAGE_PRE,
             "golden_backup_record_id": golden,
         })
-        self.logger.info("[migration] 计划 #%s pre 完成，黄金点 record=%s", pid, golden)
+        self.logger.info("[migration] 计划 %s pre 完成，黄金点 record=%s", pid, golden)
         return self.get_plan(pid)
 
     def verify_golden(self, plan_id: int) -> dict:
@@ -135,7 +135,7 @@ class MigrationPlan:
                 models.mark_record_verified(golden, True, msg)
             except Exception:
                 pass
-        self.logger.info("[migration] 计划 #%s verify_golden -> %s", plan_id, ok)
+        self.logger.info("[migration] 计划 %s verify_golden -> %s", plan_id, ok)
         return {"plan_id": plan_id, "verified": ok, "message": msg}
 
     # ------------------------- 阶段：mid -------------------------
@@ -146,7 +146,7 @@ class MigrationPlan:
         # 对源端做一次增量备份登记（高频增量保护的仿真落点）
         self._run_backup(task_id, "incremental")
         models.update_migration_plan(pid, {"stage": STAGE_MID, "status": STAGE_MID})
-        self.logger.info("[migration] 计划 #%s mid 完成（已登记高频增量备份）", pid)
+        self.logger.info("[migration] 计划 %s mid 完成（已登记高频增量备份）", pid)
         return self.get_plan(pid)
 
     # ------------------------- 阶段：post -------------------------
@@ -159,7 +159,7 @@ class MigrationPlan:
         if old_retention_days is not None:
             data["old_retention_days"] = int(old_retention_days)
         models.update_migration_plan(pid, data)
-        self.logger.info("[migration] 计划 #%s post 完成（旧库保留 %s 天）",
+        self.logger.info("[migration] 计划 %s post 完成（旧库保留 %s 天）",
                          pid, old_retention_days)
         return self.get_plan(pid)
 

@@ -15,7 +15,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 容灾切换 · 恢复演练 · 预校验 · 克隆（VDB） · 不可变备份 · 巡检 · 监控 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v2.3.8-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v2.3.9-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -33,7 +33,8 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 > 目录模拟带库全链路 28/28、防勒索专项 11/11、发版回归 97 passed；
 > 真实磁带库 / 机械手 / LTO WORM 尚无真机验证报告（见下方「诚实边界」）。
 >
-> **最新动态**：v2.3.8（2026-11-11）已发布（三粒度统一 / VDB 快照 / 应用级容灾 HA）；
+> **最新动态**：v2.3.9（2026-11-12）已发布（功能项按需启用与权限分离 / AI 结果与模型接入修复 / 迁移同步 P0 / 真机验收）；
+> v2.3.8（2026-11-11）完成三粒度统一 / VDB 快照 / 应用级容灾 HA；
 > v2.3.7 完成防勒索闭环 / 磁带库接入 / 安全审计整改；
 > 上一版本完成群晖 DSM 全面纳管、Windows 文件增量、异地容灾出站拉取、授权服务器数计量，
 > 并修复离线包全新部署时 SQL Server JDBC 逻辑备份不可用；
@@ -398,8 +399,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v2.3.8    # 固定版本（可回滚）
-# 当前最新版本：v2.3.8（2026-11-11，三粒度统一 / VDB 快照 / 应用级容灾 HA）
+docker pull ghcr.io/zhh9126/backup-platform:v2.3.9    # 固定版本（可回滚）
+# 当前最新版本：v2.3.9（2026-11-12，功能项权限分离 / 迁移同步 P0 修复）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -418,6 +419,10 @@ python tools/check_env.py
 // /etc/docker/daemon.json
 {"registry-mirrors": ["https://docker.m.daocloud.io", "https://dockerproxy.com"]}
 ```
+
+> **离线交付包版本说明**：本节（离线导入 / 运行 / 升级 / 卸载）示例基于 **v2.3.8 离线包**
+> （该包真实已交付，`manifest.json` 内含 4 个 RepoTag）。v2.3.9 当前提供 GHCR 在线镜像；
+> 如需 v2.3.9 离线包，请按「自行导出离线包」小节把 tag 换成 `v2.3.9` 重新导出。
 
 ### 离线导入
 
@@ -687,6 +692,19 @@ docker build -t backup-platform:local .
 - 默认账号请立即修改（首登会标记 `must_change_password`）；生产环境建议限制来源 IP
 
 ## 更新日志
+
+### v2.3.9（2026-11-12，已发布）
+
+- **功能项与权限分离**：新增 `core/features.py`（21 个功能项注册表）与「系统设置 → 功能项与权限」界面；平台可按需启用/停用模块，再按角色或单个用户分配。页面与 API（含 GET）双层服务端拦截，防自锁、未配置时零破坏。
+- **AI 智能助手结果明细**：NL 动作层与 ReAct 路径统一渲染真实结果表格（字段中文名、敏感字段过滤、原始结果脱敏），补筛选条件平台侧复核与问答式结论；刷新历史可重建工具结果轨迹。
+- **AI 模型接入修复**：补齐 MoMA 等厂商、支持未保存先测试、多行 SSE 响应归一化、测试状态落库、DNS 失败处置指引；并修「修改非密钥字段导致 API Key 明文落库」。
+- **异地容灾拉取并入容灾链路**：侧栏去重、旧路由 302 深链兼容、页面片段单一来源；后端 API / 表 / 调度零改动。
+- **Agent 执行器离线可用**：黑盒载荷改为零第三方依赖（HMAC-SHA256 认证流加密），修复 systemd 退出码未校验、失败不回滚注册记录、探活异常吞掉；171 真机 8466 在线。
+- **数据对比**：任务与报告两个列表各 10 行/页；报告明细弹窗修复异常吞掉与关闭后状态不清理。
+- **裸编号批量治理 + 门禁**：73 文件 272 行去掉面向用户的 `#+编号`，新增 `tests/test_no_bare_hash_id.py` 防复发。
+- **迁移 / 同步 P0 修复**：同步分批翻页死循环、轮询水位丢数、binlog 位点零持久化、手动运行并发护栏、停止超时误报、Flink 明文口令；迁移并发串库、重复触发、僵尸状态、取消端点、对象假成功、verify/dry-run 权限绕过。
+- **真实验证**：迁移/同步真机 E2E 19/19（真实 MySQL3307 建库建表 + 生产 API）、权限分离 39/39、AI 25/25 + 18/18、数据对比 14/14、全站冒烟 21/21、路由 0 BAD、组合回归 236 passed。
+- **诚实边界**：迁移仍无增量追平 / 割接 / 回退；容灾切换与同步方向、位点尚未联动；全库 full 模式无增量列时仅有防死循环护栏；三套同步实现未收敛；AI 收费模块按约定不进开源仓库、随镜像交付。
 
 ### v2.3.8（2026-11-11，已发布）
 

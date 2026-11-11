@@ -200,7 +200,7 @@ class PITRRestore:
             return False, "恢复链为空：该时间点之前没有任何可用恢复点"
         head = chain[0]
         if not head.is_full:
-            return False, (f"链头缺失基准全量：最早可用点 #{head.id} 为 "
+            return False, (f"链头缺失基准全量：最早可用点 {head.id} 为 "
                            f"{head.rp_kind}，请选择更晚的时间点")
         missing = [p for p in chain if p.storage_tier == 1 and not p.object_key]
         if missing:

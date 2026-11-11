@@ -1370,8 +1370,8 @@ def diff_backups(backup_id1: int, backup_id2: int) -> str:
     diff = difflib.unified_diff(
         c1.splitlines(keepends=True),
         c2.splitlines(keepends=True),
-        fromfile=f"备份 #{b1['id']} ({b1['device_name']} @ {b1['created_at']})",
-        tofile=f"备份 #{b2['id']} ({b2['device_name']} @ {b2['created_at']})",
+        fromfile=f"备份 {b1['id']} ({b1['device_name']} @ {b1['created_at']})",
+        tofile=f"备份 {b2['id']} ({b2['device_name']} @ {b2['created_at']})",
     )
     return "".join(diff)
 

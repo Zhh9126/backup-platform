@@ -270,7 +270,7 @@ class PostgresWALDaemon(CDCDaemon):
     # 钩子 6：密码注入
     # ------------------------------------------------------------------
     def _auth_env(self) -> dict:
-        """密码走环境变量，不进命令行（共享知识 #16：日志/命令行不落明文）。"""
+        """密码走环境变量，不进命令行（共享知识 16：日志/命令行不落明文）。"""
         env = os.environ.copy()
         if self.password:
             for key in self.PASSWORD_ENV:

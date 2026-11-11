@@ -705,7 +705,7 @@ class OracleEngine(BackupEngine):
                 _ssh_exec_pipe(client, remote_dump._wrap_login(f"rm -rf {stage_dir}"), timeout=30)
                 if rc2 == 0 and f"df_{df_no}" in ls_text:
                     restore_detail = (f"RESTORE VALIDATE 通过；并已从备份片真实抽取数据文件 "
-                                      f"#{df_no} 到暂存目录验证后清理（真实恢复证据）")
+                                      f"{df_no} 到暂存目录验证后清理（真实恢复证据）")
                 else:
                     restore_detail = ("RESTORE VALIDATE 通过；数据文件抽取未完成"
                                       f"(rc={rc2})：" + out2_text[-300:].replace("\n", " "))

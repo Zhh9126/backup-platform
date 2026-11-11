@@ -93,7 +93,7 @@ class RecoveryJournal:
 
         row = models.get_recovery_point(rp_id) or {}
         rp = RecoveryPoint.from_row(row)
-        self.logger.info("[rt.journal] task=%s 追加恢复点 #%s %s @%s (%s)",
+        self.logger.info("[rt.journal] task=%s 追加恢复点 %s %s @%s (%s)",
                          task_id, rp.id, rp.rp_kind, rp.pit_at,
                          db.human_size(rp.size_bytes))
         return rp
@@ -213,7 +213,7 @@ class RecoveryJournal:
 
         head = chain[0]
         if not head.is_full:
-            return False, (f"链头缺失基准全量：最早可用点 #{head.id} 为 "
+            return False, (f"链头缺失基准全量：最早可用点 {head.id} 为 "
                            f"{head.rp_kind}，请选择更晚的时间点或先做一次全量备份")
 
         prev: Optional[RecoveryPoint] = None
@@ -221,21 +221,21 @@ class RecoveryJournal:
             # ④ 产物存在性与校验和
             if point.storage_tier == 1:
                 if not point.object_key or not os.path.isfile(point.object_key):
-                    return False, (f"恢复点 #{point.id}（{point.pit_at}）产物缺失: "
+                    return False, (f"恢复点 {point.id}（{point.pit_at}）产物缺失: "
                                    f"{norm_path(point.object_key)}")
                 if point.checksum:
                     actual = db.sha256_file(point.object_key)
                     if actual != point.checksum:
-                        return False, (f"恢复点 #{point.id}（{point.pit_at}）校验和不匹配，"
+                        return False, (f"恢复点 {point.id}（{point.pit_at}）校验和不匹配，"
                                        f"产物可能已损坏")
                 elif os.path.getsize(point.object_key) <= 0:
-                    return False, f"恢复点 #{point.id}（{point.pit_at}）产物为空文件"
+                    return False, f"恢复点 {point.id}（{point.pit_at}）产物为空文件"
 
             if prev is not None:
                 # ② parent 连续性（允许 parent_rp_id 为空的历史数据，仅告警不阻断）
                 if point.parent_rp_id and point.parent_rp_id != prev.id:
-                    return False, (f"恢复链断裂：#{point.id} 的父节点为 "
-                                   f"#{point.parent_rp_id}，但链上前驱是 #{prev.id}，"
+                    return False, (f"恢复链断裂：{point.id} 的父节点为 "
+                                   f"{point.parent_rp_id}，但链上前驱是 {prev.id}，"
                                    f"中间存在缺失的恢复点")
                 # ③ DB 段位点连续性
                 if point.rp_kind == RP_DB_LOG and prev.rp_kind == RP_DB_LOG:

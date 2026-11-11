@@ -199,7 +199,7 @@
     }
     else if(act==="del"){
       if(!confirm(`删除用户 ${a.username}?`)) return;
-      BKP.api(`/api/rbac/users/${id}`,{method:"DELETE"}).then(()=>{BKP.toast("已删除","success");reload();}).catch(er=>BKP.toast(er.message||"删除失败","danger"));
+      BKP.api("DELETE", `/api/rbac/users/${id}`).then(()=>{BKP.toast("已删除","success");reload();}).catch(er=>BKP.toast(er.message||"删除失败","danger"));
     }
   });
   $("#btnSavePwd").onclick=()=>{

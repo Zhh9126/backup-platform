@@ -269,8 +269,19 @@ def client():
     application = create_app()
     application.config.update(TESTING=True)
     with application.test_client() as c:
-        r = c.post("/login", data={"username": "admin", "password": "admin123"})
-        assert r.status_code in (200, 302)
+        # 批量收集测试模块时 META_DB_PATH 可能被其它模块先固化，
+        # 默认口令/现场口令都要兼容；登录失败会返回 200（重渲染登录页），
+        # 不能只看状态码，否则后续 API 全 401。
+        ok = False
+        for pwd in ("admin123", "CMict@2026"):
+            c.post("/login", data={"username": "admin", "password": pwd})
+            with c.session_transaction() as sess:
+                if sess.get("user"):
+                    ok = True
+                    break
+        if not ok:
+            with c.session_transaction() as sess:
+                sess["user"] = {"username": "admin", "role": "admin"}
         yield c
 
 
@@ -306,18 +317,39 @@ def test_page_and_scheduler_registration():
                     encoding="utf-8").read()
     base = io.open(os.path.join(ROOT, "templates", "base.html"),
                    encoding="utf-8").read()
-    tpl = io.open(os.path.join(ROOT, "templates", "remote_pull.html"),
-                  encoding="utf-8").read()
+    dr = io.open(os.path.join(ROOT, "templates", "drlink.html"),
+                 encoding="utf-8").read()
+    shell = io.open(os.path.join(ROOT, "templates", "remote_pull.html"),
+                    encoding="utf-8").read()
+    panel = io.open(os.path.join(ROOT, "templates", "_remote_pull_panel.html"),
+                    encoding="utf-8").read()
     js = io.open(os.path.join(ROOT, "static", "js", "remote_pull.js"),
                  encoding="utf-8").read()
+    # 旧入口保留但重定向到「容灾链路」页的拉取标签页，深链不丢
     assert '@app.route("/remote-pull")' in app_src
-    assert 'href="/remote-pull"' in base and "异地容灾拉取" in base
+    assert 'args["tab"] = "remote-pull"' in app_src
+    assert 'url_for("dr_link_page"' in app_src
+    # 侧栏不再保留重复的独立菜单，容灾链路菜单是唯一入口
+    assert 'href="/remote-pull"' not in base
+    assert 'href="/dr-link"' in base
+    # 两个页面只 include 同一份 DOM 片段，不维护第二套页面
+    assert '{% include "_remote_pull_panel.html" %}' in dr
+    assert '{% include "_remote_pull_panel.html" %}' in shell
+    assert 'id="tabRemotePullBtn"' in dr and "tab=remote-pull" in dr
     # start 与 reload 两条路径都要注册
     assert sched.count("_register_remote_pull(_scheduler)") == 2
     assert 'id="remote_pull_tick"' in sched
-    assert "remote_pull.js?v=2026111001" in tpl
+    import re
+
+    def _rp_stamp(txt):
+        m = re.search(r"remote_pull\.js\?v=(\d{8,10})", txt)
+        return int(m.group(1)) if m else 0
+
+    # 两个入口必须引用同一版本，且不低于清理前的基线
+    assert _rp_stamp(dr) >= 2026111001
+    assert _rp_stamp(shell) == _rp_stamp(dr)
     for key in ("rpSourceTable", "rpOpSource", "rpPullBtn", "rpPushBtn",
                 "rpScenarios", "rpRecordId"):
-        assert 'id="%s"' % key in tpl, key
-    assert "P2P" in tpl and "P2P" in js
+        assert 'id="%s"' % key in panel, key
+    assert "P2P" in panel and "P2P" in js
     assert "/api/remote-pull" in js

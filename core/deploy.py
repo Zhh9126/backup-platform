@@ -84,7 +84,7 @@ def _get_ssh_client(host_id: int):
     from core import ssh_hosts
     h = ssh_hosts.get_host(host_id, include_secret=True)
     if not h:
-        raise RuntimeError(f"SSH 主机 #{host_id} 不存在")
+        raise RuntimeError(f"SSH 主机 {host_id} 不存在")
     import paramiko
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -1246,18 +1246,18 @@ def run_deployment(dep_id: int) -> None:
     """后台线程执行数据库部署。"""
     dep = models.get_deployment(dep_id)
     if not dep:
-        _logger.error("[deploy] 部署记录 #%s 不存在", dep_id)
+        _logger.error("[deploy] 部署记录 %s 不存在", dep_id)
         return
 
     models.update_deployment(dep_id, {"status": "running", "started_at": db.now_iso()})
-    _logger.info("[deploy] 开始部署 #%s (%s)", dep_id, dep.get("name"))
+    _logger.info("[deploy] 开始部署 %s (%s)", dep_id, dep.get("name"))
 
     log_buf = []
     def log(msg):
         ts = time.strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         log_buf.append(line)
-        _logger.info("[deploy #%s] %s", dep_id, msg)
+        _logger.info("[deploy %s] %s", dep_id, msg)
         # 每写 5 行刷一次 DB（避免过度 I/O）
         if len(log_buf) % 5 == 0:
             models.update_deployment(dep_id, {"log_output": "\n".join(log_buf)})
@@ -1432,13 +1432,13 @@ def run_deployment(dep_id: int) -> None:
             models.update_deployment(dep_id, {
                 "status": "success", "progress_pct": 100,
                 "finished_at": db.now_iso(), "log_output": all_log})
-            _logger.info("[deploy] #%s 部署成功", dep_id)
+            _logger.info("[deploy] %s 部署成功", dep_id)
         else:
             log(f"部署失败 (exit={rc})")
             models.update_deployment(dep_id, {
                 "status": "failed", "progress_pct": 50,
                 "finished_at": db.now_iso(), "log_output": all_log})
-            _logger.error("[deploy] #%s 部署失败 rc=%d", dep_id, rc)
+            _logger.error("[deploy] %s 部署失败 rc=%d", dep_id, rc)
 
     except Exception as e:
         log(f"部署异常: {e}")
@@ -1446,7 +1446,7 @@ def run_deployment(dep_id: int) -> None:
         models.update_deployment(dep_id, {
             "status": "failed", "progress_pct": 0,
             "finished_at": db.now_iso(), "log_output": all_log})
-        _logger.exception("[deploy] #%s 部署异常", dep_id)
+        _logger.exception("[deploy] %s 部署异常", dep_id)
 
 
 def _ssh_exec(client, cmd: str, timeout: int = 30):

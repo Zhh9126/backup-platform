@@ -108,7 +108,7 @@ def discover_for_task(task_id: int, operator: str = "") -> dict:
             try:
                 new_id = models.create_task(nt)
                 created.append({"task_id": new_id, "db_name": ndb})
-                logger.info("[auto_discover] 任务 #%s 发现新库 %s → 自动创建任务 #%s",
+                logger.info("[auto_discover] 任务 %s 发现新库 %s → 自动创建任务 %s",
                             task_id, ndb, new_id)
             except Exception as e:  # noqa: BLE001
                 logger.error("[auto_discover] 新库 %s 建任务失败: %s", ndb, e)

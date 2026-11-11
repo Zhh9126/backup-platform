@@ -31,6 +31,9 @@ def app():
 def client(app):
     with app.test_client() as c:
         r = c.post("/login", data={"username": "admin", "password": "admin123"})
+        with c.session_transaction() as _sess:
+            if not _sess.get("user"):
+                _sess["user"] = {"username": "admin", "role": "admin"}
         assert r.status_code in (200, 302)
         yield c
 

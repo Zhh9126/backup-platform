@@ -88,7 +88,7 @@ def syn_delete_device(dev_id):
     linked = _linked_task_ids(dev_id)
     if linked:
         return jsonify({
-            "error": "该设备仍被 %d 个备份任务引用（#%s），请先删除或改绑这些任务"
+            "error": "该设备仍被 %d 个备份任务引用（%s），请先删除或改绑这些任务"
                      % (len(linked), ", ".join(str(i) for i in linked[:10])),
             "task_ids": linked,
         }), 409
@@ -292,7 +292,7 @@ def syn_quick_task(dev_id):
     out = {"id": tid, "ok": True, "strategy": strategy, "paths": paths,
            "mixed_backup": 1 if strategy == "mixed" else 0,
            "incremental_minutes": inc_min, "full_cron": full_cron,
-           "note": "组合策略：全量 %s + 每 %d 分钟增量；凭据引用纳管设备 #%s"
+           "note": "组合策略：全量 %s + 每 %d 分钟增量；凭据引用纳管设备 %s"
                    % (full_cron, inc_min, dev_id)}
     if data.get("run_now"):
         try:

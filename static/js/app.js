@@ -2538,7 +2538,7 @@
         if (p.retention_days > 0) policy.push(`保留 ${p.retention_days} 天`);
         if (p.retention_count > 0) policy.push(`保留 ${p.retention_count} 份`);
         return `<tr>
-          <td>${esc(p.task_name || ("任务 #" + p.task_id))}</td>
+          <td>${esc(p.task_name || ("任务 " + p.task_id))}</td>
           <td>${esc(p.db_type || "-")}</td>
           <td class="small">${esc(policy.join(" / ") || "-")}</td>
           <td>${p.total}</td>
@@ -2792,7 +2792,7 @@
 
   // ---- 防勒索：保留锁定 / 解锁 / 完整性复检 ----
   window.lockRecord = async (id) => {
-    const reason = prompt(`对备份记录 #${id} 施加保留锁定（默认永久）？\n请填写原因（可留空）：`);
+    const reason = prompt(`对备份记录 ${id} 施加保留锁定（默认永久）？\n请填写原因（可留空）：`);
     if (reason === null) return;
     try {
       const r = await api("POST", `/api/records/${id}/lock`,
@@ -2803,7 +2803,7 @@
     } catch (e) { toast("锁定失败: " + e.message, "danger"); }
   };
   window.unlockRecord = async (id) => {
-    const reason = prompt(`解除记录 #${id} 的保留锁定？\n这是抗勒索关键闸门，请填写原因（审计必填）：`);
+    const reason = prompt(`解除记录 ${id} 的保留锁定？\n这是抗勒索关键闸门，请填写原因（审计必填）：`);
     if (!reason || !reason.trim()) return;
     try {
       await api("POST", `/api/records/${id}/unlock`, { reason });
@@ -3089,7 +3089,7 @@
         const bar = $("policyFilterBar");
         const nameEl = $("policyFilterName");
         if (bar && nameEl) {
-          nameEl.textContent = (pol.name || ("策略 #" + pid)) + "（共 " + (pol.bound_task_count || 0) + " 个任务）";
+          nameEl.textContent = (pol.name || ("策略 " + pid)) + "（共 " + (pol.bound_task_count || 0) + " 个任务）";
           bar.classList.remove("d-none");
         }
         $("filterTask").disabled = true;
@@ -3315,7 +3315,7 @@
       const barType = st === "failed" ? "danger" : st === "simulated" ? "warning" : "success";
       const prefix = st === "failed" ? "恢复失败：" : st === "simulated" ? "[仿真] " : "恢复完成：";
       toast(prefix + okMsg, barType === "danger" ? "danger" : "success", 6000);
-      restoreResultBar(barType, prefix + okMsg + (newId ? "（恢复记录 #" + newId + "）" : ""));
+      restoreResultBar(barType, prefix + okMsg + (newId ? "（恢复记录 " + newId + "）" : ""));
       if (resultBar && resultBar.classList) resultBar.classList.remove("d-none");
       await loadRestores(newId);
     } catch (e2) {
@@ -3488,7 +3488,7 @@
     $("rs_tier").textContent = RESTORE_TIER_LABELS[tier] || tier;
     $("rs_source").innerHTML = '<code>' + esc(ip || "-") + '</code>' +
       (rec.source_db ? " / " + esc(rec.source_db) : "");
-    $("rs_recno").innerHTML = '<code>#' + rec.id + '</code>';
+    $("rs_recno").innerHTML = '<code>' + rec.id + '</code>';
 
     if (row) row.style.display = "";
   };
@@ -3661,8 +3661,9 @@
         if (modelStatus.provider_presets) {
           window.__AI_PROVIDER_PRESETS = modelStatus.provider_presets;
         }
-        // 渲染快速选择链接
+        // 渲染快速选择链接；presets 此时才可用，再跑一次自动填充
         renderAiModelQuickSelect();
+        toggleAiModelProviderFields();
       } catch (e2) { /* 忽略 */ }
     } catch (e) { /* AI 配置加载失败忽略 */ }
 
@@ -3737,13 +3738,18 @@
         }
         const result = await api("POST", "/api/alerts/model/test", override);
         if (result.ok) {
+          const okHint = $("aiModelTestHint");
+          if (okHint) {
+            okHint.textContent = "测试使用页面当前参数；请点击【保存模型配置】使其对 AI 助手与告警推理生效。";
+            okHint.classList.remove("d-none");
+          }
           $("aiModelTestResult").textContent = "连接成功！延迟: " + result.latency_ms + "ms，模型返回: " + (result.sample_response || "(无响应内容)").substring(0, 100);
           $("aiModelTestResult").classList.remove("d-none", "alert-danger", "alert-warning");
           $("aiModelTestResult").classList.add("alert-success");
         } else {
           // 错误分类展示
           const category = result.error_category || "";
-          const hint = result.hint || "";
+          const hint = result.hint || (result.details && result.details.hint) || "";
           let icon = "";
           let alertClass = "alert-danger";
           if (category === "auth" || category === "forbidden") {
@@ -3902,12 +3908,18 @@
       el.classList.toggle("d-none", isLocal));
     document.querySelectorAll(".ai-model-local-field").forEach((el) =>
       el.classList.toggle("d-none", !isLocal));
-    // 端点自动填充（custom/local 不填充）
+    // 端点自动填充（custom/local 不填充）。
+    // 只在输入框为空、或当前值本来就是别家预设时覆盖：
+    // 用户手填的自定义网关地址不能被切换厂商时悄悄改掉。
     if (!isLocal && provider !== "custom") {
       const presets = window.__AI_PROVIDER_PRESETS || {};
       const preset = presets[provider];
-      if (preset && preset.endpoint) {
-        $("ai_model_endpoint").value = preset.endpoint;
+      const input = $("ai_model_endpoint");
+      if (preset && preset.endpoint && input) {
+        const cur = (input.value || "").trim();
+        const isOtherPreset = Object.keys(presets).some((k) =>
+          presets[k] && presets[k].endpoint && presets[k].endpoint === cur);
+        if (!cur || isOtherPreset) input.value = preset.endpoint;
       }
     }
     // 渲染快速选择
@@ -5592,7 +5604,7 @@
         } else {
           const r = await api("POST", "/api/deploy", data);
           depId = r.id;
-          toast("部署创建成功 #" + depId, "success");
+          toast("部署创建成功 " + depId, "success");
         }
         // 保存后立即启动部署
         $("deploySaveBtn").innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>启动部署...';
@@ -6303,7 +6315,7 @@
       const picked = (RT.tasks || []).filter(function (t) { return Number(t.id) === tid; })[0] || {};
       const ok = await confirmDialog({
         title: "确认删除该实时保护任务？",
-        message: "任务「" + esc(picked.name || ("#" + tid)) + "」将被删除，连同其全部备份记录与实时恢复点，此操作不可恢复。",
+        message: "任务「" + esc(picked.name || ("任务 " + tid)) + "」将被删除，连同其全部备份记录与实时恢复点，此操作不可恢复。",
         confirmText: "删除",
         danger: true,
       });
@@ -6615,7 +6627,7 @@
         notes: $("drill_notes").value,
       };
       if (!data.name) { toast("请输入演练名称", "warning"); return; }
-      try { const r = await api("POST", "/api/drills", data); toast("已创建演练 #" + r.id); drillModal.hide(); await loadDrills(); }
+      try { const r = await api("POST", "/api/drills", data); toast("已创建演练 " + r.id); drillModal.hide(); await loadDrills(); }
       catch (e) { toast(e.message, "danger"); }
     };
     // 绑定排程按钮
@@ -7003,7 +7015,7 @@
     const payload = { source_record_id: Number(src.value), columns, mask_rules, row_count: rowCount };
     try {
       const r = await api("POST", "/api/datamining/export", payload);
-      toast("脱敏导出成功，文件 #" + r.id + "（" + r.row_count + " 行）");
+      toast("脱敏导出成功，文件 " + r.id + "（" + r.row_count + " 行）");
       await loadExports();
     } catch (e) { toast("导出失败: " + e.message, "danger"); }
   }
@@ -7030,7 +7042,7 @@
           : ("备份记录 " + e.source_record_id);
         return '<tr>' +
           '<td>' + e.id + '</td>' +
-          '<td title="备份记录 #' + esc(e.source_record_id) + '">' + esc(srcName) + '</td>' +
+          '<td title="备份记录 ' + esc(e.source_record_id) + '">' + esc(srcName) + '</td>' +
           '<td><span class="text-truncate d-inline-block" style="max-width:220px">' + esc(cols) + '</span></td>' +
           '<td><span class="text-truncate d-inline-block" style="max-width:200px">' + esc(rules) + '</span></td>' +
           '<td>' + (e.row_count != null ? e.row_count : '-') + '</td>' +
@@ -7685,7 +7697,7 @@
         editingStorageId = r.id;
         $("st_id").value = r.id;
         $("stTestBtn").classList.remove("d-none");
-        toast("已创建: " + name + " #" + r.id);
+        toast("已创建: " + name + " " + r.id);
       }
       storageModal.hide();
       await loadTargets();
@@ -8371,8 +8383,10 @@
                     (it.error ? '：' + esc(it.error.slice(0, 90)) : '') + '</div>';
                 });
               });
+              if (d.note) html += '<div class="text-muted">' + esc(d.note) + '</div>';
               (d.routines || []).forEach(function (r) {
-                html += '<div>✅ 例程 ' + esc(r.object) + '（' + esc(r.kind) + '）</div>';
+                const st = r.status === "ok" ? '✅' : '📄';
+                html += '<div>' + st + ' 例程 ' + esc(r.object) + '（' + esc(r.kind) + '）</div>';
               });
               (d.routines_export || []).forEach(function (r) {
                 html += '<div>📄 导出待人工适配：' + esc(r.object) + '（' + esc(r.kind) + '）</div>';
@@ -8661,7 +8675,7 @@
           (c.pass ? "✓ " : "✗ ") + c.message).join("\n");
         toast((res.ok ? "接管检查通过：" : "接管检查未通过：") + (res.summary || ""),
           res.ok ? "success" : "warning");
-        if (items) console.log("接管检查明细 #" + id + "\n" + items);
+        if (items) console.log("接管检查明细 " + id + "\n" + items);
       } catch (e) { toast(e.message, "danger"); }
       await loadClones();
     };
@@ -8776,7 +8790,7 @@
         items.push({
           kind: "sync_task",
           id: Number(s.id),
-          name: s.name || ("同步任务 #" + s.id),
+          name: s.name || ("同步任务 " + s.id),
           status: s.last_status || s.status || "never",
           primary_site: (s.src_host || "") + (s.src_port ? ":" + s.src_port : ""),
           dr_site: (s.tgt_host || "") + (s.tgt_port ? ":" + s.tgt_port : ""),
@@ -8791,7 +8805,7 @@
         items.push({
           kind: "rt_task",
           id: Number(t.id),
-          name: t.name || ("实时任务 #" + t.id),
+          name: t.name || ("实时任务 " + t.id),
           status: h.health || "unknown",
           primary_site: "",
           dr_site: "",
@@ -8911,7 +8925,7 @@
     const kindLabel = s.kind === "sync_task" ? "数据同步任务" : "实时保护任务";
     box.innerHTML = '<div class="alert alert-info py-2 mb-0" style="font-size:var(--font-size-xs)">' +
       '<i class="bi bi-link-45deg"></i> 数据源：<strong>' + esc(s.name) + '</strong>' +
-      '（' + esc(kindLabel) + ' #' + s.id + '）' + linkSrcStatusBadge(s.status) +
+      '（' + esc(kindLabel) + ' ' + s.id + '）' + linkSrcStatusBadge(s.status) +
       '<button type="button" class="btn btn-link btn-sm p-0 ms-2" onclick="pickLinkSource(\'' +
         esc(s.kind) + '\', ' + Number(s.id) + ')">↻ 重新回填站点与路由</button>' +
       '</div>';
@@ -9708,7 +9722,7 @@
     return details.map(function (t) {
       const err = t.last_error ? String(t.last_error) : "";
       return '<tr>' +
-        '<td><strong>' + esc(t.task_name || ("任务 #" + numOrDash(t.task_id))) + '</strong></td>' +
+        '<td><strong>' + esc(t.task_name || ("任务 " + numOrDash(t.task_id))) + '</strong></td>' +
         '<td><span class="badge bg-secondary">' + esc(t.db_type || "-") + '</span></td>' +
         '<td>' + numOrDash(t.fail_7d) + '</td>' +
         '<td>' + numOrDash(t.fail_30d) + '</td>' +
@@ -9879,7 +9893,7 @@
               ' aria-expanded="false" title="展开任务明细"' +
               ' onclick="togglePredDetail(' + idx + ')"><i class="bi bi-chevron-right"></i></button></td>'
           : '<td></td>';
-        const topName = hasDetail ? (tds[0].task_name || ("任务 #" + numOrDash(tds[0].task_id))) : "";
+        const topName = hasDetail ? (tds[0].task_name || ("任务 " + numOrDash(tds[0].task_id))) : "";
         const taskCell = hasDetail
           ? '<td class="small"><a href="#" class="text-decoration-none" ' +
               'onclick="togglePredDetail(' + idx + '); return false;">' +

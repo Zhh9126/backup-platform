@@ -311,7 +311,7 @@ class DataMiner:
             "mask_rules": {c: rules.get(c) for c in kept_columns},
             "file_path": str(fpath),
             "row_count": len(masked_rows),
-            "note": "来源备份记录 #{}（{}）脱敏导出".format(
+            "note": "来源备份记录 {}（{}）脱敏导出".format(
                 source_record_id, rec.get("db_type") or ""),
         })
         _logger.info("[data_mining] 脱敏导出完成 id=%s 文件=%s 行数=%d",

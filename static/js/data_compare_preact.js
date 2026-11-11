@@ -69,6 +69,60 @@ const hideThen = (ref, then) => {
   }
 };
 
+// ---------- 分页（每页 10 条，与全站 pager.js 规范一致） ----------
+// Preact 页不使用 Pager.attach：那是命令式 appendChild + onclick，
+// 会把节点插进 VDOM 管理的卡片里，重渲染后残留。这里只复用同一套
+// 切片口径，分页条由组件自绘。
+const PAGE_SIZE = (window.Pager && window.Pager.PAGE_SIZE) || 10;
+
+function pageSlice(arr, page, size) {
+  const ps = Number(size) > 0 ? Number(size) : PAGE_SIZE;
+  const rows = Array.isArray(arr) ? arr : [];
+  const total = rows.length;
+  const pages = Math.max(1, Math.ceil(total / ps));
+  const p = Math.min(Math.max(1, Number(page) || 1), pages);
+  const start = (p - 1) * ps;
+  return {
+    list: rows.slice(start, start + ps),
+    page: p,
+    pages,
+    total,
+    pageSize: ps,
+    startNo: start + 1,
+  };
+}
+
+function pageNums(page, pages) {
+  if (pages <= 7) return Array.from({ length: pages }, (_, i) => i + 1);
+  const set = new Set([1, 2, page - 1, page, page + 1, pages - 1, pages]);
+  const nums = [...set].filter((n) => n >= 1 && n <= pages).sort((a, b) => a - b);
+  const out = [];
+  let prev = 0;
+  for (const n of nums) {
+    if (n - prev > 1) out.push("…");
+    out.push(n);
+    prev = n;
+  }
+  return out;
+}
+
+const PagerBar = ({ pg, onGo }) => html`
+  <div class="d-flex align-items-center justify-content-between flex-wrap gap-2 px-3 py-2 border-top">
+    <span class="text-muted small">共 ${pg.total} 条 · 第 ${pg.page}/${pg.pages} 页 · 每页 ${pg.pageSize} 条</span>
+    ${pg.pages > 1 && html`
+      <div class="btn-group btn-group-sm" role="group">
+        <button type="button" class="btn btn-outline-secondary" disabled=${pg.page <= 1}
+                onClick=${() => onGo(pg.page - 1)}>‹ 上一页</button>
+        ${pageNums(pg.page, pg.pages).map((n, i) => n === "…"
+          ? html`<span key=${"e" + i} class="btn btn-outline-secondary border-0 disabled">…</span>`
+          : html`<button type="button" key=${"p" + n}
+                   class="btn ${n === pg.page ? "btn-primary" : "btn-outline-secondary"}"
+                   onClick=${() => onGo(n)}>${n}</button>`)}
+        <button type="button" class="btn btn-outline-secondary" disabled=${pg.page >= pg.pages}
+                onClick=${() => onGo(pg.page + 1)}>下一页 ›</button>
+      </div>`}
+  </div>`;
+
 // ---------- KPI 卡片 ----------
 const StatCard = ({ icon, color, num, label }) => html`
   <div class="col-md-3">
@@ -367,13 +421,32 @@ function ReportModal({ report, onClose, onRepaired }) {
   const [repairPreview, setRepairPreview] = useState(null); // [{table, statements}]
   const [repairResult, setRepairResult] = useState(null);
   const [busy, setBusy] = useState(false);
-  useEffect(() => { if (ref.current) new bootstrap.Modal(ref.current).show(); }, []);
+  // getOrCreateInstance 避免重复实例；监听 hidden 清状态，否则 ESC / 点遮罩
+  // 关闭后 detail 仍非 null、组件不卸载，再点「明细」时 useEffect([])
+  // 不会重跑 show()，表现为「点了没反应」。
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    let inst = null;
+    try {
+      inst = bootstrap.Modal.getOrCreateInstance(el);
+      inst.show();
+    } catch (e) {
+      toast("打开报告明细失败", "danger");
+    }
+    const onHidden = () => { if (onClose) onClose(); };
+    el.addEventListener("hidden.bs.modal", onHidden);
+    return () => {
+      el.removeEventListener("hidden.bs.modal", onHidden);
+      try { if (inst) inst.hide(); } catch (e) { /* 实例已销毁 */ }
+    };
+  }, []);
   if (!report) return null;
   const s = report.summary_json || {};
-  const tables = report.tables_json || [];
+  const tables = Array.isArray(report.tables_json) ? report.tables_json : [];
 
   const diffRows = [];   // [{table, diff}]
-  tables.forEach((t) => (t.diffs || []).forEach((d) => {
+  tables.forEach((t) => (Array.isArray(t.diffs) ? t.diffs : []).forEach((d) => {
     if (d.repair && !d.repair.trim().startsWith("--")) diffRows.push({ table: t.table, diff: d });
   }));
   const selKey = (tb, pk) => tb + "|" + pk;
@@ -432,7 +505,7 @@ function ReportModal({ report, onClose, onRepaired }) {
   };
 
   return html`
-    <div class="modal fade show" id="dcReportModal" tabindex="-1" ref=${ref}>
+    <div class="modal fade" id="dcReportModal" tabindex="-1" ref=${ref}>
       <div class="modal-dialog modal-xl">
         <div class="modal-content">
           <div class="modal-header">
@@ -562,6 +635,8 @@ function App() {
   const [reports, setReports] = useState([]);
   const [formState, setFormState] = useState(null);   // null | {id, values}
   const [detail, setDetail] = useState(null);
+  const [taskPage, setTaskPage] = useState(1);
+  const [reportPage, setReportPage] = useState(1);
 
   const refreshAll = useCallback(async () => {
     try {
@@ -639,10 +714,19 @@ function App() {
   };
 
   const showReport = async (id) => {
-    const res = await api("GET", "/api/data-compare-reports/" + id);
-    if (!res.success) { toast("加载报告失败", "danger"); return; }
-    setDetail(res.data);
+    // BKP.api 对非 2xx 会抛 Error：这里必须兜住，否则点击后是
+    // Unhandled Promise Rejection，页面零反馈（表现为「没反应」）。
+    try {
+      const res = await api("GET", "/api/data-compare-reports/" + id);
+      if (!res.success) { toast(res.message || "加载报告失败", "danger"); return; }
+      setDetail(res.data);
+    } catch (e) {
+      toast("加载报告异常：" + ((e && e.message) || e), "danger");
+    }
   };
+
+  const taskPg = pageSlice(tasks, taskPage);
+  const reportPg = pageSlice(reports, reportPage);
 
   return html`
     <div>
@@ -663,9 +747,10 @@ function App() {
               <th>任务</th><th>生产库（源）</th><th>恢复库（目标）</th><th>对比范围</th>
               <th>调度</th><th>状态</th><th>上次运行</th><th class="text-end">操作</th>
             </tr></thead>
-            <${TaskTable} tasks=${tasks} onRun=${runCompare} onEdit=${openEdit} onDelete=${deleteTask} />
+            <${TaskTable} tasks=${taskPg.list} onRun=${runCompare} onEdit=${openEdit} onDelete=${deleteTask} />
           </table>
         </div>
+        <${PagerBar} pg=${taskPg} onGo=${setTaskPage} />
       </div>
 
       <div class="page-card">
@@ -677,9 +762,10 @@ function App() {
             <thead><tr>
               <th>任务</th><th>结果</th><th>表(总/一致/差异/失败)</th><th>耗时</th><th>时间</th><th class="text-end">操作</th>
             </tr></thead>
-            <${ReportTable} reports=${reports} onShow=${showReport} />
+            <${ReportTable} reports=${reportPg.list} onShow=${showReport} />
           </table>
         </div>
+        <${PagerBar} pg=${reportPg} onGo=${setReportPage} />
       </div>
 
       ${formState && html`<${TaskModal} state=${formState} onSave=${saveTask} onClose=${() => setFormState(null)} />`}

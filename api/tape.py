@@ -232,7 +232,7 @@ def api_tape_media_action(media_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
     db.add_log("WARNING", "tape_library",
-               f"介质 #{media_id} 条码 {row.get('barcode')} 操作={action} "
+               f"介质 {media_id} 条码 {row.get('barcode')} 操作={action} "
                f"note={note} by={_operator()}")
     return jsonify({"ok": True, "media": row})
 

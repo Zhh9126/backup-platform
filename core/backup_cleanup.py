@@ -351,14 +351,14 @@ def run_cleanup(task_id: int = None, dry_run: bool = False,
             # 第二道硬护栏：执行时再查一次锁（防计划与执行之间新加的锁）
             if path and path in _locked_paths_safe():
                 report["skipped_locked"] += 1
-                detail["failed"].append("#%s 产物处于保留锁保护期，已跳过删除"
+                detail["failed"].append("备份记录 %s 产物处于保留锁保护期，已跳过删除"
                                         % item["record_id"])
                 continue
             # 防勒索第二道硬护栏：计划与执行之间若最新备份被判定可疑，
             # 该记录可能刚成为/失去可信恢复点身份，执行时重新核对。
             if item["record_id"] in trusted:
                 report["skipped_trusted"] += 1
-                detail["failed"].append("#%s 是该任务最后可信恢复点，已跳过删除"
+                detail["failed"].append("备份记录 %s 是该任务最后可信恢复点，已跳过删除"
                                         % item["record_id"])
                 continue
             if dry_run:
@@ -375,12 +375,12 @@ def run_cleanup(task_id: int = None, dry_run: bool = False,
                 report["missing_files"] += 1
             if err == "outside":
                 report["skipped_outside"] += 1
-                detail["failed"].append("#%s 路径不在受管备份目录，已跳过删除"
+                detail["failed"].append("备份记录 %s 路径不在受管备份目录，已跳过删除"
                                         % item["record_id"])
                 continue
             if err:
                 report["failed"] += 1
-                detail["failed"].append("#%s 删除失败: %s" % (item["record_id"], err))
+                detail["failed"].append("%s 删除失败: %s" % (item["record_id"], err))
                 _log().warning("[cleanup] task=%s record=%s 删除失败: %s",
                                p["task_id"], item["record_id"], err)
                 continue

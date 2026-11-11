@@ -178,5 +178,5 @@ def api_cdc_replay(sid):
         result.update({"ok": r.get("ok"), "applied": r.get("applied", 0),
                        "errors": r.get("errors", []), "message": r.get("message", "")})
         db.add_log("INFO" if r.get("ok") else "ERROR", "cdc",
-                   f"CDC 流 #{sid} {mode} 应用: {r.get('message', '')}")
+                   f"CDC 流 {sid} {mode} 应用: {r.get('message', '')}")
     return jsonify(result)

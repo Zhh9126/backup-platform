@@ -168,7 +168,7 @@
     }
     try {
       await api("POST", `/api/tape/media/${id}/action`, { action, note });
-      notice(`介质 #${id} ${action} 已记录`, true);
+      notice(`介质 ${id} ${action} 已记录`, true);
       await Promise.all([loadMedia(), loadSummary()]);
     } catch (e) { notice("操作失败: " + e.message, false); }
   };

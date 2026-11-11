@@ -393,7 +393,7 @@ window.DataminingPage = (function () {
     }).join("") : '<div class="small text-secondary">无超期留存</div>');
 
     setHtml("dmLoose", (d.loose_exports || []).length ? (d.loose_exports).map(function (l) {
-      return '<div class="dm-row-item"><span>导出 #' + l.export_id + "</span>" +
+      return '<div class="dm-row-item"><span>导出 ' + l.export_id + "</span>" +
         '<span class="dm-muted small">' + (l.columns || []).map(esc).join("、") + "</span></div>";
     }).join("") : '<div class="small text-secondary">无宽松导出规则</div>');
   }

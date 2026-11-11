@@ -37,6 +37,17 @@ from .schema_compare import (
 
 logger = logging.getLogger(__name__)
 
+def _value_newer(value, current) -> bool:
+    """增量列值比较：数值按数值比，其余按字符串（时间戳字典序等价）。"""
+    if current is None:
+        return value is not None
+    if value is None:
+        return False
+    try:
+        return float(value) > float(current)
+    except (TypeError, ValueError):
+        return str(value) > str(current)
+
 # 水位时间戳可解析格式（回看窗口回拨 / 延迟计算共用，按精度从高到低）
 _WATERMARK_TS_FORMATS = (
     "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
@@ -358,10 +369,21 @@ class SyncEngine:
             self._disable_constraints(tgt_conn)
             self.writer.prepare_table(tgt_conn, cols_meta)
 
+            prev_fingerprint = None
             while True:
                 result = self.reader.read_batch(src_cur)
                 if not result.records:
                     break
+                # 各插件 read_batch 每轮都会重新 execute 同一条 SQL；
+                # 若位点与首行都与上一轮相同，说明分页根本没推进，继续循环
+                # 只会无限重复写首批。宁可明确失败，也不静默死循环。
+                fingerprint = (str(result.next_value),
+                               repr(result.records[0])[:200])
+                if fingerprint == prev_fingerprint:
+                    raise RuntimeError(
+                        "分批读取未推进（重复读到同一批），已中止以避免重复写入；"
+                        "请为任务配置增量列，或调大批次大小")
+                prev_fingerprint = fingerprint
                 total_read += len(result.records)
                 try:
                     # 零日期消毒：MySQL '0000-00-00' 在达梦/Oracle/PG 全部非法，
@@ -387,7 +409,7 @@ class SyncEngine:
                         time.sleep(1)
                         written = self.writer.write_batch(
                             tgt_conn, result.records, result.columns)
-                        logger.warning("[sync#%s] 批次写入失败后重试成功（%s 行）: %s",
+                        logger.warning("[sync%s] 批次写入失败后重试成功（%s 行）: %s",
                                        cfg.task_id, len(result.records), werr)
                     total_write += written
                 except Exception as e:
@@ -404,6 +426,10 @@ class SyncEngine:
 
                 if result.next_value is not None:
                     next_value = result.next_value
+                    # read_batch 每轮重新拼 SQL，WHERE 下界取自
+                    # cfg.incremental_value；必须在循环内推进，否则永远重读首页。
+                    if cfg.incremental_column:
+                        cfg.incremental_value = str(result.next_value)
                 if not result.has_more:
                     break
                 if progress_callback:
@@ -418,8 +444,9 @@ class SyncEngine:
             # 未提交事务会在断开时被回滚导致"写入成功却无数据"）
             try:
                 tgt_conn.commit()
-            except Exception:
-                pass
+            except Exception as e:
+                raise RuntimeError(
+                    f"目标端提交失败（本表写入可能已回滚）: {e}") from e
             # 写入后：恢复约束
             self._enable_constraints(tgt_conn)
 
@@ -504,15 +531,23 @@ class SyncEngine:
         saved = self._load_persisted_watermark(cfg.task_id)
         if saved and saved.get("col") == cfg.incremental_column and saved.get("value"):
             watermark = str(saved["value"])
-            logger.info("[sync#%s] 轮询实时同步：从持久化水位续传（%s >= %s）",
+            logger.info("[sync%s] 轮询实时同步：从持久化水位续传（%s >= %s）",
                         cfg.task_id, cfg.incremental_column, watermark)
             models.update_sync_task(cfg.task_id, {
                 "message": f"轮询实时同步启动：从上次水位续传"
                            f"（{cfg.incremental_column} > {watermark}）...",
             })
         else:
+            # 交接位点必须在全量快照「开始前」取：快照读取期间新写入的行
+            # 若大于快照后取的 MAX，会被水位越过而永久漏掉。
+            _t0 = (cfg.source_tables_list or [cfg.source_table])[0] \
+                if (cfg.source_tables_list or cfg.source_table) else ""
+            _r0 = (f"{cfg.src_schema}.{_t0}" if (cfg.src_schema and _t0)
+                   else (_t0 or ""))
+            pre_snapshot_max = (self._max_incremental_value(
+                cfg, _r0, cfg.incremental_column) if _r0 else "")
             # 全量快照（upsert 幂等，不重不漏）
-            logger.info("[sync#%s] 轮询实时同步：先执行全量快照（增量列 %s）",
+            logger.info("[sync%s] 轮询实时同步：先执行全量快照（增量列 %s）",
                         cfg.task_id, cfg.incremental_column)
             models.update_sync_task(cfg.task_id, {
                 "message": f"轮询实时同步启动：全量快照（增量列 {cfg.incremental_column}）...",
@@ -531,12 +566,7 @@ class SyncEngine:
                 return snap
             # 2) 快照→增量的交接点：以源端当前最大值建立初始水位并立即持久化
             #    （全量读取期间新写入的行 > 该水位，会由增量轮询补齐，不漏）
-            _t = (cfg.source_tables_list or [cfg.source_table])[0] \
-                if (cfg.source_tables_list or cfg.source_table) else ""
-            _ref = f"{cfg.src_schema}.{_t}" if (cfg.src_schema and _t) else (_t or "")
-            watermark = (self._max_incremental_value(
-                cfg, _ref, cfg.incremental_column) if _ref else "") \
-                or (cfg.incremental_value or "")
+            watermark = pre_snapshot_max or (cfg.incremental_value or "")
             self._save_persisted_watermark(cfg.task_id, cfg.incremental_column,
                                            watermark)
         # 至少一次投递语义告警（Checkpoint 管不丢、目标端幂等管不脏）：
@@ -544,7 +574,7 @@ class SyncEngine:
         # 幂等才能吸收重复投递；append 模式没有唯一键保护，重复会落重复行。
         if (cfg.save_mode or "append") != "upsert":
             logger.warning(
-                "[sync#%s] 轮询实时同步为「至少一次投递」语义：重启续传与回看"
+                "[sync%s] 轮询实时同步为「至少一次投递」语义：重启续传与回看"
                 "窗口会重复读取，目标端需幂等（建议 save_mode=upsert）；"
                 "当前 save_mode=%s，重复投递将在目标端产生重复行",
                 cfg.task_id, cfg.save_mode)
@@ -556,7 +586,7 @@ class SyncEngine:
         # 无法捕获的 DELETE（目标<源）与重复/脏数据（目标>源）
         reconcile_every = int((cfg.flink_config or {}).get(
             "reconcile_every_polls", 720) or 0)
-        logger.info("[sync#%s] 轮询实时同步进入增量循环（间隔 %ss）",
+        logger.info("[sync%s] 轮询实时同步进入增量循环（间隔 %ss）",
                     cfg.task_id, poll_interval)
         while not stop.is_set():
             stop.wait(poll_interval)
@@ -596,6 +626,11 @@ class SyncEngine:
                 columns = [str(d[0]) for d in cur.description]
                 rows = cur.fetchmany(cfg.batch_size)
                 total = 0
+                batch_max = None
+                try:
+                    col_idx = columns.index(col) if col else -1
+                except ValueError:
+                    col_idx = -1
                 writer = registry.create_writer(cfg.tgt_db_type, cfg)
                 wconn = writer.connect()
                 try:
@@ -619,16 +654,27 @@ class SyncEngine:
                             time.sleep(1)
                             written = writer.write_batch(wconn, records, columns)
                             logger.warning(
-                                "[sync#%s] 批次写入失败后重试成功（%s 行）: %s",
+                                "[sync%s] 批次写入失败后重试成功（%s 行）: %s",
                                 cfg.task_id, len(records), werr)
                         total += written
+                        # 水位只按「本批已成功写入目标端」的行推进：
+                        # 历史实现写完后取源表全局 MAX，读取期间新写入的行
+                        # 会让水位越过尚未读取的行，造成静默丢数。
+                        if col_idx >= 0 and written:
+                            for rec in records:
+                                v = rec[col_idx] if col_idx < len(rec) else None
+                                if v is not None and _value_newer(v, batch_max):
+                                    batch_max = v
                         rows = cur.fetchmany(cfg.batch_size)
                 finally:
                     writer.close(conn=wconn)
                 if total:
                     # 先写目标端成功，再推进并持久化水位（断点提交顺序）
-                    watermark = self._max_incremental_value(
-                        cfg, table_ref, col)
+                    if batch_max is not None:
+                        watermark = str(batch_max)
+                    else:
+                        watermark = (self._max_incremental_value(
+                            cfg, table_ref, col) or watermark)
                     poll_count += total
                     self._save_persisted_watermark(cfg.task_id, col, watermark)
                     lag = self._watermark_lag_seconds(watermark)
@@ -637,7 +683,7 @@ class SyncEngine:
                                     f"水位 {watermark}"
                                     + (f"，延迟约 {lag}s" if lag is not None else "")),
                     })
-                    logger.info("[sync#%s] 轮询同步 %d 行，watermark=%s",
+                    logger.info("[sync%s] 轮询同步 %d 行，watermark=%s",
                                 cfg.task_id, total, watermark)
                 reader.close(cur, conn)
                 cycles += 1
@@ -645,7 +691,7 @@ class SyncEngine:
                         and table_ref and target_ref):
                     diff = self._reconcile_counts(cfg, table_ref, target_ref)
                     if diff:
-                        logger.warning("[sync#%s] %s（轮询模式无法捕获 DELETE，"
+                        logger.warning("[sync%s] %s（轮询模式无法捕获 DELETE，"
                                        "建议执行数据对比定位差异，必要时重新全量快照）",
                                        cfg.task_id, diff)
                         models.update_sync_task(cfg.task_id, {
@@ -653,9 +699,9 @@ class SyncEngine:
                         })
             except Exception as e:
                 if getattr(cfg, "debug", False) or os.environ.get("SYNC_DEBUG"):
-                    logger.warning("[sync#%s] 轮询异常:\n%s",
+                    logger.warning("[sync%s] 轮询异常:\n%s",
                                    cfg.task_id, traceback.format_exc())
-                logger.warning("[sync#%s] 轮询异常（将继续重试）: %s",
+                logger.warning("[sync%s] 轮询异常（将继续重试）: %s",
                                cfg.task_id, e)
                 if reader:
                     try:
@@ -701,7 +747,7 @@ class SyncEngine:
                     and data.get("value") is not None:
                 return data
         except Exception:
-            logger.debug("[sync#%s] 读取持久化水位失败", task_id, exc_info=True)
+            logger.debug("[sync%s] 读取持久化水位失败", task_id, exc_info=True)
         return None
 
     @staticmethod
@@ -711,7 +757,7 @@ class SyncEngine:
             models.update_sync_task(task_id, {"realtime_watermark": json.dumps(
                 {"col": col, "value": str(value)}, ensure_ascii=False)})
         except Exception:
-            logger.warning("[sync#%s] 水位持久化失败（不影响本轮数据）",
+            logger.warning("[sync%s] 水位持久化失败（不影响本轮数据）",
                            task_id, exc_info=True)
 
     @staticmethod
@@ -760,7 +806,7 @@ class SyncEngine:
             finally:
                 reader.close(conn=conn)
         except Exception:
-            logger.debug("[sync#%s] 对账源端计数失败", cfg.task_id, exc_info=True)
+            logger.debug("[sync%s] 对账源端计数失败", cfg.task_id, exc_info=True)
         try:
             writer = registry.create_writer(cfg.tgt_db_type, cfg)
             wconn = writer.connect()
@@ -771,7 +817,7 @@ class SyncEngine:
             finally:
                 writer.close(conn=wconn)
         except Exception:
-            logger.debug("[sync#%s] 对账目标端计数失败", cfg.task_id, exc_info=True)
+            logger.debug("[sync%s] 对账目标端计数失败", cfg.task_id, exc_info=True)
         if src_cnt is None or tgt_cnt is None or src_cnt == tgt_cnt:
             return None
         return f"对账差异：源 {src_cnt} 行 / 目标 {tgt_cnt} 行"
@@ -849,11 +895,27 @@ class SyncEngine:
                 ms = cur.fetchone()
                 if not ms:
                     return {"success": False, "message": "无法获取源库 binlog 位点"}
-                log_file, log_pos = ms[0], int(ms[1])
+                live_file, live_pos = ms[0], int(ms[1])
+                # 断点续传：优先用上次已成功应用并持久化的位点，
+                # 否则停机期间的 binlog 变更全部丢失。
+                saved = self._load_persisted_watermark(cfg.task_id)
+                sv = str((saved or {}).get("value") or "")
+                if (saved or {}).get("col") == "binlog" and ":" in sv:
+                    _f, _, _p = sv.rpartition(":")
+                    try:
+                        log_file, log_pos = _f, int(_p)
+                        logger.info("[sync%s] 从持久化 binlog 位点续传 %s:%s",
+                                    cfg.task_id, log_file, log_pos)
+                    except ValueError:
+                        log_file, log_pos = live_file, live_pos
+                else:
+                    log_file, log_pos = live_file, live_pos
+                    self._save_persisted_watermark(
+                        cfg.task_id, "binlog", f"{log_file}:{log_pos}")
         finally:
             src_conn.close()
 
-        logger.info("[sync#%s] 实时同步：binlog 位点 %s:%s，先做全量快照", cfg.task_id, log_file, log_pos)
+        logger.info("[sync%s] 实时同步：binlog 位点 %s:%s，先做全量快照", cfg.task_id, log_file, log_pos)
         models.update_sync_task(cfg.task_id, {
             "message": f"实时同步启动：全量快照（binlog 位点 {log_file}:{log_pos}）...",
         })
@@ -942,7 +1004,7 @@ class SyncEngine:
                         self._apply_binlog_event(writer, writer_conn, event, stats)
                     except Exception as e:  # noqa: BLE001
                         stats["errors"] += 1
-                        logger.exception("[sync#%s] 应用 binlog 事件失败", cfg.task_id)
+                        logger.exception("[sync%s] 应用 binlog 事件失败", cfg.task_id)
                         # 写连接可能失效，重建
                         try:
                             if writer_conn:
@@ -955,6 +1017,10 @@ class SyncEngine:
                     now = time.time()
                     if now - last_flush >= 1.0:
                         last_flush = now
+                        self._save_persisted_watermark(
+                            cfg.task_id, "binlog",
+                            f"{getattr(stream, 'log_file', log_file)}:"
+                            f"{getattr(stream, 'log_pos', log_pos)}")
                         models.update_sync_task(cfg.task_id, {
                             "message": (
                                 f"实时同步运行中（{int(now - stats['started'])}s）："
@@ -964,16 +1030,25 @@ class SyncEngine:
                         })
         except RuntimeError as e:
             if stop_ev.is_set():
-                logger.info("[sync#%s] 收到停止信号，实时同步退出（%s）", cfg.task_id, e)
+                logger.info("[sync%s] 收到停止信号，实时同步退出（%s）", cfg.task_id, e)
             else:
                 return {"success": False, "message": str(e)}
         except Exception as e:  # noqa: BLE001
             # 停止时看门狗关闭 stream 会打断阻塞读并抛出异常（连接已关闭等），
             # 属正常停止路径，不应记为失败
             if not stop_ev.is_set():
-                logger.exception("[sync#%s] binlog 监听异常终止", cfg.task_id)
+                logger.exception("[sync%s] binlog 监听异常终止", cfg.task_id)
                 return {"success": False, "message": f"binlog 监听异常: {e}"}
         finally:
+            # 正常停止也要落下最后一段位点，否则重启会重复消费尾部事件
+            try:
+                if 'stream' in locals() and stream is not None:
+                    self._save_persisted_watermark(
+                        cfg.task_id, "binlog",
+                        f"{getattr(stream, 'log_file', log_file)}:"
+                        f"{getattr(stream, 'log_pos', log_pos)}")
+            except Exception:
+                pass
             try:
                 if writer_conn is not None:
                     self._enable_constraints(writer_conn)
@@ -992,12 +1067,16 @@ class SyncEngine:
         duration = round(time.time() - stats["started"], 1)
         msg = (f"实时同步已停止（运行 {duration}s）：新增 {stats['insert']} "
                f"更新 {stats['update']} 删除 {stats['delete']} 错误 {stats['errors']}")
+        # binlog 事件被跳过必须如实失败，便于重放/补偿；
+        # 历史实现恒定写 success，错误只留在 message 里。
+        ok = stats["errors"] == 0
+        status = "success" if ok else "failed"
         models.update_sync_task(cfg.task_id, {
-            "status": "success",
-            "last_status": "success",
+            "status": status,
+            "last_status": status,
             "message": msg,
         })
-        return {"success": True, "message": msg, "duration": duration, **stats}
+        return {"success": ok, "message": msg, "duration": duration, **stats}
 
     def _apply_binlog_event(self, writer, conn: Any, event: Any, stats: Dict[str, Any]) -> None:
         """把一条 binlog 行事件应用到目标端。"""
@@ -1416,11 +1495,11 @@ def run_sync_task_with_task(task: Dict[str, Any], progress_callback=None) -> Dic
     # 目标库预检/自动建库（MySQL/MariaDB 目标）
     ensure = _ensure_target_database(cfg)
     if ensure.get("message"):
-        logger.info("[sync] task #%d 目标库预检: %s", cfg.task_id, ensure["message"])
+        logger.info("[sync] task %d 目标库预检: %s", cfg.task_id, ensure["message"])
 
     # pre-validate（可选）
     if cfg.validate_before_run:
-        logger.info("Pre-check: schema validation for task #%d", cfg.task_id)
+        logger.info("Pre-check: schema validation for task %d", cfg.task_id)
         v_result = engine.validate()
         if not v_result.get("passed"):
             return {
@@ -1434,7 +1513,7 @@ def run_sync_task_with_task(task: Dict[str, Any], progress_callback=None) -> Dic
 
     # post-verify（可选）
     if cfg.verify_after_run and sync_result.get("success"):
-        logger.info("Post-check: migration verification for task #%d", cfg.task_id)
+        logger.info("Post-check: migration verification for task %d", cfg.task_id)
         vf_result = engine.verify()
         sync_result["verify_result"] = vf_result
 
@@ -1532,7 +1611,7 @@ def generate_flink_config(task_id: int) -> Dict[str, Any]:
             f"  'hostname' = '{cfg.src_host}',\n"
             f"  'port' = '{cfg.src_port or 3306}',\n"
             f"  'username' = '{cfg.src_username}',\n"
-            f"  'password' = '{cfg.src_password}',\n"
+            f"  'password' = '<请在 Flink 侧填入源库口令>',\n"
             f"  'database-name' = '{cfg.src_db_name}',\n"
             f"  'table-name' = '{table}',\n"
             f"  'scan.startup.mode' = 'initial'\n);"
@@ -1546,7 +1625,7 @@ def generate_flink_config(task_id: int) -> Dict[str, Any]:
             f"  'hostname' = '{cfg.src_host}',\n"
             f"  'port' = '{cfg.src_port or 5432}',\n"
             f"  'username' = '{cfg.src_username}',\n"
-            f"  'password' = '{cfg.src_password}',\n"
+            f"  'password' = '<请在 Flink 侧填入源库口令>',\n"
             f"  'database-name' = '{cfg.src_db_name}',\n"
             f"  'schema-name' = '{cfg.src_schema or 'public'}',\n"
             f"  'table-name' = '{table}',\n"

@@ -126,7 +126,7 @@ def scan_sensitive():
         hint = "未找到可扫描的备份产物"
         if task_id:
             t = models.get_task(int(task_id)) or {}
-            hint += "（任务「%s」" % (t.get("name") or ("#" + str(task_id)))
+            hint += "（任务「%s」" % (t.get("name") or ("任务 " + str(task_id)))
             recent = models.list_records(task_id=int(task_id), limit=5) or []
             ok_rows = [r for r in recent if r.get("status") == "success"]
             if not ok_rows:

@@ -286,7 +286,7 @@ def guard_before_backup(task: dict, operator: str = None) -> dict:
             pass
         try:
             db.add_log("WARNING", "system",
-                       f"[source_guard] 任务 #{task.get('id')} 被拒绝: {v['message']}"
+                       f"[source_guard] 任务 {task.get('id')} 被拒绝: {v['message']}"
                        f"（operator={operator or '-'}）")
         except Exception:
             pass

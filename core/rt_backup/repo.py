@@ -93,7 +93,7 @@ class LogRepository:
     def atomic_write(writer, dest_path: str, suffix: str = ".tmp") -> None:
         """原子写入：writer(tmp_path) 写临时文件 → os.replace 替换目标。
 
-        与 core/engines/file.py:_atomic_write_archive 同款语义（共享知识 #2）。
+        与 core/engines/file.py:_atomic_write_archive 同款语义（共享知识 2）。
         """
         parent = os.path.dirname(dest_path) or "."
         os.makedirs(parent, exist_ok=True)
@@ -306,7 +306,7 @@ class LogRepository:
 
     # ---------------- 容量守护 ----------------
     def disk_usage(self) -> dict:
-        """统计本任务仓库占用。共享知识 #14：80% 告警、100% 暂停封存。"""
+        """统计本任务仓库占用。共享知识 14：80% 告警、100% 暂停封存。"""
         total, files = 0, 0
         for dirpath, _dirs, names in os.walk(self.base):
             for name in names:

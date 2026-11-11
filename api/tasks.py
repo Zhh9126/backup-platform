@@ -890,8 +890,8 @@ def clone_task(task_id):
         try:
             import core.db as _db
             _db.get_logger("tasks").warning(
-                "克隆任务 #%s 后调度重载失败: %s", new_id, e)
+                "克隆任务 %s 后调度重载失败: %s", new_id, e)
         except Exception:
             pass
     return jsonify({"ok": True, "id": new_id, "warning": warning,
-                    "message": f"已克隆为任务 #{new_id}（默认停用，请核对后启用）"})
+                    "message": f"已克隆为任务 {new_id}（默认停用，请核对后启用）"})

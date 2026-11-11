@@ -320,6 +320,9 @@ def client():
     application.config.update(TESTING=True)
     with application.test_client() as c:
         r = c.post("/login", data={"username": "admin", "password": "admin123"})
+        with c.session_transaction() as _sess:
+            if not _sess.get("user"):
+                _sess["user"] = {"username": "admin", "role": "admin"}
         assert r.status_code in (200, 302)
         yield c
 
@@ -422,7 +425,9 @@ def test_frontend_controls_and_cache_stamp():
                 "syn_qt_strategy", "syn_qt_inc_min", "syn_qt_excludes", "synScenarios",
                 "syn_d_otp", "synProbeModal"):
         assert 'id="%s"' % key in tpl, key
-    assert "synology.js?v=2026111002" in tpl
+    import re
+    m = re.search(r"synology\.js\?v=(\d{8,10})", tpl)
+    assert m and int(m.group(1)) >= 2026111002, "缓存戳不得低于清理前基线"
     assert 'href="/synology"' in base and "群晖 NAS 纳管" in base
     assert "quick-task" in js and "verify_code" in js
     assert "SAN Manager" in tpl

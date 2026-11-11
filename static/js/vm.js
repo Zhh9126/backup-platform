@@ -77,7 +77,7 @@
       (vms || []).forEach((v) => {
         const o = document.createElement("option");
         o.value = v.id;
-        o.textContent = v.vm_name || ("VM#" + v.id);
+        o.textContent = v.vm_name || ("VM" + v.id);
         sel.appendChild(o);
       });
     } catch (e) {
@@ -207,7 +207,7 @@
       $("rpTable").innerHTML = pg.list.map((r, ri) => `
         <tr>
           <td>${pg.startNo + ri}</td>
-          <td>${esc(r.vm_name || ("VM#" + r.vm_id))}</td>
+          <td>${esc(r.vm_name || ("VM" + r.vm_id))}</td>
           <td class="small">${window.BKP.fmtTime(r.pit_at)}</td>
           <td>${rpBadge(r.rp_type)}</td>
           <td class="small">${esc(r.consistency || "-")}</td>
@@ -298,7 +298,7 @@
       $("jobTable").innerHTML = pg.list.map((j, ji) => `
         <tr>
           <td>${pg.startNo + ji}</td>
-          <td>${esc(j.vm_name || ("VM#" + j.vm_id))}</td>
+          <td>${esc(j.vm_name || ("VM" + j.vm_id))}</td>
           <td>${esc(modeName[j.mode] || j.mode)}</td>
           <td class="small">${esc(j.target_name || j.target_ref || "-")}</td>
           <td>${badge(j.status)}</td>

@@ -42,12 +42,17 @@ def me():
     uid = u.get("id") if isinstance(u, dict) else 0
     row = rbac.get_by_id(uid) if uid else None
     role = (row or {}).get("role") or (u.get("role") if isinstance(u, dict) else "admin")
+    from core import features as _features
+    _who = row if row else (u if isinstance(u, dict) else {})
     payload = {
         "username": (row or {}).get("username") or (u.get("username") if isinstance(u, dict) else ""),
         "display_name": (row or {}).get("display_name") or (u.get("display_name") if isinstance(u, dict) else ""),
         "role": role,
-        "permissions": sorted(rbac.effective_permissions(
-            row if row else (u if isinstance(u, dict) else {}))),
+        "permissions": _features.filter_permissions(
+            _who, sorted(rbac.effective_permissions(_who))),
+        # 当前账号可用功能项 + 全量清单（前端按 paths 反查隐藏菜单）
+        "features": sorted(_features.allowed_features(_who)),
+        "feature_catalog": _features.catalog(),
         "must_change_password": (row or {}).get("must_change_password", 0),
         "password_change_required": bool(session.get("pwd_change_required")),
         "force_password_change_enabled": rbac.force_password_change_enabled(),
@@ -190,3 +195,38 @@ def password_change_policy():
         "env_override": bool(getattr(_cfg, "FORCE_PASSWORD_CHANGE", False)),
         "default_password_in_use": rbac.default_admin_password_in_use(),
     })
+
+
+# --------------- 功能项：按需启用 + 权限分离 ---------------
+@api_bp.route("/rbac/features", methods=["GET"])
+@login_required
+@permission_required("system.settings")
+def feature_config_get():
+    """返回功能项清单、当前配置、角色与用户（管理界面用）。"""
+    from core import features
+    return jsonify({
+        "ok": True,
+        "catalog": features.catalog(),
+        "config": features.get_config(),
+        "roles": rbac.VALID_ROLES,
+        "role_labels": rbac.ROLE_LABELS,
+        "users": [
+            {"id": u.get("id"), "username": u.get("username"),
+             "role": u.get("role")}
+            for u in rbac.list_users(include_disabled=True)
+        ],
+    })
+
+
+@api_bp.route("/rbac/features", methods=["POST"])
+@login_required
+@permission_required("system.settings")
+def feature_config_save():
+    """保存平台功能开关 + 角色/用户功能分配。"""
+    from core import features
+    data = request.get_json(silent=True) or {}
+    cfg = features.save_config(data)
+    import core.db as _db
+    _operator = (session.get("user") or {}).get("username", "")
+    _db.add_log("WARNING", "auth", "功能项配置已更新（操作者 %s）" % _operator)
+    return jsonify({"ok": True, "config": cfg})

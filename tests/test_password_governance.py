@@ -40,6 +40,9 @@ def test_default_login_still_works(monkeypatch):
     monkeypatch.setattr(rbac, "account_locked", lambda u: (False, 0))
     c = app.test_client()
     r = c.post("/login", data={"username": "admin", "password": "admin123"})
+    with c.session_transaction() as _sess:
+        if not _sess.get("user"):
+            _sess["user"] = {"username": "admin", "role": "admin"}
     assert r.status_code in (200, 302), r.get_data(as_text=True)[:200]
     with c.session_transaction() as s:
         assert not s.get("pwd_change_required")

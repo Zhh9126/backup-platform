@@ -114,7 +114,7 @@ def create_host(data: dict) -> int:
         _dt = dup.get("db_type") or "通用"
         raise ValueError(
             f"纳管记录重复：连接 {data['host_key']} 下已存在同类型（{_dt}）的"
-            f"记录「{dup.get('name')}」(#{dup.get('id')})。同一台服务器上的其他"
+            f"记录「{dup.get('name')}」({dup.get('id')})。同一台服务器上的其他"
             f"数据库实例请选择不同的数据库类型纳管（同一 IP ≠ 一个实例）；"
             f"如为同一实例请直接编辑原记录。")
 
@@ -179,7 +179,7 @@ def set_protected(host_id: int, protected: bool, note: str = "") -> bool:
     db.execute(
         "UPDATE ssh_hosts SET protected=?, protected_note=?, updated_at=? WHERE id=?",
         (1 if protected else 0, (note or "").strip(), db.now_iso(), host_id))
-    _logger.info("[ssh_hosts] 主机 #%s 保护状态 -> %s（%s）",
+    _logger.info("[ssh_hosts] 主机 %s 保护状态 -> %s（%s）",
                  host_id, "受保护" if protected else "已解除", (note or "").strip())
     return True
 

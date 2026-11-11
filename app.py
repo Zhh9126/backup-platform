@@ -77,6 +77,27 @@ def create_app() -> Flask:
                 session.permanent = True
         except Exception:
             pass
+        # 功能项按需启用 / 权限分离：页面级服务端拦截。
+        # 前端隐藏菜单只是展示层，不能直接输 URL 绕过。
+        try:
+            from core import features as _features
+            from auth import _current_user_dict
+            _p = request.path
+            if (not _p.startswith("/static/") and not _p.startswith("/api/")
+                    and _p not in ("/login", "/logout", "/health")):
+                _ok, _reason = _features.can_access(_current_user_dict(), _p)
+                if not _ok:
+                    _tip = ("该功能项已被管理员停用" if _reason == "feature_disabled"
+                            else "当前账号未被授予该功能项")
+                    return (
+                        '<div style="max-width:560px;margin:80px auto;'
+                        'font-family:system-ui,sans-serif">'
+                        '<h3>403 · 功能项不可用</h3>'
+                        '<p>' + _tip + '（' + _p + '）</p>'
+                        '<p><a href="/">返回仪表盘</a> · '
+                        '<a href="/settings">系统设置</a></p></div>', 403)
+        except Exception:
+            pass
     db.init_schema()
     # 启动自愈：上次进程留下的 running 记录在进程消亡时不可能再完成，
     # 统一标记 failed——否则任务列表永远显示"运行中"、实时日志返回旧
@@ -90,9 +111,20 @@ def create_app() -> Flask:
             "UPDATE restore_records SET status='failed', "
             "message='服务重启，恢复中断（启动自愈自动标记）' "
             "WHERE status='running'")
-        if _n1 or _n2:
+        # 同步任务同样会因 daemon 线程随进程消亡而永久卡在 running
+        _n3 = db.execute(
+            "UPDATE sync_tasks SET status='failed', last_status='failed', "
+            "message='服务重启，同步中断（启动自愈自动标记）' "
+            "WHERE status='running'")
+        _n4 = db.execute(
+            "UPDATE db_migration_plans SET status='failed', "
+            "error_msg='服务重启，迁移中断（启动自愈自动标记）', "
+            "finished_at=datetime('now','localtime') "
+            "WHERE status IN ('checking','migrating','verifying')")
+        if _n1 or _n2 or _n3 or _n4:
             logging.getLogger("aidbm").warning(
-                "启动自愈：清理遗留 running 记录 备份=%s 恢复=%s", _n1, _n2)
+                "启动自愈：清理遗留 running 记录 备份=%s 恢复=%s 同步=%s 迁移=%s",
+                _n1, _n2, _n3, _n4)
     except Exception:
         pass
     # RBAC 启动种子：users 表为空时建首个 admin（兼容老部署）
@@ -382,8 +414,13 @@ def create_app() -> Flask:
     @app.route("/remote-pull")
     @login_required
     def remote_pull_page():
-        """异地容灾：云侧推对象存储 + 平台出站拉取（免公网 IP / 零反向隧道）。"""
-        return render_template("remote_pull.html", page="remote_pull")
+        """兼容旧入口：异地容灾拉取已并入「容灾链路」页的标签页。
+
+        后端 API / 表 / 调度完全不变，仅收敛重复菜单与重复页面入口。
+        """
+        args = request.args.to_dict(flat=True)
+        args["tab"] = "remote-pull"
+        return redirect(url_for("dr_link_page", **args))
 
     @app.route("/netdev")
     @login_required

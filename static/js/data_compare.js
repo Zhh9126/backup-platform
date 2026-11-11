@@ -270,7 +270,7 @@
           if (t.sample_diffs && t.sample_diffs.length) {
             detail += '<details class="mt-1"><summary class="text-primary small">差异明细（前 20）</summary><div class="small">' +
               t.sample_diffs.map((d, i) =>
-                '<div class="text-break">#' + (i + 1) + ' 源: ' + rowStr(d.source) +
+                '<div class="text-break">' + (i + 1) + ' 源: ' + rowStr(d.source) +
                 ' / 目标: ' + rowStr(d.target) + '</div>').join("") + '</div></details>';
           }
           return '<tr' + (t.status === "mismatch" ? ' class="table-danger"' :

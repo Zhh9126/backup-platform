@@ -112,7 +112,7 @@ class SynologyEngine(BackupEngine):
         if dev_id:
             dev = devmod.get_device(int(dev_id), include_secret=True)
             if not dev:
-                raise ValueError("引用的群晖设备 #%s 不存在（可能已被删除）" % dev_id)
+                raise ValueError("引用的群晖设备 %s 不存在（可能已被删除）" % dev_id)
             cfg = devmod.client_config(dev)
             cfg["device_id"] = int(dev_id)
             cfg["device_name"] = dev.get("name") or ""

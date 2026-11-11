@@ -144,6 +144,23 @@ def api_run_db_migrate(plan_id):
     return jsonify(result)
 
 
+@api_bp.route("/db-migrate/<int:plan_id>/cancel", methods=["POST"])
+@api_bp.route("/migration-plans/<int:plan_id>/cancel", methods=["POST"])
+@login_required
+def api_cancel_db_migrate(plan_id):
+    """请求取消正在执行的迁移（阶段边界生效，不在 DDL/写入中途硬中断）。"""
+    from core import db_migrate
+    row = db.query_one("SELECT status FROM db_migration_plans WHERE id=?",
+                       (int(plan_id),))
+    if not row:
+        return jsonify({"error": "迁移计划不存在"}), 404
+    if row["status"] not in ("checking", "migrating", "verifying"):
+        return jsonify({"ok": False, "message": "计划当前未在执行中"}), 400
+    db_migrate.request_cancel(int(plan_id))
+    return jsonify({"ok": True,
+                    "message": "已请求取消，将在当前阶段结束后生效"})
+
+
 @api_bp.route("/db-migrate/<int:plan_id>/dry-run", methods=["POST"])
 @api_bp.route("/migration-plans/<int:plan_id>/dry-run", methods=["POST"])
 @login_required

@@ -48,7 +48,7 @@
       const pg = Pager.slice('cdcStreams', rows);
       $('streamBody').innerHTML = pg.list.map(function (r) {
         return '<tr>' +
-          '<td><b>' + BKP.esc(r.name) + '</b><div class="text-muted small">#' + r.id + ' · ' + BKP.esc(r.purpose || 'cdp') + '</div></td>' +
+          '<td><b>' + BKP.esc(r.name) + '</b><div class="text-muted small">' + r.id + ' · ' + BKP.esc(r.purpose || 'cdp') + '</div></td>' +
           '<td>' + BKP.esc((BKP.META.display_names[r.db_type] || r.db_type)) + '</td>' +
           '<td class="small">' + BKP.esc(r.host) + ':' + (r.port || '') + '</td>' +
           '<td>' + BKP.esc(r.db_name || '-') + '</td>' +

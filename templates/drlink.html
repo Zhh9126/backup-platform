@@ -53,6 +53,24 @@
   }
 </style>
 
+<!-- 容灾能力统一入口：数据库主备切换链路与异地对象存储出站拉取共用一个页面。
+     两侧后端 API / 表 / 调度保持独立且方向互补，页面只复用同一份 DOM 片段，
+     不新增端点、不新建第二套链路模型。 -->
+<ul class="nav nav-tabs mb-3" id="drTabs" role="tablist">
+  <li class="nav-item" role="presentation">
+    <a class="nav-link active" id="tabDrLinkBtn" data-bs-toggle="tab" href="#tabDrLink" role="tab">
+      <i class="bi bi-diagram-3"></i> 容灾链路
+    </a>
+  </li>
+  <li class="nav-item" role="presentation">
+    <a class="nav-link" id="tabRemotePullBtn" data-bs-toggle="tab" href="#tabRemotePull" role="tab">
+      <i class="bi bi-cloud-arrow-down"></i> 异地容灾拉取
+    </a>
+  </li>
+</ul>
+
+<div class="tab-content" id="drTabsContent">
+<div class="tab-pane fade show active" id="tabDrLink" role="tabpanel" aria-labelledby="tabDrLinkBtn">
 <div class="page-header">
   <h4 class="page-title"><i class="bi bi-diagram-3"></i> 容灾链路 HA</h4>
   <p class="text-muted mb-0">双运营商专线智能选路 · 日志间隙自动填补 · 备端只读一致性校验</p>
@@ -373,4 +391,26 @@
   .dr-flow-dot.warn { background: #f59e0b; }
   .dr-flow-time { color: var(--muted, #94a3b8); font-size: .78rem; white-space: nowrap; }
 </style>
+</div><!-- /tabDrLink -->
+
+<div class="tab-pane fade" id="tabRemotePull" role="tabpanel" aria-labelledby="tabRemotePullBtn">
+  {% include "_remote_pull_panel.html" %}
+</div>
+</div><!-- /drTabsContent -->
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/remote_pull.js?v=2026111107"></script>
+<script>
+  /* 旧入口 /remote-pull 重定向带 ?tab=remote-pull，直接切到拉取面板 */
+  (function () {
+    try {
+      var t = new URLSearchParams(window.location.search).get('tab');
+      if (t === 'remote-pull' || t === 'pull') {
+        var el = document.getElementById('tabRemotePullBtn');
+        if (el && window.bootstrap) bootstrap.Tab.getOrCreateInstance(el).show();
+      }
+    } catch (e) { /* ignore */ }
+  })();
+</script>
 {% endblock %}

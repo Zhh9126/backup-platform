@@ -13,6 +13,7 @@ AI 预测告警 API（AIPredictor）。
 """
 import json
 import time
+from datetime import datetime
 
 import core.db as db
 import core.models as models
@@ -107,29 +108,50 @@ def api_alert_model_test():
 
     start_ms = time.time() * 1000
     raw = predictor._call_model(test_prompt, cfg)
+    latency = raw.get("latency_ms", round(time.time() * 1000 - start_ms, 1))
+
+    def _persist_last_test(ok: bool, error: str = "", sample: str = ""):
+        """把本次测试结果落库，状态徽章才有真实依据（此前只读取从不写入）。"""
+        try:
+            db.set_system_config("ai_model_last_test", json.dumps({
+                "ok": ok,
+                "at": datetime.now().isoformat(timespec="seconds"),
+                "latency_ms": latency,
+                "provider": ai_model.get("provider", ""),
+                "endpoint": ai_model.get("endpoint", ""),
+                "model_name": ai_model.get("model_name", ""),
+                "error": str(error)[:200],
+                "sample": str(sample)[:120],
+            }, ensure_ascii=False))
+        except Exception:
+            pass
 
     if raw.get("ok"):
-        latency = raw.get("latency_ms", round(time.time() * 1000 - start_ms, 1))
         resp_body = raw.get("response_body", "")
-        # 尝试解析
-        sample = ""
-        try:
-            resp_json = json.loads(resp_body)
-            content = resp_json.get("choices", [{}])[0].get("message", {}).get("content", "")
-            sample = content[:200]
-        except Exception:
-            sample = resp_body[:200] if resp_body else ""
+        # 统一提取函数已兼容标准 JSON / 单包 delta / 多行 SSE
+        sample = raw.get("content") or ""
+        if not sample:
+            try:
+                resp_json = json.loads(resp_body)
+                sample = (resp_json.get("choices", [{}])[0]
+                          .get("message", {}).get("content", ""))
+            except Exception:
+                sample = resp_body[:200] if resp_body else ""
+        sample = str(sample)[:200]
+        _persist_last_test(True, sample=sample)
         return jsonify({
             "ok": True,
             "status_code": raw.get("status_code", 200),
             "latency_ms": latency,
             "sample_response": sample,
+            "stream_normalized": bool(raw.get("stream_normalized")),
         })
     else:
-        latency = raw.get("latency_ms", round(time.time() * 1000 - start_ms, 1))
+        error = raw.get("error", "未知错误")
+        _persist_last_test(False, error=error)
         result = {
             "ok": False,
-            "error": raw.get("error", "未知错误"),
+            "error": error,
             "latency_ms": latency,
         }
         # 透传错误分类字段（error_category / hint）

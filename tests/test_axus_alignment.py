@@ -8,6 +8,7 @@ tests/test_win_protect.py，本文件只做静态契约。
 import io
 import json
 import os
+import re
 import tarfile
 import threading
 
@@ -178,4 +179,6 @@ def test_frontend_controls_and_cache_stamp():
     assert 'id="f_dedup_scope"' in f and 'id="f_mirror_full_tree"' in f
     assert 'win_protect.js?v=' in f
     b = io.open(os.path.join(ROOT, "templates/base.html"), encoding="utf-8").read()
-    assert "app.js?v=2026111002" in b
+    # 只要求「升过戳」，不写死某个版本：后续每次改 JS 升戳不应打破回归
+    m = re.search(r"app\.js\?v=(\d+)", b)
+    assert m and int(m.group(1)) >= 2026111002, "app.js 缓存戳未升"

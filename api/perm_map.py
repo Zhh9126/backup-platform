@@ -39,6 +39,10 @@ def normalize(path: str) -> str:
 SEGMENT_PERMS = {
     # 备份管理
     "tasks": "backup.task.manage",
+    # 源端资源保护配置（阈值/开关）属系统级设置
+    "source-guard": "system.settings",
+    # 无备份目录扫描恢复（pull 会拉回数据，按任务管理权限校验）
+    "scan-fs": "backup.task.manage",
     "file-sync": "backup.task.manage",
     "hosts": "backup.task.manage",
     "vm": "backup.task.manage",
@@ -126,11 +130,13 @@ ACTION_RULES = tuple((re.compile(p), perm) for p, perm in (
     (r"^/api/tasks/\d+/stop$", "backup.run"),
     # 防勒索扫描是只读探测（附带检测结论落库/隔离），operator 也要能发起
     (r"^/api/ransomware/(scan/\d+|scan-recent)$", "backup.task.manage"),
+    # 把推荐窗口写入任务 cron 属于任务配置变更
+    (r"^/api/source-guard/window/\d+/apply$", "backup.task.manage"),
 ))
 
 # ---- 只读语义动作词（POST 且为路径末段，精确相等；非子串匹配） ----
 READ_ACTIONS = frozenset({
-    "precheck", "restore-precheck", "preview", "probe", "dry-run",
+    "precheck", "restore-precheck", "preflight", "preview", "probe", "dry-run",
     "security-check", "verify", "check", "check-consistency",
     "takeover-check", "diff",
     "test", "test-connection", "test-ssh", "test-ftp", "batch-test",
@@ -146,6 +152,10 @@ EXTRA_EXEMPT = tuple(re.compile(p) for p in (
     r"^/api/sync/\d+/test/[^/]+$",
     r"^/api/db-adapters/preview$",
     r"^/api/object-storage/preview$",
+    # 源端 CPU 实时采样是只读探测（会落一条负载样本，不改业务数据）
+    r"^/api/source-guard/sample/\d+$",
+    # 无备份目录的扫描是纯只读探测；pull 才会拉回数据，仍走段权限
+    r"^/api/scan-fs/scan$",
 ))
 
 DEFAULT_PERM = "system.settings"

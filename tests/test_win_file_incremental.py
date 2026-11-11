@@ -330,4 +330,6 @@ def test_frontend_controls_and_cache_stamp():
     assert 'id="f_win_max_files"' in tpl
     assert "Get-FileHash" in tpl
     assert "win_hash_verify" in js and "win_max_files" in js
-    assert "app.js?v=2026111002" in base
+    import re
+    m = re.search(r"app\.js\?v=(\d+)", base)
+    assert m and int(m.group(1)) >= 2026111002, "app.js 缓存戳未升"

@@ -62,6 +62,26 @@ def probe_agent(aid):
     return jsonify(p), (200 if p.get("ok") else 502)
 
 
+@api_bp.route("/agents/<int:aid>/capabilities", methods=["GET"])
+def agent_capabilities(aid):
+    """备份插件能力自报 + 平台侧传输协商结论（只读，供页面展示）。"""
+    rec = agent_hosts.get_by_id(aid)
+    if not rec:
+        return jsonify({"error": "注册记录不存在"}), 404
+    from core.agent_client import AgentTransport
+    t = AgentTransport(rec["hostname"], rec["port"],
+                       agent_hosts.get_token(rec), timeout=8,
+                       label="agent:%s" % rec["hostname"])
+    try:
+        caps = t.capabilities(refresh=True)
+        return jsonify({"ok": True, "caps": caps,
+                        "negotiation": t.negotiation()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]}), 502
+    finally:
+        t._reset()
+
+
 @api_bp.route("/agents/<int:aid>/install-cmd", methods=["GET"])
 def install_cmd(aid):
     """生成在数据库服务器上执行的一键安装命令（黑盒：loader + 加密载荷，

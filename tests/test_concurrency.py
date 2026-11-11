@@ -216,3 +216,61 @@ def test_run_task_async_mode(client, monkeypatch):
                             "accepted": False, "duplicate": True})
     assert client.post("/api/tasks/44/run",
                        json={"async": True}).status_code == 409
+
+
+def test_quick_backup_defaults_to_all_enabled_tasks(client, monkeypatch):
+    """不传 task_ids 时一键备份全部启用任务，停用任务不触发。"""
+    calls = []
+
+    def fake_submit(tid, backup_type=None, operator=None):
+        calls.append((tid, backup_type, operator))
+        return {"accepted": True, "task_id": tid}
+
+    monkeypatch.setattr(scheduler, "submit_task_now", fake_submit)
+    monkeypatch.setattr(scheduler, "concurrency_stats",
+                        lambda: {"submitted": len(calls)})
+    monkeypatch.setattr("api.tasks.models.list_tasks",
+                        lambda include_secret=False: [
+                            {"id": 11, "name": "a", "enabled": 1},
+                            {"id": 12, "name": "b", "enabled": 1},
+                            {"id": 13, "name": "off", "enabled": 0},
+                        ])
+    r = client.post("/api/tasks/quick-backup", json={})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["triggered"] == 2 and body["total"] == 2
+    assert body["parallel"] is True
+    assert [c[0] for c in calls] == [11, 12]
+    assert all(c[1] == "full" and c[2] == "quick-backup" for c in calls)
+
+
+def test_quick_backup_isolates_single_task_failure(client, monkeypatch):
+    """单任务投递失败不影响同批其它任务，逐任务结果如实返回。"""
+    def fake_submit(tid, backup_type=None, operator=None):
+        if tid == 2:
+            raise RuntimeError("目标主机不可达")
+        return {"accepted": True, "task_id": tid}
+
+    monkeypatch.setattr(scheduler, "submit_task_now", fake_submit)
+    monkeypatch.setattr(scheduler, "concurrency_stats", lambda: {})
+    monkeypatch.setattr("api.tasks.models.list_tasks",
+                        lambda include_secret=False: [
+                            {"id": 1, "name": "a", "enabled": 1},
+                            {"id": 2, "name": "b", "enabled": 1},
+                            {"id": 3, "name": "c", "enabled": 1},
+                        ])
+    r = client.post("/api/tasks/quick-backup", json={"task_ids": [1, 2, 3]})
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["total"] == 3 and body["triggered"] == 2
+    bad = next(x for x in body["results"] if x["task_id"] == 2)
+    assert bad["ok"] is False and "目标主机不可达" in bad["message"]
+
+
+def test_quick_backup_rejects_when_no_enabled_task(client, monkeypatch):
+    monkeypatch.setattr("api.tasks.models.list_tasks",
+                        lambda include_secret=False: [
+                            {"id": 1, "name": "off", "enabled": 0}])
+    r = client.post("/api/tasks/quick-backup", json={})
+    assert r.status_code == 400
+    assert "没有可备份的启用任务" in r.get_json()["error"]

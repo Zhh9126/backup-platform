@@ -26,7 +26,7 @@ def _clean_shared_tasks():
 
     config.META_DB_PATH 是运行时读的模块属性，pytest 同进程收集多个测试模块
     时后导入者的 env 不会改写已固化的 config；其它模块留下的备份任务会触发
-    社区版 5 个配额上限，导致这里无故 QuotaExceededError。
+    社区版 FREE_MAX_QUOTA 配额上限，导致这里无故 QuotaExceededError。
     """
     try:
         _db.execute("DELETE FROM backup_tasks")
@@ -52,6 +52,20 @@ def test_create_task_with_dict_extra_options():
     t = models.get_task(tid, include_secret=True)
     assert isinstance(t["extra_options"], str)
     assert "backup_dir" in t["extra_options"]
+
+
+def test_delete_missing_task_returns_404():
+    """回归：删除不存在的任务不能回 200 假成功（应 404，与 /api/hosts 一致）。"""
+    from app import create_app
+    app = create_app()
+    app.config["TESTING"] = True
+    with app.test_client() as c:
+        with c.session_transaction() as s:
+            s["user"] = {"id": 1, "username": "admin",
+                         "display_name": "admin", "role": "admin"}
+        r = c.delete("/api/tasks/99999999")
+        assert r.status_code == 404, r.get_data(as_text=True)[:200]
+        assert "不存在" in str(r.get_json())
 
 
 def test_update_task_with_dict_extra_options():

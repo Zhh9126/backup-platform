@@ -151,10 +151,60 @@ def list_tables(backup_path: str) -> list:
     return out
 
 
-def slice_tables(backup_path: str, tables: list) -> tuple:
+def _normalize_renames(renames) -> dict:
+    """规范化表改名映射 ``{源表: 新表名}`` → ``{小写源表名: 新表名}``。
+
+    源表键支持 ``db.table``；新表名只允许常规 MySQL 标识符；
+    多个源表映射到同一新表名时拒绝（会互相覆盖）。
+    """
+    if not renames:
+        return {}
+    if not isinstance(renames, dict):
+        raise TableExtractError("table_renames 必须是 {源表名: 新表名} 对象")
+    out = {}
+    for src, dst in renames.items():
+        s = str(src).strip().strip("`\"'")
+        d = str(dst).strip().strip("`\"'")
+        if not s or not d:
+            raise TableExtractError("表改名映射的源表名 / 新表名不能为空")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", d):
+            raise TableExtractError(
+                f"新表名不合法（只允许字母/数字/下划线/$ 且不以数字开头）: {d}")
+        out[s.split(".")[-1].lower()] = d
+    lowered = [v.lower() for v in out.values()]
+    if len(set(lowered)) != len(lowered):
+        raise TableExtractError("表改名映射存在多个源表指向同一个新表名")
+    return out
+
+
+# 只替换 SQL 中的表标识符位置，不动 INSERT ... VALUES 的字符串数据。
+_RE_RENAME_POS = re.compile(
+    r"(\b(?:DROP\s+TABLE(?:\s+IF\s+EXISTS)?|CREATE\s+TABLE|"
+    r"INSERT\s+INTO|REPLACE\s+INTO|LOCK\s+TABLES|ALTER\s+TABLE|"
+    r"Table\s+structure\s+for\s+table|Dumping\s+data\s+for\s+table)\s+)"
+    r"`([^`]+)`", re.IGNORECASE)
+
+
+def _rename_lines(lines, old: str, new: str):
+    """把 mysqldump 表段中 ``old`` 的表标识符改成 ``new``。"""
+    if not new or new.lower() == old.lower():
+        return lines
+
+    def sub(m):
+        if m.group(2).lower() != old.lower():
+            return m.group(0)
+        return f"{m.group(1)}`{new}`"
+
+    return [_RE_RENAME_POS.sub(sub, line) for line in lines]
+
+
+def slice_tables(backup_path: str, tables: list, renames=None) -> tuple:
     """从产物切片指定表，返回 (tmp_sql_path, found, notes)。
 
     tables 元素支持 ``db.table``（tar 必须带前缀或单库）与 ``table``。
+    renames 为可选的 ``{源表名: 新表名}``，在切片输出时改写表标识符，
+    使「只恢复指定表 + 换成另一个表名」一次完成；found 里保留源表名并
+    以 ``renamed_to`` 记录新名，不破坏既有调用方的字段契约。
     指定表不存在时抛 TableExtractError（消息含可用表清单，诚实失败）。
     调用方负责删除返回的临时文件。
     """
@@ -162,6 +212,7 @@ def slice_tables(backup_path: str, tables: list) -> tuple:
         raise TableExtractError("未指定要恢复的表（tables 为空）")
     if not backup_path or not os.path.exists(backup_path):
         raise TableExtractError(f"备份产物不存在: {backup_path}")
+    rename_map = _normalize_renames(renames)
 
     # 解析 db.table 前缀 → {db_lower: set(tables)}；"" 表示不限库/单库
     want_map = {}
@@ -176,9 +227,12 @@ def slice_tables(backup_path: str, tables: list) -> tuple:
             want_map.setdefault("", set()).add(spec.lower())
 
     notes = []
+    if rename_map:
+        notes.append("表改名: " + ", ".join(
+            f"{k}→{v}" for k, v in rename_map.items()))
     tmp = tempfile.NamedTemporaryFile(
         prefix="table_slice_", suffix=".sql", delete=False)
-    found = []          # [{"schema","obj_name"}]
+    found = []          # [{"schema","obj_name","renamed_to"}]
     try:
         with open(tmp.name, "w", encoding="utf-8") as out:
             header_written = False
@@ -199,8 +253,12 @@ def slice_tables(backup_path: str, tables: list) -> tuple:
                     out.writelines(header)
                     header_written = True
                 for t in picked:
-                    out.writelines(sections[t])
-                    found.append({"schema": schema, "obj_name": t})
+                    new_name = rename_map.get(t.lower()) or ""
+                    out.writelines(
+                        _rename_lines(sections[t], t, new_name)
+                        if new_name else sections[t])
+                    found.append({"schema": schema, "obj_name": t,
+                                  "renamed_to": new_name})
 
             if _is_tar(backup_path):
                 dbs = _tar_list_dbs(backup_path)
@@ -255,6 +313,6 @@ def slice_tables(backup_path: str, tables: list) -> tuple:
         raise
 
 
-def slice_to_temp(backup_path: str, tables: list) -> tuple:
+def slice_to_temp(backup_path: str, tables: list, renames=None) -> tuple:
     """slice_tables 的同义词（语义更直观：返回 (tmp_path, found, notes)）。"""
-    return slice_tables(backup_path, tables)
+    return slice_tables(backup_path, tables, renames=renames)

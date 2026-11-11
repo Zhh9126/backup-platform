@@ -84,6 +84,35 @@ def _decode_maybe(data) -> str:
         return ""
 
 
+def parse_table_list(value):
+    """归一 extra_options.tables（list / JSON 字符串 / 逗号分隔）为表名列表。
+
+    供各引擎的「单表备份」分支共用：此前 PG/金仓本机通道不消费 tables，
+    用户配了单表却静默产出整库 dump，属于不真实的粒度语义。
+    """
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+    elif isinstance(value, str):
+        s = value.strip()
+        if s.startswith("["):
+            try:
+                items = json.loads(s)
+            except (TypeError, ValueError):
+                items = s.split(",")
+        else:
+            items = s.split(",")
+    else:
+        return []
+    out = []
+    for x in items:
+        t = str(x or "").strip()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
 def _is_network_error(exc: Exception) -> bool:
     """判断异常是否属于可重试的网络/连接错误。"""
     msg = str(exc).lower()

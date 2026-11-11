@@ -1753,12 +1753,41 @@ class OracleEngine(BackupEngine):
                 mode_args = self._dp_mode_args(
                     self._restore_extra_with_tables(extra, kwargs),
                     for_import=True)[0]
+                # UAT 异名 schema / 表改名：Oracle 的「库名不一样」对应
+                # REMAP_SCHEMA，表改名对应 REMAP_TABLE（19c 实测路径）。
+                # 11g 对 REMAP_TABLE 有分区表等限制，失败时由 impdp 日志如实透出。
+                if isinstance(schemas, (list, tuple)) and schemas:
+                    src_schema = str(schemas[0]).strip()
+                elif schemas:
+                    src_schema = str(schemas).split(",")[0].strip()
+                else:
+                    src_schema = str(extra.get("schema") or extra.get("owner") or "").strip()
+                remap_args = ""
+                target_schema = str(kwargs.get("target_schema") or "").strip()
+                if target_schema:
+                    if not src_schema:
+                        return BackupResult(
+                            success=False, status=BackupStatus.FAILED,
+                            backup_path=backup_path,
+                            message="REMAP_SCHEMA 需要源 schema：请在任务高级选项配置 "
+                                    "schemas（或本次恢复不指定 target_schema）")
+                    remap_args += f" REMAP_SCHEMA={src_schema}:{target_schema}"
+                renames = kwargs.get("table_renames") or {}
+                if renames:
+                    parts = []
+                    for old, new in renames.items():
+                        o, n = str(old).strip(), str(new).strip()
+                        if "." not in o and src_schema:
+                            o = f"{src_schema}.{o}"
+                        parts.append(f"{o}:{n}")
+                    remap_args += " REMAP_TABLE=" + ",".join(parts)
+
                 def _impdp_shell(conn_str):
                     _inner = (f"export PATH=$ORACLE_HOME/bin:$PATH; "
                               f"{shlex.quote(impdp_bin)} {shlex.quote(conn_str)} "
                               f"DUMPFILE={dmp_name} LOGFILE={log_name} </dev/null "
                               f"DIRECTORY=DATA_PUMP_DIR "
-                              f"TABLE_EXISTS_ACTION=REPLACE {mode_args}")
+                              f"TABLE_EXISTS_ACTION=REPLACE {mode_args}{remap_args}")
                     return (f"su - {self._resolve_check_user(target_host_info)} -c "
                             f"{shlex.quote(_inner)}")
 

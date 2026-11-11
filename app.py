@@ -555,6 +555,12 @@ def create_app() -> Flask:
         """恢复校验策略与恢复测试报告。"""
         return render_template("restore_verify.html", page="restore-verify")
 
+    @app.route("/scan-fs")
+    @login_required
+    def scan_fs_page():
+        """无备份目录扫描恢复：SSH 只读文件系统扫描 + 清单拉回。"""
+        return render_template("scan_fs.html", page="scan-fs")
+
     @app.route("/cdc")
     @login_required
     def cdc_page():

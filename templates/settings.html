@@ -34,7 +34,7 @@
     <span id="licBadgeTop" class="badge bg-secondary">检测中...</span>
   </div>
   <p class="form-text-hint mb-3">
-    社区免费版默认各项备份与纳管功能（网络设备、数据库、文件、对象存储、虚拟机、AI 模型）最多支持纳管 <b>5 个</b> 设备/任务。
+    社区免费版默认各项备份与纳管功能（网络设备、数据库、文件、对象存储、虚拟机、AI 模型）每类最多支持纳管 <b id="licFreeQuotaHint">100</b> 个设备/任务。
     激活绑定本机物理 MAC 地址的永久企业授权码后，将全量解除限制，支持无上限纳管。
   </p>
 
@@ -61,10 +61,10 @@
         <div class="text-muted small mb-1">当前运行授权模式</div>
         <div class="d-flex align-items-center gap-2">
           <span class="fs-5 fw-bold" id="licEditionText">社区免费版</span>
-          <span id="licEditionPill" class="badge bg-secondary small">限额 5 台</span>
+          <span id="licEditionPill" class="badge bg-secondary small">每类限额 {{ license_info.get('quota_limit', 100) if license_info else 100 }} 台</span>
         </div>
         <div class="text-muted small mt-2" id="licCustomerText">
-          未激活商业授权 · 受控备份任务与网络设备上限为 5
+          未激活商业授权 · 各项备份任务与网络设备每类上限为 {{ license_info.get('quota_limit', 100) if license_info else 100 }} 个
         </div>
       </div>
     </div>
@@ -135,6 +135,8 @@
 document.addEventListener("DOMContentLoaded", function () {
   let currentMac = "";
   let isCurrentlyLicensed = false;
+  // 社区免费版每类纳管上限：以服务端授权信息为准，页面所有文案/进度条共用
+  let freeQuota = 100;
 
   async function loadLicenseStatus() {
     try {
@@ -152,6 +154,11 @@ document.addEventListener("DOMContentLoaded", function () {
   function renderLicenseUI(lic, quotas) {
     isCurrentlyLicensed = !!lic.is_licensed;
     currentMac = lic.primary_mac || "";
+    const q0 = quotas && Object.keys(quotas).length ? quotas[Object.keys(quotas)[0]] : null;
+    freeQuota = Number(lic.quota_limit) > 0 ? Number(lic.quota_limit)
+      : (q0 && Number(q0.limit) > 0 ? Number(q0.limit) : 100);
+    const quotaHint = document.getElementById("licFreeQuotaHint");
+    if (quotaHint) quotaHint.textContent = freeQuota;
     document.getElementById("licPrimaryMac").textContent = currentMac || "未检测到物理网卡";
 
     const badgeTop = document.getElementById("licBadgeTop");
@@ -188,8 +195,8 @@ document.addEventListener("DOMContentLoaded", function () {
       edText.textContent = "社区免费版";
       edText.className = "fs-5 fw-bold text-info";
       edPill.className = "badge bg-secondary";
-      edPill.textContent = "每类限额 5 台";
-      custText.textContent = "未激活商业授权 · 截图中的各项备份任务与网络设备上限为 5";
+      edPill.textContent = "每类限额 " + freeQuota + " 台";
+      custText.textContent = "未激活商业授权 · 各项备份任务与网络设备每类上限为 " + freeQuota + " 个";
 
       actInput.classList.remove("d-none");
       actBtn.classList.remove("d-none");
@@ -223,16 +230,19 @@ document.addEventListener("DOMContentLoaded", function () {
       const q = quotas[key];
       const icon = icons[key] || "bi-hdd-network";
       const used = q.used || 0;
-      const limit = licensed ? "无限制" : (q.limit || 5);
-      const pct = licensed ? 15 : Math.min(100, Math.round((used / (q.limit || 5)) * 100));
-      const barColor = licensed ? "bg-info" : (used >= 5 ? "bg-danger" : (used >= 4 ? "bg-warning" : "bg-success"));
+      const max = Number(q.limit) > 0 ? Number(q.limit) : freeQuota;
+      const full = !licensed && used >= max;
+      const near = !licensed && max > 0 && used >= Math.ceil(max * 0.9);
+      const limit = licensed ? "无限制" : max;
+      const pct = licensed ? 15 : Math.min(100, Math.round((used / (max || 1)) * 100));
+      const barColor = licensed ? "bg-info" : (full ? "bg-danger" : (near ? "bg-warning" : "bg-success"));
 
       html += `
         <div class="col-md-4 col-sm-6">
           <div class="p-2 border rounded" style="background: rgba(255,255,255,0.02);">
             <div class="d-flex justify-content-between align-items-center mb-1">
               <span class="small fw-semibold"><i class="bi ${icon} me-1"></i> ${escapeHtml(q.label)}</span>
-              <span class="badge ${licensed ? 'bg-success' : (used >= 5 ? 'bg-danger' : 'bg-secondary')} small">
+              <span class="badge ${licensed ? 'bg-success' : (full ? 'bg-danger' : 'bg-secondary')} small">
                 ${used} / ${limit}
               </span>
             </div>
@@ -241,7 +251,7 @@ document.addEventListener("DOMContentLoaded", function () {
             </div>
             <div class="d-flex justify-content-between align-items-center mt-1" style="font-size: 0.72rem; color: #94a3b8;">
               <span>已纳管: ${used}</span>
-              <span>${licensed ? '终身不限' : (used >= 5 ? '已达上限' : '剩余: ' + (5 - used))}</span>
+              <span>${licensed ? '终身不限' : (full ? '已达上限' : '剩余: ' + (max - used))}</span>
             </div>
           </div>
         </div>
@@ -308,7 +318,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
   // 注销
   document.getElementById("licDeactivateBtn")?.addEventListener("click", async () => {
-    if (!confirm("确定要注销当前商业授权吗？注销后系统将回退为社区免费版，各模块重新受限最多纳管 5 个设备/任务。")) {
+    if (!confirm("确定要注销当前商业授权吗？注销后系统将回退为社区免费版，各模块每类重新受限最多纳管 " + freeQuota + " 个设备/任务。")) {
       return;
     }
     try {
@@ -431,6 +441,39 @@ document.addEventListener("DOMContentLoaded", function () {
   </div>
   <button class="btn btn-primary mt-2" id="ogSaveBtn"><i class="bi bi-save"></i> 保存安全设置</button>
   <span class="form-text ms-2 text-muted" id="og_result"></span>
+</div>
+
+<!-- 源端资源保护 / 预测性调度（离线统计，零安装） -->
+<div class="page-card">
+  <div class="card-section-title"><i class="bi bi-cpu"></i> 源端资源保护与预测调度</div>
+  <p class="form-text-hint mb-2">
+    备份前经 <b>SSH 只读读取 /proc/stat</b> 采集源端 CPU（被管端零安装）。超过拒绝阈值直接拒绝并留失败记录；
+    落在降级区间自动把并行度降到 2 并注入限速；采集失败放行且如实标注。
+    按历史负载逐小时统计推荐最佳备份窗口，<b>纯离线统计，不依赖公网 LLM / embedding API</b>。
+  </p>
+  <div class="row g-2 align-items-end">
+    <div class="col-md-3">
+      <div class="form-check">
+        <input class="form-check-input" type="checkbox" id="sg_enabled">
+        <label class="form-check-label">启用源端 CPU 保护</label>
+      </div>
+    </div>
+    <div class="col-md-2"><label class="form-label small">拒绝阈值 %</label><input class="form-control form-control-sm" type="number" id="sg_block" min="1" max="100"></div>
+    <div class="col-md-2"><label class="form-label small">降级阈值 %</label><input class="form-control form-control-sm" type="number" id="sg_throttle" min="1" max="100"></div>
+    <div class="col-md-2"><label class="form-label small">限速 KB/s</label><input class="form-control form-control-sm" type="number" id="sg_kbps" min="0"></div>
+    <div class="col-md-1"><label class="form-label small">并行度</label><input class="form-control form-control-sm" type="number" id="sg_parallel" min="1"></div>
+    <div class="col-md-2"><button class="btn btn-primary btn-sm w-100" id="sgSaveBtn"><i class="bi bi-save"></i> 保存</button></div>
+  </div>
+  <div class="mt-3 border-top pt-2">
+    <label class="form-label small">负载采样与最佳窗口（填任务 ID 可针对单任务；留空按全部主机统计）</label>
+    <div class="input-group input-group-sm">
+      <input class="form-control" id="sg_task_id" placeholder="任务 ID（可选）">
+      <button class="btn btn-outline-secondary" type="button" id="sgSampleBtn">实时采样</button>
+      <button class="btn btn-outline-secondary" type="button" id="sgWindowBtn">推荐窗口</button>
+      <button class="btn btn-outline-primary" type="button" id="sgApplyBtn">应用到任务调度</button>
+    </div>
+    <div class="form-text mt-1" id="sg_result">未采样</div>
+  </div>
 </div>
 
 <!-- 强口令策略（三员管理配套） -->
@@ -881,6 +924,85 @@ document.addEventListener("DOMContentLoaded", async function () {
       res.className = "form-text ms-2 text-danger";
     }
   });
+});
+</script>
+<script>
+// 源端资源保护 / 离线负载周期学习（配置、采样、推荐窗口、应用到任务调度）
+document.addEventListener("DOMContentLoaded", function () {
+  const $ = (id) => document.getElementById(id);
+  const result = $("sg_result");
+  const say = (t, bad) => {
+    if (!result) return;
+    result.textContent = t;
+    result.className = "form-text mt-1 " + (bad ? "text-danger" : "text-success");
+  };
+  const load = async () => {
+    try {
+      const c = await (await fetch("/api/source-guard/config", { credentials: "include" })).json();
+      $("sg_enabled").checked = c.source_guard_enabled === "1";
+      $("sg_block").value = c.source_guard_block_pct;
+      $("sg_throttle").value = c.source_guard_throttle_pct;
+      $("sg_kbps").value = c.source_guard_throttle_kbps;
+      $("sg_parallel").value = c.source_guard_parallel;
+    } catch (e) { say("配置读取失败: " + e, true); }
+  };
+  $("sgSaveBtn")?.addEventListener("click", async () => {
+    try {
+      const r = await fetch("/api/source-guard/config", {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source_guard_enabled: $("sg_enabled").checked,
+          source_guard_block_pct: Number($("sg_block").value),
+          source_guard_throttle_pct: Number($("sg_throttle").value),
+          source_guard_throttle_kbps: Number($("sg_kbps").value),
+          source_guard_parallel: Number($("sg_parallel").value),
+        }),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || r.statusText);
+      say("已保存，后续备份按三层规则执行");
+    } catch (e) { say("保存失败: " + e, true); }
+  });
+  $("sgSampleBtn")?.addEventListener("click", async () => {
+    const tid = ($("sg_task_id").value || "").trim();
+    if (!tid) { say("实时采样需要先填任务 ID", true); return; }
+    try {
+      const r = await fetch("/api/source-guard/sample/" + encodeURIComponent(tid), {
+        method: "POST", credentials: "include" });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || r.statusText);
+      const s = d.sample || {}, v = d.verdict || {};
+      say(`CPU ${s.cpu_pct ?? "-"}%（来源 ${s.source || "-"}）→ ${v.level || "-"}：${v.message || ""}`,
+          v.level === "block");
+    } catch (e) { say("采样失败: " + e, true); }
+  });
+  let recommended = "";
+  $("sgWindowBtn")?.addEventListener("click", async () => {
+    const tid = ($("sg_task_id").value || "").trim();
+    try {
+      const d = await (await fetch("/api/source-guard/window?task_id=" +
+        encodeURIComponent(tid), { credentials: "include" })).json();
+      if (!d.ok) { recommended = ""; say("暂无可用推荐：" + (d.reason || "样本不足"), true); return; }
+      recommended = d.cron;
+      say(`推荐窗口 ${String(d.best_hour).padStart(2, "0")}:00（平均 CPU ${d.avg_cpu_pct}%，样本 ${d.samples} 条，cron: ${d.cron}）`);
+    } catch (e) { say("推荐失败: " + e, true); }
+  });
+  $("sgApplyBtn")?.addEventListener("click", async () => {
+    const tid = ($("sg_task_id").value || "").trim();
+    if (!tid) { say("应用窗口需要先填任务 ID", true); return; }
+    try {
+      const r = await fetch("/api/source-guard/window/" + encodeURIComponent(tid) + "/apply", {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(recommended ? { cron: recommended } : {}),
+      });
+      const d = await r.json();
+      if (!r.ok || !d.ok) throw new Error(d.reason || d.error || r.statusText);
+      say("已应用 " + d.cron_expr + " 并重载调度");
+    } catch (e) { say("应用失败: " + e, true); }
+  });
+  load();
 });
 </script>
 

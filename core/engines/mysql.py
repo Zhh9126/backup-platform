@@ -1500,7 +1500,24 @@ class MySQLEngine(BackupEngine):
 
         # demo_only / DEMO_MODE 不再触发仿真；客户端或连接缺失直接失败。
 
-        # 0) 跨主机恢复：SFTP 推送到目标主机 → SSH 远程执行 mysql
+        # 0) 表级恢复（P0-1）优先：平台侧先切片（含可选表改名），再按目标
+        #    通道（本机 / 跨主机）灌入。必须放在跨主机分支之前——否则
+        #    target_host_info 会吞掉 tables，静默退化成整库恢复
+        #    （192.168.220.170 真机实测缺陷）。
+        sel_tables = [str(t).strip() for t in (kwargs.get("tables") or [])
+                      if str(t).strip()]
+        if sel_tables:
+            if self._is_physical_backup(backup_path):
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path,
+                    message="物理备份产物不支持表级恢复（无表级 SQL 语义）；"
+                            "请使用逻辑备份产物或走整实例恢复",
+                    detail_log="\n".join(logs))
+            return self._restore_table_slice(backup_path, sel_tables,
+                                             kwargs, logs)
+
+        # 1) 跨主机恢复：SFTP 推送到目标主机 → SSH 远程执行 mysql
         target_host_info = kwargs.get("target_host_info")
         if target_host_info:
             target_db = kwargs.get("target_db") or self.task.get("db_name") or ""
@@ -1510,7 +1527,7 @@ class MySQLEngine(BackupEngine):
             res.detail_log = "\n".join(logs) + "\n" + (res.detail_log or res.stderr or res.stdout or "")
             return res
 
-        # 1) 物理备份产物 -> XtraBackup 物理恢复（prepare + 临时实例校验）
+        # 1.5) 物理备份产物 -> XtraBackup 物理恢复（prepare + 临时实例校验）
         if self._is_physical_backup(backup_path):
             logs.append("[物理恢复] 检测到 XtraBackup 物理备份产物，执行物理恢复")
             result = self._restore_physical(backup_path, **kwargs)
@@ -1528,21 +1545,6 @@ class MySQLEngine(BackupEngine):
                 success=False, status=BackupStatus.FAILED,
                 backup_path=backup_path, message=reason,
                 detail_log="\n".join(logs))
-
-        # 1.5) 表级恢复（P0-1）：kwargs.tables → 锚点切片 → 单文件恢复通道
-        # 仅逻辑产物支持；物理备份产物不支持表级语义（如实失败）
-        sel_tables = [str(t).strip() for t in (kwargs.get("tables") or [])
-                      if str(t).strip()]
-        if sel_tables:
-            if self._is_physical_backup(backup_path):
-                return BackupResult(
-                    success=False, status=BackupStatus.FAILED,
-                    backup_path=backup_path,
-                    message="物理备份产物不支持表级恢复（无表级 SQL 语义）；"
-                            "请使用逻辑备份产物或走整实例恢复",
-                    detail_log="\n".join(logs))
-            return self._restore_table_slice(backup_path, sel_tables,
-                                             kwargs, logs)
 
         # 2) 全实例 tar 产物（multi-db-tar）→ 逐库恢复
         if backup_path.endswith((".tar.gz", ".tgz")) and self._is_full_instance_tar(backup_path):
@@ -2621,10 +2623,12 @@ class MySQLEngine(BackupEngine):
         """
         from core import table_extract
         started = time.time()
-        logs.append(f"[表级恢复] 指定表: {','.join(sel_tables)}")
+        renames = kwargs.get("table_renames") or None
+        logs.append(f"[表级恢复] 指定表: {','.join(sel_tables)}"
+                    + (f"；表改名: {renames}" if renames else ""))
         try:
             tmp_sql, found, notes = table_extract.slice_tables(
-                backup_path, sel_tables)
+                backup_path, sel_tables, renames=renames)
         except table_extract.TableExtractError as e:
             logs.append(f"[表级恢复] 切片失败: {e}")
             return BackupResult(
@@ -2652,8 +2656,19 @@ class MySQLEngine(BackupEngine):
             + (f"；{';'.join(notes)}" if notes else ""))
         kw = dict(kwargs)
         kw["target_db"] = target_db
+        target_host_info = kwargs.get("target_host_info")
         try:
-            result = self._restore_local(tmp_sql, **kw)
+            if target_host_info:
+                # 跨主机表级恢复：切片在平台侧完成，只把切片 SQL 推到目标机，
+                # 远端无需感知 tables / 改名，也不会误恢复其它表。
+                logs.append("[表级恢复] 经跨主机通道推送切片 SQL")
+                result = self._try_cross_host_restore(
+                    tmp_sql, target_host_info, target_db,
+                    kwargs.get("target_port"))
+                result.detail_log = "\n".join(logs) + "\n" + (
+                    result.detail_log or "")
+            else:
+                result = self._restore_local(tmp_sql, **kw)
             if result.success:
                 result.message = (
                     f"MySQL 表级恢复成功（{len(found)} 表 → {target_db}）"
@@ -2767,6 +2782,110 @@ class MySQLEngine(BackupEngine):
     # ------------------------------------------------------------------ #
     # 恢复校验
     # ------------------------------------------------------------------ #
+    def _verify_physical_prepare(self, backup_path: str, xtrabackup: str,
+                                 temp_dir: str) -> BackupResult:
+        """物理产物恢复校验：按完整增量链 prepare（与生产恢复同一套合并语义）。
+
+        恢复校验策略取任务「最近一次成功记录」；物理增量任务的该记录通常
+        只是 xtrabackup_inc_* 增量包，单独 --prepare 必然报
+        "This target seems not to have correct metadata"。这里复用
+        _restore_physical 的链组装口径（最近全量基 + 时间序增量层），逐层
+        --incremental-dir 合并并最终 prepare，真实证明整条链可恢复。
+        """
+        work = os.path.join(temp_dir, "data")
+        is_incr = self._xb_artifact_kind(
+            os.path.basename(backup_path.rstrip("/"))) == "inc"
+        apply_only = [] if self._is_maria_tool(xtrabackup) else ["--apply-log-only"]
+        parallel = self._restore_parallel()
+
+        def _ts(path):
+            m = re.search(r"(20\d{6}_\d{6})", os.path.basename(path))
+            return m.group(1) if m else ""
+
+        def _prepare(extra_args, what):
+            cmd = [xtrabackup, "--prepare"] + list(extra_args)
+            if parallel > 1:
+                cmd.append(f"--parallel={parallel}")
+            cmd.append(f"--target-dir={work}")
+            try:
+                res = self._run(cmd, timeout=7200)
+            except Exception as e:
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                    message=f"mysql: {what} 执行异常: {e}")
+            if res.get("returncode") != 0:
+                tail = (res.get("stderr") or res.get("stdout") or "")[-400:]
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                    message=f"mysql: {what} 失败: {tail}")
+            return None
+
+        def _materialize(src, dest, what):
+            try:
+                self._materialize_xb(src, dest)
+                try:
+                    self._decompress_xtrabackup_dir(dest)
+                except RuntimeError:
+                    pass  # 未压缩产物无需解压
+                if not os.path.isfile(os.path.join(dest, "xtrabackup_checkpoints")):
+                    return BackupResult(
+                        success=False, status=BackupStatus.FAILED,
+                        message=f"mysql: {what} 缺少 xtrabackup_checkpoints（产物不完整）")
+            except Exception as e:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    message=f"mysql: {what} 落地失败: {e}")
+            return None
+
+        base, chain = backup_path, []
+        if is_incr:
+            out_dir = os.path.dirname(os.path.abspath(backup_path))
+            entries = sorted(os.listdir(out_dir)) if os.path.isdir(out_dir) else []
+            arts = [os.path.join(out_dir, n) for n in entries
+                    if self._xb_artifact_kind(n) in ("full", "inc")]
+            target_ts = _ts(backup_path)
+            fulls = [p for p in arts if self._xb_artifact_kind(p) == "full"]
+            pre = [p for p in fulls if _ts(p) <= target_ts] or fulls
+            base = max(pre, key=_ts, default="")
+            if not base:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    message="mysql: 增量链校验失败，未找到全量基备 xtrabackup_full_*")
+            base_ts = _ts(base)
+            cand = {p for p in arts if self._xb_artifact_kind(p) == "inc"
+                    and base_ts <= _ts(p) <= target_ts}
+            cand.add(backup_path)
+            chain = sorted(cand, key=_ts)
+
+        err = _materialize(base, work, "全量基备 %s" % os.path.basename(base))
+        if err:
+            return err
+        err = _prepare(apply_only if is_incr else [], "全量基备 prepare")
+        if err:
+            return err
+
+        for i, inc in enumerate(chain):
+            inc_work = os.path.join(temp_dir, f"inc_{i}")
+            err = _materialize(inc, inc_work,
+                               "增量层 %s" % os.path.basename(inc))
+            if err:
+                return err
+            is_last = (i == len(chain) - 1)
+            err = _prepare(([] if is_last else apply_only) +
+                           [f"--incremental-dir={inc_work}"],
+                           f"应用增量层 {os.path.basename(inc)}")
+            if err:
+                return err
+        if is_incr:
+            err = _prepare([], "增量链最终 prepare")
+            if err:
+                return err
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS, verified=True,
+                message=(f"mysql: 物理增量链恢复校验通过（全量基备 + "
+                         f"{len(chain)} 层增量逐层 prepare 成功，产物可恢复）"))
+        return BackupResult(
+            success=True, status=BackupStatus.SUCCESS, verified=True,
+            message="mysql: 物理全量 xtrabackup --prepare 校验通过")
+
     def verify_record(self, record: dict, options: dict = None) -> BackupResult:
         """MySQL 恢复校验：逻辑备份检查 SQL 头；物理备份尝试 xtrabackup --prepare。"""
         options = options or {}
@@ -2779,7 +2898,17 @@ class MySQLEngine(BackupEngine):
                                 message="mysql: 不支持仿真备份校验，请使用真实备份", verified=False)
 
         mode = record.get("backup_mode") or self.backup_mode
-        size = os.path.getsize(backup_path)
+        if os.path.isdir(backup_path):
+            # 物理备份产物可以是目录（本机通道），getsize 会抛 IsADirectoryError
+            size = 0
+            for _root, _dirs, _files in os.walk(backup_path):
+                for _f in _files:
+                    try:
+                        size += os.path.getsize(os.path.join(_root, _f))
+                    except OSError:
+                        pass
+        else:
+            size = os.path.getsize(backup_path)
 
         # 物理备份：优先 xtrabackup --prepare --apply-log-only
         if mode == BackupMode.PHYSICAL:
@@ -2796,36 +2925,29 @@ class MySQLEngine(BackupEngine):
                     temp_dir = tempfile.mkdtemp(prefix=f"mysql_verify_{self.task_id}_")
                 try:
                     os.makedirs(temp_dir, exist_ok=True)
-                    is_xbstream = backup_path.endswith(".xbstream")
-                    if is_xbstream:
-                        # 先解压 xbstream
+                    if backup_path.endswith(".xbstream"):
+                        # xbstream 走独立解流路径（_materialize_xb 不支持该格式）
                         extract_cmd = [xtrabackup, "--extract",
                                        f"--target-dir={temp_dir}",
-                                       f"--stream=xbstream", "<", backup_path]
+                                       f"--stream=xbstream", "<", shlex.quote(backup_path)]
                         res = self._run(["sh", "-c", " ".join(extract_cmd)], timeout=3600)
                         if res["returncode"] != 0:
                             return BackupResult(success=False, status=BackupStatus.FAILED,
                                                 message=f"mysql: xbstream extract failed: {res['stderr']}")
-                    else:
-                        # 复制/解压 tar 到临时目录
-                        if backup_path.endswith((".tar.gz", ".tgz")):
-                            self._run(["tar", "-xzf", backup_path, "-C", temp_dir], timeout=3600)
-                        elif backup_path.endswith((".tar", ".tar.bz2")):
-                            algo = "j" if backup_path.endswith(".bz2") else ""
-                            self._run(["tar", f"-x{algo}f", backup_path, "-C", temp_dir], timeout=3600)
-                        else:
-                            _shutil.copytree(backup_path, temp_dir, dirs_exist_ok=True)
-                    prepare_cmd = [xtrabackup, "--prepare"]
-                    if self._restore_parallel() > 1:
-                        prepare_cmd.append(f"--parallel={self._restore_parallel()}")
-                    prepare_cmd.append(f"--target-dir={temp_dir}")
-                    res = self._run(prepare_cmd, timeout=7200)
-                    if res["returncode"] != 0:
-                        return BackupResult(success=False, status=BackupStatus.FAILED,
-                                            message=f"mysql: xtrabackup prepare failed: {res['stderr']}")
-                    return BackupResult(success=True, status=BackupStatus.SUCCESS,
-                                        message="mysql: xbstream extracted and prepared",
-                                        verified=True, size_bytes=size)
+                        prepare_cmd = [xtrabackup, "--prepare"]
+                        if self._restore_parallel() > 1:
+                            prepare_cmd.append(f"--parallel={self._restore_parallel()}")
+                        prepare_cmd.append(f"--target-dir={temp_dir}")
+                        res = self._run(prepare_cmd, timeout=7200)
+                        if res["returncode"] != 0:
+                            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                                message=f"mysql: xbstream prepare failed: {res['stderr']}")
+                        return BackupResult(success=True, status=BackupStatus.SUCCESS,
+                                            message="mysql: xbstream extracted and prepared",
+                                            verified=True, size_bytes=size)
+                    result = self._verify_physical_prepare(backup_path, xtrabackup, temp_dir)
+                    result.size_bytes = size
+                    return result
                 finally:
                     if os.path.isdir(temp_dir):
                         _shutil.rmtree(temp_dir, ignore_errors=True)

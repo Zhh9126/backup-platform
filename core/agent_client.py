@@ -28,6 +28,9 @@ import urllib.parse
 from core import crypto as _crypto
 
 CHUNK = 512 * 1024
+# 下载侧 sha256 对账上限：超大产物避免为目标机带来双倍读盘开销，
+# 超过阈值时如实降级为「落盘字节数」校验，不伪装成已做哈希对账。
+DIGEST_MAX_BYTES = 512 * 1024 ** 2
 
 
 class AgentError(RuntimeError):
@@ -109,6 +112,29 @@ class AgentTransport:
         if st != 200:
             raise AgentError("Agent %s 健康检查失败: HTTP %s" % (self.label, st))
         return self._open_json(data)
+
+    def negotiation(self) -> dict:
+        """平台侧按插件能力自报得出的传输协商结论（供页面/API 展示）。
+
+        全部按自报特性判定，不对未实现的特性做任何乐观假设。
+        """
+        caps = self.capabilities()
+        feats = caps.get("features") or []
+        comp = caps.get("compress") or []
+        return {
+            "version": caps.get("version") or "",
+            "os": caps.get("os") or "", "arch": caps.get("arch") or "",
+            "python": caps.get("python") or "",
+            "encryption": caps.get("algo") or "",
+            "features": feats, "compress": comp,
+            "allow_dirs": caps.get("allow_dirs") or [],
+            "chunk": caps.get("chunk"),
+            "transport_gzip": "gzip" in comp,
+            "resume": "resume" in feats,
+            "integrity_check": "fs-digest" in feats,
+            "integrity_algo": (caps.get("integrity") or ["size-only"])[0],
+            "digest_max_bytes": DIGEST_MAX_BYTES,
+        }
 
     # ---- 加密封包 ----
     def _seal(self, obj) -> bytes:
@@ -252,18 +278,60 @@ class AgentTransport:
             if offset > remote_size:
                 offset = 0
         os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-        q = urllib.parse.urlencode({"path": remote_path, "offset": offset})
+        # 按 Agent 能力自报协商传输压缩：仅全新下载（offset=0）能启用 gzip 流，
+        # 断点续传必须保持原始字节偏移，压缩后偏移会错乱。
+        use_gz = offset == 0 and "gzip" in (self.caps.get("compress") or [])
+        params = {"path": remote_path, "offset": offset}
+        if use_gz:
+            params["gz"] = "1"
+        q = urllib.parse.urlencode(params)
         st, _h, resp = self._request("GET", "/file?" + q, stream=True,
                                      timeout=86400)
         if st != 200:
             raise AgentError("Agent 下载 HTTP %s" % st)
+        dec = None
+        if use_gz:
+            import zlib
+            dec = zlib.decompressobj(16 + zlib.MAX_WBITS)
         written = offset
+        # 仅全新下载能做全文件哈希：断点续传时前 offset 字节不在本次流里。
+        hasher = hashlib.sha256() if offset == 0 else None
         with open(local_path, "ab" if offset else "wb") as f:
             for data in self._iter_chunked(resp):
-                f.write(data)
-                written += len(data)
+                payload = dec.decompress(data) if dec else data
+                f.write(payload)
+                written += len(payload)
+                if hasher and payload:
+                    hasher.update(payload)
                 if progress and written % (16 * 1024 * 1024) < CHUNK:
                     progress(written, remote_size)
+            if dec:
+                tail = dec.flush()
+                if tail:
+                    f.write(tail)
+                    written += len(tail)
+                    if hasher:
+                        hasher.update(tail)
+        # 1) 落盘字节数硬校验：任何插件版本都生效。此前只取了 remote_size
+        #    却从未核对，gzip 尾块丢失 / 断点续传中断会静默返回成功。
+        if written != remote_size:
+            raise AgentError(
+                "Agent 下载产物不完整: 落盘 %d 字节，远端 %d 字节（%s）"
+                % (written, remote_size, local_path))
+        # 2) 端到端 sha256 对账：仅新插件自报 fs-digest 且非续传时启用；
+        #    大文件由插件如实返回 sha256=None，降级为上面的大小校验。
+        if hasher and "fs-digest" in (self.caps.get("features") or []):
+            st, _h, data = self._request(
+                "POST", "/fs",
+                body=self._seal({"op": "digest", "path": remote_path,
+                                 "max_bytes": DIGEST_MAX_BYTES}))
+            if st == 200:
+                r = self._open_json(data)
+                remote_sha = r.get("sha256")
+                if remote_sha and hasher.hexdigest() != remote_sha:
+                    raise AgentError(
+                        "Agent 下载 sha256 对账不一致（传输损坏？）: %s"
+                        % local_path)
         return written
 
     # ---- 文件系统操作 ----

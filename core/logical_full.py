@@ -31,7 +31,8 @@ import config
 logger = logging.getLogger(__name__)
 
 # PG 协议系（逐库 dump + globals 语义一致），新增同源库时加入此元组即可
-PG_FAMILY = ("postgresql", "kingbase", "opengauss", "panwei")
+PG_FAMILY = ("postgresql", "kingbase", "opengauss", "panwei",
+             "highgo", "uxdb")
 
 # 各库类型的系统库清单（全实例默认排除，业务库优先）
 SYSTEM_DBS = {
@@ -100,6 +101,14 @@ TOOLING = {
         "default_query": "mysql",
     },
 }
+
+# 协议兼容层复用同族工具链：TiDB/OceanBase 为 MySQL 协议，瀚高/优炫为
+# PG 协议。此前 TOOLING/SYSTEM_DBS 只有 6 个键，这些 db_type 走全实例
+# 本机通道会直接 KeyError（被包装成「全实例备份失败」）。
+for _alias, _family in (("highgo", "postgresql"), ("uxdb", "postgresql"),
+                        ("tidb", "mysql"), ("oceanbase", "mysql")):
+    TOOLING.setdefault(_alias, TOOLING[_family])
+    SYSTEM_DBS.setdefault(_alias, SYSTEM_DBS[_family])
 
 
 def _pg_w_pass(db_type: str, password: str):

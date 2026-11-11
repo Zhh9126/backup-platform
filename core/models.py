@@ -44,6 +44,118 @@ def _normalize_json_fields(data: dict) -> dict:
     return data
 
 
+# 统一备份粒度：全实例 / 单库 / 单表。此前顶层 scope/tables/use_all_db
+# 不在 TASK_FIELDS 里，POST /api/tasks 会静默丢弃（HTTP 200 却不生效），
+# 只能靠各引擎各自的 extra_options 键表达，导致「所有库型三粒度」无统一入口。
+SCOPE_ALIASES = {
+    "full_instance": "full_instance", "instance": "full_instance",
+    "full": "full_instance", "all": "full_instance",
+    "全库": "full_instance", "全实例": "full_instance", "全库备份": "full_instance",
+    "database": "database", "db": "database", "single_db": "database",
+    "单库": "database", "库级": "database",
+    "table": "table", "single_table": "table", "tables": "table",
+    "单表": "table", "表级": "table",
+}
+
+
+# Oracle / 达梦的「库」是 schema（Data Pump / dexp 的 SCHEMAS=），
+# 与 MySQL/PG 的「库由 db_name 决定」语义不同。
+SCHEMA_SCOPE_DBS = ("oracle", "dameng")
+
+
+def _scope_list(value):
+    """把 schema / schemas / tables 的多种输入形态归一成去空白字符串列表。"""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [v.strip() for v in str(value).split(",") if v.strip()]
+
+
+def _normalize_scope_fields(data: dict, existing_extra: dict = None,
+                            db_type: str = None) -> dict:
+    """把顶层 scope / tables / schema(s) / use_all_db 归一进 extra_options。
+
+    归一后各引擎沿用既有读取口径（use_all_db / tables / schemas），无需改引擎。
+    Oracle/达梦的单库必须显式给 schema 才生成 SCHEMAS=，单表会把表名规范成
+    schema.table（expdp/dexp 要求全限定名），避免「选了单库却静默跑 FULL=Y」。
+    update 时传 existing_extra 可避免只改粒度就覆盖掉原有高级选项。
+    """
+    scope, tables, use_all = (data.get("scope"), data.get("tables"),
+                              data.get("use_all_db"))
+    top_schema = data.get("schema") or data.get("owner")
+    top_schemas = data.get("schemas")
+    if all(v is None for v in (scope, tables, use_all, top_schema, top_schemas)):
+        return data
+    extra: dict = {}
+    raw = data.get("extra_options")
+    if isinstance(raw, dict):
+        extra = dict(raw)
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            extra = dict(json.loads(raw) or {})
+        except (TypeError, ValueError):
+            extra = {}
+    elif existing_extra:
+        extra = dict(existing_extra)
+
+    schema_semantic = (str(db_type or data.get("db_type") or "").lower()
+                       in SCHEMA_SCOPE_DBS)
+    schema_list = _scope_list(top_schemas if top_schemas is not None else top_schema)
+    if not schema_list:
+        schema_list = _scope_list(extra.get("schemas") or extra.get("schema")
+                                  or extra.get("owner"))
+    schema_one = schema_list[0] if schema_list else ""
+
+    if scope is not None:
+        canonical = SCOPE_ALIASES.get(str(scope).strip().lower())
+        if not canonical:
+            raise ValueError(
+                "scope 非法（可选 full_instance/database/table 或 全库/单库/单表）: %s"
+                % scope)
+        extra["scope"] = canonical
+        if canonical == "full_instance":
+            extra["use_all_db"] = True
+            extra.pop("tables", None)
+            if schema_semantic:
+                extra.pop("schemas", None)  # 残留 SCHEMAS= 会把全库降级成单库
+        elif canonical == "table":
+            if not tables and not extra.get("tables"):
+                raise ValueError("scope=table 时必须提供 tables 表清单")
+            extra["use_all_db"] = False
+            if schema_semantic:
+                # 达梦 _scope_args 的 schemas 优先于 tables；改给单数 schema
+                # 配合全限定表名，两引擎都落到真正的 TABLES= 语义。
+                extra.pop("schemas", None)
+                names = (_scope_list(tables) if tables is not None
+                         else _scope_list(extra.get("tables")))
+                if not schema_one:
+                    if any("." not in n for n in names):
+                        raise ValueError(
+                            "Oracle/达梦 的 scope=table 必须提供 schema（业务模式名），"
+                            "或把 tables 写成 schema.table 全限定名")
+                    schema_one = names[0].split(".", 1)[0].strip('"')
+                extra["tables"] = [n if "." in n else "%s.%s" % (schema_one, n)
+                                   for n in names]
+                extra["schema"] = schema_one
+                tables = None  # 已规范化，避免下面用原始值覆盖
+        else:
+            extra["use_all_db"] = False
+            extra.pop("tables", None)
+            if schema_semantic:
+                if not schema_list:
+                    raise ValueError(
+                        "Oracle/达梦 的 scope=database 必须提供 schema（业务模式名）")
+                extra["schemas"] = schema_list
+                extra["schema"] = schema_one
+    if tables is not None:
+        extra["tables"] = tables
+    if use_all is not None:
+        extra["use_all_db"] = bool(use_all)
+    data["extra_options"] = json.dumps(extra, ensure_ascii=False)
+    return data
+
+
 def _clamp_interval(data: dict) -> dict:
     """调度间隔下限 60 秒：interval_minutes 最小 1，组合子调度同理。
 
@@ -69,7 +181,7 @@ def _clamp_interval(data: dict) -> dict:
 
 
 def create_task(data: dict) -> int:
-    # 商业授权与配额强校验（社区免费版每类限 5 个）
+    # 商业授权与配额强校验（社区免费版每类限 FREE_MAX_QUOTA 个）
     from core import license as license_mod
     _dt = data.get("db_type")
     if _dt in ("file", "synology"):
@@ -82,6 +194,7 @@ def create_task(data: dict) -> int:
     # 可选「按授权服务器数计量」：默认关闭，开启后同一主机多任务只占一个名额
     license_mod.check_server_quota(data.get("host"))
 
+    data = _normalize_scope_fields(dict(data))
     data = {k: data.get(k) for k in TASK_FIELDS}
     data = _clamp_interval(_normalize_json_fields(data))
     # 压缩级 1~29（对标 DBackup：1-8 gzip / 9-22 zstd / 23-29 zstd 高档）
@@ -125,6 +238,19 @@ def create_task(data: dict) -> int:
 
 
 def update_task(task_id: int, data: dict) -> bool:
+    # 局部更新粒度时，先合并任务原有的 extra_options，避免只改 scope
+    # 就把 ssh_cred / dump_format 等高级选项整列覆盖掉。
+    if any(k in data for k in ("scope", "tables", "use_all_db")):
+        old = get_task(task_id) or {}
+        old_eo = old.get("extra_options")
+        if isinstance(old_eo, str):
+            try:
+                old_eo = json.loads(old_eo or "{}")
+            except (TypeError, ValueError):
+                old_eo = {}
+        data = _normalize_scope_fields(
+            dict(data), existing_extra=old_eo if isinstance(old_eo, dict) else None,
+            db_type=old.get("db_type"))
     data = {k: v for k, v in data.items() if k in TASK_FIELDS}
     if not data:
         return False
@@ -1117,7 +1243,7 @@ def mark_record_verified(record_id: int, ok: bool, msg: str) -> None:
 # ------------------------- 虚拟数据库（VDB / 测试库） -------------------------
 def create_vdb(data: dict) -> int:
     fields = ["name", "source_record_id", "task_id", "db_type", "port", "host",
-              "database_name", "username", "password", "status",
+              "database_name", "username", "password", "status", "service",
               "created_at", "expires_at", "note"]
     row = {k: data.get(k) for k in fields}
     if not row.get("created_at"):
@@ -1138,7 +1264,7 @@ def get_vdb(vdb_id: int) -> dict:
 
 def update_vdb(vdb_id: int, data: dict) -> None:
     allow = {"status", "expires_at", "last_used_at", "note", "port", "host",
-             "database_name", "username", "password"}
+             "database_name", "username", "password", "service"}
     updates = {k: v for k, v in data.items() if k in allow}
     if not updates:
         return

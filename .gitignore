@@ -56,6 +56,7 @@ core/ai_agent/
 docs/ai-agent-design.md
 docs/ai-agent-prd.md
 tests/test_ai_agent.py
+tests/test_ai_autonomous.py
 templates/agent.html
 static/js/ai-agent.js
 static/js/agent-render.js

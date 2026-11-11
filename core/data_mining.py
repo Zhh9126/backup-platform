@@ -546,5 +546,7 @@ class DataMiner:
                 writer.writerow({c: row.get(c, "") for c in columns})
 
 
-# 便捷单例
-data_miner = DataMiner()
+# 导出目录按需创建：API 每次调用 DataMiner() 自行初始化。
+# 不要在模块导入期实例化——备份根目录若是断链软链、或被占用为普通文件，
+# DataMiner.__init__ 的 mkdir 会在 import 阶段抛 OSError，进而让整个 Flask
+# 应用无法启动（2026-11-11 清理旧备份根时实测暴露）。

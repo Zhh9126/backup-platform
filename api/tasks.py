@@ -206,34 +206,110 @@ def api_task_badblock_check(task_id):
     return jsonify(res)
 
 
-@api_bp.route("/tasks/<int:task_id>/list-databases", methods=["GET"])
-@login_required
-def list_task_databases(task_id):
-    """获取该任务对应的数据库实例的库列表（用于备份范围多选 UI）。
+def _db_list_payload(task: dict):
+    """生成库列表响应体，返回 (payload, error)；error 非空时调用方返回 500。
 
-    MySQL/MariaDB: SHOW DATABASES
-    PostgreSQL:     SELECT datname FROM pg_database WHERE NOT datistemplate
-    Kingbase:       同 PG（兼容协议）
-    Oracle/达梦:    通过 JDBC 拉取 schema 列表
-    其他类型：返回 []
+    MySQL/MariaDB: SHOW DATABASES；PG/金仓: pg_database；
+    Oracle/达梦: 引擎返回空时经 JDBC 拉取 schema；不支持的类型返回空列表。
     原有连接方式失败时自动回退 JDBC 通道（core/jdbc.py）。
     """
-    task = models.get_task(task_id, include_secret=True)
-    if not task:
-        return jsonify({"error": "任务不存在"}), 404
-    db_type = task.get("db_type")
+    db_type = (task.get("db_type") or "").lower()
     if db_type not in _LIST_DB_SKIP:
-        return jsonify({"databases": [], "type": "none"})
+        return {"databases": [], "type": "none"}, None
     dbs, via_jdbc, err = _fetch_db_list(db_type, task)
     if err and not dbs:
-        return jsonify({"error": f"拉取失败: {err}", "databases": []}), 500
+        return {"databases": []}, f"拉取失败: {err}"
     skip = _LIST_DB_SKIP[db_type]
     dbs = [d for d in (dbs or []) if d not in skip]
-    return jsonify({
+    return {
         "databases": dbs,
         "type": "schemas" if db_type in ("postgresql", "kingbase") else "databases",
         "via_jdbc": via_jdbc,
-    })
+    }, None
+
+
+@api_bp.route("/tasks/<int:task_id>/list-databases", methods=["GET"])
+@login_required
+def list_task_databases(task_id):
+    """获取已保存任务的库列表（编辑态，保留兼容其它调用方）。"""
+    task = models.get_task(task_id, include_secret=True)
+    if not task:
+        return jsonify({"error": "任务不存在"}), 404
+    payload, err = _db_list_payload(task)
+    if err:
+        return jsonify({"error": err, "databases": []}), 500
+    return jsonify(payload)
+
+
+def _task_from_form(body: dict):
+    """把任务向导表单参数转成一次性探测用 task dict（不落库）。
+
+    返回 (task, error)；error 非空时调用方按 400 返回。编辑态传 task_id
+    且密码留空时沿用库中已加密凭据，其余留空字段同样回填任务值。
+    """
+    db_type = str(body.get("db_type") or "").strip().lower()
+    host = str(body.get("host") or "").strip()
+    port = body.get("port")
+    username = str(body.get("username") or "").strip()
+    password = str(body.get("password") or "")
+    db_name = str(body.get("db_name") or "").strip()
+    if not db_type:
+        return None, "请先选择数据库类型"
+    if not host:
+        return None, "请先填写主机地址"
+
+    stored, tid = None, 0
+    raw_id = body.get("task_id")
+    if raw_id not in (None, "", 0, "0"):
+        try:
+            tid = int(raw_id)
+            stored = models.get_task(tid, include_secret=True)
+        except (TypeError, ValueError):
+            stored, tid = None, 0
+
+    # 引擎 / JDBC / native_conn 都按「已加密密文」读取并自行 decrypt_secret；
+    # 表单传来的是明文需先加密，编辑态留空则直接复用库中密文。
+    if stored and not password:
+        pw_cipher = stored.get("password") or ""
+    elif password.startswith(("sm4v1:", "enc:")):
+        pw_cipher = password
+    else:
+        pw_cipher = db.encrypt_secret(password)
+
+    if stored:
+        port = port or stored.get("port")
+        username = username or (stored.get("username") or "")
+        db_name = db_name or (stored.get("db_name") or "")
+
+    return {
+        "id": tid,
+        "name": "表单探测",
+        "db_type": db_type,
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": pw_cipher,
+        "db_name": db_name,
+        "extra_options": "{}",
+    }, None
+
+
+@api_bp.route("/tasks/list-databases", methods=["POST"])
+@login_required
+def list_form_databases():
+    """按任务向导当前表单参数拉取库列表：不落库、不需要先保存任务。
+
+    body: {db_type, host, port, username, password, db_name, task_id?}
+    响应结构与 GET /tasks/<id>/list-databases 完全一致。
+    """
+    body = request.get_json(silent=True) or {}
+    task, error = _task_from_form(body)
+    if error:
+        return jsonify({"error": error, "databases": []}), 400
+    payload, err = _db_list_payload(task)
+    if err:
+        return jsonify({"error": err, "databases": []}), 500
+    return jsonify(payload)
 
 
 @api_bp.route("/custom-script/template", methods=["GET"])
@@ -255,26 +331,16 @@ def custom_script_template():
     return jsonify(tpl)
 
 
-@api_bp.route("/tasks/<int:task_id>/list-tables", methods=["GET"])
-@login_required
-def list_task_tables(task_id):
-    """列出任务库中的基础表（供「自定义备份 → 单表/多表」勾选表名）。
-
-    直连优先（core/native_conn），失败回退 JDBC（core/data_compare 的表清单逻辑）。
-    """
-    task = models.get_task(task_id, include_secret=True)
-    if not task:
-        return jsonify({"error": "任务不存在"}), 404
+def _tables_payload(task: dict, database: str, schema: str):
+    """直连优先（core/native_conn），失败回退 JDBC；返回 (payload, status)。"""
     db_type = (task.get("db_type") or "").lower()
-    database = request.args.get("db") or task.get("db_name") or ""
-    schema = request.args.get("schema") or ""
-    conn = None
-    err = ""
+    pw_plain = db.decrypt_secret(task.get("password") or "")
+    conn, err = None, ""
     try:
         from core import native_conn
         conn = native_conn.connect(
             db_type, task.get("host"), task.get("port"), database,
-            task.get("username"), db.decrypt_secret(task.get("password") or ""))
+            task.get("username"), pw_plain)
     except Exception as e:
         err = str(e)
     if conn is None:
@@ -282,22 +348,51 @@ def list_task_tables(task_id):
             from core import jdbc
             conn = jdbc.connect(
                 db_type, task.get("host"), task.get("port"), database,
-                task.get("username"), db.decrypt_secret(task.get("password") or ""))
+                task.get("username"), pw_plain)
         except Exception as e:
-            # 连不上/库不存在属于"任务配置或目标环境问题"，不是服务端异常：
-            # 返回 400（带 error 与空表清单）而非 500，前端可提示用户、压测不会误判 5xx
-            return jsonify({"error": f"连接失败: {err or e}", "tables": []}), 400
+            # 连不上/库不存在属于任务配置或目标环境问题，返回 400 而非 500
+            return {"error": f"连接失败: {err or e}", "tables": []}, 400
     try:
         from core.data_compare import _list_tables
         tables = _list_tables(conn, db_type, database, schema)
     except Exception as e:
-        return jsonify({"error": f"拉取表清单失败: {e}", "tables": []}), 400
+        return {"error": f"拉取表清单失败: {e}", "tables": []}, 400
     finally:
         try:
             conn.close()
         except Exception:
             pass
-    return jsonify({"tables": tables, "db": database, "count": len(tables)})
+    return {"tables": tables, "db": database, "count": len(tables)}, 200
+
+
+@api_bp.route("/tasks/<int:task_id>/list-tables", methods=["GET"])
+@login_required
+def list_task_tables(task_id):
+    """列出已保存任务库中的基础表（编辑态，保留兼容其它调用方）。"""
+    task = models.get_task(task_id, include_secret=True)
+    if not task:
+        return jsonify({"error": "任务不存在"}), 404
+    database = request.args.get("db") or task.get("db_name") or ""
+    schema = request.args.get("schema") or ""
+    payload, status = _tables_payload(task, database, schema)
+    return jsonify(payload), status
+
+
+@api_bp.route("/tasks/list-tables", methods=["POST"])
+@login_required
+def list_form_tables():
+    """按任务向导当前表单参数拉取表清单：不落库、不需要先保存任务。
+
+    body: 同 /tasks/list-databases，另可带 db / schema 覆盖库与模式。
+    """
+    body = request.get_json(silent=True) or {}
+    task, error = _task_from_form(body)
+    if error:
+        return jsonify({"error": error, "tables": []}), 400
+    database = str(body.get("db") or task.get("db_name") or "").strip()
+    schema = str(body.get("schema") or "").strip()
+    payload, status = _tables_payload(task, database, schema)
+    return jsonify(payload), status
 
 
 @api_bp.route("/tasks", methods=["GET"])
@@ -389,6 +484,10 @@ def create_task():
         tid = models.create_task(data)
     except license_mod.QuotaExceededError as qe:
         return jsonify({"error": str(qe), "quota_exceeded": True}), 403
+    except ValueError as ve:
+        # 统一粒度字段非法（如 scope=table 未给 tables）前置报 400，
+        # 不再让静默丢弃或 500 掩盖配置错误。
+        return jsonify({"error": str(ve)}), 400
     scheduler.reload_scheduler()
     return jsonify({"id": tid, "ok": True}), 201
 
@@ -435,7 +534,10 @@ def update_task(task_id):
         except Exception:
             pass
         data["extra_options"] = _secure_ssh_cred(data["extra_options"])
-    models.update_task(task_id, data)
+    try:
+        models.update_task(task_id, data)
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
     scheduler.reload_scheduler()
     # 语义明确化：实时保护依赖任务启用。任务停用（enabled=0）时实时捕获
     # 不会被守护接管（重启后也不会自动拉起），必须提示，避免保护盲区
@@ -458,6 +560,9 @@ def delete_task(task_id):
     gate = verify_code_gate(request.get_json(silent=True) or {})
     if gate:
         return jsonify(gate[0]), gate[1]
+    # 不存在的任务必须如实 404，否则前端会提示「删除成功」但实际什么都没删
+    if not db.query_one("SELECT id FROM backup_tasks WHERE id=?", (task_id,)):
+        return jsonify({"error": "任务不存在"}), 404
     # 运行中任务：先发停止指令再删（前后端一致——删除按钮始终可见）
     row = db.query_one(
         "SELECT id FROM backup_records WHERE task_id=? AND status='running' "
@@ -475,6 +580,18 @@ def delete_task(task_id):
 def run_task(task_id):
     data = request.get_json(force=True, silent=True) or {}
     backup_type = data.get("backup_type")
+    # 三层 CPU 保护的 API 端实时复查：>70% 直接拒绝，不进入执行队列。
+    # 探测失败/模块异常一律 fail-open，不因保护逻辑阻断正常备份。
+    try:
+        from core import source_guard
+        gate = source_guard.check_api_guard(task_id)
+        if gate.get("blocked"):
+            return jsonify({
+                "error": gate.get("message") or "源端 CPU 负载过高，已拒绝本次备份",
+                "source_guard": gate,
+            }), 429
+    except Exception:
+        pass
     # 显式异步：所有库型统一投递并行队列，多个任务的「立即备份」可同时发起。
     # 不传 async 时保持原有同步语义（兼容 E2E / 调度 / 存量调用方）。
     if data.get("async") or data.get("run_async"):
@@ -493,6 +610,24 @@ def run_task(task_id):
     if record.get("accepted"):
         return jsonify(record), 202
     return jsonify(record)
+
+
+@api_bp.route("/tasks/<int:task_id>/retry", methods=["POST"])
+@login_required
+def retry_task(task_id):
+    """任务中心：重跑该任务最近一条失败记录（取消/重试/删除闭环）。"""
+    row = db.query_one(
+        "SELECT id, backup_type FROM backup_records WHERE task_id=? "
+        "AND status='failed' ORDER BY id DESC LIMIT 1", (task_id,))
+    if not row:
+        return jsonify({"error": "该任务没有可重试的失败记录"}), 404
+    if scheduler.is_task_submitted(task_id):
+        return jsonify({"error": "该任务已在并行执行队列中，请等待本次完成"}), 409
+    record = scheduler.run_task_now(task_id, backup_type=row["backup_type"],
+                                    operator="retry")
+    if not record:
+        return jsonify({"error": "任务不存在"}), 404
+    return jsonify(record), (202 if record.get("accepted") else 200)
 
 
 @api_bp.route("/tasks/quick-backup", methods=["POST"])

@@ -119,6 +119,24 @@
   </div>
 </div>
 
+<!-- 备份插件能力自报与传输协商 -->
+<div class="card mb-3">
+  <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <b><i class="bi bi-cpu me-2"></i>备份插件能力与传输协商</b>
+    <div class="d-flex gap-2 align-items-center">
+      <select class="form-select form-select-sm" id="ac_agent" style="width:260px">
+        <option value="">选择已注册执行器…</option>
+      </select>
+      <button class="btn btn-sm btn-outline-primary" onclick="loadAgentCaps()">
+        <i class="bi bi-arrow-repeat me-1"></i>读取能力自报
+      </button>
+    </div>
+  </div>
+  <div class="card-body" id="ac_caps">
+    <span class="text-muted small">选择执行器后点击「读取能力自报」：平台按插件<b>实际自报</b>的能力决定是否启用 gzip 传输压缩、断点续传与端到端 sha256 对账；插件未自报的能力不会被乐观假设。</span>
+  </div>
+</div>
+
 <!-- 任务 × 通道 -->
 <div class="card mb-3">
   <div class="card-header d-flex justify-content-between align-items-center">
@@ -259,6 +277,14 @@
     const tb = document.getElementById("agentRows");
     try {
       const list = await api("GET", "/api/v1/agents");
+      const capSel = document.getElementById("ac_agent");
+      if (capSel) {
+        const prev = capSel.value;
+        capSel.innerHTML = '<option value="">选择已注册执行器…</option>' +
+          (list || []).map((a) => '<option value="' + a.id + '">' +
+            esc(a.hostname) + ":" + esc(a.port) + "</option>").join("");
+        if (prev) capSel.value = prev;
+      }
       if (!(list || []).length) {
         tb.innerHTML = '<tr><td colspan="7" class="text-muted small">暂无已注册执行器 —— 在右侧选择纳管主机一键安装</td></tr>';
         return;
@@ -277,6 +303,51 @@
       }).join("");
     } catch (e) {
       tb.innerHTML = '<tr><td colspan="7" class="text-danger small">加载失败: ' + esc(String(e.message || e)) + "</td></tr>";
+    }
+  };
+
+  // ---------------- 备份插件能力自报 / 传输协商 ----------------
+  window.loadAgentCaps = async function () {
+    const id = (document.getElementById("ac_agent") || {}).value;
+    const box = document.getElementById("ac_caps");
+    if (!id) { box.innerHTML = '<span class="text-muted small">请先选择已注册执行器</span>'; return; }
+    box.innerHTML = '<span class="text-primary small">正在读取插件能力自报…</span>';
+    try {
+      const r = await api("GET", "/api/v1/agents/" + id + "/capabilities");
+      const n = r.negotiation || {};
+      const yn = (v, t, f) => '<span class="badge bg-' + (v ? "success" : "secondary") + '">' + (v ? t : f) + "</span>";
+      const feats = (n.features || []).map((f) =>
+        '<span class="badge bg-light text-dark border me-1">' + esc(f) + "</span>").join("") || "-";
+      const dirs = (n.allow_dirs || []).map((d) => "<code>" + esc(d) + "</code>").join("、") || "-";
+      const mb = Math.round((n.digest_max_bytes || 0) / 1024 / 1024);
+      const hasResume = (n.features || []).indexOf("resume") >= 0;
+      box.innerHTML =
+        '<div class="row g-3 mb-3">' +
+          '<div class="col-md-3"><div class="text-muted small">插件版本 / 目标平台</div><b>' +
+            esc(n.version || "-") + "</b>" +
+            '<div class="small">' + esc(n.os || "-") + " / " + esc(n.arch || "-") +
+            " · Python " + esc(n.python || "-") + "</div></div>" +
+          '<div class="col-md-3"><div class="text-muted small">传输加密</div><b>' +
+            esc(n.encryption || "-") + "</b></div>" +
+          '<div class="col-md-2"><div class="text-muted small">传输块大小</div><b>' +
+            esc(String(n.chunk || "-")) + "</b> 字节</div>" +
+          '<div class="col-md-4"><div class="text-muted small">文件白名单目录</div>' +
+            '<div class="small">' + dirs + "</div></div>" +
+        "</div>" +
+        '<div class="mb-2"><span class="text-muted small me-2">自报特性：</span>' + feats + "</div>" +
+        '<table class="table table-sm mb-0"><thead class="table-light"><tr>' +
+          "<th>能力</th><th>插件自报</th><th>平台实际决策</th></tr></thead><tbody>" +
+          "<tr><td>传输压缩</td><td>" + esc((n.compress || []).join(", ") || "-") + "</td><td>" +
+            yn(n.transport_gzip, "全新下载启用 gzip", "不启用") +
+            '<span class="text-muted small ms-2">断点续传时自动关闭（压缩后字节偏移会错乱）</span></td></tr>' +
+          "<tr><td>断点续传</td><td>" + esc(hasResume ? "resume" : "未自报") + "</td><td>" +
+            yn(n.resume, "按本地偏移续传", "每次全量重传") + "</td></tr>" +
+          "<tr><td>产物完整性</td><td>" + esc(n.integrity_algo || "-") + "</td><td>" +
+            yn(n.integrity_check, "端到端 sha256 对账 + 落盘字节数硬校验", "仅落盘字节数硬校验（老插件诚实降级）") +
+            '<span class="text-muted small ms-2">超过 ' + mb + 'MB 的产物如实跳过哈希，只做大小校验</span></td></tr>' +
+        "</tbody></table>";
+    } catch (e) {
+      box.innerHTML = '<span class="text-danger small">读取失败：' + esc(String(e.message || e)) + "</span>";
     }
   };
 

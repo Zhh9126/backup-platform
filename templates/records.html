@@ -230,8 +230,18 @@
           </div>
         </div>
         <div class="mb-3">
-          <label class="form-label">目标库（可选）</label>
-          <input class="form-control" id="object_target_db" placeholder="默认沿用备份库名">
+          <label class="form-label">目标库（可选，UAT 异名库）</label>
+          <input class="form-control" id="object_target_db" placeholder="默认沿用备份库名；填新库名即恢复到 UAT 异名库">
+          <div class="form-text">目标库不存在会自动创建，源库不会被改动</div>
+        </div>
+        <div class="mb-3">
+          <label class="form-label">新表名 / 表改名（可选）</label>
+          <input class="form-control" id="object_table_renames"
+                 placeholder="单表直接填新表名；多表：t_order=t_order_uat,t_log=t_log_uat">
+          <div class="form-text">
+            只恢复勾选的表并改成新表名。单表可直接填 <code>t_order_uat</code>；
+            多表用 <code>源表=新表</code> 逗号分隔。留空 = 保持原表名。
+          </div>
         </div>
       </div>
       <div class="modal-footer">

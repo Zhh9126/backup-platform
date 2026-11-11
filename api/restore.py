@@ -90,6 +90,8 @@ def create_restore():
             target_time=data.get("target_time"),
             pitr_restore_dir=data.get("pitr_restore_dir"),
             tables=data.get("tables"),
+            table_renames=data.get("table_renames"),
+            target_schema=data.get("target_schema"),
             restore_options=restore_options or None,
             # 强制恢复必须同时带显式确认，避免误点绕过安全门
             force_unsafe_restore=bool(data.get("force_unsafe_restore"))

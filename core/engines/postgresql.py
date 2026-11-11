@@ -21,7 +21,8 @@ import shutil
 import subprocess
 import json
 
-from core.engines.base import BackupEngine, BackupType, BackupMode, BackupStatus, BackupResult
+from core.engines.base import (BackupEngine, BackupType, BackupMode,
+                               BackupStatus, BackupResult, parse_table_list)
 import config
 import core.db as db
 
@@ -263,6 +264,10 @@ class PostgreSQLEngine(BackupEngine):
             cmd += ["-d", str(db_name), fmt_flag, "-f", dump_out]
         # openGauss：-W 显式密码（sha256 认证不读 PGPASSWORD）
         cmd += self._w_pass_args(pw)
+        # 单表备份：真实追加 -t。此前 extra.tables 只用于阻止全实例分支，
+        # 本机通道会静默产出整库 dump 却按「指定表」记账，粒度不真实。
+        for _tb in parse_table_list(extra_eo.get("tables")):
+            cmd += ["-t", _tb]
         # 追加用户自定义扩展选项（extra_options 为 JSON 字符串）
         extra = self._parse_extra_options()
         if extra:
@@ -285,7 +290,11 @@ class PostgreSQLEngine(BackupEngine):
                 stderr=ret["stderr"],
                 simulated=False,
                 checksum="",
-                message=f"pg_dump 执行失败(rc={ret['returncode']}): {ret['stderr']}",
+                message=(f"pg_dump 执行失败(rc={ret['returncode']}): {ret['stderr']}"
+                         + ("；平台侧 pg_dump 版本低于服务器，请纳管该主机或在任务高级选项配置"
+                            " SSH 凭据，平台会自动在数据库服务器用自带匹配版本工具备份（零安装）"
+                            if "server version" in str(ret.get("stderr") or "")
+                            and "pg_dump version" in str(ret.get("stderr") or "") else "")),
             )
 
         # 6.5) 目录格式（-Fd）：把目录归档打包为单文件 .dir.tar.gz 后清理临时目录
@@ -688,6 +697,29 @@ exit 0
             return self._try_cross_host_restore(
                 backup_path, target_host_info, target_db, kwargs.get("target_port"))
 
+        # 0.5) 表级 / 改名恢复优先走远端：目标机自带与实例严格匹配版本的
+        #      pg_restore（平台侧可能只有低版本客户端，实测 14.12 vs 16.9）。
+        #      也避免本机失败后 SSH 兜底把整包灌回、静默吞掉 tables。
+        if kwargs.get("tables") or kwargs.get("table_renames"):
+            from core import remote_dump as _rd
+            _ssh = _rd.resolve_ssh_host(self.task)
+            if _ssh:
+                try:
+                    from core import pg_remote_tables
+                    _r = pg_remote_tables.restore_tables(
+                        self.task, _ssh, backup_path, self._dump_db_type,
+                        kwargs.get("target_db") or "", kwargs.get("tables") or [],
+                        kwargs.get("table_renames") or {})
+                    return BackupResult(
+                        success=True, status=BackupStatus.SUCCESS,
+                        backup_path=backup_path, message=_r["message"],
+                        simulated=False)
+                except Exception as _e:
+                    return BackupResult(
+                        success=False, status=BackupStatus.FAILED,
+                        backup_path=backup_path,
+                        message=f"远端表级恢复失败: {_e}", simulated=False)
+
         # 1) 先尝试本机直接恢复
         result = self._restore_local(backup_path, **kwargs)
         if result.success:
@@ -741,6 +773,40 @@ exit 0
             env_extra=env_extra, timeout=120)
         return chk["returncode"] == 0 and chk["stdout"].strip() == "1"
 
+    def _apply_table_renames(self, host, port, user, target_db, pw,
+                             env_extra, renames) -> tuple:
+        """恢复成功后执行表改名（pg_restore --table 本身没有 rename 语义）。
+
+        返回 (ok, info)；改名失败时调用方必须把整次恢复判为失败，不假成功。
+        """
+        if not renames:
+            return True, ""
+
+        def qi(name):
+            return '"' + str(name).replace('"', '""') + '"'
+
+        stmts = []
+        for src, dst in renames.items():
+            s = str(src).strip().strip('"')
+            d = str(dst).strip().strip('"')
+            if "." in s:
+                sch, tbl = s.split(".", 1)
+                target = f"{qi(sch)}.{qi(tbl)}"
+            else:
+                target = qi(s)
+            stmts.append(f"ALTER TABLE IF EXISTS {target} RENAME TO {qi(d)};")
+        cmd = [
+            self._resolve_local_tool("psql"), "--host", str(host),
+            "--port", str(port), "--username", str(user),
+            "-v", "ON_ERROR_STOP=1", "-d", str(target_db),
+            "-c", "".join(stmts),
+        ]
+        cmd += self._w_pass_args(pw)
+        ret = self._run(cmd, env_extra=env_extra, timeout=180)
+        if ret["returncode"] != 0:
+            return False, (ret.get("stderr") or "").strip()
+        return True, ", ".join(f"{k}→{v}" for k, v in renames.items())
+
     def _restore_local(self, backup_path: str, **kwargs) -> BackupResult:
         """本机 psql/pg_restore 真实恢复。"""
         if not backup_path or not os.path.exists(backup_path):
@@ -764,6 +830,14 @@ exit 0
         #   - 含 manifest.json → 全实例逐库包（multi-db-tar），走逐库恢复流程
         #   - 含 toc.dat（无 manifest）→ 目录格式 -Fd 的单库归档，解开后 pg_restore
         #   - 其余/旧产物（两者皆无）→ 仍按全实例流程处理，保持历史兼容
+        if kwargs.get("table_renames") and backup_path.endswith((".tar.gz", ".tgz")):
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path,
+                message="目录格式 / 全实例 tar 产物暂不支持表改名；"
+                        "请用自定义格式(-Fc)单库备份后恢复指定表并改名",
+                simulated=False)
+
         if backup_path.endswith((".tar.gz", ".tgz")):
             if (not self._tar_has_member(backup_path, "manifest.json")
                     and self._tar_has_member(backup_path, "toc.dat")):
@@ -837,6 +911,16 @@ exit 0
             # 纯文本格式用 psql 执行 SQL 脚本。
             # 必须带 ON_ERROR_STOP：psql 默认遇 SQL 错误仅打印、rc 仍为 0——
             # 恢复失败会被误判成功（实测根因，FIX-2026-001 举一反三）
+            # 纯文本无对象级 TOC，--table 不可用：此前会静默全量恢复，
+            # 与「只恢复指定表」的预期不符，改为如实失败。
+            if kwargs.get("tables"):
+                return BackupResult(
+                    success=False,
+                    status=BackupStatus.FAILED,
+                    backup_path=backup_path,
+                    message="纯文本 .sql 产物不支持表级恢复（无对象级 TOC）；"
+                            "请改用自定义格式(-Fc)备份后再选表，或走整库恢复",
+                    simulated=False)
             cmd = [
                 self._resolve_local_tool("psql"),
                 "--host", str(host),
@@ -879,6 +963,28 @@ exit 0
                 message=f"恢复失败(rc={ret['returncode']}): {ret['stderr']}",
             )
 
+        # 表改名：pg_restore --table 无 rename 语义，恢复成功后在目标库执行
+        # ALTER TABLE ... RENAME TO ...；失败则整次恢复判失败（不假成功）。
+        rename_note = ""
+        renames = kwargs.get("table_renames") or {}
+        if renames:
+            ok, info = self._apply_table_renames(
+                host, port, user, target_db, pw, env_extra, renames)
+            if not ok:
+                return BackupResult(
+                    success=False,
+                    status=BackupStatus.FAILED,
+                    backup_path=backup_path,
+                    size_bytes=0,
+                    duration_sec=duration,
+                    stdout=ret["stdout"],
+                    stderr=info,
+                    simulated=False,
+                    checksum="",
+                    message=f"表改名失败: {info}",
+                )
+            rename_note = f"；表改名: {info}"
+
         return BackupResult(
             success=True,
             status=BackupStatus.SUCCESS,
@@ -889,7 +995,7 @@ exit 0
             stderr=ret["stderr"],
             simulated=False,
             checksum="",
-            message=f"PostgreSQL 恢复成功 -> {target_db}",
+            message=f"PostgreSQL 恢复成功 -> {target_db}{rename_note}",
         )
 
     # ------------------------- 恢复校验 -------------------------

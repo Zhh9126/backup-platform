@@ -55,7 +55,7 @@ try:
 except Exception:
     _HAS_AES = False
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 MAX_BODY = 16 * 1024 * 1024      # 请求体上限（JSON/分块上传均远小于此）
 MAX_SYNC_OUT = 16 * 1024 * 1024          # /exec 同步输出上限（超出建议 exec-stream）
 CHUNK = 512 * 1024                        # 流式块大小
@@ -223,8 +223,16 @@ class Handler(BaseHTTPRequestHandler):
                     "version": VERSION, "hmac": "required", "enc": bool(_HAS_AES),
                     "algo": "AES-256-GCM" if _HAS_AES else "HMAC-SHA256",
                     "chunk": CHUNK, "python": sys.version.split()[0],
+                    # 能力自报：平台据此做架构/压缩协商，不虚报未实现的特性
+                    "os": sys.platform,
+                    "arch": os.uname().machine if hasattr(os, "uname") else "unknown",
                     "allow_dirs": AgentState.allow_dirs,
                     "compress": ["gzip"],
+                    # 下载侧文件指纹：平台据此做端到端 sha256 对账，
+                    # 老版本插件不自报该特性时平台自动降级为大小校验。
+                    "integrity": ["sha256"],
+                    "features": ["exec", "exec-stream", "file-put", "file-get",
+                                 "cancel", "resume", "fs", "fs-digest"],
                 }
                 self._respond(200, caps)
                 return
@@ -560,6 +568,25 @@ class Handler(BaseHTTPRequestHandler):
                                     "isdir": os.path.isdir(path)})
             else:
                 self._respond(200, {"exists": False})
+        elif op == "digest":
+            # 下载侧端到端完整性：平台拉回产物后核对 sha256，防止断点续传 /
+            # gzip 流中断后「字节少了但仍判成功」。超过 max_bytes 的大文件
+            # 如实返回 sha256=None（平台降级为大小校验），绝不虚报。
+            if not os.path.isfile(path):
+                self._respond(200, {"exists": False})
+                return
+            size = os.path.getsize(path)
+            max_bytes = int(req.get("max_bytes") or 0)
+            if max_bytes and size > max_bytes:
+                self._respond(200, {"exists": True, "size": size,
+                                    "sha256": None, "skipped": "over_limit"})
+                return
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for blk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+                    h.update(blk)
+            self._respond(200, {"exists": True, "size": size,
+                                "sha256": h.hexdigest()})
         elif op == "chmod":
             os.chmod(path, int(req.get("mode", "644"), 8))
             self._respond(200, {"ok": True})

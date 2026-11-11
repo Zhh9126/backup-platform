@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """AIDBM 系统授权与纳管配额管理模块。
 
-- 社区免费版（未授权）：网络设备及各项备份任务（数据库、文件、网络设备、对象存储、虚拟机、AI 模型）最多纳管 5 个；
+- 社区免费版（未授权）：网络设备及各项备份任务（数据库、文件、网络设备、对象存储、虚拟机、AI 模型）每类最多纳管 FREE_MAX_QUOTA 个；
 - 企业永久版（已授权）：通过与服务器物理 MAC 绑定的 RSA-2048 防伪授权码激活，全模块解除配额限制，无上限使用。
 """
 import base64
@@ -22,7 +22,7 @@ from core import db
 logger = logging.getLogger("aidbm.license")
 
 PUB_KEY_PATH = Path(__file__).resolve().parent / "license_public.pem"
-FREE_MAX_QUOTA = 5
+FREE_MAX_QUOTA = 100
 LICENSE_CONFIG_KEY = "system_license"
 # 按「授权服务器数」计量的开关（默认关，零破坏：存量仍按任务条数计配额）
 SERVER_METERING_KEY = "license_server_metering"
@@ -394,7 +394,7 @@ def get_quotas() -> Dict[str, Any]:
 
 
 def check_quota(category: str, delta: int = 1):
-    """创建或纳管前强校验配额。若超出免费版 5 个限制且未授权则抛出 QuotaExceededError。"""
+    """创建或纳管前强校验配额。若超出免费版 FREE_MAX_QUOTA 限制且未授权则抛出 QuotaExceededError。"""
     if is_licensed():
         return  # 企业永久版，无限制
 
@@ -405,7 +405,7 @@ def check_quota(category: str, delta: int = 1):
 
     if used + delta > FREE_MAX_QUOTA:
         raise QuotaExceededError(
-            f"【{label}】纳管数量已达社区免费版上限（最多 5 台设备/任务，当前已有 {used} 个，新增 {delta} 个将超出限制）。"
+            f"【{label}】纳管数量已达社区免费版上限（最多 {FREE_MAX_QUOTA} 台设备/任务，当前已有 {used} 个，新增 {delta} 个将超出限制）。"
             f"如需纳管更多设备与任务，请在【系统设置 -> 系统授权】中输入与当前服务器 MAC 绑定的永久商业授权码解锁限制！"
         )
 

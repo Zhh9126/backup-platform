@@ -3058,10 +3058,10 @@ def remote_db_dump_to_file(task: dict, ssh_host: dict, db_type: str, final_path:
     其余类型保持 bytes 回退。
     返回 dict(path, size, compressed, fmt, suffix, sha256, resumed, dumped)。
     """
-    if (db_type or "").lower() in ("mysql", "mariadb"):
+    if (db_type or "").lower() in ("mysql", "mariadb", "tidb", "oceanbase"):
         return _remote_mysql_dump_to_file(task, ssh_host, final_path, compress,
                                           extra_args, resume)
-    if db_type in ("postgresql", "kingbase", "opengauss", "panwei"):
+    if db_type in ("postgresql", "kingbase", "opengauss", "panwei", "highgo", "uxdb"):
         client, shell, fmt = _pg_family_dump_shell(task, ssh_host, db_type, compress)
         res = _remote_stage_pull_to_file(
             client, ssh_host, task, shell, final_path,
@@ -3109,7 +3109,7 @@ def remote_db_dump(task: dict, ssh_host: dict, db_type: str, compress: int = 0,
       "dumpall"（PG 系整实例 SQL 流）。MySQL/Redis/MongoDB 恒为 "single"。
     - extra_args: 透传给 dump 命令的额外参数（目前 MySQL 用）。
     """
-    if db_type == "mysql":
+    if db_type in ("mysql", "mariadb", "tidb", "oceanbase"):
         data, fmt, compressed = _remote_mysql_dump(task, ssh_host, compress, extra_args)
         return data, compressed, fmt
     if db_type == "postgresql":
@@ -3737,9 +3737,9 @@ def remote_list_databases(task: dict, db_type: str) -> list:
             "未找到匹配的 SSH 主机：无法直接连数据库服务器。请在『任务编辑 -> 高级选项』"
             "配置 SSH 主机（先到『文件备份』页纳管数据库服务器）。"
         )
-    if db_type in ("mysql", "mariadb"):
+    if db_type in ("mysql", "mariadb", "tidb", "oceanbase"):
         return _remote_list_mysql_databases(task, ssh_host)
-    if db_type in ("postgresql", "kingbase", "opengauss", "panwei"):
+    if db_type in ("postgresql", "kingbase", "opengauss", "panwei", "highgo", "uxdb"):
         return _remote_list_pg_databases(task, ssh_host, db_type)
     raise RuntimeError(f"暂不支持为 {db_type} 拉取库/schema 列表")
 
@@ -4058,7 +4058,40 @@ def _remote_pg_restore(task: dict, ssh_host: dict, dump_bytes: bytes,
             raise RuntimeError(f"远程重建目标库 {db_name} 失败(rc={prc}): {perr[:600]}")
 
     if is_custom:
+        # 自定义格式(-Fc)/tar 归档必须用 pg_restore 从**文件**读取；此前把
+        # pg_restore 当 psql 执行 `-v ON_ERROR_STOP=1` 并向 stdin 灌字节，
+        # 真机 171 报 "could not open input file ON_ERROR_STOP=1"（假失败）。
         tool = _resolve_remote_bin(client, restore_tool) or restore_tool
+        tmp_remote = "/tmp/bp_custom_rst_{0}.dump".format(int(time.time() * 1000))
+        sftp = client.open_sftp()
+        try:
+            with sftp.open(tmp_remote, "wb") as fh:
+                fh.write(dump_bytes)
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+        # 不用 -C：归档内含原库名，会覆盖 UAT 异名库语义
+        shell = (
+            f"set -o pipefail; {env} "
+            f"{shlex.quote(tool)} -h 127.0.0.1 -p {port} "
+            f"-U {shlex.quote(user)}{wpass} "
+            f"--dbname {shlex.quote(db_name)} {shlex.quote(tmp_remote)}; "
+            f"rc=$?; rm -f {shlex.quote(tmp_remote)}; exit $rc")
+        _out, err, rc = _ssh_exec_pipe(
+            client, _wrap_login(shell), input_data=b"", timeout=3600)
+        err_txt = err.decode("utf-8", "replace") if isinstance(err, bytes) else str(err)
+        if rc != 0 and "transaction_timeout" in err_txt:
+            # pg_restore 不因单条 SQL 错误中断，数据已完整导入；仅当所有
+            # 错误都是这个跨版本 GUC 时判兼容成功，其它错误照常失败。
+            err_lines = [ln for ln in err_txt.splitlines()
+                         if "ERROR:" in ln or "error:" in ln]
+            if err_lines and all("transaction_timeout" in ln for ln in err_lines):
+                rc, err = 0, ""
+        if rc != 0:
+            raise RuntimeError(f"远程恢复失败(rc={rc}): {err[:600]}")
+        return
     else:
         tool = query_bin_probe or _pg_family_resolve_query_bin(client, cfg)
         if not tool:
@@ -4266,15 +4299,15 @@ def remote_db_restore(task: dict, ssh_host: dict, db_type: str,
     自动识别 multi-db-tar（全实例逐库 tar.gz）产物并走整实例恢复分支。
     target_db: 指定恢复目标库名（单库 dump；空 = 任务原库）。
     """
-    if db_type in ("postgresql", "kingbase", "opengauss", "panwei") and _looks_like_full_instance_tar(dump_bytes):
+    if db_type in ("postgresql", "kingbase", "opengauss", "panwei", "highgo", "uxdb") and _looks_like_full_instance_tar(dump_bytes):
         _remote_pg_family_restore_tar(task, ssh_host, db_type, dump_bytes)
         return
-    if db_type in ("mysql", "mariadb") and _looks_like_full_instance_tar(dump_bytes):
+    if db_type in ("mysql", "mariadb", "tidb", "oceanbase") and _looks_like_full_instance_tar(dump_bytes):
         _remote_mysql_restore_tar(task, ssh_host, dump_bytes)
         return
-    if db_type == "mysql":
+    if db_type in ("mysql", "mariadb", "tidb", "oceanbase"):
         _remote_mysql_restore(task, ssh_host, dump_bytes)
-    elif db_type in ("postgresql", "kingbase", "opengauss", "panwei"):
+    elif db_type in ("postgresql", "kingbase", "opengauss", "panwei", "highgo", "uxdb"):
         _remote_pg_restore(task, ssh_host, dump_bytes, is_custom,
                            db_type=db_type, target_db=target_db)
     else:

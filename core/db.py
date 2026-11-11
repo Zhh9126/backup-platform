@@ -789,6 +789,28 @@ CREATE TABLE IF NOT EXISTS vdb_instances (
     note            TEXT
 );
 
+CREATE TABLE IF NOT EXISTS vdb_snapshots (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    clone_request_id    INTEGER NOT NULL,
+    vdb_instance_id     INTEGER,
+    name                TEXT NOT NULL,
+    snap_kind           TEXT DEFAULT 'logical',
+    parent_snapshot_id  INTEGER,
+    backup_path         TEXT,
+    size_bytes          INTEGER DEFAULT 0,
+    checksum            TEXT,
+    table_count         INTEGER DEFAULT 0,
+    row_count           INTEGER DEFAULT 0,
+    status              TEXT DEFAULT 'creating',
+    note                TEXT,
+    created_at          TEXT,
+    created_by          TEXT,
+    deleted_at          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_vdb_snapshots_req
+    ON vdb_snapshots(clone_request_id);
+
 CREATE TABLE IF NOT EXISTS drills (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     name            TEXT NOT NULL,
@@ -1728,6 +1750,32 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                     conn.execute(f"ALTER TABLE clone_requests ADD COLUMN {col} {typedef}")
                 except Exception:
                     pass  # 列已存在，忽略
+
+            # 迁移：VDB 快照表（存量库补建；新库由 SCHEMA 建立）
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS vdb_snapshots ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "clone_request_id INTEGER NOT NULL, "
+                "vdb_instance_id INTEGER, "
+                "name TEXT NOT NULL, "
+                "snap_kind TEXT DEFAULT 'logical', "
+                "parent_snapshot_id INTEGER, "
+                "backup_path TEXT, "
+                "size_bytes INTEGER DEFAULT 0, "
+                "checksum TEXT, "
+                "table_count INTEGER DEFAULT 0, "
+                "row_count INTEGER DEFAULT 0, "
+                "status TEXT DEFAULT 'creating', "
+                "note TEXT, created_at TEXT, created_by TEXT, deleted_at TEXT)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_vdb_snapshots_req "
+                "ON vdb_snapshots(clone_request_id)")
+
+            # 迁移：VDB 的 Oracle 服务名（clone_service 读取但建表时漏了）
+            try:
+                conn.execute("ALTER TABLE vdb_instances ADD COLUMN service TEXT")
+            except Exception:
+                pass
 
             # 迁移：全局去重索引（参照鼎甲迪备 §2.4 全局重删）
             # 以内容哈希(block_hash)为键，跨任务、跨备份集复用同一物理块，

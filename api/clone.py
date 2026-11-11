@@ -14,7 +14,7 @@
 from flask import request, jsonify
 
 import core.clone_service as clone_mod
-from auth import login_required
+from auth import login_required, verify_code_gate
 from . import api_bp
 
 _service = clone_mod.clone_service
@@ -24,6 +24,34 @@ _service = clone_mod.clone_service
 @login_required
 def api_list_clones():
     return jsonify(_service.list_clones())
+
+
+@api_bp.route("/clone/preflight", methods=["POST"])
+@login_required
+def api_clone_preflight():
+    """只读克隆预检：不创建申请、不拉起 VDB，返回逐项检查结论。
+
+    供页面在提交克隆前展示「源产物 / 目标端口 / 磁盘余量 / 凭据 /
+    安全隔离态」检查结果，避免拉起半成品 VDB 后才发现失败。
+    """
+    from core import models
+    from core.clone_preflight import preflight
+    data = request.get_json(silent=True) or {}
+    rid = data.get("source_record_id")
+    if not rid:
+        return jsonify({"ok": False, "error": "source_record_id 必填"}), 400
+    try:
+        rec = models.get_record(int(rid))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "source_record_id 非法"}), 400
+    if not rec:
+        return jsonify({"ok": False, "error": "源备份记录不存在"}), 404
+    return jsonify(preflight(
+        rec, target_host=data.get("target_host") or "127.0.0.1",
+        target_port=data.get("target_port") or None,
+        target_password=data.get("target_password") or "",
+        note=data.get("note") or "",
+        clone_mode=data.get("clone_mode") or "logical"))
 
 
 @api_bp.route("/clone", methods=["POST"])
@@ -124,3 +152,72 @@ def api_expire_clone(request_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"ok": True, "request": req})
+
+
+# ------------------------- VDB 快照（时间点 / 回滚 / 再克隆） -------------------------
+@api_bp.route("/clone/<int:request_id>/snapshots", methods=["GET"])
+@login_required
+def api_list_vdb_snapshots(request_id):
+    if not _service.get_clone(request_id):
+        return jsonify({"error": "克隆请求不存在"}), 404
+    return jsonify(_service.list_snapshots(request_id))
+
+
+@api_bp.route("/clone/<int:request_id>/snapshots", methods=["POST"])
+@login_required
+def api_create_vdb_snapshot(request_id):
+    body = request.get_json(silent=True) or {}
+    try:
+        snap = _service.create_snapshot(
+            request_id, name=body.get("name") or "",
+            created_by=body.get("created_by") or "")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, "snapshot": snap}), 201
+
+
+@api_bp.route("/clone/<int:request_id>/snapshots/<int:snapshot_id>/rollback",
+              methods=["POST"])
+@login_required
+def api_rollback_vdb_snapshot(request_id, snapshot_id):
+    body = request.get_json(silent=True) or {}
+    gate = verify_code_gate(body)
+    if gate:
+        return jsonify(gate[0]), gate[1]
+    try:
+        res = _service.rollback_snapshot(
+            request_id, snapshot_id,
+            drop_new_tables=bool(body.get("drop_new_tables", True)),
+            operator=body.get("operator") or "")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, **res})
+
+
+@api_bp.route("/clone/<int:request_id>/snapshots/<int:snapshot_id>/reclone",
+              methods=["POST"])
+@login_required
+def api_reclone_vdb_snapshot(request_id, snapshot_id):
+    body = request.get_json(silent=True) or {}
+    try:
+        res = _service.reclone_snapshot(
+            request_id, snapshot_id,
+            target_env=body.get("target_env") or "",
+            requested_by=body.get("requested_by") or "",
+            operator=body.get("operator") or "")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(res), 201
+
+
+@api_bp.route("/clone/<int:request_id>/snapshots/<int:snapshot_id>",
+              methods=["DELETE"])
+@login_required
+def api_delete_vdb_snapshot(request_id, snapshot_id):
+    body = request.get_json(silent=True) or {}
+    try:
+        res = _service.delete_snapshot(
+            request_id, snapshot_id, operator=body.get("operator") or "")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(res)

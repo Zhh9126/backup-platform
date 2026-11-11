@@ -29,6 +29,7 @@ from core.engines.base import (
     BackupMode,
     BackupStatus,
     BackupResult,
+    parse_table_list,
 )
 
 
@@ -296,6 +297,10 @@ class KingbaseEngine(BackupEngine):
             fmt_flag,
             "-f", dump_out,
         ]
+        # 单表备份：sys_dump 真实追加 -t（与远端通道一致），
+        # 避免只配了 tables 却静默导出整库。
+        for _tb in parse_table_list(self._extra_dict().get("tables")):
+            cmd += ["-t", _tb]
 
         # 5) 执行
         start = time.time()
@@ -410,6 +415,25 @@ class KingbaseEngine(BackupEngine):
         if ssh_host and self._tar_has_member(backup_path, "toc.dat") and not self._tar_has_member(
                 backup_path, "manifest.json"):
             ssh_host = None
+        # 表级 / 改名恢复：走远端 sys_restore --table + ALTER TABLE RENAME，
+        # 使用目标机自带匹配版本工具（平台侧通常没有 sys_restore）。
+        if (kwargs.get("tables") or kwargs.get("table_renames")) and ssh_host:
+            try:
+                from core import pg_remote_tables
+                r = pg_remote_tables.restore_tables(
+                    self.task, ssh_host, backup_path, "kingbase",
+                    kwargs.get("target_db") or "", kwargs.get("tables") or [],
+                    kwargs.get("table_renames") or {})
+                return BackupResult(
+                    success=True, status=BackupStatus.SUCCESS,
+                    backup_path=backup_path, message=r["message"],
+                    simulated=False)
+            except Exception as e:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path,
+                    message=f"远端表级恢复失败: {e}", simulated=False)
+
         if ssh_host:
             try:
                 with open(backup_path, "rb") as f:
@@ -454,16 +478,19 @@ class KingbaseEngine(BackupEngine):
                     backup_path, host, port, user, target_db, self._env_with_pwd())
             return self._restore_full_instance_local(backup_path)
         if backup_path.endswith((".dump", ".tar")):
-            # custom 格式 -> sys_restore（-c 清理已存在对象，-C 创建目标库）
+            # custom 格式 -> sys_restore 灌入 target_db；不用 -C（归档内原库名
+            # 会覆盖 UAT 异名库语义），表级恢复追加 --table。
             cmd = [
                 "sys_restore",
                 "--host", host,
                 "--port", str(port),
                 "--username", user,
                 "--dbname", target_db,
-                "-c", "-C",
-                backup_path,
+                "-c",
             ]
+            for _t in (kwargs.get("tables") or []):
+                cmd += ["--table", str(_t).strip().strip('"')]
+            cmd.append(backup_path)
         elif backup_path.endswith(".sql"):
             # 纯文本格式 -> ksql 执行 SQL 脚本（-f 指定脚本）
             cmd = [

@@ -301,6 +301,10 @@ def init_logging(app_name: str = "AIDBM", console: bool = True,
             except Exception:
                 pass
         root.setLevel(level)
+        # paramiko 内部握手失败会把整段 Traceback 以 ERROR 打进平台日志
+        # （不可达主机反复重试时单次约 20 行，实测刷出 188 次 3000+ 行噪音）。
+        # 平台层已有握手重试与结构化错误上报，这里只静默第三方内部噪音。
+        logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
 
         fmt = MaskingFormatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",

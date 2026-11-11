@@ -124,7 +124,8 @@ from . import (tasks, records, restore, system, hosts, sync, inspection, deploy,
                 agentless, object_storage, backup_cleanup, meta_db,
                 agents, op_guard, oracle_txn, pool, file_sync, ai_backup,
                 report_center, access_key, snmp, job_monitor, netdev, license_api,
-                win_protect, synology, remote_pull, ransomware)  # noqa: E402,F401
+                win_protect, synology, remote_pull, ransomware,
+                source_guard, scan_fs)  # noqa: E402,F401
 
 # AI 助手（收费功能）：镜像/离线交付包中不含 core/ai_agent 与 api/ai_agent.py，
 # 这里必须容错注册——缺失时平台其余功能不受影响（2026-09-19 用户决定）。

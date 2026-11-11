@@ -1146,7 +1146,7 @@
     if ($("t_schema_only")) $("t_schema_only").checked = false;
     if ($("t_data_only")) $("t_data_only").checked = false;
     if ($("t_include_sys")) $("t_include_sys").checked = false;
-    if ($("t_db_picker_status")) $("t_db_picker_status").textContent = "点击按钮连接数据库并拉取";
+    if ($("t_db_picker_status")) $("t_db_picker_status").textContent = "点击「拉取库列表」按当前表单连接数据库";
   }
 
   // 从 extra_options JSON 加载 picker 状态
@@ -1173,22 +1173,38 @@
     if ($("t_probackup_pgdata")) $("t_probackup_pgdata").value = eo.probackup_pgdata || "";
   }
 
-  // 拉取数据库列表
+  // 拉取数据库列表（按当前表单参数探测，新建任务无需先保存）
   async function fetchDatabases() {
-    const id = $("t_id").value;
     const btn = $("t_db_picker_btn");
     const status = $("t_db_picker_status");
-    if (!id) { status.textContent = "请先保存任务（需要 task_id 才能拉取）"; status.className = "form-control form-control-sm text-warning"; return; }
+    const body = {
+      db_type: ($("t_db_type") || {}).value || "",
+      host: ($("t_host") || {}).value || "",
+      port: ($("t_port") || {}).value || "",
+      username: ($("t_username") || {}).value || "",
+      password: ($("t_password") || {}).value || "",
+      db_name: ($("t_db_name") || {}).value || "",
+    };
+    const taskId = ($("t_id") || {}).value || "";
+    if (taskId) body.task_id = taskId; // 编辑态密码留空时由后端沿用已存凭据
+    if (!body.db_type || !body.host) {
+      status.textContent = "请先在第 1 步填写数据库类型和主机地址";
+      status.className = "form-control form-control-sm text-warning";
+      return;
+    }
     btn.disabled = true;
     status.textContent = "连接中...";
     status.className = "form-control form-control-sm text-info";
     try {
-      const r = await api("GET", `/api/tasks/${id}/list-databases`);
+      const r = await api("POST", "/api/tasks/list-databases", body);
+      const list = r.databases || [];
       const sel = $("t_pick_list");
-      sel.innerHTML = (r.databases || []).map(d => `<option value="${esc(d)}">${esc(d)}</option>`).join("");
+      sel.innerHTML = list.map(d => `<option value="${esc(d)}">${esc(d)}</option>`).join("");
       const viaJdbc = !!r.via_jdbc;
-      status.textContent = `拉取到 ${r.databases.length} 个${r.type === "schemas" ? "schema" : "数据库"}（已过滤系统库${viaJdbc ? "，经 JDBC 兜底连接" : ""}）`;
-      status.className = "form-control form-control-sm text-success";
+      status.textContent = list.length
+        ? `拉取到 ${list.length} 个${r.type === "schemas" ? "schema" : "数据库"}（已过滤系统库${viaJdbc ? "，经 JDBC 兜底连接" : ""}）`
+        : "未获取到库列表：请核对连接参数，或在「数据库/实例名」中手工填写";
+      status.className = "form-control form-control-sm " + (list.length ? "text-success" : "text-warning");
       // 若有 eo.schemas/tables，恢复选中
       try {
         const eo = JSON.parse($("t_extra_options").value || "{}");
@@ -1199,7 +1215,7 @@
         }
       } catch (e) { /* ignore */ }
     } catch (e) {
-      status.textContent = "拉取失败: " + e.message;
+      status.textContent = "拉取失败: " + (e.message || e);
       status.className = "form-control form-control-sm text-danger";
     } finally {
       btn.disabled = false;
@@ -1562,16 +1578,35 @@
   }
   window.fillCustomTemplate = fillCustomTemplate;
 
-  // 单表备份：从库中挑选表名（需任务已保存，列表接口按 task_id 拉）
+  // 单表备份：按当前表单参数从库中挑选表名（新建任务无需先保存）
   async function openTablePicker() {
+    const dbName = ($("t_db_name") || {}).value || "";
+    const body = {
+      db_type: ($("t_db_type") || {}).value || "",
+      host: ($("t_host") || {}).value || "",
+      port: ($("t_port") || {}).value || "",
+      username: ($("t_username") || {}).value || "",
+      password: ($("t_password") || {}).value || "",
+      db_name: dbName,
+      db: dbName,
+    };
     const id = ($("t_id") && $("t_id").value) || "";
-    if (!id) { toast("请先保存任务，再从库中选择表", "danger"); return; }
+    if (id) body.task_id = id;
+    if (!body.db_type || !body.host) { toast("请先在第 1 步填写数据库类型和主机地址", "danger"); return; }
     const modalEl = $("tablePickModal");
     bootstrap.Modal.getOrCreateInstance(modalEl).show();
     const hint = $("tblPickHint"), list = $("tblPickList");
     hint.textContent = "加载中…"; list.innerHTML = "";
+    if (!dbName.trim()) {
+      hint.textContent = "请先在「数据库 / 实例名」填写要选表的库名（也可直接手工填写表名）";
+      return;
+    }
     try {
-      const r = await fetch(`/api/tasks/${id}/list-tables`);
+      const r = await fetch("/api/tasks/list-tables", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
       const d = await r.json();
       if (d.error) { hint.innerHTML = '<span class="text-danger">' + esc(d.error) + "</span>"; return; }
       const tables = d.tables || [];
@@ -2053,6 +2088,8 @@
           ? `<button class="btn-row" onclick="liveLog(${t.id})" title="查看最近一次备份的操作日志与结论"><i class="bi bi-terminal"></i> ${T("日志")}</button>` : ""}
           <button class="btn-row btn-row-primary" onclick="runTask(${t.id})" title="${T("立即备份")}"><i class="bi bi-play-circle"></i> ${T("立即备份")}</button>
           <button class="btn-row" onclick="BKP.runBackupPrecheck(${t.id})" title="备份预检：先探测配置/通道/源库/工具/空间能否支持本次备份"><i class="bi bi-clipboard-check"></i> ${T("预检")}</button>`}
+          ${(t.last_status === "failed" && !t._running)
+            ? `<button class="btn-row" onclick="retryTask(${t.id})" title="重跑最近一次失败的备份（沿用原备份类型，失败记录保留）"><i class="bi bi-arrow-clockwise"></i> ${T("重试")}</button>` : ""}
           <button class="btn-row" onclick="editTask(${t.id})" title="${T("编辑")}"><i class="bi bi-pencil"></i> ${T("编辑")}</button>
           <button class="btn-row" onclick="cloneTask(${t.id})" title="克隆任务：复制全部配置，默认停用，核对后启用"><i class="bi bi-copy"></i> ${T("克隆")}</button>
           <button class="btn-row btn-row-danger" onclick="delTask(${t.id})" title="${T("删除")}"><i class="bi bi-trash"></i> ${T("删除")}</button>
@@ -2120,6 +2157,23 @@
       toast(r && r.accepted
         ? "已提交并行执行队列，可在备份记录页查看进度"
         : "备份完成：" + ((r && r.status) || "-"));
+      await loadTasks();
+      setTimeout(loadTasks, 2000);
+    } catch (e) { toast(e.message, "danger"); }
+  };
+  window.retryTask = async (id) => {
+    const ok = await confirmDialog({
+      title: "重试失败的备份？",
+      message: "将沿用最近一条失败记录的备份类型重新发起一次备份；原失败记录保留用于审计。",
+      confirmText: "重新发起",
+      danger: false,
+    });
+    if (!ok) return;
+    try {
+      const r = await api("POST", `/api/tasks/${id}/retry`);
+      toast(r && r.accepted
+        ? "已提交并行执行队列，可在备份记录页查看进度"
+        : "重试完成：" + ((r && r.status) || "-"));
       await loadTasks();
       setTimeout(loadTasks, 2000);
     } catch (e) { toast(e.message, "danger"); }
@@ -2310,13 +2364,17 @@
       if (wizPrev) wizPrev.onclick = () => taskWizGo(-1);
       const wizNext = $("taskWizNext");
       if (wizNext) wizNext.onclick = () => taskWizGo(1);
-      // 已完成步骤可点击回跳
+      // 步骤条可直接跳转（含前进到「确认&提交」使用保存按钮）；前进前校验第 1 步必填
       const wizBar = document.getElementById("taskWizSteps");
       if (wizBar && !wizBar._bound) {
         wizBar._bound = true;
         wizBar.addEventListener("click", (ev) => {
-          const item = ev.target.closest(".wiz-step.done");
-          if (item) taskWizShow(Number(item.dataset.step));
+          const item = ev.target.closest(".wiz-step");
+          if (!item) return;
+          const target = Number(item.dataset.step);
+          if (!target || target === taskWizCur) return;
+          if (target > taskWizCur && !taskWizValidate(1)) return;
+          taskWizShow(target);
         });
       }
       const newBtn = $("newTaskBtn");
@@ -2916,6 +2974,31 @@
     } catch (e) { toast("PITR 失败: " + e.message, "danger"); }
   };
 
+  // 表改名映射：单表直接填新表名；多表用「源表=新表」逗号分隔。
+  function _parseTableRenames(raw, picked) {
+    const s = String(raw || "").trim();
+    if (!s) return {};
+    if (/[=:]/.test(s)) {
+      const out = {};
+      s.split(/[,，;；\n]/).forEach((part) => {
+        const m = part.trim().split(/[=:]/);
+        if (m.length >= 2 && m[0].trim() && m[1].trim()) {
+          out[m[0].trim().split(".").pop()] = m[1].trim();
+        }
+      });
+      if (!Object.keys(out).length) {
+        toast("表改名格式应为「源表=新表」，多表用逗号分隔", "warning");
+        return null;
+      }
+      return out;
+    }
+    if (picked.length === 1) {
+      return { [String(picked[0]).split(".").pop()]: s };
+    }
+    toast("多表改名请写成「源表=新表,源表2=新表2」", "warning");
+    return null;
+  }
+
   $("objectSubmitBtn").onclick = async () => {
     const id = $("object_record_id").value;
     // P0-1：勾选了表 → 统一恢复通道（/api/restores，切片+审计+验证码闸）
@@ -2924,8 +3007,12 @@
     const target = _resolveTargetHost("object");
     if (!target) { toast("请选择目标主机或直接输入 IP/账号/密码", "warning"); return; }
     if (picked.length) {
+      const renames = _parseTableRenames(
+        ($("object_table_renames") || {}).value, picked);
+      if (renames === null) return;
       const body = { record_id: Number(id), tables: picked,
-        target_db: ($("object_target_db").value || "").trim() };
+        target_db: ($("object_target_db").value || "").trim(),
+        table_renames: renames };
       if (target.mode === "managed") body.target_host_id = Number(target.host_key);
       else {
         body.target_host = `${target.user}@${target.host}:${target.port}`;
@@ -8602,6 +8689,8 @@
       $("c_target_password").value = "";
       $("c_requested_by").value = "";
       $("c_note").value = "";
+      const _pf = $("c_preflight");
+      if (_pf) _pf.innerHTML = "提交前可先做只读预检：源产物 / 目标端口 / 磁盘余量 / 凭据 / 安全隔离态（不创建申请、不拉起 VDB）。";
       if (cloneModalInst) cloneModalInst.show();
     };
     window.saveClone = async function () {
@@ -8623,6 +8712,32 @@
         if (cloneModalInst) cloneModalInst.hide();
         await loadClones();
       } catch (e) { toast(e.message, "danger"); }
+    };
+
+    window.preflightClone = async function () {
+      const rid = Number($("c_source_record_id").value);
+      const box = $("c_preflight");
+      if (!rid) { toast("请先选择源备份记录", "warning"); return; }
+      box.innerHTML = '<span class="text-primary">正在做只读预检…</span>';
+      const payload = {
+        source_record_id: rid,
+        target_host: $("c_target_host").value.trim() || "127.0.0.1",
+        target_password: $("c_target_password").value,
+        note: $("c_note").value,
+      };
+      try {
+        const r = await api("POST", "/api/clone/preflight", payload);
+        const LV = { pass: "success", warn: "warning", fail: "danger" };
+        box.innerHTML = '<div class="mb-2"><b>预检结论：</b>' +
+          (r.ok ? '<span class="badge bg-success">通过，可提交克隆</span>'
+                : '<span class="badge bg-danger">未通过，请先处理下列失败项</span>') +
+          '</div><ul class="list-unstyled mb-0 small">' +
+          (r.checks || []).map(c => `<li class="mb-1"><span class="badge bg-${LV[c.level] || "secondary"}">${esc(c.level)}</span> <b>${esc(c.item)}</b>：${esc(c.message)}</li>`).join("") +
+          '</ul>' + ((r.warnings || []).length
+            ? `<div class="alert alert-warning small mt-2 mb-0">提示：${(r.warnings || []).map(esc).join("<br>")}</div>` : "");
+      } catch (e) {
+        box.innerHTML = '<span class="text-danger">预检失败：' + esc(e.message) + "</span>";
+      }
     };
 
     bindSourceSearch();

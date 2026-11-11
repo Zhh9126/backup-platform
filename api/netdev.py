@@ -42,6 +42,7 @@ import io
 from flask import request, jsonify, send_file, session
 
 from auth import login_required
+from core.license import QuotaExceededError
 import core.netdev as netdev
 from . import api_bp
 
@@ -78,7 +79,7 @@ def create_netdev_device():
             test_res = netdev.test_ssh_connection(dev_id)
             return jsonify({"ok": True, "id": dev_id, "test": test_res}), 201
         return jsonify({"ok": True, "id": dev_id}), 201
-    except netdev.license_mod.QuotaExceededError as qe:
+    except QuotaExceededError as qe:
         return jsonify({"ok": False, "error": str(qe), "quota_exceeded": True}), 403
     except ValueError as e:
         return jsonify({"ok": False, "error": str(e)}), 400

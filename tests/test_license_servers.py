@@ -93,7 +93,8 @@ def test_server_view_deduplicates_tasks_on_same_host():
     assert s["task_count"] == 3
     assert set(s["db_types"]) == {"mysql", "postgresql", "file"}
     assert s["is_platform_self"] is False
-    assert v["limit"] == lic.FREE_MAX_QUOTA and v["remaining"] == 4
+    assert v["limit"] == lic.FREE_MAX_QUOTA
+    assert v["remaining"] == lic.FREE_MAX_QUOTA - 1
     assert v["metering_enabled"] is False
 
 
@@ -136,15 +137,15 @@ def test_metering_default_off_is_zero_breakage():
 def test_metering_on_rejects_new_host_over_limit():
     db.set_system_config(lic.SERVER_METERING_KEY, "1")
     assert lic.metering_enabled() is True
-    for i in range(1, 6):
+    for i in range(1, lic.FREE_MAX_QUOTA + 1):
         _task("10.0.1.%d" % i)
-    assert lic.server_view()["billable_count"] == 5
+    assert lic.server_view()["billable_count"] == lic.FREE_MAX_QUOTA
     lic.check_server_quota("10.0.1.3")       # 已有主机：不新增名额
     lic.check_server_quota("127.0.0.1")      # 平台自身：不计
     with pytest.raises(lic.QuotaExceededError) as e:
-        lic.check_server_quota("root@10.0.1.99:3306")
+        lic.check_server_quota("root@10.0.1.250:3306")
     assert "按授权服务器数计量" in str(e.value)
-    assert "10.0.1.99" in str(e.value)
+    assert "10.0.1.250" in str(e.value)
 
 
 def test_create_task_honors_server_metering(monkeypatch):
@@ -159,13 +160,14 @@ def test_create_task_honors_server_metering(monkeypatch):
     assert models.create_task({"name": "ok2", "biz_system": "E2E",
                                "db_type": "mysql", "host": "10.0.2.1",
                                "backup_type": "full", "enabled": 0})
-    for i in range(2, 6):
+    for i in range(2, lic.FREE_MAX_QUOTA + 1):
         models.create_task({"name": "h%d" % i, "biz_system": "E2E",
                             "db_type": "mysql", "host": "10.0.2.%d" % i,
                             "backup_type": "full", "enabled": 0})
+    assert lic.server_view()["billable_count"] == lic.FREE_MAX_QUOTA
     with pytest.raises(lic.QuotaExceededError):
         models.create_task({"name": "over", "biz_system": "E2E",
-                            "db_type": "mysql", "host": "10.0.2.99",
+                            "db_type": "mysql", "host": "10.0.2.250",
                             "backup_type": "full", "enabled": 0})
 
 
@@ -203,3 +205,44 @@ def test_frontend_contract():
     models_src = io.open(os.path.join(ROOT, "core", "models.py"),
                          encoding="utf-8").read()
     assert "check_server_quota" in models_src
+
+
+# ---------------------------------------------------------------- 免费版配额扩容
+def test_free_quota_expanded_to_100():
+    """正式库社区免费版每类纳管配额 5 -> 100（用户 2026-11-11 要求）。"""
+    assert lic.FREE_MAX_QUOTA == 100
+    info = lic.get_license_info()
+    assert info["quota_limit"] == 100
+    assert info["max_devices"] == 100
+    assert info["max_servers"] == 100
+    q = lic.get_quotas()["database"]
+    assert q["limit"] == 100 and q["remaining"] == 100
+    assert q["exceeded"] is False
+
+
+def test_database_quota_rejects_only_above_100():
+    """第 100 个数据库任务仍可建，第 101 个才拦截且错误文案带真实上限。"""
+    for i in range(lic.FREE_MAX_QUOTA - 1):
+        _task("10.0.3.%d" % i, "mysql", "q%d" % i)
+    lic.check_quota("database")          # used=99，新增后正好 100：放行
+    _task("10.0.3.99", "mysql", "q99")
+    assert lic.get_counts()["database"] == lic.FREE_MAX_QUOTA
+    with pytest.raises(lic.QuotaExceededError) as e:
+        lic.check_quota("database")
+    assert "100" in str(e.value)
+    q = lic.get_quotas()["database"]
+    assert q["used"] == 100 and q["remaining"] == 0 and q["exceeded"] is True
+
+
+def test_frontend_quota_is_not_hardcoded():
+    """授权页配额展示必须跟随服务端配额，不能残留写死 5。"""
+    tpl = io.open(os.path.join(ROOT, "templates", "settings.html"),
+                  encoding="utf-8").read()
+    assert 'id="licFreeQuotaHint"' in tpl
+    assert "freeQuota" in tpl
+    assert "每类限额 5 台" not in tpl
+    assert "上限为 5" not in tpl
+    assert "(q.limit || 5)" not in tpl
+    base = io.open(os.path.join(ROOT, "templates", "base.html"),
+                   encoding="utf-8").read()
+    assert "quota_limit" in base

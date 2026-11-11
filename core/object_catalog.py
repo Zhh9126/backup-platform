@@ -189,18 +189,69 @@ def _scan_mysql_tar(path: str) -> list:
     return rows
 
 
+_MYSQL_FAMILY = ("mysql", "mariadb", "tidb", "oceanbase")
+_PG_FAMILY = ("postgresql", "kingbase", "opengauss", "panwei", "highgo", "uxdb")
+
+
+def _scan_pg_family_tar(path: str) -> list:
+    """PG 系全实例逐库 tar：manifest 列真实库名，逐库 .sql 列真实表。
+
+    .dump/-Fc 是二进制自定义格式，平台侧不猜测其中的表名（不伪造对象），
+    只登记库级条目；需要表级恢复时由 pg_restore --table 通道处理。
+    """
+    import json as _json
+    import tarfile
+    rows, seen = [], set()
+
+    def _add(obj_type, name, schema=""):
+        key = (obj_type, schema, name)
+        if name and key not in seen:
+            seen.add(key)
+            rows.append({"obj_type": obj_type, "obj_name": name,
+                         "schema": schema})
+
+    with tarfile.open(path, "r:*") as tf:
+        names = tf.getnames()
+        mf = next((n for n in names if n.endswith("manifest.json")), None)
+        if mf:
+            try:
+                meta = _json.load(tf.extractfile(mf))
+                for d in meta.get("databases") or []:
+                    nm = d.get("name") if isinstance(d, dict) else d
+                    _add("DATABASE", str(nm or ""))
+            except Exception:
+                pass
+        for m in tf.getmembers():
+            name = m.name.lstrip("./")
+            if not (m.isfile() and
+                    re.search(r"(^|/)dbs/[^/]+\.(sql|dump)$", name)):
+                continue
+            dbn = os.path.splitext(os.path.basename(name))[0]
+            if name.endswith(".sql"):
+                fh = tf.extractfile(m)
+                if fh:
+                    text = fh.read(64 * 1024 * 1024).decode("utf-8", "ignore")
+                    for o in _scan_pg_sql(text):
+                        _add("TABLE", o["obj_name"], o.get("schema") or dbn)
+            else:
+                _add("DATABASE", dbn)
+    return rows
+
+
 def scan(record_id: int, backup_path: str, db_type: str) -> int:
     """扫描备份产物对象清单并落库，返回对象数。"""
     rows = []
     p = (backup_path or "").lower()
-    if db_type in ("mysql", "mariadb") and p.endswith((".tar.gz", ".tgz")):
+    if db_type in _MYSQL_FAMILY and p.endswith((".tar.gz", ".tgz")):
         rows = _scan_mysql_tar(backup_path)
-    elif db_type in ("mysql", "mariadb") and (p.endswith(".sql") or
-                                              p.endswith(".zst") or
-                                              p.endswith(".gz")):
+    elif db_type in _MYSQL_FAMILY and (p.endswith(".sql") or
+                                       p.endswith(".zst") or
+                                       p.endswith(".gz")):
         rows = _scan_mysql(_read_decompressed(backup_path))
-    elif db_type == "postgresql":
-        if p.endswith(".dump"):
+    elif db_type in _PG_FAMILY:
+        if p.endswith((".tar.gz", ".tgz")):
+            rows = _scan_pg_family_tar(backup_path)
+        elif p.endswith(".dump"):
             rows = _scan_pg_restore_list(_read_decompressed(backup_path))
         elif p.endswith((".sql", ".gz")):
             rows = _scan_pg_sql(_read_decompressed(backup_path))

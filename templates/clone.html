@@ -74,8 +74,12 @@
           <label class="form-label">备注</label>
           <textarea class="form-control" id="c_note" rows="2" placeholder="可填写用途说明"></textarea>
         </div>
+        <div id="c_preflight" class="border rounded p-2 small text-muted">
+          提交前可先做只读预检：源产物 / 目标端口 / 磁盘余量 / 凭据 / 安全隔离态（不创建申请、不拉起 VDB）。
+        </div>
       </div>
       <div class="modal-footer">
+        <button class="btn btn-outline-info" onclick="preflightClone()"><i class="bi bi-clipboard-check me-1"></i>克隆预检</button>
         <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
         <button class="btn btn-primary" id="cloneSaveBtn">立即克隆</button>
       </div>

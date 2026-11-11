@@ -21,6 +21,9 @@ _logger = logging.getLogger("dr_monitor")
 
 STATE_KEY = "dr_auto_monitor_state"
 _lock = threading.Lock()
+# 自动切换失败退避：避免备库长期不可达时每轮探测都重试并刷 ERROR。
+FAILOVER_BACKOFF_BASE_SEC = 60
+FAILOVER_BACKOFF_MAX_SEC = 900
 
 
 def _load_state() -> dict:
@@ -107,6 +110,15 @@ def check_once() -> list:
         primary_ok = bool(snap.get("primary", {}).get("reachable"))
         item = {"link_id": link.get("id"), "link_name": link.get("name"),
                 "primary_reachable": primary_ok, "action": "none"}
+        # 应用级容灾可见性：业务探活失败单独记录并告警，但不伪装成数据库故障
+        # （切数据库修不好应用），因此不改变 auto failover 的主库可达判据。
+        app = snap.get("app") or {}
+        if app.get("enabled") and not app.get("ok"):
+            item["app_unhealthy"] = True
+            item["app_error"] = str(app.get("error") or app.get("status") or "")[:120]
+            db.add_log("WARNING", "dr_monitor",
+                       "链路 #%s 应用探活失败（不触发数据库切换）: %s"
+                       % (link.get("id"), item["app_error"]))
         if primary_ok:
             if st.get("fails") or st.get("alerted") or st.get("auto_running"):
                 reset_state(link.get("id"))
@@ -156,6 +168,20 @@ def check_once() -> list:
             out.append(item)
             continue
 
+        # 自动切换失败退避：备库长期不可达时不能每轮都重试并刷 ERROR，
+        # 按连续失败次数指数退避（60→120→240→480→900s 封顶），
+        # 退避期内只返回 backoff；主库恢复时 reset_state 会清空全部状态。
+        backoff_until = float(st.get("failover_backoff_until") or 0)
+        if backoff_until > now:
+            item["action"] = "backoff"
+            item["result"] = {
+                "retry_in_sec": int(backoff_until - now),
+                "consecutive_failures": int(st.get("failover_fail_count") or 0),
+                "last_error": st.get("auto_failover_error") or "",
+            }
+            out.append(item)
+            continue
+
         # 自动切换：复用 FailoverEngine 全流程（fencing→提升→DNS→验证）
         with _lock:
             st_all = _load_state()
@@ -172,18 +198,43 @@ def check_once() -> list:
                               "success": True}
             with _lock:
                 st_all = _load_state()
-                st_all[lid]["auto_running"] = False
-                st_all[lid]["last_failover_at"] = db.now_iso()
+                cur = st_all[lid]
+                cur["auto_running"] = False
+                cur["last_failover_at"] = db.now_iso()
+                for k in ("failover_backoff_until", "failover_fail_count",
+                          "auto_failover_error"):
+                    cur.pop(k, None)
                 _save_state(st_all)
         except Exception as e:
-            _logger.error("[dr_monitor] 链路「%s」自动切换失败: %s",
-                          link.get("name"), e)
-            item["action"] = "auto_failover_failed"
-            item["result"] = {"success": False, "error": str(e)[:200]}
+            err = str(e)[:200]
             with _lock:
                 st_all = _load_state()
-                st_all[lid]["auto_running"] = False
-                st_all[lid]["auto_failover_error"] = str(e)[:200]
+                cur = st_all[lid]
+                n = int(cur.get("failover_fail_count") or 0) + 1
+                backoff = min(
+                    FAILOVER_BACKOFF_BASE_SEC * (2 ** min(n - 1, 4)),
+                    FAILOVER_BACKOFF_MAX_SEC)
+                cur["auto_running"] = False
+                cur["auto_failover_error"] = err
+                cur["failover_fail_count"] = n
+                cur["failover_backoff_until"] = time.time() + backoff
+                cur["last_failover_at"] = db.now_iso()
                 _save_state(st_all)
+            _logger.error(
+                "[dr_monitor] 链路「%s」自动切换失败（第 %d 次，%ds 内不再重试）: %s",
+                link.get("name"), n, backoff, err)
+            # 审计只在首次失败落库，后续退避轮次不重复写 system_logs
+            if n == 1:
+                try:
+                    db.add_log(
+                        "WARNING", "dr_monitor",
+                        "链路「%s」自动切换失败，已启用失败退避：%s" %
+                        (link.get("name"), err))
+                except Exception:
+                    pass
+            item["action"] = "auto_failover_failed"
+            item["result"] = {"success": False, "error": err,
+                              "retry_in_sec": backoff,
+                              "consecutive_failures": n}
         out.append(item)
     return out

@@ -4,7 +4,6 @@ import io
 import json
 import threading
 
-import json
 from flask import request, jsonify, send_file
 
 from . import api_bp

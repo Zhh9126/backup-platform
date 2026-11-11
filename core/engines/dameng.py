@@ -98,12 +98,19 @@ class DamengEngine(BackupEngine):
             3. 否则若 extra_options 指定了 owner，则使用 OWNER=...。
             4. 否则使用 FULL=Y（整库导出/导入）。
         """
-        # 目标库映射到 SCHEMAS（恢复场景）
+        # 目标库映射到 SCHEMAS（恢复场景，170:5236 实测可用）。
+        # 显式 remap_schema=1 且给出源 schema 时改用 REMAP_SCHEMA=源:目标，
+        # 保持对象归属重映射语义（与 Oracle REMAP_SCHEMA 对齐）。
         if target_db:
+            src = (extra.get("remap_source_schema") or extra.get("schema")
+                   or extra.get("owner"))
+            if src and extra.get("remap_schema"):
+                return ["REMAP_SCHEMA={0}:{1}".format(src, target_db)]
             return ["SCHEMAS={0}".format(target_db)]
 
         schemas = extra.get("schemas")
-        if schemas:
+        # 单表优先：tables 存在时不能让 SCHEMAS 抢先返回（否则静默导整模式）
+        if schemas and not (include_tables and extra.get("tables")):
             # 兼容 list 与逗号字符串两种写法
             if isinstance(schemas, (list, tuple)):
                 schemas_str = ",".join(str(s) for s in schemas)
@@ -112,24 +119,34 @@ class DamengEngine(BackupEngine):
             return ["SCHEMAS={0}".format(schemas_str)]
 
         owner = extra.get("owner")
-        if owner:
+        if owner and not (include_tables and extra.get("tables")):
             return ["OWNER={0}".format(owner)]
 
-        # 单表导出（dexp TABLES=表1,表2；配合 SCHEMAS 限定模式）。
-        # 恢复路径（dimp）单独用 kwargs.tables 处理，避免重复参数
+        # 单表导出：dexp 的 TABLES 与 SCHEMAS/OWNER/FULL 是互斥「导出模式」，
+        # 同时给出会 rc=1「暂时不支持多种导出模式」（170:5236 实测）。
+        # 因此只输出 TABLES，并把裸表名补成 schema.table 精确定位，
+        # 否则 dexp 会按连接用户（SYSDBA）的默认 schema 找表、导错对象。
+        # 恢复路径（dimp）单独用 kwargs.tables 处理，避免重复参数。
         tables = extra.get("tables")
         if include_tables and tables:
             if isinstance(tables, (list, tuple)):
-                names = ",".join(str(x).strip() for x in tables if str(x).strip())
+                names = [str(x).strip() for x in tables if str(x).strip()]
             else:
-                names = str(tables)
+                names = [x.strip() for x in str(tables).split(",") if x.strip()]
             if names:
-                args = []
-                if extra.get("schema") or extra.get("db_name"):
-                    sc = extra.get("schema") or extra.get("db_name")
-                    args.append("SCHEMAS={0}".format(sc))
-                args.append("TABLES={0}".format(names))
-                return args
+                schemas = extra.get("schemas")
+                if isinstance(schemas, (list, tuple)):
+                    schemas = schemas[0] if schemas else ""
+                elif isinstance(schemas, str):
+                    schemas = schemas.split(",")[0]
+                sc = (extra.get("schema") or schemas or extra.get("owner")
+                      or extra.get("db_name")
+                      or (getattr(self, "task", None) or {}).get("db_name") or "")
+                sc = str(sc).strip().strip('"')
+                if sc:
+                    names = [n if "." in n else "{0}.{1}".format(sc, n)
+                             for n in names]
+                return ["TABLES={0}".format(",".join(names))]
 
         return ["FULL=Y"]
 
@@ -953,8 +970,8 @@ class DamengEngine(BackupEngine):
             return BackupResult(success=False, status=BackupStatus.FAILED,
                                 backup_path=backup_path,
                                 message="恢复产物推送远端失败: " + str(e)[:200])
-        scope = " ".join(self._scope_args(extra, target_db=target_db,
-                                          include_tables=False))
+        scope_args = self._scope_args(extra, target_db=target_db,
+                                     include_tables=False)
         # 异名 schema 恢复前置：dimp 的 SCHEMAS 目标必须已存在（170:5236 实测
         # 缺失时 rc=2）——用 dmPython 直连创建目标 schema（disql 管道引号
         # 多层嵌套不可靠，db_migrate 的 dmPython 方式已真机验证）
@@ -990,13 +1007,31 @@ class DamengEngine(BackupEngine):
                      # 重建直接插数据，触发 -6602 唯一约束冲突（137 实测），
                      # 与 REPLACE 语义互斥。
                      "TABLE_EXISTS_ACTION=REPLACE"]
-        if scope:
-            cmd_parts.append(scope)
         sel_tables = kwargs.get("tables") or []
         if sel_tables:
-            names = ",".join(str(x).strip().strip('"') for x in sel_tables)
+            # DM8 dimp 的 SCHEMAS/OWNER/FULL 与 TABLES 属互斥「导入模式」，
+            # 同时给出会 rc=1「暂时不支持多种导入模式」（170:5236 实测）。
+            # 指定表时只保留映射参数 REMAP_SCHEMA，并用 TABLES=<源模式>.<表>
+            # 精确定位（裸表名会让 dimp 找不到对象/等待确认）。
+            scope_args = [a for a in scope_args
+                          if a.startswith("REMAP_SCHEMA=")]
+            _schemas = extra.get("schemas")
+            if isinstance(_schemas, (list, tuple)):
+                _schemas = _schemas[0] if _schemas else None
+            elif isinstance(_schemas, str):
+                _schemas = _schemas.split(",")[0]
+            _src_schema = (extra.get("remap_source_schema") or _schemas
+                           or extra.get("schema") or extra.get("owner")
+                           or self.task.get("db_name") or "")
+            _prefix = (_src_schema.strip('"') + ".") if _src_schema else ""
+            names = ",".join(
+                _prefix + str(x).strip().strip('"')
+                for x in sel_tables if str(x).strip())
+            cmd_parts.extend(scope_args)
             if names:
                 cmd_parts.append("TABLES=" + names)
+        else:
+            cmd_parts.extend(scope_args)
         import shlex as _shlex
         from core.engines.file import _ssh_exec_pipe as _sep
         remote_cmd = " ".join(_shlex.quote(p) for p in cmd_parts)
@@ -1019,11 +1054,62 @@ class DamengEngine(BackupEngine):
                 duration_sec=duration, stdout=otext, stderr=etext,
                 message="远端 dimp 恢复失败(returncode={0}){1}{2}: {3}".format(
                     rc, conn_note, target_note, (otext + etext)[-500:]))
+        # 表改名：dimp 无 REMAP_TABLE，恢复成功后用远端 disql 执行
+        # ALTER TABLE <schema>.<old> RENAME TO <new>（DM8 真机语法已验证）。
+        # 失败必须让整次恢复判失败，不能留下「成功但表名没改」的假结果。
+        renames = kwargs.get("table_renames") or {}
+        renamed_note = ""
+        if renames:
+            # 改名目标 schema 必须是本次 dimp 实际导入的模式：优先 target_db，
+            # 其次备份任务配置的 schemas/schema/owner/db_name。旧实现缺省写死
+            # SYSDBA，源数据位于自建模式时 ALTER TABLE 找不到表（真机暴露）。
+            _schemas = extra.get("schemas")
+            if isinstance(_schemas, (list, tuple)):
+                _schemas = _schemas[0] if _schemas else None
+            elif isinstance(_schemas, str):
+                _schemas = _schemas.split(",")[0]
+            _imp_schema = (target_db or _schemas or extra.get("schema")
+                           or extra.get("owner") or self.task.get("db_name")
+                           or "SYSDBA")
+            _schema_q = str(_imp_schema).strip('"').replace('"', '""')
+            _lines = []
+            for _old, _new in renames.items():
+                _o = str(_old).split(".")[-1].replace('"', '""')
+                _n = str(_new).replace('"', '""')
+                _lines.append(
+                    f'ALTER TABLE "{_schema_q}"."{_o}" RENAME TO "{_n}";')
+            _disql = remote_dump.resolve_remote_tool(
+                ssh_host, "disql",
+                check_user=self._resolve_check_user(ssh_host)) or "disql"
+            _shell = ("{bin} {uid} <<'AIDBM_SQL'\n{sql}\nEXIT;\nAIDBM_SQL").format(
+                bin=_shlex.quote(_disql), uid=_shlex.quote(self._connect_userid()),
+                sql="\n".join(_lines))
+            try:
+                _o2, _e2, _rc2 = _sep(
+                    client, remote_dump._wrap_login(_shell), timeout=180)
+                _t2 = ((_o2.decode("utf-8", "replace") if isinstance(_o2, bytes)
+                        else str(_o2))
+                       + (_e2.decode("utf-8", "replace") if isinstance(_e2, bytes)
+                          else str(_e2)))
+                if _rc2 != 0 or "[-" in _t2 or "语法分析出错" in _t2:
+                    return BackupResult(
+                        success=False, status=BackupStatus.FAILED,
+                        backup_path=backup_path, duration_sec=duration,
+                        stdout=otext, stderr=_t2[-500:],
+                        message="达梦表改名失败: " + _t2[-300:])
+                renamed_note = "；表改名: " + ",".join(
+                    f"{a}→{b}" for a, b in renames.items())
+            except Exception as _re:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path, duration_sec=duration,
+                    message=f"达梦表改名执行失败: {_re}")
         return BackupResult(
             success=True, status=BackupStatus.SUCCESS, backup_path=backup_path,
             duration_sec=duration, stdout=otext, stderr=etext,
             checksum=db.sha256_file(backup_path),
-            message="达梦 远程 dimp 逻辑恢复成功{0}{1}".format(conn_note, target_note))
+            message="达梦 远程 dimp 逻辑恢复成功{0}{1}{2}".format(
+                conn_note, target_note, renamed_note))
 
     # ---------------- 列出数据库 ----------------
     def list_databases(self) -> list:

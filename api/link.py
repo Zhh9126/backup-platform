@@ -468,6 +468,8 @@ def api_link_failover_config(link_id):
             "standby_conn": _mask_conn(cfg.get("standby_conn") or {}),
             "dns": cfg.get("dns") or {},
             "replication_user": cfg.get("replication_user") or "",
+            "app_probe": cfg.get("app_probe") or {},
+            "post_switch_verification": cfg.get("post_switch_verification") or {},
         })
     data = request.get_json(silent=True) or {}
     for key in ("primary_conn", "standby_conn"):
@@ -490,9 +492,46 @@ def api_link_failover_config(link_id):
         cfg["dns"] = {**cfg.get("dns", {}), **data["dns"]}
     if data.get("replication_user") is not None:
         cfg["replication_user"] = str(data["replication_user"]).strip()
+    # 应用级容灾配置：应用探活（SSRF 校验）+ 切换后业务验证（键白名单）
+    from core import dr_app_ha, net_guard
+    if isinstance(data.get("app_probe"), dict):
+        ap = {k: v for k, v in data["app_probe"].items()
+              if k in ("enabled", "url", "expect_status", "expect_body",
+                       "timeout")}
+        if str(ap.get("url") or "").strip():
+            ok, reason = net_guard.validate_url(str(ap["url"]).strip())
+            if not ok:
+                return jsonify({"error": "应用探活 URL 不合法: %s" % reason}), 400
+        cfg["app_probe"] = {**(cfg.get("app_probe") or {}), **ap}
+    if isinstance(data.get("post_switch_verification"), dict):
+        pv = data["post_switch_verification"]
+        cfg["post_switch_verification"] = {
+            "enabled": bool(pv.get("enabled")),
+            "checks": dr_app_ha.sanitize_checks(pv.get("checks")),
+        }
     models.update_disaster_link(link_id, {
         "failover_config": _json.dumps(cfg, ensure_ascii=False)})
     return jsonify({"ok": True})
+
+
+@api_bp.route("/disaster-links/<int:link_id>/verify-business", methods=["POST"])
+@login_required
+def api_link_verify_business(link_id):
+    """业务可用性验证（只读）：切换后自动执行，也可由向导/演练手动预跑。
+
+    支持 SQL 断言（仅 SELECT，凭据复用 failover_config）与 HTTP 应用探活。
+    """
+    from core import dr_app_ha, dr_failover
+    link = models.get_disaster_link(link_id)
+    if not link:
+        return jsonify({"error": "链路不存在"}), 404
+    data = request.get_json(silent=True) or {}
+    phase = data.get("phase") if data.get("phase") in ("failover", "failback") \
+        else "failover"
+    res = dr_app_ha.run_post_switch_verification(
+        dr_failover._load_config(dict(link)), phase=phase,
+        decrypt_conn=dr_failover._decrypt_conn)
+    return jsonify({"ok": res.get("ok"), **res})
 
 
 @api_bp.route("/disaster-links/auto-monitor", methods=["GET"])

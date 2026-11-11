@@ -112,6 +112,17 @@ class CloneService:
         if clone_mode in ("template", "schema") and not live_source_db:
             raise ValueError(f"克隆模式 {clone_mode} 需要提供源库名/schema（live_source_db）")
 
+        # VDB 克隆预检（只读，对标 zBackup clonePreflight）：在创建申请之前
+        # 拦住产物缺失 / 目标端口不可达 / 安全隔离态，避免拉起半成品 VDB。
+        from core.clone_preflight import preflight as _clone_preflight
+        pf = _clone_preflight(rec, target_host=target_host,
+                              target_password=target_password,
+                              note=note, clone_mode=clone_mode)
+        if not pf["ok"]:
+            raise ValueError("克隆预检未通过: " + "；".join(pf["errors"]))
+        if pf["warnings"]:
+            self.logger.info("[clone] 预检提示: %s", "；".join(pf["warnings"]))
+
         # 克隆模式编码进 note（免改表结构，_launch_vdb 解析）
         mode_tag = f"[clone_mode={clone_mode}]"
         if live_source_db:
@@ -199,7 +210,20 @@ class CloneService:
             except Exception as e:
                 self.logger.warning("[clone] 同步 ITSM 工单失败（忽略）: %s", e)
 
-        # 2) 拉起 VDB 实例（异常必须落 failed，避免卡死 creating 无法重试）
+        # 2) 审批路径同样做预检（关闭免审批直通时不能绕过）
+        import re as _re
+        from core import clone_preflight as _cpf
+        _m = _re.search(r"\[clone_mode=([^\]]+)\]", str(req.get("note") or ""))
+        _mode = _m.group(1) if _m else "logical"
+        _src = models.get_record(req.get("source_record_id"))
+        _pf = _cpf.preflight(
+            _src, target_host=req.get("target_host") or "127.0.0.1",
+            target_password=req.get("target_password") or "",
+            note=req.get("note") or "", clone_mode=_mode)
+        if not _pf["ok"]:
+            raise ValueError("克隆预检未通过: " + "；".join(_pf["errors"]))
+
+        # 3) 拉起 VDB 实例（异常必须落 failed，避免卡死 creating 无法重试）
         req = models.get_clone_request(request_id, include_secret=True)
         req["status"] = STATUS_CREATING
         models.update_clone_request(request_id, {"status": STATUS_CREATING,
@@ -494,7 +518,8 @@ class CloneService:
                 "postgres" if db_type == "postgresql" else ("system" if db_type == "oracle" else "root"),
                 password,
                 f"{'COW 快照/模板' if res.get('cow') else 'Schema'}克隆实例"
-                f"{elapsed} | {user_note}")
+                f"{elapsed} | {user_note}",
+                service=(service if db_type == "oracle" else None))
 
         # ---- logical（默认）：基于备份产物逻辑导入 ----
         if not backup_path or not os.path.isfile(backup_path):
@@ -546,8 +571,9 @@ class CloneService:
                                      if target_host != "127.0.0.1" else ""))
 
     def _register_vdb(self, req: dict, rec: dict, db_type: str, name: str,
-                      port, user: str, password: str, note: str) -> int:
-        """登记 VDB 实例元数据。"""
+                      port, user: str, password: str, note: str,
+                      service: str = None) -> int:
+        """登记 VDB 实例元数据（Oracle 额外持久化服务名，供销毁/校验使用）。"""
         vdb_id = models.create_vdb({
             "name": name,
             "source_record_id": req["source_record_id"],
@@ -557,6 +583,7 @@ class CloneService:
             "host": req.get("target_host") or "127.0.0.1",
             "database_name": name,
             "username": user,
+            "service": service or "",
             "password": db.encrypt_secret(password or "") if password else "",
             "status": "ready",
             "created_at": db.now_iso(),
@@ -591,11 +618,7 @@ class CloneService:
         vdb = models.get_vdb(req["vdb_instance_id"])
         if not vdb:
             raise ValueError("VDB 实例元数据缺失")
-        # 连接密码：与拉起逻辑一致——目标实例密码优先，未填则沿用源任务密码
-        password = req.get("target_password") or ""
-        if not password:
-            src_task = models.get_task(vdb.get("task_id"), include_secret=True) or {}
-            password = src_task.get("password") or ""
+        password = self._vdb_password(vdb, req)
         res = restore_extras.verify_clone_conn(
             vdb.get("db_type"), vdb.get("host") or "127.0.0.1",
             vdb.get("port"), vdb.get("database_name"), vdb.get("username"),
@@ -614,10 +637,7 @@ class CloneService:
             if config.DEMO_MODE == "off":
                 # 连接密码：目标实例密码优先，未填则沿用源任务密码
                 creq = models.get_clone_request(req["id"], include_secret=True) or {}
-                password = creq.get("target_password") or ""
-                if not password:
-                    src_task = models.get_task(vdb.get("task_id"), include_secret=True) or {}
-                    password = src_task.get("password") or ""
+                password = self._vdb_password(vdb, creq)
                 try:
                     if vdb.get("db_type") == "oracle":
                         res = restore_extras_clone.drop_clone_extended(
@@ -641,6 +661,167 @@ class CloneService:
                 models.delete_vdb(vdb_id)
             except Exception as e:
                 self.logger.warning("[clone] 删除 VDB 元数据 #%s 失败（忽略）: %s", vdb_id, e)
+
+
+    # ------------------------- VDB 快照（时间点 / 回滚 / 再克隆） -------------------------
+    @staticmethod
+    def _vdb_password(vdb: dict, req: dict = None) -> str:
+        """统一密码来源：VDB 自己持久化的凭据优先，其次申请单，最后源任务。
+
+        历史缺陷：verify_clone 只读 clone_requests.target_password，接管检查却
+        优先 vdb_instances.password，旧 VDB API 甚至不写密码 —— 三处口径不一致。
+        """
+        pw = db.decrypt_secret(vdb.get("password") or "") or ""
+        if not pw and req:
+            pw = req.get("target_password") or ""
+        if not pw:
+            src_task = models.get_task(vdb.get("task_id"), include_secret=True) or {}
+            pw = src_task.get("password") or ""
+        return pw
+
+    @staticmethod
+    def _snapshot_row(snapshot_id: int, request_id: int = None) -> dict:
+        if request_id:
+            rows = db.query("SELECT * FROM vdb_snapshots WHERE id=? "
+                            "AND clone_request_id=?", (snapshot_id, request_id))
+        else:
+            rows = db.query("SELECT * FROM vdb_snapshots WHERE id=?", (snapshot_id,))
+        if not rows:
+            raise ValueError("VDB 快照不存在: %s" % snapshot_id)
+        return dict(rows[0])
+
+    def _vdb_context(self, request_id: int, require_ready: bool = True):
+        req = models.get_clone_request(request_id, include_secret=True)
+        if not req:
+            raise ValueError("克隆请求不存在: %s" % request_id)
+        if require_ready and (req.get("status") != STATUS_READY
+                              or not req.get("vdb_instance_id")):
+            raise ValueError("克隆未就绪，无法操作快照")
+        vdb = models.get_vdb(req.get("vdb_instance_id"))
+        if not vdb:
+            raise ValueError("VDB 实例元数据缺失")
+        return req, vdb, self._vdb_password(vdb, req)
+
+    def list_snapshots(self, request_id: int) -> list:
+        return [dict(r) for r in (db.query(
+            "SELECT * FROM vdb_snapshots WHERE clone_request_id=? "
+            "AND status!='deleted' ORDER BY id DESC", (request_id,)) or [])]
+
+    def create_snapshot(self, request_id: int, name: str = "",
+                        created_by: str = "") -> dict:
+        """对就绪 VDB 做一次数据级全量快照（逻辑导出 + sha256 对账）。"""
+        from core import vdb_snapshot as vs
+        req, vdb, password = self._vdb_context(request_id)
+        meta = vs.export_snapshot(vdb, password, name=name,
+                                  created_by=created_by)
+        parent = None
+        last = db.query("SELECT id FROM vdb_snapshots WHERE clone_request_id=? "
+                        "AND status='ready' ORDER BY id DESC LIMIT 1",
+                        (request_id,))
+        if last:
+            parent = last[0]["id"]
+        sid = db.execute(
+            "INSERT INTO vdb_snapshots(clone_request_id, vdb_instance_id, name,"
+            " snap_kind, parent_snapshot_id, backup_path, size_bytes, checksum,"
+            " table_count, row_count, status, note, created_at, created_by)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (request_id, vdb["id"], meta["name"], meta["snap_kind"], parent,
+             meta["backup_path"], meta["size_bytes"], meta["checksum"],
+             meta["table_count"], meta["row_count"], "ready", "",
+             db.now_iso(), created_by or "unknown"))
+        db.add_log("INFO", "clone",
+                   "VDB 快照 #%s 创建：克隆 #%s，%s 表 / %s 行，%s 字节"
+                   % (sid, request_id, meta["table_count"], meta["row_count"],
+                      meta["size_bytes"]))
+        return self._snapshot_row(sid)
+
+    def rollback_snapshot(self, request_id: int, snapshot_id: int,
+                          drop_new_tables: bool = True,
+                          operator: str = "") -> dict:
+        """把 VDB 数据回滚到快照点；先做 sha256 完整性复核，篡改即拒绝。"""
+        from core import vdb_snapshot as vs
+        _req, vdb, password = self._vdb_context(request_id)
+        snap = self._snapshot_row(snapshot_id, request_id)
+        if snap.get("status") != "ready":
+            raise ValueError("快照 #%s 不是就绪状态（%s），拒绝回滚"
+                             % (snapshot_id, snap.get("status")))
+        try:
+            actual = vs.sha256_file(snap["backup_path"])
+        except Exception as e:
+            raise ValueError("快照产物不可读: %s" % e)
+        if snap.get("checksum") and actual != snap["checksum"]:
+            raise ValueError("快照产物校验和不匹配（可能被篡改），拒绝回滚")
+        res = vs.restore_snapshot(vdb, password, snap["backup_path"],
+                                  drop_new_tables=drop_new_tables)
+        db.add_log("WARNING", "clone",
+                   "VDB 快照回滚：克隆 #%s 回到快照 #%s，操作人 %s，%s"
+                   % (request_id, snapshot_id, operator or "unknown",
+                      res.get("message")))
+        return {**res, "snapshot_id": snapshot_id}
+
+    def reclone_snapshot(self, request_id: int, snapshot_id: int,
+                         target_env: str = "", requested_by: str = "",
+                         operator: str = "") -> dict:
+        """从快照再克隆：用源备份产物拉起新 VDB，再把快照数据回放进去。
+
+        依赖原备份产物提供表结构（平台不做 DDL 逆向），产物不可用时如实拒绝。
+        """
+        from core import vdb_snapshot as vs
+        req, vdb, password = self._vdb_context(request_id)
+        snap = self._snapshot_row(snapshot_id, request_id)
+        if snap.get("status") != "ready":
+            raise ValueError("快照 #%s 不是就绪状态，拒绝再克隆" % snapshot_id)
+        if not req.get("source_record_id"):
+            raise ValueError("源克隆不是基于备份产物，无法再克隆")
+        rec = models.get_record(req["source_record_id"]) or {}
+        if not os.path.isfile(rec.get("backup_path") or ""):
+            raise ValueError("源备份产物已不可用，无法从快照再克隆"
+                             "（请用可用备份产物重新克隆）")
+        new_id = models.create_clone_request({
+            "source_record_id": req["source_record_id"],
+            "target_env": target_env or (req.get("target_env") or "snapshot-clone"),
+            "target_host": req.get("target_host") or vdb.get("host") or "127.0.0.1",
+            "target_password": password,
+            "status": STATUS_CREATING,
+            "purpose": "test",
+            "requested_by": requested_by or operator or "snapshot",
+            "note": "[clone_mode=logical][snapshot_parent=%s]" % snapshot_id,
+        })
+        try:
+            new_req = models.get_clone_request(new_id, include_secret=True)
+            vdb_id = self._launch_vdb(new_req)
+            models.update_clone_request(
+                new_id, {"status": STATUS_READY, "vdb_instance_id": vdb_id})
+            _, new_vdb, new_pw = self._vdb_context(new_id)
+            applied = vs.restore_snapshot(new_vdb, new_pw,
+                                          snap["backup_path"],
+                                          drop_new_tables=False)
+        except Exception as e:
+            models.update_clone_request(
+                new_id, {"status": STATUS_FAILED,
+                         "note": "快照再克隆失败: %s" % str(e)[:300]})
+            db.add_log("WARNING", "clone",
+                       "快照 #%s 再克隆失败：%s" % (snapshot_id, str(e)[:200]))
+            raise ValueError("快照再克隆失败: %s" % e)
+        db.add_log("INFO", "clone",
+                   "VDB 快照 #%s 再克隆为新克隆 #%s（VDB #%s）"
+                   % (snapshot_id, new_id, vdb_id))
+        return {"ok": True, "clone_request_id": new_id,
+                "vdb_instance_id": vdb_id, "snapshot_id": snapshot_id,
+                "applied": applied}
+
+    def delete_snapshot(self, request_id: int, snapshot_id: int,
+                        operator: str = "") -> dict:
+        """软删快照元数据（保留产物文件与审计轨迹），不可回滚点不再可选。"""
+        snap = self._snapshot_row(snapshot_id, request_id)
+        db.execute("UPDATE vdb_snapshots SET status='deleted', deleted_at=?, "
+                   "note=? WHERE id=?",
+                   (db.now_iso(), "由 %s 删除" % (operator or "unknown"),
+                    snapshot_id))
+        db.add_log("INFO", "clone",
+                   "VDB 快照 #%s 已删除（产物保留）" % snapshot_id)
+        return {"ok": True, "snapshot_id": snapshot_id,
+                "status": "deleted", "backup_path": snap.get("backup_path")}
 
 
 # 便捷单例

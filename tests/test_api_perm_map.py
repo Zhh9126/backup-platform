@@ -66,6 +66,9 @@ def test_all_write_endpoints_are_mapped(app):
     ("POST", "/api/tokens", "security.manage", "segment"),
     ("PUT", "/api/system/concurrency", "system.settings", "segment"),
     ("GET", "/api/tasks", None, "read"),
+    ("POST", "/api/source-guard/config", "system.settings", "segment"),
+    ("POST", "/api/source-guard/sample/1", None, "exempt"),
+    ("POST", "/api/source-guard/window/1/apply", "backup.task.manage", "action"),
 ])
 def test_key_resolutions(method, path, expected_perm, expected_reason):
     perm, reason = perm_map.resolve(path, method)

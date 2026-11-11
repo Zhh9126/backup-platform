@@ -522,23 +522,25 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
             </div>
             <div class="tab-pane fade" id="tab_extra" role="tabpanel">
               <div class="alert alert-info py-2 mb-3">
-                <small>根据所选数据库类型显示对应参数。MySQL/PG 可在下方可视化选择库/表；其他类型或高级参数请用右侧 JSON 编辑。</small>
+                <small>根据所选数据库类型显示对应参数。MySQL/PG 可在下方可视化选择库/表；其他类型或高级参数请用右侧 JSON 编辑。</small><br>
+                <small><b>无需先保存任务</b>：「拉取库列表」「选择表」「测试连接」「JDBC 测试」都直接按第 1 步填写的连接参数探测；任务共 4 步，「保存」按钮在第 4 步「确认&amp;提交」，也可点击顶部该步骤直达。</small>
               </div>
 
               <!-- MySQL/PostgreSQL 友好的可视化选择（仅在选 mysql/mariadb/postgresql 时显示） -->
               <div id="t_db_picker" class="mb-3" style="display:none">
                 <div class="row g-2 align-items-end mb-2">
                   <div class="col-md-8">
-                    <label class="form-label small text-muted">数据库列表（点击按钮连接数据库并拉取）</label>
+                    <label class="form-label small text-muted">数据库列表（按当前表单参数拉取，无需先保存任务）</label>
                     <div class="input-group">
-                      <button class="btn btn-outline-primary btn-sm" type="button" id="t_db_picker_btn">
+                      <button class="btn btn-outline-primary btn-sm" type="button" id="t_db_picker_btn"
+                              title="按当前表单的连接参数拉取库列表，新建任务无需先保存">
                         <i class="bi bi-arrow-clockwise"></i> 拉取库列表
                       </button>
                       <button class="btn btn-outline-secondary btn-sm" type="button" id="t_jdbc_test_btn"
                               title="通过 JDBC 驱动直连数据库测试连通性（无需 SSH / 数据库客户端）">
                         <i class="bi bi-plugin"></i> JDBC 测试
                       </button>
-                      <span class="form-control form-control-sm text-muted" id="t_db_picker_status">点击按钮连接数据库并拉取</span>
+                      <span class="form-control form-control-sm text-muted" id="t_db_picker_status">点击「拉取库列表」按当前表单连接数据库</span>
                     </div>
                   </div>
                   <div id="t_jdbc_test_result" class="col-md-8 d-none">

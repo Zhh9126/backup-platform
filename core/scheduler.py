@@ -55,12 +55,20 @@ class _ConcurrencyController:
         # config 在启动时统一解析环境变量（非法值已回落 0），此处只读一次
         env_limit = int(getattr(config, "MAX_CONCURRENT_BACKUPS", 0) or 0)
         if env_limit > 0:
-            return max(1, min(env_limit, 64))
+            base = max(1, min(env_limit, 64))
+        else:
+            try:
+                limit = int(db.get_system_config("max_concurrent_backups") or 2)
+            except Exception:
+                limit = 2
+            base = max(1, min(limit, 64))
+        # 源端 CPU 处于 50~70% 时临时把并行度压到 2（5 分钟后自动恢复），
+        # 不改用户持久化的 max_concurrent_backups 配置。
         try:
-            limit = int(db.get_system_config("max_concurrent_backups") or 2)
+            from core import source_guard
+            return source_guard.current_parallel_cap(base)
         except Exception:
-            limit = 2
-        return max(1, min(limit, 64))
+            return base
 
     def _ensure(self):
         now = time.monotonic()
@@ -442,6 +450,20 @@ def _execute_backup(task: dict, backup_type: str = None,
                     operator: str = None) -> dict:
     from core.engines.base import BackupType, BackupResult
     bt = _normalize_backup_type(backup_type or task.get("backup_type") or "full")
+    # 三层 CPU 保护的执行端：cron 调度、手动触发、异步队列统一经过这里。
+    # 决策失败/模块缺失一律放行（fail-open），不因探测问题阻断正常备份。
+    try:
+        from core import source_guard
+        guard = source_guard.guard_before_backup(task, operator=operator)
+        if guard.get("blocked"):
+            return guard["record"]
+        if guard.get("throttle_kbps"):
+            task = dict(task)
+            task["bandwidth_limit"] = guard["throttle_kbps"]
+            _logger.info("[source_guard] 任务 #%s 降级执行: %s",
+                         task.get("id"), guard["verdict"].get("message"))
+    except Exception as _ge:  # noqa: BLE001
+        _logger.debug("[source_guard] 决策跳过（不阻断备份）: %s", _ge)
     # 全局并发控制：限制同时执行的备份数量（缺省保守，不破坏旧串行行为）。
     # release 必须作用于 acquire 时拿到的那个信号量，配置热变更重建不串味。
     sem = _CONCURRENCY.acquire()
@@ -766,6 +788,8 @@ def run_restore_now(record_id: int, target_host: str = None,
                     target_time: str = None,
                     pitr_restore_dir: str = None,
                     tables: list = None,
+                    table_renames: dict = None,
+                    target_schema: str = None,
                     restore_options: dict = None,
                     force_unsafe_restore: bool = False) -> Optional[dict]:
     """立即执行一次恢复。
@@ -851,6 +875,9 @@ def run_restore_now(record_id: int, target_host: str = None,
         "目标端口": target_port or "-",
         "恢复时间点(PITR)": target_time or "-",
         "指定表": ",".join(tables) if tables else "(全部)",
+        "表改名": ",".join(f"{k}→{v}" for k, v in (table_renames or {}).items())
+                 or "(无)",
+        "目标Schema": target_schema or "(原schema)",
         "操作人": operator or "-",
     }, title="恢复任务上下文")
 
@@ -880,6 +907,8 @@ def run_restore_now(record_id: int, target_host: str = None,
                                         target_time=target_time,
                                         pitr_restore_dir=pitr_restore_dir,
                                         tables=tables,
+                                        table_renames=table_renames,
+                                        target_schema=target_schema,
                                         **_obj_kw)
         finally:
             _rd.reset_task_env_export(_env_token)

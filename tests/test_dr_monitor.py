@@ -139,12 +139,45 @@ def test_monitor_auto_failover_failure_recorded(monkeypatch):
     _advance_clock()
     out = dr_monitor.check_once()
     assert out[0]["action"] == "auto_failover_failed"
+    assert out[0]["result"]["retry_in_sec"] == 60
     st = dr_monitor.state_view()[str(lid)]
     assert "备库不可达" in (st.get("auto_failover_error") or "")
-    # auto_running 已复位，下轮可重试
+    assert st["failover_fail_count"] == 1
+    # 退避期内不再重试，避免每轮探测都尝试切换并刷 ERROR
     _advance_clock()
     out2 = dr_monitor.check_once()
-    assert out2[0]["action"] in ("auto_failover", "auto_failover_failed")
+    assert out2[0]["action"] == "backoff"
+    assert out2[0]["result"]["retry_in_sec"] > 0
+    # 模拟退避到期：再次真实尝试，退避翻倍
+    st2 = dr_monitor.state_view()
+    st2[str(lid)]["failover_backoff_until"] = 0
+    dr_monitor._save_state(st2)
+    _advance_clock()
+    out3 = dr_monitor.check_once()
+    assert out3[0]["action"] == "auto_failover_failed"
+    assert out3[0]["result"]["retry_in_sec"] == 120
+    assert dr_monitor.state_view()[str(lid)]["failover_fail_count"] == 2
+
+
+def test_monitor_recovery_clears_backoff(monkeypatch):
+    """主库恢复后 reset_state 应清空退避，故障再来时重新按 60s 起算。"""
+    lid = _make_link({"enabled": True, "check_interval_sec": 10,
+                      "consecutive_failures": 1,
+                      "require_manual_confirm": False})
+    monkeypatch.setattr(dr_failover, "health_snapshot",
+                        lambda x: _snap(False, "down"))
+    monkeypatch.setattr(dr_failover, "run_failover",
+                        lambda x, force=False: (_ for _ in ()).throw(
+                            dr_failover.FailoverError("备库不可达")))
+    _advance_clock()
+    assert dr_monitor.check_once()[0]["action"] == "auto_failover_failed"
+    assert dr_monitor.state_view()[str(lid)].get("failover_backoff_until")
+    monkeypatch.setattr(dr_failover, "health_snapshot", lambda x: _snap(True))
+    _advance_clock()
+    assert dr_monitor.check_once()[0]["action"] == "ok"
+    st = dr_monitor.state_view()[str(lid)]
+    assert not st.get("failover_backoff_until")
+    assert not st.get("failover_fail_count")
 
 
 def test_monitor_recovery_resets(monkeypatch):

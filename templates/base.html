@@ -37,9 +37,9 @@
       box-shadow: 0 0 8px rgba(245, 158, 11, .25);
     }
   </style>
-  <link href="/static/css/bootstrap.min.css?v=2026080210" rel="stylesheet">
-  <link href="/static/vendor/bootstrap-icons/bootstrap-icons-inline.css?v=2026110401" rel="stylesheet">
-  <link href="/static/css/app.css?v=2026110609" rel="stylesheet">
+  <link href="/static/css/bootstrap.min.css?v=2026111102" rel="stylesheet">
+  <link href="/static/vendor/bootstrap-icons/bootstrap-icons-inline.css?v=2026111102" rel="stylesheet">
+  <link href="/static/css/app.css?v=2026111006" rel="stylesheet">
 </head>
 <body data-page="{{ page }}">
   <!-- 语言切换：右上角悬浮按钮 -->
@@ -72,7 +72,7 @@
           {% if license_info and license_info.is_licensed %}
             <span class="brand-edition brand-edition-enterprise" id="brandEditionBadge" title="已激活永久商业授权（客户: {{ license_info.customer }}）"><i class="bi bi-shield-fill-check"></i> 企业永久版</span>
           {% else %}
-            <span class="brand-edition" id="brandEditionBadge" title="社区免费版（每类受控功能最多纳管 5 个）"><i class="bi bi-box"></i> 社区版</span>
+            <span class="brand-edition" id="brandEditionBadge" title="社区免费版（每类受控功能最多纳管 {{ license_info.get('quota_limit', 100) if license_info else 100 }} 个）"><i class="bi bi-box"></i> 社区版</span>
           {% endif %}
         </span>
         <button class="sidebar-toggle" id="sidebarToggle" type="button" title="收起 / 展开侧边栏" aria-label="收起或展开侧边栏">
@@ -101,6 +101,7 @@
         <div class="nav-group-label">数据恢复管理</div>
         <a class="nav-link {% if page=='restore' %}active{% endif %}" href="/restore" title="数据恢复" data-perm="restore.run"><i class="bi bi-arrow-counterclockwise"></i> <span class="nav-label">数据恢复</span></a>
         <a class="nav-link {% if page=='restore-verify' %}active{% endif %}" href="/restore-verify" title="恢复校验" data-perm="restore.verify.manage"><i class="bi bi-patch-check"></i> <span class="nav-label">恢复校验</span></a>
+        <a class="nav-link {% if page=='scan-fs' %}active{% endif %}" href="/scan-fs" title="无备份目录扫描恢复：SSH 只读扫描文件系统找回数据文件并拉回平台（文件系统层，非扇区雕刻）" data-perm="backup.task.view"><i class="bi bi-hdd-rack"></i> <span class="nav-label">无备份目录扫描</span></a>
         <a class="nav-link {% if page=='data-compare' %}active{% endif %}" href="/data-compare" title="数据对比（恢复数据 vs 生产库）" data-perm="data_compare.run"><i class="bi bi-clipboard-data"></i> <span class="nav-label">数据对比</span></a>
         <a class="nav-link {% if page=='deploy' %}active{% endif %}" href="/deploy" title="数据库部署" data-perm="deploy.manage"><i class="bi bi-rocket-takeoff"></i> <span class="nav-label">数据库部署</span></a>
         <div class="nav-group-label">记录</div>
@@ -171,16 +172,16 @@
       <button type="button" class="btn-close me-2 m-auto" data-bs-dismiss="toast"></button></div>
   </div>
 
-  <script src="/static/js/bootstrap.bundle.min.js?v=2026080210"></script>
+  <script src="/static/js/bootstrap.bundle.min.js?v=2026111102"></script>
   <!-- 首屏注入 META（数据库类型/显示名/默认端口）：必须在 bkp-core.js 之前，
        否则依赖 BKP.META 的下拉会被填成空（见 app.py context_processor 注释） -->
   <script>window.__BKP_META__ = {{ bkp_meta | default({}) | tojson }};</script>
-  <script src="/static/js/i18n.js?v=2026101303"></script>
-  <script src="/static/js/bkp-core.js?v=2026110301"></script>
-  <script src="/static/js/pager.js?v=2026110403"></script>
+  <script src="/static/js/i18n.js?v=2026111101"></script>
+  <script src="/static/js/bkp-core.js?v=2026111102"></script>
+  <script src="/static/js/pager.js?v=2026111102"></script>
   <script src="/static/js/precheck.js?v=2026110610"></script>
-  <script src="/static/js/app.js?v=2026111005"></script>
-  {% if has_ai_agent %}<script src="/static/js/ai-agent.js?v=2026101501"></script>{% endif %}
+  <script src="/static/js/app.js?v=2026111010"></script>
+  {% if has_ai_agent %}<script src="/static/js/ai-agent.js?v=2026111102"></script>{% endif %}
   <script>
     // 按权限隐藏菜单（每个 <a class="nav-link" data-perm="..."> 命中则可见）
     document.addEventListener("DOMContentLoaded", function () {

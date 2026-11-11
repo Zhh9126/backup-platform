@@ -15,7 +15,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 容灾切换 · 恢复演练 · 预校验 · 克隆（VDB） · 不可变备份 · 巡检 · 监控 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v2.3.7-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v2.3.8-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -33,7 +33,8 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 > 目录模拟带库全链路 28/28、防勒索专项 11/11、发版回归 97 passed；
 > 真实磁带库 / 机械手 / LTO WORM 尚无真机验证报告（见下方「诚实边界」）。
 >
-> **最新动态**：v2.3.7（2026-11-10）已发布（防勒索闭环 / 磁带库接入 / 安全审计整改）；
+> **最新动态**：v2.3.8（2026-11-11）已发布（三粒度统一 / VDB 快照 / 应用级容灾 HA）；
+> v2.3.7 完成防勒索闭环 / 磁带库接入 / 安全审计整改；
 > 上一版本完成群晖 DSM 全面纳管、Windows 文件增量、异地容灾出站拉取、授权服务器数计量，
 > 并修复离线包全新部署时 SQL Server JDBC 逻辑备份不可用；
 > 2026-11-07 四库型（Oracle/PostgreSQL/金仓/达梦）全功能深度测试收官——
@@ -397,8 +398,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v2.3.7    # 固定版本（可回滚）
-# 当前最新版本：v2.3.7（2026-11-10，防勒索闭环 / 磁带库接入 / 安全审计整改）
+docker pull ghcr.io/zhh9126/backup-platform:v2.3.8    # 固定版本（可回滚）
+# 当前最新版本：v2.3.8（2026-11-11，三粒度统一 / VDB 快照 / 应用级容灾 HA）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -686,6 +687,15 @@ docker build -t backup-platform:local .
 - 默认账号请立即修改（首登会标记 `must_change_password`）；生产环境建议限制来源 IP
 
 ## 更新日志
+
+### v2.3.8（2026-11-11，已发布）
+
+- **全库 / 单库 / 单表统一入口**：顶层 `scope=full_instance|database|table`（含中文别名）与 `schema/tables` 归一进 `extra_options`，非法参数前置 400；Oracle/达梦按 `SCHEMAS=` / `TABLES=schema.table` 语义处理，杜绝「选单库却静默跑 `FULL=Y`」。PG/金仓本机 `pg_dump -t` 单表真修复；协议兼容层白名单与全实例对象清单补齐。
+- **克隆服务 VDB 快照**：`vdb_snapshots` 版本链 + 平台侧逻辑快照（gzip JSON + sha256，零客户端安装），支持创建 / 回滚（篡改即拒）/ 从快照再克隆 / 软删；回滚接高危验证码闸。顺带统一 VDB 密码口径、补 `vdb_instances.service` 列。
+- **应用级容灾 HA（第一批）**：新增 `core/dr_app_ha.py` —— 出站应用 HTTP 探活（SSRF 防护、零 Agent）与切换后业务验证（SQL 仅 SELECT + HTTP 断言）；`health_snapshot` 增 `app` 段，切换入口加链路级并发锁，自动监控把应用故障单独告警而不误触发数据库切换。产品边界纠正为「容灾 = 应用级，数据级由实时同步承担」。
+- **11-11 质量门禁与缺陷修复**：i18n 覆盖 / 静态缓存戳 / 启动无模块级 IO / 物理增量链恢复校验 / 网络设备配额 403 五道门禁，及对应真实缺陷。
+- **真实验证**：5 库型三粒度矩阵 58 项全绿（MySQL170/金仓170/PG170/Oracle171/达梦170）、VDB 快照 E2E 17/17、应用级容灾影子 E2E 9/9、组合回归 107 passed、`route_smoke` 0 UNAUTH / 0 BAD、`full_smoke` 21/21。
+- **诚实边界**：VDB 快照是数据级非 DDL 快照、全量、再克隆依赖源备份产物；应用级容灾尚无真实 VIP/代理与多站点验证；两块新能力目前只有 API、暂无页面入口；切换引擎仍仅 MySQL。
 
 ### v2.3.7（2026-11-10，已发布）
 

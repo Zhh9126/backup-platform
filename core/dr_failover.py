@@ -467,20 +467,64 @@ class FailoverEngine:
                    (json.dumps(hist, ensure_ascii=False), self.link.get("id")))
 
 
+# ---------------------------------------------------------------------------
+# 应用级容灾接入：链路级并发护栏 + 切换后业务验证（默认零破坏）
+# ---------------------------------------------------------------------------
+import threading as _threading  # noqa: E402
+
+_LINK_LOCKS = {}
+_LOCK_GUARD = _threading.Lock()
+
+
+def _acquire_link_lock(link_id: int):
+    """手动向导与自动监控可同时触发切换，链路级非阻塞锁防双切换。"""
+    with _LOCK_GUARD:
+        lk = _LINK_LOCKS.setdefault(link_id, _threading.Lock())
+    if not lk.acquire(blocking=False):
+        raise FailoverError("链路 #%s 已有切换/回切在执行，请勿并发触发" % link_id)
+    return lk
+
+
+def _attach_business_verification(result: dict, cfg: dict, phase: str,
+                                  link_id: int) -> dict:
+    from core import dr_app_ha
+    v = dr_app_ha.run_post_switch_verification(
+        cfg, phase=phase, decrypt_conn=_decrypt_conn)
+    result["business_verification"] = v
+    result["business_ok"] = bool(v.get("ok"))
+    if v.get("configured") and not v.get("ok"):
+        result["message"] = v.get("message")
+        db.add_log("ERROR", "dr_failover",
+                   "链路 #%s %s：%s" % (link_id, phase, v.get("message")))
+    return result
+
+
 def run_failover(link_id: int, force: bool = False) -> dict:
-    from core import models
-    link = db.query_one("SELECT * FROM disaster_links WHERE id=?", (link_id,))
-    if not link:
-        raise FailoverError("容灾链路不存在: %s" % link_id)
-    return FailoverEngine(dict(link)).failover(force=force)
+    lk = _acquire_link_lock(link_id)
+    try:
+        link = db.query_one("SELECT * FROM disaster_links WHERE id=?", (link_id,))
+        if not link:
+            raise FailoverError("容灾链路不存在: %s" % link_id)
+        link = dict(link)
+        cfg = _load_config(link)
+        res = FailoverEngine(link).failover(force=force)
+        return _attach_business_verification(res, cfg, "failover", link_id)
+    finally:
+        lk.release()
 
 
 def run_failback(link_id: int) -> dict:
-    from core import models
-    link = db.query_one("SELECT * FROM disaster_links WHERE id=?", (link_id,))
-    if not link:
-        raise FailoverError("容灾链路不存在: %s" % link_id)
-    return FailoverEngine(dict(link)).failback()
+    lk = _acquire_link_lock(link_id)
+    try:
+        link = db.query_one("SELECT * FROM disaster_links WHERE id=?", (link_id,))
+        if not link:
+            raise FailoverError("容灾链路不存在: %s" % link_id)
+        link = dict(link)
+        cfg = _load_config(link)
+        res = FailoverEngine(link).failback()
+        return _attach_business_verification(res, cfg, "failback", link_id)
+    finally:
+        lk.release()
 
 
 # ---------------------------------------------------------------------------
@@ -558,7 +602,7 @@ def health_snapshot(link_id: int) -> dict:
         raise FailoverError("链路缺少 failover_config.primary_conn，无法探测")
     snap = {"link_id": link_id, "link_name": link.get("name"),
             "checked_at": db.now_iso(), "primary": None, "standby": None,
-            "dns": None}
+            "dns": None, "app": None}
     # 主库
     pr = _probe_mysql(p.get("host"), int(p.get("port") or 3306),
                       p.get("user") or p.get("username") or "root",
@@ -588,4 +632,7 @@ def health_snapshot(link_id: int) -> dict:
             snap["dns"] = {"domain": domain, "resolved_ip": resolved,
                            "expected_ip": expected,
                            "in_sync": bool(resolved and resolved == expected)}
+    # 应用级容灾：平台侧出站探活业务健康端点（未配置时 ok=True，零破坏）
+    from core import dr_app_ha
+    snap["app"] = dr_app_ha.probe_app(cfg.get("app_probe") or {})
     return snap

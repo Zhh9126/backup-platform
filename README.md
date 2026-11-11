@@ -422,17 +422,17 @@ python tools/check_env.py
 ### 离线导入
 
 ```bash
-# 交付包：aidbm_2.3.7_offline.tar.gz（约 1.3GB，gzip 压缩的完整镜像，含全部运行依赖与备份工具）
-docker load -i aidbm_2.3.7_offline.tar.gz
+# 交付包：aidbm_2.3.8_offline.tar.gz（约 1.3GB，gzip 压缩的完整镜像，含全部运行依赖与备份工具）
+docker load -i aidbm_2.3.8_offline.tar.gz
 
 # 导入后确认镜像名（离线环境不会自动去公网拉取）
 docker images | grep -E 'backup-platform|aidbm'
 ```
 
 > **导入后可用 4 个镜像名（同一镜像 ID，任选其一启动，全程零联网）**：
-> `ghcr.io/zhh9126/backup-platform:v2.3.7`、`ghcr.io/zhh9126/backup-platform:latest`、
-> `aidbm:2.3.7`、`aidbm:latest`。
-> **v2.3.7 交付包已把这 4 个 tag 全部打进 `manifest.json` 的 `RepoTags`**，
+> `ghcr.io/zhh9126/backup-platform:v2.3.8`、`ghcr.io/zhh9126/backup-platform:latest`、
+> `aidbm:2.3.8`、`aidbm:latest`。
+> **v2.3.8 交付包已把这 4 个 tag 全部打进 `manifest.json` 的 `RepoTags`**，
 > `docker load` 时会输出 4 行 `Loaded image:`，直接 `docker run` 任一名字都不会访问公网。
 >
 > 若遇到 `Unable to find image 'xxx' locally` 后跟着
@@ -440,18 +440,18 @@ docker images | grep -E 'backup-platform|aidbm'
 > 说明**启动命令用的镜像名不在包内 tag 里**（Docker 找不到本地镜像就会去公网），
 > 不是包损坏。先 `docker images` 查实际 tag，或补一条：
 > ```bash
-> docker tag ghcr.io/zhh9126/backup-platform:v2.3.7 aidbm:2.3.7
+> docker tag ghcr.io/zhh9126/backup-platform:v2.3.8 aidbm:2.3.8
 > ```
 
 自行导出（有网机器上**先打齐 tag 再 save**，否则包内只带单个 tag）：
 
 ```bash
-docker pull ghcr.io/zhh9126/backup-platform:v2.3.7
-docker tag ghcr.io/zhh9126/backup-platform:v2.3.7 ghcr.io/zhh9126/backup-platform:latest
-docker tag ghcr.io/zhh9126/backup-platform:v2.3.7 aidbm:2.3.7
-docker tag ghcr.io/zhh9126/backup-platform:v2.3.7 aidbm:latest
-docker save ghcr.io/zhh9126/backup-platform:v2.3.7 ghcr.io/zhh9126/backup-platform:latest aidbm:2.3.7 aidbm:latest | gzip > aidbm_2.3.7_offline.tar.gz
-gzip -t aidbm_2.3.7_offline.tar.gz    # 必须输出 OK，否则包被截断不可交付
+docker pull ghcr.io/zhh9126/backup-platform:v2.3.8
+docker tag ghcr.io/zhh9126/backup-platform:v2.3.8 ghcr.io/zhh9126/backup-platform:latest
+docker tag ghcr.io/zhh9126/backup-platform:v2.3.8 aidbm:2.3.8
+docker tag ghcr.io/zhh9126/backup-platform:v2.3.8 aidbm:latest
+docker save ghcr.io/zhh9126/backup-platform:v2.3.8 ghcr.io/zhh9126/backup-platform:latest aidbm:2.3.8 aidbm:latest | gzip > aidbm_2.3.8_offline.tar.gz
+gzip -t aidbm_2.3.8_offline.tar.gz    # 必须输出 OK，否则包被截断不可交付
 ```
 
 ### 磁带库 / 可移动介质接入（离线容器部署）
@@ -495,7 +495,7 @@ docker run -d --name aidbm -p 8080:8080 \
   --device /dev/sg2:/dev/sg2:rwm \
   -v /opt/backup-platform/data:/data \
   -e BACKUP_ROOT=/data/backups -e TZ=Asia/Shanghai \
-  aidbm:2.3.7
+  aidbm:2.3.8
 ```
 
 离线安装脚本支持 `TAPE_DEVICES="/dev/tape/by-id/scsi-XXXX-nst /dev/sg2" ./install.sh`，
@@ -523,11 +523,11 @@ docker run -d --name backup-platform \
   -v backup-data:/data \
   -e BACKUP_ROOT=/data/backups \
   --restart unless-stopped \
-  ghcr.io/zhh9126/backup-platform:v2.3.7
+  ghcr.io/zhh9126/backup-platform:v2.3.8
 ```
 
 > 离线环境请用**固定版本 tag**（不要用 `:latest` 指代"从公网拉最新"）。
-> 交付包内 `aidbm:2.3.7`、`aidbm:latest`、`ghcr.io/zhh9126/backup-platform:latest`
+> 交付包内 `aidbm:2.3.8`、`aidbm:latest`、`ghcr.io/zhh9126/backup-platform:latest`
 > 均与上面这个镜像名指向同一个镜像 ID，替换使用完全等效。
 
 > **备份文件存在哪？** 镜像默认把备份产物写到容器内 `/data/backups`（布局 `<该路径>/<数据库类型>/<任务ID_任务名>/`）。
@@ -538,14 +538,14 @@ docker run -d --name backup-platform \
 
 ```bash
 # 1. 导入新版本镜像（把交付包拷入离线机器）
-docker load -i aidbm_2.3.7_offline.tar.gz
+docker load -i aidbm_2.3.8_offline.tar.gz
 
 # 2. 停止并删除旧容器（备份数据在 backup-data 卷中，不受影响）
 docker stop backup-platform
 docker rm backup-platform
 
 # 3. 用新版本镜像启动（命令与首次部署完全一致，仅换镜像 tag）
-docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.3.7
+docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.3.8
 
 # 4.（可选）删除旧版本镜像释放空间
 docker rmi ghcr.io/zhh9126/backup-platform:v2.3.5
@@ -563,7 +563,7 @@ docker stop backup-platform
 docker rm backup-platform
 
 # 2. 删除镜像
-docker rmi ghcr.io/zhh9126/backup-platform:v2.3.7
+docker rmi ghcr.io/zhh9126/backup-platform:v2.3.8
 
 # 3.（谨慎）删除数据卷 —— 会清掉全部备份产物与元数据，操作前务必
 #    先把备份文件拷贝转移！

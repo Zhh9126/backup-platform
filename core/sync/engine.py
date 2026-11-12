@@ -1303,6 +1303,18 @@ class SyncEngine:
     def validate(self) -> Dict[str, Any]:
         """执行前兼容性校验（pg2mysql Validator）。"""
         cfg = self.config
+        src_t = (cfg.src_db_type or "").lower()
+        tgt_t = (cfg.tgt_db_type or "").lower()
+        # SchemaValidator 只实现了 MySQL / PG 系方言，Oracle/达梦源过去会走
+        # psycopg2 风格 %s 绑定而抛 DPY-4009。这里如实标注未支持，不伪装成功。
+        if src_t not in _SCHEMA_VALIDATOR_TYPES or tgt_t not in _SCHEMA_VALIDATOR_TYPES:
+            return {
+                "success": True, "validated": False, "supported": False,
+                "passed": None, "incompatible_columns": [],
+                "incompatible_row_count": 0, "incompatible_row_ids": [],
+                "message": ("Schema 兼容性校验暂不支持 %s → %s（当前实现 MySQL / PG 系方言），"
+                            "已如实跳过；同步与迁移主链路不受影响" % (src_t, tgt_t)),
+            }
         try:
             src_conn = self.reader.connect()
             tgt_conn = self.writer.connect()
@@ -1314,9 +1326,11 @@ class SyncEngine:
                 result = validator.validate_table(
                     src_table=cfg.source_table,
                     dst_table=cfg.target_table or cfg.source_table,
-                    src_schema=cfg.src_schema or cfg.src_db_name,
+                    src_schema=_schema_locator(cfg.src_db_type, cfg.src_schema,
+                                               cfg.src_db_name, cfg.src_username),
                     dst_database=cfg.tgt_db_name,
-                    dst_schema=cfg.tgt_schema,
+                    dst_schema=_schema_locator(cfg.tgt_db_type, cfg.tgt_schema,
+                                               cfg.tgt_db_name, cfg.tgt_username),
                 )
                 return {
                     "success": True,
@@ -1345,7 +1359,13 @@ class SyncEngine:
         tables = self._get_tables_to_sync()
         if not tables:
             return {"success": False, "message": "没有可校验的表"}
-
+        src_t = (cfg.src_db_type or "").lower()
+        tgt_t = (cfg.tgt_db_type or "").lower()
+        if src_t not in _SCHEMA_VALIDATOR_TYPES or tgt_t not in _SCHEMA_VALIDATOR_TYPES:
+            return {"success": True, "validated": False, "supported": False,
+                    "all_pass": None, "tables": [],
+                    "message": ("全库 Schema 校验暂不支持 %s → %s（当前实现 MySQL / PG 系方言），"
+                                "已如实跳过" % (src_t, tgt_t))}
         try:
             src_conn = self.reader.connect()
             tgt_conn = self.writer.connect()
@@ -1359,9 +1379,11 @@ class SyncEngine:
                 for table in tables:
                     r = validator.validate_table(
                         src_table=table, dst_table=table,
-                        src_schema=cfg.src_schema or cfg.src_db_name,
+                        src_schema=_schema_locator(cfg.src_db_type, cfg.src_schema,
+                                                   cfg.src_db_name, cfg.src_username),
                         dst_database=cfg.tgt_db_name,
-                        dst_schema=cfg.tgt_schema,
+                        dst_schema=_schema_locator(cfg.tgt_db_type, cfg.tgt_schema,
+                                                   cfg.tgt_db_name, cfg.tgt_username),
                     )
                     results.append({
                         "table": table,
@@ -1414,8 +1436,10 @@ class SyncEngine:
                     )
                     result = verifier.verify_table(
                         table=table,
-                        src_schema=cfg.src_schema or cfg.src_db_name,
-                        dst_database=cfg.tgt_db_name or cfg.tgt_schema,
+                        src_schema=_schema_locator(cfg.src_db_type, cfg.src_schema,
+                                                   cfg.src_db_name, cfg.src_username),
+                        dst_database=_schema_locator(cfg.tgt_db_type, cfg.tgt_schema,
+                                                     cfg.tgt_db_name, cfg.tgt_username),
                     )
 
                 return {
@@ -1520,8 +1544,30 @@ def run_sync_task_with_task(task: Dict[str, Any], progress_callback=None) -> Dic
     return sync_result
 
 
+_PG_FAMILY = ("postgresql", "kingbase", "opengauss", "panwei", "highgo", "uxdb")
+_SCHEMA_FAMILY = ("oracle", "dameng")
+_SCHEMA_VALIDATOR_TYPES = ("mysql", "mariadb") + _PG_FAMILY
+
+
+def _schema_locator(db_type, schema, db_name, username):
+    """按方言给出校验 SQL 的表限定符。
+
+    PG 系连接已选定 database，限定符是 schema（默认 public）；MySQL 系才是库名；
+    Oracle/达梦是 owner/schema。混用会拼出不存在的 "库名"."表"。
+    """
+    t = (db_type or "").lower()
+    if t in _PG_FAMILY:
+        return schema or "public"
+    if t in _SCHEMA_FAMILY:
+        return schema or username or db_name
+    return db_name or schema
+
+
+# 以下这些入口都要真实连库（测试连接/列表/列/校验），必须读取解密后的口令；
+# get_sync_task 默认会把 src_password/tgt_password 置空用于前端脱敏展示，
+# 曾导致 validate/verify/test/tables/columns 全部 1045 using password: NO。
 def test_sync_connection(task_id: int, side: str = "source") -> Dict[str, Any]:
-    task = models.get_sync_task(task_id)
+    task = models.get_sync_task(task_id, include_secret=True)
     if not task:
         return {"success": False, "message": "同步任务不存在"}
     cfg = _task_to_config(task)
@@ -1532,7 +1578,7 @@ def test_sync_connection(task_id: int, side: str = "source") -> Dict[str, Any]:
 
 
 def list_sync_tables(task_id: int) -> Dict[str, Any]:
-    task = models.get_sync_task(task_id)
+    task = models.get_sync_task(task_id, include_secret=True)
     if not task:
         return {"success": False, "message": "同步任务不存在"}
     cfg = _task_to_config(task)
@@ -1545,7 +1591,7 @@ def list_sync_tables(task_id: int) -> Dict[str, Any]:
 
 
 def list_sync_columns(task_id: int, table: str) -> Dict[str, Any]:
-    task = models.get_sync_task(task_id)
+    task = models.get_sync_task(task_id, include_secret=True)
     if not task:
         return {"success": False, "message": "同步任务不存在"}
     cfg = _task_to_config(task)
@@ -1560,7 +1606,7 @@ def list_sync_columns(task_id: int, table: str) -> Dict[str, Any]:
 
 def validate_sync_task(task_id: int) -> Dict[str, Any]:
     """Schema 校验入口（Pre-check）。"""
-    task = models.get_sync_task(task_id)
+    task = models.get_sync_task(task_id, include_secret=True)
     if not task:
         return {"success": False, "message": "同步任务不存在"}
     cfg = _task_to_config(task)
@@ -1572,7 +1618,7 @@ def validate_sync_task(task_id: int) -> Dict[str, Any]:
 
 def verify_sync_task(task_id: int) -> Dict[str, Any]:
     """迁移校验入口（Post-verify）。"""
-    task = models.get_sync_task(task_id)
+    task = models.get_sync_task(task_id, include_secret=True)
     if not task:
         return {"success": False, "message": "同步任务不存在"}
     cfg = _task_to_config(task)

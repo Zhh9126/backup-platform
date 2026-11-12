@@ -28,14 +28,15 @@ class ColumnInfo:
 
     def compatible(self, other: "ColumnInfo") -> bool:
         """判断本列（源）数据能否安全写入目标列。"""
-        # 双方都无限制 → 兼容
-        if self.max_chars == 0 and other.max_chars == 0:
+        # 目标无长度限制（TEXT / CLOB，max_chars=0）：无论源是否有限制都装得下。
+        # 旧实现把「源 varchar(100) → 目标 text」误判为不兼容。
+        if other.max_chars == 0:
             return True
+        # 源无限制、目标有限制 → 可能装不下
+        if self.max_chars == 0:
+            return False
         # 双方都有限制：源 <= 目标则兼容
-        if self.max_chars > 0 and other.max_chars > 0:
-            return self.max_chars <= other.max_chars
-        # 一方有限制一方无限制 → 不兼容（源为 0 表示无限制，目标有限制则装不下）
-        return False
+        return self.max_chars <= other.max_chars
 
     def incompatible(self, other: "ColumnInfo") -> bool:
         return not self.compatible(other)
@@ -474,6 +475,29 @@ class CrossDBVerifier:
         对源表中每行，在目标表用所有列做精确匹配（<=> / IS NOT DISTINCT FROM），
         找不到即 missing。
         """
+        # 0. Oracle / 达梦源：_read_all_mysql / _read_all_pg 都是对应驱动的方言
+        #    （Oracle 上会抛 DPY-4009 / ORA-00942）。降级为双侧行数对账，
+        #    如实标注降级，不伪装逐行比对、也不抛驱动异常。
+        if (self.src_driver or "").lower() in ("oracle", "dameng", "dm"):
+            try:
+                src_ref = self._src_ref_generic(table, src_schema)
+                dst_ref = self._dst_ref_generic(table, dst_database)
+                with self.src_conn.cursor() as cur:
+                    cur.execute(f"SELECT COUNT(*) FROM {src_ref}")
+                    a = int(cur.fetchone()[0] or 0)
+                with self.dst_conn.cursor() as cur:
+                    cur.execute(f"SELECT COUNT(*) FROM {dst_ref}")
+                    b = int(cur.fetchone()[0] or 0)
+            except Exception as e:
+                return VerifyResult(table_name=table, success=False,
+                                    error=f"行数对账失败：{e}")
+            return VerifyResult(
+                table_name=table, success=(a == b),
+                total_source_rows=a, missing_rows=max(0, a - b),
+                error=("" if a == b else
+                       f"源端 {self.src_driver} 逐行比对未适配，已降级为行数对账"
+                       f"（{src_ref} / {dst_ref}）：源 {a} 行 / 目标 {b} 行"))
+
         # 1. 读取源列和所有数据
         if self.src_driver in ("mysql", "mariadb"):
             columns, src_rows = self._read_all_mysql(self.src_conn, table, src_schema)
@@ -568,6 +592,17 @@ class CrossDBVerifier:
 
     def _dst_table_ref(self, table: str, db: str) -> str:
         return f"`{db}`.`{table}`" if db else f"`{table}`"
+
+    def _src_ref_generic(self, table: str, schema: str) -> str:
+        """按源方言构造表引用（Oracle/达梦行数对账降级路径用）。"""
+        d = (self.src_driver or "").lower()
+        if d in ("dameng", "dm", "oracle"):
+            s, t = (schema or "").upper(), table.upper()
+            return f'"{s}"."{t}"' if s else f'"{t}"'
+        if d in ("postgresql", "kingbase", "opengauss", "panwei"):
+            s = schema or "public"
+            return f'"{s}"."{table}"'
+        return f"`{schema}`.`{table}`" if schema else f"`{table}`"
 
     def _dst_ref_generic(self, table: str, schema: str) -> str:
         """按目标方言构造表引用（行数对账降级路径用）。"""

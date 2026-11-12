@@ -107,7 +107,11 @@ class MySQLSourceReader(SourceReader):
         where_parts = []
         if self.config.source_where:
             where_parts.append(f"({self.config.source_where})")
-        if self.config.sync_mode == "incremental" and self.config.incremental_column:
+        # 首轮尚无水位时不能加 %s 占位符：read_batch 只在 incremental_value
+        # 非空时才传入该参数，否则 pymysql 会报
+        # "not enough arguments for format string"（增量同步首轮必崩）。
+        if (self.config.sync_mode == "incremental" and self.config.incremental_column
+                and self.config.incremental_value):
             where_parts.append(f"`{self.config.incremental_column}` > %s")
         if where_parts:
             sql += " WHERE " + " AND ".join(where_parts)

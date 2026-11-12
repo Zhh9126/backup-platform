@@ -83,19 +83,28 @@ def _get_cols_typed(conn, db_type: str, database: str, schema: str,
                 "WHERE table_schema=%s AND table_name=%s "
                 "ORDER BY ordinal_position", (database, table))
         elif db_type in ("postgresql", "kingbase"):
+            # 不在 SQL 里拼类型串：金仓 V9R1 无 concat()，V9R3 又把 || 解析成
+            # 逻辑 OR（CASE types boolean and text cannot be matched）。
+            # 只取原始元数据列，类型修饰在 Python 侧拼，PG/金仓各版本通用。
             cur.execute(
-                "SELECT column_name, "
-                "CASE WHEN data_type IN ('character varying','char','character') "
-                "  AND character_maximum_length IS NOT NULL "
-                "  THEN data_type || '(' || character_maximum_length || ')' "
-                "WHEN data_type IN ('numeric','decimal') "
-                "  AND numeric_precision IS NOT NULL "
-                "  THEN data_type || '(' || numeric_precision || ',' "
-                "       || numeric_scale || ')' "
-                "ELSE data_type END "
+                "SELECT column_name, data_type, character_maximum_length, "
+                "numeric_precision, numeric_scale "
                 "FROM information_schema.columns "
                 "WHERE table_schema=%s AND table_name=%s "
                 "ORDER BY ordinal_position", (schema or "public", table))
+            raw = cur.fetchall()
+            cols = []
+            for r in raw:
+                name, dtype = str(r[0]), str(r[1])
+                clen, nprec, nscale = r[2], r[3], r[4]
+                low = dtype.lower()
+                if low in ("character varying", "char", "character") and clen is not None:
+                    dtype = "%s(%s)" % (dtype, clen)
+                elif low in ("numeric", "decimal") and nprec is not None:
+                    dtype = "%s(%s,%s)" % (
+                        dtype, nprec, nscale if nscale is not None else 0)
+                cols.append((name, dtype))
+            return cols
         elif db_type in ("oracle", "dameng"):
             owner = (schema or _user_of(conn) or "").upper()
             cur.execute(

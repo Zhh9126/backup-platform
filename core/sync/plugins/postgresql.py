@@ -121,7 +121,10 @@ class PostgreSQLSourceReader(SourceReader):
         where_parts = []
         if self.config.source_where:
             where_parts.append(f"({self.config.source_where})")
-        if self.config.sync_mode == "incremental" and self.config.incremental_column:
+        # 首轮无水位时不加 %s 占位符，与 read_batch 的参数构造保持一致，
+        # 否则 psycopg2 会因占位符多于参数而报错（增量同步首轮必崩）。
+        if (self.config.sync_mode == "incremental" and self.config.incremental_column
+                and self.config.incremental_value):
             where_parts.append(f'"{self.config.incremental_column}" > %s')
         if where_parts:
             sql += " WHERE " + " AND ".join(where_parts)

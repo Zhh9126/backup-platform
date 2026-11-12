@@ -15,7 +15,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 容灾切换 · 恢复演练 · 预校验 · 克隆（VDB） · 不可变备份 · 巡检 · 监控 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v2.3.9-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v2.3.10-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -33,7 +33,8 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 > 目录模拟带库全链路 28/28、防勒索专项 11/11、发版回归 97 passed；
 > 真实磁带库 / 机械手 / LTO WORM 尚无真机验证报告（见下方「诚实边界」）。
 >
-> **最新动态**：v2.3.9（2026-11-12）已发布（功能项按需启用与权限分离 / AI 结果与模型接入修复 / 迁移同步 P0 / 真机验收）；
+> **最新动态**：v2.3.10（2026-11-12）已发布（170/171 五库型迁移同步全面真机验收 / 6 个真实缺陷修复 / 离线镜像包交付）；
+> v2.3.9（2026-11-12）完成功能项按需启用与权限分离 / AI 结果与模型接入修复 / 迁移同步 P0；
 > v2.3.8（2026-11-11）完成三粒度统一 / VDB 快照 / 应用级容灾 HA；
 > v2.3.7 完成防勒索闭环 / 磁带库接入 / 安全审计整改；
 > 上一版本完成群晖 DSM 全面纳管、Windows 文件增量、异地容灾出站拉取、授权服务器数计量，
@@ -399,8 +400,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v2.3.9    # 固定版本（可回滚）
-# 当前最新版本：v2.3.9（2026-11-12，功能项权限分离 / 迁移同步 P0 修复）
+docker pull ghcr.io/zhh9126/backup-platform:v2.3.10   # 固定版本（可回滚）
+# 当前最新版本：v2.3.10（2026-11-12，170/171 迁移同步真机验收 / 6 个缺陷修复）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -420,14 +421,15 @@ python tools/check_env.py
 {"registry-mirrors": ["https://docker.m.daocloud.io", "https://dockerproxy.com"]}
 ```
 
-> **离线交付包版本说明**：本节（离线导入 / 运行 / 升级 / 卸载）示例基于 **v2.3.8 离线包**
-> （该包真实已交付，`manifest.json` 内含 4 个 RepoTag）。v2.3.9 当前提供 GHCR 在线镜像；
-> 如需 v2.3.9 离线包，请按「自行导出离线包」小节把 tag 换成 `v2.3.9` 重新导出。
+> **离线交付包版本说明**：**v2.3.10 离线包已交付**（`aidbm_2.3.10_offline.tar.gz`，
+> `manifest.json` 内含 4 个 RepoTag，可直接 `docker load`）。本节（离线导入 / 运行 / 升级 / 卸载）
+> 示例沿用 v2.3.8 写法，实际部署时把示例中的 `2.3.8` 全部替换成 `2.3.10` 即可；
+> GHCR 同步提供 `v2.3.10` / `v2.3.10-20261112` / `latest` 三个在线 tag。
 
 ### 离线导入
 
 ```bash
-# 交付包：aidbm_2.3.8_offline.tar.gz（约 1.3GB，gzip 压缩的完整镜像，含全部运行依赖与备份工具）
+# 交付包：aidbm_2.3.10_offline.tar.gz（gzip 压缩的完整镜像，含全部运行依赖与备份工具；旧版示例见下方命令，把 2.3.8 换成 2.3.10）
 docker load -i aidbm_2.3.8_offline.tar.gz
 
 # 导入后确认镜像名（离线环境不会自动去公网拉取）
@@ -692,6 +694,14 @@ docker build -t backup-platform:local .
 - 默认账号请立即修改（首登会标记 `must_change_password`）；生产环境建议限制来源 IP
 
 ## 更新日志
+
+### v2.3.10（2026-11-12，已发布）
+
+- **170/171 五库型迁移与同步全面真机验收**：MySQL170（主）/ MySQL171（备，只读源）/ PG170 / 金仓170 V9R1 / 金仓171 V9R3 / 达梦170 / Oracle171，全部走生产 8080 API 与正式元库，逐链路中文与金额硬核对。迁移矩阵 7 条 + 修复复跑 5/5、同步矩阵 22/22、深度 P0 24/24、辅助端点 33/33、UI 可见性 12/12、组合回归 76 passed、全站冒烟 34 端点 0 个 5xx。
+- **界面记录落地**：迁移计划 12 条、同步任务 27 条、执行记录 26 条，均落在正式 `instance/meta.db`；并用真实 API 数据在 Node 最小 DOM 中执行 `sync.js` 列表渲染，确认表格行与任务名真实生成。
+- **修复 6 个真实缺陷**：①金仓 V9R1 无 `concat()`、V9R3 把 `||` 当逻辑 OR 导致列元数据预检必崩（改为 SQL 取原始列、Python 侧拼类型）；②MySQL/PG 插件增量同步首轮 SQL 占位符多于参数，`not enough arguments for format string` 首轮必崩；③`validate`/`verify`/`test`/`tables`/`columns` 五个入口读脱敏任务致口令为空、HTTP 200 假成功；④跨库校验把 PG 库名当 schema 拼出不存在的 `"库名"."表"`；⑤Oracle/达梦源校验走 psycopg2 方言抛 `DPY-4009`/`ORA-00942`（降级行数对账 + 未支持方言如实标注）；⑥`varchar(100) → TEXT` 被误判长度不兼容。
+- **离线交付**：GHCR 三 tag（`v2.3.10` / `v2.3.10-20261112` / `latest`）与 `aidbm_2.3.10_offline.tar.gz` 离线镜像包。
+- **诚实边界**：MySQL171 复制 IO 实测已断，仅作只读源、未写从库、未扰动 DR；PG171:5432 未启动未纳入；Oracle/达梦源的 Schema 兼容性校验尚未实现（结构化标注跳过），其 `verify` 为行数对账而非逐行比对；迁移仍无增量追平 / 割接 / 回退；AI 收费模块按约定不进开源仓库、随镜像交付。
 
 ### v2.3.9（2026-11-12，已发布）
 

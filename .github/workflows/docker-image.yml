@@ -39,13 +39,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 版本 tag：vX.Y.Z → vX.Y.Z / X.Y.Z / X.Y.Z-r<run_number> / latest / community
-      # 保留 v 前缀以对齐离线包 workflow 与文档；同时保留无 v 兼容既有部署。
+      # 版本 tag：vX.Y.Z[ -rerunN ] → vX.Y.Z / X.Y.Z / X.Y.Z-r<run_number> / latest / community
+      # rerunN 只用于重新触发发布，不进入镜像版本；保留 v 前缀对齐离线包 workflow 与文档。
       - name: Compute image tags
         id: tags
         run: |
           set -euo pipefail
-          VER="${GITHUB_REF_NAME#v}"
+          RAW_VER="${GITHUB_REF_NAME#v}"
+          VER="${RAW_VER%%-rerun*}"
           IMAGE="${{ steps.image.outputs.name }}"
           echo "all_tags=${IMAGE}:v${VER},${IMAGE}:${VER},${IMAGE}:${VER}-r${GITHUB_RUN_NUMBER},${IMAGE}:latest,${IMAGE}:community" >> "$GITHUB_OUTPUT"
           echo "version_tag=${IMAGE}:v${VER}" >> "$GITHUB_OUTPUT"

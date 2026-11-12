@@ -28,7 +28,8 @@ jobs:
         run: |
           echo "REPO_LC=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            VERSION="${GITHUB_REF_NAME#v}"
+            RAW_VERSION="${GITHUB_REF_NAME#v}"
+            VERSION="${RAW_VERSION%%-rerun*}"
           else
             VERSION="${{ github.event.inputs.version || '2.3.11' }}"
           fi
@@ -83,11 +84,13 @@ jobs:
           TAG="v${VERSION}"
           FILE="aidbm_${VERSION}_offline.tar.gz"
           SUM="${FILE}.sha256"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$FILE" "$SUM" --clobber
-          else
-            gh release create "$TAG" "$FILE" "$SUM" \
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
               --title "AIDBM ${TAG} 离线镜像包" \
-              --notes "AIDBM ${TAG} 离线交付镜像包（含 4 个 RepoTag，可直接 docker load）。由本 workflow 从 GHCR 已发布镜像导出并校验 gzip 完整性；同源镜像地址 ghcr.io/${REPO_LC}:v${VERSION}。"
+              --notes "AIDBM ${TAG} 离线交付镜像包（含 4 个 RepoTag，可直接 docker load）。由本 workflow 从 GHCR 已发布镜像导出并校验 gzip 完整性；同源镜像地址 ghcr.io/${REPO_LC}:v${VERSION}。" \
+              || true
           fi
+          # 先建空 Release 再单独上传附件，避免并发/已有 Release 导致 create 带附件失败。
+          gh release upload "$TAG" "$FILE" --clobber
+          gh release upload "$TAG" "$SUM" --clobber
           gh release view "$TAG" --json assets --jq '.assets[].name'

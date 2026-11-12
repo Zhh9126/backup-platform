@@ -39,17 +39,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 版本 tag：vX.Y.Z → X.Y.Z / X.Y.Z-<run_number> / latest / community
-      # 用 GITHUB_RUN_NUMBER 区分同版本多次构建（稳定、无语法兼容风险），
-      # 不再用 metadata-action 的 date 表达式。
+      # 版本 tag：vX.Y.Z → vX.Y.Z / X.Y.Z / X.Y.Z-r<run_number> / latest / community
+      # 保留 v 前缀以对齐离线包 workflow 与文档；同时保留无 v 兼容既有部署。
       - name: Compute image tags
         id: tags
         run: |
           set -euo pipefail
           VER="${GITHUB_REF_NAME#v}"
           IMAGE="${{ steps.image.outputs.name }}"
-          echo "all_tags=${IMAGE}:${VER},${IMAGE}:${VER}-r${GITHUB_RUN_NUMBER},${IMAGE}:latest,${IMAGE}:community" >> "$GITHUB_OUTPUT"
-          echo "version_tag=${IMAGE}:${VER}" >> "$GITHUB_OUTPUT"
+          echo "all_tags=${IMAGE}:v${VER},${IMAGE}:${VER},${IMAGE}:${VER}-r${GITHUB_RUN_NUMBER},${IMAGE}:latest,${IMAGE}:community" >> "$GITHUB_OUTPUT"
+          echo "version_tag=${IMAGE}:v${VER}" >> "$GITHUB_OUTPUT"
           echo "dated_tag=${IMAGE}:${VER}-r${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
 
       - name: Extract metadata (labels)
@@ -72,6 +71,7 @@ jobs:
         run: |
           echo "Published:"
           echo "  ${{ steps.tags.outputs.version_tag }}"
+          echo "  ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_REF_NAME#v}"
           echo "  ${{ steps.tags.outputs.dated_tag }}"
           echo "  ${{ steps.image.outputs.name }}:latest"
           echo "  ${{ steps.image.outputs.name }}:community"

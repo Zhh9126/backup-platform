@@ -30,6 +30,18 @@ _FORBIDDEN_ROOTS = {
 }
 _MAX_STAT_ENTRIES = 20000  # 目录用量统计上限（防超大目录拖慢接口）
 
+
+def _nearest_existing_dir(path: str) -> str:
+    """容量探测允许回退到最近存在祖先目录；绝不在 GET 接口自动创建目录。"""
+    cur = os.path.abspath(str(path or "/"))
+    while cur and not os.path.isdir(cur):
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return "/"
+        cur = parent
+    return cur or "/"
+
+
 # D3 存储池类型抽象（对标 DSG/鼎甲存储池体系）：local=本地/标准池、
 # dedup=重删池、synthetic=合成池（合成全量/黄金副本）、archive=归档冷池。
 POOL_KINDS = {
@@ -77,21 +89,30 @@ def api_get_local_root():
     info["exists"] = os.path.isdir(path)
     info["writable"] = (os.access(path, os.W_OK) if info["exists"]
                         else os.access(os.path.dirname(path) or "/", os.W_OK))
+    usage_path = _nearest_existing_dir(path)
+    degraded = os.path.abspath(usage_path) != os.path.abspath(path)
     try:
-        du = shutil.disk_usage(path)
+        du = shutil.disk_usage(usage_path)
         info["disk"] = {
             "total_bytes": du.total,
             "used_bytes": du.used,
             "free_bytes": du.free,
-            "used_percent": round(du.used / du.total * 100, 1),
+            "total_human": db.human_size(du.total),
+            "used_human": db.human_size(du.used),
+            "free_human": db.human_size(du.free),
+            "used_percent": round(du.used / du.total * 100, 1) if du.total else 0,
+            "usage_path": usage_path,
+            "degraded": degraded,
         }
-    except Exception:
-        info["disk"] = {}
+    except Exception as e:
+        info["disk"] = {"usage_path": usage_path, "degraded": True,
+                        "warning": str(e)}
     info["data"] = _dir_usage(path) if info["exists"] else {"bytes": 0, "files": 0, "approximate": False}
-    # 是否已配置对象存储（决定"仅本地保存"的提示强度）
+    info["data"]["bytes_human"] = db.human_size(info["data"].get("bytes") or 0)
+    # 是否已配置对象/远端存储（决定"仅本地保存"的提示强度）
     row = db.query_one(
         "SELECT COUNT(*) AS cnt FROM storage_targets "
-        "WHERE enabled=1 AND type IN ('minio','s3')"
+        "WHERE enabled=1 AND type IN ('minio','s3','sftp','tape')"
     )
     info["object_storage_configured"] = bool(row and row["cnt"])
     return jsonify(info)
@@ -305,6 +326,8 @@ def api_update_target(target_id):
 
     data = request.get_json(silent=True) or {}
     now = db.now_iso()
+    if "type" in data and data.get("type") not in TYPE_META:
+        return jsonify({"error": "不支持的存储类型: %s" % data.get("type")}), 400
 
     allowed = [
         "name", "type", "tier", "endpoint", "access_key", "bucket",
@@ -455,20 +478,46 @@ def api_storage_usage():
     能告诉用户备份到底存在哪里。
     """
     path = os.path.abspath(str(config.get_backup_root()))
+    base = {
+        "path": path,
+        "path_exists": os.path.isdir(path),
+        "source": config.backup_root_source(),
+        "source_label": config.backup_root_source_label(),
+    }
+    usage_path = _nearest_existing_dir(path)
+    degraded = os.path.abspath(usage_path) != os.path.abspath(path)
     try:
-        du = shutil.disk_usage(path)
-        used_percent = round(du.used / du.total * 100, 1)
-        return jsonify({
-            "path": path,
-            "source": config.backup_root_source(),
-            "source_label": config.backup_root_source_label(),
+        du = shutil.disk_usage(usage_path)
+        used_percent = round(du.used / du.total * 100, 1) if du.total else 0
+        base.update({
+            "usage_path": usage_path,
+            "degraded": degraded,
             "total_bytes": du.total,
             "used_bytes": du.used,
             "free_bytes": du.free,
+            "total_human": db.human_size(du.total),
+            "used_human": db.human_size(du.used),
+            "free_human": db.human_size(du.free),
             "used_percent": used_percent,
         })
+        if degraded:
+            base["hint"] = "备份目录不存在或未挂载，容量按最近存在目录 %s 统计" % usage_path
+        return jsonify(base)
     except Exception as e:
-        return jsonify({"path": path, "error": str(e)}), 400
+        base.update({
+            "usage_path": usage_path,
+            "degraded": True,
+            "total_bytes": None,
+            "used_bytes": None,
+            "free_bytes": None,
+            "total_human": "不可用",
+            "used_human": "不可用",
+            "free_human": "不可用",
+            "used_percent": None,
+            "warning": str(e),
+            "hint": "无法读取磁盘容量，请检查备份目录、挂载点与权限",
+        })
+        return jsonify(base)
 
 
 @api_bp.route("/storage/replicate/<int:record_id>", methods=["POST"])

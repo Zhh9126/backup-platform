@@ -31,6 +31,7 @@ _TMP = tempfile.mkdtemp(prefix="qa_storage_")
 os.environ["INSTANCE_DIR"] = os.path.join(_TMP, "instance")
 os.environ["LOG_DIR"] = os.path.join(_TMP, "logs")
 os.environ["BACKUP_ROOT"] = os.path.join(_TMP, "backups")
+os.makedirs(os.environ["BACKUP_ROOT"], exist_ok=True)
 os.environ["META_DB_PATH"] = os.path.join(_TMP, "instance", "meta.db")
 os.environ["SCHEDULER_ENABLED"] = "false"
 
@@ -160,9 +161,10 @@ class _FakeMinioClient:
 # ================= A. 存储后端抽象单元测试 =================
 class TestStorageBackends(QABase):
 
-    def test_supported_types_three(self):
+    def test_supported_types_match_registry(self):
         types = {t["type"] for t in list_supported_types()}
-        self.assertEqual(types, {"local", "minio", "s3"})
+        self.assertEqual(types, set(TYPE_META))
+        self.assertTrue({"local", "minio", "s3", "sftp", "tape"}.issubset(types))
 
     def test_tier_mapping_matches_user_model(self):
         # 用户需求：L1=MinIO 热, L2=S3 冷, L3=源端本地路径导出
@@ -293,7 +295,24 @@ class TestStorageAPI(QABase):
         self._create_target({"name": "本地导出", "type": "local", "endpoint": self._dir()})
         st = self.client.get("/api/storage/stats").get_json()
         self.assertIn("tiers", st)
-        usage = self.client.get("/api/storage/usage").get_json()
+        resp = self.client.get("/api/storage/usage")
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        usage = resp.get_json()
+        self.assertIn("used_percent", usage)
+        self.assertIn("total_human", usage)
+        self.assertIn("used_human", usage)
+        self.assertIn("free_human", usage)
+
+    def test_usage_missing_root_falls_back_to_parent(self):
+        missing = os.path.join(_TMP, "missing_root", "backups")
+        with mock.patch("config.get_backup_root", return_value=missing):
+            resp = self.client.get("/api/storage/usage")
+        self.assertEqual(resp.status_code, 200, resp.get_json())
+        usage = resp.get_json()
+        self.assertFalse(usage.get("path_exists"))
+        self.assertTrue(usage.get("degraded"))
+        self.assertTrue(os.path.isdir(usage.get("usage_path")))
+        self.assertIn("total_human", usage)
         self.assertIn("used_percent", usage)
 
     def test_replication_config_defaults(self):
@@ -402,6 +421,31 @@ class TestTierReplication(QABase):
         self.assertIn("minio", res)
         self.assertIn("s3", res)
         self.assertIn("local", res)
+
+    def test_replicate_sftp_target_is_not_silently_skipped(self):
+        from core import tier_replication
+        src = os.path.join(self._dir(), "backup-sftp.sim")
+        with open(src, "wb") as f:
+            f.write(b"sftp-payload")
+        tid = self._task()
+        rec_id = models.create_record({
+            "task_id": tid, "db_type": "mysql", "backup_type": "full",
+            "status": "success", "size_bytes": 12, "backup_path": src})
+        db.set_system_config("replication_strategy", json.dumps({
+            "push_l1_minio": 0, "push_l2_s3": 1, "push_l3_local": 0,
+            "max_retries": 1, "retry_interval": 0}))
+        sftp_target = {"id": 901, "name": "SFTP-NAS", "type": "sftp",
+                       "endpoint": "127.0.0.1", "extra_options": {}}
+        with mock.patch.object(tier_replication, "_get_enabled_targets",
+                               return_value=[sftp_target]), \
+             mock.patch.object(tier_replication, "_replicate_with_retry",
+                               return_value=True) as rep:
+            res = tier_replication.replicate_to_tiers(src, models.get_task(tid), rec_id)
+        self.assertTrue(res.get("sftp"), "启用的 SFTP 目标必须参与 L2 复制")
+        self.assertTrue(rep.called)
+        tier = db.query_one(
+            "SELECT storage_tier FROM backup_records WHERE id=?", (rec_id,))
+        self.assertIn("sftp", tier["storage_tier"] or "")
 
 
 # ---------------- 运行入口 ----------------

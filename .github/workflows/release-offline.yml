@@ -2,17 +2,17 @@ name: Publish Offline Image Bundle
 
 # 由 GitHub 侧 runner 从已推送的 GHCR 版本镜像重新导出离线包，
 # 并作为 Release 附件发布。使用内置 GITHUB_TOKEN，无需额外凭据。
-# 触发：本文件变更推送到 main（发版轮），或在 Actions 页面手动指定版本重跑。
+# 触发：推送 v* tag（与 docker-image.yml 并行，拉取步骤会等待镜像就绪），
+# 或在 Actions 页面手动指定版本重跑。
 on:
   push:
-    branches: [main]
-    paths: ['.github/workflows/release-offline.yml']
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       version:
         description: '版本号（不带 v）'
         required: true
-        default: '2.3.10'
+        default: '2.3.11'
 
 permissions:
   contents: write
@@ -27,7 +27,12 @@ jobs:
       - name: Setup variables
         run: |
           echo "REPO_LC=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
-          echo "VERSION=${{ github.event.inputs.version || '2.3.10' }}" >> "$GITHUB_ENV"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ github.event.inputs.version || '2.3.11' }}"
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -37,7 +42,16 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Pull the published version image
-        run: docker pull "ghcr.io/${REPO_LC}:v${VERSION}"
+        run: |
+          set -euo pipefail
+          IMG="ghcr.io/${REPO_LC}:v${VERSION}"
+          for i in $(seq 1 60); do
+            if docker pull "$IMG"; then exit 0; fi
+            echo "[$i/60] $IMG 尚未就绪，30 秒后重试"
+            sleep 30
+          done
+          echo "等待 GHCR 镜像超时: $IMG" >&2
+          exit 1
 
       - name: Tag all 4 RepoTags for the offline bundle
         run: |
@@ -58,7 +72,8 @@ jobs:
             "aidbm:latest" | gzip > "$FILE"
           # gzip -t 是完整性唯一可信判据；失败即终止，不上传截断包
           gzip -t "$FILE"
-          ls -lh "$FILE"
+          sha256sum "$FILE" > "${FILE}.sha256"
+          ls -lh "$FILE" "${FILE}.sha256"
 
       - name: Publish as GitHub Release asset
         env:
@@ -67,10 +82,11 @@ jobs:
           set -euo pipefail
           TAG="v${VERSION}"
           FILE="aidbm_${VERSION}_offline.tar.gz"
+          SUM="${FILE}.sha256"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$FILE" --clobber
+            gh release upload "$TAG" "$FILE" "$SUM" --clobber
           else
-            gh release create "$TAG" "$FILE" \
+            gh release create "$TAG" "$FILE" "$SUM" \
               --title "AIDBM ${TAG} 离线镜像包" \
               --notes "AIDBM ${TAG} 离线交付镜像包（含 4 个 RepoTag，可直接 docker load）。由本 workflow 从 GHCR 已发布镜像导出并校验 gzip 完整性；同源镜像地址 ghcr.io/${REPO_LC}:v${VERSION}。"
           fi

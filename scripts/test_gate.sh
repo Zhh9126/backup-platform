@@ -11,15 +11,15 @@
 # 说明：
 # - 用例集与基线是**显式**的（不静默跳过）：快速集只含当前 100% 通过的确定性模块；
 #   全量模式允许存量失败（环境依赖），但失败/错误数不得高于基线、通过数不得低于基线。
-# - 覆盖率门槛当前为**存量基线 17%**（core+api，合计约 3.9 万行），只用于拦下降；
-#   每次版本发布应上调（目标：每版 +5pt，见 docs/api_conventions.md §6）。
+# - 覆盖率门槛按 GitHub CI 干净 checkout 实测基线设为 15%（core+api，合计约 5.9 万行），只用于拦下降；
+#   本地工作区包含被 .gitignore 排除的 AI 收费模块，覆盖率口径与 CI 不同，不能据此上调。
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 PY="${PY:-$ROOT/.venv/bin/python}"
-COV_THRESHOLD="${COV_THRESHOLD:-17}"
+COV_THRESHOLD="${COV_THRESHOLD:-15}"
 ART_DIR="${ART_DIR:-$ROOT/artifacts}"
 BASELINE="${BASELINE:-$ROOT/scripts/test_baseline.json}"
 export CODEBUDDY_SAFE_DELETE_ENABLED=0

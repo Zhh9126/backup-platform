@@ -1097,6 +1097,73 @@ class TestMomaProviderAndStreamNormalization(unittest.TestCase):
         self.assertEqual(AIPredictor().get_config()["ai_model"]["api_key"], plain)
 
 
+class TestModelCallResilience(unittest.TestCase):
+    """模型调用超时与模型名错误的回归。"""
+
+    def setUp(self):
+        self.p = AIPredictor()
+        self.cfg = {
+            "ai_model": {
+                "provider": "moma",
+                "endpoint": "http://moma.invalid/v3/chat/completions",
+                "api_key": "k",
+                "model_name": "m",
+                "request_timeout_sec": 10,
+            },
+        }
+
+    def test_socket_timeout_classified_as_timeout(self):
+        from unittest import mock
+
+        class _Resp:
+            status = 200
+
+            def read(self, *args):
+                raise TimeoutError("timed out")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with mock.patch("urllib.request.urlopen", lambda req, timeout=None: _Resp()):
+            out = self.p._call_model("hi", self.cfg)
+        self.assertFalse(out.get("ok"), out)
+        self.assertEqual(out.get("error_category"), "timeout")
+        self.assertIn("请求超时", out.get("error", ""))
+        self.assertIn("30-60s", out.get("hint", ""))
+
+    def test_model_not_found_classified_as_model(self):
+        import io
+        import urllib.error
+        from unittest import mock
+
+        body = json.dumps({"error": {"code": 400, "message": "找不到模型: bad/model"}},
+                          ensure_ascii=False).encode("utf-8")
+        err = urllib.error.HTTPError(self.cfg["ai_model"]["endpoint"], 400,
+                                     "Bad Request", {}, io.BytesIO(body))
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            out = self.p._call_model("hi", self.cfg)
+        self.assertFalse(out.get("ok"), out)
+        self.assertEqual(out.get("error_category"), "model")
+        self.assertIn("模型名不存在或无权限", out.get("error", ""))
+        self.assertIn("jiutian/jiutian-lan-35b", out.get("hint", ""))
+
+    def test_read_model_response_stops_on_sse_done(self):
+        from core.ai_alert import _read_model_response
+
+        body = b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n'
+
+        class _Resp:
+            def read(self, *args):
+                return body
+
+        blob, timed_out = _read_model_response(_Resp(), time.monotonic() + 2)
+        self.assertFalse(timed_out)
+        self.assertIn(b"[DONE]", blob)
+
+
 def _main() -> int:
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromModule(sys.modules[__name__])

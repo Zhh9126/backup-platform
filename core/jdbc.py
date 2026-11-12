@@ -422,6 +422,168 @@ def _norm_port(db_type, port):
 _jvm_lock = threading.RLock()
 _jvm_started = False
 
+# ---------------------------------------------------------------------------
+# 旧版 TLS 兼容（SQL Server 2008 / 2008 R2 等仅支持 TLS 1.0 的服务端）
+#
+# 背景：JDK 11+ 的 java.security 默认把 TLSv1/TLSv1.1 列入
+# jdk.tls.disabledAlgorithms，JSSE 只提供 [TLS1.3, TLS1.2]。SQL Server 的
+# 登录包（prelogin）始终走 TLS 握手，即使 JDBC URL 写了 encrypt=false 也无法
+# 绕开；服务端只支持 TLS1.0 时报 "TLS10 is not accepted by client preferences"。
+#
+# 做法：显式开关（默认关闭）→ 在 JVM 启动后、任何 TLS 握手之前，把 TLSv1 /
+# TLSv1.1 从禁用列表移除。不锁定 sslProtocol，客户端仍优先协商 TLS1.2/1.3，
+# 只有对端仅支持 TLS1.0 时才回落，现代实例不受影响。
+#
+# 重要：JSSE 会缓存协议表（实测先做过一次 TLS 握手后再 setProperty 无效），
+# 因此必须尽早放开；运行中开启若已来不及，API 会如实返回 needs_restart。
+# ---------------------------------------------------------------------------
+LEGACY_TLS_CONFIG_KEY = "jdbc_legacy_tls"
+LEGACY_TLS_ENV = "AIDBM_JDBC_LEGACY_TLS"
+_TLS_PROP = "jdk.tls.disabledAlgorithms"
+_LEGACY_TLS_LOCK = threading.RLock()
+_LEGACY_TLS_STATE = {
+    "applied": None,          # 本进程是否已成功放开（None=未尝试）
+    "tlsv1_available": None,  # 放开后实测 TLSv1 是否进入可用协议
+    "reason": "",
+}
+
+TLS_HINT = (
+    "【旧版 TLS 提示】服务端只支持 TLS 1.0/1.1，而当前 JVM 默认禁用该协议。"
+    "请到「备份插件 → JDBC 驱动管理」开启「兼容旧版 TLS」并重启平台服务；"
+    "更推荐在 SQL Server 服务端启用 TLS 1.2（安装对应 SP/CU 后配置 SCHANNEL）。"
+)
+
+
+def _truthy(v):
+    return str(v if v is not None else "").strip().lower() in (
+        "1", "true", "yes", "on", "enabled")
+
+
+def legacy_tls_configured():
+    """进程级开关：环境变量优先（容器/离线部署），其次 system_config。默认关闭。"""
+    env = os.environ.get(LEGACY_TLS_ENV)
+    if env is not None and str(env).strip():
+        return _truthy(env)
+    try:
+        import core.db as db
+        return _truthy(db.get_system_config(LEGACY_TLS_CONFIG_KEY, "0"))
+    except Exception:
+        return False
+
+
+def set_legacy_tls_config(enabled: bool):
+    import core.db as db
+    db.set_system_config(LEGACY_TLS_CONFIG_KEY, "1" if enabled else "0")
+
+
+def relax_disabled_algorithms(value):
+    """纯函数：仅移除 TLSv1 / TLSv1.1 两个禁用项，保留 SSLv3/RC4/弱密钥等约束。
+
+    返回 (新值, 被移除项列表)。
+    """
+    if not value:
+        return "", []
+    kept, removed = [], []
+    for item in str(value).split(","):
+        s = item.strip()
+        if s.upper() in ("TLSV1", "TLSV1.1"):
+            removed.append(s)
+        else:
+            kept.append(s)
+    return ", ".join(kept), removed
+
+
+def _tlsv1_available():
+    """实测 TLSv1 context 是否真的启用了 TLSv1。
+
+    只允许在放开之后调用：本函数会初始化 JSSE 协议表，若在放开前调用会把
+    「TLSv1 被禁用」缓存进 JVM，导致后续放开失效。
+    """
+    try:
+        import jpype
+        SSLContext = jpype.JClass("javax.net.ssl.SSLContext")
+        ctx = SSLContext.getInstance("TLSv1")
+        ctx.init(None, None, None)
+        return "TLSv1" in [str(x) for x in ctx.getDefaultSSLParameters().getProtocols()]
+    except Exception as e:
+        _LEGACY_TLS_STATE["reason"] = "TLSv1 探测失败: %s" % (str(e) or type(e).__name__)
+        return False
+
+
+def relax_legacy_tls():
+    """JVM 启动后放开 TLSv1/TLSv1.1 并实测；幂等，返回是否生效。"""
+    with _LEGACY_TLS_LOCK:
+        try:
+            import jpype
+            if not jpype.isJVMStarted():
+                _LEGACY_TLS_STATE["applied"] = False
+                _LEGACY_TLS_STATE["reason"] = "JVM 尚未启动"
+                return False
+            Security = jpype.JClass("java.security.Security")
+            before = str(Security.getProperty(_TLS_PROP) or "")
+            after, _removed = relax_disabled_algorithms(before)
+            if after != before:
+                Security.setProperty(_TLS_PROP, after)
+            ok = _tlsv1_available()
+            _LEGACY_TLS_STATE.update({
+                "applied": ok,
+                "tlsv1_available": ok,
+                "reason": "" if ok else "JVM 已缓存 TLS 协议表，运行时放开未生效，需重启平台服务",
+            })
+            return ok
+        except Exception as e:
+            _LEGACY_TLS_STATE["applied"] = False
+            _LEGACY_TLS_STATE["reason"] = str(e) or type(e).__name__
+            return False
+
+
+def ensure_legacy_tls():
+    """在 JVM 首次启动的最早时机按配置放开（由 _ensure_jvm 调用）；幂等。"""
+    if not legacy_tls_configured():
+        return
+    st = _LEGACY_TLS_STATE
+    if st.get("applied") is True:
+        return
+    if st.get("applied") is False and st.get("reason") != "JVM 尚未启动":
+        return
+    relax_legacy_tls()
+
+
+def legacy_tls_status():
+    """诊断状态：不做任何 TLS 探测，避免锁死 JVM 协议表。"""
+    configured = legacy_tls_configured()
+    applied = _LEGACY_TLS_STATE.get("applied")
+    try:
+        import jpype
+        started = bool(jpype.isJVMStarted())
+    except Exception:
+        started = _jvm_started
+    return {
+        "configured": configured,
+        "applied": applied,
+        "tlsv1_available": _LEGACY_TLS_STATE.get("tlsv1_available"),
+        "needs_restart": bool(configured and applied is not True and started),
+        "jvm_started": started,
+        "reason": _LEGACY_TLS_STATE.get("reason", ""),
+        "env_override": bool(os.environ.get(LEGACY_TLS_ENV)),
+    }
+
+
+def apply_legacy_tls(enabled: bool):
+    """页面开关：写配置 + 尝试即时生效（若 JVM 尚未做过 TLS 则无需重启）。"""
+    set_legacy_tls_config(enabled)
+    if enabled and legacy_tls_status()["jvm_started"]:
+        relax_legacy_tls()
+    return legacy_tls_status()
+
+
+def tls_error_hint(err_text):
+    """识别「服务端 TLS1.0 不被客户端偏好接受」这一类握手错误，返回引导文案。"""
+    s = str(err_text or "")
+    keys = ("TLS10 is not accepted", "protocol_version", "No appropriate protocol",
+            "TLSv1 is not accepted", "SSLHandshakeException", "client preferences")
+    return " " + TLS_HINT if any(k.lower() in s.lower() for k in keys) else ""
+
 
 def _frozen_jdk_dirs():
     """冻结（PyInstaller）环境下，可执行文件同目录的便携 JDK/JRE 目录。
@@ -577,6 +739,7 @@ def _ensure_jvm():
         try:
             if _jvm_started or jpype.isJVMStarted():
                 _jvm_started = True
+                ensure_legacy_tls()
                 return
         except Exception:
             pass
@@ -605,6 +768,8 @@ def _ensure_jvm():
             convertStrings=True,
         )
         _jvm_started = True
+        # 必须在任何 TLS 握手之前放开：JSSE 会缓存协议表
+        ensure_legacy_tls()
 
 
 # ---------------------------------------------------------------------------
@@ -706,9 +871,11 @@ def test_connection(db_type, host, port, db, user, password, timeout=15):
             # 真实错误，否则用户会误以为平台不支持该库型。
             return False, (
                 f"JDBC 连接失败（{ms} ms）: {jdbc_err}"
-                f"（{db_type} 走 JDBC 通道，原生直连不适用）"), None
+                f"（{db_type} 走 JDBC 通道，原生直连不适用）"
+                + tls_error_hint(jdbc_err)), None
         # 两条通道都失败时优先返回原生通道的错误（更贴近真实原因）
-        return False, f"连接失败（{ms} ms）: {native_err or jdbc_err}", None
+        return False, (f"连接失败（{ms} ms）: {native_err or jdbc_err}"
+                       + tls_error_hint(jdbc_err)), None
 
 
 def list_databases(db_type, host, port, db, user, password, timeout=30):

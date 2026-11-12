@@ -35,6 +35,7 @@ def jdbc_status():
         "jvm": jdbc.jvm_info(),
         "drivers": jdbc.available_drivers(),
         "db_types": list(jdbc.effective_db_types()),
+        "legacy_tls": jdbc.legacy_tls_status(),
     })
 
 
@@ -104,6 +105,29 @@ def jdbc_list_databases():
         return jsonify({"success": True, "databases": dbs})
     except Exception as e:
         return jsonify({"success": False, "error": str(e), "databases": []}), 400
+
+
+@api_bp.route("/jdbc/legacy-tls", methods=["POST"])
+@login_required
+def jdbc_legacy_tls():
+    """开关旧版 TLS 兼容（SQL Server 2008 等仅支持 TLS 1.0 的服务端）。
+
+    Body 省略 enabled 时仅返回当前状态；开启后若 JVM 已做过 TLS 握手，
+    会如实返回 needs_restart=True（JSSE 协议表已缓存，须重启平台服务）。
+    """
+    body = request.get_json(silent=True) or {}
+    if body.get("enabled") is None:
+        return jsonify({"success": True, "data": jdbc.legacy_tls_status()})
+    try:
+        st = jdbc.apply_legacy_tls(bool(body.get("enabled")))
+        msg = "已开启旧版 TLS 兼容" if st["configured"] else "已关闭旧版 TLS 兼容"
+        if st["configured"] and st.get("needs_restart"):
+            msg += "；当前 JVM 已缓存协议表，请重启平台服务后生效"
+        elif st["configured"] and st.get("applied") is True:
+            msg += "，当前进程已生效（TLS 1.0 可用于旧版 SQL Server）"
+        return jsonify({"success": True, "message": msg, "data": st})
+    except Exception as e:
+        return jsonify({"success": False, "message": f"设置失败: {e}"}), 400
 
 
 # ---------------------------------------------------------------------------

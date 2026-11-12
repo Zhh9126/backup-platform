@@ -43,8 +43,17 @@ def _connect(task, database=None, timeout=30):
     url = ("jdbc:sqlserver://%s:%s;databaseName=%s;encrypt=false;"
            "trustServerCertificate=true;loginTimeout=15;socketTimeout=600000"
            % (host, port, database or task.get("db_name") or ""))
-    return jaydebeapi.connect(driver_class, url,
-                              [user or "", pw or ""], jars=str(jar))
+    try:
+        return jaydebeapi.connect(driver_class, url,
+                                  [user or "", pw or ""], jars=str(jar))
+    except Exception as e:
+        # 逻辑备份/恢复通道的错误要带出旧版 TLS 引导，否则用户只看到裸握手异常
+        from core import jdbc
+        raw = str(e) or type(e).__name__
+        hint = jdbc.tls_error_hint(raw)
+        if hint:
+            raise RuntimeError(raw + hint)
+        raise
 
 
 def _jconn(conn):

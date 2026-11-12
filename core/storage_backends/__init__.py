@@ -43,7 +43,7 @@ def get_backend(storage_type: str, config: dict, logger: logging.Logger = None) 
     """工厂方法：根据类型创建存储后端实例。
 
     Args:
-        storage_type: 存储类型 (local | minio | s3)
+        storage_type: 存储类型 (local | minio | s3 | tape | sftp)
         config: 来自 storage_targets 表的配置字典
         logger: 日志记录器
 

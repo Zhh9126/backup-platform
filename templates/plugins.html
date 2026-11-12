@@ -185,6 +185,16 @@
       驱动绑定请核对是否为 <code>mssql-jdbc-*.jar</code>。该测试仅诊断连通性，
       SQL Server 备份能力在「备份任务 → 新建任务 → 逻辑备份（JDBC）」。
     </div>
+    <div class="d-flex flex-wrap gap-2 align-items-center mt-2 pt-2 border-top">
+      <div class="form-check form-switch mb-0">
+        <input class="form-check-input" type="checkbox" id="jdbcLegacyTls">
+        <label class="form-check-label small" for="jdbcLegacyTls">兼容旧版 TLS（SQL Server 2008 等仅支持 TLS 1.0）</label>
+      </div>
+      <span class="small text-muted" id="jdbcLegacyTlsStatus">检测中…</span>
+    </div>
+    <div class="small text-muted mt-1">
+      开启后仅放开 JVM 的 TLS 1.0/1.1 禁用，客户端仍优先协商 TLS 1.2/1.3；若 JVM 已建立过 JDBC 连接，需重启平台服务。长期方案仍建议在 SQL Server 服务端启用 TLS 1.2。
+    </div>
   </div>
 </div>
 
@@ -219,5 +229,5 @@
 
 {% block scripts %}
 <link rel="stylesheet" href="/static/css/plugins.css?v=2026111102">
-<script src="/static/js/plugins.js?v=2026111102"></script>
+<script src="/static/js/plugins.js?v=2026111201"></script>
 {% endblock %}

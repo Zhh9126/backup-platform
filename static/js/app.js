@@ -3646,7 +3646,7 @@
       $("ai_model_model_name").value = aiModel.model_name || "";
       $("ai_model_api_key").value = "";  // 不回显密钥
       $("ai_model_local_path").value = aiModel.local_model_path || "";
-      $("ai_model_timeout").value = aiModel.request_timeout_sec || 30;
+      $("ai_model_timeout").value = Math.max(Number(aiModel.request_timeout_sec || 30), 10);
       $("ai_model_max_chars").value = aiModel.max_input_chars || 8000;
       $("ai_model_prompt_template").value = aiModel.prompt_template || "";
       // 密钥状态提示
@@ -3730,6 +3730,8 @@
           endpoint: $("ai_model_endpoint").value,
           model_name: $("ai_model_model_name").value,
           provider: $("ai_model_provider").value,
+          request_timeout_sec: Number($("ai_model_timeout").value) || 30,
+          max_input_chars: Number($("ai_model_max_chars").value) || 8000,
         };
         // 只有用户输入了新密钥才覆盖，否则后端保留已保存的密钥
         const inputKey = $("ai_model_api_key").value;

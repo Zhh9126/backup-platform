@@ -482,9 +482,15 @@ def _insights(tasks, records, total_size):
     try:
         import shutil
         root = config.BACKUP_ROOT or "/opt/backup-platform"
-        if not os.path.isdir(root):
-            root = "/"
-        usage = shutil.disk_usage(root)
+        usage_root = os.path.abspath(root)
+        while usage_root and not os.path.isdir(usage_root):
+            parent = os.path.dirname(usage_root)
+            if parent == usage_root:
+                usage_root = "/"
+                break
+            usage_root = parent
+        usage = shutil.disk_usage(usage_root)
+        degraded_capacity = os.path.abspath(usage_root) != os.path.abspath(root)
         since = (now - timedelta(days=7)).date().isoformat()
         growth_bytes = 0
         try:
@@ -495,14 +501,19 @@ def _insights(tasks, records, total_size):
         except Exception:
             growth_bytes = 0
         per_day = growth_bytes / 7.0 if growth_bytes else 0
+        used_pct = round(usage.used / max(usage.total, 1) * 100)
         out["capacity"] = {
             "used_bytes": usage.used, "total_bytes": usage.total, "free_bytes": usage.free,
+            "total_human": db.human_size(usage.total),
             "used_human": db.human_size(usage.used), "free_human": db.human_size(usage.free),
             "backup_bytes": total_size, "backup_human": db.human_size(total_size),
             "growth_7d_bytes": growth_bytes, "growth_7d_human": db.human_size(growth_bytes),
             "growth_per_day_bytes": int(per_day),
             "eta_days": int(usage.free // per_day) if per_day > 0 else None,
-            "used_pct": round(usage.used / max(usage.total, 1) * 100),
+            "used_pct": used_pct,
+            "used_percent": round(usage.used / usage.total * 100, 1) if usage.total else 0,
+            "usage_path": usage_root,
+            "degraded": degraded_capacity,
         }
     except Exception as exc:
         logger.debug("capacity 计算失败: %s", exc)

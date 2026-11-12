@@ -39,7 +39,8 @@ def replicate_to_tiers(backup_path: str, task: dict, record_id: int,
     """
     log = logger or _logger
     result = {"minio": None, "s3": None, "local": None,
-              "tape": None, "tape_details": []}
+              "tape": None, "tape_details": [],
+              "sftp": None, "sftp_details": []}
     if not backup_path or not os.path.exists(backup_path):
         log.warning("[TierReplicate] 备份文件不存在，跳过三级复制: %s", backup_path)
         return result
@@ -151,12 +152,27 @@ def replicate_to_tiers(backup_path: str, task: dict, record_id: int,
     result["tape"] = any(d["ok"] for d in tape_details) if tape_details else None
     result["tape_details"] = tape_details
 
-    tiers_achieved = [k for k in ("minio", "s3", "local", "tape") if result.get(k)]
+    # L2 SFTP / NAS：与 S3 同属异地冷层，启用 L2 策略时一起参与复制。
+    sftp_details = []
+    if strategy.get("push_l2_s3"):
+        for st in [x for x in targets if x.get("type") == "sftp"]:
+            ok = _replicate_with_retry(backup_path, st, object_key_base, log,
+                                       tier_label=f"L2-SFTP-{st.get('name')}",
+                                       max_retries=max_retries,
+                                       retry_interval=retry_interval)
+            sftp_details.append({"target_id": st.get("id"),
+                                 "name": st.get("name"), "ok": bool(ok)})
+            if not ok:
+                log.warning("[TierReplicate] L2 SFTP 复制失败: %s", st.get("name"))
+    result["sftp"] = any(d["ok"] for d in sftp_details) if sftp_details else None
+    result["sftp_details"] = sftp_details
+
+    tiers_achieved = [k for k in ("minio", "s3", "sftp", "local", "tape") if result.get(k)]
     final_tier = "+".join(tiers_achieved) if tiers_achieved else "local"
     _update_record_tier(record_id, final_tier)
-    log.info("[TierReplicate] 完成: minio=%s s3=%s local=%s tape=%s → %s",
-             result.get("minio"), result.get("s3"), result.get("local"),
-             result.get("tape"), final_tier)
+    log.info("[TierReplicate] 完成: minio=%s s3=%s sftp=%s local=%s tape=%s → %s",
+             result.get("minio"), result.get("s3"), result.get("sftp"),
+             result.get("local"), result.get("tape"), final_tier)
     if packed_tmp and os.path.exists(packed_tmp):
         try:
             os.unlink(packed_tmp)
@@ -263,6 +279,7 @@ def get_replication_status(record_id: int) -> dict:
             "local": "local" in (row.get("storage_tier") or ""),
             "minio": "minio" in (row.get("storage_tier") or ""),
             "s3": "s3" in (row.get("storage_tier") or ""),
+            "sftp": "sftp" in (row.get("storage_tier") or ""),
             "tape": "tape" in (row.get("storage_tier") or ""),
         },
     }

@@ -575,6 +575,7 @@
             el.title = "JVM 未检测到（不影响使用：直连走原生 Python 驱动，无需 Java）";
           }
         }
+        renderLegacyTls(st && st.legacy_tls);
       }
     } catch (e) { /* 不影响驱动列表 */ }
     await loadJdbcDrivers();
@@ -742,6 +743,30 @@
     }
   }
 
+  // 旧版 TLS 兼容开关（SQL Server 2008 仅支持 TLS 1.0）
+  function renderLegacyTls(lt) {
+    const cb = $("jdbcLegacyTls");
+    const label = $("jdbcLegacyTlsStatus");
+    if (!cb || !lt) return;
+    cb.checked = !!lt.configured;
+    if (!label) return;
+    let text = "默认关闭";
+    let cls = "small text-muted";
+    if (lt.needs_restart) {
+      text = "已开启，需重启平台服务生效";
+      cls = "small text-warning";
+    } else if (lt.applied) {
+      text = "已生效（TLS 1.0 可用）";
+      cls = "small text-success";
+    } else if (lt.configured) {
+      text = "已开启，将在下次 JDBC 启动时生效";
+      cls = "small text-info";
+    }
+    label.className = cls;
+    label.textContent = text;
+    label.title = lt.reason || "";
+  }
+
   function bindJdbc() {
     const up = $("jdbcUploadInput");
     if (up) {
@@ -764,6 +789,22 @@
     }
     const ref = $("jdbcRefreshBtn");
     if (ref) ref.addEventListener("click", loadJdbc);
+    const legacy = $("jdbcLegacyTls");
+    if (legacy) legacy.addEventListener("change", async () => {
+      const wanted = legacy.checked;
+      legacy.disabled = true;
+      try {
+        const r = await api("POST", "/api/jdbc/legacy-tls", { enabled: wanted });
+        toast(wanted ? "已开启旧版 TLS 兼容" : "已关闭旧版 TLS 兼容", "success");
+        if (r && r.data && r.data.needs_restart) toast("需重启平台服务后生效", "warning");
+        await loadJdbc();
+      } catch (e) {
+        legacy.checked = !wanted;
+        toast("设置失败：" + (e.message || e), "danger");
+      } finally {
+        legacy.disabled = false;
+      }
+    });
     const tbtn = $("jdbcTestBtn");
     if (tbtn) {
       tbtn.addEventListener("click", async () => {

@@ -17,6 +17,8 @@ DEMO_MODE 下所有外部数据（真实专线延迟、ML 服务）均以仿真�
 import json
 import logging
 import os
+import re
+import socket
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -182,6 +184,63 @@ def normalize_model_body(body: str) -> tuple:
         {"choices": [{"message": {"content": content},
                       "finish_reason": "stop"}]}, ensure_ascii=False)
     return normalized, content, True
+
+
+_MODEL_FINAL_RE = re.compile(rb'"finish_reason"\s*:\s*"(stop|length|content_filter|tool_calls)"')
+
+
+def _response_socket(resp):
+    fp = getattr(resp, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    return sock if sock is not None and hasattr(sock, "settimeout") else None
+
+
+def _read_model_response(resp, deadline):
+    chunks = []
+    timed_out = False
+    last_chunk = None
+    headers = getattr(resp, "headers", None)
+    content_type = ""
+    if headers is not None:
+        try:
+            content_type = str(headers.get("Content-Type") or "").lower()
+        except Exception:
+            content_type = ""
+    is_sse = "text/event-stream" in content_type
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timed_out = True
+            break
+        sock = _response_socket(resp)
+        if sock is not None:
+            sock.settimeout(min(remaining, 30.0))
+        try:
+            try:
+                chunk = resp.read(4096)
+            except TypeError:
+                chunk = resp.read()
+        except (TimeoutError, socket.timeout):
+            timed_out = True
+            break
+        except OSError as e:
+            if "timed out" in str(e).lower():
+                timed_out = True
+                break
+            raise
+        if not chunk:
+            break
+        if sock is None and chunk == last_chunk:
+            break
+        last_chunk = chunk
+        chunks.append(chunk)
+        blob = b"".join(chunks)
+        if not is_sse and blob.lstrip().startswith(b"data:"):
+            is_sse = True
+        if is_sse and (b"[DONE]" in blob or _MODEL_FINAL_RE.search(blob)):
+            break
+    return b"".join(chunks), timed_out
 
 
 # 风险等级阈值（0-100 分）：左闭右开
@@ -611,15 +670,19 @@ class AIPredictor:
         }
 
         start_ms = time.time() * 1000
+        deadline = time.monotonic() + resolved_timeout
         try:
             req = urllib.request.Request(uri, data=body, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=resolved_timeout) as resp:
-                raw_body = resp.read().decode("utf-8", errors="replace")
+                raw_bytes, partial_timeout = _read_model_response(resp, deadline)
+                raw_body = raw_bytes.decode("utf-8", errors="replace")
                 resp_body, content, stream_normalized = normalize_model_body(raw_body)
+                if partial_timeout and not content:
+                    raise TimeoutError("模型响应超时")
                 latency_ms = round(time.time() * 1000 - start_ms, 1)
                 self.logger.info(
-                    "[ai_alert] 模型调用成功: %s, latency=%.1fms, sse_normalized=%s, content_len=%d",
-                    uri, latency_ms, stream_normalized, len(content))
+                    "[ai_alert] 模型调用成功: %s, latency=%.1fms, sse_normalized=%s, content_len=%d, partial=%s",
+                    uri, latency_ms, stream_normalized, len(content), partial_timeout)
                 return {
                     "ok": True,
                     "status_code": resp.status,
@@ -627,6 +690,7 @@ class AIPredictor:
                     "response_body": resp_body,
                     "content": content,
                     "stream_normalized": stream_normalized,
+                    "partial": partial_timeout,
                 }
         except urllib.error.HTTPError as e:
             latency_ms = round(time.time() * 1000 - start_ms, 1)
@@ -646,6 +710,10 @@ class AIPredictor:
             except (json.JSONDecodeError, TypeError):
                 pass
             # 按 HTTP 状态码分类错误
+            detail_lower = str(detail_msg or "").lower()
+            model_missing = any(k in detail_lower for k in (
+                "找不到模型", "模型不存在", "model not found", "invalid model",
+                "model_not_found", "does not exist"))
             category_map = {
                 401: {"error_category": "auth", "error": "API Key 校验未通过", "hint": "请检查密钥或密钥是否有该模型权限"},
                 403: {"error_category": "forbidden", "error": "无权限访问该模型", "hint": "该模型可能需要单独申请权限"},
@@ -653,7 +721,13 @@ class AIPredictor:
                 429: {"error_category": "rate_limit", "error": "请求过于频繁", "hint": "请降低调用频率或稍后重试"},
                 503: {"error_category": "provider_full", "error": "提供商并发已满", "hint": "该模型/提供商当前排队较多，请稍后重试或切换其他模型"},
             }
-            if e.code in category_map:
+            if model_missing:
+                classified = {
+                    "error_category": "model",
+                    "error": f"模型名不存在或无权限（{detail_msg}）",
+                    "hint": "请在 MoMA 开放平台确认当前 API Key 可用的模型名；快速选择里的 jiutian/jiutian-lan-35b 已从平台机实测可用，修改后保存再测试",
+                }
+            elif e.code in category_map:
                 classified = category_map[e.code]
                 # 如果响应体有更详细的错误信息，补充到 error 字段
                 if detail_msg:
@@ -682,7 +756,7 @@ class AIPredictor:
                 classified = {
                     "error_category": "timeout",
                     "error": f"请求超时（{resolved_timeout}s）",
-                    "hint": "可能是远端排队中或网络抖动，请稍后重试",
+                    "hint": "模型网关排队或网络抖动；MoMA 推理模型建议把请求超时调到 30-60s 后保存，或改用 jiutian/jiutian-lan-35b 快速模型重试",
                 }
             else:
                 dns_fail = any(w in reason_str.lower() for w in (
@@ -700,6 +774,20 @@ class AIPredictor:
             self.logger.warning(
                 "[ai_alert] 模型调用 URL 错误: %s, category=%s, latency=%.1fms",
                 e.reason, classified["error_category"], latency_ms,
+            )
+            result = {"ok": False, "latency_ms": latency_ms}
+            result.update(classified)
+            return result
+        except (TimeoutError, socket.timeout) as e:
+            latency_ms = round(time.time() * 1000 - start_ms, 1)
+            classified = {
+                "error_category": "timeout",
+                "error": f"请求超时（{resolved_timeout}s）",
+                "hint": "模型网关排队或网络抖动；MoMA 推理模型建议把请求超时调到 30-60s 后保存，或改用 jiutian/jiutian-lan-35b 快速模型重试",
+            }
+            self.logger.warning(
+                "[ai_alert] 模型调用超时: %s, category=timeout, latency=%.1fms",
+                e, latency_ms,
             )
             result = {"ok": False, "latency_ms": latency_ms}
             result.update(classified)

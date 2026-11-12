@@ -15,7 +15,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 容灾切换 · 恢复演练 · 预校验 · 克隆（VDB） · 不可变备份 · 巡检 · 监控 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v2.3.10-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v2.3.11-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -33,7 +33,8 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 > 目录模拟带库全链路 28/28、防勒索专项 11/11、发版回归 97 passed；
 > 真实磁带库 / 机械手 / LTO WORM 尚无真机验证报告（见下方「诚实边界」）。
 >
-> **最新动态**：v2.3.10（2026-11-12）已发布（170/171 五库型迁移同步全面真机验收 / 6 个真实缺陷修复 / 离线镜像包交付）；
+> **最新动态**：v2.3.11（2026-11-12）已发布（SQL Server 旧版 TLS/JDBC 兼容 / AI 模型超时与存储容量可读化 / 克隆服务小库真机验证 / 离线发布链路修复）；
+> v2.3.10（2026-11-12）已发布（170/171 五库型迁移同步全面真机验收 / 6 个真实缺陷修复 / 离线镜像包交付）；
 > v2.3.9（2026-11-12）完成功能项按需启用与权限分离 / AI 结果与模型接入修复 / 迁移同步 P0；
 > v2.3.8（2026-11-11）完成三粒度统一 / VDB 快照 / 应用级容灾 HA；
 > v2.3.7 完成防勒索闭环 / 磁带库接入 / 安全审计整改；
@@ -400,8 +401,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v2.3.10   # 固定版本（可回滚）
-# 当前最新版本：v2.3.10（2026-11-12，170/171 迁移同步真机验收 / 6 个缺陷修复）
+docker pull ghcr.io/zhh9126/backup-platform:v2.3.11   # 固定版本（可回滚）
+# 当前最新版本：v2.3.11（2026-11-12，TLS/JDBC 兼容 / 容量可读化 / 克隆服务验证 / 离线发布链路修复）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -421,25 +422,24 @@ python tools/check_env.py
 {"registry-mirrors": ["https://docker.m.daocloud.io", "https://dockerproxy.com"]}
 ```
 
-> **离线交付包版本说明**：**v2.3.10 离线包已交付**（`aidbm_2.3.10_offline.tar.gz`，
-> `manifest.json` 内含 4 个 RepoTag，可直接 `docker load`）。本节（离线导入 / 运行 / 升级 / 卸载）
-> 示例沿用 v2.3.8 写法，实际部署时把示例中的 `2.3.8` 全部替换成 `2.3.10` 即可；
-> GHCR 同步提供 `v2.3.10` / `v2.3.10-20261112` / `latest` 三个在线 tag。
+> **离线交付包版本说明**：**v2.3.11 离线包由 tag 自动发布**（`aidbm_2.3.11_offline.tar.gz` 与 `.sha256`，
+> `manifest.json` 内含 4 个 RepoTag，可直接 `docker load`）。
+> GHCR 同步提供 `v2.3.11` / `2.3.11` / `2.3.11-r<run_number>` / `latest` / `community` 在线 tag。
 
 ### 离线导入
 
 ```bash
-# 交付包：aidbm_2.3.10_offline.tar.gz（gzip 压缩的完整镜像，含全部运行依赖与备份工具；旧版示例见下方命令，把 2.3.8 换成 2.3.10）
-docker load -i aidbm_2.3.8_offline.tar.gz
+# 交付包：aidbm_2.3.11_offline.tar.gz（gzip 压缩的完整镜像，含全部运行依赖与备份工具）
+docker load -i aidbm_2.3.11_offline.tar.gz
 
 # 导入后确认镜像名（离线环境不会自动去公网拉取）
 docker images | grep -E 'backup-platform|aidbm'
 ```
 
 > **导入后可用 4 个镜像名（同一镜像 ID，任选其一启动，全程零联网）**：
-> `ghcr.io/zhh9126/backup-platform:v2.3.8`、`ghcr.io/zhh9126/backup-platform:latest`、
-> `aidbm:2.3.8`、`aidbm:latest`。
-> **v2.3.8 交付包已把这 4 个 tag 全部打进 `manifest.json` 的 `RepoTags`**，
+> `ghcr.io/zhh9126/backup-platform:v2.3.11`、`ghcr.io/zhh9126/backup-platform:latest`、
+> `aidbm:2.3.11`、`aidbm:latest`。
+> **v2.3.11 交付包已把这 4 个 tag 全部打进 `manifest.json` 的 `RepoTags`**，
 > `docker load` 时会输出 4 行 `Loaded image:`，直接 `docker run` 任一名字都不会访问公网。
 >
 > 若遇到 `Unable to find image 'xxx' locally` 后跟着
@@ -447,18 +447,19 @@ docker images | grep -E 'backup-platform|aidbm'
 > 说明**启动命令用的镜像名不在包内 tag 里**（Docker 找不到本地镜像就会去公网），
 > 不是包损坏。先 `docker images` 查实际 tag，或补一条：
 > ```bash
-> docker tag ghcr.io/zhh9126/backup-platform:v2.3.8 aidbm:2.3.8
+> docker tag ghcr.io/zhh9126/backup-platform:v2.3.11 aidbm:2.3.11
 > ```
 
 自行导出（有网机器上**先打齐 tag 再 save**，否则包内只带单个 tag）：
 
 ```bash
-docker pull ghcr.io/zhh9126/backup-platform:v2.3.8
-docker tag ghcr.io/zhh9126/backup-platform:v2.3.8 ghcr.io/zhh9126/backup-platform:latest
-docker tag ghcr.io/zhh9126/backup-platform:v2.3.8 aidbm:2.3.8
-docker tag ghcr.io/zhh9126/backup-platform:v2.3.8 aidbm:latest
-docker save ghcr.io/zhh9126/backup-platform:v2.3.8 ghcr.io/zhh9126/backup-platform:latest aidbm:2.3.8 aidbm:latest | gzip > aidbm_2.3.8_offline.tar.gz
-gzip -t aidbm_2.3.8_offline.tar.gz    # 必须输出 OK，否则包被截断不可交付
+docker pull ghcr.io/zhh9126/backup-platform:v2.3.11
+docker tag ghcr.io/zhh9126/backup-platform:v2.3.11 ghcr.io/zhh9126/backup-platform:latest
+docker tag ghcr.io/zhh9126/backup-platform:v2.3.11 aidbm:2.3.11
+docker tag ghcr.io/zhh9126/backup-platform:v2.3.11 aidbm:latest
+docker save ghcr.io/zhh9126/backup-platform:v2.3.11 ghcr.io/zhh9126/backup-platform:latest aidbm:2.3.11 aidbm:latest | gzip > aidbm_2.3.11_offline.tar.gz
+gzip -t aidbm_2.3.11_offline.tar.gz    # 必须输出 OK，否则包被截断不可交付
+sha256sum aidbm_2.3.11_offline.tar.gz > aidbm_2.3.11_offline.tar.gz.sha256
 ```
 
 ### 磁带库 / 可移动介质接入（离线容器部署）
@@ -694,6 +695,14 @@ docker build -t backup-platform:local .
 - 默认账号请立即修改（首登会标记 `must_change_password`）；生产环境建议限制来源 IP
 
 ## 更新日志
+
+### v2.3.11（2026-11-12，已发布）
+
+- **SQL Server 旧版 TLS/JDBC 兼容**：补齐 SQL Server 2008/2012 旧 TLS 协议探测与 JDBC 连接参数兼容，真实环境连接通过后回归通过。
+- **AI 模型与存储容量可读性**：修复模型测试超时状态与保存状态不一致；`/api/storage/usage`、`/api/storage/local-root`、仪表盘容量统一输出 `*_human`，AI 助手主回答、明细、原始结果与历史会话不再暴露裸字节和内部英文键。
+- **存储与克隆健壮性**：BACKUP_ROOT 缺失时容量统计回退最近存在目录且返回完整降级字段；SFTP/NAS 目标真正参与 L2 复制；克隆服务用 `fulltest_db`（1 表 / 16 KB）完成真实预检、创建、就绪、校验、销毁闭环。
+- **离线发布链路修复**：GHCR 同时发布 `vX.Y.Z` 与 `X.Y.Z` tag；`v*` tag 自动触发离线包导出，等待 GHCR 就绪后生成 4 RepoTag 的 `aidbm_2.3.11_offline.tar.gz` 与 `.sha256`，并上传 GitHub Release。
+- **回归**：qa_storage 20 passed；AI 模型 / i18n / 静态缓存戳门禁 68 passed；真实系统页面与 API 深度冒烟 51/51；克隆服务小库端到端 PASS。
 
 ### v2.3.10（2026-11-12，已发布）
 

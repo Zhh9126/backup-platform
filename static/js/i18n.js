@@ -13,6 +13,17 @@
    ============================================================= */
 window.I18N = (function () {
   var EN = {
+    // ---- SQL Server 旧版 TLS 兼容（2026-11-12）----
+    "兼容旧版 TLS（SQL Server 2008 等仅支持 TLS 1.0）": "Legacy TLS compatibility (SQL Server 2008 etc. supporting only TLS 1.0)",
+    "开启后仅放开 JVM 的 TLS 1.0/1.1 禁用，客户端仍优先协商 TLS 1.2/1.3；若 JVM 已建立过 JDBC 连接，需重启平台服务。长期方案仍建议在 SQL Server 服务端启用 TLS 1.2。": "This only removes the JVM ban on TLS 1.0/1.1; the client still prefers TLS 1.2/1.3. If the JVM has already opened JDBC connections, restart the platform service. Enabling TLS 1.2 on the SQL Server side remains the recommended long-term fix.",
+    "已开启，需重启平台服务生效": "Enabled; restart the platform service to apply",
+    "已生效（TLS 1.0 可用）": "Active (TLS 1.0 available)",
+    "已开启，将在下次 JDBC 启动时生效": "Enabled; applies on next JDBC startup",
+    "默认关闭": "Off by default",
+    "已开启旧版 TLS 兼容": "Legacy TLS compatibility enabled",
+    "已关闭旧版 TLS 兼容": "Legacy TLS compatibility disabled",
+    "需重启平台服务后生效": "Restart the platform service to apply",
+    "设置失败：": "Failed to save setting: ",
     // ---- 侧边栏菜单 ----
     "仪表盘": "Dashboard",
     "数据库备份": "Database Backup",

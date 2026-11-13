@@ -229,7 +229,9 @@
     go.textContent = "去恢复";
     go.onclick = () => {
       modal.hide();
-      if (typeof window.openRestoreModal === "function") window.openRestoreModal(recordId);
+      // 恢复入口是独立页面（/restore），此前这里调用从未定义的
+      // window.openRestoreModal，点击「去恢复」后毫无反应（静默失效）。
+      window.location.href = "/restore?record_id=" + encodeURIComponent(recordId);
     };
     showModalSafe(modal);
   }

@@ -599,6 +599,15 @@ class DamengEngine(BackupEngine):
         _dm_os_user = self._resolve_check_user(ssh_host)
         restore_dir = (kwargs.get("pitr_restore_dir")
                        or f"/home/{_dm_os_user}/pitr_restore_{ts}").rstrip("/")
+        # 还原目录来自 API 入参，会被拼进远端 shell 命令：必须是绝对路径且
+        # 不含 shell 元字符，否则等于以数据库 OS 用户身份任意命令执行。
+        if (not restore_dir.startswith("/")
+                or re.search(r"[\s'\"`\\;|&$<>()\n\r\t]", restore_dir)):
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED, backup_path=backup_path,
+                message=f"非法的 PITR 还原目录 {restore_dir!r}：必须是绝对路径，"
+                        f"且不含空白与 shell 特殊字符（'\"`;|&$ 等）")
+        _rd_q = shlex.quote(restore_dir)
         if not ssh_host:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED, backup_path=backup_path,
@@ -621,8 +630,8 @@ class DamengEngine(BackupEngine):
                 rate_kbps=int(self.task.get("bandwidth_limit") or 0),
                 label="达梦 PITR 备份集推送")
             out, err, rc = _ssh_exec_pipe(client, remote_dump._wrap_login(
-                f"mkdir -p {bset_dir} {restore_dir} && chown -R {_dm_os_user} {bset_dir} "
-                f"{restore_dir} && tar xzf {remote_pkg} -C {bset_dir} && "
+                f"mkdir -p {bset_dir} {_rd_q} && chown -R {_dm_os_user} {bset_dir} "
+                f"{_rd_q} && tar xzf {remote_pkg} -C {bset_dir} && "
                 f"find {bset_dir} -type f | head -3"), timeout=300)
             if rc != 0:
                 return BackupResult(
@@ -716,7 +725,7 @@ class DamengEngine(BackupEngine):
                         f"(PORT_NUM={replica_port})")
             # 动态定位生成的 dm.ini（实例目录名可能为 DAMENG/源实例名等）
             ini_chk, _e, _rc = _ssh_exec_pipe(client, remote_dump._wrap_login(
-                f"find {restore_dir} -name dm.ini -type f 2>/dev/null | head -1"),
+                f"find {_rd_q} -name dm.ini -type f 2>/dev/null | head -1"),
                 timeout=30)
             found_ini = (ini_chk.decode("utf-8", "replace")
                          if isinstance(ini_chk, bytes) else ini_chk or "").strip()

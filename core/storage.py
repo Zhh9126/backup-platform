@@ -12,6 +12,42 @@ from pathlib import Path
 import config
 import core.db as db
 
+# 同一次备份的多个产物（RMAN 多片 / xtrabackup 多 volume / .sha256 与
+# manifest 副产物）落盘时间相差很小；用 120s 窗口聚成「一份」。
+_BATCH_WINDOW_SEC = 120
+
+
+def _safe_mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def group_backup_batches(files: list) -> list:
+    """把同一任务目录下的产物按「备份份」分组（mtime 邻近聚类，时间倒序）。
+
+    保留策略里的 retention_count 语义是「保留多少份备份」，不是「保留多少
+    个文件」。此前直接 ``files[retention_count:]`` 按文件个数截断，遇到一
+    份备份产出多个文件时会把这份删残（留下半份 tar → 无法恢复）。
+    """
+    if not files:
+        return []
+    ordered = sorted(files, key=_safe_mtime, reverse=True)
+    batches, cur, last = [], [], None
+    for p in ordered:
+        mt = _safe_mtime(p)
+        if last is not None and (last - mt) <= _BATCH_WINDOW_SEC:
+            cur.append(p)
+        else:
+            if cur:
+                batches.append(cur)
+            cur = [p]
+        last = mt
+    if cur:
+        batches.append(cur)
+    return batches
+
 
 class StorageManager:
     def __init__(self, task: dict, logger=None):
@@ -80,7 +116,11 @@ class StorageManager:
         files = self.list_backup_files()
         to_delete = []
         if retention_count and retention_count > 0:
-            to_delete += files[retention_count:]  # 超出份数的旧文件
+            # 按「备份份」截断（不是文件个数）：一次备份可能产出多片/多文件，
+            # 按文件数截断会把一份备份删残，留下无法恢复的碎片。
+            batches = group_backup_batches(files)
+            for batch in batches[retention_count:]:
+                to_delete.extend(batch)
         if retention_days and retention_days > 0:
             cutoff = time.time() - retention_days * 86400
             for p in files:

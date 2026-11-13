@@ -2614,10 +2614,15 @@
     const kw = ($("recordSearch")?.value || "").trim();
     const urlParams = new URLSearchParams(location.search);
     const pid = urlParams.get("policy_id");
-    // 下钻支持：/records?status=failed 直接预置状态筛选
-    const qStatus = urlParams.get("status");
-    if (qStatus != null && $("recordStatusFilter")) {
-      $("recordStatusFilter").value = qStatus;
+    // 下钻支持：/records?status=failed 直接预置状态筛选。
+    // 只应用一次——否则用户把下拉切回「全部状态」触发 loadRecords 时，
+    // URL 参数又把它重置回 failed，表现为"筛选清不掉"。
+    if (!window._recordStatusFromUrl) {
+      window._recordStatusFromUrl = true;
+      const qStatus = urlParams.get("status");
+      if (qStatus != null && $("recordStatusFilter")) {
+        $("recordStatusFilter").value = qStatus;
+      }
     }
     const q = [];
     if (tid) q.push("task_id=" + encodeURIComponent(tid));
@@ -2722,7 +2727,18 @@
     const rsf = $("recordStatusFilter");
     if (rsf && !rsf._wired) {
       rsf._wired = true;
-      rsf.addEventListener("change", loadRecords);
+      rsf.addEventListener("change", () => {
+        // 用户手动改筛选：清掉下钻带来的 ?status=，避免刷新后被重新覆盖
+        try {
+          const u = new URL(location.href);
+          if (u.searchParams.has("status")) {
+            u.searchParams.delete("status");
+            history.replaceState(null, "", u.pathname + (u.search || "") + u.hash);
+          }
+        } catch (e) { /* 老浏览器忽略 */ }
+        window._recordStatusFromUrl = true;
+        loadRecords();
+      });
     }
   }
 
@@ -3224,6 +3240,23 @@
     renderRestoreRecords();
     onRestoreTypeChange();
 
+    // 记录页/预检弹窗「去恢复」跳转携带 record_id：切到对应类型并选中该记录
+    const wantId = Number(new URLSearchParams(location.search).get("record_id") || 0);
+    const wantRec = wantId
+      ? (window.RESTORE_RECORDS || []).find(r => Number(r.id) === wantId)
+      : null;
+    if (wantRec) {
+      const wantType = wantRec.db_type === "file" ? "file"
+        : (wantRec.db_type === "object_storage" ? "obj" : "db");
+      const radio = document.querySelector(`input[name="r_type"][value="${wantType}"]`);
+      if (radio) radio.checked = true;
+      onRestoreTypeChange();
+      if ($("r_record")) $("r_record").value = String(wantId);
+      onRecordChange();
+      const sec = document.getElementById("r_sec2");
+      if (sec && sec.scrollIntoView) sec.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+
     $("restoreForm").onsubmit = null; // 清除旧绑定
     $("restoreForm").onsubmit = (e) => {
       e.preventDefault();
@@ -3275,7 +3308,20 @@
       const mode = document.querySelector('input[name="r_mode"]:checked')?.value || 'same';
       if (mode === "same") {
         // 恢复到源任务，目标库可选
-        body.target_db = ($("r_target_db_same")?.value || "").trim();
+        const tdb = ($("r_target_db_same")?.value || "").trim();
+        body.target_db = tdb;
+        // 目标库留空 = 引擎按源库名原位覆盖恢复（生产库会被直接覆盖，不可撤销）。
+        // 必须让用户显式确认一次，后端也会要求 confirm_same_db 才放行。
+        if (!tdb) {
+          const okSame = await confirmDialog({
+            title: "未指定目标库：将原位覆盖源库",
+            message: "未填写目标库时，本次恢复会按源库名原位覆盖，现有数据将被覆盖且不可撤销。如需保留现网数据，请填写一个不同的目标库名。",
+            confirmText: "确认覆盖恢复",
+            danger: true,
+          });
+          if (!okSame) return;
+          body.confirm_same_db = true;
+        }
         // 达梦 PITR：物理备份集 + 时点（留空=恢复到最新）
         const tt = ($("r_target_time")?.value || "").trim();
         if (tt) body.target_time = tt;
@@ -3504,6 +3550,10 @@
   }
 
   window.loadRestoreForm = async () => { await initRestore(); };
+  // restore.html 的表单内联 onsubmit="submitRestore()" 需要全局可解析；
+  // 此前只有 IIFE 内绑定生效，一旦 initRestore 的首次请求失败（会话过期等），
+  // 内联处理器就保留生效 → 点「执行恢复」报 submitRestore is not defined。
+  window.submitRestore = submitRestore;
 
   // ------------------------- 系统设置 -------------------------
   async function initSettings() {

@@ -147,10 +147,24 @@ def apply_gfs(task_id: int = None, dry_run: bool = False) -> dict:
             keep_ids.add(r["id"])
         # 护栏2：物理备份/合成备份若仍是链基备（有增量引用）不删
         for rid in list(mark_ids):
+            # ``backup_sets.parent_set_id`` 指向的是 **backup_sets.id**，不是
+            # backup_records.id：拿 record id 直接比会永不命中，护栏形同虚设
+            # （于是仍被增量引用的全量基备可能被删 → 整条链无法恢复）。
+            _sets = db.query(
+                "SELECT id FROM backup_sets WHERE record_id=?", (rid,))
+            _set_ids = []
+            for _s in _sets or []:
+                try:
+                    _set_ids.append(int(_s["id"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if not _set_ids:
+                continue
+            _ph = ",".join("?" * len(_set_ids))
             refs = db.query(
-                "SELECT COUNT(*) AS c FROM backup_sets WHERE parent_set_id=?",
-                (rid,))
-            if refs and refs[0]["c"] > 0:
+                "SELECT COUNT(*) AS c FROM backup_sets WHERE parent_set_id IN (%s)" % _ph,
+                tuple(_set_ids))
+            if refs and (refs[0]["c"] or 0) > 0:
                 mark_ids.discard(rid)
         # 护栏2.5：保留锁（G13 不可变备份）保护期内一律不标记不删——
         # 锁定备份不受 GFS 策略影响，到期后自然回到策略视野

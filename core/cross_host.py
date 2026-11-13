@@ -19,15 +19,54 @@
 4. 返回结果
 """
 import os
+import re
 import time
 from shlex import quote as shlex_quote
 import paramiko
+
+from core.redact import redact_cmd as _redact_cmd
+
+# 目标库名会拼进远端 shell 命令（以目标主机的 SSH 用户身份执行），必须先做
+# 字符白名单校验：含引号/反引号/分号/$() 等即等于允许命令注入。
+_DB_NAME_UNSAFE = re.compile(r"[\s'\"`\\;|&$<>()\n\r\t]")
+
+
+def _guard_db_name(name: str, kind: str = "目标库") -> str:
+    """恢复目标库名安全校验（空值原样返回，表示沿用源库/默认）。"""
+    s = (name or "").strip()
+    if not s:
+        return ""
+    if _DB_NAME_UNSAFE.search(s):
+        raise ValueError(
+            "非法的%s名 %r：不允许空白与 shell 特殊字符"
+            "（'\"`\\;|&$<>() 等），以免远端恢复命令被注入。" % (kind, s))
+    return s
+
+
+def _host_key_policy():
+    """主机公钥策略：默认兼容，严格模式校验 known_hosts。
+
+    system_config ``ssh_strict_host_key=1`` 时切到 RejectPolicy 并加载系统
+    known_hosts（防 MITM）；未登记过的目标主机连接会直接失败，需先把公钥
+    写入 known_hosts。默认保持 AutoAddPolicy 以兼容存量部署。
+    """
+    try:
+        import core.db as _db
+        if str(_db.get_system_config("ssh_strict_host_key") or "").strip().lower() in (
+                "1", "true", "yes", "on"):
+            return paramiko.RejectPolicy(), True
+    except Exception:  # noqa: BLE001
+        pass
+    return paramiko.AutoAddPolicy(), False
 
 
 def _build_ssh(target_host_info: dict):
     """构造到目标主机的 SSH 客户端（不复用主连接池，因为恢复是一次性操作）。"""
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    _policy, _strict = _host_key_policy()
+    client.set_missing_host_key_policy(_policy)
+    if _strict:
+        client.load_system_host_keys()
     connect = dict(
         hostname=target_host_info.get("hostname") or "",
         port=int(target_host_info.get("port") or 22),
@@ -200,7 +239,7 @@ def cross_host_restore(db_type: str, backup_path: str, target_host_info: dict,
             # 任务级自定义环境变量前缀（contextvar，由 scheduler 设置）
             from core.remote_dump import current_task_env_export
             cmd = current_task_env_export() + cmd
-            log(f"全实例跨主机恢复: {cmd[:200]}")
+            log(f"全实例跨主机恢复: {_redact_cmd(cmd, 200)}")
             out, err, rc = _remote_exec_logged(client, cmd, timeout=14400, log=log)
             out_s = out.decode("utf-8", "replace")
             err_s = err.decode("utf-8", "replace")
@@ -219,7 +258,7 @@ def cross_host_restore(db_type: str, backup_path: str, target_host_info: dict,
         # 任务级自定义环境变量前缀（contextvar，由 scheduler 设置）
         from core.remote_dump import current_task_env_export
         cmd = current_task_env_export() + cmd
-        log(f"远程执行: {cmd[:200]}")
+        log(f"远程执行: {_redact_cmd(cmd, 200)}")
         out, err, rc = _remote_exec_logged(client, cmd, timeout=7200, log=log)
         out_s = out.decode("utf-8", "replace")
         err_s = err.decode("utf-8", "replace")
@@ -356,6 +395,10 @@ echo "RESTORE_SUMMARY ok=$OK fail=$FAIL"
 def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
                        extra: dict, target_host_info: dict) -> str:
     """构造各 DB 跨主机恢复命令（目标主机上执行）。"""
+    # 统一入口校验：库名来自 API 入参，直接拼 shell 会成为命令注入通道。
+    # file 类型的目标是目录路径（允许空格等，走 shlex_quote），不做库名白名单。
+    if db_type != "file":
+        target_db = _guard_db_name(target_db)
     base = extra.get("base_dir") or ""
     # 数据库 OS 用户（标准变量：主机级 db_os_user > 库型默认），
     # Oracle/DM 等工具链仅在其属主用户 profile 中可用
@@ -386,13 +429,15 @@ def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
             pre = f"bunzip2 -c '{remote_pkg}' > '{actual}' && "
         else:
             pre = ""
-        target = f"'{target_db}'" if target_db else ""
+        target = shlex_quote(target_db) if target_db else ""
         # 目标库不存在时自动创建：单库 dump 不含 CREATE DATABASE，
         # 否则导入报 ERROR 1049 Unknown database（全实例路径已有自动建库，
         # 单库跨主机路径此前缺失）。
         create_part = ""
         strip_part = ""
         if target_db:
+            # 已过 _guard_db_name（无引号/反引号/分号等），再剔除反引号确保
+            # CREATE DATABASE 的标识符包裹不可被闭合
             safe_db = str(target_db).replace("`", "")
             create_part = (
                 f"{mysql_bin} -h {host} -P {port} -u {user} -p'{pw_esc}' "
@@ -438,8 +483,8 @@ def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
             pre = ""
         if remote_pkg.endswith(".dump"):
             return (f"export PGPASSWORD='{pw}'; {pre}{pg_restore_bin} "
-                    f"-h {host} -p {port} -U {user} -d '{target_db or 'postgres'}' -c '{actual}'")
-        target = f"-d '{target_db}'" if target_db else ""
+                    f"-h {host} -p {port} -U {user} -d {shlex_quote(target_db or 'postgres')} -c '{actual}'")
+        target = f"-d {shlex_quote(target_db)}" if target_db else ""
         return (f"export PGPASSWORD='{pw}'; {pre}{psql_bin} "
                 f"-h {host} -p {port} -U {user} {target} -f '{actual}'")
 
@@ -507,8 +552,8 @@ exit $RC
         else:
             pre = ""
         if remote_pkg.endswith(".dump"):
-            return f"{env} {pre}{restore_bin} -h {host} -p {port} -U {user} -d '{target_db or 'kingbase'}' '{actual}'"
-        target = f"-d '{target_db}'" if target_db else ""
+            return f"{env} {pre}{restore_bin} -h {host} -p {port} -U {user} -d {shlex_quote(target_db or 'kingbase')} '{actual}'"
+        target = f"-d {shlex_quote(target_db)}" if target_db else ""
         return f"{env} {pre}{ksql_bin} -h {host} -p {port} -U {user} {target} -f '{actual}'"
 
     elif db_type in ("opengauss", "panwei"):
@@ -596,7 +641,9 @@ exit $RC
 
     elif db_type == "file":
         target = target_db or "/tmp/restore"
-        return f"mkdir -p '{target}' && tar -xzf '{remote_pkg}' -C '{target}' && echo '已解压到 {target}'"
+        # 目录路径允许空格，统一 shlex.quote，避免 root shell 任意命令执行
+        tq = shlex_quote(target)
+        return f"mkdir -p {tq} && tar -xzf {shlex_quote(remote_pkg)} -C {tq} && echo '已解压到 '{tq}"
 
     elif db_type == "dameng":
         # DM 真实 dimp 恢复：动态解析 dimp（dmdba 用户 profile → 常见安装目录），

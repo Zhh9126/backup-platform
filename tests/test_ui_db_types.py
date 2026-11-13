@@ -38,8 +38,12 @@ MIGRATION_HTML = os.path.join(ROOT, "templates", "migration.html")
 META = {
     "db_types": ["mysql", "mariadb", "postgresql", "oracle", "kingbase",
                  "dameng", "sqlserver", "redis", "file"],
-    "sync_types": ["dameng", "kingbase", "mariadb", "mysql", "oracle",
-                   "postgresql", "sqlserver"],
+    # 与 core.sync.plugins.registry.available() 的当前注册集一致：协议兼容层
+    # 接入的 highgo / uxdb / tidb / oceanbase 也已注册同步插件与迁移通道，
+    # 前端类型下拉应当可见（旧基线只写了 7 项已过时）。
+    "sync_types": ["dameng", "highgo", "kingbase", "mariadb", "mysql",
+                   "oceanbase", "oracle", "postgresql", "sqlserver",
+                   "tidb", "uxdb"],
     "display_names": {"mysql": "MySQL", "mariadb": "MariaDB",
                       "postgresql": "PostgreSQL", "oracle": "Oracle",
                       "kingbase": "kingbase", "dameng": "DM 达梦",

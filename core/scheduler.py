@@ -403,8 +403,31 @@ def run_task_now(task_id: int, backup_type: str = None,
         return submit_task_now(task_id, backup_type=backup_type,
                                 operator=operator)
 
-    _auto_discover_for_task(task, operator)
-    return _execute_backup(task, backup_type, operator)
+    # 同步通道同样需要进程内互斥：手动连点「立即备份」、或手动与调度触发
+    # 撞车时，两次执行会同时读写同一产物目录（同秒产物同名互相覆盖），
+    # 此前只有异步队列去重，同步路径完全没有保护。
+    tid = None
+    try:
+        tid = int(task["id"])
+    except (KeyError, TypeError, ValueError):
+        tid = None
+    if tid is not None:
+        with _RUNNING_LOCK:
+            if tid in _RUNNING_TASKS:
+                _logger.warning("[concurrency] 任务 %s 正在执行，拒绝重复触发", tid)
+                return {"accepted": False, "duplicate": True, "task_id": tid,
+                        "status": "running",
+                        "message": "任务正在执行中，请等待本次完成后再试"}
+            _RUNNING_TASKS.add(tid)
+            _RUNNING_IDS[tid] = db.now_iso()
+    try:
+        _auto_discover_for_task(task, operator)
+        return _execute_backup(task, backup_type, operator)
+    finally:
+        if tid is not None:
+            with _RUNNING_LOCK:
+                _RUNNING_TASKS.discard(tid)
+                _RUNNING_IDS.pop(tid, None)
 
 
 def _bg_execute_backup(task: dict, backup_type: str = None,
@@ -791,7 +814,9 @@ def run_restore_now(record_id: int, target_host: str = None,
                     table_renames: dict = None,
                     target_schema: str = None,
                     restore_options: dict = None,
-                    force_unsafe_restore: bool = False) -> Optional[dict]:
+                    force_unsafe_restore: bool = False,
+                    drill_mode: bool = False,
+                    confirm_same_db: bool = False) -> Optional[dict]:
     """立即执行一次恢复。
 
     ``restore_options`` 是**对象存储恢复**的专有参数（目标桶 / 前缀 / 覆盖
@@ -853,6 +878,18 @@ def run_restore_now(record_id: int, target_host: str = None,
         else:
             target_host_label = target_host
         detail_log_lines.append(f"[目标主机] 直接输入: {target_host_label}")
+
+    # 「目标库留空 = 按源库名原位覆盖」必须显式确认（API / 调度 / CLI 统一收口）。
+    # 放在反勒索安全门与受保护主机校验之后：安全类拒绝优先于参数提示。
+    if not (target_db or target_schema or tables or restore_options):
+        _db_type = rec.get("db_type") or (task or {}).get("db_type")
+        if _db_type not in ("file", "object_storage") and not confirm_same_db:
+            raise ValueError(
+                "未指定目标库：本次恢复会按源库名原位覆盖（%s），现有数据将被"
+                "覆盖且不可撤销。异名恢复请指定 target_db / target_schema；"
+                "确需原地覆盖请传 confirm_same_db=True。"
+                % ((task or {}).get("db_name") or "源库"))
+
     rid = models.create_restore({
         "task_id": rec["task_id"], "record_id": record_id,
         "target_host": target_host_label, "target_db": target_db,
@@ -909,6 +946,9 @@ def run_restore_now(record_id: int, target_host: str = None,
                                         tables=tables,
                                         table_renames=table_renames,
                                         target_schema=target_schema,
+                                        # 演练模式：禁止引擎做任何"清 binlog /
+                                        # 重置 GTID"之类污染生产实例的动作
+                                        drill_mode=bool(drill_mode),
                                         **_obj_kw)
         finally:
             _rd.reset_task_env_export(_env_token)
@@ -1032,10 +1072,14 @@ def _next_fire_naive(task: dict, st_key: str, expr_key: str, minutes_key: str,
             raw = str(last_run)[:19]
             for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
                 try:
-                    prev = _dt.datetime.strptime(raw, fmt)
-                    break
+                    _prev = _dt.datetime.strptime(raw, fmt)
                 except ValueError:
                     continue
+                # APScheduler 的 get_next_fire_time 会比较 now(aware) 与
+                # previous_fire_time：后者若少 tzinfo 会抛 TypeError，被下面的
+                # except 吞掉 → 任何跑过一次的 cron 任务"下次备份时间"恒为空。
+                prev = _prev.replace(tzinfo=tz) if tz is not None else _prev
+                break
         nft = trig.get_next_fire_time(prev, now)
         if nft is None:
             return None
@@ -1252,6 +1296,25 @@ def _make_inspection_trigger(cron_expr: str):
         return CronTrigger.from_crontab(cron_expr)
     except Exception:
         return None
+
+
+def _runtime_heartbeat_job():
+    """多 worker 存活心跳：让其他进程的「启动自愈」放过本进程在途任务。"""
+    try:
+        from core import runtime_registry
+        runtime_registry.heartbeat()
+    except Exception:  # noqa: BLE001
+        _logger.debug("[runtime] 心跳写入失败", exc_info=True)
+
+
+def _register_runtime_heartbeat(sched):
+    from apscheduler.triggers.interval import IntervalTrigger
+    try:
+        sched.add_job(_runtime_heartbeat_job, IntervalTrigger(seconds=20),
+                      id="runtime_heartbeat", replace_existing=True,
+                      max_instances=1, coalesce=True)
+    except Exception:  # noqa: BLE001
+        _logger.debug("[runtime] 心跳任务注册失败", exc_info=True)
 
 
 def _register_inspection(sched):
@@ -1962,6 +2025,7 @@ def start_scheduler():
         if st.get("sync_mode") == "realtime":
             continue
         _register(_scheduler, st, prefix="sync")
+    _register_runtime_heartbeat(_scheduler)
     _register_inspection(_scheduler)
     _register_lifecycle(_scheduler)
     _register_clone_expire(_scheduler)
@@ -2033,6 +2097,7 @@ def _reload_scheduler_locked():
         if st.get("sync_mode") == "realtime":
             continue
         _register(_scheduler, st, prefix="sync")
+    _register_runtime_heartbeat(_scheduler)
     _register_inspection(_scheduler)
     _register_lifecycle(_scheduler)
     _register_clone_expire(_scheduler)

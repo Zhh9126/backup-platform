@@ -175,11 +175,11 @@
   <!-- 首屏注入 META（数据库类型/显示名/默认端口）：必须在 bkp-core.js 之前，
        否则依赖 BKP.META 的下拉会被填成空（见 app.py context_processor 注释） -->
   <script>window.__BKP_META__ = {{ bkp_meta | default({}) | tojson }};</script>
-  <script src="/static/js/i18n.js?v=2026111202"></script>
+  <script src="/static/js/i18n.js?v=2026111301"></script>
   <script src="/static/js/bkp-core.js?v=2026111201"></script>
   <script src="/static/js/pager.js?v=2026111102"></script>
-  <script src="/static/js/precheck.js?v=2026110610"></script>
-  <script src="/static/js/app.js?v=2026111203"></script>
+  <script src="/static/js/precheck.js?v=2026111301"></script>
+  <script src="/static/js/app.js?v=2026111301"></script>
   {% if has_ai_agent %}<script src="/static/js/ai-agent.js?v=2026111102"></script>{% endif %}
   <script>
     // 按权限隐藏菜单（每个 <a class="nav-link" data-perm="..."> 命中则可见）

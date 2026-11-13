@@ -204,6 +204,35 @@ def _task_rows(task_id: int):
         "ORDER BY COALESCE(finished_at, started_at) DESC, id DESC", (task_id,))
 
 
+def _is_chain_base(record_id: int) -> bool:
+    """该记录是否仍是增量/合成链的基备（被其它备份集的 parent_set_id 引用）。
+
+    ``backup_sets.parent_set_id`` 存的是 **backup_sets.id**，不是 record id；
+    必须先把 record 映射到它自己的 set id 再查引用，否则护栏永不命中
+    （删掉链基备 = 后续增量全部无法恢复）。
+    """
+    try:
+        rows = db.query("SELECT id FROM backup_sets WHERE record_id=?", (record_id,))
+    except Exception:  # noqa: BLE001
+        return False
+    ids = []
+    for r in rows or []:
+        try:
+            ids.append(int(r["id"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not ids:
+        return False
+    holders = ",".join("?" * len(ids))
+    try:
+        refs = db.query(
+            "SELECT COUNT(*) AS c FROM backup_sets WHERE parent_set_id IN (%s)" % holders,
+            tuple(ids))
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(refs and (refs[0]["c"] or 0) > 0)
+
+
 def build_plan(task_id: int = None, keep_min: int = None) -> list:
     """按任务保留策略扫描可清理的成功备份（只读，不做任何删除）。
 
@@ -237,6 +266,22 @@ def build_plan(task_id: int = None, keep_min: int = None) -> list:
         items = []
         task_locked = 0
         task_trusted = 0
+        task_chain = 0
+        # 护栏1：最近 keep_min 份无条件保留——按"产物仍在磁盘"的记录计数，
+        # 否则最新的几条若是幽灵记录（文件已丢/已被保留策略删掉），磁盘上
+        # 最后一个真正可用的备份仍会进入待删清单。
+        keep_recent = set()
+        _kept = 0
+        for r in rows:
+            if _kept >= km:
+                break
+            _p = r.get("backup_path") or ""
+            if _p and os.path.isfile(str(_p)):
+                keep_recent.add(r["id"])
+                _kept += 1
+        if not keep_recent and km > 0:
+            # 全为幽灵记录时退化为按序位保留前 km 条（不额外放宽删除面）
+            keep_recent = {r["id"] for r in rows[:km]}
         for idx, r in enumerate(rows):
             ts = _parse_ts(r.get("finished_at") or r.get("started_at"))
             age_days = (now - ts).days if ts else None
@@ -248,7 +293,7 @@ def build_plan(task_id: int = None, keep_min: int = None) -> list:
             if not reason:
                 continue
             # 护栏1：最近 keep_min 份无条件保留
-            if idx < km:
+            if r["id"] in keep_recent:
                 continue
             # 护栏4：保留锁（G13 不可变备份）保护期内一律不清理——
             # 锁定期长于保留策略时锁优先，绝不因策略过期而删掉受保护备份
@@ -261,6 +306,11 @@ def build_plan(task_id: int = None, keep_min: int = None) -> list:
             # 可信恢复点清掉——勒索场景常见手法是先删干净所有可恢复副本。
             if r["id"] in trusted:
                 task_trusted += 1
+                continue
+            # 护栏6（增量链）：仍是增量/合成链基备的记录不清理——删掉基备
+            # 会让后续所有增量都无法恢复（GFS 侧有同款护栏，这里此前缺失）。
+            if _is_chain_base(r["id"]):
+                task_chain += 1
                 continue
             path = r.get("backup_path") or ""
             items.append({
@@ -291,6 +341,7 @@ def build_plan(task_id: int = None, keep_min: int = None) -> list:
             "ghost_bytes": sum(i["size_bytes"] for i in items if not i["has_file"]),
             "skipped_locked": task_locked,
             "skipped_trusted": task_trusted,
+            "skipped_chain": task_chain,
             "items": items,
         })
     return plans
@@ -322,6 +373,10 @@ def run_cleanup(task_id: int = None, dry_run: bool = False,
     """执行清理。dry_run=True 只返回计划，不做任何删除。"""
     cfg = get_config()
     do_purge = cfg["purge_records"] if purge_records is None else bool(purge_records)
+    # 调用方（尤其是调度器）通常不传 keep_min，此时必须回落到界面配置值，
+    # 否则用户在「定期清理」里设置的"最少保留份数"被静默忽略、恒为默认 1。
+    if keep_min is None:
+        keep_min = cfg["keep_min"]
     plans = build_plan(task_id=task_id, keep_min=keep_min)
     try:
         from core.ransomware_guard import trusted_point_ids
@@ -338,6 +393,7 @@ def run_cleanup(task_id: int = None, dry_run: bool = False,
         "skipped_outside": 0,
         "skipped_locked": 0,
         "skipped_trusted": 0,
+        "skipped_chain": sum(p.get("skipped_chain", 0) for p in plans),
         "failed": 0,
         "purge_records": bool(do_purge),
         "details": [],

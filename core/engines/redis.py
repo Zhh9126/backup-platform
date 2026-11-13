@@ -265,9 +265,12 @@ class RedisEngine(BackupEngine):
             # 2) 生成最小保真 conf 并推送（port/dir/dbfilename/appendonly/
             #    requirepass 保真；daemonize+独立 pid/log 不污染原环境）
             gen_conf = "/tmp/platform_redis_restart_%d.conf" % port
+            # rdb 文件名以实例当前配置为准：恒写 dump.rdb 时，若实例用的是
+            # 其它 dbfilename（或启用了 AOF），重启后加载的仍是旧数据 → 假成功。
+            rdb_name = (kv.get("dbfilename") or "dump.rdb").strip() or "dump.rdb"
             conf_text = (
                 f"port {port}\nbind 0.0.0.0\ndir {data_dir}\n"
-                f"dbfilename {kv.get('dbfilename') or 'dump.rdb'}\n"
+                f"dbfilename {rdb_name}\n"
                 f"appendonly {kv.get('appendonly') or 'no'}\n"
                 f"save {kv.get('save') or ''}\n"
                 f"daemonize yes\npidfile /tmp/platform_redis_{port}.pid\n"
@@ -291,7 +294,7 @@ class RedisEngine(BackupEngine):
                 # 用 cat 重定向而非 cp：很多环境 root 的 .bashrc 把 cp 别名
                 # 成 `cp -i`（bash -lc 登录 shell 会加载），目标存在时 cp -i
                 # 等待 y/n 确认 → 无 stdin 永久挂起（170 实测暴露）
-                f"cat {shlex_quote(tmp_rdb)} > {shlex_quote(data_dir)}/dump.rdb; "
+                f"cat {shlex_quote(tmp_rdb)} > {shlex_quote(data_dir + '/' + rdb_name)}; "
                 f"RC_CP=$?; "
                 f"setsid redis-server {shlex_quote(gen_conf)} >/dev/null 2>&1 & "
                 f"sleep 3; "
@@ -306,8 +309,14 @@ class RedisEngine(BackupEngine):
             logs.append(f"停库+替换({data_dir}/dump.rdb rc_cp={cp_rc})"
                         f"+按保真conf({gen_conf})重启")
             if cp_rc not in ("0", "?"):
-                logs.append(f"cp 退出码 {cp_rc}"
-                            "（rdb 替换失败，实例已按原样重启）")
+                # rdb 未替换成功时，即使实例重启后 PING=PONG，加载的仍是原有
+                # 数据——必须如实判失败，不能拿"实例活着"冒充"数据已恢复"。
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path,
+                    duration_sec=__import__("time").time() - t0,
+                    message=("Redis 恢复失败：rdb 文件替换未成功（rc=%s），"
+                             "实例已按原有数据重启；" % cp_rc) + "; ".join(logs))
             ping_ok = "PONG" in out
             duration = __import__("time").time() - t0
             if ping_ok:

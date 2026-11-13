@@ -2502,6 +2502,15 @@ def add_log(level: str, source: str, message: str, task_id: int = None,
     新增关联字段（task_id / record_id / detail / log_path）用于把日志与
     具体任务、备份记录、操作日志文件串起来，排查时可从任一入口回溯全链路。
     """
+    # 日志与明细里经常带完整远端命令（mysqldump -p'xxx' / PGPASSWORD=...
+    # / ksql -W ... / sqlcmd -P ...），统一脱敏后再落库，避免口令明文长期
+    # 存在 system_logs 与详情弹窗里（redact 内部有零开销快路径）。
+    try:
+        from core.redact import redact as _redact
+        message = _redact(message)
+        detail = _redact(detail)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         execute(
             "INSERT INTO system_logs(ts, level, source, message, task_id, "

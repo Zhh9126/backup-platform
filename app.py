@@ -99,32 +99,66 @@ def create_app() -> Flask:
         except Exception:
             pass
     db.init_schema()
-    # 启动自愈：上次进程留下的 running 记录在进程消亡时不可能再完成，
-    # 统一标记 failed——否则任务列表永远显示"运行中"、实时日志返回旧
-    # 日志（用户实测 task41 两条 10-26 僵尸 running）
+    # 启动自愈：只把「已消亡进程」遗留的 running 记录标记 failed。
+    # 多 worker / 多容器共享元数据库时，别的 worker 正在跑的任务必须放过，
+    # 否则 B 进程启动会把 A 的在途备份直接判失败（见 core/runtime_registry）。
     try:
-        _n1 = db.execute(
-            "UPDATE backup_records SET status='failed', "
-            "message='服务重启，任务中断（启动自愈自动标记）' "
-            "WHERE status='running'")
-        _n2 = db.execute(
-            "UPDATE restore_records SET status='failed', "
-            "message='服务重启，恢复中断（启动自愈自动标记）' "
-            "WHERE status='running'")
+        from core import runtime_registry as _rr
+        _rr.register()
+        _alive_since = _rr.alive_since()
+
+        def _stale_ids(table, ts_col, statuses=("running",)):
+            _ph = ",".join("?" * len(statuses))
+            try:
+                rows = db.query(
+                    "SELECT id, %s AS ts FROM %s WHERE status IN (%s)"
+                    % (ts_col, table, _ph), tuple(statuses)) or []
+            except Exception:  # noqa: BLE001
+                return []
+            out = []
+            for r in rows:
+                ts = _rr.parse_started(r.get("ts"))
+                # 开始时间晚于"最早存活 worker 的登记时间" → 可能属于它，放过
+                if ts and _alive_since and ts >= _alive_since:
+                    continue
+                try:
+                    out.append(int(r["id"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return out
+
+        def _mark_stale(table, ids, set_sql):
+            if not ids:
+                return 0
+            _ph = ",".join("?" * len(ids))
+            try:
+                db.execute("UPDATE %s SET %s WHERE id IN (%s)"
+                           % (table, set_sql, _ph), tuple(ids))
+            except Exception:  # noqa: BLE001
+                return 0
+            return len(ids)
+
+        _n1 = _mark_stale(
+            "backup_records", _stale_ids("backup_records", "started_at"),
+            "status='failed', message='服务重启，任务中断（启动自愈自动标记）'")
+        _n2 = _mark_stale(
+            "restore_records", _stale_ids("restore_records", "started_at"),
+            "status='failed', message='服务重启，恢复中断（启动自愈自动标记）'")
         # 同步任务同样会因 daemon 线程随进程消亡而永久卡在 running
-        _n3 = db.execute(
-            "UPDATE sync_tasks SET status='failed', last_status='failed', "
-            "message='服务重启，同步中断（启动自愈自动标记）' "
-            "WHERE status='running'")
-        _n4 = db.execute(
-            "UPDATE db_migration_plans SET status='failed', "
-            "error_msg='服务重启，迁移中断（启动自愈自动标记）', "
-            "finished_at=datetime('now','localtime') "
-            "WHERE status IN ('checking','migrating','verifying')")
+        _n3 = _mark_stale(
+            "sync_tasks", _stale_ids("sync_tasks", "last_run_at"),
+            "status='failed', last_status='failed', "
+            "message='服务重启，同步中断（启动自愈自动标记）'")
+        _n4 = _mark_stale(
+            "db_migration_plans",
+            _stale_ids("db_migration_plans", "created_at",
+                       ("checking", "migrating", "verifying")),
+            "status='failed', error_msg='服务重启，迁移中断（启动自愈自动标记）', "
+            "finished_at=datetime('now','localtime')")
         if _n1 or _n2 or _n3 or _n4:
             logging.getLogger("aidbm").warning(
-                "启动自愈：清理遗留 running 记录 备份=%s 恢复=%s 同步=%s 迁移=%s",
-                _n1, _n2, _n3, _n4)
+                "启动自愈：清理遗留 running 记录 备份=%s 恢复=%s 同步=%s 迁移=%s"
+                "（存活 worker=%s）", _n1, _n2, _n3, _n4, len(_rr.alive_workers()))
     except Exception:
         pass
     # RBAC 启动种子：users 表为空时建首个 admin（兼容老部署）

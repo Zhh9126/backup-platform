@@ -333,16 +333,20 @@ def get_counts() -> Dict[str, int]:
     except Exception:
         pass
 
-    # 2. 数据库备份任务 (不含 file, object_storage)
+    # 2. 数据库备份任务 (不含 file / synology / object_storage)
+    #    口径必须与 models.create_task 的扣除分类一致，否则会出现
+    #    「扣 file 名额但 file 不计数」→ 可无限创建绕过配额，且白吃库名额。
     try:
-        r = db.query_one("SELECT COUNT(1) AS c FROM backup_tasks WHERE db_type NOT IN ('file', 'object_storage')")
+        r = db.query_one("SELECT COUNT(1) AS c FROM backup_tasks "
+                         "WHERE db_type NOT IN ('file', 'synology', 'object_storage')")
         counts["database"] = r["c"] if r else 0
     except Exception:
         pass
 
-    # 3. 文件备份任务 (db_type = 'file')
+    # 3. 文件备份任务 (file + synology：群晖是 NAS 文件级备份，扣 file 配额)
     try:
-        r = db.query_one("SELECT COUNT(1) AS c FROM backup_tasks WHERE db_type = 'file'")
+        r = db.query_one("SELECT COUNT(1) AS c FROM backup_tasks "
+                         "WHERE db_type IN ('file', 'synology')")
         counts["file"] = r["c"] if r else 0
     except Exception:
         pass

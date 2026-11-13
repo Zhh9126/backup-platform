@@ -1252,8 +1252,10 @@ class MySQLEngine(BackupEngine):
         from core import logical_full
         # 恢复前清空 GTID_PURGED，避免导入含 GTID 的 dump 时报 1840
         # （与单库恢复 _restore_local 的 _reset_gtid_before_restore 对齐）
-        self._reset_gtid_before_restore(
-            host=self.task.get("host"), port=self.task.get("port"))
+        # 演练模式跳过：RESET MASTER 会清掉生产实例 binlog/GTID
+        if not getattr(self, "_drill_mode", False):
+            self._reset_gtid_before_restore(
+                host=self.task.get("host"), port=self.task.get("port"))
         restore_tool = self._resolve_local_tool("mysql")
         query_tool = restore_tool
         try:
@@ -1491,6 +1493,14 @@ class MySQLEngine(BackupEngine):
     def restore(self, backup_path: str, **kwargs) -> BackupResult:
         logs = [f"[MySQL 恢复] 备份文件: {backup_path}",
                 f"[MySQL 恢复] 任务: {self.task_name} ({self.task.get('host')}:{self.task.get('port')})"]
+
+        # 演练模式（真实恢复演练 / 临时实例校验）：恢复前清理 GTID 的
+        # RESET MASTER 会清空目标实例 binlog 与 GTID_EXECUTED，等于毁掉
+        # 该实例的 PITR 与主从复制——演练绝不能碰生产实例的这些状态。
+        self._drill_mode = bool(kwargs.get("drill_mode"))
+        if self._drill_mode:
+            logs.append("[演练模式] 已禁用 RESET MASTER / GTID 清理"
+                        "（保留源实例 binlog 与主从状态）")
 
         # 调用方指定的恢复目标主机/端口优先于任务原配置（同库型异机恢复）
         if kwargs.get("target_host"):
@@ -2695,8 +2705,9 @@ class MySQLEngine(BackupEngine):
         try:
             cnf = self._make_cnf(user, pw)
 
-            # 恢复前先清空 GTID，避免 1840 错误
-            self._reset_gtid_before_restore(host=host, port=port)
+            # 恢复前先清空 GTID，避免 1840 错误；演练模式跳过（见 restore）
+            if not getattr(self, "_drill_mode", False):
+                self._reset_gtid_before_restore(host=host, port=port)
 
             # 指定目标库时自动建库（幂等）：否则 mysqldump --databases 产物
             # 虽含 CREATE DATABASE，但按目标库导入时 mysql 会先报 1049
@@ -2952,9 +2963,15 @@ class MySQLEngine(BackupEngine):
                     if os.path.isdir(temp_dir):
                         _shutil.rmtree(temp_dir, ignore_errors=True)
             else:
-                return BackupResult(success=True, status=BackupStatus.SUCCESS,
-                                    message="mysql: xtrabackup not available, file verified",
-                                    verified=True, size_bytes=size)
+                # 平台没有 xtrabackup/mariabackup 时无法做 --prepare 校验，
+                # 此前直接返回 success+verified=True，等于把"文件存在"冒充
+                # "恢复校验通过"。物理产物必须如实标失败并给出处置指引。
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    message=("mysql: 平台缺少 xtrabackup/mariabackup，无法对物理产物"
+                             "执行 prepare 校验（仅确认了文件存在，未验证可恢复性）；"
+                             "请在平台侧安装 xtrabackup 或改用具逻辑校验的产物"),
+                    verified=False, size_bytes=size)
 
         # 逻辑备份：全实例 tar（multi-db-tar = manifest.json + dbs/*.sql）
         # 此前把 .tar.gz 当单库 gzip SQL 读头，tar 魔数被判 "dump header invalid"

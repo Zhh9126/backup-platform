@@ -606,6 +606,10 @@ def run_task(task_id):
     record = scheduler.run_task_now(task_id, backup_type=backup_type)
     if not record:
         return jsonify({"error": "任务不存在"}), 404
+    # 同步通道并发去重：上一次仍在执行时如实返回 409（此前会并发跑两次，
+    # 同一任务目录下同秒产物同名，后跑的覆盖先跑的）
+    if record.get("duplicate"):
+        return jsonify(record), 409
     # 文件备份异步执行时返回 202 + accepted
     if record.get("accepted"):
         return jsonify(record), 202
@@ -627,6 +631,8 @@ def retry_task(task_id):
                                     operator="retry")
     if not record:
         return jsonify({"error": "任务不存在"}), 404
+    if record.get("duplicate"):
+        return jsonify(record), 409
     return jsonify(record), (202 if record.get("accepted") else 200)
 
 

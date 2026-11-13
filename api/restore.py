@@ -77,6 +77,8 @@ def create_restore():
             [k.strip() for k in str(keys).replace("\n", ",").split(",")
              if k.strip()] if isinstance(keys, str) else list(keys))
 
+    # 「目标库留空 = 原位覆盖源库」的确认在 scheduler.run_restore_now 里统一
+    # 校验（放在反勒索安全门之后：安全拒绝优先于参数提示）。
     try:
         result = scheduler.run_restore_now(
             record_id,
@@ -93,6 +95,9 @@ def create_restore():
             table_renames=data.get("table_renames"),
             target_schema=data.get("target_schema"),
             restore_options=restore_options or None,
+            # 目标库留空 = 原位覆盖源库，必须显式确认（见 run_restore_now）
+            confirm_same_db=str(data.get("confirm_same_db") or "").lower()
+            in ("1", "true", "yes", "on"),
             # 强制恢复必须同时带显式确认，避免误点绕过安全门
             force_unsafe_restore=bool(data.get("force_unsafe_restore"))
             and str(data.get("confirm_unsafe") or "").lower()

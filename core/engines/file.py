@@ -2276,9 +2276,22 @@ class FileBackupEngine(BackupEngine):
         return []
 
     def _apply_deleted(self, target: str, deleted: List[str]) -> None:
-        """把删除清单应用到目标目录（文件/空目录/符号链接）。"""
+        """把删除清单应用到目标目录（文件/空目录/符号链接）。
+
+        删除清单来自备份产物（.deleted.txt）；若产物被篡改（含 ``..`` 或绝对
+        路径），直接 join 后删除会打到目标目录之外（如 /etc）。这里统一做
+        越界护栏：只允许删除目标目录内的条目。
+        """
+        root = os.path.abspath(target)
         for rel in deleted or []:
-            p = os.path.join(target, rel.replace("\\", "/"))
+            raw = str(rel).replace("\\", "/").strip().lstrip("/")
+            if not raw or raw in (".", ".."):
+                continue
+            p = os.path.abspath(os.path.join(root, raw))
+            if p != root and not p.startswith(root + os.sep):
+                self.logger.warning("[%s] 跳过越界删除（清单含 .. 或绝对路径）: %s",
+                                    self.task_name, rel)
+                continue
             try:
                 if os.path.islink(p):
                     os.unlink(p)

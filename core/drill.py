@@ -324,9 +324,14 @@ def _run_real_restore_drill(d: dict, drill_id: int) -> dict:
 
         # 1) 演练专用临时库（drill_ 前缀，绝不触碰生产库名）
         from core import scheduler
-        drill_db = f"drill_t{task['id']}_{time.strftime('%Y%m%d%H%M%S')}"
+        # 库名带随机后缀：秒级时间戳在并发/重试时会撞名，撞名后 CREATE 失败
+        # 且 finally 仍会 DROP → 可能删掉另一场演练正在使用的库。
+        import uuid as _uuid
+        drill_db = (f"drill_t{task['id']}_{time.strftime('%Y%m%d%H%M%S')}_"
+                    f"{_uuid.uuid4().hex[:8]}")
         report_extra["drill_db"] = drill_db
         cleanup_ok = False
+        created_ok = False   # 只有本次真正建成功的库才允许在收尾时销毁
         try:
             import pymysql
             pw_plain = db.decrypt_secret(str(task.get("password") or ""))
@@ -340,12 +345,16 @@ def _run_real_restore_drill(d: dict, drill_id: int) -> dict:
                     cur.execute(f"CREATE DATABASE `{drill_db}` "
                                 "DEFAULT CHARSET utf8mb4")
                 conn.commit()
+                created_ok = True
             finally:
                 conn.close()
 
             # 2) 真实恢复（复用生产恢复通道，走 backup_records 审计）
+            # drill_mode：禁止引擎执行 RESET MASTER / GTID 清理——演练恢复
+            # 到临时库时不能把生产实例的 binlog 与主从状态一起清掉。
             result = scheduler.run_restore_now(
-                rec["id"], target_db=drill_db, operator="drill-real")
+                rec["id"], target_db=drill_db, operator="drill-real",
+                drill_mode=True)
             rto = round(time.time() - rto_start, 1)
             restore_ok = bool(result) and result.get("status") == "success"
             report_extra["restore"] = {
@@ -373,8 +382,10 @@ def _run_real_restore_drill(d: dict, drill_id: int) -> dict:
             else:
                 report_extra["verify_note"] = "全部表行数与源库一致"
         finally:
-            # 4) 演练完销毁（无论成败，finally 兜底）
-            cleanup_ok = _drop_drill_db(task, drill_db, pw_plain)
+            # 4) 演练完销毁（无论成败，finally 兜底）——但只销毁本次真正
+            #    创建成功的库：CREATE 失败时该库可能属于另一场演练
+            cleanup_ok = (_drop_drill_db(task, drill_db, pw_plain)
+                          if created_ok else True)
             report_extra["cleanup_ok"] = cleanup_ok
         if not cleanup_ok:
             score -= 10
@@ -394,9 +405,9 @@ def _run_real_restore_drill(d: dict, drill_id: int) -> dict:
     except Exception as e:
         _logger.exception("[drill] 真实演练 %s 异常", drill_id)
         issues.append(f"演练异常: {e}")
-        # 演练库兜底销毁（异常路径）
+        # 演练库兜底销毁（异常路径）——同样只处理本次建成功的库
         try:
-            if report_extra.get("drill_db"):
+            if created_ok and report_extra.get("drill_db"):
                 _drop_drill_db(task or {}, report_extra["drill_db"], pw_plain)
         except Exception:
             pass

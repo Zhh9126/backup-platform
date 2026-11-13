@@ -15,7 +15,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 容灾切换 · 恢复演练 · 预校验 · 克隆（VDB） · 不可变备份 · 巡检 · 监控 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v2.3.11-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v2.4.0-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -25,15 +25,16 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 ---
 
-> **v2.3.7 本轮要点**：防勒索保护闭环（安全检测结论落库 → 可疑自动隔离 → 恢复/下载安全门 →
-> 可信恢复点与定期清理护栏 → 全流程审计与强制恢复二次确认）、磁带库 / 可移动介质工程化接入
-> （`lsscsi -g` 设备发现、持久化 `/dev/tape/by-id` 命名、`mtx` 机械手库存与装载、`mt` 非回绕流式写、
-> 介质台账 / 出库归库 / 退役、写后 sha256 校验、容器 `--device` 透传、离线安装脚本设备段）、
-> 全站安全审计整改（RCE / SSRF / 注入 / 路径穿越及 5 类运行时缺陷）、分层复制与生命周期孤儿副本防护。
-> 目录模拟带库全链路 28/28、防勒索专项 11/11、发版回归 97 passed；
-> 真实磁带库 / 机械手 / LTO WORM 尚无真机验证报告（见下方「诚实边界」）。
+> **v2.4.0 本轮要点**：22 项业务/系统缺陷集中修复——保留链安全（最少保留份数回落、增量链基备护栏、
+> 保留位只算磁盘上真实存在的产物）、拒绝假成功（Redis rdb 替换失败、MySQL 物理校验缺工具如实失败）、
+> 恢复安全加固（目标库名白名单 + `shlex.quote`、达梦 PITR 目录校验、文件删除清单越界护栏、原位覆盖需二次确认）、
+> 演练与生产隔离（随机演练库名、演练模式禁止 `RESET MASTER`/GTID 清理）、并发去重与多实例心跳、
+> 口令全链路脱敏与 SSH 指纹严格模式、前端四处未定义回调。
+> 新增回归 `tests/test_bugfix_20261113.py` 23 项，cleanup / immutability / license / ransomware / op_guard /
+> i18n / 文件传输 / API 契约等 130+ 用例全绿；`v*` tag 自动发布离线包并清理历史 Release 附件。
 >
-> **最新动态**：v2.3.11（2026-11-12）已发布（SQL Server 旧版 TLS/JDBC 兼容 / AI 模型超时与存储容量可读化 / 克隆服务小库真机验证 / 离线发布链路修复）；
+> **最新动态**：v2.4.0（2026-11-13）已发布（22 项业务/系统缺陷修复：保留链安全 / 拒绝假成功 / 恢复安全加固 / 演练隔离 / 并发去重 / 口令脱敏 / 离线包自动发布）；
+> v2.3.11（2026-11-12）已发布（SQL Server 旧版 TLS/JDBC 兼容 / AI 模型超时与存储容量可读化 / 克隆服务小库真机验证 / 离线发布链路修复）；
 > v2.3.10（2026-11-12）已发布（170/171 五库型迁移同步全面真机验收 / 6 个真实缺陷修复 / 离线镜像包交付）；
 > v2.3.9（2026-11-12）完成功能项按需启用与权限分离 / AI 结果与模型接入修复 / 迁移同步 P0；
 > v2.3.8（2026-11-11）完成三粒度统一 / VDB 快照 / 应用级容灾 HA；
@@ -401,8 +402,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v2.3.11   # 固定版本（可回滚）
-# 当前最新版本：v2.3.11（2026-11-12，TLS/JDBC 兼容 / 容量可读化 / 克隆服务验证 / 离线发布链路修复）
+docker pull ghcr.io/zhh9126/backup-platform:v2.4.0   # 固定版本（可回滚）
+# 当前最新版本：v2.4.0（2026-11-13，22 项业务/系统缺陷修复 / 演练隔离 / 口令脱敏 / 离线包自动发布）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -422,24 +423,27 @@ python tools/check_env.py
 {"registry-mirrors": ["https://docker.m.daocloud.io", "https://dockerproxy.com"]}
 ```
 
-> **离线交付包版本说明**：**v2.3.11 离线包由 tag 自动发布**（`aidbm_2.3.11_offline.tar.gz` 与 `.sha256`，
+> **离线交付包版本说明**：**v2.4.0 离线包由 tag 自动发布**（`aidbm_2.4.0_offline.tar.gz` 与 `.sha256`，
 > `manifest.json` 内含 4 个 RepoTag，可直接 `docker load`）。
-> GHCR 同步提供 `v2.3.11` / `2.3.11` / `2.3.11-r<run_number>` / `latest` / `community` 在线 tag。
+> GHCR 同步提供 `v2.4.0` / `2.4.0` / `2.4.0-r<run_number>` / `latest` / `community` 在线 tag。
+> **历史产物保留策略**：每个离线包约 1.3GB，发布流程在附件上传成功后会自动清理仅保留当前版本的
+> Release 附件，并清理 GHCR 历史版本 manifest（`latest` / `community` 与当前版本 tag 不动）。
+> **git tag 一律保留**，旧版本仍可用源码回溯；需要旧离线包请在对应 Release 被清理前自行归档。
 
 ### 离线导入
 
 ```bash
-# 交付包：aidbm_2.3.11_offline.tar.gz（gzip 压缩的完整镜像，含全部运行依赖与备份工具）
-docker load -i aidbm_2.3.11_offline.tar.gz
+# 交付包：aidbm_2.4.0_offline.tar.gz（gzip 压缩的完整镜像，含全部运行依赖与备份工具）
+docker load -i aidbm_2.4.0_offline.tar.gz
 
 # 导入后确认镜像名（离线环境不会自动去公网拉取）
 docker images | grep -E 'backup-platform|aidbm'
 ```
 
 > **导入后可用 4 个镜像名（同一镜像 ID，任选其一启动，全程零联网）**：
-> `ghcr.io/zhh9126/backup-platform:v2.3.11`、`ghcr.io/zhh9126/backup-platform:latest`、
-> `aidbm:2.3.11`、`aidbm:latest`。
-> **v2.3.11 交付包已把这 4 个 tag 全部打进 `manifest.json` 的 `RepoTags`**，
+> `ghcr.io/zhh9126/backup-platform:v2.4.0`、`ghcr.io/zhh9126/backup-platform:latest`、
+> `aidbm:2.4.0`、`aidbm:latest`。
+> **v2.4.0 交付包已把这 4 个 tag 全部打进 `manifest.json` 的 `RepoTags`**，
 > `docker load` 时会输出 4 行 `Loaded image:`，直接 `docker run` 任一名字都不会访问公网。
 >
 > 若遇到 `Unable to find image 'xxx' locally` 后跟着
@@ -447,19 +451,19 @@ docker images | grep -E 'backup-platform|aidbm'
 > 说明**启动命令用的镜像名不在包内 tag 里**（Docker 找不到本地镜像就会去公网），
 > 不是包损坏。先 `docker images` 查实际 tag，或补一条：
 > ```bash
-> docker tag ghcr.io/zhh9126/backup-platform:v2.3.11 aidbm:2.3.11
+> docker tag ghcr.io/zhh9126/backup-platform:v2.4.0 aidbm:2.4.0
 > ```
 
 自行导出（有网机器上**先打齐 tag 再 save**，否则包内只带单个 tag）：
 
 ```bash
-docker pull ghcr.io/zhh9126/backup-platform:v2.3.11
-docker tag ghcr.io/zhh9126/backup-platform:v2.3.11 ghcr.io/zhh9126/backup-platform:latest
-docker tag ghcr.io/zhh9126/backup-platform:v2.3.11 aidbm:2.3.11
-docker tag ghcr.io/zhh9126/backup-platform:v2.3.11 aidbm:latest
-docker save ghcr.io/zhh9126/backup-platform:v2.3.11 ghcr.io/zhh9126/backup-platform:latest aidbm:2.3.11 aidbm:latest | gzip > aidbm_2.3.11_offline.tar.gz
-gzip -t aidbm_2.3.11_offline.tar.gz    # 必须输出 OK，否则包被截断不可交付
-sha256sum aidbm_2.3.11_offline.tar.gz > aidbm_2.3.11_offline.tar.gz.sha256
+docker pull ghcr.io/zhh9126/backup-platform:v2.4.0
+docker tag ghcr.io/zhh9126/backup-platform:v2.4.0 ghcr.io/zhh9126/backup-platform:latest
+docker tag ghcr.io/zhh9126/backup-platform:v2.4.0 aidbm:2.4.0
+docker tag ghcr.io/zhh9126/backup-platform:v2.4.0 aidbm:latest
+docker save ghcr.io/zhh9126/backup-platform:v2.4.0 ghcr.io/zhh9126/backup-platform:latest aidbm:2.4.0 aidbm:latest | gzip > aidbm_2.4.0_offline.tar.gz
+gzip -t aidbm_2.4.0_offline.tar.gz    # 必须输出 OK，否则包被截断不可交付
+sha256sum aidbm_2.4.0_offline.tar.gz > aidbm_2.4.0_offline.tar.gz.sha256
 ```
 
 ### 磁带库 / 可移动介质接入（离线容器部署）
@@ -503,7 +507,7 @@ docker run -d --name aidbm -p 8080:8080 \
   --device /dev/sg2:/dev/sg2:rwm \
   -v /opt/backup-platform/data:/data \
   -e BACKUP_ROOT=/data/backups -e TZ=Asia/Shanghai \
-  aidbm:2.3.8
+  aidbm:2.4.0
 ```
 
 离线安装脚本支持 `TAPE_DEVICES="/dev/tape/by-id/scsi-XXXX-nst /dev/sg2" ./install.sh`，
@@ -531,11 +535,11 @@ docker run -d --name backup-platform \
   -v backup-data:/data \
   -e BACKUP_ROOT=/data/backups \
   --restart unless-stopped \
-  ghcr.io/zhh9126/backup-platform:v2.3.8
+  ghcr.io/zhh9126/backup-platform:v2.4.0
 ```
 
 > 离线环境请用**固定版本 tag**（不要用 `:latest` 指代"从公网拉最新"）。
-> 交付包内 `aidbm:2.3.8`、`aidbm:latest`、`ghcr.io/zhh9126/backup-platform:latest`
+> 交付包内 `aidbm:2.4.0`、`aidbm:latest`、`ghcr.io/zhh9126/backup-platform:latest`
 > 均与上面这个镜像名指向同一个镜像 ID，替换使用完全等效。
 
 > **备份文件存在哪？** 镜像默认把备份产物写到容器内 `/data/backups`（布局 `<该路径>/<数据库类型>/<任务ID_任务名>/`）。
@@ -546,17 +550,17 @@ docker run -d --name backup-platform \
 
 ```bash
 # 1. 导入新版本镜像（把交付包拷入离线机器）
-docker load -i aidbm_2.3.8_offline.tar.gz
+docker load -i aidbm_2.4.0_offline.tar.gz
 
 # 2. 停止并删除旧容器（备份数据在 backup-data 卷中，不受影响）
 docker stop backup-platform
 docker rm backup-platform
 
 # 3. 用新版本镜像启动（命令与首次部署完全一致，仅换镜像 tag）
-docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.3.8
+docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.4.0
 
 # 4.（可选）删除旧版本镜像释放空间
-docker rmi ghcr.io/zhh9126/backup-platform:v2.3.5
+docker rmi ghcr.io/zhh9126/backup-platform:v2.3.11
 ```
 
 > 升级不丢数据：元数据库、备份产物、日志都在 `backup-data` 卷（`/data`），
@@ -571,7 +575,7 @@ docker stop backup-platform
 docker rm backup-platform
 
 # 2. 删除镜像
-docker rmi ghcr.io/zhh9126/backup-platform:v2.3.8
+docker rmi ghcr.io/zhh9126/backup-platform:v2.4.0
 
 # 3.（谨慎）删除数据卷 —— 会清掉全部备份产物与元数据，操作前务必
 #    先把备份文件拷贝转移！
@@ -695,6 +699,19 @@ docker build -t backup-platform:local .
 - 默认账号请立即修改（首登会标记 `must_change_password`）；生产环境建议限制来源 IP
 
 ## 更新日志
+
+### v2.4.0（2026-11-13，已发布）
+
+- **备份保留链安全**：定期清理回落到界面配置的最少保留份数；新增增量/合成链基备护栏（`backup_sets.parent_set_id` 存的是 set id，用记录 id 比对导致护栏永不命中）；保留位改按“产物仍在磁盘”计数，避免幽灵记录把最后一个可用备份清掉；GFS 侧同款修复。
+- **拒绝假成功**：Redis 恢复 rdb 替换失败不再凭 PING=PONG 报成功，写盘文件名跟随实例 `dbfilename`；MySQL 物理产物校验在平台缺 xtrabackup 时如实失败（原先返回 `verified=True`）。
+- **恢复安全加固**：跨主机恢复目标库名白名单 + `shlex.quote`（命令注入）；达梦 PITR 还原目录校验与转义；文件恢复增量删除清单越界护栏（`.deleted.txt` 含 `..` 不再删到目录外）；目标库留空必须显式 `confirm_same_db`（原位覆盖源库二次确认）。
+- **演练与生产隔离**：真实恢复演练临时库名随机后缀 + `created_ok` 守卫（撞名后不再误删其他演练库）；`drill_mode` 禁止引擎执行 `RESET MASTER`/GTID 清理，演练不再破坏生产实例 binlog 与主从复制。
+- **并发与多实例**：同步备份通道补齐进程内去重（重复触发返回 409）；新增 `core/runtime_registry` 心跳，多 worker/多容器部署下启动自愈只修正“已消亡进程”的遗留记录。
+- **合规**：新增 `core/redact`，远端命令口令（`-p/-P/-W/-a`、`PGPASSWORD`、`USERID`、`disql`、`mysql://u:pw@h`）在系统日志与操作日志统一脱敏；新增 SSH 主机指纹严格模式开关 `ssh_strict_host_key`。
+- **配额口径**：群晖任务计入 file 配额（此前创建时扣 file、统计时不计 file，可无限绕过并白占数据库名额）。
+- **前端修复**：复制日志回调未定义 `toast`；预检弹窗「去恢复」调用未定义函数（现跳转 `/restore?record_id=` 并预选记录）；记录状态筛选被 URL 参数反复覆盖；恢复表单内联 `submitRestore` 未挂 window。
+- **发版链路**：`v*` tag 自动构建 GHCR 镜像并导出 `aidbm_2.4.0_offline.tar.gz` + `.sha256` 上传 GitHub Release，同时清理历史 Release 附件。
+- **回归**：新增 `tests/test_bugfix_20261113.py` 23 项；cleanup / immutability / license / ransomware / op_guard / i18n / 文件传输 / API 契约等模块 130+ 用例全绿；全站静态扫描未定义名 0 命中。
 
 ### v2.3.11（2026-11-12，已发布）
 

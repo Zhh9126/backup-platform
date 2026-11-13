@@ -12,11 +12,12 @@ on:
       version:
         description: '版本号（不带 v）'
         required: true
-        default: '2.3.11'
+        default: '2.4.0'
 
 permissions:
   contents: write
-  packages: read
+  # write 不仅用于读镜像，历史 manifest 清理（DELETE versions）也需要它
+  packages: write
 
 jobs:
   bundle:
@@ -31,7 +32,7 @@ jobs:
             RAW_VERSION="${GITHUB_REF_NAME#v}"
             VERSION="${RAW_VERSION%%-rerun*}"
           else
-            VERSION="${{ github.event.inputs.version || '2.3.11' }}"
+            VERSION="${{ github.event.inputs.version || '2.4.0' }}"
           fi
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
@@ -94,3 +95,57 @@ jobs:
           gh release upload "$TAG" "$FILE" --clobber
           gh release upload "$TAG" "$SUM" --clobber
           gh release view "$TAG" --json assets --jq '.assets[].name'
+
+      # 历史离线包附件体积很大（每版 ~1.3GB），发布成功后只保留当前版本，
+      # 其余 vX.Y.Z Release 一并删除（git tag 保留，不影响代码回溯）。
+      - name: Prune historical releases (keep current only)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          KEEP="v${VERSION}"
+          echo "保留 Release: ${KEEP}"
+          gh release list --limit 100 --json tagName \
+            --jq '.[].tagName' 2>/dev/null \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' \
+            | grep -vx "$KEEP" > /tmp/old_releases.txt || true
+          COUNT=$(wc -l < /tmp/old_releases.txt)
+          echo "待清理历史 Release: ${COUNT} 个"
+          while read -r t; do
+            [ -z "$t" ] && continue
+            echo "删除 Release $t（含历史离线包附件）"
+            gh release delete "$t" --yes || true
+          done < /tmp/old_releases.txt
+          gh release list --limit 20
+
+      # GHCR 历史版本 manifest 一并清理（保留当前版本与 latest/community 指向）。
+      # GITHUB_TOKEN 对同仓库包有写权限；失败不影响发版结果。
+      - name: Prune historical GHCR image versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          PKG="backup-platform"
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          # 版本号里的点要转义，否则正则里 . 会匹配任意字符
+          VRE=$(printf '%s' "$VERSION" | sed 's/\./\\./g')
+          gh api "/users/${OWNER}/packages/container/${PKG}/versions?per_page=100" \
+            --jq '.[] | [.id, ((.metadata.container.tags // []) | join(","))] | @tsv' \
+            > /tmp/ghcr_versions.tsv 2>/dev/null || exit 0
+          while IFS=$'\t' read -r vid tags; do
+            [ -z "$vid" ] && continue
+            case "$tags" in
+              *latest*|*community*) continue ;;
+            esac
+            if echo "$tags" | tr ',' '\n' | grep -qE "^v?${VRE}(-r[0-9]+)?$"; then
+              echo "保留当前版本 manifest id=${vid} (${tags})"
+              continue
+            fi
+            if echo "$tags" | tr ',' '\n' | grep -qE '^v?[0-9]+\.[0-9]+\.[0-9]+(-r[0-9]+)?$'; then
+              echo "删除历史镜像版本 id=${vid} (${tags})"
+              gh api --method DELETE \
+                "/users/${OWNER}/packages/container/${PKG}/versions/${vid}" || true
+            fi
+          done < /tmp/ghcr_versions.tsv

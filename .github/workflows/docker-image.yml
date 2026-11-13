@@ -4,6 +4,11 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重建（勾选后用 CI 精简上下文覆盖 GHCR 已有镜像，默认不覆盖）'
+        type: boolean
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -58,7 +63,29 @@ jobs:
         with:
           images: ${{ steps.image.outputs.name }}
 
+      # 完整性守卫（2026-11-13）：本机发布时会用 scripts/docker_prep_tools.sh 产出
+      # 的 .docker-bake 烘焙 MySQL 客户端族 / XtraBackup / MariaDB Backup 等工具层，
+      # 再手动推到 GHCR；而 CI 上下文不含 .docker-bake（.dockerignore 排除），
+      # 构建出的同名 tag 是“精简镜像”。若 CI 无条件重建，会把本机推的完整镜像覆盖掉，
+      # 用户 docker pull 就少工具。因此：GHCR 已存在该版本 tag 时默认跳过构建。
+      # 确实需要 CI 重建时，用 workflow_dispatch 勾选 force。
+      - name: Integrity guard (skip if already published)
+        id: guard
+        run: |
+          set -uo pipefail
+          IMAGE="${{ steps.image.outputs.name }}"
+          VER="${GITHUB_REF_NAME#v}"
+          VER="${VER%%-rerun*}"
+          FORCE="${{ github.event.inputs.force || 'false' }}"
+          if [ "$FORCE" != "true" ] && docker manifest inspect "${IMAGE}:v${VER}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::GHCR 已存在 ${IMAGE}:v${VER}（视作本机完整镜像），跳过 CI 重建以免覆盖"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and push
+        if: steps.guard.outputs.skip != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .

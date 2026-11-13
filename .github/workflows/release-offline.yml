@@ -55,6 +55,23 @@ jobs:
           echo "等待 GHCR 镜像超时: $IMG" >&2
           exit 1
 
+      # 离线包必须来自「完整镜像」：本机 scripts/docker_prep_tools.sh 烘焙进
+      # .docker-bake（831MB：MySQL 8.0.40 客户端族 / XtraBackup 8.0+2.4 /
+      # MariaDB Backup），而 CI 上下文只有 .docker-bake/.keep，构建出的是纯应用
+      # 镜像。宁可发版失败，也不要把缺工具的包交给离线环境（现场无法补装）。
+      - name: Verify image is the full build (baked backup tools)
+        run: |
+          set -euo pipefail
+          IMG="ghcr.io/${REPO_LC}:v${VERSION}"
+          if docker run --rm --entrypoint bash "$IMG" -c \
+              'test -x /opt/mysql840b/bin/mysqldump && test -x /usr/bin/xtrabackup && test -x /opt/mariabackup/usr/bin/mariabackup && command -v pg_dump >/dev/null'; then
+            echo "完整镜像校验通过（MySQL 客户端族 / XtraBackup / MariaBackup / PG 客户端均在位）"
+          else
+            echo "::error::${IMG} 缺烘焙备份工具，判定为 CI 精简镜像，拒绝导出不完整的离线包。"
+            echo "::error::处置：在平台机 docker build（含 .docker-bake）后 docker push 该版本，再重跑本 workflow。"
+            exit 1
+          fi
+
       - name: Tag all 4 RepoTags for the offline bundle
         run: |
           set -euo pipefail

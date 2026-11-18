@@ -99,6 +99,7 @@ def api_list_db_migrate():
 
 
 @api_bp.route("/db-migrate", methods=["POST"])
+@api_bp.route("/migration-plans", methods=["POST"])
 @login_required
 def api_create_db_migrate():
     data = request.get_json(silent=True) or {}

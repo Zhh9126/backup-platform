@@ -1,0 +1,49 @@
+{
+  "id": "lvm-snapshot",
+  "name": "LVM 快照（文件/挂载点）",
+  "version": "builtin",
+  "category": "file",
+  "description": "用 LVM 快照做文件系统级一致性备份（毫秒级打快照后慢慢打包），适用于大目录/数据库数据目录。",
+  "required_clients": [
+    "lvs",
+    "lvcreate"
+  ],
+  "supports": [
+    "file",
+    "mount",
+    "mysql",
+    "postgresql",
+    "dameng",
+    "kingbase"
+  ],
+  "tags": [
+    "文件备份",
+    "LVM",
+    "一致性快照"
+  ],
+  "icon": "bi-layers-half",
+  "packages": {
+    "linux": {
+      "package_managers": {
+        "apt": {
+          "command": "DEBIAN_FRONTEND=noninteractive apt-get install -y lvm2",
+          "binaries": [
+            "lvs",
+            "lvcreate"
+          ]
+        },
+        "yum": {
+          "command": "yum install -y lvm2",
+          "binaries": [
+            "lvs",
+            "lvcreate"
+          ]
+        }
+      }
+    }
+  },
+  "verify_after_install": [
+    "lvs --version"
+  ],
+  "fallback_note": "未安装时文件备份仍可用（tar 零安装通道），只是缺少一致性快照能力"
+}

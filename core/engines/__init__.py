@@ -35,6 +35,11 @@ from core.engines.synology import SynologyEngine
 from core.engines.qdrant import QdrantEngine
 from core.engines.chroma import ChromaEngine
 from core.engines.highgo import HighGoEngine
+from core.engines.gaussdb import GaussDBEngine
+from core.engines.vastbase import VastbaseEngine
+from core.engines.greatdb import GreatDBEngine
+from core.engines.goldendb import GoldenDBEngine
+from core.engines.jdbc_logical import JDBCLogicalEngine
 from core.engines.uxdb import UXDBEngine
 from core.engines.tidb import TiDBEngine
 from core.engines.oceanbase import OceanBaseEngine
@@ -82,6 +87,13 @@ ENGINE_REGISTRY = {
     "uxdb": UXDBEngine,
     "tidb": TiDBEngine,
     "oceanbase": OceanBaseEngine,
+    # 2026-11-13：从「模板目录」提升为内置引擎（复用 PG/MySQL 工具族）
+    "gaussdb": GaussDBEngine,
+    "vastbase": VastbaseEngine,
+    "greatdb": GreatDBEngine,
+    "goldendb": GoldenDBEngine,
+    # 2026-11-13：通用 JDBC 逻辑备份（长尾库型兜底：Db2/HANA/Vertica/Teradata 等）
+    "jdbc_generic": JDBCLogicalEngine,
 }
 
 ENGINE_DISPLAY = {k: cls.display_name for k, cls in ENGINE_REGISTRY.items()}
@@ -156,8 +168,10 @@ _ENGINE_META_OVERRIDE = {
     },
     "synology": {
         "icon": "bi-hdd-network",
-        "description": "群晖 NAS（DSM）：FileStation Web API 文件级全量 + "
+        "category": "storage",
+        "description": "NAS 存储（群晖 DSM）：FileStation Web API 文件级全量 + "
                        "size/mtime 增量，HTTP Range 断点续传，DSM 侧零安装；"
+                       "恢复支持回推 DSM 共享目录（FileStation.Upload + 回读大小校验）；"
                        "SAN Manager 裸 LUN 不直接读取，iSCSI 场景请备份业务主机挂载点",
         "backup_modes": ["logical"],
         "supports_incremental": True,
@@ -172,6 +186,141 @@ _ENGINE_META_OVERRIDE = {
         "supports_incremental": True,
         "supports_full_instance": False,
         "supports_sync": False,
+    },
+    # ---- 2026-11-13：按各引擎**真实能力**补齐（此前全部落到乐观默认值，
+    #      「数据库类型」页面把 redis/file/mongodb 也标成「物理 + 全实例 + 增量」）----
+    "mysql": {
+        "icon": "bi-database-fill",
+        "description": "mysqldump 逻辑 + XtraBackup 物理（免安装推送），支持增量/全实例/数据同步",
+        "backup_modes": ["logical", "physical"],
+        "supports_incremental": True, "supports_full_instance": True, "supports_sync": True,
+    },
+    "mariadb": {
+        "icon": "bi-database-fill",
+        "description": "mysqldump/mariabackup，MariaDB 10.x 全版本；支持增量/全实例/同步",
+        "backup_modes": ["logical", "physical"],
+        "supports_incremental": True, "supports_full_instance": True, "supports_sync": True,
+    },
+    "postgresql": {
+        "icon": "bi-database-fill",
+        "description": "pg_dump 逻辑 + pg_basebackup 物理，支持 PITR 与数据同步",
+        "backup_modes": ["logical", "physical"],
+        "supports_incremental": True, "supports_full_instance": True, "supports_sync": True,
+    },
+    "oracle": {
+        "icon": "bi-database-fill-exclamation",
+        "description": "expdp 逻辑 + RMAN 物理（11g/19c），LogMiner 实时与事务级还原",
+        "backup_modes": ["logical", "physical"],
+        "supports_incremental": True, "supports_full_instance": True, "supports_sync": True,
+    },
+    "kingbase": {
+        "icon": "bi-database-fill-gear",
+        "description": "金仓 KingbaseES：sys_dump 逻辑 + sys_basebackup 物理（V8/V9 全版本）",
+        "backup_modes": ["logical", "physical"],
+        "supports_incremental": True, "supports_full_instance": True, "supports_sync": True,
+    },
+    "opengauss": {
+        "icon": "bi-database-fill-gear",
+        "description": "openGauss：gs_dump 逻辑 + gs_basebackup 物理；物理增量未实现（诚实回退全量）",
+        "backup_modes": ["logical", "physical"],
+        "supports_incremental": False, "supports_full_instance": True, "supports_sync": True,
+    },
+    "dameng": {
+        "icon": "bi-database-fill-gear",
+        "description": "达梦 DM8：dexp/dimp 逻辑 + dmrman 物理；支持实时（归档日志）",
+        "backup_modes": ["logical", "physical"],
+        "supports_incremental": True, "supports_full_instance": True, "supports_sync": True,
+    },
+    "sqlserver": {
+        "icon": "bi-database-fill",
+        "description": "SQL Server：BACKUP DATABASE 物理（SSH）+ JDBC 逻辑（免 SSH）/ 差异 / 日志",
+        "backup_modes": ["logical", "physical"],
+        "supports_incremental": True, "supports_full_instance": True, "supports_sync": True,
+    },
+    "redis": {
+        "icon": "bi-lightning-charge",
+        "description": "Redis RDB 快照（redis-cli --rdb），支持跨主机恢复；无增量/全实例语义",
+        "backup_modes": ["logical"],
+        "supports_incremental": False, "supports_full_instance": False, "supports_sync": False,
+    },
+    "mongodb": {
+        "icon": "bi-node-plus",
+        "description": "MongoDB：mongodump --archive 归档 + mongorestore",
+        "backup_modes": ["logical"],
+        "supports_incremental": False, "supports_full_instance": True, "supports_sync": False,
+    },
+    "file": {
+        "icon": "bi-folder2-open",
+        "description": "文件/目录备份：tar 打包 + 增量 + 源端去重 + 镜像恢复（Windows 通道同名）",
+        "backup_modes": ["logical"],
+        "supports_incremental": True, "supports_full_instance": False, "supports_sync": False,
+    },
+    "qdrant": {
+        "icon": "bi-boxes",
+        "description": "向量库 Qdrant：snapshot API 全量快照 + 恢复",
+        "backup_modes": ["logical"],
+        "supports_incremental": False, "supports_full_instance": False, "supports_sync": False,
+    },
+    "chroma": {
+        "icon": "bi-boxes",
+        "description": "向量库 Chroma：集合级导出/导入（HTTP API）",
+        "backup_modes": ["logical"],
+        "supports_incremental": False, "supports_full_instance": False, "supports_sync": False,
+    },
+    "highgo": {
+        "icon": "bi-database-fill-gear",
+        "description": "瀚高 HighGo（PG 协议兼容层）：pg_dump/pg_restore 通道",
+        "backup_modes": ["logical"], "supports_incremental": False,
+        "supports_full_instance": True, "supports_sync": True,
+    },
+    "uxdb": {
+        "icon": "bi-database-fill-gear",
+        "description": "优炫 UXDB（PG 协议兼容层）：pg_dump/pg_restore 通道",
+        "backup_modes": ["logical"], "supports_incremental": False,
+        "supports_full_instance": True, "supports_sync": True,
+    },
+    "tidb": {
+        "icon": "bi-diagram-2-fill",
+        "description": "TiDB（MySQL 协议兼容层）：mysqldump 逻辑；物理需官方 br（未接入）",
+        "backup_modes": ["logical"], "supports_incremental": False,
+        "supports_full_instance": True, "supports_sync": True,
+    },
+    "oceanbase": {
+        "icon": "bi-diagram-2-fill",
+        "description": "OceanBase MySQL 租户（协议兼容层）：mysqldump 逻辑",
+        "backup_modes": ["logical"], "supports_incremental": False,
+        "supports_full_instance": True, "supports_sync": True,
+    },
+    # ---- 2026-11-13：从模板目录提升为内置引擎（复用 PG/MySQL 工具族）----
+    "gaussdb": {
+        "icon": "bi-database-fill-gear",
+        "description": "GaussDB（华为，openGauss 血缘）：gs_dump / gs_restore / gs_basebackup 通道",
+        "backup_modes": ["logical", "physical"], "supports_incremental": False,
+        "supports_full_instance": True, "supports_sync": True,
+    },
+    "vastbase": {
+        "icon": "bi-database-fill-gear",
+        "description": "Vastbase（海量数据，PG 系）：pg_dump / pg_restore 通道",
+        "backup_modes": ["logical"], "supports_incremental": False,
+        "supports_full_instance": True, "supports_sync": True,
+    },
+    "greatdb": {
+        "icon": "bi-database-fill",
+        "description": "GreatDB（万里，MySQL 协议兼容）：mysqldump / mysql 通道",
+        "backup_modes": ["logical"], "supports_incremental": False,
+        "supports_full_instance": True, "supports_sync": True,
+    },
+    "jdbc_generic": {
+        "icon": "bi-plug",
+        "description": "通用 JDBC 逻辑备份（长尾库型兜底）：JDBC 元数据 + SELECT 导出为 JSONL，回放建表与批量 INSERT；需平台侧 JRE + 驱动 jar",
+        "backup_modes": ["logical"], "supports_incremental": False,
+        "supports_full_instance": False, "supports_sync": False,
+    },
+    "goldendb": {
+        "icon": "bi-diagram-2-fill",
+        "description": "GoldenDB（中兴，MySQL 协议兼容，分布式）：按 CN/Proxy 入口 mysqldump 逻辑备份",
+        "backup_modes": ["logical"], "supports_incremental": False,
+        "supports_full_instance": True, "supports_sync": True,
     },
 }
 
@@ -235,6 +384,19 @@ def get_engine(db_type: str, task: dict, storage_root: str, logger=None):
             from core import db_adapters
             if db_adapters.ensure_registered(db_type):
                 cls = ENGINE_REGISTRY.get(db_type)
+        except Exception:
+            pass
+    if not cls:
+        # 2026-11-13：长尾库型兜底——只要 core.jdbc 里有驱动配置（Db2 / ClickHouse /
+        # YashanDB / TDengine …），就用通用 JDBC 逻辑引擎接住，而不是直接报
+        # 「不支持的数据库类型」。这样"上传一张 jar 就能备份任意关系型库"成立。
+        try:
+            from core import jdbc as _jdbc
+            if str(db_type).lower() in {t.lower() for t in _jdbc.effective_db_types()}:
+                cls = JDBCLogicalEngine
+                ENGINE_REGISTRY.setdefault(str(db_type).lower(), JDBCLogicalEngine)
+                ENGINE_DISPLAY.setdefault(str(db_type).lower(),
+                                          "%s（JDBC 逻辑）" % str(db_type).upper())
         except Exception:
             pass
     if not cls:

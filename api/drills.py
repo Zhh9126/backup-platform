@@ -22,8 +22,22 @@ def create_drill():
     data = request.get_json(force=True, silent=True) or {}
     if not data.get("name"):
         return jsonify({"error": "name 必填"}), 400
-    if not data.get("task_id"):
+    # 切换演练不关联备份任务，关联的是容灾链路（scenario.link_id；
+    # 兼容把链路 ID 直接填进 task_id 字段的调用方式）
+    is_switch = str(data.get("drill_type") or "") == "switch"
+    if not is_switch and not data.get("task_id"):
         return jsonify({"error": "task_id 必填"}), 400
+    if is_switch:
+        scenario = data.get("scenario") or {}
+        if isinstance(scenario, str):
+            try:
+                scenario = json.loads(scenario)
+            except Exception:
+                scenario = {}
+        scenario = dict(scenario or {})
+        if data.get("link_id"):
+            scenario["link_id"] = int(data["link_id"])
+        data["scenario"] = scenario
     drill_id = models.create_drill(data)
     return jsonify({"id": drill_id, "ok": True}), 201
 

@@ -19,6 +19,7 @@ from flask import jsonify, request
 
 from auth import login_required
 from core import plugin_catalog, plugin_installer, plugin_runtime
+import core.models as models
 from . import api_bp
 
 
@@ -182,6 +183,113 @@ def batch_install_plugins():
         "failed": failed,
         "host_id": host_id,
     })
+
+
+@api_bp.route("/plugins/version-matrix", methods=["GET"])
+@login_required
+def api_plugin_version_matrix():
+    """插件版本矩阵：期望版本 vs 各主机已装版本 + 升级建议。"""
+    from core import plugin_version_matrix as pvm
+    host_id = request.args.get("host_id", type=int)
+    return jsonify(pvm.matrix(host_id))
+
+
+@api_bp.route("/plugins/bundle/build", methods=["POST"])
+@login_required
+def api_plugin_bundle_build():
+    """把一组插件打成单文件离线包（无网现场一次导入）。"""
+    from core import plugin_bundle
+    body = request.get_json(silent=True) or {}
+    res = plugin_bundle.build(body.get("plugins") or [],
+                              out_path=str(body.get("out_path") or ""),
+                              note=str(body.get("note") or ""))
+    return jsonify(res), (200 if res.get("ok") else 400)
+
+
+@api_bp.route("/plugins/bundle/inspect", methods=["GET"])
+@login_required
+def api_plugin_bundle_inspect():
+    """只读查看离线包内容（不安装）。"""
+    from core import plugin_bundle
+    return jsonify(plugin_bundle.inspect(request.args.get("path") or ""))
+
+
+@api_bp.route("/plugins/bundle/import", methods=["POST"])
+@login_required
+def api_plugin_bundle_import():
+    """导入单文件离线包：校验 sha256 → 落离线包目录 → 逐个安装。"""
+    from core import plugin_bundle
+    body = request.get_json(silent=True) or {}
+    path = str(body.get("path") or "")
+    if not path:
+        return jsonify({"ok": False, "message": "请提供 path（bundle 文件路径）"}), 400
+    res = plugin_bundle.import_bundle(
+        path, host_id=body.get("host_id"),
+        install=bool(body.get("install", True)))
+    return jsonify(res), (200 if res.get("ok") else 400)
+
+
+@api_bp.route("/plugins/coverage", methods=["GET"])
+@login_required
+def api_plugin_coverage():
+    """备份类型 × 插件覆盖矩阵（DB / 文件 / 对象存储 / 虚拟机 / 通用）。"""
+    from core import plugin_policy
+    return jsonify(plugin_policy.coverage())
+
+
+@api_bp.route("/plugins/policy/<int:task_id>", methods=["GET"])
+@login_required
+def api_plugin_policy_get(task_id: int):
+    """查询任务的插件使用策略与能力协商结果。"""
+    from core import plugin_policy
+    task = models.get_task(task_id, include_secret=True)
+    if not task:
+        return jsonify({"error": "任务不存在"}), 404
+    res = plugin_policy.resolve(task)
+    res["task_id"] = task_id
+    res["db_type"] = task.get("db_type")
+    return jsonify(res)
+
+
+@api_bp.route("/plugins/policy/<int:task_id>", methods=["POST"])
+@login_required
+def api_plugin_policy_set(task_id: int):
+    """设置任务级插件模式：auto（默认）/ off（走零安装）/ require（必须用插件）。"""
+    from core import plugin_policy
+    body = request.get_json(silent=True) or {}
+    res = plugin_policy.set_task_mode(task_id, body.get("mode"))
+    return jsonify(res), (200 if res.get("ok") else 400)
+
+
+@api_bp.route("/plugins/bundle", methods=["POST"])
+@login_required
+def api_plugin_bundle():
+    """对外「一个包」：按一组任务推导所需插件并一键安装。
+
+    body: {"task_ids": [..], "dry_run": false}
+    返回：需要的插件清单 + 逐个安装结果（失败如实返回，不吞错）。
+    """
+    from core import plugin_policy
+    from core import plugin_installer
+    body = request.get_json(silent=True) or {}
+    ids = body.get("task_ids") or []
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"success": False, "message": "请提供 task_ids"}), 400
+    plan = plugin_policy.bundle_for_tasks([int(x) for x in ids])
+    if body.get("dry_run"):
+        return jsonify({"success": True, "dry_run": True, "plan": plan})
+    results = []
+    for p in plan["plugins"]:
+        try:
+            r = plugin_installer.install(p["id"]) if hasattr(plugin_installer, "install") \
+                else {"ok": False, "message": "安装器缺少 install 接口"}
+        except Exception as e:  # noqa: BLE001
+            r = {"ok": False, "message": str(e)[:300]}
+        results.append({"plugin": p["id"], "name": p.get("name"),
+                        "ok": bool(r.get("ok")), "message": (r.get("message") or "")[:300]})
+    ok_n = sum(1 for x in results if x["ok"])
+    return jsonify({"success": True, "plan": plan, "results": results,
+                    "installed": ok_n, "failed": len(results) - ok_n})
 
 
 @api_bp.route("/plugins/<pid>", methods=["GET"])

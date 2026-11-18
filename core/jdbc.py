@@ -173,6 +173,43 @@ DRIVER_CONFIG = {
         "list_sql": "SELECT username FROM all_users ORDER BY 1",
         "filter": ("SYS", "SYSTEM", "SYSAUDITOR", "SYSSSO"),
     },
+    # ---- 2026-11-13：协议兼容层四库的 JDBC 通道（jar 复用同族驱动）----
+    "gaussdb": {
+        "jar": "opengauss-jdbc-6.0.6.jar",
+        "class": "org.postgresql.Driver",
+        "url": "jdbc:opengauss://{host}:{port}/{db}?connectTimeout=8&socketTimeout=15",
+        "probe": "SELECT 1",
+        "list_sql": "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY 1",
+        "filter": (),
+    },
+    "vastbase": {
+        "jar": "postgresql-42.7.5.jar",
+        "class": "org.postgresql.Driver",
+        "url": "jdbc:postgresql://{host}:{port}/{db}?connectTimeout=8&socketTimeout=15",
+        "probe": "SELECT 1",
+        "list_sql": "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY 1",
+        "filter": (),
+    },
+    "greatdb": {
+        "jar": "mysql-connector-j-8.4.0.jar",
+        "class": "com.mysql.cj.jdbc.Driver",
+        "url": "jdbc:mysql://{host}:{port}/{db}?useSSL=false&allowPublicKeyRetrieval=true"
+               "&serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf8"
+               "&connectTimeout=8000&socketTimeout=15000",
+        "probe": "SELECT 1",
+        "list_sql": "SHOW DATABASES",
+        "filter": ("information_schema", "performance_schema", "mysql", "sys"),
+    },
+    "goldendb": {
+        "jar": "mysql-connector-j-8.4.0.jar",
+        "class": "com.mysql.cj.jdbc.Driver",
+        "url": "jdbc:mysql://{host}:{port}/{db}?useSSL=false&allowPublicKeyRetrieval=true"
+               "&serverTimezone=Asia/Shanghai&useUnicode=true&characterEncoding=utf8"
+               "&connectTimeout=8000&socketTimeout=15000",
+        "probe": "SELECT 1",
+        "list_sql": "SHOW DATABASES",
+        "filter": ("information_schema", "performance_schema", "mysql", "sys"),
+    },
 }
 
 # 使用 JDBC 的数据库类型（redis / mongodb 走 python 原生驱动，不需要 JDBC）

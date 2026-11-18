@@ -286,14 +286,14 @@ class DamengSinkWriter(SinkWriter):
 
     def _table_ref(self, table: str = None) -> str:
         cfg = self.config
-        schema = _upper(cfg.tgt_schema or cfg.tgt_username or "SYSDBA")
+        schema = _upper(cfg.tgt_schema or cfg.tgt_db_name or cfg.tgt_username or "SYSDBA")
         tbl = _upper(table or cfg.target_table or "")
         return f'{schema}.{tbl}'
 
     def _get_target_columns(self, conn: Any, table: str) -> List[str]:
         cur = conn.cursor()
-        schema = _upper(self.config.tgt_schema or self.config.tgt_username
-                        or "SYSDBA")
+        schema = _upper(self.config.tgt_schema or self.config.tgt_db_name
+                        or self.config.tgt_username or "SYSDBA")
         rows = _dict_rows(cur, [
             ("SELECT column_name FROM all_tab_columns "
              "WHERE owner=? AND table_name=? ORDER BY column_id",
@@ -308,8 +308,8 @@ class DamengSinkWriter(SinkWriter):
 
     def _get_primary_keys(self, conn: Any, table: str) -> List[str]:
         cur = conn.cursor()
-        schema = _upper(self.config.tgt_schema or self.config.tgt_username
-                        or "SYSDBA")
+        schema = _upper(self.config.tgt_schema or self.config.tgt_db_name
+                        or self.config.tgt_username or "SYSDBA")
         rows = _dict_rows(cur, [
             ("SELECT cols.column_name FROM all_constraints c "
              "JOIN all_cons_columns cols ON c.owner=cols.owner "
@@ -331,7 +331,7 @@ class DamengSinkWriter(SinkWriter):
 
     def _create_table_sql(self, table: str, columns: List[ColumnMeta]) -> str:
         cfg = self.config
-        schema = _upper(cfg.tgt_schema or cfg.tgt_username or "SYSDBA")
+        schema = _upper(cfg.tgt_schema or cfg.tgt_db_name or cfg.tgt_username or "SYSDBA")
         tbl = _upper(table)
         defs = []
         for c in columns:
@@ -495,7 +495,7 @@ class DamengSinkWriter(SinkWriter):
         cfg = self.config
         table = cfg.target_table
         cur = conn.cursor()
-        schema = _upper(cfg.tgt_schema or cfg.tgt_username or "SYSDBA")
+        schema = _upper(cfg.tgt_schema or cfg.tgt_db_name or cfg.tgt_username or "SYSDBA")
         rows = _dict_rows(cur, [
             ("SELECT COUNT(*) FROM all_tables WHERE owner=? AND table_name=?",
              (schema, _upper(table))),

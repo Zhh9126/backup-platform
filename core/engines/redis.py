@@ -193,14 +193,17 @@ class RedisEngine(BackupEngine):
             target_db = kwargs.get("target_db") or "0"
             return self._try_cross_host_restore(backup_path, target_host_info, target_db)
 
-        target_host = kwargs.get("target_host")
-        target_dir = kwargs.get("target_db")
-
-        # 2. 必须同时提供目标主机与目标目录
-        if not (target_host and target_dir):
+        # 同机恢复：目标主机缺省为任务数据库地址（Redis 恢复=RDB 整体替换，
+        # 不存在「异名库」概念，target_db 仅作 db 索引兜底）。
+        # 2026-11-13 170 真机实测：此前要求必须显式给 target_host/target_db，
+        # 同机恢复会直接返回提示语，且该提示被默认 status=SUCCESS 记成「恢复成功」。
+        target_host = kwargs.get("target_host") or (self.task.get("host") or "")
+        target_dir = kwargs.get("target_db") or "0"
+        if not target_host:
             return BackupResult(
-                success=False,
-                message="请提供目标主机与 rdb 目录(target_host, target_db)")
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path,
+                message="Redis 恢复失败：无法确定目标主机（任务未配置数据库地址）")
 
         # 3. SFTP 推送 rdb → 停库 → 替换数据文件 → 重启加载 → PING 验证
         #    （零安装：全平台侧 paramiko 完成，不依赖本机 scp/人工干预）
@@ -268,10 +271,15 @@ class RedisEngine(BackupEngine):
             # rdb 文件名以实例当前配置为准：恒写 dump.rdb 时，若实例用的是
             # 其它 dbfilename（或启用了 AOF），重启后加载的仍是旧数据 → 假成功。
             rdb_name = (kv.get("dbfilename") or "dump.rdb").strip() or "dump.rdb"
+            # AOF 优先：实例开启 appendonly 时 Redis 启动只加载 AOF，被替换的
+            # dump.rdb 会被完全忽略（2026-11-13 171 真机实测：替换 rdb 后重启，
+            # 数据仍是旧的却报恢复成功）。因此统一以 appendonly no 启动，
+            # 起来后再按配置重新打开 appendonly（会按恢复后的数据集重写 AOF）。
+            aof_was_on = (kv.get("appendonly") or "no").strip().lower() == "yes"
             conf_text = (
                 f"port {port}\nbind 0.0.0.0\ndir {data_dir}\n"
                 f"dbfilename {rdb_name}\n"
-                f"appendonly {kv.get('appendonly') or 'no'}\n"
+                f"appendonly no\n"
                 f"save {kv.get('save') or ''}\n"
                 f"daemonize yes\npidfile /tmp/platform_redis_{port}.pid\n"
                 f"logfile /tmp/platform_redis_{port}.log\n")
@@ -288,9 +296,16 @@ class RedisEngine(BackupEngine):
             # SSH 会话时，中间步骤可能因连接停顿丢失，实例会遗留在停机
             # 状态无人重启（170 实测 cp 阶段会话停顿 120s 超时）。重启按
             # 生成的保真 conf；替换失败也照常重启实例（不留死实例）。
+            aof_dir_q = shlex_quote(data_dir + "/appendonlydir")
+            aof_file_q = shlex_quote(data_dir + "/appendonly.aof")
             atomic = (
                 f"{cli_cmd} SHUTDOWN NOSAVE >/dev/null 2>&1; "
                 f"sleep 2; "
+                # AOF 在场时必须挪开：否则重启只回放 AOF，替换的 rdb 形同无效
+                f"if [ -d {aof_dir_q} ]; then mv -f {aof_dir_q} "
+                f"{aof_dir_q}.bak_restore 2>/dev/null; fi; "
+                f"if [ -f {aof_file_q} ]; then mv -f {aof_file_q} "
+                f"{aof_file_q}.bak_restore 2>/dev/null; fi; "
                 # 用 cat 重定向而非 cp：很多环境 root 的 .bashrc 把 cp 别名
                 # 成 `cp -i`（bash -lc 登录 shell 会加载），目标存在时 cp -i
                 # 等待 y/n 确认 → 无 stdin 永久挂起（170 实测暴露）
@@ -299,7 +314,10 @@ class RedisEngine(BackupEngine):
                 f"setsid redis-server {shlex_quote(gen_conf)} >/dev/null 2>&1 & "
                 f"sleep 3; "
                 f"echo CP_RC=$RC_CP; "
-                f"{cli_cmd} PING 2>&1"
+                # 恢复后按原配置重新打开 AOF（会按当前数据集重写，后续重启一致）
+                + (f"{cli_cmd} CONFIG SET appendonly yes >/dev/null 2>&1; "
+                   if aof_was_on else "")
+                + f"{cli_cmd} PING 2>&1"
             )
             rc, out, _ = _run(atomic, timeout=180)
             cp_rc = "?"

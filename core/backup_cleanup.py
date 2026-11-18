@@ -322,7 +322,11 @@ def build_plan(task_id: int = None, keep_min: int = None) -> list:
                 "has_file": bool(path) and os.path.isfile(str(path)),
                 "reason": reason,
             })
-        if not items:
+        # 没有任何可清理项时，若存在"因护栏被跳过"的记录，仍要返回该任务的
+        # 统计：否则预览直接消失，运维看不到「为什么这些过期备份没被清」——
+        # 分不清是实现漏清还是防勒索/锁/可信点护栏在起作用（2026-11-14 实测：
+        # 2 条过期记录一条被锁一条是最后可信点，预览返回空，像是功能没生效）。
+        if not items and not (task_locked or task_trusted or task_chain):
             continue
         plans.append({
             "task_id": t["id"],

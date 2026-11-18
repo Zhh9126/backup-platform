@@ -1,23 +1,37 @@
 {% extends "base.html" %}
-{% block title %}无备份目录扫描恢复{% endblock %}
+{% block title %}特殊恢复{% endblock %}
 
 {% block content %}
 <div class="toolbar">
   <div>
     <div class="page-title">
-      <i class="bi bi-hdd-rack text-info me-2"></i>无备份目录扫描恢复
+      <i class="bi bi-life-preserver text-danger me-2"></i>特殊恢复
     </div>
-    <div class="page-sub">
-      备份目录/元信息丢失时，通过 SSH 只读扫描目标主机文件系统，列出仍可找回的数据文件，
-      勾选后经 SFTP 拉回平台暂存目录并逐文件计算 sha256，交给既有恢复通道处理。
-    </div>
+    <div class="page-sub">常规恢复不可用时的最后手段：只读扫描目标主机，把残留的原始数据文件 / 日志 / 控制文件拉回平台，交由人工或既有工具装载；已覆盖 Oracle、MySQL / MariaDB、PostgreSQL、金仓、openGauss、达梦、SQL Server、Redis、MongoDB、SQLite。</div>
   </div>
 </div>
 
-<div class="alert alert-warning small" role="alert">
-  <b>能力边界</b>：本功能是<b>文件系统层</b>的只读扫描与清单拉回（<code>lsblk / blkid / find / stat</code>，零安装、零 agent），
-  <b>不读裸块设备、不做扇区级数据雕刻</b>；对已覆盖的磁盘块无法恢复。扫描不会在目标主机写入或删除任何东西，
-  只有点击「拉回选中对象」才会把文件拉到平台侧。
+<div class="alert alert-danger small" role="alert">
+  <div class="fw-bold mb-2"><i class="bi bi-exclamation-triangle-fill me-1"></i>这是「特殊恢复」，不属于常规恢复链路</div>
+  <div class="row g-2">
+    <div class="col-md-6">
+      <div><b>能做</b></div>
+      <ul class="mb-0 ps-3">
+        <li>SSH 只读扫描（lsblk / blkid / find / ps / oratab），零安装、零 agent</li>
+        <li>按库型识别残留的数据文件、WAL / redo / binlog、控制文件与配置文件</li>
+        <li>列出本机运行中的数据库实例（含数据目录与端口），进程已退出时按常见目录兜底</li>
+        <li>勾选后经 SFTP 拉回平台并逐文件计算 sha256（可核对完整性）</li>
+      </ul>
+    </div>
+    <div class="col-md-6">
+      <div><b>不能做</b></div>
+      <ul class="mb-0 ps-3">
+        <li>不读裸块设备、不做扇区级数据雕刻，已覆盖的块无法找回</li>
+        <li><b>不自动修复数据库一致性</b>：需按库型各自前滚 — Oracle 用 RMAN、MySQL 用 redo/binlog、PG / 金仓 / openGauss 用 WAL 回放、达梦用 dmrman、SQL Server 用事务日志、Redis 直接替换 RDB / AOF</li>
+        <li>不会在目标主机写入或删除任何东西（只有「拉回」动作会落平台侧）</li>
+      </ul>
+    </div>
+  </div>
 </div>
 
 <div class="card mb-3">
@@ -29,7 +43,7 @@
         <select class="form-select form-select-sm" id="sf_task">
           <option value="">不使用任务（下方直填主机）</option>
         </select>
-        <div class="form-text">选中后 SSH 凭据复用该任务；「Oracle 实例清单」也基于所选任务。</div>
+        <div class="form-text">选中后 SSH 凭据复用该任务；「实例清单」也基于所选任务。</div>
       </div>
       <div class="col-md-3">
         <label class="form-label">主机 IP</label>
@@ -51,8 +65,8 @@
     <div class="row g-3 mt-1 align-items-end">
       <div class="col-md-7">
         <label class="form-label">扫描根目录（逗号或换行分隔，须为绝对路径）</label>
-        <textarea class="form-control form-control-sm" id="sf_roots" rows="2">/u01, /opt/oracle, /oradata, /data, /var/lib/mysql</textarea>
-        <div class="form-text">最多 20 个；禁止 <code>..</code> 与 shell 元字符。不存在的目录会被跳过。</div>
+        <textarea class="form-control form-control-sm" id="sf_roots" rows="2">/u01, /opt/oracle, /oradata, /data, /var/lib/mysql, /var/lib/postgresql, /opt/Kingbase, /dm/data, /var/opt/mssql, /var/lib/redis, /var/lib/mongo</textarea>
+        <div class="form-text">最多 20 个；禁止 <code>..</code> 与 shell 元字符。不存在的目录会被跳过（已预置主流库型的默认数据目录）。</div>
       </div>
       <div class="col-md-2">
         <label class="form-label">最大文件数</label>
@@ -62,8 +76,8 @@
         <button class="btn btn-sm btn-primary" id="sf_scan_btn" onclick="scanFsRun()">
           <i class="bi bi-search me-1"></i>只读扫描
         </button>
-        <button class="btn btn-sm btn-outline-info" onclick="scanFsOracle()">
-          <i class="bi bi-database me-1"></i>Oracle 实例清单
+        <button class="btn btn-sm btn-outline-info" onclick="scanFsInstances()">
+          <i class="bi bi-database me-1"></i>实例清单
         </button>
       </div>
     </div>
@@ -73,7 +87,7 @@
 <div id="sf_status" class="small text-muted mb-2">尚未扫描。</div>
 
 <div class="row g-3 mb-3">
-  <div class="col-md-6">
+  <div class="col-md-5">
     <div class="card h-100">
       <div class="card-header"><b><i class="bi bi-2-circle me-1"></i>卷 / 挂载点</b></div>
       <div class="table-responsive">
@@ -84,13 +98,13 @@
       </div>
     </div>
   </div>
-  <div class="col-md-6">
+  <div class="col-md-7">
     <div class="card h-100">
-      <div class="card-header"><b>Oracle 实例 / ORACLE_HOME / PDB</b></div>
+      <div class="card-header"><b>数据库实例 / 数据目录</b></div>
       <div class="table-responsive">
         <table class="table table-sm mb-0">
-          <thead class="table-light"><tr><th>SID</th><th>状态</th><th>版本</th><th>ORACLE_HOME</th><th>PDB</th></tr></thead>
-          <tbody id="sf_ora"><tr><td colspan="5" class="text-muted small">点「Oracle 实例清单」查询（需选择任务）</td></tr></tbody>
+          <thead class="table-light"><tr><th>库型</th><th>实例</th><th>数据目录 / 安装目录</th><th>端口</th><th>线索</th></tr></thead>
+          <tbody id="sf_inst"><tr><td colspan="5" class="text-muted small">点「实例清单」查询（需选择任务）</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -101,13 +115,18 @@
   <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
     <b><i class="bi bi-3-circle me-1"></i>可恢复对象清单 <span id="sf_count" class="badge bg-secondary">0</span></b>
     <div class="d-flex gap-2 align-items-center flex-wrap">
-      <input class="form-control form-control-sm" id="sf_kw" style="width:210px"
+      <input class="form-control form-control-sm" id="sf_kw" style="width:190px"
              placeholder="过滤路径 / 类型" oninput="scanFsFilter()">
+      <select class="form-select form-select-sm" id="sf_db" style="width:150px" onchange="scanFsFilter()">
+        <option value="">全部库型</option>
+      </select>
       <select class="form-select form-select-sm" id="sf_kind" style="width:150px" onchange="scanFsFilter()">
         <option value="">全部类型</option>
-        <option value="oracle_artifact">Oracle 对象</option>
-        <option value="db_file">数据文件</option>
-        <option value="db_log">日志/binlog</option>
+        <option value="db_data">数据文件</option>
+        <option value="db_log">日志 / WAL / binlog</option>
+        <option value="db_control">控制文件</option>
+        <option value="db_config">配置文件</option>
+        <option value="backup_artifact">备份产物</option>
         <option value="file">普通文件</option>
       </select>
       <button class="btn btn-sm btn-outline-secondary" onclick="scanFsToggleAll()">全选 / 清空</button>
@@ -119,9 +138,9 @@
   <div class="table-responsive">
     <table class="table table-sm table-hover align-middle mb-0">
       <thead class="table-light"><tr>
-        <th style="width:36px"></th><th>路径</th><th>识别类型</th><th>大小</th><th>修改时间</th>
+        <th style="width:36px"></th><th>路径</th><th>库型</th><th>识别类型</th><th>大小</th><th>修改时间</th>
       </tr></thead>
-      <tbody id="sf_files"><tr><td colspan="5" class="text-muted small">扫描后显示</td></tr></tbody>
+      <tbody id="sf_files"><tr><td colspan="6" class="text-muted small">扫描后显示</td></tr></tbody>
     </table>
   </div>
   <div id="sf_filePager"></div>
@@ -135,5 +154,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/js/scan_fs.js?v=2026111107"></script>
+<script src="/static/js/scan_fs.js?v=2026111401"></script>
 {% endblock %}

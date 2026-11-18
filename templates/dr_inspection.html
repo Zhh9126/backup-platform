@@ -1,0 +1,224 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-card mb-3">
+  <div class="d-flex align-items-center mb-2">
+    <h5 class="mb-0"><i class="bi bi-clipboard2-pulse me-2"></i>容灾巡检</h5>
+    <div class="ms-auto d-flex gap-2 align-items-center">
+      <a class="btn btn-sm btn-outline-secondary" href="/dr">容灾总览</a>
+      <button class="btn btn-sm btn-primary" id="diRunBtn"><i class="bi bi-play-fill me-1"></i>立即巡检</button>
+    </div>
+  </div>
+  <div class="text-muted small mb-3">
+    巡检三块（重点容灾环境）：环境健康（生产可达 / 容灾可达）、数据复制状态（IO / SQL / 延迟）、
+    DNS 运行状态（记录一致性）。支持定时自动巡检与报表导出。巡检=只读探测，不改任何配置。
+  </div>
+  <div class="row g-3 align-items-end">
+    <div class="col-md-3">
+      <label class="form-label">定时自动巡检</label>
+      <select class="form-select" id="diEnabled">
+        <option value="1">启用</option>
+        <option value="0">停用</option>
+      </select>
+    </div>
+    <div class="col-md-4">
+      <label class="form-label">巡检周期（cron）</label>
+      <input class="form-control" id="diCron" placeholder="0 8 * * *">
+      <div class="form-text">5 段：分 时 日 月 周，默认每日 08:00。</div>
+    </div>
+    <div class="col-md-2">
+      <button class="btn btn-outline-primary w-100" id="diSaveCfg">保存配置</button>
+    </div>
+    <div class="col-md-3 d-flex align-items-end">
+      <span class="small text-muted" id="diCfgSaved"></span>
+    </div>
+  </div>
+</div>
+
+<div class="page-card">
+  <div class="d-flex align-items-center mb-2">
+    <h6 class="text-muted mb-0"><i class="bi bi-clock-history me-1"></i>巡检记录</h6>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead class="table-light"><tr>
+        <th style="width:60px">#</th><th>结论</th><th>链路</th><th>正常 / 警告 / 异常</th>
+        <th>摘要</th><th>触发方式</th><th>时间</th><th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="diList"><tr><td colspan="8" class="text-center text-muted py-3">加载中…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 巡检详情弹窗 -->
+<div class="modal fade" id="diModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h6 class="modal-title">巡检详情 <span id="diHead" class="text-muted small"></span></h6>
+        <div class="ms-auto d-flex gap-2">
+          <a class="btn btn-sm btn-outline-secondary" id="diExpCsv" href="#">导出 CSV</a>
+          <a class="btn btn-sm btn-outline-secondary" id="diExpXlsx" href="#">导出 Excel</a>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+      </div>
+      <div class="modal-body">
+        <div id="diSummary" class="small mb-2"></div>
+        <div id="diDetail"></div>
+        <h6 class="small text-muted mt-3 mb-1">DNS 服务巡检</h6>
+        <div id="diDns"></div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var modalInst = null, currentId = null;
+
+  function el(id) { return document.getElementById(id); }
+  function esc(s) { return BKP.esc(String(s == null ? "" : s)); }
+
+  function overallBadge(o) {
+    var m = { ok: ["badge-ok", "正常"], warn: ["badge-warn", "警告"],
+              fail: ["badge-fail", "异常"] };
+    var x = m[o] || ["bg-secondary", o || "-"];
+    return '<span class="badge ' + x[0] + '">' + x[1] + '</span>';
+  }
+  function stBadge(s) {
+    var m = { ok: ["badge-ok", "正常"], warn: ["badge-warn", "警告"],
+              fail: ["badge-fail", "异常"] };
+    var x = m[s] || ["bg-secondary", s || "-"];
+    return '<span class="badge ' + x[0] + '">' + x[1] + '</span>';
+  }
+
+  function loadCfg() {
+    BKP.api("GET", "/api/dr-inspections/config").then(function (d) {
+      el("diEnabled").value = d.enabled ? "1" : "0";
+      el("diCron").value = d.cron || "";
+    });
+  }
+
+  el("diSaveCfg").onclick = function () {
+    BKP.api("POST", "/api/dr-inspections/config",
+      { enabled: el("diEnabled").value === "1", cron: el("diCron").value.trim() })
+      .then(function (d) {
+        el("diCfgSaved").textContent = "已保存（调度已重载）";
+        BKP.toast("巡检配置已保存");
+        setTimeout(function () { el("diCfgSaved").textContent = ""; }, 4000);
+      })
+      .catch(function (e) { BKP.toast(e.message || "保存失败", "danger"); });
+  };
+
+  el("diRunBtn").onclick = function () {
+    var btn = el("diRunBtn");
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>巡检中…';
+    BKP.api("POST", "/api/dr-inspections/run", {})
+      .then(function (d) {
+        BKP.toast("巡检完成：" + d.item.summary);
+        loadList();
+        showDetail(d.item.id);
+      })
+      .catch(function (e) { BKP.toast("巡检失败: " + e.message, "danger"); })
+      .finally(function () {
+        btn.disabled = false;
+        btn.innerHTML = '<i class="bi bi-play-fill me-1"></i>立即巡检';
+      });
+  };
+
+  function loadList() {
+    return BKP.api("GET", "/api/dr-inspections?limit=100").then(function (d) {
+      var rows = d.items || [];
+      var tb = el("diList");
+      if (!rows.length) {
+        tb.innerHTML = '<tr><td colspan="8" class="text-center text-muted py-4">' +
+          '暂无巡检记录，点击「立即巡检」开始第一轮巡检</td></tr>';
+        return;
+      }
+      tb.innerHTML = rows.map(function (r) {
+        return '<tr>' +
+          '<td>' + r.id + '</td>' +
+          '<td>' + overallBadge(r.overall) + '</td>' +
+          '<td>' + r.links_total + '</td>' +
+          '<td class="small"><span class="text-success">' + r.ok_count + '</span> / ' +
+            '<span class="text-warning-emphasis">' + r.warn_count + '</span> / ' +
+            '<span class="text-danger">' + r.fail_count + '</span></td>' +
+          '<td class="small">' + esc(r.summary || "-") + '</td>' +
+          '<td class="small">' + esc(r.triggered_by || "-") + '</td>' +
+          '<td class="small text-muted">' + esc((r.created_at || "").slice(0, 19).replace("T", " ")) + '</td>' +
+          '<td class="text-end btn-row">' +
+            '<button class="btn btn-sm btn-outline-secondary" data-show="' + r.id + '">详情</button>' +
+            '<button class="btn btn-sm btn-outline-danger" data-del="' + r.id + '">删除</button>' +
+          '</td></tr>';
+      }).join("");
+    });
+  }
+
+  el("diList").addEventListener("click", function (ev) {
+    var show = ev.target.closest("button[data-show]");
+    var del = ev.target.closest("button[data-del]");
+    if (show) showDetail(+show.dataset.show);
+    if (del) {
+      if (!confirm("确认删除该巡检记录？")) return;
+      BKP.api("DELETE", "/api/dr-inspections/" + del.dataset.del)
+        .then(function () { BKP.toast("已删除"); loadList(); })
+        .catch(function (e) { BKP.toast(e.message || "删除失败", "danger"); });
+    }
+  });
+
+  function showDetail(rid) {
+    currentId = rid;
+    BKP.api("GET", "/api/dr-inspections/" + rid).then(function (d) {
+      var r = d.item;
+      el("diHead").textContent = "#" + r.id + " · " +
+        (r.created_at || "").slice(0, 19).replace("T", " ");
+      el("diSummary").innerHTML = overallBadge(r.overall) +
+        ' <span class="text-muted ms-2">' + esc(r.summary || "") +
+        ' · 触发 ' + esc(r.triggered_by || "-") + '</span>';
+      var det = r.detail || [];
+      el("diDetail").innerHTML = det.length ? det.map(function (lk) {
+        return '<div class="border rounded p-2 mb-2">' +
+          '<div class="d-flex align-items-center mb-1">' +
+          '<b class="small">' + esc(lk.name) + '</b>' +
+          '<span class="ms-2">' + overallBadge(lk.overall) + '</span>' +
+          '<span class="small text-muted ms-auto">承载：' +
+          esc(lk.active_site === "standby" ? "容灾环境" :
+              (lk.active_site === "primary" ? "生产环境" : "未知")) + '</span></div>' +
+          '<ul class="small mb-0 ps-3">' +
+          (lk.checks || []).map(function (c) {
+            return '<li>' + stBadge(c.status) + ' ' + esc(c.item) +
+              (c.message ? ' <span class="text-muted">— ' + esc(c.message) + '</span>' : "") + '</li>';
+          }).join("") + '</ul>' +
+          (lk.error ? '<div class="text-danger small mt-1">' + esc(lk.error) + '</div>' : "") +
+          '</div>';
+      }).join("") : '<div class="text-muted small">本轮无链路巡检明细</div>';
+      var dns = r.dns_summary || {};
+      var recs = dns.records || [];
+      el("diDns").innerHTML =
+        '<div class="small mb-1">服务状态：' + stBadge(dns.ok ? "ok" : "fail") +
+        (recs.length ? '' : ' <span class="text-muted">（无 A 记录或未部署 DNS）</span>') + '</div>' +
+        (recs.length ? '<table class="table table-sm table-bordered small mb-0">' +
+          '<thead class="table-light"><tr><th>域名</th><th>配置 IP</th><th>实际解析</th><th>一致</th></tr></thead><tbody>' +
+          recs.map(function (x) {
+            return '<tr><td>' + esc(x.domain) + '</td><td>' + esc(x.ip || "-") + '</td>' +
+              '<td>' + esc(x.resolved || "解析失败") + '</td>' +
+              '<td>' + stBadge(x.consistent ? "ok" : "fail") + '</td></tr>';
+          }).join("") + '</tbody></table>' : "") +
+        ((dns.errors || []).length
+          ? '<div class="text-danger small mt-1">' + dns.errors.map(esc).join("<br>") + '</div>' : "");
+      el("diExpCsv").href = "/api/dr-inspections/" + rid + "/export?format=csv";
+      el("diExpXlsx").href = "/api/dr-inspections/" + rid + "/export?format=xlsx";
+      modalInst = modalInst || new bootstrap.Modal(el("diModal"));
+      modalInst.show();
+    }).catch(function (e) {
+      BKP.toast("加载详情失败: " + e.message, "danger");
+    });
+  }
+
+  loadCfg();
+  loadList();
+})();
+</script>
+{% endblock %}

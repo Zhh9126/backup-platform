@@ -993,7 +993,8 @@ CREATE TABLE IF NOT EXISTS cdc_events (
     before_json    TEXT,                        -- 前镜像
     after_json     TEXT,                        -- 后镜像
     before_partial INTEGER DEFAULT 0,           -- 前镜像不完整（如 PG 未开 REPLICA IDENTITY FULL）
-    sql_text       TEXT,                        -- LogMiner 等 SQL 级事件的原语句
+    sql_text       TEXT,                        -- LogMiner 等 SQL 级事件的原语句（redo）
+    sql_undo       TEXT,                        -- SQL 级事件的撤销语句（Oracle/达梦 SQL_UNDO）
     applied        INTEGER DEFAULT 0,           -- 增量同步/迁移是否已投递到目标
     created_at     TEXT
 );
@@ -1019,6 +1020,7 @@ CREATE TABLE IF NOT EXISTS clone_requests (
     target_password TEXT,                            -- 目标实例 root/管理员密码（加密存储，可空=沿用源任务密码）
     status         TEXT DEFAULT 'pending',            -- pending|approved|rejected|creating|ready|expired|deleted
     purpose        TEXT DEFAULT 'test',               -- test|dev|staging|emergency（B3 应急接管）
+    databases      TEXT,                              -- 整实例克隆的库白名单（JSON 数组；空=全部库）
     itsm_ticket_id INTEGER,                          -- 关联的 ITSM 工单
     requested_by   TEXT,
     approved_by    TEXT,
@@ -1068,6 +1070,8 @@ CREATE TABLE IF NOT EXISTS disaster_links (
     name                    TEXT NOT NULL,
     primary_site            TEXT,                              -- 主站点（标识/地址）
     dr_site                 TEXT,                              -- 备站点（标识/地址）
+    primary_region          TEXT DEFAULT '',                   -- 主站点地域 JSON {"city","lat","lon"}（地图定位）
+    dr_region               TEXT DEFAULT '',                   -- 备站点地域 JSON（地图定位）
     status                  TEXT DEFAULT 'standby',           -- active | standby | filling | broken
     route_policy            TEXT,                              -- JSON: 多专线配置 [{provider, endpoint, priority, enabled}]
     last_consistency_check  TEXT,                             -- 最近一次一致性校验时间
@@ -1402,6 +1406,71 @@ CREATE TABLE IF NOT EXISTS netdev_backups (
     created_at          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_netdev_backups_dev ON netdev_backups(device_id, created_at DESC);
+
+-- =====================================================================
+-- 2026-11-13 补齐：以下 6 张表此前只在各模块的 ensure_schema() 里按需创建，
+-- 全新部署（或测试临时库）跑完 init_schema 后**缺表**，一旦调用相关功能就
+-- 报 "no such table"（真机验证：fresh 建库 62 张 vs 生产库 68 张）。
+-- 统一收口到主 schema，保证"一次 init_schema = 完整可用"。
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS access_keys (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    access_key  TEXT NOT NULL UNIQUE,
+    secret_enc  TEXT NOT NULL,
+    enabled     INTEGER DEFAULT 1,
+    revoked     INTEGER DEFAULT 0,
+    created_by  TEXT,
+    created_at  TEXT,
+    last_used_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS dr_switch_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    link_id     INTEGER NOT NULL,
+    link_name   TEXT DEFAULT '',
+    direction   TEXT NOT NULL DEFAULT 'failover',
+    mode        TEXT NOT NULL DEFAULT 'execute',
+    status      TEXT NOT NULL DEFAULT 'running',
+    phase       TEXT DEFAULT '',
+    steps       TEXT DEFAULT '[]',
+    precheck    TEXT DEFAULT '{}',
+    rto_sec     REAL DEFAULT 0,
+    message     TEXT DEFAULT '',
+    operator    TEXT DEFAULT '',
+    started_at  TEXT,
+    finished_at TEXT,
+    created_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ransomware_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, event TEXT, level TEXT,
+    record_id INTEGER, task_id INTEGER, operator TEXT, detail TEXT
+);
+
+CREATE TABLE IF NOT EXISTS source_load_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER, host TEXT, ts TEXT,
+    hour INTEGER, cpu_pct REAL, load1 REAL, source TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_source_load_host_hour ON source_load_samples(host, hour);
+
+CREATE TABLE IF NOT EXISTS tape_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, target_id INTEGER, record_id INTEGER,
+    object_key TEXT, media_id INTEGER, media_label TEXT, filemark INTEGER,
+    size_bytes INTEGER DEFAULT 0, checksum TEXT, verified INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'writing', error TEXT, operator TEXT,
+    created_at TEXT, finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_tape_jobs_key ON tape_jobs(object_key);
+
+CREATE TABLE IF NOT EXISTS tape_media (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, target_id INTEGER, barcode TEXT,
+    slot INTEGER, state TEXT DEFAULT 'in_library', drive INTEGER,
+    write_protected INTEGER DEFAULT 0, worm INTEGER DEFAULT 0,
+    capacity_bytes INTEGER DEFAULT 0, used_bytes INTEGER DEFAULT 0,
+    last_written_at TEXT, last_verified_at TEXT, offsite_since TEXT,
+    note TEXT, created_at TEXT, updated_at TEXT
+);
 """
 
 # ------------------------- 连接与执行 -------------------------
@@ -1452,6 +1521,13 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                 conn.executescript(SCHEMA)
             else:
                 conn.executescript(_translate_schema_ddl(SCHEMA, backend))
+            # 迁移（2026-11-14）：cdc_events 增加 sql_undo——Oracle/达梦的
+            # LogMiner 段自带 SQL_UNDO，此前丢弃导致这两个库的「行级回滚」
+            # 在 SQL 级事件上无法生成撤销语句。
+            try:
+                conn.execute("ALTER TABLE cdc_events ADD COLUMN sql_undo TEXT")
+            except Exception:
+                pass  # 列已存在
             # 迁移：确保 backup_mode 列存在（SQLite 不支持 IF NOT EXISTS 的 ALTER TABLE）
             try:
                 conn.execute("ALTER TABLE backup_tasks ADD COLUMN backup_mode TEXT DEFAULT 'logical'")
@@ -1539,7 +1615,9 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
             except Exception:
                 pass  # 迁移失败不阻塞启动（旧约束仍在，新字段照常工作）
             # 迁移：容灾链路切换配置与切换历史（failover/failback 引擎）
-            for col, typedef in [("failover_config", "TEXT"), ("failover_history", "TEXT")]:
+            for col, typedef in [("failover_config", "TEXT"), ("failover_history", "TEXT"),
+                                 ("primary_region", "TEXT DEFAULT ''"),
+                                 ("dr_region", "TEXT DEFAULT ''")]:
                 try:
                     conn.execute(f"ALTER TABLE disaster_links ADD COLUMN {col} {typedef}")
                 except Exception:
@@ -1745,6 +1823,7 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
             for col, typedef in [
                 ("target_host", "TEXT DEFAULT '127.0.0.1'"),
                 ("target_password", "TEXT"),
+                ("databases", "TEXT"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE clone_requests ADD COLUMN {col} {typedef}")
@@ -2471,12 +2550,21 @@ def human_size(n: int) -> str:
     return f"{n:.1f} EB"
 
 
-def sha256_file(path: str) -> str:
+def sha256_stream(fp, chunk_size: int = 1 << 20) -> str:
+    """对已打开的文件对象计算 sha256（tar 成员流、网络流等）。
+
+    ``sha256_file`` 只接受路径；磁带/压缩包内的成员只能拿到文件对象，
+    此前 tape.py / synology.py 各自又写了一份循环，统一收敛到这里。
+    """
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
+    for chunk in iter(lambda: fp.read(chunk_size), b""):
+        h.update(chunk)
     return h.hexdigest()
+
+
+def sha256_file(path: str) -> str:
+    with open(path, "rb") as f:
+        return sha256_stream(f, 65536)
 
 
 def get_logger(name: str = "backup") -> logging.Logger:

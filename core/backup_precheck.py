@@ -398,19 +398,58 @@ def precheck_restore(record: dict, target_host_info: dict = None,
             _add(items, "restore_tools", "unknown",
                  "远端工具探测失败: %s" % str(e)[:120])
     else:
-        # 本机恢复：用引擎 check_client 通道
+        # 源实例恢复（target_host 未指定）：主流引擎恢复是 remote-first（经
+        # SSH/Agent 通道在数据库服务器执行），必须先按任务解析远程通道探测
+        # 远端工具——此前一律用本机 check_client，达梦/金仓/Oracle 等"平台
+        # 机零安装"组合会被误报缺工具而拦截（恢复前自动校验引入时的必修项）。
+        task_full = None
+        ssh = None
         try:
-            import config
-            from core.engines import get_engine
-            task = {"id": 0, "db_type": db_type, "name": "precheck",
-                    "host": "127.0.0.1", "port": 0, "username": "",
-                    "password": "", "db_name": target_db or ""}
-            engine = get_engine(db_type, task, getattr(config, "BACKUP_ROOT", "/tmp"))
-            ok, msg = engine.check_client()
-            _add(items, "restore_tools", "pass" if ok else "fail", str(msg)[:180])
-        except Exception as e:
-            _add(items, "restore_tools", "unknown",
-                 "本机工具检查异常: %s" % str(e)[:120])
+            from core import models as _models
+            task_full = _models.get_task(record.get("task_id"),
+                                         include_secret=True) or {}
+        except Exception:
+            task_full = None
+        if task_full and db_type not in ("file", "object_storage"):
+            try:
+                ssh = remote_dump.resolve_ssh_host(task_full)
+            except Exception:
+                ssh = None
+        if ssh:
+            try:
+                check_user = None
+                from core.remote_dump import resolve_db_os_user
+                check_user = resolve_db_os_user(None, ssh, db_type=db_type)
+                missing = [t for t in tools
+                           if not remote_dump.remote_has_tool(
+                               ssh, t, check_user=check_user)]
+                if missing:
+                    _add(items, "restore_tools", "fail",
+                         "数据库服务器缺少恢复工具: %s" % ", ".join(missing))
+                else:
+                    _add(items, "restore_tools", "pass",
+                         "恢复工具就绪（%s，OS 用户 %s，通道 %s）"
+                         % (", ".join(tools), check_user,
+                            ssh.get("host_key") or "远程"))
+            except Exception as e:
+                _add(items, "restore_tools", "unknown",
+                     "远端工具探测失败: %s" % str(e)[:120])
+        else:
+            # 无纳管 SSH/Agent 主机：真正的本机恢复，用引擎 check_client
+            try:
+                import config
+                from core.engines import get_engine
+                task = {"id": 0, "db_type": db_type, "name": "precheck",
+                        "host": "127.0.0.1", "port": 0, "username": "",
+                        "password": "", "db_name": target_db or ""}
+                engine = get_engine(db_type, task,
+                                    getattr(config, "BACKUP_ROOT", "/tmp"))
+                ok, msg = engine.check_client()
+                _add(items, "restore_tools", "pass" if ok else "fail",
+                     str(msg)[:180])
+            except Exception as e:
+                _add(items, "restore_tools", "unknown",
+                     "本机工具检查异常: %s" % str(e)[:120])
 
     # 6) 目标库连通（给出目标库时；只连不写）
     if target_db and target_host_info is None:

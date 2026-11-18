@@ -552,22 +552,9 @@ class OracleLogMinerDaemon(PollingLogMinerDaemon):
 
     @staticmethod
     def _cell_str(row, index: int) -> str:
-        """安全取列并转字符串（LOB / datetime / None 全兼容）。"""
-        try:
-            value = row[index]
-        except (IndexError, TypeError):
-            return ""
-        if value is None:
-            return ""
-        reader = getattr(value, "read", None)
-        if callable(reader):          # cx_Oracle LOB
-            try:
-                value = reader()
-            except Exception:
-                return ""
-        if isinstance(value, bytes):
-            return value.decode("utf-8", "replace")
-        return str(value)
+        """安全取列并转字符串（统一走 cdc.util.cell_str）。"""
+        from core.cdc.util import cell_str
+        return cell_str(row, index)
 
     # ------------------------------------------------------------------
     def probe_driver(self) -> dict:

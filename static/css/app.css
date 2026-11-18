@@ -125,6 +125,12 @@ i.bi { line-height: 1; }
   border-radius: 10px;
   box-shadow: 0 2px 8px rgba(13, 148, 136, .35);
 }
+/* 自定义 Logo（系统配置 → 品牌设置）：按容器 contain，透明底图不留色块 */
+.brand .brand-logo-img {
+  width: 100%; height: 100%;
+  object-fit: contain;
+  border-radius: inherit;
+}
 .brand .brand-text {
   display: flex; flex-direction: column; line-height: 1.25;
   transition: opacity .15s ease; min-width: 0;
@@ -1206,3 +1212,45 @@ body {
 .task-page .wiz-step .wiz-dot { width: 28px; height: 28px; font-size: 13px; }
 .task-page .wiz-step .wiz-label { font-size: 14px; font-weight: 600; }
 .task-page .wiz-arrow { flex: 1 1 auto; }
+
+/* ---- 侧栏可折叠父菜单（存储管理/容灾管理/运维监控/系统设置）----
+   2026-11-17 对齐修复：此前独立定义 padding/高度/字号/图标尺寸，与
+   .nav-link（46px 高、20px 图标、15px 字号、margin 3px 6px）不一致，
+   导致「存储管理」等父项与普通菜单项错位。现完全对齐 .nav-link 的
+   盒模型与排版，仅多右侧折叠箭头；active 态与 nav-link 同款渐变。 */
+.sidebar .nav-parent {
+  position: relative;
+  display: flex; align-items: center; gap: 12px;
+  height: 46px; margin: 3px 6px; padding: 0 var(--space-md);
+  color: var(--sidebar-text);
+  border-radius: var(--radius-md);
+  font-size: 15px; letter-spacing: .02em;
+  font-weight: var(--weight-medium);
+  cursor: pointer; user-select: none;
+  white-space: nowrap;
+  transition: background .15s ease, color .15s ease;
+}
+.sidebar .nav-parent:hover { background: var(--sidebar-hover); color: var(--text-on-dark); }
+.sidebar .nav-parent.active {
+  color: var(--text-on-dark);
+  background: linear-gradient(90deg, rgba(13, 148, 136, .28), rgba(13, 148, 136, .06));
+  box-shadow: inset 3px 0 0 var(--primary);
+}
+.sidebar .nav-parent .bi:not(.nav-caret) { font-size: 20px; width: 20px; text-align: center; flex: 0 0 20px; }
+.sidebar .nav-parent .nav-caret { margin-left: auto; font-size: .72rem; opacity: .7; transition: transform .16s ease; }
+.sidebar .nav-parent.open .nav-caret { transform: rotate(180deg); }
+.sidebar .nav-sub {
+  display: none; margin: .15rem 0 .35rem .9rem; padding-left: .6rem;
+  border-left: 1px solid rgba(148, 163, 184, .22);
+}
+.sidebar .nav-sub.open { display: block; }
+.sidebar .nav-sub .nav-link {
+  font-size: .84rem; padding: .34rem .55rem;
+  height: auto; min-height: 34px; margin: 1px 0;
+}
+.sidebar .nav-sub .nav-link i { font-size: 15px; width: 15px; text-align: center; flex: 0 0 15px; }
+.layout.sidebar-collapsed .sidebar .nav-sub { display: none !important; }
+.layout.sidebar-collapsed .sidebar .nav-parent { justify-content: center; padding: 0; }
+.layout.sidebar-collapsed .sidebar .nav-parent .nav-label { opacity: 0; width: 0; overflow: hidden; }
+.layout.sidebar-collapsed .sidebar .nav-parent .nav-caret { display: none; }
+

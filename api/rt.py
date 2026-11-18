@@ -477,3 +477,36 @@ def rt_control():
         return _fail("action 必须是 start / stop / reconcile 之一")
     except Exception as exc:
         return _fail(f"守护控制失败: {exc}", 500)
+
+
+# ------------------------- 孤儿数据维护（2026-11-14） -------------------------
+@api_bp.route("/rt/orphans", methods=["GET"])
+@login_required
+def rt_orphans():
+    """孤儿实时保护数据扫描。
+
+    备份任务删除后 ``rt_tasks`` / ``rt_capture_state`` / 段目录不会自动回收，
+    实测堆积 210 行 + 105MB，还会让健康看板出现僵尸状态。这里只读扫描。
+    """
+    from core.rt_backup import maintenance
+    try:
+        return jsonify({"ok": True, "data": maintenance.scan_orphans()})
+    except Exception as exc:
+        return _fail(f"扫描孤儿数据失败: {exc}", 500)
+
+
+@api_bp.route("/rt/orphans/purge", methods=["POST"])
+@login_required
+def rt_orphans_purge():
+    """清理孤儿数据。默认 dry_run=true（只预览不落刀）。"""
+    from core.rt_backup import maintenance
+    data = request.get_json(silent=True) or {}
+    dry_run = data.get("dry_run")
+    dry_run = True if dry_run is None else bool(dry_run)
+    purge_logs = data.get("purge_logs")
+    purge_logs = True if purge_logs is None else bool(purge_logs)
+    try:
+        res = maintenance.purge_orphans(dry_run=dry_run, purge_logs=purge_logs)
+        return jsonify({"ok": True, "data": res})
+    except Exception as exc:
+        return _fail(f"清理孤儿数据失败: {exc}", 500)

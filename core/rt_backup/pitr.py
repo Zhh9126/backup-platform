@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -64,6 +65,38 @@ _MYSQL_ENGINES = ("mysql", "mariadb")
 _PG_ENGINES = ("postgresql", "postgres", "pg")
 # T06 已具备日志捕获、但尚不支持自动回放的信创引擎（拍板 Q3/Q4）
 _T06_CDC_ENGINES = ("oracle", "kingbase", "dameng")
+
+# 用户/前端传入的「无时区」时间点（可选秒）——需补时区后再做字符串比较
+_NAIVE_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?$")
+
+
+def normalize_ts(ts: str) -> str:
+    """把目标时间点归一成与 recovery_journal.pit_at 相同的格式。
+
+    2026-11-13 真机暴露：journal 里的 pit_at 是
+    ``2026-11-13T21:07:16+08:00``，而前端/脚本常传
+    ``2026-11-13 21:07:56``（空格分隔、无时区）。SQL 用字符串比较
+    ``pit_at <= ?`` 时，``'T'``(0x54) > ``' '``(0x20)，**所有恢复点都被判成
+    “晚于目标时间”**，链头 db-full 被整条丢弃 → 报
+    “链头缺失基准全量：最早可用点 N 为 db-log，请先做一次全量备份”，
+    与真实原因完全不符。这里统一：
+
+    - 空格分隔 → ``T`` 分隔；
+    - 无时区 → 按平台本地时区补齐（与 ``db.now_iso()`` 一致）；
+    - 空值 → 当前时间（恢复到最新）。
+    """
+    s = (ts or "").strip()
+    if not s:
+        return db.now_iso()
+    s = s.replace(" ", "T", 1)
+    if _NAIVE_TS_RE.match(s):
+        try:
+            offset = db.now_iso()[-6:]      # 形如 +08:00
+        except Exception:
+            offset = ""
+        if offset and (offset[0] in "+-" and ":" in offset):
+            return s + offset
+    return s
 
 
 class PITRRestore:
@@ -137,7 +170,7 @@ class PITRRestore:
                                gap_reason=f"任务 {task_id} 不存在")
 
         rt_cfg = RtConfig.from_task(task)
-        target_ts = (target_ts or "").strip() or db.now_iso()
+        target_ts = normalize_ts(target_ts)
 
         chain = self.journal.resolve_chain(task_id, target_ts)
         kind = self._infer_kind(chain, rt_cfg)
@@ -297,7 +330,7 @@ class PITRRestore:
         db.add_log("info" if outcome.get("ok") else "error", "rt.pitr",
                    f"任务 {task_id} PITR 恢复至 {plan.target_ts} "
                    f"{'成功' if outcome.get('ok') else '失败'}：{message}")
-        return {
+        result = {
             "ok": bool(outcome.get("ok")),
             "message": message,
             "plan": plan.to_dict(),
@@ -306,6 +339,11 @@ class PITRRestore:
             "restore_id": restore_id,
             "detail": outcome.get("detail") or {},
         }
+        # GTID 模式 PITR 语义透出（顶层供 API/UI 直接读取）
+        for k in ("gtid_mode", "gtid_preserved"):
+            if k in outcome:
+                result[k] = outcome[k]
+        return result
 
     # ------------------------------------------------------------------
     # 具体恢复路径
@@ -443,12 +481,17 @@ class PITRRestore:
         log_segments = [p for p in plan.chain if p.rp_kind == RP_DB_LOG]
         suffix = (f"；日志段 {len(log_segments)} 个，停止位点 "
                   f"{plan.stop_binlog_file or plan.stop_lsn or '-'}")
-        return {
+        result = {
             "ok": bool(raw.get("ok")),
             "simulated": False,
             "message": f"{raw.get('message') or '恢复完成'}{suffix}",
             "detail": {k: v for k, v in raw.items() if k != "message"},
         }
+        # GTID 模式 PITR 语义上提（配合 restore() 顶层透出）
+        for k in ("gtid_mode", "gtid_preserved"):
+            if k in raw:
+                result[k] = raw[k]
+        return result
 
     @staticmethod
     def _target_conn(task: dict, target: dict) -> Dict[str, Any]:

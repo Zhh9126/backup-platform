@@ -241,7 +241,7 @@
 
 <div class="toolbar">
   <div>
-    <div class="page-title"><i class="bi bi-speedometer2"></i> 仪表盘</div>
+    <div class="page-title"><i class="bi bi-speedometer2"></i> {{ brand.title if brand and brand.title else '仪表盘' }}</div>
     <div class="page-sub">备份任务与记录总览</div>
   </div>
   <div class="d-flex gap-2">
@@ -254,6 +254,10 @@
     <button class="btn btn-sm btn-outline-secondary" onclick="location.href='/drills'">
       <i class="bi bi-shield-check"></i> 恢复演练
     </button>
+    <a class="btn btn-sm btn-dark" href="/screen" target="_blank" rel="noopener"
+       title="打开领导驾驶舱大屏（1920x1080 自适应，适合投屏汇报；按 F11 全屏，Esc 退出）">
+      <i class="bi bi-easel2-fill"></i> 进入大屏
+    </a>
   </div>
 </div>
 
@@ -447,7 +451,10 @@
   </div>
   <div class="col-md-4">
     <div class="card p-3 h-100">
-      <h6 class="mb-2"><i class="bi bi-calendar-event"></i> 即将执行</h6>
+      <div class="d-flex align-items-center justify-content-between mb-2">
+        <h6 class="mb-0"><i class="bi bi-calendar-event"></i> 正在执行 / 即将执行</h6>
+        <a href="/tasks" class="small text-decoration-none">任务 <i class="bi bi-arrow-right-short"></i></a>
+      </div>
       <div id="nextRunsBox"></div>
     </div>
   </div>

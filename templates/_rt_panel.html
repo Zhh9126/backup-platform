@@ -97,12 +97,13 @@
 
 <div class="toolbar">
   <div>
-    <div class="page-title">实时备份 · PITR 时间轴</div>
-    <div class="page-sub">准 CDP 持续数据保护：数据库日志流 + 文件变更捕获，支持恢复到时间轴上的任意时刻</div>
+    <div class="page-title">实时备份</div>
+    <div class="page-sub">持续捕获数据库日志与文件变更：按恢复点整库恢复到任意时刻，也可下钻到行级变更做精细化回滚</div>
   </div>
   <div class="d-flex gap-2">
     <button class="btn btn-primary btn-sm" id="rtCreateBtn" type="button" title="从已有备份任务开启实时保护"><i class="bi bi-plus-lg"></i> 创建实时保护任务</button>
     <button class="btn btn-outline-secondary btn-sm" id="rtReconcileBtn" type="button" title="立即对账任务配置"><i class="bi bi-arrow-repeat"></i> 对账</button>
+    <button class="btn btn-outline-warning btn-sm" id="rtOrphanBtn" type="button" title="清理已删除备份任务残留的实时保护记录与日志段"><i class="bi bi-trash3"></i> 清理孤儿数据</button>
     <button class="btn btn-outline-secondary btn-sm" id="rtRefreshBtn" type="button" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
   </div>
 </div>
@@ -112,7 +113,7 @@
   <i class="bi bi-broadcast-pin rt-empty-icon"></i>
   <h5 class="mt-3 mb-1" style="font-weight:var(--weight-semibold);color:var(--text-primary)">尚未开启任何实时保护任务</h5>
   <p class="text-muted mb-4" style="font-size:var(--font-size-base)">
-    实时保护在常规备份之外持续捕获变更，把 RPO 从「小时级」压缩到「秒级 / 分钟级」，并生成可任意选点的 PITR 时间轴。
+    实时保护在常规备份之外持续捕获变更，把 RPO 从「小时级」压缩到「秒级 / 分钟级」，并生成可任意选点的恢复点时间轴。
   </p>
   <div class="rt-steps mb-4">
     <div class="rt-step">

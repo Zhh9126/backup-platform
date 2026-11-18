@@ -201,11 +201,14 @@ def run_plan(plan_id: int, operator: str = "") -> dict:
     plan = get_plan(plan_id)
     if not plan:
         raise PlanError(f"保护计划不存在: {plan_id}")
+    from concurrent.futures import ThreadPoolExecutor
+
     from core import scheduler as sched
     started = time.time()
-    results = []
-    for m in plan["members"]:
+
+    def _run_member(m: dict) -> dict:
         tid = m["task_id"]
+        rec_id, at, status, msg = None, None, "failed", ""
         try:
             rec = sched.run_task_now(tid, operator=operator or "ai-plan")
             rec_id = rec.get("id") if isinstance(rec, dict) else None
@@ -218,13 +221,24 @@ def run_plan(plan_id: int, operator: str = "") -> dict:
             # 状态兜底：取该任务最近记录
             if not rec_id:
                 rec_id, at = _member_record_at(tid)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - 单成员失败不阻断组
             rec_id, at = _member_record_at(tid)
             status, msg = "error", str(e)[:200]
-        results.append({"task_id": tid, "task_name": m.get("task_name"),
-                        "layer": m.get("layer"), "layer_cn": _LAYER_CN.get(m.get("layer"), ""),
-                        "record_id": rec_id, "status": status,
-                        "at": at, "message": msg[:200]})
+        return {"task_id": tid, "task_name": m.get("task_name"),
+                "layer": m.get("layer"), "layer_cn": _LAYER_CN.get(m.get("layer"), ""),
+                "record_id": rec_id, "status": status,
+                "at": at, "message": (msg or "")[:200]}
+
+    # 成员并发驱动：串行会让后跑成员的备份时间比前面的晚几分钟，
+    # 组恢复点的层间偏差（drift）必然超阈值，与"一致性组"语义相悖。
+    members = plan["members"]
+    workers = min(4, max(1, len(members)))
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            results = list(ex.map(_run_member, members))
+    else:
+        results = [_run_member(m) for m in members]
+    mode = "parallel" if workers > 1 else "serial"
 
     ats = sorted([r["at"] for r in results if r["at"]])
     epoch = ats[0] if ats else None
@@ -246,6 +260,7 @@ def run_plan(plan_id: int, operator: str = "") -> dict:
         "consistency": ("跨层一致" if (ok and drift_ok)
                         else ("偏差超阈值" if ok else "存在失败成员")),
         "members": results,
+        "mode": mode,
         "duration_sec": round(time.time() - started, 1),
         "run_at": _now(),
     }

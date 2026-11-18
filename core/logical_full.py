@@ -397,8 +397,13 @@ def _mysqldump_to_file(cmd: list, env: dict, fpath: str):
 def backup_full_instance(db_type: str, *, host, port, user, password,
                          dump_tool: str, out_path: str,
                          query_tool: str = "", dumpall_tool: str = "",
-                         include_system_dbs: bool = False) -> dict:
-    """本机全实例备份：逐库一个文件 + globals（PG 系）→ tar.gz。返回 manifest。"""
+                         include_system_dbs: bool = False,
+                         parallel: int = 1) -> dict:
+    """本机全实例备份：逐库一个文件 + globals（PG 系）→ tar.gz。返回 manifest。
+
+    parallel > 1 时逐库 dump 并发执行（引擎级并行，见 core/parallel_plan.py）；
+    单库失败仍按"整任务如实失败"处理，并保留首个失败库的真实诊断。
+    """
     cfg = TOOLING[db_type]
     env = _build_env(db_type, password)
     is_pg = db_type in PG_FAMILY
@@ -497,7 +502,8 @@ def backup_full_instance(db_type: str, *, host, port, user, password,
                 "-u", user, "-N", "-e", "SELECT @@global.gtid_mode",
             ], env, timeout=60)
             gtid_on = _rc == 0 and (_out or "").strip().upper().startswith("ON")
-        for idx, d in enumerate(dbs, 1):
+        def _dump_one(d: str) -> int:
+            """dump 单库 → 产物字节数；失败抛 RuntimeError（消息已带真实诊断）。"""
             if is_pg:
                 rc, _o, err = _run([
                     dump_tool, "-h", str(host), "-p", str(port), "-U", user,
@@ -533,25 +539,73 @@ def backup_full_instance(db_type: str, *, host, port, user, password,
                 raise RuntimeError(
                     "库 %s dump 失败(rc=%s): %s"
                     % (d, rc, (err or "").strip()[:300] or "命令未输出 stderr（请检查该库的读取权限与磁盘）"))
-
             try:
-                size = os.path.getsize(os.path.join(
+                return os.path.getsize(os.path.join(
                     dbs_dir, f"{d}.dump" if is_pg else f"{d}.sql"))
             except OSError:
-                size = 0
-            free_now = disk_free(work)
-            floor = max(prev_size, size) * 2
-            if prev_size and size and free_now >= 0 and free_now < floor:
-                raise RuntimeError(
-                    "磁盘空间不足，已在第 %d/%d 个库（%s）后提前终止，避免产出残缺备份："
-                    "已完成 %s；临时工作目录 %s 剩余 %s，不足以容纳下一个库"
-                    "（上一个库 dump %s，按 2 倍预留需 %s）。"
-                    "处置：清理该分区 / 把任务「产物根目录」改到空间充足的分区 / "
-                    "用环境变量 BP_WORK_DIR 指定更大的临时工作目录"
-                    % (idx, len(dbs), d, "、".join(dbs[:idx]), work,
-                       human_size(free_now), human_size(max(prev_size, size)),
-                       human_size(floor)))
-            prev_size = max(prev_size, size)
+                return 0
+
+        # 引擎并行：逐库 dump 并发（每库一个独立 dump 进程）。平台并发被压到
+        # 1~2 路时，几十个库的大实例靠它把单任务耗时和排队 drift 压下来。
+        dumps_par = max(1, min(int(parallel or 1), len(dbs)))
+        if dumps_par <= 1:
+            for idx, d in enumerate(dbs, 1):
+                size = _dump_one(d)
+                free_now = disk_free(work)
+                floor = max(prev_size, size) * 2
+                if prev_size and size and free_now >= 0 and free_now < floor:
+                    raise RuntimeError(
+                        "磁盘空间不足，已在第 %d/%d 个库（%s）后提前终止，避免产出残缺备份："
+                        "已完成 %s；临时工作目录 %s 剩余 %s，不足以容纳下一个库"
+                        "（上一个库 dump %s，按 2 倍预留需 %s）。"
+                        "处置：清理该分区 / 把任务「产物根目录」改到空间充足的分区 / "
+                        "用环境变量 BP_WORK_DIR 指定更大的临时工作目录"
+                        % (idx, len(dbs), d, "、".join(dbs[:idx]), work,
+                           human_size(free_now), human_size(max(prev_size, size)),
+                           human_size(floor)))
+                prev_size = max(prev_size, size)
+        else:
+            import threading as _threading
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            _lock = _threading.Lock()
+            _space = {"seen": 0, "err": None}
+            _order = {d: i for i, d in enumerate(dbs)}
+
+            def _guarded(d: str) -> int:
+                size = _dump_one(d)
+                with _lock:
+                    if _space["err"] is None:
+                        free_now = disk_free(work)
+                        floor = max(_space["seen"], size) * 2
+                        if _space["seen"] and size and free_now >= 0 and free_now < floor:
+                            _space["err"] = RuntimeError(
+                                "磁盘空间不足，并行 dump 第 %d/%d 个库（%s）后提前终止："
+                                "临时工作目录 %s 剩余 %s，不足以容纳下一个库"
+                                "（上一个库 dump %s，按 2 倍预留需 %s）。"
+                                "处置：清理该分区 / 把任务「产物根目录」改到空间充足的分区 / "
+                                "用环境变量 BP_WORK_DIR 指定更大的临时工作目录"
+                                % (_order[d] + 1, len(dbs), d, work,
+                                   human_size(free_now),
+                                   human_size(max(_space["seen"], size)),
+                                   human_size(floor)))
+                    _space["seen"] = max(_space["seen"], size)
+                return size
+
+            first_err = None
+            with ThreadPoolExecutor(max_workers=dumps_par,
+                                    thread_name_prefix="aidbm-dbdump") as _ex:
+                futs = {_ex.submit(_guarded, d): d for d in dbs}
+                for _fut in as_completed(futs):
+                    _d = futs[_fut]
+                    try:
+                        _fut.result()
+                    except Exception as _de:  # noqa: BLE001 —— 按库顺序取首个错误
+                        if first_err is None or _order[_d] < _order[first_err[0]]:
+                            first_err = (_d, _de)
+            if first_err:
+                raise first_err[1]
+            if _space["err"] is not None:
+                raise _space["err"]
 
         globals_status = "na"
         globals_path = ""
@@ -584,6 +638,8 @@ def backup_full_instance(db_type: str, *, host, port, user, password,
             # （恢复到异实例不卡 GTID）；events 缺表自动降级记录
             "gtid_purged_off": bool(gtid_on),
             "events_retry_notes": events_retry_notes,
+            # 引擎并行度（逐库并发 dump）：审计/报告可由此解释耗时与 drift
+            "parallel_dump": dumps_par,
         }
         with open(os.path.join(work, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, ensure_ascii=False, indent=2)

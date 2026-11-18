@@ -127,6 +127,36 @@ class RtSupervisor:
             self._last_error = f"创建锁目录失败: {exc}"
             return False
 
+        # 首选内核 flock：进程退出（含 SIGKILL/OOM）时内核自动释放，
+        # 天然免疫「陈旧锁」与「PID 复用」两类误判。
+        # 2026-11-14 实测：锁里记录的是已被 kill 的 PID，但该 PID 恰好被系统
+        # 复用给别的进程，`_lock_owner_alive` 误判为存活 → 112 个实时任务
+        # 全程停止捕获且新进程永久拒绝接管。基于 PID/mtime 的启发式天生不可靠。
+        try:
+            import fcntl
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                self.logger.info("[rt.supervisor] 已有活跃守护持有文件锁 %s，本进程不启动",
+                                 path.replace("\\", "/"))
+                return False
+            try:
+                os.ftruncate(fd, 0)
+                os.write(fd, f"{os.getpid()}\n{db.now_iso()}\n".encode("utf-8"))
+            except OSError:
+                pass
+            self._lock_fd = fd
+            return True
+        except ImportError:                 # 非 POSIX：回落旧逻辑
+            pass
+        except OSError as exc:
+            self.logger.debug("[rt.supervisor] flock 不可用，回落独占创建：%s", exc)
+
         for attempt in (1, 2):
             try:
                 fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -255,6 +285,11 @@ class RtSupervisor:
             self._tick_count = 0
 
         try:
+            self._purge_orphan_state()
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("[rt.supervisor] 清理孤儿实时状态失败: %s", exc)
+
+        try:
             summary = self.reconcile()
         except Exception as exc:
             summary = {"error": str(exc)}
@@ -365,6 +400,41 @@ class RtSupervisor:
     # ==================================================================
     # 对账
     # ==================================================================
+    def _purge_orphan_state(self) -> None:
+        """清理「主任务已不存在」的实时状态残留（启动时执行一次）。
+
+        场景：任务被删除/重建（或历史版本删除任务时未级联清理）后，
+        ``rt_tasks`` / ``rt_capture_state`` 里留着 failed 行——
+        ①仪表盘/大屏会把 ``degrade_reason`` 算进「实时异常」；
+        ②监督进程可能反复尝试拉起一个不存在的任务，日志刷屏。
+        这里按 backup_tasks 里现存的任务 id 做一次对账删除。
+        """
+        try:
+            alive = {int(r["id"]) for r in db.query("SELECT id FROM backup_tasks")}
+        except Exception:  # noqa: BLE001
+            return
+        removed = 0
+        for tbl in ("rt_tasks", "rt_capture_state", "recovery_journal"):
+            try:
+                rows = db.query("SELECT DISTINCT task_id FROM %s" % tbl)
+            except Exception:  # noqa: BLE001
+                continue
+            for r in rows:
+                try:
+                    tid = int(r["task_id"])
+                except (TypeError, ValueError, KeyError):
+                    continue
+                if tid in alive:
+                    continue
+                try:
+                    db.execute("DELETE FROM %s WHERE task_id=?" % tbl, (tid,))
+                    removed += 1
+                except Exception:  # noqa: BLE001
+                    pass
+        if removed:
+            self.logger.info("[rt.supervisor] 已清理 %d 条孤儿实时状态（任务已不存在）",
+                             removed)
+
     def reconcile(self) -> dict:
         """按 ``backup_tasks.rt_enabled`` 对账 worker 集合。
 

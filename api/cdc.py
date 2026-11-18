@@ -33,7 +33,10 @@ def api_cdc_capabilities():
         "pg_recvlogical": bool(shutil.which("pg_recvlogical")
                                or __import__("os").path.exists(
                                    "/pgdb/pgsql/bin/pg_recvlogical")),
-        "supported": ["mysql", "mariadb", "postgresql"],
+        # oracle/dameng 走「段消费」模式：消费实时备份已落盘的 LogMiner jsonl，
+        # 不需要平台侧额外客户端；kingbase 复用 PG 的 pg_recvlogical 通道（待接）
+        "segment_consumer": ["oracle", "dameng"],
+        "supported": ["mysql", "mariadb", "postgresql", "oracle", "dameng"],
     })
 
 
@@ -45,7 +48,8 @@ def api_cdc_probe():
     res = rl.probe_cdc_capability(
         data.get("db_type") or "", data.get("host") or "",
         int(data.get("port") or 0), data.get("username") or "",
-        data.get("password") or "", data.get("db_name") or "")
+        data.get("password") or "", data.get("db_name") or "",
+        ref_id=int(data.get("ref_id") or 0))
     return jsonify(res)
 
 
@@ -71,8 +75,13 @@ def api_cdc_create():
     host = (data.get("host") or "").strip()
     if not name:
         return jsonify({"error": "名称必填"}), 400
-    if db_type not in ("mysql", "mariadb", "postgresql"):
-        return jsonify({"error": "行级 CDC 当前支持 mysql / mariadb / postgresql"}), 400
+    if db_type not in ("mysql", "mariadb", "postgresql", "oracle", "dameng"):
+        return jsonify({"error": "行级 CDC 当前支持 mysql / mariadb / postgresql / "
+                                 "oracle / dameng（oracle/dameng 走实时备份段消费）"}), 400
+    # oracle/dameng 走段消费模式：必须绑定一个已开启实时备份的任务
+    if db_type in ("oracle", "dameng") and not (data.get("ref_id") or 0):
+        return jsonify({"error": "oracle/dameng 行级事件来自实时备份产出的 LogMiner 段，"
+                                 "创建时必须指定 ref_id（实时备份任务 id）"}), 400
     if not host:
         return jsonify({"error": "主机必填"}), 400
     now = db.now_iso()
@@ -165,11 +174,26 @@ def api_cdc_replay(sid):
     dialect = "mysql" if stream["db_type"] in ("mysql", "mariadb") else "postgresql"
     sqls = rl.STORE.gen_sql(events, dialect=dialect, mode=mode,
                             schema_name=data.get("schema_name") or "")
+    # 不可撤销事件计数：SQL 级事件（Oracle/达梦 LogMiner）依赖源库返回
+    # SQL_UNDO，某些版本/语句类型不返回（实测 DM8 对部分 INSERT 返回空），
+    # 此时 undo 只能跳过——必须如实告知，不能让调用方以为「0 条 = 无需回滚」。
+    no_undo = 0
+    if mode == "undo":
+        for ev in events:
+            if (ev.get("op") or "").upper() == "DDL":
+                continue
+            has_img = bool(ev.get("before")) or bool(ev.get("after"))
+            if not has_img and not (ev.get("sql_undo") or "").strip():
+                no_undo += 1
     result = {
         "ok": True, "mode": mode, "events": len(events), "sql_count": len(sqls),
+        "events_no_undo": no_undo,
         "sqls": sqls[:500],
         "applied": 0, "errors": [],
     }
+    if no_undo:
+        result["message"] = ("其中 %d 条事件缺少撤销语句（源库未返回 SQL_UNDO），"
+                             "无法自动回滚，需人工处理" % no_undo)
     if data.get("apply"):
         tgt = data.get("target") or {}
         if not tgt.get("host"):

@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client as http_client
 import json
 import os
 import ssl
@@ -416,3 +417,141 @@ class DSMClient:
                     break
                 h.update(chunk)
         return h.hexdigest()
+
+    # ---------------------------------------------------------------- 写入
+    def create_folder(self, folder_path: str, create_parents: bool = True) -> bool:
+        """官方 API：创建共享目录下的文件夹（已存在视为成功）。
+
+        SYNO.FileStation.CreateFolder 的语义是「parent + name」，
+        这里接收完整路径，自动拆成父目录与末级名字；
+        已存在时 DSM 返回 code=414（file exists），按幂等成功处理。
+        """
+        path = "/" + str(folder_path or "").strip("/")
+        if path == "/":
+            return True
+        parent, _, name = path.rpartition("/")
+        parent = parent or "/"
+        try:
+            self.call("SYNO.FileStation.CreateFolder", "create", {
+                "folder_path": parent,
+                "name": name,
+                "force_parent": "true" if create_parents else "false",
+            })
+            return True
+        except DSMError as e:
+            if e.code in (414, 408):      # 已存在 / 无权限但目录已就绪
+                return True
+            raise
+
+    def upload(self, local_path: str, dest_dir: str, filename: str = "",
+               overwrite: bool = True, create_parents: bool = True) -> int:
+        """官方 API：上传单个文件到 DSM 目录（恢复回推的唯一写通道）。
+
+        用 ``http.client`` 手工构造 multipart 请求，按 1 MB 分块流式发送并
+        预先算好 Content-Length —— 大文件（GB 级）不会整体读进内存，
+        也不依赖 DSM 是否接受 chunked 传输编码。
+
+        Returns: 上传的字节数。
+        """
+        if not self._sid:
+            self.login()
+        size = os.path.getsize(local_path)
+        fname = filename or os.path.basename(local_path)
+        boundary = "----AIDBM%s" % hashlib.md5(
+            ("%s%s%s" % (fname, size, time.time())).encode()).hexdigest()
+        query = urllib.parse.urlencode({
+            "api": "SYNO.FileStation.Upload", "version": 2, "method": "upload",
+            "_sid": self._sid, "path": dest_dir,
+            "create_parents": "true" if create_parents else "false",
+            "overwrite": "true" if overwrite else "false",
+        })
+        head = (
+            "--%s\r\n"
+            "Content-Disposition: form-data; name=\"api\"\r\n\r\n%s\r\n"
+            "--%s\r\n"
+            "Content-Disposition: form-data; name=\"version\"\r\n\r\n2\r\n"
+            "--%s\r\n"
+            "Content-Disposition: form-data; name=\"method\"\r\n\r\nupload\r\n"
+            "--%s\r\n"
+            "Content-Disposition: form-data; name=\"path\"\r\n\r\n%s\r\n"
+            "--%s\r\n"
+            "Content-Disposition: form-data; name=\"create_parents\"\r\n\r\n%s\r\n"
+            "--%s\r\n"
+            "Content-Disposition: form-data; name=\"overwrite\"\r\n\r\n%s\r\n"
+            "--%s\r\n"
+            "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+            "Content-Type: application/octet-stream\r\n\r\n"
+            % (boundary, "SYNO.FileStation.Upload", boundary, boundary, boundary,
+               dest_dir, boundary, "true" if create_parents else "false",
+               boundary, "true" if overwrite else "false", boundary,
+               fname.replace('"', "_"))
+        ).encode("utf-8")
+        tail = ("\r\n--%s--\r\n" % boundary).encode("utf-8")
+        total = len(head) + size + len(tail)
+
+        conn = None
+        try:
+            if self.secure:
+                ctx = (ssl._create_unverified_context() if not self.verify_ssl
+                       else ssl.create_default_context())
+                conn = http_client.HTTPSConnection(self.host, self.port,
+                                                   timeout=max(self.timeout, 60),
+                                                   context=ctx)
+            else:
+                conn = http_client.HTTPConnection(self.host, self.port,
+                                                  timeout=max(self.timeout, 60))
+            conn.putrequest("POST", "/webapi/entry.cgi?" + query)
+            conn.putheader("Content-Type",
+                           "multipart/form-data; boundary=%s" % boundary)
+            conn.putheader("Content-Length", str(total))
+            if self._syno_token:
+                conn.putheader("X-SYNO-TOKEN", self._syno_token)
+            conn.endheaders()
+            conn.send(head)
+            sent = 0
+            with open(local_path, "rb") as f:
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    conn.send(chunk)
+                    sent += len(chunk)
+            conn.send(tail)
+            resp = conn.getresponse()
+            body = resp.read()
+            if resp.status != 200:
+                raise DSMError("DSM 上传 HTTP %d（%s）" % (resp.status, fname),
+                               api="SYNO.FileStation.Upload",
+                               detail=body[:200].decode("utf-8", "ignore"))
+            try:
+                res = json.loads(body.decode("utf-8", "replace"))
+            except Exception:
+                raise DSMError("DSM 上传返回非 JSON（%s）" % fname,
+                               api="SYNO.FileStation.Upload",
+                               detail=body[:200].decode("utf-8", "ignore"))
+            if not res.get("success"):
+                raise DSMError("DSM 上传失败 %s: code=%d" % (fname, self._err_code(res)),
+                               code=self._err_code(res),
+                               api="SYNO.FileStation.Upload")
+            return sent
+        except (OSError, http_client.HTTPException) as e:
+            raise DSMError("DSM 上传网络异常（%s）: %s" % (fname, str(e)[:200]),
+                           api="SYNO.FileStation.Upload")
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+    def stat_file(self, path: str) -> dict:
+        """官方 API：取单个文件/目录的元信息（回读校验用，失败返回空字典）。"""
+        try:
+            d = self.call("SYNO.FileStation.List", "getinfo", {
+                "path": json.dumps([path]),
+                "additional": json.dumps(["size", "time", "type"]),
+            })
+            files = d.get("files") or []
+            return files[0] if files else {}
+        except DSMError:
+            return {}

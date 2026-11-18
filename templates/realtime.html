@@ -1,40 +1,31 @@
 {% extends "base.html" %}
-{% block title %}实时备份（CDC / CDP） · AIDBM{% endblock %}
+{% block title %}实时备份 · AIDBM{% endblock %}
 {% block content %}
-<!-- 实时备份：把「准 CDP 恢复点时间轴（PITR）」与「CDC 行级变更捕获与回放」
-     两套能力合成一个菜单入口，页面内以标签页切换。 -->
-<ul class="nav nav-tabs mb-3" id="rtTabs" role="tablist">
-  <li class="nav-item" role="presentation">
-    <a class="nav-link active" id="tabRtBtn" data-bs-toggle="tab" href="#tabRt" role="tab" title="准 CDP：持续捕获恢复点，可恢复到时间轴任意时刻">
-      <i class="bi bi-broadcast-pin"></i> PITR 时间轴（准 CDP）
-    </a>
-  </li>
-  <li class="nav-item" role="presentation">
-    <a class="nav-link" id="tabCdcBtn" data-bs-toggle="tab" href="#tabCdc" role="tab" title="CDC：行级变更捕获、事件查看、撤销回滚 / 重放到目标库">
-      <i class="bi bi-broadcast"></i> CDC 变更捕获与回放
-    </a>
-  </li>
-</ul>
+<!-- 实时备份（统一页面）：不再区分「PITR/准 CDP」与「CDC」两个标签页。
+     同一条日志流产出两样东西——恢复点（可整库恢复到任意时刻）
+     与行级变更（可下钻做精细化回滚/重放），所以合成一个页面按上下顺序呈现。 -->
+{% include "_rt_panel.html" %}
 
-<div class="tab-content" id="rtTabsContent">
-  <div class="tab-pane fade show active" id="tabRt" role="tabpanel" aria-labelledby="tabRtBtn">
-    {% include "_rt_panel.html" %}
-  </div>
-  <div class="tab-pane fade" id="tabCdc" role="tabpanel" aria-labelledby="tabCdcBtn">
-    {% include "_cdc_panel.html" %}
-  </div>
+<div class="d-flex align-items-center gap-2 my-4">
+  <hr class="flex-grow-1 m-0">
+  <span class="text-muted small px-2"><i class="bi bi-chevron-double-down"></i> 下钻：同一条日志里的行级变更</span>
+  <hr class="flex-grow-1 m-0">
+</div>
+
+<div id="rtChangeDetail">
+  {% include "_cdc_panel.html" %}
 </div>
 {% endblock %}
 {% block scripts %}
-<script src="/static/js/cdc.js?v=2026111107"></script>
+<script src="/static/js/cdc.js?v=2026111404"></script>
 <script>
-  /* ?tab=cdc 深链：旧的 /cdc 入口重定向到本页时直接切到 CDC 面板；?task_id= 由 app.js 的 PITR 深链逻辑处理 */
+  /* 兼容旧深链：?tab=cdc / ?cdp 不再切标签，改为滚动到「变更明细」区 */
   (function () {
     try {
       var t = new URLSearchParams(window.location.search).get('tab');
       if (t === 'cdc' || t === 'cdp') {
-        var el = document.getElementById('tabCdcBtn');
-        if (el && window.bootstrap) bootstrap.Tab.getOrCreateInstance(el).show();
+        var el = document.getElementById('rtChangeDetail');
+        if (el) setTimeout(function () { el.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 300);
       }
     } catch (e) { /* ignore */ }
   })();

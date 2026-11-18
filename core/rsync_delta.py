@@ -182,8 +182,6 @@ def _remote_sha256(cmd_prefix, remote_path: str) -> tuple:
 
 
 def _file_sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    """统一委托 core.db.sha256_file（此前 7 个模块各写一份，已收敛）。"""
+    from core import db as _db
+    return _db.sha256_file(path)

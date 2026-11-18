@@ -17,6 +17,22 @@ import subprocess
 from typing import Dict, Any
 
 
+def _ora_connect_retry(connect_fn, retries=3, delay=2.0):
+    """Oracle 直连偶发 DPY-6005/12514（171/129 监听抖动实测）：短暂重试。
+
+    connect_fn(i) -> connection；全部失败抛最后一次异常。
+    """
+    last = None
+    for i in range(max(1, retries)):
+        try:
+            return connect_fn(i)
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if i < retries - 1:
+                time.sleep(delay)
+    raise last
+
+
 def pg_template_clone(src_db: str, clone_name: str,
                       pg_host: str = "127.0.0.1", pg_port: int = None,
                       pg_user: str = "postgres",
@@ -195,13 +211,12 @@ def drop_clone_extended(db_type: str, instance_name: str,
     """扩展类型克隆清理：oracle —— DROP USER ... CASCADE。"""
     if db_type == "oracle":
         import oracledb
+        _dsn = f"{host}:{port or 1521}/{service or 'ORCL'}"
         try:
-            conn = oracledb.connect(user=user, password=password,
-                                    dsn=f"{host}:{port or 1521}/{service or 'ORCL'}",
-                                    tcp_connect_timeout=15)
+            conn = _ora_connect_retry(lambda _i: oracledb.connect(
+                user=user, password=password, dsn=_dsn, tcp_connect_timeout=15))
         except TypeError:
-            conn = oracledb.connect(user=user, password=password,
-                                    dsn=f"{host}:{port or 1521}/{service or 'ORCL'}")
+            conn = oracledb.connect(user=user, password=password, dsn=_dsn)
         except Exception as e:
             return {"ok": False, "message": f"连接失败: {str(e)[:150]}"}
         cur = conn.cursor()

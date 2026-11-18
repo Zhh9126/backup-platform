@@ -1,0 +1,43 @@
+{
+  "id": "pigz",
+  "name": "pigz（并行 gzip）",
+  "version": "2.8",
+  "category": "common",
+  "description": "多线程 gzip 实现，大文件压缩速度提升明显；产物与 gzip 完全兼容。",
+  "required_clients": [
+    "pigz"
+  ],
+  "supports": [
+    "file",
+    "object_storage",
+    "vm"
+  ],
+  "tags": [
+    "压缩",
+    "并行",
+    "兼容gzip"
+  ],
+  "icon": "bi-file-zip",
+  "packages": {
+    "linux": {
+      "package_managers": {
+        "apt": {
+          "command": "apt-get install -y pigz",
+          "binaries": [
+            "pigz"
+          ]
+        },
+        "yum": {
+          "command": "yum install -y pigz",
+          "binaries": [
+            "pigz"
+          ]
+        }
+      }
+    }
+  },
+  "verify_after_install": [
+    "pigz --version"
+  ],
+  "fallback_note": "未安装时用 gzip 单线程"
+}

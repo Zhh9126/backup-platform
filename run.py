@@ -15,12 +15,64 @@ from core import scheduler
 app = create_app()
 
 
+def _acquire_app_lock():
+    """进程级单实例锁（内核 flock）。
+
+    必须在 ``start_scheduler()`` **之前**抢：调度器会拉起实时备份守护并抢
+    ``rt_supervisor.lock``。如果先启动调度器再绑端口，第二个 run.py 会先抢走
+    实时守护锁、然后才因端口占用失败退出——形成「HTTP 在一个进程、实时守护在
+    另一个进程」的分裂，两边都自认为正常。
+    2026-11-14 实测：127461 占 8080 无守护，128831 持 rt 锁但无 HTTP，
+    112 个实时任务的实际捕获状态无从判断。
+
+    Returns:
+        持有的 fd（保持到进程退出）；抢不到返回 None（调用方应直接退出）。
+    """
+    import os
+    try:
+        import fcntl
+    except ImportError:          # 非 POSIX：不做单实例约束
+        return True
+    inst = getattr(config, "INSTANCE_DIR", None) or os.path.dirname(
+        getattr(config, "META_DB_PATH", "instance/meta.db"))
+    try:
+        os.makedirs(str(inst), exist_ok=True)
+        path = os.path.join(str(inst), "app.lock")
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return None
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, ("%s\n" % os.getpid()).encode("utf-8"))
+        except OSError:
+            pass
+        return fd
+    except OSError:
+        return True          # 锁设施不可用时不阻断启动
+
+
 def main():
     # 日志基础设施（幂等；create_app 中已初始化，这里确保 run.py 独立启动也可用）
     from core import logging_setup, oplog
     log_dir = logging_setup.init_logging("AIDBM")
     logger = db.get_logger("run")
     logger.info("启动入口 run.py 开始执行，日志目录: %s", log_dir)
+
+    # 单实例守卫：抢不到锁说明已有实例在跑（端口/守护都在它那里），本进程
+    # 必须干净退出，绝不能继续启动调度器制造「守护与 HTTP 分裂」。
+    _app_lock = _acquire_app_lock()
+    if _app_lock is None:
+        logger.warning("检测到已有 AIDBM 实例在运行（instance/app.lock 被占用），"
+                       "本进程退出以避免双进程：HTTP 与实时守护分离会让两边都看起来正常")
+        db.add_log("WARNING", "system",
+                   "启动被拒绝：已有实例持有单实例锁（instance/app.lock）")
+        return
     # 操作日志保留策略：清理过期文件，避免长期运行占满磁盘
     try:
         removed = oplog.purge_old()

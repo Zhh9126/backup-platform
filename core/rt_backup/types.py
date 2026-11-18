@@ -343,8 +343,13 @@ class RtHealth:
         if target <= 0:
             return "green"
         if not self.last_rp_at:
-            # 刚起步、还没有任何恢复点：按运行时长宽容处理，交由 lag 判定
-            return "yellow" if self.rpo_actual_sec > 2 * target else "green"
+            # 从未产出恢复点。刚起步（RPO 未超阈值）容忍为绿；但长期没有
+            # 任何恢复点且 RPO 已超 2×target，说明「捕获在跑却从未成功入账」，
+            # 属严重异常。此前一律 yellow（顶格），实测有任务 106 天没有恢复点
+            # 仍只显示黄色，掩盖了真实故障（2026-11-14）。
+            if self.rpo_actual_sec <= target:
+                return "green"
+            return "yellow" if self.rpo_actual_sec <= 2 * target else "red"
         if self.rpo_actual_sec <= target:
             return "green"
         if self.rpo_actual_sec <= 2 * target:

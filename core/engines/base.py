@@ -258,6 +258,16 @@ class BackupStatus(str, enum.Enum):
 class BackupResult:
     success: bool
     status: str = BackupStatus.SUCCESS
+
+    def __post_init__(self):
+        # 状态归一化（2026-11-13 真机实测的假成功根因之一）：多个引擎用
+        # BackupResult(success=False, message=...) 返回失败却没显式给 status，
+        # 而 status 默认值是 SUCCESS → 调度器按 status 落库，最终页面显示
+        # 「恢复成功/备份成功」，实际什么都没做。这里强制一致。
+        if not self.success and self.status == BackupStatus.SUCCESS:
+            self.status = BackupStatus.FAILED
+        if self.success and self.status == BackupStatus.FAILED:
+            self.status = BackupStatus.SUCCESS
     backup_path: Optional[str] = None
     size_bytes: int = 0
     original_size_bytes: int = 0   # 压缩前原始数据量（用于计算压缩率）
@@ -691,9 +701,21 @@ class BackupEngine:
                 missing.append(tool)
         primary = self.required_clients[0]
         if primary in missing:
+            conn_err = ""
+            try:
+                conn_err = remote_dump.get_last_probe_error()
+            except Exception:
+                conn_err = ""
+            if conn_err:
+                # 连接层失败 ≠ 工具缺失：早前统一报「缺少工具」会把网络/限流/
+                # 凭据问题误导成"去装客户端"（2026-11-14 实测 170 SSH 限流）。
+                return False, (
+                    "远端工具探测失败：SSH 连接异常（%s）——请先排查主机连通性/"
+                    "连接数限流/凭据，而非安装客户端。待探测工具: %s"
+                    % (conn_err[:200], ", ".join(missing)))
             return False, (
                 "远端 SSH 主机缺少客户端工具: " + ", ".join(missing) +
-                "（请安装并在 PATH 中）"
+                "（请安装并在 PATH 中，或在任务高级选项配置 tool_path）"
             )
         if missing:
             self.logger.warning(
@@ -738,6 +760,15 @@ class BackupEngine:
             mode = BackupMode.LOGICAL
 
         if mode == BackupMode.PHYSICAL:
+            # 插件策略门禁（2026-11-14）：use_plugin=off / auto 无插件时，
+            # 物理通道必须真正被拦住，而不是"策略判定说不行、引擎照跑"。
+            try:
+                from core import plugin_policy as _pp
+                _blocked, _why = _pp.physical_blocked(self.task)
+                if _blocked:
+                    return False, _why
+            except Exception:
+                pass
             # 物理备份：先查远端
             try:
                 from core import remote_dump
@@ -753,6 +784,7 @@ class BackupEngine:
                     "[%s] 远端物理备份工具缺失（%s），转检查本机",
                     self.task_name, msg2)
             # 查本机自带工具（同样走兜底探测，避免 PATH 问题误报）
+            miss_phys = []
             if self.physical_bundled_tools:
                 miss_phys, _ = self._ensure_local_clients_on_path(
                     list(self.physical_bundled_tools))
@@ -763,10 +795,15 @@ class BackupEngine:
                     return True, "本机已检测到物理备份工具"
             # 无远端也无本机自带工具
             _, detail = self.check_client()
+            # 2026-11-13：原文案以 {detail}（常为 "ok"）开头且不提"物理备份"、
+            # 也不说缺哪个工具，用户看到「ok。按数据库服务器零安装原则…」完全
+            # 不知发生了什么。这里显式点名缺失工具并给出三条可操作路径。
+            lack = "、".join(miss_phys) if miss_phys else (detail or "客户端工具")
             return False, (
-                f"{detail}。按数据库服务器零安装原则：可在平台服务端【备份插件】"
-                f"页安装工具（备份时由平台临时推送执行，结束即清理），"
-                f"或纳管 SSH 主机使用数据库自带工具。"
+                f"物理备份缺少客户端工具：{lack}。按数据库服务器零安装原则："
+                f"可在平台服务端【备份插件】页安装（备份时由平台临时推送执行，"
+                f"结束即清理），或纳管 SSH 主机使用数据库自带工具，"
+                f"也可改用逻辑备份模式。"
             )
 
         # 逻辑备份：本机有客户端直接放行
@@ -1022,12 +1059,26 @@ class BackupEngine:
         return dest_dir
 
     def _new_dump_path(self, backup_type: BackupType, ext: str) -> str:
-        """生成产物落盘路径（与 _write_dump_file 命名规则一致，供流式落盘复用）。"""
+        """生成产物落盘路径（与 _write_dump_file 命名规则一致，供流式落盘复用）。
+
+        2026-11-13 对象存储真机暴露：时间戳只到秒，而对象存储/文件等轻量任务
+        一次备份几十毫秒，连续两次备份会生成**同名产物并互相覆盖**——
+        表现为「按时间点恢复到第 1 次备份」实际拿到的是第 2 次的数据。
+        这里做存在性检查，重名时追加短随机后缀，保证每次产物唯一。
+        """
         out_dir = self._output_dir()
         os.makedirs(out_dir, exist_ok=True)
         ts = self._timestamp()
         bt = backup_type.value if isinstance(backup_type, BackupType) else str(backup_type)
-        return os.path.join(out_dir, f"{ts}__{self.task_name}__{bt}{ext}")
+        base = os.path.join(out_dir, f"{ts}__{self.task_name}__{bt}")
+        path = f"{base}{ext}"
+        if os.path.exists(path):
+            import uuid as _uuid
+            for _ in range(8):
+                cand = f"{base}__{_uuid.uuid4().hex[:8]}{ext}"
+                if not os.path.exists(cand):
+                    return cand
+        return path
 
     def _write_dump_file(self, data: bytes, backup_type: BackupType,
                           ssh_host: dict, ext: str, label: str) -> BackupResult:
@@ -1057,6 +1108,8 @@ class BackupEngine:
         from core import remote_dump
         comp = int(self.task.get("compress") or 0)
         extra0 = self._extra_dict() if hasattr(self, "_extra_dict") else {}
+        task_for_dump = self.task      # 可能被"并行需目录格式"改写
+        par_note = ""
         db_name = self.task.get("db_name") or ""
         schemas = [str(s).strip() for s in (extra0.get("schemas") or []) if str(s).strip()]
         tables = [str(t).strip() for t in (extra0.get("tables") or []) if str(t).strip()]
@@ -1070,13 +1123,32 @@ class BackupEngine:
         else:
             from core import dump_format as _dfmt
             spec = _dfmt.resolve(db_type, extra0, compress=bool(comp))
+            # 引擎并行：PG 系的 -j 只在目录格式(-Fd)有效。任务要求并行但格式
+            # 非目录 → 自动切目录格式，并把改写后的 extra_options 传给
+            # remote_dump（**同一份**决策，避免"命令切了格式、后缀没切"）。
+            if db_type in ("postgresql", "kingbase", "opengauss", "panwei") \
+                    and not spec.get("dir"):
+                try:
+                    from core import parallel_plan as _pp
+                    _bpar = int(_pp.resolve(self.task)["workers"])
+                except Exception:
+                    _bpar = 1
+                if _bpar > 1:
+                    spec = _dfmt.resolve(db_type, {"dump_format": "directory"},
+                                         compress=bool(comp))
+                    _eo = dict(extra0)
+                    _eo["dump_format"] = "directory"
+                    task_for_dump = dict(self.task)
+                    task_for_dump["extra_options"] = json.dumps(
+                        _eo, ensure_ascii=False)
+                    par_note = f"（已自动切换目录格式 -Fd 以启用 {_bpar} 路并行导出）"
             ext = spec.get("ext") or (".dump" if comp else ".sql")
             if spec.get("dir"):
                 ext = ".dir.tar.gz"
             fmt, calgo = "single", ("zlib" if comp else "none")
         out_path = self._new_dump_path(backup_type, ext)
         res_d = remote_dump.remote_db_dump_to_file(
-            self.task, ssh_host, db_type, out_path, comp)
+            task_for_dump, ssh_host, db_type, out_path, comp)
         size = int(res_d.get("size") or 0)
         notes = []
         if res_d.get("resumed"):
@@ -1094,7 +1166,7 @@ class BackupEngine:
             checksum=res_d.get("sha256") or "",
             compress_algo=calgo,
             message=(f"通过 SSH 在数据库服务器({hk})执行 {label} 成功 | "
-                     f"{db.human_size(size)}{note}"),
+                     f"{db.human_size(size)}{note}{par_note}"),
         )
 
     # ---------------- 远程优先回退策略 ----------------
@@ -1373,11 +1445,38 @@ class BackupEngine:
         ]
         if pw:
             lines.append(f"export PLATFORM_DB_PASSWORD={shlex_quote(pw)}")
+        lines.extend(self._custom_param_env_lines(extra))
         return lines
 
     def _custom_backup_env(self, backup_type, artifact_dir: str,
                            extra: dict, pw: str) -> list:
         return self._custom_backup_env_lines(backup_type, artifact_dir, extra, pw)
+
+    def _custom_param_env_lines(self, extra: dict) -> list:
+        """把适配器 params 注入为 PLATFORM_PARAM_<KEY>（模板脚本可直接引用）。
+
+        2026-11-13 修复：db_adapters 文档一直承诺 {{PARAM_<KEY>}} →
+        PLATFORM_PARAM_<KEY>，但平台从未真正注入，模板里写
+        ``${PLATFORM_PARAM_TOOL_BIN}`` 会静默取空值（工具路径/仓库目录一类参数
+        全部失效）。这里统一在备份/恢复两条通道注入。
+        """
+        params = (extra or {}).get("custom_params") or {}
+        if isinstance(params, str):
+            try:
+                import json as _json
+                params = _json.loads(params)
+            except Exception:
+                params = {}
+        out = []
+        for k, v in (params or {}).items():
+            key = str(k).strip().upper()
+            if not key or not key[0].isalpha():
+                continue
+            if not all(c.isalnum() or c == "_" for c in key):
+                continue
+            out.append("export PLATFORM_PARAM_{}={}".format(
+                key, shlex_quote("" if v is None else str(v))))
+        return out
 
     @staticmethod
     def _custom_env_map(lines: list) -> dict:
@@ -1537,6 +1636,7 @@ class BackupEngine:
         ]
         if pw:
             env_lines.append(f"export PLATFORM_DB_PASSWORD={shlex_quote(pw)}")
+        env_lines.extend(self._custom_param_env_lines(extra))
 
         fd, script_path = tempfile.mkstemp(prefix="platform_custom_restore_", suffix=".sh")
         try:
@@ -1781,6 +1881,7 @@ class BackupEngine:
             ]
             if pw2:
                 env_lines.append(f"export PLATFORM_DB_PASSWORD={shlex_quote(pw2)}")
+            env_lines.extend(self._custom_param_env_lines(extra))
             inner = " && ".join(env_lines) + f" && bash {remote_script}"
             shell = remote_dump._wrap_login(inner)
             out, err, rc = _ssh_exec_pipe(client, shell, timeout=timeout_sec)

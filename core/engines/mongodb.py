@@ -13,6 +13,7 @@ MongoDB 备份引擎实现。
   备份（full），并在 message 中提示建议改用 oplog / 时间点恢复方案。
 """
 import os
+import re
 import json
 import shutil
 import subprocess
@@ -43,9 +44,17 @@ class MongoEngine(BackupEngine):
         return opts if isinstance(opts, dict) else {}
 
     def _build_auth_args(self, cmd: list) -> list:
-        """根据 extra_options.authSource 追加 --authenticationDatabase 参数。"""
+        """追加 --authenticationDatabase。
+
+        2026-11-13 真机暴露：任务只填了 root/Zhh@190226（用户建在 admin 库），
+        未填 authSource 时 mongodump 不带 --authenticationDatabase，
+        认证直接失败。MongoDB 惯例是管理账号建在 ``admin`` 库，因此
+        未显式配置且用户名非空时默认 ``admin``（可在 extra_options.authSource 覆盖）。
+        """
         opts = self._parse_extra_options()
         auth_source = opts.get("authSource")
+        if not auth_source and (self.task.get("username") or "").strip():
+            auth_source = "admin"
         if auth_source:
             cmd += ["--authenticationDatabase", str(auth_source)]
         return cmd
@@ -90,6 +99,18 @@ class MongoEngine(BackupEngine):
             self.task, ssh_host, "mongodb", archive_path, compress)
         duration = round(time.time() - t0, 3)
         size = int(res_d.get("size") or 0)
+        # 空产物保护：mongodump 未输出真实数据时（客户端缺失/认证失败被管道
+        # 吞掉）会得到一个十几字节的空归档。这种情况必须判失败，让上层回退
+        # 平台本机直连或提示安装 mongodb-database-tools，绝不能报"备份成功"。
+        if size < 1024:
+            try:
+                os.remove(archive_path)
+            except Exception:
+                pass
+            raise RuntimeError(
+                "MongoDB 远端导出产物异常（仅 %d 字节）：通常是数据库主机缺少 "
+                "mongodump 或认证失败。请在数据库主机安装 mongodb-database-tools "
+                "（或在「备份插件」页一键安装），或确认任务已填写正确的认证库。" % size)
         note = "（断点续传拉回）" if res_d.get("resumed") else ""
         return BackupResult(
             success=True, status=BackupStatus.SUCCESS,
@@ -278,13 +299,19 @@ class MongoEngine(BackupEngine):
             "--port", str(port),
             "--username", str(username),
             "--password", str(password),
-            "--db", str(target_db),
-            "--drop",
         ]
         if is_archive:
-            cmd += ["--archive=%s" % restore_archive]
+            # 2026-11-13 真机暴露：归档（--archive）模式下 mongorestore **忽略 --db**，
+            # 归档内的 namespace 是源库（e2e_mongo_t.t1），因此指定目标库后
+            # 数据仍写回源库、并与已有 _id 冲突 → "2 failures"，而 rc 依然是 0，
+            # 平台就报了"恢复成功、目标库却 0 集合"。
+            # 正确做法：用 --nsFrom/--nsTo 做 namespace 重命名（mongorestore 4.2+）。
+            src_db = db_name or target_db
+            if target_db and src_db and target_db != src_db:
+                cmd += ["--nsFrom=%s.*" % src_db, "--nsTo=%s.*" % target_db]
+            cmd += ["--drop", "--archive=%s" % restore_archive]
         else:
-            cmd += [restore_archive]
+            cmd += ["--db", str(target_db), "--drop", restore_archive]
         cmd = self._build_auth_args(cmd)
 
         # 4. 执行命令（目录格式用完即清理临时解压目录）
@@ -296,7 +323,9 @@ class MongoEngine(BackupEngine):
                 shutil.rmtree(tmp_dir, ignore_errors=True)
         duration = __import__("time").time() - start
 
-        # 5. 按 returncode 判定结果
+        # 5. 按 returncode + 输出统计判定结果
+        #    mongorestore 在"文档全部写入失败"（例如 _id 冲突）时 **rc 仍为 0**，
+        #    只看返回码会漏判成成功（真机实测：0 成功 / 2 失败，平台报 success）。
         if res["returncode"] != 0:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,
@@ -304,13 +333,30 @@ class MongoEngine(BackupEngine):
                 stdout=res["stdout"], stderr=res["stderr"],
                 message="mongorestore 执行失败(返回码=%s)" % res["returncode"])
 
+        combined = (res["stdout"] or "") + (res["stderr"] or "")
+        failed_docs = 0
+        ok_docs = 0
+        for mt in re.finditer(r"(\d+)\s+document\(s\)\s+failed to restore", combined):
+            failed_docs = max(failed_docs, int(mt.group(1)))
+        for mt in re.finditer(r"(\d+)\s+document\(s\)\s+restored successfully", combined):
+            ok_docs += int(mt.group(1))
+        if failed_docs > 0:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                backup_path=backup_path, duration_sec=duration,
+                stdout=res["stdout"], stderr=res["stderr"],
+                message=("MongoDB 恢复失败：%d 个文档写入失败（成功 %d 个）。"
+                         "常见原因：目标库已有同 _id 文档，或归档内 namespace "
+                         "与目标库不匹配。" % (failed_docs, ok_docs)))
+
         return BackupResult(
             success=True, status=BackupStatus.SUCCESS,
             backup_path=backup_path, duration_sec=duration,
             stdout=res["stdout"], stderr=res["stderr"],
             simulated=False, checksum="",
-            message=("mongorestore 恢复成功；目标库=%s；密码以 --password 参数传入"
-                     "命令行(mongo 惯例)。" % target_db))
+            message=("mongorestore 恢复成功：目标库=%s，成功写入 %d 个文档"
+                     "（密码以 --password 参数传入命令行，mongo 惯例）。"
+                     % (target_db, ok_docs)))
 
     def list_databases(self) -> list:
         """列出可备份的数据库名。

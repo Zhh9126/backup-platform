@@ -100,6 +100,7 @@ SEGMENT_PERMS = {
     # 系统 / 安全
     "system": "system.settings",
     "settings": "system.settings",
+    "brand": "system.settings",
     "scheduler": "system.settings",
     "meta-db": "system.settings",
     "rbac": "users.manage",

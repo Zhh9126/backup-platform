@@ -25,6 +25,85 @@
   </div>
 </div>
 
+<!-- 品牌设置：登录页 Logo / 侧栏 Logo / 品牌文字 -->
+<style>
+  .brand-set-card { border: 1px solid #eef1f5; border-radius: 10px; padding: 14px 16px; height: 100%; background: #fff; }
+  .brand-set-title { font-size: .9rem; font-weight: 600; color: var(--text-primary); margin-bottom: 10px; }
+  .brand-upload-box {
+    border: 1px dashed #d7dde5; border-radius: 8px; background: #fafbfc;
+    height: 116px; display: flex; align-items: center; justify-content: center;
+    overflow: hidden; position: relative;
+  }
+  .brand-upload-box img { max-width: 92%; max-height: 96px; object-fit: contain; }
+  .brand-upload-empty { color: #aab4c0; font-size: .82rem; display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .brand-upload-empty i { font-size: 22px; }
+  .brand-set-hint { color: #8b97a6; font-size: .76rem; line-height: 1.6; margin-top: 8px; }
+  .brand-counter { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); color: #aab4c0; font-size: .74rem; pointer-events: none; }
+  .brand-text-wrap { position: relative; }
+  .brand-text-wrap .form-control { padding-right: 56px; }
+</style>
+<div class="page-card mb-3" id="brandCard">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <div class="card-section-title mb-0"><i class="bi bi-palette"></i> 品牌设置</div>
+    <span class="text-muted small">登录页与平台侧栏的 Logo、名称按此处展示（保存后刷新页面生效）</span>
+  </div>
+
+  <div class="row g-3">
+    <div class="col-md-6">
+      <div class="brand-set-card">
+        <div class="brand-set-title">登录页 Logo</div>
+        <div class="brand-upload-box">
+          <img id="brandLoginPreview" class="d-none" alt="登录页 Logo 预览">
+          <span class="brand-upload-empty" id="brandLoginEmpty"><i class="bi bi-image"></i>当前使用内置默认图标</span>
+        </div>
+        <div class="brand-set-hint">支持 PNG / JPG / WEBP，单张不超过 2MB<br>建议宽度 ≤ 320px，高度自适应</div>
+        <div class="d-flex gap-2 mt-2">
+          <input type="file" id="brandLoginFile" class="d-none" accept="image/png,image/jpeg,image/webp">
+          <button class="btn btn-sm btn-primary" type="button" data-brand-pick="login"><i class="bi bi-upload"></i> 上传 Logo</button>
+          <button class="btn btn-sm btn-outline-secondary" type="button" data-brand-reset="login" id="brandLoginReset" disabled>恢复默认</button>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-6">
+      <div class="brand-set-card">
+        <div class="brand-set-title">页面左上角 Logo</div>
+        <div class="brand-upload-box">
+          <img id="brandSidebarPreview" class="d-none" alt="侧栏 Logo 预览">
+          <span class="brand-upload-empty" id="brandSidebarEmpty"><i class="bi bi-image"></i>当前使用内置默认图标</span>
+        </div>
+        <div class="brand-set-hint">支持 PNG / JPG / WEBP，单张不超过 2MB<br>建议正方形 1:1，显示尺寸 36px</div>
+        <div class="d-flex gap-2 mt-2">
+          <input type="file" id="brandSidebarFile" class="d-none" accept="image/png,image/jpeg,image/webp">
+          <button class="btn btn-sm btn-primary" type="button" data-brand-pick="sidebar"><i class="bi bi-upload"></i> 上传 Logo</button>
+          <button class="btn btn-sm btn-outline-secondary" type="button" data-brand-reset="sidebar" id="brandSidebarReset" disabled>恢复默认</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="row g-3 mt-1">
+    <div class="col-md-6">
+      <label class="form-label small">侧栏品牌名称</label>
+      <div class="brand-text-wrap">
+        <input class="form-control" id="brandNameInput" maxlength="32" placeholder="默认 AIDBM" autocomplete="off">
+        <span class="brand-counter" id="brandNameCount">0 / 32</span>
+      </div>
+    </div>
+    <div class="col-md-6">
+      <label class="form-label small">首页大标题</label>
+      <div class="brand-text-wrap">
+        <input class="form-control" id="brandTitleInput" maxlength="32" placeholder="默认 仪表盘" autocomplete="off">
+        <span class="brand-counter" id="brandTitleCount">0 / 32</span>
+      </div>
+    </div>
+    <div class="col-12 d-flex align-items-center gap-2">
+      <button class="btn btn-sm btn-primary" type="button" id="brandSaveTextBtn"><i class="bi bi-check2"></i> 保存文字</button>
+      <button class="btn btn-sm btn-outline-secondary" type="button" id="brandResetTextBtn">恢复默认文字</button>
+      <span class="small text-muted" id="brandMsg"></span>
+    </div>
+  </div>
+</div>
+
 <!-- 系统商业授权与纳管配额管理 -->
 <div class="page-card mb-3" id="licenseCard">
   <div class="d-flex justify-content-between align-items-center mb-2">
@@ -423,9 +502,27 @@ document.addEventListener("DOMContentLoaded", function () {
         <label class="form-check-label">使用 TLS/SSL（推荐）</label>
       </div>
     </div>
+    <div class="col-12"><hr class="my-2"><label class="form-label fw-bold mb-0"><i class="bi bi-phone"></i> 短信渠道（通用 HTTP 短信网关）</label>
+      <div class="form-text">适配企业内自建短信网关（短信猫/运营商行业网关）：URL 与参数模板中用 <code>{phone}</code> <code>{title}</code> <code>{content}</code> 占位符，网关返回 HTTP 2xx 即视为成功。</div>
+    </div>
+    <div class="col-md-5"><label class="form-label">短信网关 URL</label>
+      <input class="form-control" id="n_sms_url" placeholder="如 http://sms-gw.inner:8080/send">
+    </div>
+    <div class="col-md-2"><label class="form-label">请求方式</label>
+      <select class="form-select" id="n_sms_method"><option value="GET">GET</option><option value="POST">POST(JSON)</option></select>
+    </div>
+    <div class="col-md-5"><label class="form-label">手机号（逗号分隔）</label>
+      <input class="form-control" id="n_sms_phones" placeholder="13800000001,13800000002">
+    </div>
+    <div class="col-md-6"><label class="form-label">参数模板（POST 为 JSON body；GET 为查询串；留空则 GET 仅用 URL 占位符）</label>
+      <textarea class="form-control font-monospace" id="n_sms_params" rows="2" placeholder='{"mobile":"{phone}","content":"{title} {content}"}'></textarea>
+    </div>
+    <div class="col-md-6"><label class="form-label">自定义请求头 JSON（可选，用于网关鉴权）</label>
+      <textarea class="form-control font-monospace" id="n_sms_headers" rows="2" placeholder='{"X-API-Key":"xxxx"}'></textarea>
+    </div>
     <div class="col-12">
       <button class="btn btn-primary" id="saveNotifyBtn"><i class="bi bi-save"></i> 保存通知配置</button>
-      <button class="btn btn-outline-info ms-2" id="testNotifyBtn" type="button"><i class="bi bi-envelope-paper"></i> 发送测试邮件</button>
+      <button class="btn btn-outline-info ms-2" id="testNotifyBtn" type="button"><i class="bi bi-envelope-paper"></i> 发送测试通知（邮件+短信）</button>
       <span class="form-text ms-2 text-muted">先「保存」再「测试」，失败会有具体错误提示</span>
     </div>
   </div>
@@ -438,6 +535,11 @@ document.addEventListener("DOMContentLoaded", function () {
   <div class="form-check">
     <input class="form-check-input" type="checkbox" id="og_vc_enabled">
     <label class="form-check-label">高危操作需要验证码确认</label>
+  </div>
+  <div class="form-check">
+    <input class="form-check-input" type="checkbox" id="og_restore_precheck">
+    <label class="form-check-label">恢复前自动校验（预检通过才执行恢复）</label>
+    <div class="form-text-hint">提交恢复时自动检测：产物存在与完整性（sha256）、结构嗅探、恢复目标通道、恢复工具就绪、解包空间。检测到阻断项（产物缺失/损坏/校验不一致等）直接拦截本次恢复并弹报告；所有数据库类型统一生效。默认开启。</div>
   </div>
   <button class="btn btn-primary mt-2" id="ogSaveBtn"><i class="bi bi-save"></i> 保存安全设置</button>
   <span class="form-text ms-2 text-muted" id="og_result"></span>
@@ -905,19 +1007,25 @@ document.addEventListener("DOMContentLoaded", async function () {
 document.addEventListener("DOMContentLoaded", async function () {
   const cb = document.getElementById("og_vc_enabled");
   if (!cb) return;
+  const pc = document.getElementById("og_restore_precheck");
   try {
     const cfg = await (await fetch("/api/op-guard/config", { credentials: "include" })).json();
     cb.checked = !!cfg.verify_code_enabled;
-  } catch (e) { /* 忽略，保持默认关 */ }
+    if (pc) pc.checked = cfg.restore_auto_precheck !== false;
+  } catch (e) { /* 忽略，保持默认 */ }
   document.getElementById("ogSaveBtn")?.addEventListener("click", async () => {
     const res = document.getElementById("og_result");
     try {
       await (await fetch("/api/op-guard/config", {
         method: "POST", credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ verify_code_enabled: cb.checked }),
+        body: JSON.stringify({
+          verify_code_enabled: cb.checked,
+          restore_auto_precheck: pc ? !!pc.checked : true,
+        }),
       })).json();
-      res.textContent = "已保存，对恢复/清理/删除等高危操作" + (cb.checked ? "生效" : "关闭");
+      res.textContent = "已保存（验证码确认" + (cb.checked ? "开" : "关") +
+        "；恢复前自动校验" + (pc && pc.checked ? "开" : "关") + "）";
       res.className = "form-text ms-2 text-success";
     } catch (e) {
       res.textContent = "保存失败: " + e;
@@ -1225,6 +1333,157 @@ document.addEventListener("DOMContentLoaded", function () {
       : ("发送失败: " + (r.message || (r.data || {}).detail || "未知"));
     $("snmp_result").className = "form-text " + (r.success ? "text-success" : "text-danger");
   });
+});
+</script>
+
+<script>
+/* 品牌设置：Logo 上传 / 文字保存（图片存 instance/brand，文字存 system_config） */
+document.addEventListener("DOMContentLoaded", function () {
+  const $ = (id) => document.getElementById(id);
+  const API = "/api/brand";
+  const MAX = 2 * 1024 * 1024;
+
+  function msg(text, ok) {
+    const el = $("brandMsg");
+    if (!el) return;
+    el.textContent = text || "";
+    el.className = "small " + (ok ? "text-success" : "text-danger");
+  }
+
+  function setPreview(kind, url) {
+    const cap = kind === "login" ? "Login" : "Sidebar";
+    const img = $("brand" + cap + "Preview");
+    const empty = $("brand" + cap + "Empty");
+    const resetBtn = $("brand" + cap + "Reset");
+    if (!img || !empty) return;
+    if (url) {
+      img.src = url;
+      img.classList.remove("d-none");
+      empty.classList.add("d-none");
+      if (resetBtn) resetBtn.disabled = false;
+    } else {
+      img.removeAttribute("src");
+      img.classList.add("d-none");
+      empty.classList.remove("d-none");
+      if (resetBtn) resetBtn.disabled = true;
+    }
+  }
+
+  function counter(inputId, countId) {
+    const i = $(inputId), c = $(countId);
+    if (i && c) c.textContent = (i.value || "").length + " / 32";
+  }
+
+  function applyBrand(b) {
+    if (!b) return;
+    setPreview("login", b.login_logo);
+    setPreview("sidebar", b.sidebar_logo);
+    const d = b.defaults || {};
+    const ni = $("brandNameInput"), ti = $("brandTitleInput");
+    // 输入框只回显"已自定义"的值；默认值放 placeholder（与参考交互一致）
+    if (ni) ni.value = (b.name && b.name !== d.name) ? b.name : "";
+    if (ti) ti.value = (b.title && b.title !== d.title) ? b.title : "";
+    if (ni) ni.placeholder = "默认 " + (d.name || "AIDBM");
+    if (ti) ti.placeholder = "默认 " + (d.title || "仪表盘");
+    counter("brandNameInput", "brandNameCount");
+    counter("brandTitleInput", "brandTitleCount");
+  }
+
+  function loadBrand() {
+    fetch(API, { credentials: "include" })
+      .then((r) => r.json())
+      .then((j) => { if (j && j.success) applyBrand(j.data); })
+      .catch(() => msg("品牌设置读取失败", false));
+  }
+
+  async function upload(kind, file) {
+    if (!file) return;
+    if (file.size > MAX) { msg("图片超过 2MB 上限（当前 " + (file.size / 1024 / 1024).toFixed(2) + " MB）", false); return; }
+    if (!/^image\/(png|jpeg|webp)$/i.test(file.type || "")) { msg("仅支持 PNG / JPG / WEBP 格式", false); return; }
+    const fd = new FormData();
+    fd.append("kind", kind);
+    fd.append("file", file);
+    msg("上传中…", true);
+    try {
+      const r = await (await fetch(API + "/logo", { method: "POST", body: fd, credentials: "include" })).json();
+      if (!r.success) { msg(r.message || "上传失败", false); return; }
+      applyBrand((r.data || {}).brand);
+      msg((r.message || "已上传") + "（刷新页面后生效）", true);
+      if (window.BKP && BKP.toast) BKP.toast(r.message || "已上传", "success");
+    } catch (e) {
+      msg("上传失败: " + e.message, false);
+    }
+  }
+
+  async function resetLogo(kind) {
+    if (!window.confirm("确定恢复为内置默认 Logo？")) return;
+    try {
+      const r = await (await fetch(API + "/logo?kind=" + encodeURIComponent(kind),
+        { method: "DELETE", credentials: "include" })).json();
+      if (!r.success) { msg(r.message || "恢复失败", false); return; }
+      applyBrand((r.data || {}).brand);
+      msg((r.message || "已恢复默认") + "（刷新页面后生效）", true);
+    } catch (e) {
+      msg("恢复失败: " + e.message, false);
+    }
+  }
+
+  async function saveText() {
+    const ni = $("brandNameInput"), ti = $("brandTitleInput");
+    try {
+      const r = await (await fetch(API + "/text", {
+        method: "POST", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: ni ? ni.value : null, title: ti ? ti.value : null }),
+      })).json();
+      if (!r.success) { msg(r.message || "保存失败", false); return; }
+      applyBrand((r.data || {}).brand);
+      msg((r.message || "已保存") + "（刷新页面后生效）", true);
+      if (window.BKP && BKP.toast) BKP.toast("品牌文字已保存", "success");
+    } catch (e) {
+      msg("保存失败: " + e.message, false);
+    }
+  }
+
+  async function resetText() {
+    if (!window.confirm("确定恢复默认品牌文字？")) return;
+    try {
+      const r = await (await fetch(API + "/text", { method: "DELETE", credentials: "include" })).json();
+      if (!r.success) { msg(r.message || "恢复失败", false); return; }
+      applyBrand((r.data || {}).brand);
+      msg(r.message || "已恢复默认", true);
+    } catch (e) {
+      msg("恢复失败: " + e.message, false);
+    }
+  }
+
+  document.querySelectorAll("[data-brand-pick]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const kind = btn.getAttribute("data-brand-pick");
+      const input = $(kind === "login" ? "brandLoginFile" : "brandSidebarFile");
+      if (input) { input.value = ""; input.click(); }
+    });
+  });
+  document.querySelectorAll("[data-brand-reset]").forEach((btn) => {
+    btn.addEventListener("click", () => resetLogo(btn.getAttribute("data-brand-reset")));
+  });
+  ["brandLoginFile", "brandSidebarFile"].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    el.addEventListener("change", () => {
+      const kind = id === "brandLoginFile" ? "login" : "sidebar";
+      upload(kind, el.files && el.files[0]);
+    });
+  });
+  ["brandNameInput", "brandTitleInput"].forEach((id) => {
+    const el = $(id);
+    if (!el) return;
+    el.addEventListener("input", () => counter(id, id === "brandNameInput" ? "brandNameCount" : "brandTitleCount"));
+  });
+  if ($("brandSaveTextBtn")) $("brandSaveTextBtn").addEventListener("click", saveText);
+  if ($("brandResetTextBtn")) $("brandResetTextBtn").addEventListener("click", resetText);
+
+  if ($("brandCard")) loadBrand();
 });
 </script>
 

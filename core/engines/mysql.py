@@ -347,6 +347,20 @@ class MySQLEngine(BackupEngine):
         return "mariabackup" in b or "mariadb-backup" in b
 
     @staticmethod
+    def _xtrabackup_major(bin_path: str) -> int:
+        """本机 xtrabackup 主版本（解析失败返回 0 = 未知，按能力最优处理）。
+
+        用途：xtrabackup 2.4 不支持 ``--compress=zstd``（8.0 才引入），
+        对 5.7 实例传入会让物理备份直接失败。
+        """
+        try:
+            r = subprocess.run([bin_path, "--version"], capture_output=True,
+                               text=True, timeout=20)
+            m = re.search(r"version\s+(\d+)\.", (r.stdout or "") + (r.stderr or ""))
+            return int(m.group(1)) if m else 0
+        except Exception:
+            return 0
+
     @staticmethod
     def purge_binlogs_after_backup(task: dict, keep_files: int = 1) -> str:
         """备份完成后 PURGE 已覆盖 binlog（对标鼎甲"备份完删除已备份日志"）。
@@ -759,6 +773,11 @@ class MySQLEngine(BackupEngine):
         cmd = [xtrabackup, "--no-defaults", "--backup", f"--target-dir={target_dir}",
                f"--user={user}", f"--password={pw}",
                f"--host={host}", f"--port={port}", "--no-lock"]
+        # 引擎并行：xtrabackup/mariabackup 的 --parallel 让数据文件拷贝并行，
+        # 是"平台并发被压到 2 路时仍能压低单任务耗时/drift"的关键手段。
+        bk_parallel = self._backup_parallel()
+        if bk_parallel > 1:
+            cmd.append(f"--parallel={bk_parallel}")
         note_cmp = ""
         if not is_maria:
             # 仅 Percona xtrabackup 支持；mariabackup 传了会直接 unknown option 失败
@@ -769,10 +788,18 @@ class MySQLEngine(BackupEngine):
                 # 明确降级为未压缩物理备份，不谎报压缩
                 note_cmp = "（mariabackup 不支持 --compress=zstd，按未压缩物理备份执行）"
             else:
-                # 最高压缩：zstd 级别取任务 compress_level（上限 19，xtrabackup 支持范围）
-                zl = int(self.task.get("compress_level") or 0)
-                zl = max(1, min(zl, 19)) if zl else 19
-                cmd += ["--compress=zstd", f"--compress-zstd-level={zl}", "--compress-threads=4"]
+                # xtrabackup 2.4 不支持 --compress=zstd（8.0 才支持），传了直接
+                # "Invalid --compress argument: zstd" 整任务失败——按未压缩执行并
+                # 如实说明（此前对 5.7 环境的物理备份 100% 失败，实测命中）。
+                xb_major = self._xtrabackup_major(xtrabackup)
+                if xb_major and xb_major < 8:
+                    note_cmp = (f"（xtrabackup {xb_major}.x 不支持 --compress=zstd，"
+                                f"按未压缩物理备份执行）")
+                else:
+                    # 最高压缩：zstd 级别取任务 compress_level（上限 19，xtrabackup 支持范围）
+                    zl = int(self.task.get("compress_level") or 0)
+                    zl = max(1, min(zl, 19)) if zl else 19
+                    cmd += ["--compress=zstd", f"--compress-zstd-level={zl}", "--compress-threads=4"]
 
         note = ""
         if backup_type == BackupType.INCREMENTAL:
@@ -843,7 +870,9 @@ class MySQLEngine(BackupEngine):
         return BackupResult(success=True, status=BackupStatus.SUCCESS,
                             backup_path=target_dir, size_bytes=size, duration_sec=dur,
                             stdout=ret.stdout, simulated=False, checksum=checksum,
-                            message=f"MySQL 物理备份(XtraBackup)成功 {note}")
+                            message=(f"MySQL 物理备份(XtraBackup)成功 {note}"
+                                     + (f"（引擎并行 {bk_parallel} 路）"
+                                        if bk_parallel > 1 else "")))
 
     def _backup_physical_remote(self, ssh_host: dict, backup_type: BackupType) -> BackupResult:
         """物理备份：通过 SSH 在远端数据库服务器以 xtrabackup/mariabackup 执行
@@ -1042,6 +1071,10 @@ class MySQLEngine(BackupEngine):
             # 3) 远端执行：xtrabackup --backup -> tar czf（密码不在命令行）
             # 注意：--defaults-file 必须是第一个参数（xtrabackup 硬性要求）
             inc_flag = f"--incremental-lsn={inc_lsn} " if inc_lsn else ""
+            # 引擎并行：远端 xtrabackup --parallel（数据文件拷贝并行）。
+            # 平台并发被压小（1~2 路）时，这是单任务不排队等太久的关键。
+            bk_parallel = 0 if reuse else self._backup_parallel()
+            par_flag = f"--parallel={bk_parallel} " if bk_parallel > 1 else ""
             if reuse:
                 inner = "true"      # 产物已就绪，本次只需拉回
             else:
@@ -1056,7 +1089,7 @@ class MySQLEngine(BackupEngine):
                     f"--defaults-file={remote_cnf} "
                     f"--backup --target-dir={remote_tmp} "
                     f"--host={shlex.quote(host)} --port={port} --no-lock "
-                    f"{inc_flag}"
+                    f"{inc_flag}{par_flag}"
                     f"&& tar cf {remote_tar} -C {remote_tmp} ."
                 )
             wrapped = remote_dump._wrap_login(inner)
@@ -1149,6 +1182,7 @@ class MySQLEngine(BackupEngine):
                    f"{'（复用上次远端产物，未重跑备份）' if reuse else ''}"
                    f"{'（断点续传）' if pulled['resumed'] else ''}"
                    f"{push_note}{inc_note}{rsync_note}"
+                   f"{'（引擎并行 %d 路）' % bk_parallel if bk_parallel > 1 else ''}"
                    f"{'（' + stage_note + '）' if stage_note else ''}")
             self.logger.info("[%s] %s", self.task_name, msg)
 
@@ -1221,6 +1255,9 @@ class MySQLEngine(BackupEngine):
         out_path = os.path.join(out_dir, f"{self._timestamp()}.tar.gz")
         dump_tool = self._resolve_local_tool("mysqldump")
         query_tool = self._resolve_local_tool("mysql")
+        # 引擎并行：全实例逐库 dump 并发（每库一个 mysqldump 进程），
+        # 大实例（几十个库）在小平台并发下靠它把单任务耗时压下来。
+        bk_parallel = self._backup_parallel()
         try:
             manifest = logical_full.backup_full_instance(
                 self.db_type,
@@ -1230,7 +1267,8 @@ class MySQLEngine(BackupEngine):
                 password=db.decrypt_secret(self.task.get("password") or ""),
                 dump_tool=dump_tool, out_path=out_path,
                 query_tool=query_tool,
-                include_system_dbs=bool(extra.get("include_system_dbs")))
+                include_system_dbs=bool(extra.get("include_system_dbs")),
+                parallel=bk_parallel)
         except Exception as e:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,
@@ -1241,7 +1279,8 @@ class MySQLEngine(BackupEngine):
         dbs_txt = ", ".join(manifest.get("databases") or [])
         msg = (f"{self.display_name} 全实例备份成功: {len(manifest['databases'])} 个库"
                f"（{dbs_txt}）{'，已排除系统库' if not manifest.get('include_system_dbs') else ''}，"
-               f"产物 {out_path}")
+               f"产物 {out_path}"
+               + (f"（引擎并行 {bk_parallel} 路）" if bk_parallel > 1 else ""))
         return BackupResult(
             success=True, status=BackupStatus.SUCCESS,
             backup_path=out_path, size_bytes=size, duration_sec=0,
@@ -1306,55 +1345,40 @@ class MySQLEngine(BackupEngine):
         guess = f"{_ext}.zst" if comp else _ext
         p = remote_dump.transfer_params(self.task)
 
-        if p.get("resume"):
-            out_path = self._new_dump_path(backup_type, guess)
-            info = remote_dump.remote_db_dump_to_file(
-                self.task, ssh_host, "mysql", out_path, comp, extra_args)
-            actual = info.get("suffix") or guess
-            final_path = info["path"]
-            if actual != guess and final_path.endswith(guess):
-                new_path = final_path[: -len(guess)] + actual
-                try:
-                    os.replace(final_path, new_path)
-                    final_path = new_path
-                except OSError:
-                    pass
-            hk = (ssh_host or {}).get("host_key", "remote")
-            size = int(info.get("size") or 0)
-            resumed = bool(info.get("resumed"))
-            self.logger.info(
-                "[%s] MySQL 逻辑备份完成: %s（%s%s）", self.task_name, final_path,
-                db.human_size(size), "，断点续传" if resumed else "")
-            res = BackupResult(
-                success=True, status=BackupStatus.SUCCESS, backup_path=final_path,
-                size_bytes=size, duration_sec=0.0, checksum=info.get("sha256") or "",
-                message=(f"通过 SSH 在数据库服务器({hk})执行 mysqldump 成功 | "
-                         f"{db.human_size(size)}"
-                         + ("（断点续传完成）" if resumed else "")))
-            if info.get("fmt") == "multi-db-tar":
-                res.compress_algo = "gzip"
-            else:
-                res.compress_algo = "zstd" if info.get("compressed") else "none"
-                if not info.get("compressed") and enable:
-                    res.message = (res.message or "") + "（远端未安装 zstd，已降级为不压缩）"
-            return res
-
-        data, compressed, fmt = remote_dump.remote_db_dump(self.task, ssh_host, "mysql", comp, extra_args)
-        if fmt == "multi-db-tar":
-            # 全实例：逐库 .sql → tar.gz（远端已 gzip，manifest.json 标注库清单）
-            res = self._write_dump_file(data, backup_type, ssh_host, ".tar.gz", "mysqldump")
+        # 统一走「远端 stage 落盘 + 流式拉回」通道：内存恒定（旧通道会把整包
+        # 产物读进内存，大库必爆），断点续传由 resume 开关控制——关闭续传只是
+        # 不命中旧断点，仍然流式落盘，不再退回 bytes 整包路径。
+        out_path = self._new_dump_path(backup_type, guess)
+        info = remote_dump.remote_db_dump_to_file(
+            self.task, ssh_host, "mysql", out_path, comp, extra_args,
+            resume=bool(p.get("resume")))
+        actual = info.get("suffix") or guess
+        final_path = info["path"]
+        if actual != guess and final_path.endswith(guess):
+            new_path = final_path[: -len(guess)] + actual
+            try:
+                os.replace(final_path, new_path)
+                final_path = new_path
+            except OSError:
+                pass
+        hk = (ssh_host or {}).get("host_key", "remote")
+        size = int(info.get("size") or 0)
+        resumed = bool(info.get("resumed"))
+        self.logger.info(
+            "[%s] MySQL 逻辑备份完成: %s（%s%s）", self.task_name, final_path,
+            db.human_size(size), "，断点续传" if resumed else "")
+        res = BackupResult(
+            success=True, status=BackupStatus.SUCCESS, backup_path=final_path,
+            size_bytes=size, duration_sec=0.0, checksum=info.get("sha256") or "",
+            message=(f"通过 SSH 在数据库服务器({hk})执行 mysqldump 成功 | "
+                     f"{db.human_size(size)}"
+                     + ("（断点续传完成）" if resumed else "")))
+        if info.get("fmt") == "multi-db-tar":
             res.compress_algo = "gzip"
-            return res
-        # compressed 反映远端实际是否压缩（缺 zstd 时 remote_dump 会降级为不压缩）
-        # 产物后缀由任务「备份文件格式」决定（sql → .sql；xml → .xml）
-        from core import dump_format as _dfmt
-        _spec = _dfmt.resolve(self.db_type, extra, compress=bool(compressed))
-        _ext = _spec.get("ext") or ".sql"
-        suffix = f"{_ext}.zst" if compressed else _ext
-        res = self._write_dump_file(data, backup_type, ssh_host, suffix, "mysqldump")
-        res.compress_algo = "zstd" if compressed else "none"
-        if not compressed and enable:
-            res.message = (res.message or "") + "（远端未安装 zstd，已降级为不压缩）"
+        else:
+            res.compress_algo = "zstd" if info.get("compressed") else "none"
+            if not info.get("compressed") and enable:
+                res.message = (res.message or "") + "（远端未安装 zstd，已降级为不压缩）"
         return res
 
     def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:
@@ -1527,7 +1551,31 @@ class MySQLEngine(BackupEngine):
             return self._restore_table_slice(backup_path, sel_tables,
                                              kwargs, logs)
 
-        # 1) 跨主机恢复：SFTP 推送到目标主机 → SSH 远程执行 mysql
+        # 1) 物理备份产物必须优先走物理恢复通道，且必须排在「跨主机恢复」之前。
+        #    历史缺陷（2026-11-13 170 真机实测）：物理产物 + 指定目标主机时，
+        #    通用跨主机恢复把它当逻辑 dump（找 dbs/*.sql）→ 脚本空转 rc=0 →
+        #    平台报「恢复成功」，实际目标库连库都没建（假成功）。
+        if self._is_physical_backup(backup_path):
+            thi = kwargs.get("target_host_info") or {}
+            th = (thi.get("hostname") or "").strip()
+            cur_host = (self.task.get("host") or "").strip()
+            if th and th != cur_host and th not in ("127.0.0.1", "localhost", "::1"):
+                logs.append(f"[物理恢复] 目标实例主机: {th}（沿用任务数据库凭据）")
+                self.task["host"] = th
+                if kwargs.get("target_port"):
+                    self.task["port"] = kwargs["target_port"]
+            logs.append("[物理恢复] 检测到 XtraBackup 物理备份产物，执行物理恢复"
+                        "（实例级 prepare + 异名库落地）")
+            result = self._restore_physical(backup_path, **kwargs)
+            logs.append(f"[物理恢复] success={result.success}, message={result.message}")
+            if result.stdout:
+                logs.append(f"[物理恢复 stdout]\n{result.stdout}")
+            if result.stderr:
+                logs.append(f"[物理恢复 stderr]\n{result.stderr}")
+            result.detail_log = "\n".join(logs)
+            return result
+
+        # 2) 跨主机恢复：SFTP 推送到目标主机 → SSH 远程执行 mysql
         target_host_info = kwargs.get("target_host_info")
         if target_host_info:
             target_db = kwargs.get("target_db") or self.task.get("db_name") or ""
@@ -1695,6 +1743,20 @@ class MySQLEngine(BackupEngine):
                     os.remove(src)
                     cnt += 1
         return cnt
+
+    def _backup_parallel(self) -> int:
+        """备份并行度（单任务内部引擎级并行）。
+
+        来源见 core/parallel_plan.py：任务 extra_options.engine_parallel >
+        保护策略 backup_strategy.parallel > 按平台并发自动推算。
+        1 = 串行（旧行为）；>1 时 xtrabackup 加 ``--parallel``、
+        全实例逻辑备份逐库并发 dump。
+        """
+        try:
+            from core import parallel_plan
+            return int(parallel_plan.resolve(self.task)["workers"])
+        except Exception:
+            return 1
 
     def _restore_parallel(self) -> int:
         """恢复并行度：逻辑备份表级并发导入 / 物理备份 prepare 并行线程。"""

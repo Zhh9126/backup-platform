@@ -1,0 +1,505 @@
+{% extends "base.html" %}
+{% block content %}
+<style>
+.dr-legend-dot{display:inline-block;width:10px;height:10px;border-radius:50%;vertical-align:middle}
+.dr-biz-row{border:1px solid var(--bs-border-color,#dee2e6);border-radius:8px;padding:8px 10px;margin-bottom:8px;cursor:pointer;background:#fff}
+.dr-biz-row.active{border-color:#0ea5e9;box-shadow:0 0 0 2px rgba(14,165,233,.15)}
+.dr-biz-row .idx{width:22px;height:22px;border-radius:6px;background:#f1f5f9;color:#475569;display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;margin-right:8px;flex:none}
+#drMapWrap{min-height:520px}
+</style>
+<div class="page-card mb-3">
+  <div class="d-flex align-items-center mb-2">
+    <h5 class="mb-0"><i class="bi bi-shield-fill-check me-2"></i>容灾总览</h5>
+    <span class="badge bg-secondary ms-2" id="drGenAt">—</span>
+    <div class="ms-auto d-flex gap-2">
+      <a class="btn btn-sm btn-outline-secondary" href="/dr-link">容灾链路</a>
+      <a class="btn btn-sm btn-outline-secondary" href="/dr-inspection"><i class="bi bi-clipboard2-pulse me-1"></i>容灾巡检</a>
+      <a class="btn btn-sm btn-primary" href="/dr-switch"><i class="bi bi-lightning-charge me-1"></i>一键切换</a>
+    </div>
+  </div>
+  <div class="row g-3" id="drKpi">
+    <div class="col"><div class="card p-3"><div class="text-muted small">容灾业务</div><div class="fs-4" id="kpiLinks">—</div></div></div>
+    <div class="col"><div class="card p-3"><div class="text-muted small">复制正常</div><div class="fs-4 text-success" id="kpiHealthy">—</div></div></div>
+    <div class="col"><div class="card p-3"><div class="text-muted small">异常链路</div><div class="fs-4" id="kpiBad">—</div></div></div>
+    <div class="col"><div class="card p-3"><div class="text-muted small">生产承载</div><div class="fs-4" id="kpiPrimary">—</div></div></div>
+    <div class="col"><div class="card p-3"><div class="text-muted small">容灾承载</div><div class="fs-4" id="kpiStandby">—</div></div></div>
+    <div class="col"><div class="card p-3"><div class="text-muted small">最近切换 RTO</div><div class="fs-4" id="kpiRto">—</div></div></div>
+  </div>
+</div>
+
+<div class="row g-3 mb-3">
+  <!-- 地图 -->
+  <div class="col-lg-8">
+    <div class="page-card h-100">
+      <div class="d-flex align-items-center mb-1">
+        <h6 class="text-muted mb-0"><i class="bi bi-geo-alt me-1"></i>生产 / 容灾站点分布（省级地图，按链路配置的城市经纬度定位）</h6>
+        <span class="ms-auto small text-muted" id="mapHint">点击站点或清单行可下钻业务明细 · 支持缩放/拖拽</span>
+      </div>
+      <div class="position-relative" id="drMapWrap">
+        <div id="drMap" style="height:520px"></div>
+        <div class="position-absolute d-none" id="mapEmpty"
+             style="top:50%;left:50%;transform:translate(-50%,-50%);z-index:4;max-width:430px;text-align:center;pointer-events:none">
+          <div class="border rounded p-3 small text-muted" style="background:rgba(255,255,255,.93)">
+            <i class="bi bi-geo me-1"></i><b>尚未配置站点地域</b><br/>
+            到「容灾链路」编辑链路，填写生产 / 容灾站点的城市（或经纬度）后，
+            地图会自动标注站点、按健康状态着色省份并绘制复制流
+          </div>
+        </div>
+        <!-- 下钻面板 -->
+        <div class="card position-absolute d-none" id="drDrill"
+             style="top:12px;right:12px;width:340px;z-index:5;box-shadow:0 6px 24px rgba(0,0,0,.15)">
+          <div class="card-header py-2 d-flex align-items-center">
+            <span class="small fw-bold" id="drillTitle">—</span>
+            <button class="btn-close btn-sm ms-auto" id="drillClose"></button>
+          </div>
+          <div class="card-body py-2 px-3 small" id="drillBody"></div>
+        </div>
+      </div>
+      <div class="d-flex gap-3 small text-muted mt-1">
+        <span><span class="dr-legend-dot" style="background:#22c55e"></span>健康</span>
+        <span><span class="dr-legend-dot" style="background:#f59e0b"></span>警告</span>
+        <span><span class="dr-legend-dot" style="background:#ef4444"></span>异常</span>
+        <span>■=生产中心　▲=容灾中心</span>
+        <span><i class="bi bi-arrow-right" style="color:#0ea5e9"></i> 数据复制流（流向容灾中心）</span>
+      </div>
+    </div>
+  </div>
+  <!-- 业务清单 -->
+  <div class="col-lg-4">
+    <div class="page-card h-100">
+      <div class="d-flex align-items-center mb-2">
+        <h6 class="text-muted mb-0"><i class="bi bi-list-task me-1"></i>容灾业务清单</h6>
+        <span class="badge bg-secondary ms-2" id="bizCount">0</span>
+      </div>
+      <div id="bizList" style="max-height:560px;overflow-y:auto">
+        <div class="text-center text-muted py-4 small">加载中…</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="page-card">
+  <h6 class="text-muted mb-2"><i class="bi bi-clock-history me-1"></i>最近切换作业</h6>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead class="table-light"><tr><th style="width:60px">#</th><th>链路</th><th>方向</th><th>范围</th><th>状态</th><th>RTO</th><th>时间</th><th class="text-end">明细</th></tr></thead>
+      <tbody id="drRunTable"><tr><td colspan="8" class="text-center text-muted py-3">暂无切换记录</td></tr></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/vendor/echarts.min.js?v=2026111801"></script>
+<script>
+(function () {
+  var links = [], selected = null, timer = null, chart = null, mapReady = null;
+
+  function el(id) { return document.getElementById(id); }
+  function esc(s) { return BKP.esc(String(s == null ? "" : s)); }
+
+  function healthOf(l) {
+    if (l.health_skipped) return { level: "warn", label: "未探测" };
+    var h = l.health || {}, p = h.primary || {}, s = h.standby || {};
+    if (l.health_error || !h.primary) return { level: "warn", label: "探测失败" };
+    if (!p.reachable) return { level: "bad", label: "生产不可达" };
+    if (s.host) {
+      if (!s.reachable) return { level: "bad", label: "容灾不可达" };
+      var io = String(s.io || "").toLowerCase(), sq = String(s.sql || "").toLowerCase();
+      if (s.is_replica && !(io === "yes" || io === "on" || io === "1" || io === "true")) return { level: "bad", label: "复制异常" };
+      if (s.is_replica && !(sq === "yes" || sq === "on" || sq === "1" || sq === "true")) return { level: "bad", label: "复制异常" };
+      if (s.is_replica && parseInt(s.behind || 0, 10) > 60) return { level: "warn", label: "延迟 " + s.behind + "s" };
+      if (!s.is_replica) return { level: "warn", label: "非复制角色" };
+    }
+    if (h.dns && h.dns.domain && h.dns.in_sync === false) return { level: "warn", label: "DNS 不一致" };
+    return { level: "ok", label: "健康" };
+  }
+  function colorOf(level) {
+    return level === "ok" ? "#22c55e" : (level === "warn" ? "#f59e0b" : "#ef4444");
+  }
+  function activeLabel(a) {
+    return a === "primary" ? "生产承载" : (a === "standby" ? "容灾承载" : "承载未知");
+  }
+  function activeBadge(a) {
+    var cls = a === "standby" ? "badge-warn" : (a === "primary" ? "badge-ok" : "bg-secondary");
+    return '<span class="badge ' + cls + '">' + activeLabel(a) + '</span>';
+  }
+  function cityName(r) { return (r && r.city) || "—"; }
+  function regionPos(r) {
+    return (r && typeof r.lat === "number" && typeof r.lon === "number")
+      ? [r.lon, r.lat] : null;
+  }
+
+  // 省份简称：全名太长在东部密集区互相重叠
+  var SHORT = {
+    "北京市": "北京", "天津市": "天津", "上海市": "上海", "重庆市": "重庆",
+    "河北省": "河北", "山西省": "山西", "辽宁省": "辽宁", "吉林省": "吉林",
+    "黑龙江省": "黑龙江", "江苏省": "江苏", "浙江省": "浙江", "安徽省": "安徽",
+    "福建省": "福建", "江西省": "江西", "山东省": "山东", "河南省": "河南",
+    "湖北省": "湖北", "湖南省": "湖南", "广东省": "广东", "海南省": "海南",
+    "四川省": "四川", "贵州省": "贵州", "云南省": "云南", "陕西省": "陕西",
+    "甘肃省": "甘肃", "青海省": "青海", "台湾省": "台湾",
+    "内蒙古自治区": "内蒙古", "广西壮族自治区": "广西", "西藏自治区": "西藏",
+    "宁夏回族自治区": "宁夏", "新疆维吾尔自治区": "新疆",
+    "香港特别行政区": "香港", "澳门特别行政区": "澳门"
+  };
+  // 小面积/密集省市：不显示常驻标注（避免重叠），悬停才显示
+  var HIDE_LABEL = {
+    "北京市": 1, "天津市": 1, "上海市": 1, "重庆市": 1,
+    "宁夏回族自治区": 1, "海南省": 1,
+    "香港特别行政区": 1, "澳门特别行政区": 1
+  };
+  function geoLabel(p) { return HIDE_LABEL[p.name] ? "" : (SHORT[p.name] || p.name); }
+
+  // 站点经纬度 → 所属省份（点在多边形判定，纯前端离线）
+  var geoFeatures = [];
+  function pip(ring, x, y) {
+    var inside = false;
+    for (var i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      var xi = ring[i][0], yi = ring[i][1], xj = ring[j][0], yj = ring[j][1];
+      if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
+    }
+    return inside;
+  }
+  function provinceOf(lon, lat) {
+    for (var i = 0; i < geoFeatures.length; i++) {
+      var g = (geoFeatures[i] || {}).geometry;
+      if (!g) continue;
+      var polys = g.type === "Polygon" ? [g.coordinates] : (g.coordinates || []);
+      for (var j = 0; j < polys.length; j++) {
+        if (polys[j] && polys[j][0] && pip(polys[j][0], lon, lat))
+          return (geoFeatures[i].properties || {}).name;
+      }
+    }
+    return null;
+  }
+  // 承载站点的省份按链路健康状态淡染色
+  var TINT = { ok: "#d9f2e3", warn: "#fdeecb", bad: "#fbdcdc" };
+  var LVL = { ok: 1, warn: 2, bad: 3 };
+  var provStats = {};
+
+  // ------------------------- 地图（echarts + 省级 GeoJSON） -------------------------
+  function loadMap() {
+    if (mapReady) return mapReady;
+    mapReady = fetch("/static/vendor/maps/china.json")
+      .then(function (r) { return r.json(); })
+      .then(function (geojson) {
+        echarts.registerMap("china", geojson);
+        geoFeatures = (geojson && geojson.features) || [];
+        chart = echarts.init(el("drMap"));
+        chart.on("click", function (params) {
+          if (params.data && params.data.linkId) drDrill(params.data.linkId);
+        });
+        window.addEventListener("resize", function () { chart && chart.resize(); });
+        return true;
+      })
+      .catch(function (e) {
+        var hint = el("mapHint");
+        if (hint) hint.innerHTML =
+          '<span class="text-danger">地图加载失败: ' + esc(e && e.message || e) + '</span>';
+        mapReady = null;
+        return false;
+      });
+    return mapReady;
+  }
+
+  function renderMap() {
+    if (!chart) return;
+    var primData = [], drData = [], flows = [];
+    provStats = {};
+    links.forEach(function (l, i) {
+      var n = i + 1;
+      var pr = regionPos(l.primary_region), dr = regionPos(l.dr_region);
+      var h = healthOf(l);
+      var hp = (l.health || {}).primary || {};
+      var pColor = (l.health_error || !l.health) ? colorOf("warn")
+        : (hp.reachable ? colorOf("ok") : colorOf("bad"));
+      var addProv = function (prov, level, tag, city) {
+        if (!prov) return;
+        var st = provStats[prov] || (provStats[prov] = { level: "ok", items: [] });
+        if (LVL[level] > LVL[st.level]) st.level = level;
+        st.items.push({ n: n, name: l.name, tag: tag, label: h.label, city: city });
+      };
+      if (pr) addProv(provinceOf(pr[0], pr[1]),
+        (l.health_error || !l.health) ? "warn" : (hp.reachable ? "ok" : "bad"),
+        "生产", cityName(l.primary_region));
+      if (dr) addProv(provinceOf(dr[0], dr[1]), h.level, "容灾", cityName(l.dr_region));
+      var tip = function (l, tag, color) {
+        return {
+          formatter: '<b>[' + n + "] " + esc(l.name) + '</b><br/>' + tag +
+            "：" + esc((l.primary_region && l.primary_region.city) || l.primary_site || "-") +
+            ' → ' + esc((l.dr_region && l.dr_region.city) || l.dr_site || "-") +
+            '<br/>状态：' + esc(h.label) + " · " + activeLabel(l.active_site),
+          extraCssText: "max-width:320px;white-space:normal;"
+        };
+      };
+      if (pr) primData.push({
+        name: "[" + n + "] " + cityName(l.primary_region),
+        value: pr, linkId: l.id, tag: "■ 生产",
+        itemStyle: { color: pColor, borderColor: "#fff", borderWidth: 1.5 },
+        label: { color: "#1e293b" },
+        tooltip: tip(l, "生产", pColor),
+        emphasis: { scale: 1.6 }
+      });
+      if (dr) drData.push({
+        name: "[" + n + "] " + cityName(l.dr_region),
+        value: dr, linkId: l.id, tag: "▲ 容灾",
+        itemStyle: { color: colorOf(h.level), borderColor: "#fff", borderWidth: 1.5 },
+        label: { color: "#1e293b" },
+        tooltip: tip(l, "容灾", colorOf(h.level)),
+        emphasis: { scale: 1.6 }
+      });
+      if (pr && dr) flows.push({
+        coords: [pr, dr],
+        lineStyle: { color: h.level === "bad" ? "#ef4444" : "#0ea5e9" },
+        linkId: l.id
+      });
+    });
+    lastPrimData = primData;
+    lastDrData = drData;
+    var provRegions = Object.keys(provStats).map(function (name) {
+      return { name: name, itemStyle: { areaColor: TINT[provStats[name].level] } };
+    });
+    var option = {
+      tooltip: {
+        trigger: "item",
+        extraCssText: "max-width:340px;white-space:normal;",
+        formatter: function (p) {
+          if (p.componentType === "geo") {
+            var st = provStats[p.name];
+            if (!st) return esc(SHORT[p.name] || p.name);
+            var html = '<b>' + esc(SHORT[p.name] || p.name) + '</b>';
+            st.items.forEach(function (it) {
+              html += '<br/>' + it.tag + ' · [' + it.n + '] ' + esc(it.name) +
+                '（' + esc(it.city) + '）· ' + esc(it.label);
+            });
+            return html;
+          }
+          if (p.componentSubType === "lines") return "";
+          return esc(p.name);
+        }
+      },
+      geo: {
+        map: "china", roam: true,
+        layoutCenter: ["50%", "48%"], layoutSize: "94%",
+        itemStyle: { areaColor: "#eef4fa", borderColor: "#7c8ea3", borderWidth: 0.7 },
+        regions: provRegions,
+        label: { show: true, fontSize: 10, color: "#6b7f95",
+                 textBorderColor: "#fff", textBorderWidth: 2, formatter: geoLabel },
+        emphasis: {
+          itemStyle: { areaColor: "#d7e5f2" },
+          label: { show: true, color: "#334155", fontSize: 11,
+                   formatter: function (p) { return SHORT[p.name] || p.name; } }
+        },
+        select: { disabled: true }
+      },
+      series: [
+        {
+          type: "lines", coordinateSystem: "geo", zlevel: 2,
+          effect: { show: flows.length > 0, period: 5, trailLength: 0.5,
+                    symbol: "arrow", symbolSize: 7, color: "#0ea5e9" },
+          lineStyle: { width: 2.5, opacity: 0.8, curveness: 0.35, type: "dashed" },
+          data: flows
+        },
+        {
+          type: "scatter", coordinateSystem: "geo", zlevel: 3,
+          symbol: "rect", symbolSize: 16,
+          label: { show: true, formatter: "{b}", position: "top",
+                   fontSize: 11, fontWeight: "bold",
+                   backgroundColor: "rgba(255,255,255,.85)",
+                   padding: [1, 4], borderRadius: 3 },
+          data: primData
+        },
+        {
+          type: "scatter", coordinateSystem: "geo", zlevel: 3,
+          symbol: "triangle", symbolSize: 16,
+          label: { show: true, formatter: "{b}", position: "bottom",
+                   fontSize: 11, fontWeight: "bold",
+                   backgroundColor: "rgba(255,255,255,.85)",
+                   padding: [1, 4], borderRadius: 3 },
+          data: drData
+        }
+      ]
+    };
+    try {
+      chart.setOption(option, true);
+    } catch (err) {
+      var hint = el("mapHint");
+      if (hint) hint.innerHTML =
+        '<span class="text-danger">地图渲染失败: ' + esc(err && err.message || err) + '</span>';
+      return;
+    }
+    // 提示条：站点标注统计；全部未配置地域时给引导
+    var marked = 0;
+    links.forEach(function (l) {
+      if (regionPos(l.primary_region) || regionPos(l.dr_region)) marked++;
+    });
+    var hint = el("mapHint"), empty = el("mapEmpty");
+    if (hint && !hint.querySelector(".text-danger"))
+      hint.textContent = "站点标注 " + marked + "/" + links.length +
+        " 条链路 · 点击站点可下钻 · 支持缩放/拖拽";
+    if (empty) {
+      if (links.length && marked === 0) empty.classList.remove("d-none");
+      else empty.classList.add("d-none");
+    }
+    // 下钻高亮联动：选中站点放大，其他淡化
+    if (selected != null) highlightSelected();
+  }
+
+  var lastPrimData = [], lastDrData = [];
+
+  function highlightSelected() {
+    if (!chart) return;
+    try {
+      chart.dispatchAction({ type: "downplay", seriesIndex: [1, 2] });
+      if (selected != null) {
+        [lastPrimData, lastDrData].forEach(function (arr, si) {
+          var idxs = arr.map(function (d, i) { return d.linkId === selected ? i : -1; })
+            .filter(function (i) { return i >= 0; });
+          if (idxs.length) {
+            chart.dispatchAction({ type: "highlight", seriesIndex: si + 1, dataIndex: idxs });
+          }
+        });
+      }
+    } catch (e) { /* 高亮联动失败不影响主流程 */ }
+  }
+
+  // ------------------------- 下钻 -------------------------
+  window.drDrill = function (linkId) {
+    var l = links.filter(function (x) { return x.id === linkId; })[0];
+    if (!l) return;
+    selected = linkId;
+    renderDrill(l);
+    renderBiz();
+    highlightSelected();
+  };
+  el("drillClose").onclick = function () {
+    el("drDrill").classList.add("d-none");
+    selected = null;
+    highlightSelected();
+    renderBiz();
+  };
+
+  function renderDrill(l) {
+    var h = l.health || {}, p = h.primary || {}, s = h.standby || {}, dns = h.dns || {};
+    el("drillTitle").textContent = "[" + (links.indexOf(l) + 1) + "] " + (l.name || "");
+    var rows = [
+      ["生产环境", (p.host || l.primary_site || "—") + (p.reachable ? "（可达）" : "（不可达）")],
+      ["容灾环境", s.host ? ((s.host || "—") + (s.reachable ? "（可达）" : "（不可达）")) : "未配置"],
+      ["复制状态", s.is_replica ? ("IO " + (s.io || "-") + " / SQL " + (s.sql || "-") +
+        " / 延迟 " + (s.behind == null ? "-" : s.behind + "s")) : "—"],
+      ["DNS", dns.domain ? (dns.domain + " → " + (dns.resolved_ip || "解析失败") +
+        (dns.in_sync ? "（一致）" : "（不一致）")) : "未配置"],
+      ["当前承载", activeLabel(l.active_site)],
+    ];
+    el("drillBody").innerHTML =
+      rows.map(function (r) {
+        return '<div class="d-flex justify-content-between border-bottom py-1">' +
+          '<span class="text-muted">' + r[0] + '</span><span>' + esc(r[1]) + '</span></div>';
+      }).join("") +
+      '<div class="d-flex gap-2 mt-2">' +
+      '<a class="btn btn-sm btn-outline-primary" href="/dr-switch?link_id=' + l.id + '">去切换</a>' +
+      '<a class="btn btn-sm btn-outline-secondary" href="/dr-link">链路详情</a>' +
+      '</div>' +
+      (l.health_error ? '<div class="text-danger small mt-1">' + esc(l.health_error) + '</div>' : "");
+    el("drDrill").classList.remove("d-none");
+  }
+
+  // ------------------------- 业务清单 -------------------------
+  function renderBiz() {
+    var box = el("bizList");
+    el("bizCount").textContent = links.length;
+    if (!links.length) {
+      box.innerHTML = '<div class="text-center text-muted py-4 small">尚未创建容灾链路，' +
+        '请前往「容灾链路」新建并配置站点地域</div>';
+      return;
+    }
+    box.innerHTML = links.map(function (l, i) {
+      var h = healthOf(l);
+      var dot = '<span class="dr-legend-dot" style="background:' + colorOf(h.level) + '"></span>';
+      return '<div class="dr-biz-row d-flex align-items-start' +
+        (selected === l.id ? " active" : "") + '" onclick="drDrill(' + l.id + ')">' +
+        '<span class="idx">' + (i + 1) + '</span>' +
+        '<div class="flex-grow-1">' +
+        '<div class="d-flex align-items-center flex-wrap gap-1">' +
+        '<b>' + esc(l.name) + '</b>' + activeBadge(l.active_site) + dot +
+        '<span class="small text-muted ms-1">' + h.label + '</span></div>' +
+        '<div class="small text-muted mt-1"><i class="bi bi-geo-alt me-1"></i>' +
+        esc(cityName(l.primary_region) + " → " + cityName(l.dr_region)) +
+        '　<i class="bi bi-hdd-network me-1"></i>' +
+        esc((l.primary_site || "—") + " → " + (l.dr_site || "—")) + '</div>' +
+        '</div>' +
+        '<a class="btn btn-sm btn-outline-primary ms-2 flex-none" href="/dr-switch?link_id=' + l.id + '" onclick="event.stopPropagation()">切换</a>' +
+        '</div>';
+    }).join("");
+  }
+
+  // ------------------------- KPI / 切换记录 -------------------------
+  function renderKpi(runs) {
+    var okN = 0, badN = 0, priN = 0, stdN = 0;
+    links.forEach(function (l) {
+      var h = healthOf(l);
+      if (h.level === "ok") okN++;
+      else if (h.level === "bad") badN++;
+      if (l.active_site === "primary") priN++;
+      else if (l.active_site === "standby") stdN++;
+    });
+    el("kpiLinks").textContent = links.length;
+    el("kpiHealthy").textContent = okN;
+    var bad = el("kpiBad");
+    bad.textContent = badN;
+    bad.className = "fs-4 " + (badN ? "text-danger" : "text-success");
+    el("kpiPrimary").textContent = priN;
+    el("kpiStandby").textContent = stdN;
+    var last = (runs || []).filter(function (r) { return r.status === "success"; })[0];
+    el("kpiRto").textContent = last ? (last.rto_sec || 0).toFixed(1) + "s" : "—";
+  }
+
+  function renderRuns(runs) {
+    var rt = el("drRunTable");
+    if (!runs.length) {
+      rt.innerHTML = '<tr><td colspan="8" class="text-center text-muted py-3">暂无切换记录</td></tr>';
+      return;
+    }
+    var scopeName = { full: "业务+DNS", business: "仅业务", dns_only: "仅DNS" };
+    rt.innerHTML = runs.map(function (r) {
+      var cls = r.status === "success" ? "badge-ok" : (r.status === "failed" ? "badge-fail" : "badge-run");
+      return '<tr><td>' + r.id + '</td><td class="small">' + esc(r.link_name || "") + '</td>' +
+        '<td class="small">' + (r.direction === "failback" ? "回切" : "切换") + '</td>' +
+        '<td class="small">' + (scopeName[r.scope] || "业务+DNS") + '</td>' +
+        '<td>' + '<span class="badge ' + cls + '">' + esc(r.status) + '</span></td>' +
+        '<td>' + (r.rto_sec ? Number(r.rto_sec).toFixed(1) + "s" : "—") + '</td>' +
+        '<td class="small">' + esc((r.started_at || "").slice(0, 19).replace("T", " ")) + '</td>' +
+        '<td class="text-end"><a class="btn btn-sm btn-outline-secondary" href="/dr-switch?run_id=' + r.id + '">查看</a></td></tr>';
+    }).join("");
+  }
+
+  // ------------------------- 加载 -------------------------
+  function load(full) {
+    // full=false：light 模式秒回（跳过逐链路探活），先把页面渲染出来；
+    // full=true：完整探测，健康状态随后异步刷新。
+    BKP.api("GET", "/api/dr/overview" + (full ? "" : "?light=1")).then(function (d) {
+      links = d.links || [];
+      var runs = d.recent_runs || [];
+      el("drGenAt").textContent = "更新 " + (d.generated_at || "").slice(11, 19);
+      renderBiz();
+      renderKpi(runs);
+      renderRuns(runs);
+      renderMap();
+      if (selected != null) {
+        var l = links.filter(function (x) { return x.id === selected; })[0];
+        if (l) renderDrill(l);
+      }
+    }).catch(function (e) {
+      BKP.toast("加载容灾总览失败: " + e.message, "danger");
+    });
+  }
+
+  // 底图立即渲染（不依赖 API）：页面打开即出省界
+  loadMap().then(function () { renderMap(); });
+  load(false);
+  setTimeout(function () { load(true); }, 400);
+  timer = setInterval(function () { load(true); }, 30000);
+})();
+</script>
+{% endblock %}

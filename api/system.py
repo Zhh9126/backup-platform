@@ -154,22 +154,45 @@ def _dash_recalc_async():
     threading.Thread(target=_job, daemon=True).start()
 
 
+def _with_live(payload: dict) -> dict:
+    """把「正在执行 / 即将执行」叠加到缓存快照上。
+
+    这两段是**秒级变化**的：跟着 30s 缓存走会让用户刚点完备份、页面上
+    还在显示"暂无正在执行"。所以每次请求都现算（一次 SQL + 少量推算）。
+    """
+    try:
+        data = dict(payload or {})
+        data.update(_dashboard_live())
+        return data
+    except Exception as exc:                                    # noqa: BLE001
+        logger.debug("dashboard live 叠加失败: %s", exc)
+        return payload
+
+
 @api_bp.route("/dashboard", methods=["GET"])
 @login_required
 def dashboard():
     import time as _time
     now = _time.time()
+    # ?fresh=1：大屏 5 秒级轮询用，跳过 120s 快照缓存直接重算（一次约 0.15s），
+    # 否则"实时刷新"拿到的仍是最多 2 分钟前的聚合数字，属于自欺欺人。
+    _fresh = str(request.args.get("fresh") or "").lower() in ("1", "true", "yes", "on")
+    if _fresh:
+        payload = _dashboard_payload()
+        _DASH_CACHE["ts"] = now
+        _DASH_CACHE["data"] = payload
+        return jsonify(_with_live(payload))
     if _DASH_CACHE["data"] is not None and now - _DASH_CACHE["ts"] < _DASH_TTL:
-        return jsonify(_DASH_CACHE["data"])
+        return jsonify(_with_live(_DASH_CACHE["data"]))
     # 过期：有旧快照立即返回（stale）+ 后台重算（revalidate）——用户永远秒开；
     # 仅服务刚启动无任何快照时才同步算一次
     if _DASH_CACHE["data"] is not None:
         _dash_recalc_async()
-        return jsonify(_DASH_CACHE["data"])
+        return jsonify(_with_live(_DASH_CACHE["data"]))
     payload = _dashboard_payload()
     _DASH_CACHE["ts"] = now
     _DASH_CACHE["data"] = payload
-    return jsonify(payload)
+    return jsonify(_with_live(payload))
 
 
 def _dashboard_payload():
@@ -235,6 +258,33 @@ def _dashboard_payload():
         }
 
     recent = [_enrich(r) for r in records[:10]]
+
+    # ---- 业务系统/主机保护态势（大屏 TOP：按 业务系统+IP 聚合近 500 次作业） ----
+    # 大屏要回答"哪个业务哪台机器有没有问题"——只给任务名/次数定位不了，
+    # 这里按（业务系统, IP）聚合成功/失败计数，失败>0 的行大屏红色警示。
+    biz_top = []
+    try:
+        _biz_map = {t["id"]: (t.get("biz_system") or "-") for t in tasks}
+        _host_map = {t["id"]: (t.get("host") or "-") for t in tasks}
+        agg = {}
+        for r in records:
+            tid = r.get("task_id")
+            key = (_biz_map.get(tid) or "-", _host_map.get(tid) or "-")
+            a = agg.setdefault(key, {"biz_system": key[0], "host_ip": key[1],
+                                     "success": 0, "failed": 0, "last_failed_at": ""})
+            st = r.get("status")
+            if st == "failed":
+                a["failed"] += 1
+                if not a["last_failed_at"] or str(r.get("started_at") or "") > a["last_failed_at"]:
+                    a["last_failed_at"] = str(r.get("started_at") or "")
+            elif st in ("success", "simulated", "running"):
+                a["success"] += 1
+        biz_top = sorted(agg.values(), key=lambda x: -(x["success"] + x["failed"]))[:8]
+        for a in biz_top:
+            a["total"] = a["success"] + a["failed"]
+            a["has_problem"] = a["failed"] > 0
+    except Exception:
+        biz_top = []
     payload = {
         "task_count": len(tasks),
         "db_task_count": db_task_count,
@@ -262,6 +312,7 @@ def _dashboard_payload():
         "total_size_human": db.human_size(total_size),
         "recent_records": recent,
         "recent_tasks": tasks[:5],
+        "biz_top": biz_top,
         "health_score": health,
         "health_details": health_details,
         "compression_pct": comp_ratio,
@@ -306,6 +357,206 @@ def _parse_dt(val):
         return None
 
 
+def _iso(ts) -> str:
+    """把各类时间表示统一成可排序的 ISO 字符串（带本地时区）。
+
+    policy_schedule 推算出来的是 ``2026-11-14 10:28``（空格、无时区），
+    APScheduler 给的是 ``2026-11-13T22:28:40+08:00``。字符串排序时
+    空格(0x20) < 'T'(0x54)，混排会把"明天 10:28"错排到今天之前——
+    统一归一后再排序，前端也能直接 new Date() 解析。
+    """
+    if ts is None or ts == "":
+        return ""
+    from datetime import datetime
+    if hasattr(ts, "isoformat"):
+        try:
+            return ts.isoformat()
+        except Exception:
+            return str(ts)
+    s = str(ts).strip().replace(" ", "T", 1)
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return s
+    if dt.tzinfo is None:
+        # 无时区 → 按平台本地偏移补齐，避免与带时区的时间混排错序
+        try:
+            off = db.now_iso()[-6:]
+            if off and off[0] in "+-" and ":" in off:
+                return s + off
+        except Exception:
+            pass
+    return s
+
+
+def _elapsed_sec(val) -> int:
+    """已运行秒数（本地时间口径，兼容 ISO 与空格两种写法）。"""
+    from datetime import datetime
+    s = str(val or "").strip().replace("T", " ")[:19]
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return max(0, int((datetime.now() - datetime.strptime(s, fmt)).total_seconds()))
+        except Exception:
+            continue
+    return None
+
+
+def _dashboard_live() -> dict:
+    """仪表盘「正在执行 / 即将执行」——**不吃缓存**的实时数据。
+
+    背景（2026-11-13）：原「即将执行」只读 APScheduler 的 jobs，而平台里绝大多数
+    任务 schedule_type 是 ``manual``/空串（不注册调度器），于是卡片永远显示
+    “暂无已排程任务”；同时「正在执行」这一段根本不存在，运维看不到谁在跑。
+
+    这里改为三段合并、全部实算：
+
+    1. **正在执行**：``backup_records.status='running'`` 的作业（含已运行时长）
+       + 实时保护守护运行中的数量；
+    2. **即将执行**：APScheduler 已注册作业的 ``next_run_time``（最准）∪
+       任务自身 ``schedule_type=cron/interval`` 推算 ∪ 绑定策略的
+       ``policy_schedule.next_fire_times`` 推算；
+    3. 两者都按时间排序、去重、限量返回。
+
+    诚实边界：``manual`` 任务不会被凭空排进"即将执行"——没配调度就是没计划。
+    """
+    from datetime import datetime, timezone
+
+    out = {"running": [], "next_runs": [], "running_count": 0,
+           "rt_running": 0, "generated_at": db.now_iso()}
+
+    # ---- ① 正在执行（备份作业） ----
+    try:
+        rows = db.query(
+            "SELECT r.id, r.task_id, r.backup_type, r.started_at, r.status, "
+            "       t.name AS task_name, t.db_type, t.host "
+            "FROM backup_records r LEFT JOIN backup_tasks t ON t.id = r.task_id "
+            "WHERE r.status='running' ORDER BY r.id DESC LIMIT 20") or []
+        for r in rows:
+            # 时长按**本地时间**比较：备份记录的 started_at 有两种写法
+            # （`2026-11-13T22:16:12+08:00` 与 `2026-11-13 22:29:12`），
+            # 用 UTC now 去减本地 naive 时间会算出 -28800 秒这种负时长。
+            elapsed = _elapsed_sec(r.get("started_at"))
+            out["running"].append({
+                "record_id": r.get("id"), "task_id": r.get("task_id"),
+                "name": r.get("task_name") or ("task_%s" % r.get("task_id")),
+                "db_type": r.get("db_type") or "", "host": r.get("host") or "",
+                "backup_type": r.get("backup_type") or "",
+                "started_at": r.get("started_at"), "elapsed_sec": elapsed,
+                "kind": "backup",
+            })
+    except Exception as exc:                                    # noqa: BLE001
+        logger.debug("dashboard running 计算失败: %s", exc)
+
+    # ---- ② 实时保护守护运行中 ----
+    try:
+        row = db.query_one(
+            "SELECT COUNT(*) AS c FROM backup_tasks "
+            "WHERE enabled=1 AND rt_enabled=1")
+        out["rt_running"] = int((row or {}).get("c") or 0)
+    except Exception:
+        out["rt_running"] = 0
+
+    out["running_count"] = len(out["running"])
+
+    # ---- ③ 即将执行（三来源合并） ----
+    seen = set()
+    items = []
+
+    def _push(task_id, name, next_at, source, extra=None):
+        if not next_at:
+            return
+        key = (task_id, str(next_at)[:16])
+        if key in seen:
+            return
+        seen.add(key)
+        it = {"task_id": task_id, "name": name, "next_at": next_at,
+              "source": source}
+        if extra:
+            it.update(extra)
+        items.append(it)
+
+    # 3a) APScheduler 已注册作业（最准）——**只保留能映射到真实备份任务的作业**。
+    # 调度器里还跑着 runtime_heartbeat / backup_cleanup / gfs_cleanup /
+    # netdev_auto_backup / ferry_inbox 等系统维护作业，把它们混进"备份计划"会误导。
+    try:
+        task_map = {}
+        for t in db.query("SELECT id, name, db_type FROM backup_tasks") or []:
+            task_map[int(t["id"])] = t
+        for j in (scheduler.scheduler_status() or {}).get("jobs") or []:
+            jid = str(j.get("id") or "")
+            tid = None
+            for sep in ("_", "-"):
+                tail = jid.rsplit(sep, 1)[-1]
+                if tail.isdigit() and int(tail) in task_map:
+                    tid = int(tail)
+                    break
+            if not tid:
+                continue                     # 系统维护作业：不进备份计划列表
+            _push(tid, task_map[tid].get("name") or jid, _iso(j.get("next_run")),
+                  "scheduler", {"db_type": task_map[tid].get("db_type")})
+    except Exception as exc:                                    # noqa: BLE001
+        logger.debug("dashboard next_runs(scheduler) 失败: %s", exc)
+
+    # 3b) 任务自身调度（cron / interval）→ 用 policy_schedule 统一推算
+    try:
+        from core import policy_schedule as _ps
+        rows = db.query(
+            "SELECT id, name, schedule_type, cron_expr, interval_minutes, "
+            "       mixed_backup, full_schedule_type, full_schedule_days, "
+            "       full_schedule_expr, policy_id "
+            "FROM backup_tasks WHERE enabled=1 "
+            "AND schedule_type IN ('cron','interval') LIMIT 200") or []
+        for t in rows:
+            sched = {
+                "enabled": True,
+                "type": "cron" if str(t.get("schedule_type")) == "cron" else "interval",
+                "cron_expr": t.get("cron_expr") or "",
+                "interval_minutes": int(t.get("interval_minutes") or 1440),
+                "full_mode": "mixed" if t.get("mixed_backup") else "full_only",
+                "full_type": "cron" if str(t.get("full_schedule_type")) == "cron" else "week",
+                "full_days": [int(x) for x in str(t.get("full_schedule_days") or "").replace(" ", "").split(",")
+                              if x.strip().isdigit()],
+                "full_cron_expr": t.get("full_schedule_expr") or "",
+            }
+            for nt in _ps.next_fire_times(sched, 1)[:1]:
+                _push(t.get("id"), t.get("name"), _iso(nt),
+                      "policy" if t.get("policy_id") else "task",
+                      {"db_type": t.get("db_type")})
+    except Exception as exc:                                    # noqa: BLE001
+        logger.debug("dashboard next_runs(任务调度) 失败: %s", exc)
+
+    # 3c) 绑定策略的任务（策略改了而任务的 schedule_type 尚未落库时兜底）
+    try:
+        from core import policy_schedule as _ps
+        rows = db.query(
+            "SELECT id, name, backup_strategy FROM protection_policies "
+            "WHERE enabled=1 AND id IN (SELECT DISTINCT policy_id FROM backup_tasks "
+            "WHERE enabled=1 AND policy_id IS NOT NULL)") or []
+        for pol in rows:
+            bs = pol.get("backup_strategy") or {}
+            if isinstance(bs, str):
+                try:
+                    bs = json.loads(bs)
+                except Exception:
+                    bs = {}
+            names = db.query(
+                "SELECT id, name FROM backup_tasks WHERE enabled=1 AND policy_id=? "
+                "LIMIT 20", (pol.get("id"),)) or []
+            nxts = _ps.next_fire_times(bs, 1)
+            if not nxts:
+                continue
+            for t in names:
+                _push(t.get("id"), t.get("name"), _iso(nxts[0]), "policy")
+    except Exception as exc:                                    # noqa: BLE001
+        logger.debug("dashboard next_runs(策略) 失败: %s", exc)
+
+    items.sort(key=lambda x: str(x.get("next_at")))
+    out["next_runs"] = items[:6]
+    return out
+
+
 def _insights(tasks, records, total_size):
     """首页"运营态势"指标（对标 Veeam / Commvault / Rubrik 的保护与合规视图）。
 
@@ -322,6 +573,22 @@ def _insights(tasks, records, total_size):
         "drills": {}, "replication": {}, "wow": {}, "objects": {},
     }
     now = datetime.now().astimezone()
+
+    # ---- 任务索引：IP / 业务系统（大屏与关注列表要能定位到"哪台机器哪个业务"） ----
+    tinfo = {}
+    for t in tasks:
+        try:
+            tinfo[t.get("id")] = {
+                "host_ip": t.get("host") or "-",
+                "biz_system": t.get("biz_system") or "-",
+                "name": t.get("name") or "",
+            }
+        except Exception:
+            pass
+
+    def _tmeta(tid):
+        info = tinfo.get(tid) or {}
+        return info.get("host_ip") or "-", info.get("biz_system") or "-"
 
     # ---- 每个任务最近的**成功**备份时间 ----
     # 注意：不能用入参 records（只取最近 500 条）来判断"某任务是否被保护过"——
@@ -417,21 +684,23 @@ def _insights(tasks, records, total_size):
     try:
         att = []
         for it in (out["rpo"].get("items") or []):
+            _ip, _biz = _tmeta(it["task_id"])
             if it.get("never"):
                 att.append({"kind": "never", "severity": "high", "task_id": it["task_id"],
-                            "title": it["name"],
+                            "title": it["name"], "host_ip": _ip, "biz_system": _biz,
                             "detail": f"启用任务从未成功备份（RPO 目标 {it['target_min']} 分钟）"})
             elif (it.get("overdue_min") or 0) > 0:
                 hrs = round((it["age_min"] or 0) / 60, 1)
                 att.append({"kind": "rpo", "severity": "high", "task_id": it["task_id"],
-                            "title": it["name"],
+                            "title": it["name"], "host_ip": _ip, "biz_system": _biz,
                             "detail": f"已 {hrs}h 未成功备份，超出 RPO 目标 {it['target_min']} 分钟"})
         for r in records[:200]:
             if r.get("status") == "failed" and len(att) < 12:
                 tname = next((t.get("name") for t in tasks if t.get("id") == r.get("task_id")),
                              f"task_{r.get('task_id')}")
+                _ip, _biz = _tmeta(r.get("task_id"))
                 att.append({"kind": "failed", "severity": "medium", "task_id": r.get("task_id"),
-                            "title": tname,
+                            "title": tname, "host_ip": _ip, "biz_system": _biz,
                             "detail": f"备份失败于 {str(r.get('started_at') or '')[:16]}"})
                 if len([a for a in att if a["kind"] == "failed"]) >= 4:
                     break
@@ -450,10 +719,12 @@ def _insights(tasks, records, total_size):
             for g in pg["gaps"]:
                 if len(att) >= 12:
                     break
+                _ip, _biz = _tmeta(g.get("task_id"))
                 att.append({"kind": f"goal_{g['code']}",
                             "task_id": g.get("task_id"),
                             "severity": "high" if g["level"] == "fail" else "medium",
-                            "title": g.get("task_name"),
+                            "title": g.get("task_name"), "host_ip": _ip,
+                            "biz_system": _biz,
                             "detail": g.get("message")})
         except Exception as exc:
             logger.debug("protection gaps 计算失败: %s", exc)
@@ -537,7 +808,9 @@ def _insights(tasks, records, total_size):
                 running += 1
             else:
                 degraded += 1
+            _ip, _biz = _tmeta(tid)
             rt_items.append({"task_id": tid, "name": row.get("name") or f"task_{tid}",
+                             "host_ip": _ip, "biz_system": _biz,
                              "status": st or "unknown",
                              "reason": ((state_map.get(tid) or {}).get("degrade_reason") or "")[:120]})
         out["rt"] = {"total": len(rt_items), "running": running, "degraded": degraded,
@@ -993,10 +1266,10 @@ def save_notify_config():
 @api_bp.route("/notify-config/test", methods=["POST"])
 @login_required
 def test_notify_config():
-    """使用当前已保存的邮件渠道发送一封测试邮件。
+    """测试已保存的通知渠道（邮件 + 短信），逐渠道返回结果。
 
-    用于在「保存通知配置」后立即验证 SMTP 是否通畅：避免配错
-    （主机/端口/密码/授权码）后还要等下一次失败备份才察觉。
+    用于在「保存通知配置」后立即验证通道是否通畅：避免配错
+    （主机/端口/密码/授权码/网关地址）后还要等下一次失败备份才察觉。
     """
     import json
     import smtplib
@@ -1007,87 +1280,105 @@ def test_notify_config():
     if not raw:
         return jsonify({"ok": False, "error": "尚未保存通知配置"}), 400
     cfg = json.loads(raw)
-    email_ch = next((c for c in cfg.get("channels", []) if c.get("type") == "email"), None)
-    if not email_ch:
-        return jsonify({"ok": False, "error": "未配置邮件渠道"}), 400
-    # 基础字段校验
-    missing = []
-    if not email_ch.get("smtp_host"): missing.append("smtp_host")
-    if not email_ch.get("smtp_user"): missing.append("smtp_user")
-    if not email_ch.get("to"): missing.append("to")
-    if missing:
-        return jsonify({"ok": False, "error": f"字段缺失: {', '.join(missing)}"}), 400
-    if not email_ch.get("smtp_password"):
-        return jsonify({
-            "ok": False,
-            "error": "SMTP 密码未填写。QQ/163/Gmail 等需要的是「授权码」，不是登录密码。",
-        }), 400
-    # 组装并发送（HTML 卡片样式）
-    title = "[AIDBM] 通知测试邮件"
-    text = (
-        f"发送时间: {db.now_iso()}\n"
-        f"发件人: {email_ch.get('from_addr') or email_ch.get('smtp_user')}\n"
-        f"收件人: {', '.join(email_ch.get('to', []))}\n"
-        f"SMTP 主机: {email_ch.get('smtp_host')}:{email_ch.get('smtp_port', 25)}\n"
-        f"使用 TLS: {email_ch.get('use_tls')}\n\n"
-        "如果你看到这封邮件，说明通知配置正确，备份告警/巡检异常会通过该渠道送达。\n"
-        "若未收到，请检查：(1) 邮箱垃圾箱；(2) QQ/163 需要「授权码」而非登录密码；"
-        "(3) QQ 邮箱请使用 smtp.qq.com:465 + SSL。"
-    )
-    try:
-        from core.email_template import render_test_email
-        html = render_test_email({
-            "from_addr": email_ch.get("from_addr") or email_ch.get("smtp_user"),
-            "smtp_user": email_ch.get("smtp_user"),
-            "smtp_host": email_ch.get("smtp_host"),
-            "smtp_port": email_ch.get("smtp_port", 25),
-            "use_tls": email_ch.get("use_tls"),
-            "to": email_ch.get("to", []),
-        })
-    except Exception:
-        html = None
-    # 多部分邮件：HTML 优先，纯文本兜底
-    if html:
-        msg = MIMEMultipart("alternative")
-        msg.attach(MIMEText(text, "plain", "utf-8"))
-        msg.attach(MIMEText(html, "html", "utf-8"))
-    else:
-        msg = MIMEText(text, "plain", "utf-8")
-    msg["Subject"] = Header(title, "utf-8")
-    msg["From"] = email_ch.get("from_addr") or email_ch.get("smtp_user")
-    msg["To"] = ", ".join(email_ch["to"])
-    port = int(email_ch.get("smtp_port", 25))
-    host = email_ch["smtp_host"]
-    timeout = 15
-    try:
-        # QQ/Gmail/163 普遍 465 用 SSL；其它 port+use_tls 用 STARTTLS
-        if port == 465:
-            with smtplib.SMTP_SSL(host, port, timeout=timeout) as s:
-                s.login(email_ch["smtp_user"], email_ch["smtp_password"])
-                s.sendmail(msg["From"], email_ch["to"], msg.as_string())
+    channels = cfg.get("channels", [])
+    results = []
+
+    # ---------------- 短信渠道（通用 HTTP 网关） ----------------
+    sms_ch = next((c for c in channels if c.get("type") == "sms"), None)
+    if sms_ch:
+        from core.notifier import Notifier as _N
+        ok, detail = _N()._send_sms(sms_ch, "[AIDBM] 通知测试",
+                                      f"通知测试（{db.now_iso()}）：邮件/短信通道验证，收到即配置正确。")
+        results.append({"type": "sms", "ok": ok, "detail": detail})
+        db.add_log("INFO" if ok else "ERROR", "notify", f"test sms -> ok={ok} {detail}")
+
+    # ---------------- 邮件渠道（SMTP） ----------------
+    email_ch = next((c for c in channels if c.get("type") == "email"), None)
+    if email_ch:
+        # 基础字段校验（缺字段不直接 400——短信渠道可能已配好，邮件问题作为结果返回）
+        missing = []
+        if not email_ch.get("smtp_host"): missing.append("smtp_host")
+        if not email_ch.get("smtp_user"): missing.append("smtp_user")
+        if not email_ch.get("to"): missing.append("to")
+        if missing:
+            results.append({"type": "email", "ok": False,
+                            "detail": f"字段缺失: {', '.join(missing)}"})
+        elif not email_ch.get("smtp_password"):
+            results.append({"type": "email", "ok": False,
+                            "detail": "SMTP 密码未填写。QQ/163/Gmail 等需要的是「授权码」，不是登录密码。"})
         else:
-            with smtplib.SMTP(host, port, timeout=timeout) as s:
-                s.ehlo()
-                if email_ch.get("use_tls"):
-                    s.starttls()
-                    s.ehlo()
-                if email_ch.get("smtp_user"):
-                    s.login(email_ch["smtp_user"], email_ch["smtp_password"])
-                s.sendmail(msg["From"], email_ch["to"], msg.as_string())
-        db.add_log("INFO", "notify", f"test email sent to {', '.join(email_ch['to'])}")
-        return jsonify({"ok": True, "message": "测试邮件发送成功，请检查收件箱（含垃圾邮件）"})
-    except smtplib.SMTPAuthenticationError as e:
-        return jsonify({
-            "ok": False,
-            "error": f"认证失败：账号或密码错误（QQ/163/Gmail 需使用「授权码」）。详情: {e}",
-        }), 400
-    except smtplib.SMTPConnectError as e:
-        return jsonify({
-            "ok": False,
-            "error": f"无法连接 SMTP {host}:{port}。检查主机名/端口/防火墙/SSL。详情: {e}",
-        }), 400
-    except Exception as e:
-        return jsonify({"ok": False, "error": f"发送失败: {e}"}), 500
+            # 组装并发送（HTML 卡片样式）
+            title = "[AIDBM] 通知测试邮件"
+            text = (
+                f"发送时间: {db.now_iso()}\n"
+                f"发件人: {email_ch.get('from_addr') or email_ch.get('smtp_user')}\n"
+                f"收件人: {', '.join(email_ch.get('to', []))}\n"
+                f"SMTP 主机: {email_ch.get('smtp_host')}:{email_ch.get('smtp_port', 25)}\n"
+                f"使用 TLS: {email_ch.get('use_tls')}\n\n"
+                "如果你看到这封邮件，说明通知配置正确，备份告警/巡检异常会通过该渠道送达。\n"
+                "若未收到，请检查：(1) 邮箱垃圾箱；(2) QQ/163 需要「授权码」而非登录密码；"
+                "(3) QQ 邮箱请使用 smtp.qq.com:465 + SSL。"
+            )
+            try:
+                from core.email_template import render_test_email
+                html = render_test_email({
+                    "from_addr": email_ch.get("from_addr") or email_ch.get("smtp_user"),
+                    "smtp_user": email_ch.get("smtp_user"),
+                    "smtp_host": email_ch.get("smtp_host"),
+                    "smtp_port": email_ch.get("smtp_port", 25),
+                    "use_tls": email_ch.get("use_tls"),
+                    "to": email_ch.get("to", []),
+                })
+            except Exception:
+                html = None
+            # 多部分邮件：HTML 优先，纯文本兜底
+            if html:
+                msg = MIMEMultipart("alternative")
+                msg.attach(MIMEText(text, "plain", "utf-8"))
+                msg.attach(MIMEText(html, "html", "utf-8"))
+            else:
+                msg = MIMEText(text, "plain", "utf-8")
+            msg["Subject"] = Header(title, "utf-8")
+            msg["From"] = email_ch.get("from_addr") or email_ch.get("smtp_user")
+            msg["To"] = ", ".join(email_ch["to"])
+            port = int(email_ch.get("smtp_port", 25))
+            host = email_ch["smtp_host"]
+            timeout = 15
+            try:
+                # QQ/Gmail/163 普遍 465 用 SSL；其它 port+use_tls 用 STARTTLS
+                if port == 465:
+                    with smtplib.SMTP_SSL(host, port, timeout=timeout) as s:
+                        s.login(email_ch["smtp_user"], email_ch["smtp_password"])
+                        s.sendmail(msg["From"], email_ch["to"], msg.as_string())
+                else:
+                    with smtplib.SMTP(host, port, timeout=timeout) as s:
+                        s.ehlo()
+                        if email_ch.get("use_tls"):
+                            s.starttls()
+                            s.ehlo()
+                        if email_ch.get("smtp_user"):
+                            s.login(email_ch["smtp_user"], email_ch["smtp_password"])
+                        s.sendmail(msg["From"], email_ch["to"], msg.as_string())
+                db.add_log("INFO", "notify", f"test email sent to {', '.join(email_ch['to'])}")
+                results.append({"type": "email", "ok": True,
+                                "detail": "测试邮件发送成功，请检查收件箱（含垃圾邮件）"})
+            except smtplib.SMTPAuthenticationError as e:
+                results.append({"type": "email", "ok": False,
+                                "detail": f"认证失败：账号或密码错误（QQ/163/Gmail 需使用「授权码」）。详情: {e}"})
+            except smtplib.SMTPConnectError as e:
+                results.append({"type": "email", "ok": False,
+                                "detail": f"无法连接 SMTP {host}:{port}。检查主机名/端口/防火墙/SSL。详情: {e}"})
+            except Exception as e:
+                results.append({"type": "email", "ok": False, "detail": f"发送失败: {e}"})
+
+    if not results:
+        return jsonify({"ok": False, "error": "未配置任何通知渠道（邮件/短信）"}), 400
+    any_ok = any(r.get("ok") for r in results)
+    return jsonify({
+        "ok": any_ok,
+        "results": results,
+        "message": "；".join("%s: %s" % (r["type"], r["detail"]) for r in results)[:400],
+    }), (200 if any_ok else 400)
 
 
 # ------------------------- 存储池加密密钥 (KMS) -------------------------
@@ -1266,12 +1557,20 @@ def api_get_concurrency():
     except Exception as exc:  # noqa: BLE001
         stats = {"error": str(exc)}
     env_override = int(getattr(config, "MAX_CONCURRENT_BACKUPS", 0) or 0) or None
+    # 引擎并行预算：平台并发 × 单任务并行 ≈ 总并行（parallel_plan 的实时快照），
+    # 让运维在界面上一眼看到"当前并发被压小后单任务会自动开几路"。
+    try:
+        from core import parallel_plan
+        engine_parallel = parallel_plan.refresh_now()
+    except Exception as exc:  # noqa: BLE001
+        engine_parallel = {"error": str(exc)}
     return jsonify({
         "max_concurrent_backups": stats.get("max_concurrent_backups", 2),
         "env_override": env_override or None,
         "default": 2,
         "range": [1, 64],
         "stats": stats,
+        "engine_parallel": engine_parallel,
     })
 
 

@@ -27,6 +27,8 @@ def run_drill(drill_id: int) -> dict:
 
     if d.get("drill_type") == "real_restore":
         return _run_real_restore_drill(d, drill_id)
+    if d.get("drill_type") == "switch":
+        return _run_switch_drill(d, drill_id)
     _logger.info("[drill] 开始演练 %s: %s", drill_id, d.get("name"))
 
     rto_start = time.time()
@@ -436,6 +438,99 @@ def _gen_recommendation(score: int, issues: list, drill_type: str) -> str:
     if not recs:
         recs.append("请定期执行容灾演练，每季度至少一次")
     return "; ".join(recs)
+
+
+def _run_switch_drill(d: dict, drill_id: int) -> dict:
+    """容灾切换演练：计划性切换（优雅换主）→ 新主写入探针 → 自动回切
+    → 探针闭环核对 → 拓扑终态核对。
+
+    与真实恢复演练的区别：恢复演练验证的是「备份能不能恢复」；
+    切换演练验证的是「主备架构能不能真的换主」——RTO/RPO/复制闭环/
+    DNS 牵引全链路真执行，演练结束自动回到原拓扑（零残留）。
+
+    当前支持 MySQL/MariaDB 主备链路（failover_config + replication_user），
+    其他库型如实拒绝。scenario: {"link_id": N}（兼容直接把链路 ID 填在
+    task_id 字段的旧用法）。
+    """
+    from core import dr_failover
+
+    rto_start = time.time()
+    issues = []
+    score = 100
+
+    def _finish(score_, status_, issues_, report_):
+        rto = round(time.time() - rto_start, 1)
+        report_.update({"score": score_, "rto_sec": rto, "issues": issues_,
+                        "recommendation": _gen_recommendation(
+                            score_, issues_, "switch")})
+        models.update_drill(drill_id, {
+            "status": status_, "finished_at": db.now_iso(),
+            "rto_actual_sec": rto, "score": score_,
+            "issues_found": json.dumps(issues_, ensure_ascii=False),
+            "report": json.dumps(report_, ensure_ascii=False),
+        })
+        _logger.info("[drill] 切换演练 %s 完成 status=%s score=%s rto=%.1fs",
+                     drill_id, status_, score_, rto)
+        return {"ok": status_ == "success", "status": status_,
+                "score": score_, "rto_sec": rto, "issues": issues_}
+
+    try:
+        scenario = {}
+        try:
+            scenario = json.loads(d.get("scenario") or "{}")
+        except Exception:
+            scenario = {}
+        link_id = int(scenario.get("link_id") or d.get("task_id") or 0)
+        if not link_id:
+            return _finish(0, "failed",
+                           ["切换演练未指定容灾链路（scenario.link_id）"],
+                           {"mode": "switch"})
+        link = models.get_disaster_link(link_id)
+        if not link:
+            return _finish(0, "failed", ["容灾链路不存在: %s" % link_id],
+                           {"mode": "switch"})
+        cfg = dr_failover._load_config(dict(link))
+        if not (cfg.get("primary_conn") and cfg.get("standby_conn")):
+            return _finish(0, "failed",
+                           ["链路缺少切换参数（primary_conn/standby_conn），"
+                            "请先在容灾页「配置」中完成主备连接配置"],
+                           {"mode": "switch", "link_id": link_id})
+
+        report = {"mode": "switch", "link_id": link_id,
+                  "link_name": link.get("name")}
+        res = dr_failover.run_switch_drill(link_id)
+
+        if not res.get("ok"):
+            failed_steps = [s.get("name") for s in (res.get("steps") or [])
+                            if not s.get("ok")]
+            issues = [res.get("error") or "切换演练失败"]
+            if failed_steps:
+                issues.append("失败步骤: %s" % "、".join(failed_steps))
+            report.update({"steps": res.get("steps") or [],
+                           "snapshot": res.get("snapshot") or {}})
+            return _finish(0, "failed", issues, report)
+
+        sw = res.get("switch") or {}
+        sb = res.get("switchback") or {}
+        report.update({
+            "marker": res.get("marker"),
+            "rto_switch_sec": res.get("rto_switch_sec"),
+            "rto_switchback_sec": res.get("rto_switchback_sec"),
+            "total_sec": res.get("total_sec"),
+            "switch_steps": sw.get("steps") or [],
+            "switchback_steps": sb.get("steps") or [],
+        })
+        # RTO 阈值扣分（>120s 扣 10，>300s 扣 20）
+        for k in ("rto_switch_sec", "rto_switchback_sec"):
+            v = res.get(k) or 0
+            if v > 300:
+                score -= 20
+            elif v > 120:
+                score -= 10
+        return _finish(score, "success" if score >= 60 else "failed",
+                       issues, report)
+    except Exception as e:
+        return _finish(0, "failed", [str(e)[:300]], {"mode": "switch"})
 
 
 def run_drill_async(drill_id: int) -> None:

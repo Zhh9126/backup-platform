@@ -16,6 +16,19 @@ from . import api_bp
 ALLOWED_PKG_EXTS = (".tar.gz", ".tgz", ".tar.xz", ".tar.bz2", ".zip", ".iso", ".bin", ".run", ".tar")
 
 
+def _dameng_password_error(pw: str):
+    """达梦 dminit 的口令硬校验前移到接口层。
+
+    dminit 要求 SYSDBA/SYSAUDITOR 口令 8-48 位且"大写+小写+数字"组合，
+    不合规会直接 fail to init db；在下发前拦掉，避免用户等半分钟后才看到失败。
+    """
+    if len(pw) < 8 or len(pw) > 48:
+        return "达梦 SYSDBA 口令长度必须 8-48 位（当前 %d 位），dminit 会拒绝初始化" % len(pw)
+    if not (any(c.isupper() for c in pw) and any(c.islower() for c in pw) and any(c.isdigit() for c in pw)):
+        return "达梦 SYSDBA 口令必须同时包含大写字母、小写字母和数字，dminit 会拒绝初始化"
+    return None
+
+
 @api_bp.route("/deploy/upload", methods=["POST"])
 @login_required
 def upload_package():
@@ -68,6 +81,12 @@ def create_deployment():
     data["config_json"] = json.dumps(cfg, ensure_ascii=False)
     data["direct_port"] = data.get("direct_port") or 22
     data["direct_user"] = data.get("direct_user") or "root"
+    if data.get("db_type") == "dameng":
+        pw = data.get("password") or cfg.get("dm_sysdba") or ""
+        if pw:
+            err = _dameng_password_error(pw)
+            if err:
+                return jsonify({"error": err}), 400
     dep_id = models.create_deployment(data)
     return jsonify({"id": dep_id, "ok": True}), 201
 
@@ -87,17 +106,30 @@ def get_deployment(dep_id):
 @login_required
 def update_deployment(dep_id):
     data = request.get_json(force=True, silent=True) or {}
-    if not models.get_deployment(dep_id):
+    existing = models.get_deployment(dep_id)
+    if not existing:
         return jsonify({"error": "部署记录不存在"}), 404
-    # 初始化/校验 config_json
+    # 部分更新语义：PUT 只带少数字段时，未提供的字段不得被默认值覆盖。
+    # 旧实现无条件写回 config_json（未传即写 "{}"）并把 direct_user 强制成 root，
+    # 导致"改个口令"会把 dm_instance / version 等配置清空（171 实测）。
     cfg = {}
-    try:
-        cfg = json.loads(data.get("config_json") or "{}")
-    except Exception:
-        cfg = {}
-    data["config_json"] = json.dumps(cfg, ensure_ascii=False)
-    data["direct_port"] = data.get("direct_port") or 22
-    data["direct_user"] = data.get("direct_user") or "root"
+    if "config_json" in data:
+        try:
+            cfg = json.loads(data.get("config_json") or "{}")
+        except Exception:
+            cfg = {}
+        data["config_json"] = json.dumps(cfg, ensure_ascii=False)
+    if "direct_port" in data:
+        data["direct_port"] = data.get("direct_port") or 22
+    if "direct_user" in data:
+        data["direct_user"] = data.get("direct_user") or "root"
+    _db_type = data.get("db_type") or existing.get("db_type")
+    if _db_type == "dameng":
+        pw = data.get("password") or cfg.get("dm_sysdba") or ""
+        if pw:
+            err = _dameng_password_error(pw)
+            if err:
+                return jsonify({"error": err}), 400
     models.update_deployment(dep_id, data)
     return jsonify({"ok": True})
 

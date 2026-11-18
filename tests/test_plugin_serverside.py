@@ -288,9 +288,7 @@ class TestPreflightPhysicalMissing(unittest.TestCase):
         fake_ssh = {"host_key": "root@1.2.3.4:22"}
         with patch("shutil.which", return_value=None), \
              patch("core.remote_dump.resolve_ssh_host", return_value=fake_ssh), \
-             patch("core.plugin_runtime.remote_check_clients",
-                   return_value={"installed": True, "missing": [],
-                                 "found_paths": {"rman": "/usr/bin/rman"}}):
+             patch("core.remote_dump.remote_has_tool", return_value=True):
             ok, msg = engine.preflight()
         self.assertTrue(ok)
         self.assertIn("远端", msg)
@@ -301,9 +299,7 @@ class TestPreflightPhysicalMissing(unittest.TestCase):
         fake_ssh = {"host_key": "root@1.2.3.4:22"}
         with patch("shutil.which", return_value=None), \
              patch("core.remote_dump.resolve_ssh_host", return_value=fake_ssh), \
-             patch("core.plugin_runtime.remote_check_clients",
-                   return_value={"installed": False, "missing": ["rman"],
-                                 "found_paths": {}}):
+             patch("core.remote_dump.remote_has_tool", return_value=False):
             ok, msg = engine.preflight()
         self.assertFalse(ok)
         self.assertIn("rman", msg)

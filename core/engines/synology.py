@@ -63,14 +63,26 @@ def _safe_rel(path: str) -> str:
 
 
 def _sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(8 << 20)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
+    """统一委托 core.db.sha256_file（此前 7 个模块各写一份，已收敛）。"""
+    from core import db as _db
+    return _db.sha256_file(path)
+
+
+def _rel_under_root(rel: str, roots: list) -> str:
+    """恢复回推时的目标相对路径：单根去掉共享根前缀，多根保留完整路径消歧。
+
+    例：只保护 `/backup_src` 时，`backup_src/docs/a.txt` → `docs/a.txt`，
+    恢复到 `/restore_t1` 得到 `/restore_t1/docs/a.txt`（不会多出一层
+    `/restore_t1/backup_src/docs/a.txt`）。
+    """
+    roots = [str(r).rstrip("/") for r in (roots or []) if str(r)]
+    if len(roots) == 1:
+        root = roots[0].lstrip("/")
+        if rel == root:
+            return os.path.basename(rel)
+        if rel.startswith(root + "/"):
+            return rel[len(root) + 1:]
+    return rel
 
 
 def _is_excluded(path: str, patterns: list) -> bool:
@@ -99,7 +111,7 @@ def _is_excluded(path: str, patterns: list) -> bool:
 
 class SynologyEngine(BackupEngine):
     db_type = "synology"
-    display_name = "群晖 NAS（DSM）"
+    display_name = "NAS 存储（群晖 DSM）"
     required_clients = []            # 纯标准库，平台侧零插件
     adapter_tier = "peripheral_api"
 
@@ -566,14 +578,109 @@ class SynologyEngine(BackupEngine):
             os.path.getsize(os.path.join(target, FILES_DIR, _safe_rel(p)))
             for p in expect
             if os.path.isfile(os.path.join(target, FILES_DIR, _safe_rel(p))))
+
+        # ---- 推回 DSM（FileStation.Upload）：真正的「恢复到 NAS」 ----
+        # 目标可以是：
+        #   ① 恢复弹窗 target_db 直接填 DSM 路径（形如 /backup_restore/20261113）；
+        #   ② 任务 extra.synology_restore_nas_path（该任务的默认恢复目录）；
+        #   ③ kwargs.target_nas_path（调度/API 显式指定，优先级最高）。
+        # 未指定则保持「只解包到平台侧目录」的旧行为（不改变既有语义）。
+        nas_path = (str(kwargs.get("target_nas_path") or "").strip()
+                    or str(self.extra.get("synology_restore_nas_path") or "").strip())
+        if not nas_path:
+            # target_db 既可能是「平台本地解包目录」，也可能是「DSM 目标路径」，
+            # 不能只看是否以 "/" 开头——2026-11-13 真机回归暴露：把本地路径
+            # （/tmp/xxx/restore_prod）误当 DSM 路径，去调 FileStation.CreateFolder
+            # 必然失败（code=102）。这里改为**显式约定**：
+            #   ① "nas:/共享/子目录" 前缀 → 明确要求回推 NAS；
+            #   ② 任务开关 extra.synology_restore_to_nas=True 且 target_db 是绝对路径
+            #      → 回推 NAS（该任务默认恢复到 DSM）；
+            #   ③ 其余绝对路径 → 保持旧语义（平台本地解包目录）。
+            cand = str(kwargs.get("target_db") or "").strip()
+            if cand.startswith("nas:") and cand[4:].startswith("/"):
+                nas_path = cand[4:]
+            elif (self.extra.get("synology_restore_to_nas") and cand.startswith("/")
+                  and ".." not in cand.split("/")):
+                nas_path = cand
+        if nas_path and not nas_path.startswith("/"):
+            return BackupResult(False, BackupStatus.FAILED,
+                                message="DSM 恢复路径必须是绝对路径（如 /backup_restore/test）",
+                                duration_sec=round(time.time() - started, 2))
+        up_ok, up_fail = 0, []
+        if nas_path:
+            cfg = self._cfg()
+            try:
+                cli = DSMClient(**{k: v for k, v in cfg.items()
+                                   if k in ("host", "port", "secure", "verify_ssl",
+                                            "username", "password", "otp_code",
+                                            "timeout", "session_name")})
+                cli.login()
+                cli.create_folder(nas_path, create_parents=True)
+                overwrite = bool(self.extra.get("synology_restore_overwrite", True))
+                # 上传路径解析：只保护一个共享根时去掉该根前缀（见 _rel_under_root）
+                roots = cfg.get("paths") or []
+                uploads = []
+                for p in expect:
+                    rel = _safe_rel(p)
+                    local = os.path.join(target, FILES_DIR, rel)
+                    if not os.path.isfile(local):
+                        continue
+                    uploads.append((p, _rel_under_root(rel, roots), local))
+                for p, rel, local in uploads:
+                    sub = os.path.dirname(rel)
+                    dest_dir = nas_path.rstrip("/") + ("/" + sub if sub else "")
+                    try:
+                        cli.upload(local, dest_dir, os.path.basename(rel),
+                                   overwrite=overwrite, create_parents=True)
+                        up_ok += 1
+                    except DSMError as e:
+                        up_fail.append("%s: %s" % (p, str(e)[:160]))
+                # 回读校验：从 DSM 重新列目录，逐文件比对大小（真实落地证据）
+                stat_bad = []
+                if up_ok:
+                    try:
+                        seen = {x.get("path"): int(x.get("size") or 0)
+                                for x in cli.walk_files(nas_path, max_files=200000)}
+                    except Exception:
+                        seen = {}
+                    for p, rel, local in uploads:
+                        remote = nas_path.rstrip("/") + "/" + rel
+                        if remote not in seen:
+                            stat_bad.append("%s: DSM 上不存在（%s）" % (p, rel))
+                        elif seen[remote] != os.path.getsize(local):
+                            stat_bad.append("%s: 大小不一致（本地 %d / NAS %d）"
+                                            % (p, os.path.getsize(local), seen[remote]))
+                if stat_bad:
+                    return BackupResult(
+                        False, BackupStatus.FAILED, backup_path=target,
+                        duration_sec=round(time.time() - started, 2),
+                        message=("群晖回推校验失败：%d 个文件在 NAS 上不一致，首条：%s"
+                                 % (len(stat_bad), stat_bad[0])),
+                        stderr="\n".join(stat_bad[:20]))
+                if up_fail:
+                    return BackupResult(
+                        False, BackupStatus.FAILED, backup_path=target,
+                        duration_sec=round(time.time() - started, 2),
+                        message=("群晖回推部分失败：成功 %d 个、失败 %d 个，首条：%s"
+                                 % (up_ok, len(up_fail), up_fail[0])),
+                        stderr="\n".join(up_fail[:20]))
+                cli.logout()
+            except DSMError as e:
+                return BackupResult(False, BackupStatus.FAILED,
+                                    message="群晖回推失败（DSM 通道）: %s" % e,
+                                    duration_sec=round(time.time() - started, 2))
+
+        nas_note = ("，已回推 DSM 目录 %s（上传 %d 个文件，回读大小校验一致）"
+                    % (nas_path, up_ok)) if nas_path else \
+                   "（未指定 DSM 恢复路径，仅解包到平台侧目录）"
         return BackupResult(
-            True, BackupStatus.SUCCESS, backup_path=target,
+            True, BackupStatus.SUCCESS, backup_path=(nas_path or target),
             size_bytes=restored_bytes,
             duration_sec=round(time.time() - started, 2),
+            target_ref=nas_path or target,
             message=("群晖恢复成功：回放 %d 个备份集，%d 个文件 SHA256 硬核对一致，"
-                     "删除事件 %d 条，落地目录 %s。注：恢复产物在平台侧，"
-                     "推回 DSM 共享目录需 FileStation.Upload 通道（尚未实现）"
-                     % (len(replay), len(expect), deleted_all, target)),
+                     "删除事件 %d 条，本地解包目录 %s%s"
+                     % (len(replay), len(expect), deleted_all, target, nas_note)),
             verified=True)
 
     # ---------------------------------------------------------------- 校验
@@ -605,10 +712,9 @@ class SynologyEngine(BackupEngine):
                     if f is None:
                         return BackupResult(False, BackupStatus.FAILED,
                                             message="无法读取成员: %s" % e["path"])
-                    h = hashlib.sha256()
-                    for chunk in iter(lambda: f.read(1 << 20), b""):
-                        h.update(chunk)
-                    if e.get("sha256") and h.hexdigest() != e["sha256"]:
+                    from core import db as _db
+                    digest = _db.sha256_stream(f)
+                    if e.get("sha256") and digest != e["sha256"]:
                         return BackupResult(False, BackupStatus.FAILED,
                                             message="文件 %s 的 SHA256 不一致" % e["path"])
                     checked += 1

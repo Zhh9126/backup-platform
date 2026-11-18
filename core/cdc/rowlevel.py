@@ -35,6 +35,7 @@
 """
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
@@ -52,6 +53,13 @@ _LOG = db.get_logger("cdc.rowlevel")
 # 事件写入批大小（攒批提交，降低高频写入开销）
 _BATCH_SIZE = 50
 _FLUSH_INTERVAL_SEC = 1.0
+
+# 段消费模式：这些库型的行级事件不另起子进程抓日志，而是消费「实时备份」
+# 已经捕获并落盘的 LogMiner jsonl 段（{scn,ts,owner,table,op,redo,undo,xid}）。
+# 好处：零新增数据库连接、与 PITR 时间轴共用同一份数据源（收敛的第一步）。
+_SEGMENT_CONSUMER_TYPES = ("oracle", "dameng")
+_SEGMENT_POLL_SEC = 5
+_SEGMENT_MAX_BYTES = 200 * 1024 * 1024   # 单段上限，防超大文件读爆内存
 
 # 值序列化：bytes 无法直接 JSON，统一编码为 "hex:<hex>"（SQL 生成时按方言还原）
 _HEX_PREFIX = "hex:"
@@ -281,13 +289,15 @@ class BaseRowParser:
     # ---------------- 事件构造 ----------------
     def _event(self, op: str, schema: str, table: str, ts: str, position: str,
                before: dict, after: dict, pk: dict = None,
-               before_partial: bool = False, sql_text: str = "") -> dict:
+               before_partial: bool = False, sql_text: str = "",
+               sql_undo: str = "") -> dict:
         self.stats["parsed"] += 1
         return {
             "op": op, "schema": schema, "table": table, "ts": ts,
             "position": position, "before": before or {}, "after": after or {},
             "pk": pk or {}, "before_partial": before_partial,
             "sql_text": sql_text or "",
+            "sql_undo": sql_undo or "",
         }
 
     def feed(self, line: str) -> List[dict]:
@@ -660,13 +670,23 @@ class SqlRedoRowParser(BaseRowParser):
         except Exception:
             obj = None
         if isinstance(obj, dict):
-            sql = (obj.get("sql_redo") or obj.get("SQL_REDO") or "").strip()
-            table = obj.get("table_name") or obj.get("TABLE_NAME") or ""
-            schema = obj.get("seg_owner") or obj.get("SEG_OWNER") or ""
+            # 字段名双兼容：外部喂入用 sql_redo/table_name/seg_owner，
+            # 而平台自己的 LogMiner 段（PollingLogMinerDaemon）落盘用
+            # redo/table/owner —— 段消费模式下必须都能识别，否则
+            # Oracle/达梦的整段事件会被静默丢弃（2026-11-14 接入时修正）
+            sql = (obj.get("sql_redo") or obj.get("SQL_REDO")
+                   or obj.get("redo") or obj.get("REDO") or "").strip()
+            undo = (obj.get("sql_undo") or obj.get("SQL_UNDO")
+                    or obj.get("undo") or obj.get("UNDO") or "").strip()
+            table = (obj.get("table_name") or obj.get("TABLE_NAME")
+                     or obj.get("table") or obj.get("TABLE") or "")
+            schema = (obj.get("seg_owner") or obj.get("SEG_OWNER")
+                      or obj.get("owner") or obj.get("OWNER") or "")
             self._scn = str(obj.get("scn") or obj.get("SCN") or self._scn or "")
-            ts = obj.get("timestamp") or obj.get("TIMESTAMP") or ""
+            ts = (obj.get("timestamp") or obj.get("TIMESTAMP")
+                  or obj.get("ts") or "")
         else:
-            sql, table, schema, ts = line, "", "", ""
+            sql, undo, table, schema, ts = line, "", "", "", ""
         if not sql:
             return []
         if ts:
@@ -680,7 +700,8 @@ class SqlRedoRowParser(BaseRowParser):
         if table and not self._allowed(table):
             return []
         return [self._event(op, schema, table, self._ts or db.now_iso(),
-                            self._scn, {}, {}, {}, sql_text=sql)]
+                            self._scn, {}, {}, {}, sql_text=sql,
+                            sql_undo=undo)]
 
 
 # ======================================================================
@@ -697,8 +718,8 @@ class EventStore:
             db.execute(
                 "INSERT INTO cdc_events (stream_id, op, schema_name, table_name,"
                 " event_time, position, pk_json, before_json, after_json,"
-                " before_partial, sql_text, applied, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?)",
+                " before_partial, sql_text, sql_undo, applied, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?)",
                 (int(stream_id), ev.get("op") or "", ev.get("schema") or "",
                  ev.get("table") or "", ev.get("ts") or now,
                  str(ev.get("position") or ""),
@@ -706,7 +727,8 @@ class EventStore:
                  _json_dump({k: _jsonable(v) for k, v in (ev.get("before") or {}).items()}),
                  _json_dump({k: _jsonable(v) for k, v in (ev.get("after") or {}).items()}),
                  1 if ev.get("before_partial") else 0,
-                 (ev.get("sql_text") or "")[:4000], now))
+                 (ev.get("sql_text") or "")[:4000],
+                 (ev.get("sql_undo") or "")[:4000], now))
         try:
             db.execute("UPDATE cdc_streams SET events_total=events_total+?,"
                        " last_event_at=?, updated_at=? WHERE id=?",
@@ -818,9 +840,13 @@ class EventStore:
             after = ev.get("after") or {}
             pk = ev.get("pk") or {}
             if ev.get("sql_text") and not after and not before:
-                # LogMiner 等 SQL 级事件：直接回放原语句
-                if mode == "redo":
+                # LogMiner 等 SQL 级事件：redo 回放原语句，undo 用 SQL_UNDO
+                # （Oracle/达梦的 LogMiner 段自带 undo 语句，之前 undo 直接
+                #  continue 丢弃，导致这两个库的「行级回滚」形同虚设）
+                if mode == "redo" and ev.get("sql_text"):
                     sqls.append(ev["sql_text"].rstrip(";"))
+                elif mode == "undo" and ev.get("sql_undo"):
+                    sqls.append(ev["sql_undo"].rstrip(";"))
                 continue
             if mode == "redo":
                 if op == "INSERT":
@@ -1006,6 +1032,9 @@ class RowCDCStream:
         if self.proc and self.proc.poll() is None:
             return True
         self._stop_evt.clear()
+        if self.db_type in _SEGMENT_CONSUMER_TYPES:
+            # Oracle / 达梦：不起子进程，消费实时备份已落盘的 LogMiner 段
+            return self._start_segment_consumer()
         if self.db_type in ("mysql", "mariadb"):
             cmd = self._mysql_cmd()
             env = os.environ.copy()
@@ -1065,6 +1094,11 @@ class RowCDCStream:
         db.add_log("INFO", "cdc", f"CDC 流 {self.stream_id} 已停止")
 
     def is_alive(self) -> bool:
+        # 段消费模式（Oracle/达梦）没有子进程，运行态由消费线程决定；
+        # 只看 proc 会让「明明在消费」的流被判定为未运行（前端红灯 +
+        # manager.start 重复建实例），2026-11-14 实测暴露。
+        if self.db_type in _SEGMENT_CONSUMER_TYPES:
+            return bool(self.thread and self.thread.is_alive())
         return bool(self.proc and self.proc.poll() is None)
 
     # ---------------- 读取与解析 ----------------
@@ -1144,6 +1178,114 @@ class RowCDCStream:
                            " updated_at=? WHERE id=?",
                            (err[:500], db.now_iso(), self.stream_id))
                 db.add_log("ERROR", "cdc", f"CDC 流 {self.stream_id} 异常退出: {err[:200]}")
+
+    # ---------------- 段消费模式（Oracle / 达梦 LogMiner jsonl） ----------------
+    def _start_segment_consumer(self) -> bool:
+        """消费实时备份任务已封存的 LogMiner 段，不新建数据库连接。"""
+        if self.thread and self.thread.is_alive():
+            return True
+        ref_id = self.cfg.get("ref_id")
+        try:
+            ref_id = int(ref_id) if ref_id else 0
+        except (TypeError, ValueError):
+            ref_id = 0
+        if not ref_id:
+            self.last_error = ("段消费模式需要 ref_id 指向一个已开启实时备份的备份任务"
+                               "（Oracle/达梦的行级事件来自该任务捕获的 LogMiner 段）")
+            return False
+        self._stop_evt.clear()
+        self.started_at = db.now_iso()
+        self.thread = threading.Thread(target=self._segment_reader, daemon=True,
+                                       name=f"cdc-seg-{self.stream_id}")
+        self.thread.start()
+        db.execute("UPDATE cdc_streams SET status='running', last_error=NULL,"
+                   " pid=NULL, updated_at=? WHERE id=?",
+                   (db.now_iso(), self.stream_id))
+        db.add_log("INFO", "cdc", f"CDC 流 {self.stream_id} 已启动"
+                                  f"（{self.db_type} 段消费，任务 {ref_id}）")
+        return True
+
+    def _segment_root(self) -> str:
+        root = getattr(config, "RT_LOG_ROOT", None) or os.path.join(
+            str(getattr(config, "BACKUP_ROOT", "backups")), "rt_logs")
+        return os.path.join(str(root), str(int(self.cfg.get("ref_id") or 0)))
+
+    def _load_seen(self) -> dict:
+        try:
+            pos = json.loads(self.cfg.get("position_json") or "{}")
+        except Exception:
+            pos = {}
+        seen = pos.get("seg_lines")
+        return dict(seen) if isinstance(seen, dict) else {}
+
+    def _save_seg_position(self, seen: dict) -> None:
+        try:
+            payload = json.dumps({"seg_lines": seen}, ensure_ascii=False)
+            self.cfg["position_json"] = payload
+            db.execute("UPDATE cdc_streams SET position_json=?, updated_at=? WHERE id=?",
+                       (payload, db.now_iso(), self.stream_id))
+        except Exception:
+            pass
+
+    def _segment_reader(self) -> None:
+        """轮询 sealed/ 下的 jsonl 段，按行增量喂给 SQL_REDO 解析器。"""
+        parser = self._parser()
+        seen = self._load_seen()
+        buf: List[dict] = []
+        last_flush = time.time()
+
+        def flush(force: bool = False):
+            nonlocal buf, last_flush
+            if not buf:
+                return
+            if not force and len(buf) < _BATCH_SIZE and (time.time() - last_flush) < _FLUSH_INTERVAL_SEC:
+                return
+            try:
+                STORE.save(self.stream_id, buf)
+                self.events_captured += len(buf)
+            except Exception as exc:
+                self.last_error = f"事件落库失败: {exc}"
+            buf = []
+            last_flush = time.time()
+
+        try:
+            while not self._stop_evt.is_set():
+                try:
+                    root = self._segment_root()
+                    pattern = os.path.join(root, "sealed", "*", "*.jsonl")
+                    for path in sorted(glob.glob(pattern)):
+                        if self._stop_evt.is_set():
+                            break
+                        key = os.path.relpath(path, root)
+                        done = int(seen.get(key) or 0)
+                        try:
+                            if os.path.getsize(path) > _SEGMENT_MAX_BYTES:
+                                self.last_error = f"段文件超过 {_SEGMENT_MAX_BYTES} 字节，已跳过: {key}"
+                                continue
+                            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                                lines = fh.readlines()
+                        except OSError:
+                            continue
+                        if len(lines) <= done:
+                            continue
+                        for line in lines[done:]:
+                            for ev in parser.feed(line):
+                                buf.append(ev)
+                            flush()
+                        seen[key] = len(lines)
+                        self._save_seg_position(seen)
+                    flush(force=True)
+                    if not self.last_error:
+                        db.execute("UPDATE cdc_streams SET last_error=NULL WHERE id=?",
+                                   (self.stream_id,))
+                except Exception as exc:            # noqa: BLE001
+                    self.last_error = f"段消费异常: {exc}"
+                    _LOG.exception("[cdc] 流 %s 段消费异常", self.stream_id)
+                self._stop_evt.wait(_SEGMENT_POLL_SEC)
+        finally:
+            flush(force=True)
+            db.execute("UPDATE cdc_streams SET status='stopped', updated_at=? WHERE id=?",
+                       (db.now_iso(), self.stream_id))
 
     def _save_position(self, parser) -> None:
         pos = {}
@@ -1252,8 +1394,45 @@ manager = CDCManager()
 # ======================================================================
 # 能力探测（创建流前的前置检查，对标 DTS 预检查）
 # ======================================================================
+def _probe_segment_mode(db_type: str, ref_id: int) -> dict:
+    """段消费模式（Oracle / 达梦）的能力探测。
+
+    这类库的行级事件不另起客户端抓日志，而是消费实时备份任务已封存的
+    LogMiner jsonl 段，因此检查对象是「备份任务 + 已捕获段」而非源库连通性。
+    """
+    res: Dict[str, Any] = {"ok": False, "checks": [], "db_type": db_type,
+                           "mode": "segment_consumer"}
+    if not ref_id:
+        res["checks"].append({"item": "实时备份任务", "ok": False,
+                              "message": "未指定 ref_id：行级事件来自实时备份产出的段"})
+        res["message"] = "缺少 ref_id"
+        return res
+    try:
+        task = db.query_one("SELECT id, name, db_type FROM backup_tasks WHERE id=?",
+                            (int(ref_id),))
+    except Exception as exc:                     # noqa: BLE001
+        task = None
+        res["checks"].append({"item": "实时备份任务", "ok": False, "message": str(exc)})
+    if task:
+        res["checks"].append({"item": "实时备份任务", "ok": True,
+                              "message": "任务 %s (#%s)" % (task.get("name"), ref_id)})
+    root = getattr(config, "RT_LOG_ROOT", None) or os.path.join(
+        str(getattr(config, "BACKUP_ROOT", "backups")), "rt_logs")
+    seg_root = os.path.join(str(root), str(int(ref_id)))
+    segs = sorted(glob.glob(os.path.join(seg_root, "sealed", "*", "*.jsonl")))
+    live = sorted(glob.glob(os.path.join(seg_root, "live", "*.jsonl")))
+    res["checks"].append({
+        "item": "已封存 LogMiner 段", "ok": bool(segs),
+        "message": ("sealed 下 %d 个段（live 待封存 %d 个）" % (len(segs), len(live)))
+        if segs else "尚无已封存的 jsonl 段：请先在实时保护页开启该任务日志捕获并触发封存",
+    })
+    res["ok"] = bool(task) and bool(segs)
+    res["message"] = "段消费条件就绪" if res["ok"] else "段尚未就绪"
+    return res
+
+
 def probe_cdc_capability(db_type: str, host: str, port: int, username: str,
-                         password: str, db_name: str = "") -> dict:
+                         password: str, db_name: str = "", ref_id: int = 0) -> dict:
     """检查源库是否具备行级 CDC 条件。
 
     Returns:
@@ -1261,6 +1440,8 @@ def probe_cdc_capability(db_type: str, host: str, port: int, username: str,
     """
     res: Dict[str, Any] = {"ok": False, "checks": [], "db_type": db_type}
     db_type = (db_type or "").lower()
+    if db_type in _SEGMENT_CONSUMER_TYPES:
+        return _probe_segment_mode(db_type, int(ref_id or 0))
     if db_type in ("mysql", "mariadb"):
         try:
             import pymysql

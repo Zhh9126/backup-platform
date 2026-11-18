@@ -298,6 +298,15 @@ def delete_task(task_id: int) -> bool:
         try:
             conn.execute("DELETE FROM backup_records WHERE task_id=?", (task_id,))
             conn.execute("DELETE FROM restore_records WHERE task_id=?", (task_id,))
+            # 实时保护的状态类表必须一起清：残留会让 rt 监督进程反复尝试拉起
+            # 一个已经不存在的任务（2026-11-14 实测：删除任务后 rt_capture_state
+            # 仍留着 failed 行，日志每 10 秒刷一次启动失败），并污染健康度统计。
+            for _tbl in ("rt_tasks", "rt_capture_state", "recovery_journal"):
+                try:
+                    conn.execute("DELETE FROM %s WHERE task_id=?" % _tbl, (task_id,))
+                except Exception:
+                    # 表不存在（老库/未启用实时）不影响删除主流程
+                    pass
             conn.execute("DELETE FROM backup_tasks WHERE id=?", (task_id,))
             conn.commit()
         finally:
@@ -343,8 +352,13 @@ def list_tasks(include_secret: bool = False, db_type: str = None,
         where.append("db_type=?")
         params.append(db_type)
     if db_type_exclude:
-        where.append("db_type<>?")
-        params.append(db_type_exclude)
+        # 支持逗号分隔多值（"文件备份"页排除 file；"数据库备份"页要一次排除
+        # file/vm/object_storage/synology —— 非数据库的备份对象各有独立入口，
+        # 混进数据库任务列表会让「数据库备份里出现 NAS/对象存储」）。
+        ex = [x.strip() for x in str(db_type_exclude).split(",") if x.strip()]
+        if ex:
+            where.append("db_type NOT IN (%s)" % ",".join("?" * len(ex)))
+            params.extend(ex)
     if enabled is not None:
         where.append("enabled=?")
         params.append(1 if enabled else 0)
@@ -403,7 +417,12 @@ def _policy_to_dict(row: Optional[dict]) -> Optional[dict]:
 
 
 def _fill_policy_columns(data: dict, policy_id, db_type: str) -> None:
-    """在 create_task 的数据 dict 中追加策略派生的保护列（就地修改）。"""
+    """在 create_task 的数据 dict 中追加策略派生的保护列（就地修改）。
+
+    2026-11-13 重构：策略不再只是 RPO/RTO 两个数字——绑定策略即由策略
+    **托管调度与保留**（频次 / cron / 全量周期 / 保留天数与份数 / 锁定天数）。
+    这里把策略翻译出的任务字段覆盖进创建数据，任务侧无需再手填频次。
+    """
     pol = get_protection_policy(policy_id)
     if not pol:
         return
@@ -411,6 +430,23 @@ def _fill_policy_columns(data: dict, policy_id, db_type: str) -> None:
     data["adapter_tier"] = _engine_adapter_tier(db_type)
     data["rpo_target_min"] = pol["rpo_target_min"]
     data["rto_target_min"] = pol["rto_target_min"]
+    try:
+        from core import policy_schedule as _ps
+        data.update(_ps.policy_task_fields(pol))
+        extra = _ps.policy_extra_fields(pol)
+        if extra:
+            cur = data.get("extra_options")
+            if isinstance(cur, str):
+                try:
+                    cur = json.loads(cur) if cur.strip() else {}
+                except Exception:
+                    cur = {}
+            cur = dict(cur or {})
+            cur.update(extra)
+            # 统一存 JSON 字符串：create_task 的 SQL 绑定不接受 dict
+            data["extra_options"] = json.dumps(cur, ensure_ascii=False)
+    except Exception:
+        pass
 
 
 def _append_policy_binding(sets: list, params: list, task_id: int,
@@ -435,6 +471,42 @@ def _append_policy_binding(sets: list, params: list, task_id: int,
                  ("rto_target_min", pol["rto_target_min"])):
         sets.append(f"{c}=?")
         params.append(v)
+    # 策略托管的调度与保留字段（不覆盖调用方显式传入的同名列）
+    try:
+        from core import policy_schedule as _ps
+        for c, v in _ps.policy_task_fields(pol).items():
+            if f"{c}=?" in sets:
+                continue
+            sets.append(f"{c}=?")
+            params.append(v)
+        # 不可变锁天数存在 extra_options（不是表列）：与既有 extra 合并
+        extra_new = _ps.policy_extra_fields(pol)
+        if extra_new:
+            key = "extra_options=?"
+            if key in sets:
+                idx = sets.index(key)
+                try:
+                    cur = (json.loads(params[idx])
+                           if isinstance(params[idx], str) and params[idx].strip()
+                           else (params[idx] or {}))
+                except Exception:
+                    cur = {}
+                cur = dict(cur) if isinstance(cur, dict) else {}
+                cur.update(extra_new)
+                params[idx] = json.dumps(cur, ensure_ascii=False)
+            else:
+                raw = (task or {}).get("extra_options")
+                try:
+                    cur = (json.loads(raw) if isinstance(raw, str) and raw.strip()
+                           else (raw or {}))
+                except Exception:
+                    cur = {}
+                cur = dict(cur) if isinstance(cur, dict) else {}
+                cur.update(extra_new)
+                sets.append(key)
+                params.append(json.dumps(cur, ensure_ascii=False))
+    except Exception:
+        pass
     sets.append("updated_at=?")
     params.append(now)
 
@@ -536,23 +608,31 @@ def list_tasks_by_policy(policy_id: int) -> list:
 
 
 def bind_policy_to_tasks(policy_id: int, task_ids: list) -> int:
-    """将策略绑定到多个任务，返回成功绑定的数量。"""
+    """将策略绑定到多个任务，返回成功绑定的数量。
+
+    2026-11-13 重构：绑定不再只是写 policy_id + RPO/RTO——统一走
+    ``update_task``，由 ``_append_policy_binding`` 把策略的**调度（频次/cron/
+    全量周期）与保留（天数/份数/锁定天数）**一并下发，绑定即生效。
+    """
     pol = get_protection_policy(policy_id)
     if not pol:
         return 0
-    now = db.now_iso()
     bound = 0
     for tid in (task_ids or []):
         task = get_task(tid)
         if not task:
             continue
-        tier = _engine_adapter_tier(task.get("db_type"))
-        db.execute(
-            "UPDATE backup_tasks SET policy_id=?, protection_level=?, adapter_tier=?, "
-            "rpo_target_min=?, rto_target_min=?, updated_at=? WHERE id=?",
-            (policy_id, pol["level"], tier, pol["rpo_target_min"],
-             pol["rto_target_min"], now, tid))
-        bound += 1
+        try:
+            update_task(int(tid), {"policy_id": int(policy_id)})
+            bound += 1
+        except Exception:
+            continue
+    if bound:
+        try:
+            import core.scheduler as scheduler
+            scheduler.reload_scheduler()
+        except Exception:
+            pass
     return bound
 
 
@@ -1045,8 +1125,11 @@ def set_sync_status(sync_id: int, last_run_at: str, last_status: str,
 
 # ------------------------- 同步记录 -------------------------
 def create_sync_record(data: dict) -> int:
+    # 2026-11-13 修复：白名单只列了 6 个字段，调用方传入的 read_rows /
+    # error_rows / watermark 被**静默丢弃**，同步记录永远「读取 0 行」，
+    # 与消息里的「读取 N 行」自相矛盾（真机 MySQL 同步复现）。
     fields = ["sync_task_id", "started_at", "finished_at", "status",
-              "rows_synced", "message"]
+              "rows_synced", "read_rows", "error_rows", "watermark", "message"]
     data = {k: data.get(k) for k in fields}
     cols = list(data.keys())
     sql = "INSERT INTO sync_records ({}) VALUES ({})".format(
@@ -1285,6 +1368,11 @@ def create_drill(data: dict) -> int:
     if not row.get("created_at"):
         row["created_at"] = db.now_iso()
     row["status"] = row.get("status", "pending")
+    # scenario/notes 允许调用方传 dict（切换演练传 {"link_id": N}）——
+    # dict 直传 sqlite 绑定报 "type dict is not supported"，统一序列化
+    for k in ("scenario", "notes"):
+        if isinstance(row.get(k), dict):
+            row[k] = json.dumps(row[k], ensure_ascii=False)
     cols = list(row.keys())
     sql = f"INSERT INTO drills ({','.join(cols)}) VALUES ({','.join('?'*len(cols))})"
     return db.execute(sql, tuple(row.values()))
@@ -1383,7 +1471,7 @@ def delete_migration_plan(plan_id: int) -> None:
 # ------------------------- 克隆请求（CloneRequest，Phase 2） -------------------------
 _CLONE_FIELDS = [
     "source_record_id", "target_env", "target_host", "target_password",
-    "status", "purpose", "itsm_ticket_id",
+    "status", "purpose", "itsm_ticket_id", "databases",
     "requested_by", "approved_by", "expires_at", "vdb_instance_id", "note",
 ]
 
@@ -1410,7 +1498,22 @@ def create_clone_request(data: dict) -> int:
 
 
 def get_clone_request(request_id: int, include_secret: bool = False) -> Optional[dict]:
-    row = db.query_one("SELECT * FROM clone_requests WHERE id=?", (request_id,))
+    """单个克隆请求详情。
+
+    必须联查 vdb_instances：早期实现是 `SELECT * FROM clone_requests`，详情接口
+    拿不到 vdb_host/vdb_port/vdb_dbname，导致「克隆已就绪」时前端/调用方无法
+    显示连接串（而列表接口能显示），2026-11-14 克隆深度测试暴露该不一致。
+    """
+    row = db.query_one(
+        "SELECT cr.*, br.db_type AS source_db_type, br.task_id AS source_task_id, "
+        "t.name AS task_name, "
+        "v.host AS vdb_host, v.port AS vdb_port, v.database_name AS vdb_dbname, "
+        "v.status AS vdb_status, v.username AS vdb_username "
+        "FROM clone_requests cr "
+        "LEFT JOIN backup_records br ON br.id = cr.source_record_id "
+        "LEFT JOIN backup_tasks t ON t.id = br.task_id "
+        "LEFT JOIN vdb_instances v ON v.id = cr.vdb_instance_id "
+        "WHERE cr.id=?", (request_id,))
     if not row:
         return None
     row = dict(row)
@@ -1438,7 +1541,8 @@ def list_clone_requests() -> list:
 def update_clone_request(request_id: int, data: dict) -> None:
     """更新克隆请求字段（白名单）。target_password 自动加密。"""
     allow = {"status", "itsm_ticket_id", "approved_by", "expires_at",
-             "vdb_instance_id", "note", "target_host", "target_password"}
+             "vdb_instance_id", "note", "target_host", "target_password",
+             "databases"}
     updates = {k: v for k, v in data.items() if k in allow}
     if not updates:
         return
@@ -1558,6 +1662,8 @@ _DISASTER_LINK_FIELDS = [
     # 只有 PUT failover-config 端点能写入，创建时带配置会被静默吞掉，
     # 170/171 自动切换真机 E2E 实测暴露）
     "failover_config", "failover_history",
+    # 容灾总览地图定位：站点地域 {"city","lat","lon"} JSON（2026-11-18）
+    "primary_region", "dr_region",
 ]
 
 # 容灾链路允许的数据源类型

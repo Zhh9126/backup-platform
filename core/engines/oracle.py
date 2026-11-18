@@ -582,6 +582,52 @@ class OracleEngine(BackupEngine):
 
         # 1) 找出最小的数据文件（真实抽取用它，控制磁盘占用）
         sftp = client.open_sftp()
+
+        def _put_text(path, text):
+            """写远端小文件，SFTP 会话失效时自动重连重试。
+
+            2026-11-13 171 真机实测缺陷：把 1.7GB 备份片回推后，原 SFTP 通道
+            已被服务端关闭，随后写 RMAN 校验脚本直接 OSError: Socket is closed，
+            整次校验失败。长传输之后必须允许重建会话。
+            """
+            nonlocal client, sftp
+            try:
+                with sftp.open(path, "w") as fh:
+                    fh.write(text)
+                return
+            except Exception:
+                pass
+            for _ in (1, 2):
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                client = remote_dump._connect(ssh_host)
+                sftp = client.open_sftp()
+                with sftp.open(path, "w") as fh:
+                    fh.write(text)
+                return
+
+        def _ensure_conn():
+            """执行前确认 SSH 通道可用，失效则重连（长传输后通道常被服务端关闭）。"""
+            nonlocal client, sftp
+            tr = client.get_transport() if client else None
+            if tr is not None and tr.is_active():
+                return
+            try:
+                sftp.close()
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass
+            client = remote_dump._connect(ssh_host)
+            sftp = client.open_sftp()
         try:
             sql = ("SET HEADING OFF\nSET PAGESIZE 0\nSET FEEDBACK OFF\n"
                    "SELECT file# FROM v$datafile WHERE bytes = "
@@ -668,11 +714,12 @@ class OracleEngine(BackupEngine):
             _vch_rel = "".join(
                 f"  RELEASE CHANNEL ch{i:02d};\n"
                 for i in range(_vch)) if _vch > 1 else ""
-            with sftp.open("/tmp/platform_verify_rman.cmd", "w") as f:
-                f.write(f"RUN {{\n{_vch_lines}{catalog_line}  RESTORE DATABASE VALIDATE;\n{_vch_rel}}}\nEXIT;\n")
+            _put_text("/tmp/platform_verify_rman.cmd",
+                      f"RUN {{\n{_vch_lines}{catalog_line}  RESTORE DATABASE VALIDATE;\n{_vch_rel}}}\nEXIT;\n")
             shell = remote_dump._wrap_login(
                 f"su - {self._resolve_check_user(ssh_host)} -c "
                 f"{shlex.quote(f'{shlex.quote(rman_bin)} target / @/tmp/platform_verify_rman.cmd')}")
+            _ensure_conn()
             start = _time.time()
             out, err, rc = _ssh_exec_pipe(client, shell, timeout=7200)
             duration = round(_time.time() - start, 3)
@@ -687,14 +734,15 @@ class OracleEngine(BackupEngine):
                 stage_dir = f"/var/tmp/platform_restore_test/{ts}"
                 pre = (f"mkdir -p {stage_dir} && chown oracle {stage_dir} && chmod 755 {stage_dir}")
                 _ssh_exec_pipe(client, remote_dump._wrap_login(pre), timeout=30)
-                with sftp.open("/tmp/platform_verify_df2.cmd", "w") as f:
-                    f.write(f"RUN {{\n"
+                _put_text("/tmp/platform_verify_df2.cmd",
+                          f"RUN {{\n"
                             f"  SET NEWNAME FOR DATAFILE {df_no} TO '{stage_dir}/df_{df_no}.dbf';\n"
                             f"  RESTORE DATAFILE {df_no};\n"
                             f"}}\nEXIT;\n")
                 shell = remote_dump._wrap_login(
                     f"su - {self._resolve_check_user(ssh_host)} -c "
                     f"{shlex.quote(f'{shlex.quote(rman_bin)} target / @/tmp/platform_verify_df2.cmd')}")
+                _ensure_conn()
                 out2, _err, rc2 = _ssh_exec_pipe(client, shell, timeout=3600)
                 out2_text = out2.decode("utf-8", "replace") if isinstance(out2, bytes) else (out2 or "")
                 # 确认真实文件落盘
@@ -1087,10 +1135,15 @@ class OracleEngine(BackupEngine):
             db_line = (
                 f"  BACKUP AS COMPRESSED BACKUPSET INCREMENTAL LEVEL 0 DATABASE "
                 f"FORMAT '{fmt_db}';")
+        elif backup_type == BackupType.DIFFERENTIAL:
+            db_line = (
+                f"  BACKUP AS COMPRESSED BACKUPSET INCREMENTAL LEVEL 1 DATABASE "
+                f"FORMAT '{fmt_db}';")
         else:
             db_line = f"  BACKUP AS COMPRESSED BACKUPSET DATABASE FORMAT '{fmt_db}';"
         arch_line = (
-            f"  BACKUP AS COMPRESSED BACKUPSET ARCHIVELOG ALL FORMAT '{fmt_arch}';")
+            f"  BACKUP AS COMPRESSED BACKUPSET ARCHIVELOG ALL NOT BACKED UP 1 TIMES "
+            f"FORMAT '{fmt_arch}';")
         nch = self._rman_channels()
         with open(script, "w") as f:
             f.write(self._rman_run_script(db_line, arch_line, channels=nch))
@@ -1100,10 +1153,13 @@ class OracleEngine(BackupEngine):
         if ret["returncode"] != 0:
             return BackupResult(success=False, status=BackupStatus.FAILED,
                                 message=f"RMAN 物理备份失败: {ret.get('stderr','')[:500]}")
+        lvl = ("RMAN LEVEL 1 差异增量" if backup_type == BackupType.DIFFERENTIAL
+               else "RMAN LEVEL 0 增量基备" if backup_type == BackupType.INCREMENTAL
+               else "全量")
         return BackupResult(success=True, status=BackupStatus.SUCCESS,
                             backup_path=out_dir, duration_sec=dur,
                             stdout=ret.get("stdout", ""),
-                            message="Oracle 物理备份(RMAN)成功(本机)")
+                            message=f"Oracle 物理备份({lvl})成功(本机)")
 
     def _backup_physical_remote(self, ssh_host: dict, backup_type) -> BackupResult:
         """物理备份：通过 SSH 在远端 Oracle 服务器以 oracle 用户执行 RMAN，
@@ -1135,16 +1191,26 @@ class OracleEngine(BackupEngine):
         remote_cmd_file = f"{remote_dir}/rman_t{tid}.cmd"
 
         # 1) 组装 RMAN 脚本（注意：rman target / @file 已建立连接，脚本内不要再 connect）
+        # 类型语义（如实）：
+        #   INCREMENTAL  → RMAN LEVEL 0 增量基备（0 级=全量基础，供 L1 增量链挂接）
+        #   DIFFERENTIAL → RMAN LEVEL 1 差异增量（仅备份上次基备以来变更块，
+        #                  首次使用前必须已有 L0/全量基备，恢复链 RMAN 自动装配）
+        _rman_level_note = ""
         if backup_type == BackupType.INCREMENTAL:
             db_line = (
                 f"  BACKUP AS COMPRESSED BACKUPSET INCREMENTAL LEVEL 0 DATABASE "
                 f"FORMAT '{remote_dir}/{bkp_prefix}%U.bkp';")
+        elif backup_type == BackupType.DIFFERENTIAL:
+            db_line = (
+                f"  BACKUP AS COMPRESSED BACKUPSET INCREMENTAL LEVEL 1 DATABASE "
+                f"FORMAT '{remote_dir}/{bkp_prefix}%U.bkp';")
+            _rman_level_note = "（RMAN LEVEL 1 差异增量，需已有 L0/全量基备）"
         else:
             db_line = (
                 f"  BACKUP AS COMPRESSED BACKUPSET DATABASE "
                 f"FORMAT '{remote_dir}/{bkp_prefix}%U.bkp';")
         arch_line = (
-            f"  BACKUP AS COMPRESSED BACKUPSET ARCHIVELOG ALL "
+            f"  BACKUP AS COMPRESSED BACKUPSET ARCHIVELOG ALL NOT BACKED UP 1 TIMES "
             f"FORMAT '{remote_dir}/{bkp_prefix}arch_%U.bkp';")
         nch = self._rman_channels()
         rman_script = self._rman_run_script(db_line, arch_line, channels=nch)
@@ -1378,6 +1444,8 @@ class OracleEngine(BackupEngine):
                 mf.write(f"remote_dir: {remote_dir}\n")
                 mf.write(f"rman_channels: {nch or 1}\n")
                 mf.write(f"pull_workers: {pull_workers}\n")
+                if _rman_level_note:
+                    mf.write(f"rman_level_note: {_rman_level_note}\n")
                 for p, sz in pieces:
                     mf.write(f"{os.path.basename(p)}\t{sz}\t{db.sha256_file(p)}\n")
 
@@ -1388,7 +1456,7 @@ class OracleEngine(BackupEngine):
                 sftp.remove(remote_cmd_file)
             except Exception:
                 pass
-            msg = (f"通过 SSH 在 {hk} 以 oracle 用户执行 RMAN 物理备份成功，"
+            msg = (f"通过 SSH 在 {hk} 以 oracle 用户执行 RMAN 物理备份成功{_rman_level_note}，"
                    f"已拉回 {len(pieces)} 个备份片，共 {db.human_size(total_size)}"
                    + (f"，RMAN 通道 {nch}" if nch > 1 else "")
                    + (f"，并行拉回 {pull_workers} 线程" if pull_workers > 1 else "")
@@ -1668,6 +1736,105 @@ class OracleEngine(BackupEngine):
             return BackupResult(success=False, status=BackupStatus.FAILED,
                                  message=msg)
 
+    def _oracle_sysdba_query(self, sql: str, ssh_host: dict, timeout: int = 60) -> str:
+        """远端以 sysdba 执行 SQL（SFTP 写文件 + oracle 用户 sqlplus，规避引号嵌套）。
+        返回 sqlplus 输出文本；连接/执行失败返回空串（调用方如实降级）。"""
+        from core import remote_dump as _rd
+        from core.engines.file import _ssh_exec_pipe
+        try:
+            client = _rd._connect(ssh_host)
+        except Exception as e:
+            self.logger.warning("[%s] sysdba 查询连接失败: %s", self.task_name, e)
+            return ""
+        try:
+            sftp = client.open_sftp()
+            with sftp.open("/tmp/platform_sysdba_q.sql", "w") as f:
+                f.write(sql)
+            shell = _rd._wrap_login(
+                f"su - {self._resolve_check_user(ssh_host)} -c "
+                f"{shlex.quote('sqlplus -s / as sysdba @/tmp/platform_sysdba_q.sql')}")
+            out, _e, _rc = _ssh_exec_pipe(client, shell, timeout=timeout)
+            return out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+        except Exception as e:
+            self.logger.warning("[%s] sysdba 查询执行失败: %s", self.task_name, e)
+            return ""
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def clone_target_schema(self, base_name: str) -> str:
+        """克隆目标 schema 名（2026-11-17）：CDB 根容器下普通用户必须 C## 前缀
+        （否则 CREATE USER 报 ORA-65096 / impdp REMAP 报 ORA-01918），
+        非 CDB / PDB 原样返回。SSH/探测失败时原样返回，由后续 impdp 报错如实透出。
+        171（orcldg，CDB）实测 → C##CLONE_N；129（非 CDB）→ CLONE_N。
+        """
+        name = str(base_name or "").strip().upper()
+        if not name:
+            return name
+        try:
+            from core import remote_dump as _rd
+            ssh_host = _rd.resolve_ssh_host(self.task)
+            if not ssh_host:
+                return name
+            text = self._oracle_sysdba_query(
+                "SET HEADING OFF\nSET PAGESIZE 0\nSET FEEDBACK OFF\n"
+                "SELECT cdb || '|' || sys_context('USERENV','CON_NAME') "
+                "FROM v$database;\nEXIT;\n", ssh_host)
+            for line in text.splitlines():
+                line = line.strip()
+                if "|" in line and "," not in line:
+                    cdb, con = line.split("|", 1)
+                    if (cdb.strip().upper() == "YES"
+                            and con.strip().upper() == "CDB$ROOT"):
+                        self.logger.info("[%s] CDB 根容器：克隆 schema 使用 C## 前缀",
+                                         self.task_name)
+                        return "C##" + name
+                    return name
+        except Exception as e:
+            self.logger.warning("[%s] CDB 检测失败，克隆 schema 不加前缀: %s",
+                                self.task_name, e)
+        return name
+
+    def _ensure_remap_user(self, client, target_host_info: dict, schema: str) -> None:
+        """impdp REMAP_SCHEMA 前幂等预建目标用户。
+
+        表模式 impdp 不会自动创建 REMAP 目标用户（19c CDB 实测
+        ORA-39083 + ORA-01918: user 'CLONE_N' does not exist），导入前
+        以 sysdba 预建（已存在则跳过；schema 名含 C## 时按 common 用户创建）。
+        """
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+        sql = ("whenever sqlerror continue\n"
+               "declare n number;\n"
+               "begin\n"
+               "  select count(*) into n from all_users where username = '%s';\n"
+               "  if n = 0 then\n"
+               "    execute immediate 'create user %s identified by \"Aidbm_Clone_2026\"';\n"
+               "    execute immediate 'grant create session, create table to %s';\n"
+               "    execute immediate 'grant unlimited tablespace to %s';\n"
+               "  end if;\n"
+               "end;\n/\nexit\n" % (schema, schema, schema, schema))
+        try:
+            sftp = client.open_sftp()
+            with sftp.open("/tmp/platform_remap_user.sql", "w") as f:
+                f.write(sql)
+            shell = remote_dump._wrap_login(
+                f"su - {self._resolve_check_user(target_host_info)} -c "
+                f"{shlex.quote('sqlplus -s / as sysdba @/tmp/platform_remap_user.sql')}")
+            out, _e, _rc = _ssh_exec_pipe(client, shell, timeout=60)
+            text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+            if "ORA-" in text:
+                self.logger.warning("[%s] REMAP 目标用户 %s 预建告警: %s",
+                                    self.task_name, schema, text.strip()[-200:])
+            else:
+                self.logger.info("[%s] REMAP 目标用户 %s 已就绪（缺失时已预建）",
+                                 self.task_name, schema)
+        except Exception as e:
+            self.logger.warning("[%s] REMAP 目标用户 %s 预建失败（继续，impdp 会如实报错）: %s",
+                                self.task_name, schema, e)
+
     def _restore_logical_remote(self, backup_path: str, target_host_info: dict,
                                 kwargs: dict) -> BackupResult:
         """逻辑备份（expdp 拉回的 dmp）远端恢复：SFTP 推回数据库服务器，
@@ -1781,6 +1948,10 @@ class OracleEngine(BackupEngine):
                             o = f"{src_schema}.{o}"
                         parts.append(f"{o}:{n}")
                     remap_args += " REMAP_TABLE=" + ",".join(parts)
+                if target_schema:
+                    # 表模式 impdp 不自动创建 REMAP 目标用户（ORA-01918），
+                    # 导入前幂等预建（2026-11-17 克隆服务深度测试实测暴露）
+                    self._ensure_remap_user(client, target_host_info, target_schema)
 
                 def _impdp_shell(conn_str):
                     _inner = (f"export PATH=$ORACLE_HOME/bin:$PATH; "

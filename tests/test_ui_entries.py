@@ -17,11 +17,17 @@ def test_scan_fs_page_and_menu():
     assert 'render_template("scan_fs.html", page="scan-fs")' in _src("app.py")
     tpl = _src("templates/scan_fs.html")
     assert "scan_fs.js" in tpl
+    # 2026-11-13 页面改为「无备份救援（特殊恢复）」定位：能做什么/不能做什么
+    # 用两栏卡片表达，原单句「不读裸块设备、不做扇区级数据雕刻」已并入列表项，
+    # 断言随之对齐（能力描述本身没有放宽）。
     assert "只读扫描" in tpl and "拉回选中对象" in tpl
     assert "Oracle 实例清单" in tpl
-    assert "不读裸块设备、不做扇区级数据雕刻" in tpl
+    assert "这是「特殊恢复」，不属于常规恢复链路" in tpl
+    assert "不读裸块设备" in tpl and "不自动修复数据库一致性" in tpl
     base = _src("templates/base.html")
-    assert 'href="/scan-fs"' in base and "无备份目录扫描" in base
+    # 2026-11-13 菜单改名：明确"特殊恢复"定位（原来的"无备份目录扫描"易被误读为常规恢复）
+    assert 'href="/scan-fs"' in base
+    assert "无备份救援（特殊恢复）" in base
 
 
 def test_scan_fs_js_covers_all_three_endpoints():

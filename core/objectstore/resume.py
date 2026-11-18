@@ -177,14 +177,9 @@ def reusable_entry(stage: str, entry, meta: dict) -> dict | None:
 
 
 def _sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(8 << 20)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
+    """统一委托 core.db.sha256_file（此前 7 个模块各写一份，已收敛）。"""
+    from core import db as _db
+    return _db.sha256_file(path)
 
 
 def clear(stage: str) -> None:

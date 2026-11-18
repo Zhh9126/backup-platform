@@ -1,0 +1,41 @@
+{
+  "id": "qemu-img",
+  "name": "qemu-img（磁盘镜像导出）",
+  "version": "8.2",
+  "category": "vm",
+  "description": "虚拟机磁盘镜像转换/导出（qcow2/vmdk/raw），用于 KVM/VMware 磁盘级备份。",
+  "required_clients": [
+    "qemu-img"
+  ],
+  "supports": [
+    "vm"
+  ],
+  "tags": [
+    "虚拟机",
+    "磁盘镜像",
+    "转换"
+  ],
+  "icon": "bi-hdd",
+  "packages": {
+    "linux": {
+      "package_managers": {
+        "apt": {
+          "command": "apt-get install -y qemu-utils",
+          "binaries": [
+            "qemu-img"
+          ]
+        },
+        "yum": {
+          "command": "yum install -y qemu-img",
+          "binaries": [
+            "qemu-img"
+          ]
+        }
+      }
+    }
+  },
+  "verify_after_install": [
+    "qemu-img --version"
+  ],
+  "fallback_note": "未安装时虚拟机备份仅支持文件级（rsync/tar），无磁盘块级导出"
+}

@@ -23,7 +23,7 @@ else:
 # ---------- 产品标识 ----------
 # 产品正式名称与版本（对外 API 文档、健康检查、报告落款统一取这里，避免各处硬编码）。
 PLATFORM_NAME = os.environ.get("AIDBM_NAME", "AIDBM")
-PLATFORM_VERSION = os.environ.get("AIDBM_VERSION", "2.4.0")
+PLATFORM_VERSION = os.environ.get("AIDBM_VERSION", "2.4.2")
 
 # ---------- 路径 ----------
 BACKUP_ROOT = os.environ.get("BACKUP_ROOT", str(BASE_DIR / "backups"))
@@ -130,6 +130,17 @@ MAX_CONCURRENT_BACKUPS = _env_int("AIDBM_MAX_CONCURRENT_BACKUPS", 0)
 # 并行执行队列线程池大小；0 = max(8, 并发上限×2)。
 BACKUP_WORKERS = _env_int("AIDBM_BACKUP_WORKERS", 0)
 
+# ---------- 单任务内部并行（引擎级并行，v2.3.8） ----------
+# 平台并发上限（max_concurrent_backups）与单任务引擎并行度共同构成"总并行预算"：
+#     平台并发 × 引擎并行 ≈ BACKUP_PARALLEL_TARGET（不超过）
+# 平台并发被压小时（2 路），单任务自动提升内部并行（xtrabackup --parallel /
+# pg_dump -j / 全实例逐库并发 dump），成员任务排队时间与 drift 随之下降；
+# 平台并发充足时回归串行，避免总 IO 放大压垮生产库。
+# 0 = 关闭自动放大（引擎并行恒为 1，保持旧行为）。
+BACKUP_PARALLEL_TARGET = _env_int("AIDBM_BACKUP_PARALLEL_TARGET", 8)
+# 单任务引擎并行硬上限（任务/策略配置超过此值一律钳制）。
+BACKUP_PARALLEL_MAX = max(1, min(_env_int("AIDBM_BACKUP_PARALLEL_MAX", 8), 32))
+
 # ---------- 首次登录口令治理（默认全部关闭，存量部署零破坏） ----------
 # 开启后：users.must_change_password=1 的账号登录被强制改密；
 # 关闭时仅在启动日志与 /api/rbac/me 给出弱口令告警。
@@ -211,7 +222,7 @@ DB_DISPLAY_NAMES = {
     "dameng": "DM 达梦", "sqlserver": "SQL Server",
     "redis": "Redis", "mongodb": "MongoDB", "file": "文件",
     "neo4j": "Neo4j", "vm": "虚拟机", "object_storage": "对象存储",
-    "synology": "群晖 NAS（DSM）",
+    "synology": "NAS 存储（群晖 DSM）",
     # 国产数据库协议兼容层（2026-11-03）
     "highgo": "HighGo（瀚高）", "uxdb": "UXDB（优炫）",
     "tidb": "TiDB", "oceanbase": "OceanBase",

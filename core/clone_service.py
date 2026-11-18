@@ -15,6 +15,7 @@
 所有外部依赖（底层克隆函数）均支持 DEMO_MODE 仿真兜底：DEMO 下直接仿真成功并登记
 VDB 实例，保证无真实数据库客户端也能跑通自测闭环。
 """
+import json
 import logging
 import os
 import re
@@ -46,6 +47,20 @@ _CLONE_ENGINE = {
     "mysql": "mysql_clone_to_test",
     "mariadb": "mysql_clone_to_test",
     "postgresql": "pg_clone_to_test",
+    # 2026-11-13：金仓补上真实克隆（此前直接拒："暂不支持真实克隆"）。
+    # 走金仓引擎自身的恢复通道（远端 SSH + ksql 建库导入），该通道已在
+    # 170 真机验证：异名库 293 张业务表完整落地。
+    "kingbase": "kb_clone_to_test",
+    # 2026-11-15：达梦真实克隆（逻辑 .dmp 产物）：走达梦引擎自身的恢复
+    # 通道（dimp REMAP_SCHEMA=源:clone_N + dmPython 自动建模式，171:5238
+    # 真机验证），克隆实例=同实例上的独立 schema（DM8 无库级隔离语义，
+    # schema 即达梦的"库"对等物，与 Oracle schema 克隆同构）。
+    "dameng": "dameng_clone_to_test",
+    # 2026-11-17：Oracle 逻辑备份产物（.dmp）克隆补齐。此前逻辑分支没有
+    # oracle 映射，用户从 Oracle 备份记录发起克隆必然报「暂不支持真实克隆」。
+    # 走 Oracle 引擎恢复通道（impdp REMAP_SCHEMA=源:CLONE_N，与达梦 schema
+    # 克隆同构）：克隆实例=源实例上的独立 schema，verify/drop 均已支持。
+    "oracle": "oracle_clone_to_test",
 }
 
 
@@ -75,7 +90,8 @@ class CloneService:
                       target_password: str = "",
                       clone_mode: str = "logical",
                       live_source_db: str = "",
-                      purpose: str = "test") -> dict:
+                      purpose: str = "test",
+                      databases: list = None) -> dict:
         """提交克隆申请。
 
         clone_mode：
@@ -138,6 +154,9 @@ class CloneService:
             "purpose": (purpose or "test").strip() or "test",
             "requested_by": requested_by,
             "note": note,
+            "databases": (json.dumps([str(x).strip() for x in databases
+                                      if str(x).strip()], ensure_ascii=False)
+                          if databases else ""),
         })
         # ITSM 工单：仅显式指定适配器时创建（可选审计留痕，不阻塞克隆）
         if itsm_system:
@@ -308,14 +327,20 @@ class CloneService:
             raise ValueError("仅就绪（ready）状态的克隆库可做接管检查")
         # 连接信息从 vdb_instances 取（get_clone 是原始行，无 join 字段）
         vrow = db.query_one(
-            "SELECT host, port, database_name, username FROM vdb_instances "
-            "WHERE id=?", (req.get("vdb_instance_id"),))
+            "SELECT host, port, database_name, username, service, db_type "
+            "FROM vdb_instances WHERE id=?", (req.get("vdb_instance_id"),))
         if not vrow:
             raise ValueError("克隆库连接信息缺失（vdb 实例不存在）")
         vdb_host = vrow["host"]
         vdb_port = vrow["port"]
         vdb_db = vrow["database_name"]
         vdb_user = vrow["username"]
+        # Oracle：native_conn 第 4 参语义是**服务名**，不是 schema 名——
+        # 传 schema 名（C##CLONE_N）会 ORA-12514/DPY-6005（实测）。连接用
+        # vdb 注册时持久化的源实例服务名，统计仍按 schema 名（下文 owner=）
+        _ora_service = None
+        if (vrow.get("db_type") or "").lower() == "oracle" and vrow.get("service"):
+            _ora_service = vrow["service"]
         if not (vdb_host and vdb_port and vdb_db):
             raise ValueError("克隆库连接信息缺失（vdb 实例未就绪）")
         from core import native_conn
@@ -341,13 +366,22 @@ class CloneService:
             except Exception:
                 vdb_pw = req_full.get("target_password") or ""
         try:
-            conn = native_conn.connect(
-                src_type, vdb_host, int(vdb_port), vdb_db,
-                vdb_user or "", vdb_pw, timeout=15)
+            if src_type == "oracle":
+                # Oracle 直连偶发 DPY-6005（171/129 监听抖动实测）：重试 3 次
+                from core.restore_extras_clone import _ora_connect_retry
+                conn = _ora_connect_retry(lambda _i: native_conn.connect(
+                    src_type, vdb_host, int(vdb_port), _ora_service or vdb_db,
+                    vdb_user or "", vdb_pw, timeout=15))
+            else:
+                conn = native_conn.connect(
+                    src_type, vdb_host, int(vdb_port), vdb_db,
+                    vdb_user or "", vdb_pw, timeout=15)
             try:
                 cur = conn.cursor()
                 try:
-                    cur.execute("SELECT 1")
+                    # Oracle 语法要求 FROM DUAL（裸 SELECT 1 报 ORA-00923，实测）
+                    cur.execute("SELECT 1 FROM DUAL" if src_type == "oracle"
+                                else "SELECT 1")
                     checks.append(("connectivity", True, "克隆库直连成功"))
                     n_tables = 0
                     first_rows = None
@@ -365,16 +399,29 @@ class CloneService:
                                                     str(r[0]).replace("`", "``"))
                                 cur.execute("SELECT count(*) FROM %s" % fq)
                                 first_rows = int(cur.fetchone()[0])
-                    else:  # PG 系 / Oracle schema
-                        q = ("SELECT count(*) FROM information_schema.tables "
-                             "WHERE table_schema=%s" if src_type not in ("oracle",)
-                             else "SELECT count(*) FROM all_tables WHERE owner=UPPER(:1)")
-                        try:
+                    elif src_type == "dameng":
+                        # 达梦：克隆实例=独立模式（database_name=模式名），DM8
+                        # 无 information_schema.tables，用 dba_tables 按模式统计
+                        #（dmPython 占位符 ?）
+                        cur.execute("SELECT count(*) FROM dba_tables WHERE owner = ?",
+                                    (str(vdb_db or "").upper(),))
+                        n_tables = int(cur.fetchone()[0] or 0)
+                    else:  # PG 系（库级克隆）/ Oracle schema
+                        if src_type == "oracle":
+                            q = "SELECT count(*) FROM all_tables WHERE owner=UPPER(:1)"
                             cur.execute(q, (vdb_db,))
                             n_tables = int(cur.fetchone()[0])
-                        except Exception:
-                            cur.execute("SELECT count(*) FROM information_schema.tables")
-                            n_tables = int(cur.fetchone()[0])
+                        else:
+                            # 库级克隆的表都在 public（金仓/PG），按「当前库全部
+                            # 用户表」统计——此前按 table_schema=<库名> 过滤恒 0
+                            #（金仓 clone_36 实测 103 张表被误报 0）。
+                            # 2026-11-17：金仓内部 schema 排不净导致虚高（fresh 库
+                            # sys_catalog/sys_hm/pg_catalog 等 100+ 张），补 sys% 前缀排除。
+                            cur.execute(
+                                "SELECT count(*) FROM information_schema.tables "
+                                "WHERE table_schema NOT LIKE 'sys%' AND table_schema "
+                                "NOT IN ('pg_catalog','information_schema','anon','src_restrict')")
+                            n_tables = int(cur.fetchone()[0] or 0)
                     checks.append(("tables", n_tables > 0,
                                    "表数量 %d" % n_tables))
                     if first_rows is not None:
@@ -426,7 +473,37 @@ class CloneService:
         return result
 
     # ------------------------- 查询 -------------------------
+    def _sweep_stuck_creating(self, minutes: int = 45) -> int:
+        """把长时间停在 creating 的克隆请求置为 failed（防永久「创建中」）。
+
+        场景：整实例克隆导入耗时很长，平台重启/崩溃会让后台线程消失，请求
+        永远停在 creating，前端一直转圈且无法销毁。这里按 updated_at 兜底。
+        """
+        try:
+            cutoff = (datetime.now() - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+            rows = models.db.query(
+                "SELECT id, note FROM clone_requests WHERE status='creating' "
+                "AND (updated_at IS NULL OR updated_at < ?)", (cutoff,))
+        except Exception:  # noqa: BLE001
+            return 0
+        n = 0
+        for r in rows:
+            try:
+                models.update_clone_request(int(r["id"]), {
+                    "status": STATUS_FAILED,
+                    "note": ((r.get("note") or "") + "\n"
+                             "拉起超时（>%d 分钟未完成）：可能平台重启中断或目标实例过载，"
+                             "请核对目标实例上的 clone_* 库后重试或销毁" % minutes)[-800:]})
+                n += 1
+            except Exception:  # noqa: BLE001
+                pass
+        if n:
+            self.logger.warning("[clone] %d 个克隆请求停在 creating 超时，已置 failed", n)
+        return n
+
     def list_clones(self) -> list:
+        # 列表是最高频入口：顺带把卡死的 creating 兜底置失败（幂等，成本一条 SQL）
+        self._sweep_stuck_creating()
         return models.list_clone_requests()
 
     def get_clone(self, request_id: int) -> Optional[dict]:
@@ -485,8 +562,10 @@ class CloneService:
                     pg_host=req.get("target_host") or "127.0.0.1",
                     pg_user="postgres", pg_password=password)
             elif db_type in ("mysql", "mariadb") and clone_mode == "snapshot":
+                _st0 = models.get_task(rec.get("task_id"), include_secret=True) or {}
                 res = restore_extras_clone.mysql_snapshot_clone(
-                    instance_name, src_port=int(rec.get("port") or 3306),
+                    instance_name,
+                    src_port=int(rec.get("port") or _st0.get("port") or 3306),
                     mysql_host=req.get("target_host") or "127.0.0.1",
                     mysql_password=password)
             elif db_type == "oracle" and clone_mode == "schema":
@@ -526,8 +605,18 @@ class CloneService:
             raise RuntimeError(f"备份产物不存在: {backup_path or '-'}")
 
         target_host = (req.get("target_host") or "127.0.0.1").strip() or "127.0.0.1"
-        port = 3306 if db_type in ("mysql", "mariadb") else (
-            5432 if db_type == "postgresql" else 0)
+        # backup_records 没有 port 字段（实测恒 None）：默认端口必须回退到
+        # 源任务真实端口，否则达梦非 5236 / 金仓非 54321 的实例上，克隆本体
+        # 成功而就绪校验/接管检查连错端口（171:5238 实测 -70028）
+        src_task0 = models.get_task(rec.get("task_id"), include_secret=True) or {}
+        # 默认端口一律「记录 → 源任务 → 引擎默认」三级回退（mysql/pg 与
+        # 金仓/达梦/Oracle 同口径）：本机 MySQL 3307 / PG 5785 克隆实测暴露
+        # 此前 mysql/postgresql 分支端口写死 3306/5432，克隆打错实例
+        port = int(rec.get("port") or src_task0.get("port") or (
+            3306 if db_type in ("mysql", "mariadb") else (
+                5432 if db_type == "postgresql" else (
+                    54321 if db_type == "kingbase" else (
+                        5236 if db_type == "dameng" else 1521)))))
         # target_host 支持 host:port 形式（B3 应急接管/自定义实例端口）
         if ":" in target_host:
             _th, _tp = target_host.rsplit(":", 1)
@@ -536,7 +625,10 @@ class CloneService:
                 req = dict(req)
                 req["target_host"] = target_host  # vdb 注册存纯主机名
         user = "root" if db_type in ("mysql", "mariadb") else (
-            "postgres" if db_type == "postgresql" else "")
+            "postgres" if db_type == "postgresql" else (
+                "system" if db_type == "kingbase" else (
+                    "SYSDBA" if db_type == "dameng" else (
+                        "system" if db_type == "oracle" else ""))))
         # 连接密码：目标实例密码优先，未填则沿用源任务密码
         password = req.get("target_password") or ""
         if not password:
@@ -544,18 +636,108 @@ class CloneService:
             password = src_task.get("password") or ""
 
         simulated = config.DEMO_MODE != "off"
+        scope = self._archive_scope(backup_path)
+        if not simulated and scope == "full_instance":
+            # 整实例克隆：全实例归档（多库 tar）按库拆开，每库落到 <prefix>__<源库>。
+            # 此前把多库 tar 当单个 SQL 灌进一个库，直接报 ASCII '\0'（实测）。
+            _want = self._parse_databases(req.get("databases"))
+
+            def _prog(idx, total, db):
+                try:
+                    models.update_clone_request(req["id"], {
+                        "note": "整实例克隆中 %d/%d：%s | scope=full_instance"
+                                % (idx, total, db)})
+                except Exception:  # noqa: BLE001
+                    pass
+
+            res = restore_extras.mysql_full_instance_clone(
+                backup_path, instance_name,
+                mysql_host=target_host, mysql_port=port or 3306,
+                mysql_user=user, mysql_password=password,
+                databases=_want, progress=_prog)
+            if not res.get("ok"):
+                raise RuntimeError(f"整实例克隆失败: {res.get('message')}")
+            _dbs = res.get("databases") or []
+            _note = ("整实例克隆（%d 库 / %d 表：%s）| scope=full_instance | 目标主机 %s"
+                     % (res.get("db_count") or 0, res.get("table_total") or 0,
+                        ",".join(str(d.get("source", "")) for d in _dbs[:6]),
+                        target_host))
+            return self._register_vdb(req, rec, db_type, instance_name, port, user,
+                                      password, _note)
+        if not simulated and scope == "physical":
+            # 物理归档（xtrabackup / base.tar.gz 等）不能用「逻辑导入」克隆：
+            # 此前会被当 SQL 灌入，报 ASCII '\0'，用户看不出根因。明确拒绝。
+            raise RuntimeError(
+                "该备份是物理备份归档（tar），逻辑克隆不支持：请改用「数据恢复」的"
+                "物理恢复通道，或对逻辑备份记录发起克隆")
         if not simulated:
             engine_name = _CLONE_ENGINE.get(db_type)
             if not engine_name:
                 raise RuntimeError(
                     f"db_type={db_type} 暂不支持真实克隆"
-                    "（当前支持 mysql/mariadb/postgresql 逻辑导入；"
-                    "Oracle 走 schema 模式；秒级克隆见 template/snapshot 模式）")
-            if engine_name == "pg_clone_to_test":
+                    "（当前支持 mysql/mariadb/postgresql/kingbase/dameng/oracle"
+                    " 逻辑导入；秒级克隆见 template/snapshot/schema 模式）")
+            if engine_name == "dameng_clone_to_test":
+                # 达梦：复用引擎恢复通道（dimp REMAP_SCHEMA=源:目标 + dmPython
+                # 自动建目标模式）。DM8 未加引号的模式名一律落大写
+                # （CASE_SENSITIVE=1），克隆模式名统一大写，保证 dimp 导入、
+                # 就绪校验（dba_tables.owner）、销毁（DROP SCHEMA）三处口径一致。
+                from core.engines import get_engine as _get_engine
+                dm_task = models.get_task(rec.get("task_id"),
+                                          include_secret=True) or {}
+                if password and target_host not in ("127.0.0.1", "", None):
+                    dm_task = {**dm_task, "password": password}
+                eng = _get_engine("dameng", dm_task,
+                                  getattr(config, "BACKUP_ROOT", self._storage_root()))
+                tgt_schema = instance_name.upper()
+                rr = eng.restore(backup_path, target_db=tgt_schema)
+                res = {"ok": bool(getattr(rr, "success", False)),
+                       "message": getattr(rr, "message", "") or "",
+                       "schema": tgt_schema}
+                # 达梦无库级克隆语义：VDB database_name 直接存模式名（大写）
+                instance_name = tgt_schema
+            elif engine_name == "oracle_clone_to_test":
+                # Oracle：逻辑 .dmp 产物 → impdp REMAP_SCHEMA=源:CLONE_N。
+                # 克隆实例=源实例上的独立 schema（Oracle 无库级隔离，与达梦
+                # schema 克隆同构）；模式名统一大写（未引号标识符落大写），
+                # 保证 impdp 导入、verify（all_tables.owner）、销毁（drop
+                # schema）三处口径一致。源 schema 取自源任务 extra.schemas，
+                # 恢复目标服务名由引擎按任务配置解析。
+                from core.engines import get_engine as _get_engine
+                ora_task = models.get_task(rec.get("task_id"),
+                                           include_secret=True) or {}
+                eng = _get_engine("oracle", ora_task,
+                                  getattr(config, "BACKUP_ROOT", self._storage_root()))
+                tgt_schema = instance_name.upper()
+                try:
+                    # CDB 根容器下普通用户必须 C## 前缀（171 orcldg 实测
+                    # ORA-65096/01918）；非 CDB 原样返回
+                    tgt_schema = eng.clone_target_schema(tgt_schema)
+                except Exception:
+                    pass
+                rr = eng.restore(backup_path, target_schema=tgt_schema)
+                res = {"ok": bool(getattr(rr, "success", False)),
+                       "message": getattr(rr, "message", "") or "",
+                       "schema": tgt_schema}
+                instance_name = tgt_schema
+            elif engine_name == "pg_clone_to_test":
                 res = restore_extras.pg_clone_to_test(
                     backup_path, instance_name,
                     pg_host=target_host, pg_port=port or None,
                     pg_user=user, pg_password=password)
+            elif engine_name == "kb_clone_to_test":
+                # 金仓：复用引擎恢复通道（远端 SSH + ksql 建库导入，零安装），
+                # 引擎侧已处理 sys_dump/ksql 的版本与 PATH 解析。
+                from core.engines import get_engine as _get_engine
+                kb_task = models.get_task(rec.get("task_id"),
+                                          include_secret=True) or {}
+                if password and target_host not in ("127.0.0.1", "", None):
+                    kb_task = {**kb_task, "password": password}
+                eng = _get_engine("kingbase", kb_task,
+                                  getattr(config, "BACKUP_ROOT", self._storage_root()))
+                rr = eng.restore(backup_path, target_db=instance_name)
+                res = {"ok": bool(getattr(rr, "success", False)),
+                       "message": getattr(rr, "message", "") or ""}
             else:
                 res = restore_extras.mysql_clone_to_test(
                     backup_path, instance_name,
@@ -568,7 +750,54 @@ class CloneService:
                                   password,
                                   ("DEMO 仿真实例" if simulated else "真实克隆实例")
                                   + (f" | 目标主机 {target_host}"
-                                     if target_host != "127.0.0.1" else ""))
+                                     if target_host != "127.0.0.1" else ""),
+                                  service=((src_task0.get("db_name")
+                                            or rec.get("db_name") or "")
+                                           if db_type == "oracle" else None))
+
+    @staticmethod
+    def _parse_databases(raw) -> list:
+        """解析「整实例克隆要哪些库」：支持 JSON 数组 / 逗号串 / 空（=全部库）。"""
+        if not raw:
+            return []
+        if isinstance(raw, (list, tuple)):
+            return [str(x).strip() for x in raw if str(x).strip()]
+        txt = str(raw).strip()
+        if not txt:
+            return []
+        if txt.startswith("["):
+            try:
+                data = json.loads(txt)
+                return [str(x).strip() for x in data if str(x).strip()]
+            except Exception:  # noqa: BLE001
+                pass
+        # 支持中英文逗号/换行/空格混排（UI 是从输入框手输的）
+        import re as _re
+        return [x.strip() for x in _re.split(r"[,，\s]+", txt) if x.strip()]
+
+    @staticmethod
+    def _archive_scope(path: str) -> str:
+        """探测备份产物范围：single（单库逻辑文件）/ full_instance（全实例多库归档）/ physical。
+
+        只读 tar 成员名，不做解包，成本毫秒级。
+        """
+        low = (path or "").lower()
+        if not (low.endswith(".tar.gz") or low.endswith(".tgz") or low.endswith(".tar")):
+            return "single"
+        try:
+            import tarfile
+            with tarfile.open(path, "r:*") as tf:
+                names = [n.lstrip("./") for n in tf.getnames()[:600]]
+        except Exception:  # noqa: BLE001
+            return "single"
+        if any(n.endswith("xtrabackup_checkpoints") or n.endswith("backup-my.cnf")
+               or n.endswith("mariabackup_checkpoints") for n in names):
+            return "physical"
+        if any(n.endswith("manifest.json") or n.startswith("dbs/") or "/dbs/" in n
+               for n in names):
+            return "full_instance"
+        # 其它 tar（PG/金仓 base.tar.gz、达梦备份集）同样不是可逻辑导入的产物
+        return "physical"
 
     def _register_vdb(self, req: dict, rec: dict, db_type: str, name: str,
                       port, user: str, password: str, note: str,
@@ -592,6 +821,14 @@ class CloneService:
                             if req.get("note") else ""),
         })
         return vdb_id
+
+    @staticmethod
+    def _storage_root() -> str:
+        """备份根目录（引擎构造需要）；缺配置时退回 config 默认值。"""
+        try:
+            return config.BACKUP_ROOT
+        except Exception:
+            return os.path.join(os.getcwd(), "backups")
 
     @staticmethod
     def _resolve_ssh(rec: dict) -> dict:
@@ -619,6 +856,14 @@ class CloneService:
         if not vdb:
             raise ValueError("VDB 实例元数据缺失")
         password = self._vdb_password(vdb, req)
+        if "scope=full_instance" in str(vdb.get("note") or ""):
+            # 整实例克隆：库是 <prefix>__<源库>，按前缀统计库数与表数
+            res = restore_extras.verify_full_instance_clone(
+                vdb.get("host") or "127.0.0.1", vdb.get("port"),
+                vdb.get("username"), password,
+                vdb.get("database_name") or "")
+            self.logger.info("[clone] 请求 %s 整实例校验: %s", request_id, res.get("message"))
+            return res
         res = restore_extras.verify_clone_conn(
             vdb.get("db_type"), vdb.get("host") or "127.0.0.1",
             vdb.get("port"), vdb.get("database_name"), vdb.get("username"),

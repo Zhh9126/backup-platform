@@ -14,6 +14,9 @@
     执行，平台注入 <code>PLATFORM_DB_HOST/PORT/USER/PASSWORD/NAME/BACKUP_TYPE/BACKUP_DIR</code>
     等环境变量；<code>{% raw %}{{KEY}}{% endraw %}</code> 占位渲染为 <code>${PLATFORM_KEY}</code>（不写明文）。
   </div>
+  <div class="alert alert-light border py-2 small">
+    点击「从模板复制」可打开模板目录（协议族 / 时序 / 图 / 国产信创等），支持勾选批量导入。
+  </div>
 
   <div class="card">
     <div class="table-responsive">
@@ -148,16 +151,31 @@
   </div>
 </div>
 
-<!-- 模板 模态框 -->
+<!-- 模板 模态框（模板目录：按协议族分组 + 批量导入） -->
 <div class="modal fade" id="tplModal" tabindex="-1">
-  <div class="modal-dialog modal-lg">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
     <div class="modal-content">
       <div class="modal-header">
-        <h5 class="modal-title">从模板复制</h5>
+        <h5 class="modal-title">数据库类型模板目录 <span class="badge bg-secondary ms-2" id="tplCount">0</span></h5>
         <button class="btn-close" data-bs-dismiss="modal"></button>
       </div>
       <div class="modal-body">
+        <div class="d-flex gap-2 mb-2">
+          <input class="form-control form-control-sm" id="tplSearch" placeholder="搜索数据库名称 / db_type（如 db2、时序、国产）">
+          <button class="btn btn-sm btn-outline-secondary text-nowrap" id="tplSelAll">全选</button>
+          <button class="btn btn-sm btn-outline-secondary text-nowrap" id="tplSelNone">清空</button>
+        </div>
+        <div class="alert alert-light border py-2 small mb-2">
+          <div>协议兼容：与已验证引擎同族工具（pg_dump / mysqldump / exp-imp），参数基本一致。</div>
+          <div>需现场核对：厂商专有工具或 API 导出，命令骨架按官方文档给出，首次使用请先点「测试」核对工具路径。</div>
+          <div>勾选后点右下「批量导入」即可一次性创建这些库型。</div>
+        </div>
         <div id="tplList" class="list-group"></div>
+      </div>
+      <div class="modal-footer">
+        <span class="text-muted small me-auto" id="tplSelInfo">未选择</span>
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" id="btnImportSel"><i class="bi bi-box-arrow-in-down me-1"></i>批量导入选中</button>
       </div>
     </div>
   </div>
@@ -288,29 +306,119 @@ function __initDbAdaptersPanel(){
   }
 
   document.getElementById("btnNew").onclick=()=>openEditor(null);
+
+  // ---- 模板目录：分组渲染 + 勾选批量导入 + 单条套用 ----
+  let tplGroups = [];
+  function tplSelected(){
+    return Array.from(document.querySelectorAll("#tplList .tpl-chk:checked")).map(x=>x.value);
+  }
+  function tplUpdateInfo(){
+    const n=tplSelected().length;
+    document.getElementById("tplSelInfo").textContent = n ? ("已选 "+n+" 项") : "未选择";
+    document.getElementById("btnImportSel").disabled = !n;
+  }
+  function renderTplList(){
+    const box=document.getElementById("tplList"); box.innerHTML="";
+    const kw=(document.getElementById("tplSearch").value||"").trim().toLowerCase();
+    let shown=0;
+    tplGroups.forEach(g=>{
+      const items=(g.templates||[]).filter(t=>!kw ||
+        ((t.label||"")+(t.key||"")+(t.description||"")+(t.db_type_hint||"")).toLowerCase().includes(kw));
+      if(!items.length) return;
+      const head=document.createElement("div");
+      head.className="list-group-item bg-light d-flex align-items-center";
+      head.innerHTML=`<b>${g.label}</b><span class="badge bg-secondary ms-2">${items.length}</span>
+        <button class="btn btn-sm btn-link ms-auto py-0" data-grp="${g.group}">全选本组</button>`;
+      box.appendChild(head);
+      items.forEach(t=>{
+        shown++;
+        const row=document.createElement("div");
+        row.className="list-group-item d-flex align-items-start gap-2";
+        const vb = t.verification==="protocol"
+          ? '<span class="badge bg-info-subtle text-dark border">协议兼容</span>'
+          : '<span class="badge bg-warning-subtle text-dark border">需现场核对</span>';
+        row.innerHTML=`<input class="form-check-input mt-1 tpl-chk" type="checkbox" value="${t.key}">
+          <div class="flex-grow-1">
+            <div><b>${t.label||t.key}</b> ${vb}</div>
+            <div class="text-muted small">${t.description||""}</div>
+            <div class="text-muted small">db_type=<code>${t.db_type_hint||t.key}</code>${t.default_port?" · 端口 "+t.default_port:""}</div>
+          </div>
+          <button class="btn btn-sm btn-outline-primary text-nowrap" data-use="${t.key}">套用</button>`;
+        box.appendChild(row);
+      });
+    });
+    document.getElementById("tplCount").textContent = shown+" 项";
+    tplUpdateInfo();
+  }
+  function tplByKey(key){
+    for(const g of tplGroups){ for(const t of (g.templates||[])){ if(t.key===key) return t; } }
+    return null;
+  }
+  document.getElementById("tplList").addEventListener("click",(e)=>{
+    const useBtn=e.target.closest("button[data-use]");
+    if(useBtn){
+      const t=tplByKey(useBtn.dataset.use); if(!t) return;
+      openEditor({
+        db_type:"", display_name:t.display_name||t.label, category:t.category||"custom",
+        default_port:t.default_port||null, icon:t.icon||"bi-box-seam",
+        description:t.description||"",
+        backup_modes:t.backup_modes||["logical"],
+        supports_incremental:t.supports_incremental?1:0,
+        supports_full_instance:t.supports_full_instance?1:0,
+        supports_sync:t.supports_sync?1:0,
+        client_tools:t.client_tools||[],
+        script_backup_full:t.script_backup_full||"",
+        script_restore:t.script_restore||"",
+        script_test_conn:t.script_test_conn||"",
+        script_list_dbs:t.script_list_dbs||"",
+        params:t.params_hint||{},
+      });
+      bootstrap.Modal.getInstance(document.getElementById("tplModal")).hide();
+      return;
+    }
+    const grpBtn=e.target.closest("button[data-grp]");
+    if(grpBtn){
+      const g=tplGroups.find(x=>x.group===grpBtn.dataset.grp);
+      (g&&g.templates||[]).forEach(t=>{
+        const cb=document.querySelector(`#tplList .tpl-chk[value="${t.key}"]`);
+        if(cb) cb.checked=true;
+      });
+      tplUpdateInfo();
+    }
+  });
+  document.getElementById("tplList").addEventListener("change",(e)=>{
+    if(e.target.classList.contains("tpl-chk")) tplUpdateInfo();
+  });
+  document.getElementById("tplSearch").addEventListener("input", renderTplList);
+  document.getElementById("tplSelAll").onclick=()=>{
+    document.querySelectorAll("#tplList .tpl-chk").forEach(cb=>cb.checked=true); tplUpdateInfo();
+  };
+  document.getElementById("tplSelNone").onclick=()=>{
+    document.querySelectorAll("#tplList .tpl-chk").forEach(cb=>cb.checked=false); tplUpdateInfo();
+  };
   document.getElementById("btnTemplates").onclick=()=>{
     BKP.api("GET", "/api/db-adapters/templates").then(d=>{
-      const box=document.getElementById("tplList"); box.innerHTML="";
-      (d.templates||[]).forEach(t=>{
-        const a=document.createElement("a");
-        a.className="list-group-item list-group-item-action";
-        a.href="#"; a.innerHTML=`<div class="d-flex"><div><b>${t.label}</b><div class="text-muted small">${t.description||""}</div></div><i class="bi bi-arrow-right ms-auto"></i></div>`;
-        a.onclick=(e)=>{e.preventDefault(); openEditor({
-          db_type:"", display_name:t.label, category:t.category||"custom",
-          default_port:t.default_port||null, icon:t.icon||"bi-box-seam",
-          backup_modes:t.backup_modes||["logical"],
-          supports_incremental:t.supports_incremental?1:0,
-          supports_full_instance:t.supports_full_instance?1:0,
-          script_backup_full:t.script_backup_full||"",
-          script_restore:t.script_restore||"",
-          script_test_conn:t.script_test_conn||"",
-          script_list_dbs:t.script_list_dbs||"",
-          params:t.params_hint||{},
-        }); bootstrap.Modal.getInstance(document.getElementById("tplModal")).hide();};
-        box.appendChild(a);
-      });
+      tplGroups = d.groups || (d.templates||[]).map(t=>({group:"all",label:"全部模板",templates:[t]}));
+      document.getElementById("tplSearch").value="";
+      renderTplList();
       bootstrap.Modal.getOrCreateInstance(document.getElementById("tplModal")).show();
     }).catch(e=>BKP.toast("模板加载失败: "+(e.message||e),"danger"));
+  };
+  document.getElementById("btnImportSel").onclick=()=>{
+    const keys=tplSelected();
+    if(!keys.length){ BKP.toast("请先勾选要导入的库型","warning"); return; }
+    const btn=document.getElementById("btnImportSel");
+    btn.disabled=true; btn.innerHTML='<span class="spinner-border spinner-border-sm me-1"></span>导入中…';
+    BKP.api("POST","/api/db-adapters/import",{keys:keys}).then(d=>{
+      const c=(d.created||[]).length, s=(d.skipped||[]).length, f=(d.failed||[]).length;
+      BKP.toast(`导入完成：新增 ${c} 项，跳过 ${s} 项，失败 ${f} 项`, f?"warning":"success");
+      if(f){
+        console.warn("导入失败明细", d.failed);
+      }
+      bootstrap.Modal.getInstance(document.getElementById("tplModal")).hide();
+      reload();
+    }).catch(e=>BKP.toast("批量导入失败: "+(e.message||e),"danger"))
+      .finally(()=>{ btn.disabled=false; btn.innerHTML='<i class="bi bi-box-arrow-in-down me-1"></i>批量导入选中'; });
   };
   document.getElementById("btnPreview").onclick=()=>{
     const script=document.getElementById("f_script_backup_full").value;

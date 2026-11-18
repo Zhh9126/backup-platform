@@ -113,6 +113,8 @@ v2.2.0（2026-11-05）——近两个月主线：AI 大模型数据备份（v2.0
 | 生命周期 | L1→L2 按龄/按容量下沉、到期清理 |
 | 全局重删 | 内容 sha256 索引 + 引用计数 |
 | 存储池加密 | AES-256-GCM 信封式，密钥来源：环境变量 / 系统设置托管 / 外部 KMS |
+| **备份并行预算** | 平台并发上限 × 单任务引擎并行 ≈ 8 路（`AIDBM_BACKUP_PARALLEL_TARGET` 可调，0=关）。平台并发被压到 1~2 路时单任务自动提升内部并行，成员排队与 drift 随之下降；记录消息标注「排队等待 Xs（平台并发上限 N 路）」与并行口径，drift 可归因 |
+| **单任务引擎并行** | MySQL 物理备份 XtraBackup `--parallel`（本机/远端）；PostgreSQL/金仓/openGauss `pg_dump -j`（自动切目录格式 -Fd 并打包单文件，恢复通道自建库）；全实例逻辑备份逐库并发 dump（manifest 记 `parallel_dump`）。任务级 `extra_options.engine_parallel`（0=强制串行）覆盖，默认受保护策略并行度约束（core 4 / important 2 / general 1）|
 | 备份插件 | 服务端插件市场（XtraBackup / MariaDB Backup / pgBackRest / MongoDB Tools 等），支持离线包安装 |
 | 虚拟机备份（整机） | PVE / KVM(libvirt) / ESXi / Hyper-V 纳管 → 保护策略 → 恢复点 → 原地还原 / 克隆新 VM（新 UUID/MAC/隔离网络/TTL 回收）/ 自动恢复验证；libvirt 通道已真机端到端验证（外部快照→convert→blockcommit 回切业务无停机、克隆、原位还原），libvirt ≥6.0 支持真块级增量，低版本诚实回退全量；复用平台既有调度、保留、存储分层与告警 |
 | 可插拔数据库类型 | 「数据库类型」页界面新增：填脚本模板（备份/增量/全实例/恢复/校验/列库/连通性）+ 能力声明，运行时渲染为 `CustomDBEngine` 注入引擎注册表，与内置引擎同一调度链路；`{{KEY}}` 占位渲染为 `${PLATFORM_KEY}`，脚本不落明文密码 |

@@ -196,6 +196,18 @@ class PostgreSQLEngine(BackupEngine):
             "pg_dump", "pg_dumpall")
         return _with_note(res)
 
+    def _backup_parallel(self) -> int:
+        """备份并行度（单任务内部引擎级并行）。
+
+        `pg_dump -j` 只在目录格式(-Fd)下生效；并行度来源见
+        core/parallel_plan.py（任务显式 > 保护策略上限 > 按平台并发自动推算）。
+        """
+        try:
+            from core import parallel_plan
+            return int(parallel_plan.resolve(self.task)["workers"])
+        except Exception:
+            return 1
+
     def _backup_logical_local(self, backup_type: BackupType) -> BackupResult:
         """本机 pg_dump 真实备份。"""
         # 构造输出目录与文件名
@@ -234,6 +246,16 @@ class PostgreSQLEngine(BackupEngine):
         #    - directory：-Fd 目录归档，落盘前打包为 .dir.tar.gz
         from core import dump_format as _dfmt
         fmt = _dfmt.resolve(self._dump_db_type, extra_eo, compress=bool(compress))
+        # 引擎并行：pg_dump/gs_dump/sys_dump 的 -j 仅在目录格式(-Fd)下有效。
+        # 任务要求并行但格式不是目录 → 自动切目录格式（产物仍打包成单文件
+        # .dir.tar.gz，恢复通道完备），并在结果消息里如实标注，不静默改行为。
+        bpar = self._backup_parallel()
+        par_note = ""
+        if bpar > 1 and not fmt.get("dir"):
+            fmt = dict(_dfmt.resolve(self._dump_db_type,
+                                     {"dump_format": "directory"},
+                                     compress=bool(compress)))
+            par_note = f"（已自动切换目录格式 -Fd 以启用 {bpar} 路并行导出）"
         fmt_flag = fmt.get("flag") or ("-Fc" if compress else "-Fp")
         if fmt.get("dir"):
             out_path = os.path.join(out_dir, f"{ts}.dir.tar.gz")
@@ -264,6 +286,9 @@ class PostgreSQLEngine(BackupEngine):
             cmd += ["-d", str(db_name), fmt_flag, "-f", dump_out]
         # openGauss：-W 显式密码（sha256 认证不读 PGPASSWORD）
         cmd += self._w_pass_args(pw)
+        # 引擎并行：目录格式下 pg_dump/gs_dump -j N 并发导出
+        if fmt.get("dir") and bpar > 1:
+            cmd += ["-j", str(bpar)]
         # 单表备份：真实追加 -t。此前 extra.tables 只用于阻止全实例分支，
         # 本机通道会静默产出整库 dump 却按「指定表」记账，粒度不真实。
         for _tb in parse_table_list(extra_eo.get("tables")):
@@ -315,6 +340,8 @@ class PostgreSQLEngine(BackupEngine):
         message = f"PostgreSQL {real_type.value} 备份成功"
         if fallback_note:
             message += " " + fallback_note
+        if par_note:
+            message += par_note
 
         return BackupResult(
             success=True,
@@ -344,6 +371,8 @@ class PostgreSQLEngine(BackupEngine):
         dump_tool = self._resolve_local_tool("pg_dump")
         query_tool = self._resolve_local_tool("psql")
         dumpall_tool = self._resolve_local_tool("pg_dumpall")
+        # 引擎并行：全实例逐库 dump 并发（每库一个 pg_dump 进程）
+        bpar = self._backup_parallel()
         try:
             manifest = logical_full.backup_full_instance(
                 self._dump_db_type,
@@ -352,7 +381,8 @@ class PostgreSQLEngine(BackupEngine):
                 password=db.decrypt_secret(self.task.get("password") or ""),
                 dump_tool=dump_tool, out_path=out_path,
                 query_tool=query_tool, dumpall_tool=dumpall_tool,
-                include_system_dbs=bool(self._extra_dict().get("include_system_dbs")))
+                include_system_dbs=bool(self._extra_dict().get("include_system_dbs")),
+                parallel=bpar)
         except Exception as e:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,
@@ -362,7 +392,8 @@ class PostgreSQLEngine(BackupEngine):
         dbs_txt = ", ".join(manifest.get("databases") or [])
         msg = (f"PostgreSQL 全实例备份成功: {len(manifest['databases'])} 个库"
                f"（{dbs_txt}）+ 全局对象({manifest.get('globals')})，"
-               f"产物 {out_path}")
+               f"产物 {out_path}"
+               + (f"（引擎并行 {bpar} 路）" if bpar > 1 else ""))
         return BackupResult(
             success=True, status=BackupStatus.SUCCESS,
             backup_path=out_path, size_bytes=size, duration_sec=0,
@@ -372,10 +403,49 @@ class PostgreSQLEngine(BackupEngine):
                                    target_db: str, env_extra: dict) -> BackupResult:
         """目录格式（-Fd）单库归档恢复：解开 tar.gz → pg_restore -Fd <dir>。
 
-        目标库的创建/清理由调用方（_restore_local）在分派前完成，这里只负责
-        解开归档并调用 pg_restore 回放，临时目录用完即删。
+        -Fd 的 pg_restore 是直连目标库回放（不像 -C 会自动建库），因此目标库
+        必须已存在且干净——此前该分支在建库之前就 return（只有 .dump/.sql 分支
+        建库），异构名恢复会直接 FATAL: database "xxx" does not exist。
+        并行使目录格式成为默认产物后，这里必须自己保证目标库就绪。
+
+        临时目录用完即删。
         """
         import tempfile
+        # 0) 目标库就绪：DROP（存在时）+ CREATE，保证恢复结果可重复
+        if str(target_db or "").strip():
+            pw0 = db.decrypt_secret(self.task.get("password") or "")
+            safe_db = str(target_db).replace('"', '""')
+            base = [self._resolve_local_tool("psql"),
+                    "--host", str(host), "--port", str(port),
+                    "--username", str(user)]
+            exists = self._pg_db_exists(host, port, user, target_db, env_extra)
+            if exists:
+                drop = self._run(
+                    base + ["-d", "postgres",
+                            "-c", f'DROP DATABASE IF EXISTS "{safe_db}" WITH (FORCE)']
+                    + self._w_pass_args(pw0),
+                    env_extra=env_extra, timeout=180)
+                if drop["returncode"] != 0:
+                    # PG13 以下 / openGauss 系不支持 WITH (FORCE)：回退普通 DROP
+                    drop = self._run(
+                        base + ["-d", "postgres",
+                                "-c", f'DROP DATABASE IF EXISTS "{safe_db}"']
+                        + self._w_pass_args(pw0),
+                        env_extra=env_extra, timeout=180)
+                if drop["returncode"] != 0:
+                    return BackupResult(
+                        success=False, status=BackupStatus.FAILED,
+                        backup_path=backup_path, simulated=False,
+                        message=f"目录格式恢复前清理目标库 {target_db} 失败: {drop['stderr']}")
+            create = self._run(
+                base + ["-d", "postgres", "-c", f'CREATE DATABASE "{safe_db}"']
+                + self._w_pass_args(pw0),
+                env_extra=env_extra, timeout=180)
+            if create["returncode"] != 0:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path, simulated=False,
+                    message=f"目录格式恢复前创建目标库 {target_db} 失败: {create['stderr']}")
         tmp_root = tempfile.mkdtemp(prefix="pgdir_")
         try:
             self._untar_to_dir(backup_path, tmp_root)
@@ -489,8 +559,33 @@ class PostgreSQLEngine(BackupEngine):
                 backup_path=backup_path, simulated=False,
                 message=f"远端未找到 {self._restore_ctl_tool}/{self._restore_psql_tool}"
                         f"（{os_user} 用户 PATH 与常见目录均无），无法做物理恢复")
+        # 落地阶段（异名库）依赖两件事，缺一就会「临时实例校验通过但落地静默失败」
+        # 最终 rc=-1/43（2026-11-13 金仓 170 真机实测）：
+        #  a) 目标实例维护库：金仓 V9R1 无 postgres 库，写死 -d postgres 必失败；
+        #  b) 导出工具需绝对路径：kingbase 用户 PATH 里没有 sys_dump。
+        maint_db = "postgres"
+        try:
+            _pw_probe = db.decrypt_secret(self.task.get("password") or "")
+            _tport = int(self.task.get("port") or 5432)
+            _tuser = self.task.get("username") or "postgres"
+            for _cand in ("postgres", "kingbase", "template1"):
+                _o, _e, _r = _ssh_exec_pipe(
+                    client, remote_dump._wrap_login(
+                        f"export PGPASSWORD='{_pw_probe}'; "
+                        f"export KINGBASE_PASSWORD='{_pw_probe}'; "
+                        f"{psql} -h 127.0.0.1 -p {_tport} -U {_tuser} "
+                        f"-d {_cand} -tAc 'SELECT 1'"), timeout=30)
+                if _r == 0:
+                    maint_db = _cand
+                    break
+        except Exception:
+            pass
+        dump_bin = (remote_dump.resolve_remote_tool(
+            ssh_host, self._restore_dump_tool, check_user=os_user)
+            or self._restore_dump_tool)
         sftp = client.open_sftp()
-        logs = [f"[PG 物理恢复] 产物: {backup_path}"]
+        logs = [f"[PG 物理恢复] 产物: {backup_path}",
+                f"[PG 物理恢复] 维护库: {maint_db}，导出工具: {dump_bin}"]
         try:
             def _push_and_verify(local_p, remote_p, label):
                 """推送 + 大小/sha 对账（半包会让远端 tar 解包失败伪装成
@@ -567,10 +662,12 @@ echo "PG_VERIFY dbs=$dbs taskdb={{{src_db}}} tables=$tn"
             if tgt_db and tgt_db != src_db:
                 script += f"""
 export PGPASSWORD={shlex.quote(pw_plain)}
-su - {os_user} -c "{self._restore_dump_tool} -h {rdir} -p {port} -U {self.task.get('username') or 'postgres'} {src_db}" > {rdir}/landing.sql 2>{rdir}/landing.err
-psql_src(){{ {psql} -h 127.0.0.1 -p {int(self.task.get('port') or 5432)} -U {self.task.get('username') or 'postgres'} "$@"; }}
-psql_src -d postgres -tAc "DROP DATABASE IF EXISTS {tgt_db}" >/dev/null
-psql_src -d postgres -c "CREATE DATABASE {tgt_db}" >/dev/null || {{ echo LANDING_FAIL_CREATE; exit 43; }}
+export KINGBASE_PASSWORD={shlex.quote(pw_plain)}
+su - {os_user} -c "{dump_bin} -h {rdir} -p {port} -U {self.task.get('username') or 'postgres'} {src_db}" > {rdir}/landing.sql 2>{rdir}/landing.err
+if [ ! -s {rdir}/landing.sql ]; then echo "LANDING_FAIL_DUMP"; tail -4 {rdir}/landing.err; exit 46; fi
+psql_src(){{ export PGPASSWORD={shlex.quote(pw_plain)}; export KINGBASE_PASSWORD={shlex.quote(pw_plain)}; {psql} -h 127.0.0.1 -p {int(self.task.get('port') or 5432)} -U {self.task.get('username') or 'postgres'} "$@"; }}
+psql_src -d {maint_db} -tAc "DROP DATABASE IF EXISTS {tgt_db}" >/dev/null
+psql_src -d {maint_db} -c "CREATE DATABASE {tgt_db}" >/dev/null || {{ echo LANDING_FAIL_CREATE; exit 43; }}
 psql_src -q -d {tgt_db} < {rdir}/landing.sql >/dev/null 2>{rdir}/landing2.err || {{ echo LANDING_FAIL_IMPORT; tail -4 {rdir}/landing2.err; exit 44; }}
 rn=$(psql_src -d {tgt_db} -tAc "SELECT count(*) FROM t1" 2>/dev/null)
 echo "PG_LANDED target={{{tgt_db}}} rows=$rn"
@@ -892,6 +989,7 @@ exit 0
 
         # 4) 按文件后缀选择恢复方式（.dump=-Fc 自定义格式 / .tar=-Ft 归档 /
         #    .sql=-Fp 纯文本；三者与任务「备份文件格式」一一对应）
+        _sanitized_tmp = None
         if backup_path.endswith((".dump", ".tar")):
             # 自定义格式/tar 归档用 pg_restore（目标库已创建，无需 -C；库已全新无需 -c）
             cmd = [
@@ -930,6 +1028,30 @@ exit 0
                 "-d", str(target_db),
                 "-f", backup_path,
             ]
+            # 新版 pg_dump（17.6+/18 安全回补丁）产物头部含 psql 元命令
+            # \restrict/\unrestrict 与 SET transaction_timeout（17+ 服务端
+            # 参数），旧 psql/服务器会整次中断——探测到时剥离为临时副本再
+            # 导入（仅守卫/会话参数行，无数据影响）
+            _sanitized_tmp = None
+            try:
+                import re as _re2
+                with open(backup_path, "rb") as _hf:
+                    _head = _hf.read(65536)
+                if b"\\restrict" in _head or b"transaction_timeout" in _head:
+                    import tempfile as _tf
+                    _fd, _sanitized_tmp = _tf.mkstemp(suffix=".sql")
+                    with open(backup_path, "rb") as _src, \
+                            os.fdopen(_fd, "wb") as _dst:
+                        for _line in _src:
+                            if _re2.match(rb"^[ \t]*\\(un)?restrict[ \t]", _line):
+                                continue
+                            if _re2.match(rb"^[ \t]*SET[ \t]+transaction_timeout[ \t]*=", _line,
+                                          _re2.IGNORECASE):
+                                continue
+                            _dst.write(_line)
+                    cmd[-1] = _sanitized_tmp
+            except Exception:
+                pass
             cmd += self._w_pass_args(pw)
         else:
             return BackupResult(
@@ -948,6 +1070,11 @@ exit 0
         start = time.time()
         ret = self._run(cmd, env_extra=env_extra, timeout=3600)
         duration = time.time() - start
+        if _sanitized_tmp:
+            try:
+                os.unlink(_sanitized_tmp)
+            except Exception:
+                pass
 
         if ret["returncode"] != 0:
             return BackupResult(
@@ -1189,6 +1316,11 @@ exit 0
                 "all_db_mode", "include_system_dbs", "pg_basebackup_extra_args",
                 # 备份文件格式（由引擎内部消费，绝不能当 CLI 参数拼进命令行）
                 "dump_format",
+                # 并行度/传输/路径类内部键（单任务引擎并行、并行拉回、限速时段等）
+                "engine_parallel", "parallel_workers", "parallel_pull",
+                "rate_limit_window", "backup_stage_dir", "db_os_user",
+                "bad_block_check", "bad_block_mode", "hot_copy_tablespaces",
+                "auto_discover_new_dbs", "rman_channels", "rman_temp_dir",
                 # gs_probackup 物理（全量+增量）链路（openGauss/磐维，引擎内部消费）
                 "physical_tool", "probackup_mode", "probackup_dir",
                 "probackup_pgdata", "probackup_instance",
@@ -1198,6 +1330,12 @@ exit 0
             args = []
             for k, v in data.items():
                 if str(k) in reserved:
+                    continue
+                # 只有以 "-" 开头的键才是用户想追加的 CLI 扩展参数；其余都是
+                # 平台内部键（engine_parallel / parallel_pull / rate_limit_window
+                # 等），拼进命令行会变成 pg_dump 的位置参数，直接报
+                # "too many command-line arguments"（本轮并行度参数实测命中）。
+                if not str(k).startswith("-"):
                     continue
                 # 支持 {"key": "value"} 与 {"--flag": None} 形式
                 if v is None or v == "":

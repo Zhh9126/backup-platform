@@ -490,8 +490,24 @@ def api_link_failover_config(link_id):
         cfg[key] = merged
     if isinstance(data.get("dns"), dict):
         cfg["dns"] = {**cfg.get("dns", {}), **data["dns"]}
-    if data.get("replication_user") is not None:
-        cfg["replication_user"] = str(data["replication_user"]).strip()
+    # 复制账号：回切时需要 user + password（CHANGE REPLICATION SOURCE 用）。
+    # 2026-11-13 修复：此前一律 str() 落库，结构化 dict 会被转成
+    # "{'user': ...}" 垃圾字符串，_decrypt_conn 直接 TypeError → 回切必失败。
+    ru = data.get("replication_user")
+    if isinstance(ru, dict):
+        merged_ru = {k: str(ru.get(k) or "").strip()
+                     for k in ("host", "port", "user")}
+        merged_ru.pop("has_password", None)
+        old_ru = cfg.get("replication_user")
+        old_ru = old_ru if isinstance(old_ru, dict) else {}
+        new_pw = str(ru.get("password") or "").strip()
+        if new_pw:
+            merged_ru["password"] = _db.encrypt_secret(new_pw)
+        elif old_ru.get("password"):
+            merged_ru["password"] = old_ru["password"]
+        cfg["replication_user"] = merged_ru
+    elif ru is not None:
+        cfg["replication_user"] = str(ru).strip()
     # 应用级容灾配置：应用探活（SSRF 校验）+ 切换后业务验证（键白名单）
     from core import dr_app_ha, net_guard
     if isinstance(data.get("app_probe"), dict):

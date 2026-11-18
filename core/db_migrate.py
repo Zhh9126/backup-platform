@@ -269,6 +269,9 @@ class DbMigrationEngine:
         phases: Dict[str, Any] = (
             {"migrate": {"manifest": prev_manifest}} if prev_manifest else {})
         started = time.monotonic()
+        # 内存跟踪当前阶段：异常归因不能用 plan 记录里的 current_phase
+        # （那是创建时的旧值，会把 verify 阶段的异常写进 precheck 的结果里）
+        _cur_phase = "precheck"
         try:
             if self._check_cancel(plan_id, phases, "precheck"):
                 return
@@ -286,6 +289,7 @@ class DbMigrationEngine:
             if self._check_cancel(plan_id, phases, "migrate"):
                 return
             if "structure" in types or "full" in types:
+                _cur_phase = "migrate"
                 self._set(plan_id, status=ST_MIGRATING, current_phase="migrate")
                 # 断点续跑：上次执行失败且留有 manifest → 只补失败表
                 prev_manifest = (phases.get("migrate") or {}).get("manifest") or []
@@ -322,6 +326,7 @@ class DbMigrationEngine:
             if self._check_cancel(plan_id, phases, "verify"):
                 return
             if "verify" in types:
+                _cur_phase = "verify"
                 self._set(plan_id, status=ST_VERIFYING, current_phase="verify")
                 ver = self._phase_verify(
                     plan, manifest=(phases.get("migrate") or {}).get("manifest"))
@@ -353,7 +358,7 @@ class DbMigrationEngine:
             self.logger.info("[db_migrate] 计划 %s 完成", plan_id)
         except Exception as exc:
             self.logger.exception("[db_migrate] 计划 %s 执行异常", plan_id)
-            self._fail(plan_id, phases, plan.get("current_phase") or "precheck",
+            self._fail(plan_id, phases, _cur_phase,
                        f"执行异常: {exc}")
         finally:
             clear_cancel(plan_id)

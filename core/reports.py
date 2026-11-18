@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-报告生成器：支持 CSV / Word(docx) / PDF 三种格式。
+报告生成器：支持 CSV / Excel(xlsx) / Word(docx) / PDF 四种格式。
 
-依赖：python-docx（Word）、reportlab（PDF）
+依赖：openpyxl（Excel）、python-docx（Word）、reportlab（PDF）
+可选依赖缺失时抛 ValueError（API 层转 400），不产生 500。
 """
 import io
 import csv
@@ -201,6 +202,72 @@ def build_pdf(title: str, summary: dict, headers: list, rows: list) -> bytes:
     return buf.getvalue()
 
 
+# ----------------- Excel(xlsx) -----------------
+def build_xlsx(title: str, summary: dict, headers: list, rows: list) -> bytes:
+    """生成 xlsx 报告（openpyxl，纯本地离线可用）。
+
+    版式：标题 → 汇总键值对 → 空行 → 表头（teal 底加粗，冻结） → 数据。
+    数值列保留原始类型（Excel 里可排序/求和），文本仍走 _cell_text 清洗。
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        raise ValueError(
+            "Excel 导出依赖 openpyxl 未安装：请在平台环境执行 "
+            "`pip install openpyxl` 后重试（CSV 导出不受影响）")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "报表"
+    ncol = max(len(headers), 2)
+
+    # 标题
+    ws.cell(row=1, column=1, value=title).font = Font(bold=True, size=14)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncol)
+
+    row = 3
+    for k, v in (summary or {}).items():
+        ws.cell(row=row, column=1, value=_cell_text(k, 200)).font = Font(bold=True)
+        c = ws.cell(row=row, column=2, value=v if isinstance(v, (int, float)) else _cell_text(v, 1000))
+        c.alignment = Alignment(vertical="top", wrap_text=False)
+        row += 1
+
+    row += 1
+    head_row = row
+    fill = PatternFill("solid", fgColor="0D9488")
+    for i, h in enumerate(headers, start=1):
+        c = ws.cell(row=head_row, column=i, value=_cell_text(h, 200))
+        c.font = Font(bold=True, color="FFFFFF")
+        c.fill = fill
+        c.alignment = Alignment(horizontal="center", vertical="center")
+
+    for r in rows:
+        row += 1
+        for i, val in enumerate(r, start=1):
+            if isinstance(val, bool) or val is None:
+                ws.cell(row=row, column=i, value=_cell_text(val, 0))
+            elif isinstance(val, (int, float)):
+                ws.cell(row=row, column=i, value=val)
+            else:
+                ws.cell(row=row, column=i, value=_cell_text(val, 30000))
+
+    # 列宽：按表头与样本内容估算（上限 60，避免超长消息列撑爆）
+    for i in range(1, len(headers) + 1):
+        sample = [len(str(headers[i - 1] if i - 1 < len(headers) else ""))]
+        for r in rows[:50]:
+            if i - 1 < len(r):
+                sample.append(len(_cell_text(r[i - 1], 200)))
+        ws.column_dimensions[get_column_letter(i)].width = min(60, max(10, max(sample) + 2))
+
+    ws.freeze_panes = ws.cell(row=head_row + 1, column=1)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 # ----------------- 工厂 -----------------
 def build_report(fmt: str, title: str, summary: dict, headers: list, rows: list) -> tuple:
     """根据 fmt 返回 (mime_type, file_ext, content_bytes)。
@@ -208,8 +275,19 @@ def build_report(fmt: str, title: str, summary: dict, headers: list, rows: list)
     可选依赖缺失时抛 ValueError（API 层转 400 明确提示），不产生 500。
     """
     fmt = (fmt or "csv").lower()
+    if fmt in ("excel", "xls"):
+        fmt = "xlsx"
     if fmt == "csv":
         return ("text/csv; charset=utf-8-sig", "csv", build_csv(title, headers, rows))
+    if fmt == "xlsx":
+        try:
+            content = build_xlsx(title, summary, headers, rows)
+        except ImportError:
+            raise ValueError(
+                "Excel 导出依赖 openpyxl 未安装：请在平台环境执行 "
+                "`pip install openpyxl` 后重试（CSV 导出不受影响）")
+        return ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "xlsx", content)
     if fmt in ("docx", "word"):
         try:
             content = build_docx(title, summary, headers, rows)

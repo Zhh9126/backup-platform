@@ -103,9 +103,26 @@ class DamengEngine(BackupEngine):
         # 保持对象归属重映射语义（与 Oracle REMAP_SCHEMA 对齐）。
         if target_db:
             src = (extra.get("remap_source_schema") or extra.get("schema")
-                   or extra.get("owner"))
-            if src and extra.get("remap_schema"):
-                return ["REMAP_SCHEMA={0}:{1}".format(src, target_db)]
+                   or extra.get("owner")) or ""
+            if not src:
+                # 备份范围常用 extra.schemas 指定（["E2E_DM"] / "A,B"），
+                # 恢复时它也代表 dump 里对象的源归属——必须作为 REMAP 的源。
+                sc = extra.get("schemas")
+                if isinstance(sc, (list, tuple)):
+                    src = sc[0] if sc else ""
+                elif isinstance(sc, str):
+                    src = sc.split(",")[0]
+            if not src:
+                src = (extra.get("db_name")
+                       or (getattr(self, "task", None) or {}).get("db_name") or "")
+            src_u = str(src or "").strip().upper()
+            tgt_u = str(target_db).strip().upper()
+            # 2026-11-13 170 真机实测缺陷：dimp 的 SCHEMAS= 是「从 dump 里
+            # 挑选源模式」的过滤器，不是目标重映射——恢复到异名模式时用
+            # SCHEMAS=<目标> 会把全部对象过滤掉，dimp 仍 rc=0，平台报
+            # "恢复成功"但目标模式空（假成功）。异名必须用 REMAP_SCHEMA。
+            if src_u and src_u != tgt_u:
+                return ["REMAP_SCHEMA={0}:{1}".format(src_u, tgt_u)]
             return ["SCHEMAS={0}".format(target_db)]
 
         schemas = extra.get("schemas")
@@ -179,7 +196,8 @@ class DamengEngine(BackupEngine):
         out_dir = self._output_dir()
         os.makedirs(out_dir, exist_ok=True)
         ts = self._timestamp()
-        script = os.path.join(out_dir, f"dmrman_{ts}.cmd")
+        # dmrman 只认 .sql 后缀的脚本文件（.cmd 会报 -2423 postfix invalid）
+        script = os.path.join(out_dir, f"dmrman_{ts}.sql")
         with open(script, "w") as f:
             f.write(f"BACKUP DATABASE FULL TO {out_dir};\nexit;\n")
         start = time.time()
@@ -277,7 +295,10 @@ class DamengEngine(BackupEngine):
                 online_ok = bool(chk_text.strip())
                 if not online_ok:
                     snippet = online_out[-600:]
-                    if ("归档" in snippet or "-718" in snippet or "-8003" in snippet
+                    if "DMAP" in snippet or "-7170" in snippet:
+                        hint = ("；提示：达梦联机备份依赖 DmAPService（dmap 辅助进程）。"
+                                "请在数据库服务器上启动：su - dmdba -c 'nohup <DM_HOME>/bin/dmap &'。")
+                    elif ("归档" in snippet or "-718" in snippet or "-8003" in snippet
                             or "archive" in snippet.lower()):
                         hint = ("；提示：达梦联机备份要求数据库处于归档模式"
                                 "(ARCH_MODE=Y)。请先开启归档：dm.ini 设 ARCH_INI=1、"
@@ -299,7 +320,7 @@ class DamengEngine(BackupEngine):
                                                              check_user=_dm_os_user)
                 if dmrman_bin:
                     user = _dm_os_user
-                    remote_script = f"/tmp/dmrman_{ts}.cmd"
+                    remote_script = f"/tmp/dmrman_{ts}.sql"
                     with sftp.open(remote_script, "w") as f:
                         f.write(f"BACKUP DATABASE FULL TO '{remote_dir}';\nexit;\n")
                     try:
@@ -690,6 +711,7 @@ class DamengEngine(BackupEngine):
             # 页大小/簇大小必须与源实例一致，否则 RESTORE 报
             # DM[-105] Invalid control file（备份集与目标实例页大小不匹配）
             page_size, extent_size = 8, 16
+            charset, case_sensitive, length_in_char = None, None, None
             try:
                 from core.sync.plugins.dameng import _jdbc_connect as _dmconn
                 _c = _dmconn(self.task.get("host") or "127.0.0.1",
@@ -706,6 +728,23 @@ class DamengEngine(BackupEngine):
                     extent_size = max(int(_cur.fetchone()[0]) // 1024, 16)
                 except Exception:
                     extent_size = 16
+                # 备份集控制文件与骨架实例属性强校验（缺一即 DM[-105]
+                # Invalid control file，171 实测）：字符集/大小写敏感/长度语义
+                # 必须与源实例一致，dminit 骨架必须显式传齐。
+                for _fn, _var in (("SF_GET_UNICODE_FLAG", "charset"),
+                                  ("SF_GET_CASE_SENSITIVE_FLAG", "case_sensitive"),
+                                  ("SF_GET_LENGTH_IN_CHAR", "length_in_char")):
+                    try:
+                        _cur.execute(f"SELECT {_fn}()")
+                        _v = int(_cur.fetchone()[0])
+                        if _var == "charset":
+                            charset = _v
+                        elif _var == "case_sensitive":
+                            case_sensitive = _v
+                        else:
+                            length_in_char = _v
+                    except Exception:
+                        pass
                 _cur.close()
                 _c.close()
                 logs.append(f"[PITR] 源实例页大小={page_size}K 簇大小={extent_size}K")
@@ -715,8 +754,18 @@ class DamengEngine(BackupEngine):
                            " PORT_NUM=" + str(replica_port) +
                            " PAGE_SIZE=" + str(page_size) +
                            " EXTENT_SIZE=" + str(extent_size) +
+                           # 骨架 redo 用最小值：默认 4096M×2 与页大小挂钩，
+                           # 32K 页实例骨架需要 8.5G 磁盘（171 实测 ENOSPC）；
+                           # 副本 redo 由 RESTORE 重建，骨架大小不影响恢复正确性
+                           " LOG_SIZE=256" +
                            " SYSDBA_PWD=" + src_pwd +
                            " SYSAUDITOR_PWD=" + src_pwd)
+            if charset is not None:
+                dminit_args += " CHARSET=" + str(charset)
+            if case_sensitive is not None:
+                dminit_args += " CASE_SENSITIVE=" + str(case_sensitive)
+            # 注意：LENGTH_IN_CHAR 不是 dminit 启动参数（dm.ini 参数），
+            # 传入会 "Invalid parameter:LENGTH_IN_CHAR" 直接 init 失败（171 实测）
             init_shell = f"su - {_dm_os_user} -c " + shlex.quote(dminit_args)
             out, _e, _rc = _ssh_exec_pipe(
                 client, remote_dump._wrap_login(init_shell) + " 2>&1 | tail -3",
@@ -738,22 +787,18 @@ class DamengEngine(BackupEngine):
             logs.append(f"[PITR] 新实例 dm.ini: {new_ini}")
 
             def _dmrman(stmt: str, timeout: int = 3600) -> dict:
-                """写 dmrman 脚本（.txt，官方 CTLFILE 示例后缀；.cmd/.sql 会报
-                -2423 postfix invalid）并执行。
-                两个真机踩坑（137 PROD 实例验证）：
-                - 脚本 owner 必须为数据库 OS 用户，否则 -8291 failed to open ctl file
-                - 脚本内不能写 exit;（dmrman 无此语句，报 -2007 语法错误）"""
-                script_path = f"/home/{_dm_os_user}/dmrman_pitr_{ts}.txt"
-                with sftp.open(script_path, "w") as f:
-                    f.write(stmt + "\n")
-                try:
-                    sftp.chmod(script_path, 0o644)
-                except Exception:
-                    pass
-                # chown 与 dmrman 串在同一条 shell 原子执行（分开两次 exec
-                # 时 chown 竞态不生效，dmrman 会报 -8291）
-                shell = (f"chown {_dm_os_user} {script_path} && "
-                         f"su - {_dm_os_user} -c {shlex.quote(dmrman_bin + ' CTLFILE=' + script_path)}")
+                """执行单条 dmrman 语句，返回 {"ok", "output"}。
+
+                优先 CTLSTMT（语句作为单个参数内联执行，171 实测三条语句
+                RESTORE/RECOVER/UPDATE DB_MAGIC 全部成功）；CTLFILE 脚本方式
+                在本介质上不可靠：.cmd/.sql 报 -2423 postfix invalid，.txt 能
+                执行 RESTORE 但 RECOVER 报 -2007（语句解析差异）。
+                踩坑备忘（137 PROD 验证，CTLFILE 通道）：脚本 owner 必须为
+                数据库 OS 用户，否则 -8291；脚本内不能写 exit;（报 -2007）。"""
+                shell = (f"su - {_dm_os_user} -c " +
+                         shlex.quote('LD_LIBRARY_PATH={dm_bin_dir} {bin} CTLSTMT="{stmt}"'.format(
+                             dm_bin_dir=os.path.dirname(dmrman_bin),
+                             bin=dmrman_bin, stmt=stmt)))
                 o, e, rc = _ssh_exec_pipe(client, remote_dump._wrap_login(shell),
                                           timeout=timeout)
                 text = (o.decode("utf-8", "replace") if isinstance(o, bytes) else o) or ""
@@ -795,10 +840,108 @@ class DamengEngine(BackupEngine):
             r3 = _dmrman(f"RECOVER DATABASE '{new_ini}' UPDATE DB_MAGIC")
             logs.append(f"[PITR] UPDATE DB_MAGIC: {'成功' if r3['ok'] else '失败'}")
 
+            # 5) 自动化收尾：启动副本实例（独立端口，避免与源实例冲突）
+            #    并用 disql 真实登录验证——副本"能启动、能登录"才是恢复交付的
+            #    硬判据（此前只打印"可用 dmserver 启动该副本"让人工收尾）。
+            replica_started, replica_msg = False, ""
+            _vc = None    # 副本启动/验证专用独立连接（分发后不读不关，判定完统一关闭）
+            _sess0 = None
+            try:
+                start_shell = (
+                    f"su - {_dm_os_user} -c " + shlex.quote(
+                        f"cd {os.path.dirname(new_ini)} && "
+                        f"LD_LIBRARY_PATH={os.path.dirname(dmrman_bin)} setsid nohup "
+                        f"{os.path.dirname(dmrman_bin)}/dmserver path={new_ini} -noconsole "
+                        f"> {restore_dir}/dmserver.out 2>&1 &"))
+                # 常驻 daemon 启动的三种姿势取舍（171 三轮实测）：
+                # a) 池化/独立连接上读回：常驻会话永不结束 → agent 通道
+                #    recv_ready 是同步 HTTP 分块读、无限阻塞，循环级超时
+                #    走不到 → 恢复线程卡死、记录永远 running（r4/r6）；
+                # b) 分发后立即关会话：dmserver 尚未 spawn 就被连带杀掉
+                #    （r5，dmserver.out 都没生成）；
+                # c) 正确姿势 = **分发后不读不关**：agent 通道 exec 带
+                #    killpg 硬顶（setsid 的守护不在被杀进程组内，20s 后
+                #    会话自然收尾）；paramiko 通道会话随守护 FD 存续，
+                #    端口轮询判定完成后统一关闭，届时守护已 setsid 存活。
+                _vc = remote_dump._connect_isolated(ssh_host)
+                _sess0 = _vc.get_transport().open_session()
+                _start_cmd = remote_dump._wrap_login(start_shell)
+                try:
+                    _sess0.exec_command(_start_cmd, timeout=20)
+                except TypeError:
+                    _sess0.exec_command(_start_cmd)
+                except Exception:
+                    raise
+                for _i in range(15):
+                    time.sleep(2)
+                    out, _e, _rc = _ssh_exec_pipe(_vc, remote_dump._wrap_login(
+                        f"ss -lnt | grep -q ':{replica_port} ' && echo OK || echo NO"),
+                        timeout=30)
+                    chk = (out.decode("utf-8", "replace")
+                           if isinstance(out, bytes) else out) or ""
+                    if "OK" in chk:
+                        replica_started = True
+                        break
+                if replica_started:
+                    logs.append(f"[PITR] 副本实例已启动（端口 {replica_port}）")
+                    # disql 登录验证（口令含 @ 用双引号包裹，达梦官方语法）
+                    probe_sql = f"/home/{_dm_os_user}/dm_pitr_probe_{ts}.sql"
+                    with sftp.open(probe_sql, "w") as f:
+                        f.write(f"conn SYSDBA/\"{src_pwd}\"@127.0.0.1:{replica_port}\n"
+                                "select 'DM_PITR_REPLICA_OK' as probe;\nexit\n")
+                    try:
+                        sftp.chmod(probe_sql, 0o644)
+                    except Exception:
+                        pass
+                    disql_bin = remote_dump.resolve_remote_tool(
+                        ssh_host, "disql", check_user=_dm_os_user)
+                    if disql_bin:
+                        vshell = (
+                            f"su - {_dm_os_user} -c " + shlex.quote(
+                                f"LD_LIBRARY_PATH={os.path.dirname(disql_bin)} "
+                                f"{disql_bin} /nolog < {probe_sql}"))
+                        vout, _e2, _rc2 = _ssh_exec_pipe(
+                            _vc, remote_dump._wrap_login(vshell), timeout=60)
+                        vtext = (vout.decode("utf-8", "replace")
+                                 if isinstance(vout, bytes) else vout) or ""
+                        replica_msg = ("disql 登录验证通过"
+                                       if "DM_PITR_REPLICA_OK" in vtext
+                                       else "副本已启动但 disql 验证未通过: " + vtext[-200:])
+                        logs.append(f"[PITR] 副本验证: {replica_msg}")
+                    else:
+                        replica_msg = "副本已启动（远端未找到 disql，跳过登录验证）"
+                        logs.append(f"[PITR] {replica_msg}")
+                    try:
+                        _ssh_exec_pipe(_vc, remote_dump._wrap_login(
+                            f"rm -f {probe_sql}"), timeout=30)
+                    except Exception:
+                        pass
+                else:
+                    replica_msg = (f"副本未能在 30 秒内监听端口"
+                                   f"（日志: {restore_dir}/dmserver.out）")
+                    logs.append(f"[PITR] 副本启动失败: {replica_msg}")
+            except Exception as _se:  # noqa: BLE001 - 副本启动失败不否定恢复本身
+                replica_msg = f"副本启动异常: {_se}"
+                logs.append(f"[PITR] {replica_msg}")
+            finally:
+                try:
+                    if _sess0 is not None:
+                        _sess0.close()
+                except Exception:
+                    pass
+                try:
+                    if _vc is not None:
+                        _vc.close()
+                except Exception:
+                    pass
+
             msg = (f"达梦 PITR 恢复完成（{restore_dir}），"
                    f"时点: {target_time or '最新可用'}"
                    f"{'；UPDATE DB_MAGIC ' + ('成功' if r3['ok'] else '失败')}"
-                   f"。如需对外提供，可用 dmserver path={new_ini} 启动该副本")
+                   + (f"；副本实例自动启动于端口 {replica_port}，{replica_msg}"
+                      if replica_started else
+                      f"；副本未自动启动（{replica_msg}），可手动: "
+                      f"dmserver path={new_ini} 启动"))
             self.logger.info("[%s] %s", self.task_name, msg)
             return BackupResult(
                 success=True, status=BackupStatus.SUCCESS, backup_path=backup_path,
@@ -915,7 +1058,9 @@ class DamengEngine(BackupEngine):
         res = self._run(cmd, timeout=3600)
         duration = round(time.time() - start, 3)
 
-        if res["returncode"] != 0:
+        _ok, _rc_note = self._dimp_result_ok(
+            res["returncode"], (res.get("stdout") or "") + (res.get("stderr") or ""))
+        if not _ok:
             return BackupResult(
                 success=False,
                 status=BackupStatus.FAILED,
@@ -940,8 +1085,222 @@ class DamengEngine(BackupEngine):
             stderr=res["stderr"],
             simulated=False,
             checksum=db.sha256_file(backup_path),
-            message="dimp 逻辑恢复成功{0}{1}".format(conn_note, target_note),
+            message="dimp 逻辑恢复成功{0}{1}{2}".format(conn_note, target_note, _rc_note),
         )
+
+    # ---- dimp 返回码语义（170 真机实测）----------------------------------
+    # 达梦 dimp 在「导入成功但存在警告」时返回 **2**（日志末行是
+    # 「成功终止导入, 出现3个警告」+ 每张表都是「数据导入完成」）。
+    # 旧实现把 rc!=0 一律判失败 → 明明恢复成功，页面显示失败（170 实测：
+    # DT_DM_R.DT_T 3 行已导入，却报 "远端 dimp 恢复失败(returncode=2)"）。
+    # 这里按达梦官方语义：既有成功终止标记、又没有真正的失败关键字，才算成功；
+    # 任何真正的错误（无法打开/错误码/导入失败…）仍然如实判失败。
+    _DIMP_FATAL_MARKERS = (
+        "导入失败", "无法打开", "无法继续", "错误码", "用户名或密码错误",
+        "不是一个有效的", "文件不存在", "磁盘空间不足", "表空间不足",
+    )
+
+    @classmethod
+    def _dimp_result_ok(cls, rc: int, text: str) -> tuple:
+        """返回 (是否成功, 附加说明)。只对 dimp/dimp 的 rc=2 警告语义放宽。"""
+        if rc == 0:
+            return True, ""
+        blob = text or ""
+        if any(m in blob for m in cls._DIMP_FATAL_MARKERS):
+            return False, ""
+        # 「成功终止导入」是 dimp 的官方收尾标记（英文版：successfully terminated）
+        if ("成功终止导入" in blob) or ("successfully terminated" in blob.lower()):
+            return True, "（dimp 返回码 {0}，日志为「成功终止导入 + 警告」，按达梦官方返回码语义判定成功）".format(rc)
+        return False, ""
+
+    # ---------------- 恢复校验（深度校验） ----------------
+    def verify_record(self, record: dict, options: dict = None) -> BackupResult:
+        """达梦恢复校验（真实产物深度校验，非文件级占位）：
+
+        - 逻辑备份（.dmp）：SFTP 推回服务端执行 `dimp SHOW=y` —— 真实解析
+          dump 的对象清单（schema/表/行数统计，不落数据零风险），能完整解析
+          即证明可导入；
+        - 物理备份（.tar.gz 备份集）：SFTP 推回服务端解包后执行 dmrman
+          `CHECK BACKUPSET`（离线完整性校验，逐备份片验证可恢复性）；
+        - 其他产物 / 未纳管 SSH：回退基类通用校验（文件存在/非空/sha256）。
+        """
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+
+        base_res = super().verify_record(record, options)
+        if not base_res.success:
+            return base_res
+
+        backup_path = record.get("backup_path") or record.get("output_path") or ""
+        ssh_host = remote_dump.resolve_ssh_host(self.task)
+        if not ssh_host:
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS, verified=True,
+                size_bytes=base_res.size_bytes,
+                message=base_res.message + "（未纳管 SSH 主机，仅完成文件级校验）")
+        if not (backup_path.endswith(".dmp") or backup_path.endswith(".tar.gz")):
+            return base_res
+
+        client = remote_dump._connect(ssh_host)
+        ts = self._timestamp()
+        remote_tmp = "{0}/dm_verify_{1}".format(
+            remote_dump.task_stage_dir(self.task), ts)
+        try:
+            if backup_path.endswith(".dmp"):
+                return self._verify_logical_remote(client, ssh_host, record,
+                                                   backup_path, remote_tmp)
+            return self._verify_physical_remote(client, ssh_host, record,
+                                                backup_path, remote_tmp)
+        finally:
+            try:
+                _ssh_exec_pipe(client, remote_dump._wrap_login(
+                    "rm -rf {0}".format(remote_tmp)), timeout=30)
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def _verify_logical_remote(self, client, ssh_host, record, backup_path,
+                               remote_tmp) -> BackupResult:
+        """逻辑产物深度校验：dimp SHOW=y 真实解析 dump 对象清单（零风险）。"""
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+        import time as _time
+
+        _dm_os_user = self._resolve_check_user(ssh_host)
+        dimp_bin = remote_dump.resolve_remote_tool(ssh_host, "dimp",
+                                                   check_user=_dm_os_user)
+        if not dimp_bin:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message=(f"远端主机未找到 dimp（{_dm_os_user} 用户），"
+                         "无法执行 SHOW=y 深度校验"))
+        ts = self._timestamp()
+        remote_dmp = "{0}/{1}.dmp".format(remote_tmp, ts)
+        try:
+            _ssh_exec_pipe(client, remote_dump._wrap_login(
+                "mkdir -p {0}".format(remote_tmp)), timeout=60)
+            remote_dump.sftp_put_resumable(
+                client, backup_path, remote_dmp,
+                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                label="达梦 dmp 校验推送")
+        except Exception as e:  # noqa: BLE001
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="校验产物推送远端失败: " + str(e)[:200])
+        # SHOW=y 只解析对象清单不落数据（官方「仅显示导入内容」模式，值只能
+        # y/Y/n/N）；密码含特殊字符的 USERID 单引号包裹规则与备份/恢复一致
+        userid = self._connect_userid()
+        cmd = (f"mkdir -p {remote_tmp} && {dimp_bin} "
+               f"{shlex.quote('USERID=' + userid)} FILE={ts}.dmp "
+               f"DIRECTORY={remote_tmp} LOG={ts}.log SHOW=y")
+        start = _time.time()
+        out, err, rc = _ssh_exec_pipe(
+            client, remote_dump._wrap_login(cmd), timeout=1800)
+        duration = round(_time.time() - start, 3)
+        text = (out.decode("utf-8", "replace") if isinstance(out, bytes) else out) or ""
+        errt = (err.decode("utf-8", "replace") if isinstance(err, bytes) else err) or ""
+        blob = text + errt
+        ok, note = self._dimp_result_ok(rc, blob)
+        # 对象清单证据：dimp SHOW=y 逐对象打印（如 "T_DEPLOY_E2E, 3 lines"）
+        objs = re.findall(r"([\w\"'\.]+),\s*(\d+)\s*(?:lines|行)", blob)
+        if not ok:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED, duration_sec=duration,
+                stdout=blob[-1000:],
+                message=("达梦逻辑备份深度校验失败：dimp SHOW=y 解析异常"
+                         f"(rc={rc})，dmp 可能损坏: {blob[-500:]}"))
+        if not objs and not blob.strip():
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED, duration_sec=duration,
+                message="dimp SHOW=y 无解析输出，dmp 内容异常")
+        sample = "、".join(f"{n}({c}行)" for n, c in objs[:5])
+        msg = ("达梦逻辑备份深度校验通过：dimp SHOW=y 解析出 %d 个对象%s%s"
+               % (len(objs), ("（" + sample + "）") if objs else "",
+                  ("；" + note) if note else ""))
+        return BackupResult(success=True, status=BackupStatus.SUCCESS,
+                            verified=True, duration_sec=duration,
+                            stdout=blob[-1000:], message=msg)
+
+    def _verify_physical_remote(self, client, ssh_host, record, backup_path,
+                                remote_tmp) -> BackupResult:
+        """物理产物深度校验：dmrman CHECK BACKUPSET 离线校验备份集完整性。"""
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+        import time as _time
+
+        _dm_os_user = self._resolve_check_user(ssh_host)
+        dmrman_bin = remote_dump.resolve_remote_tool(ssh_host, "dmrman",
+                                                     check_user=_dm_os_user)
+        if not dmrman_bin:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message=(f"远端主机未找到 dmrman（{_dm_os_user} 用户），"
+                         "无法执行 CHECK BACKUPSET 深度校验"))
+        ts = self._timestamp()
+        remote_pkg = "{0}/{1}.tar.gz".format(remote_tmp, ts)
+        unpack_dir = "{0}/unpack".format(remote_tmp)
+        try:
+            _ssh_exec_pipe(client, remote_dump._wrap_login(
+                f"mkdir -p {unpack_dir} && chown {_dm_os_user} {remote_tmp} {unpack_dir}"),
+                timeout=60)
+            remote_dump.sftp_put_resumable(
+                client, backup_path, remote_pkg,
+                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                label="达梦物理备份集校验推送")
+        except Exception as e:  # noqa: BLE001
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="校验产物推送远端失败: " + str(e)[:200])
+        out, _e, rc = _ssh_exec_pipe(client, remote_dump._wrap_login(
+            f"tar xzf {remote_pkg} -C {unpack_dir} && "
+            f"find {unpack_dir} -type f \\( -name '*.meta' -o -name '*.bak' \\) "
+            f"| head -3"), timeout=600)
+        listing = ((out.decode("utf-8", "replace")
+                    if isinstance(out, bytes) else out) or "").strip()
+        if rc != 0 or not listing:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message=f"备份集解包失败或产物内无备份文件(rc={rc})")
+        # 备份集目录 = .meta 所在目录（dmrman CHECK BACKUPSET 入参）
+        meta_line = next((l for l in listing.splitlines()
+                          if l.strip().endswith(".meta")), "")
+        if not meta_line:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message="产物中未找到备份集元数据(.meta)，不是有效的达梦备份集")
+        bset_dir = os.path.dirname(meta_line.strip())
+        # CHECK BACKUPSET 用 CTLSTMT 内联（与 PITR 同款：CTLFILE 在本介质
+        # 报 -2423 postfix invalid；语句内字符串必须单引号）
+        stmt = f"CHECK BACKUPSET '{bset_dir}'"
+        shell = (f"su - {_dm_os_user} -c " +
+                 shlex.quote('LD_LIBRARY_PATH={dm_bin_dir} {bin} CTLSTMT="{stmt}"'.format(
+                     dm_bin_dir=os.path.dirname(dmrman_bin),
+                     bin=dmrman_bin, stmt=stmt)))
+        start = _time.time()
+        out, err, rc = _ssh_exec_pipe(
+            client, remote_dump._wrap_login(shell), timeout=3600)
+        duration = round(_time.time() - start, 3)
+        text = (out.decode("utf-8", "replace") if isinstance(out, bytes) else out) or ""
+        errt = (err.decode("utf-8", "replace") if isinstance(err, bytes) else err) or ""
+        blob = text + errt
+        if "check backupset successfully" in blob.lower():
+            n_files = len([l for l in listing.splitlines() if l.strip()])
+            return BackupResult(
+                success=True, status=BackupStatus.SUCCESS, verified=True,
+                duration_sec=duration, stdout=blob[-1000:],
+                message=(f"达梦物理备份深度校验通过：dmrman CHECK BACKUPSET "
+                         f"校验成功（备份集 {bset_dir}，{n_files} 个备份文件）"))
+        hint = ""
+        if "DMAP" in blob or "-7170" in blob:
+            hint = ("；提示：dmrman 依赖 DmAPService（dmap 辅助进程），"
+                    "请在数据库服务器上启动: "
+                    "su - dmdba -c 'nohup <DM_HOME>/bin/dmap &'")
+        return BackupResult(
+            success=False, status=BackupStatus.FAILED, duration_sec=duration,
+            stdout=blob[-1000:],
+            message=("达梦物理备份深度校验失败：CHECK BACKUPSET 未通过"
+                     f"(rc={rc}): {blob[-500:]}" + hint))
 
     def _restore_logical_remote(self, ssh_host: dict, backup_path: str,
                                 **kwargs) -> BackupResult:
@@ -1057,12 +1416,15 @@ class DamengEngine(BackupEngine):
             pass
         conn_note = "（达梦 dimp 将密码写入 USERID 参数，属官方语法惯例）"
         target_note = " 目标库/模式={0}".format(target_db) if target_db else ""
-        if rc != 0:
+        _ok, _rc_note = self._dimp_result_ok(rc, otext + etext)
+        if not _ok:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED, backup_path=backup_path,
                 duration_sec=duration, stdout=otext, stderr=etext,
                 message="远端 dimp 恢复失败(returncode={0}){1}{2}: {3}".format(
                     rc, conn_note, target_note, (otext + etext)[-500:]))
+        if _rc_note:
+            conn_note = conn_note + _rc_note
         # 表改名：dimp 无 REMAP_TABLE，恢复成功后用远端 disql 执行
         # ALTER TABLE <schema>.<old> RENAME TO <new>（DM8 真机语法已验证）。
         # 失败必须让整次恢复判失败，不能留下「成功但表名没改」的假结果。
@@ -1113,6 +1475,37 @@ class DamengEngine(BackupEngine):
                     success=False, status=BackupStatus.FAILED,
                     backup_path=backup_path, duration_sec=duration,
                     message=f"达梦表改名执行失败: {_re}")
+        # 恢复后校验（2026-11-13 170 真机实测缺陷）：dimp 在「目标模式里没有
+        # 任何对象」时同样 rc=0，平台会报恢复成功但数据根本没落地（假成功）。
+        # 指定目标模式时必须确认该模式里有对象，否则如实判失败。
+        if target_db:
+            try:
+                import dmPython
+                _pw3 = db.decrypt_secret(self.task.get("password") or "")
+                _c3 = dmPython.connect(user="SYSDBA", password=_pw3,
+                                       server=self.task.get("host"),
+                                       port=int(self.task.get("port") or 5236),
+                                       login_timeout=5)
+                _cur3 = _c3.cursor()
+                _cur3.execute("SELECT COUNT(*) FROM DBA_OBJECTS WHERE OWNER='%s'"
+                              % str(target_db).upper().replace("'", "''"))
+                _row3 = _cur3.fetchone() or [0]
+                _n_obj = int(_row3[0] or 0)
+                _cur3.close()
+                _c3.close()
+                if _n_obj <= 0:
+                    return BackupResult(
+                        success=False, status=BackupStatus.FAILED,
+                        backup_path=backup_path, duration_sec=duration,
+                        stdout=otext, stderr=etext,
+                        message=("达梦恢复未落地：目标模式 {0} 内无任何对象"
+                                 "（dimp rc=0 但未导入任何数据）——请核对备份范围"
+                                 "（SCHEMAS/OWNER）与恢复模式映射").format(target_db))
+                self.logger.info("[%s] 达梦恢复校验: 目标模式 %s 对象数=%d",
+                                 self.task_name, target_db, _n_obj)
+            except Exception as _ve:
+                self.logger.warning("[%s] 达梦恢复后对象校验跳过: %s",
+                                    self.task_name, str(_ve)[:150])
         return BackupResult(
             success=True, status=BackupStatus.SUCCESS, backup_path=backup_path,
             duration_sec=duration, stdout=otext, stderr=etext,

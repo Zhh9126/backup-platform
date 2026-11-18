@@ -1,0 +1,353 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-card mb-3">
+  <div class="d-flex align-items-center mb-1">
+    <h5 class="mb-0"><i class="bi bi-lightning-charge me-2"></i>一键容灾切换</h5>
+    <span class="badge bg-secondary ms-2" id="swState">待预检</span>
+    <div class="ms-auto d-flex gap-2">
+      <a class="btn btn-sm btn-outline-secondary" href="/dr">容灾总览</a>
+      <a class="btn btn-sm btn-outline-secondary" href="/dr-link">容灾链路</a>
+    </div>
+  </div>
+  <div class="text-muted small mb-3">
+    流程：<b>预检</b>（主备可达 / 复制状态 / 延迟 / DNS）→ <b>Fencing 冻结旧主</b> →
+    <b>提升备库</b> → <b>DNS 牵引</b> → <b>新主验证</b>，全过程记录 RTO 与逐步耗时。
+  </div>
+
+  <div class="row g-3">
+    <div class="col-md-4">
+      <label class="form-label">容灾链路 *</label>
+      <select class="form-select" id="swLink"></select>
+      <div class="form-text" id="swLinkHint">选择要切换的链路</div>
+    </div>
+    <div class="col-md-2">
+      <label class="form-label">操作</label>
+      <select class="form-select" id="swDir">
+        <option value="failover">切换（主→备）</option>
+        <option value="failback">回切（备→主）</option>
+      </select>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label">执行方式</label>
+      <select class="form-select" id="swMode">
+        <option value="execute">真实执行</option>
+        <option value="dry_run">仅预检（不切换）</option>
+      </select>
+    </div>
+    <div class="col-md-3">
+      <label class="form-label">切换范围</label>
+      <select class="form-select" id="swScope">
+        <option value="full">业务切换 + DNS 牵引（完整）</option>
+        <option value="business">仅业务切换（主备互换，不动 DNS）</option>
+        <option value="dns_only">仅 DNS 牵引（业务切换已完成时）</option>
+      </select>
+      <div class="form-text">业务一键切换依赖 DNS 牵引流量；两步可拆分执行。</div>
+    </div>
+    <div class="col-md-3 d-flex align-items-end gap-2">
+      <button class="btn btn-outline-primary w-100" id="swPreBtn"><i class="bi bi-search me-1"></i>预检</button>
+      <button class="btn btn-danger w-100" id="swRunBtn" disabled><i class="bi bi-lightning-fill me-1"></i>执行切换</button>
+    </div>
+  </div>
+
+  <!-- 承载现状：切换前哪个环境承载业务 / 切换后由谁承载 -->
+  <div class="row g-2 mt-2" id="swBearerCard">
+    <div class="col-12">
+      <div class="border rounded p-2 d-flex align-items-center flex-wrap gap-3 small">
+        <span class="fw-bold text-muted"><i class="bi bi-arrow-left-right me-1"></i>承载现状</span>
+        <span id="swBearerBefore">—</span>
+        <i class="bi bi-arrow-right text-primary"></i>
+        <span id="swBearerAfter" class="text-muted">选择链路后自动计算</span>
+        <span class="ms-auto text-muted" id="swDnsCfg">DNS 配置：—</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="form-check mt-3">
+    <input class="form-check-input" type="checkbox" id="swForce">
+    <label class="form-check-label small" for="swForce">
+      强制切换（主库仍可达 / 假死时使用；会先 Fencing 冻结旧主写入）
+    </label>
+  </div>
+  <div class="form-check">
+    <input class="form-check-input" type="checkbox" id="swConfirm">
+    <label class="form-check-label small" for="swConfirm">
+      我已知晓本次操作会造成业务连接中断，并已获授权执行
+    </label>
+  </div>
+</div>
+
+<div class="page-card mb-3 d-none" id="swPreCard">
+  <h6 class="text-muted mb-2"><i class="bi bi-clipboard2-pulse me-1"></i>预检结果</h6>
+  <div id="swPreBody"></div>
+</div>
+
+<div class="page-card mb-3 d-none" id="swRunCard">
+  <div class="d-flex align-items-center mb-2">
+    <h6 class="text-muted mb-0"><i class="bi bi-activity me-1"></i>执行进度</h6>
+    <span class="badge bg-secondary ms-2" id="swRunStatus">—</span>
+    <span class="ms-auto small text-muted" id="swRunRto">—</span>
+  </div>
+  <ol class="list-group list-group-numbered small" id="swSteps"></ol>
+  <div class="alert alert-light border py-2 px-3 small mt-2 mb-0 d-none" id="swManual">
+    <b>切换后人工跟进清单：</b><ul class="mb-0" id="swManualList"></ul>
+  </div>
+</div>
+
+<div class="page-card">
+  <h6 class="text-muted mb-2"><i class="bi bi-clock-history me-1"></i>切换历史</h6>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead class="table-light"><tr>
+        <th style="width:60px">#</th><th>链路</th><th>方向</th><th>模式</th><th>范围</th><th>状态</th>
+        <th>RTO</th><th>操作人</th><th>开始时间</th><th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="swHistory"><tr><td colspan="9" class="text-center text-muted py-3">加载中…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var links = [], runs = [], currentRun = null, timer = null;
+  var q = new URLSearchParams(location.search);
+
+  function el(id) { return document.getElementById(id); }
+  function statusPill(s) {
+    var m = { success: ["badge-ok", "成功"], failed: ["badge-fail", "失败"],
+              running: ["badge-run", "执行中"], blocked: ["badge-warn", "被预检拦截"] };
+    var x = m[s] || ["bg-secondary", s || "-"];
+    return '<span class="badge ' + x[0] + '">' + x[1] + '</span>';
+  }
+
+  function loadLinks() {
+    return BKP.api("GET", "/api/dr/links").then(function (d) {
+      links = d.links || [];
+      var sel = el("swLink");
+      if (!links.length) {
+        sel.innerHTML = '<option value="">（尚未创建容灾链路）</option>';
+        return;
+      }
+      sel.innerHTML = links.map(function (l) {
+        var warn = l.has_failover_config ? "" : "（未配置切换参数）";
+        return '<option value="' + l.id + '">' + BKP.esc(l.name) + warn + '</option>';
+      }).join("");
+      var want = q.get("link_id");
+      if (want) sel.value = want;
+      onLinkChange();
+    });
+  }
+
+  function onLinkChange() {
+    var l = links.filter(function (x) { return String(x.id) === el("swLink").value; })[0];
+    el("swLinkHint").textContent = l
+      ? ("主 " + (l.primary_site || "-") + " → 备 " + (l.dr_site || "-") +
+         (l.has_failover_config ? "" : " · 该链路未配置 failover-config，无法切换"))
+      : "选择要切换的链路";
+    el("swPreBtn").disabled = !l;
+    el("swRunBtn").disabled = true;
+    el("swPreCard").classList.add("d-none");
+    el("swRunCard").classList.add("d-none");
+    el("swState").textContent = "待预检";
+    el("swState").className = "badge bg-secondary";
+    if (l) loadContext(l.id);
+    else {
+      el("swBearerBefore").textContent = "—";
+      el("swBearerAfter").textContent = "选择链路后自动计算";
+      el("swDnsCfg").textContent = "DNS 配置：—";
+    }
+  }
+
+  // 承载现状 + DNS 配置摘要（不含密码）
+  function loadContext(lid) {
+    BKP.api("GET", "/api/dr/switch-context/" + lid).then(function (c) {
+      var city = function (r) { return (r && r.city) || ""; };
+      var a = c.active_site;
+      var before = a === "standby"
+        ? "容灾环境「" + (city(c.dr_region) || c.dr_site || "-") + "」承载业务"
+        : (a === "primary" ? "生产环境「" + (city(c.primary_region) || c.primary_site || "-") + "」承载业务"
+                           : "当前承载未知（主库不可达且无 DNS 判据）");
+      var d = c.direction;
+      // 切换后承载：failover→容灾承载 / failback→生产承载
+      var after = el("swDir").value === "failover"
+        ? "切换后由容灾环境「" + (city(c.dr_region) || c.dr_site || "-") + "」承载业务"
+        : "切回后由生产环境「" + (city(c.primary_region) || c.primary_site || "-") + "」承载业务";
+      var cls = a === "standby" ? "badge-warn" : (a === "primary" ? "badge-ok" : "bg-secondary");
+      el("swBearerBefore").innerHTML = '<span class="badge ' + cls + '">' +
+        (a === "standby" ? "容灾承载" : (a === "primary" ? "生产承载" : "承载未知")) +
+        '</span> ' + before;
+      el("swBearerAfter").textContent = after;
+      var dns = c.dns;
+      el("swDnsCfg").textContent = dns
+        ? ("DNS 配置：" + dns.domain + "（" + dns.provider +
+           (dns.container ? " · 容器 " + dns.container : "") +
+           (dns.conf_path ? " · " + dns.conf_path : "") + "）")
+        : "DNS 配置：未配置（完整切换将只做业务主备切换）";
+    }).catch(function () {
+      el("swBearerBefore").textContent = "承载探测失败";
+    });
+  }
+
+  function renderPre(r) {
+    el("swPreCard").classList.remove("d-none");
+    var ok = r.ready;
+    var html = '<div class="alert alert-' + (ok ? "success" : "warning") + ' py-2 small mb-2">' +
+      (ok ? "✓ 预检通过，可以执行切换" : "✗ 预检存在阻塞项，需处理后或勾选强制切换") + '</div>';
+    if ((r.risks || []).length) {
+      html += '<div class="small text-danger mb-1"><b>阻塞项</b></div><ul class="small mb-2">' +
+        r.risks.map(function (x) { return "<li>" + BKP.esc(x) + "</li>"; }).join("") + '</ul>';
+    }
+    if ((r.warnings || []).length) {
+      html += '<div class="small text-warning-emphasis mb-1"><b>提示</b></div><ul class="small mb-2">' +
+        r.warnings.map(function (x) { return "<li>" + BKP.esc(x) + "</li>"; }).join("") + '</ul>';
+    }
+    var s = r.snapshot || {}, p = s.primary || {}, st = s.standby || {}, d = s.dns || {};
+    html += '<div class="row g-2 small">' +
+      '<div class="col-md-4">主库：<b>' + BKP.esc((p.host || "-") + ":" + (p.port || "")) + '</b> ' +
+        (p.reachable ? '<span class="badge badge-ok">可达</span>' : '<span class="badge badge-fail">不可达</span>') + '</div>' +
+      '<div class="col-md-4">备库：<b>' + BKP.esc((st.host || "-") + ":" + (st.port || "")) + '</b> ' +
+        (st.reachable ? '<span class="badge badge-ok">可达</span>' : '<span class="badge badge-fail">不可达</span>') +
+        ' · IO=' + BKP.esc(String(st.io || "-")) + ' SQL=' + BKP.esc(String(st.sql || "-")) +
+        ' 延迟=' + BKP.esc(String(st.behind == null ? "-" : st.behind + "s")) + '</div>' +
+      '<div class="col-md-4">DNS：' + (d.domain ? BKP.esc(d.domain) + " → " + BKP.esc(d.resolved_ip || "-") +
+        (d.in_sync ? ' <span class="badge badge-ok">一致</span>' : ' <span class="badge badge-fail">不一致</span>')
+        : '<span class="text-muted">未配置</span>') + '</div></div>';
+    el("swPreBody").innerHTML = html;
+    el("swRunBtn").disabled = false;
+    el("swState").textContent = ok ? "预检通过" : "预检有阻塞";
+    el("swState").className = "badge " + (ok ? "badge-ok" : "badge-warn");
+  }
+
+  function precheck() {
+    var lid = el("swLink").value;
+    if (!lid) return;
+    el("swPreBtn").disabled = true;
+    BKP.api("POST", "/api/disaster-links/" + lid + "/switch/precheck",
+      { direction: el("swDir").value, force: el("swForce").checked,
+        scope: el("swScope").value })
+      .then(renderPre)
+      .catch(function (e) { BKP.toast("预检失败: " + e.message, "danger"); })
+      .finally(function () { el("swPreBtn").disabled = false; });
+  }
+
+  function renderRun(run) {
+    currentRun = run;
+    el("swRunCard").classList.remove("d-none");
+    el("swRunStatus").textContent = run.status;
+    el("swRunStatus").className = "badge " + (run.status === "success" ? "badge-ok"
+      : run.status === "failed" ? "badge-fail" : "badge-run");
+    el("swRunRto").textContent = run.rto_sec ? ("RTO " + Number(run.rto_sec).toFixed(1) + "s") : (run.phase || "");
+    var steps = run.steps || [];
+    el("swSteps").innerHTML = steps.length ? steps.map(function (s) {
+      var ic = s.ok ? '<span class="text-success">✔</span>' : '<span class="text-danger">✘</span>';
+      var det = s.detail && s.detail.error ? (" — " + BKP.esc(s.detail.error))
+        : (s.detail && Object.keys(s.detail).length ? (" — " + BKP.esc(JSON.stringify(s.detail).slice(0, 160))) : "");
+      return '<li class="list-group-item py-1">' + ic + " " + BKP.esc(s.name) +
+        ' <span class="text-muted">(' + (s.ms || 0) + 'ms)</span>' + det + '</li>';
+    }).join("") : '<li class="list-group-item py-1 text-muted">等待执行…</li>';
+    if (run.message) {
+      el("swManual").classList.remove("d-none");
+      el("swManualList").innerHTML = '<li>' + BKP.esc(run.message) + '</li>' +
+        ((run.precheck && run.precheck.warnings) || []).map(function (w) {
+          return "<li>" + BKP.esc(w) + "</li>";
+        }).join("");
+    }
+    if (run.status === "success" || run.status === "failed" || run.status === "blocked") {
+      if (timer) { clearInterval(timer); timer = null; }
+      el("swState").textContent = run.status === "success" ? "切换完成" : "切换未完成";
+      el("swState").className = "badge " + (run.status === "success" ? "badge-ok" : "badge-fail");
+      loadHistory();
+    }
+  }
+
+  function poll(runId) {
+    if (timer) clearInterval(timer);
+    timer = setInterval(function () {
+      BKP.api("GET", "/api/dr/switch-runs/" + runId).then(renderRun)
+        .catch(function () { /* 轮询失败忽略，下次再试 */ });
+    }, 1200);
+  }
+
+  function execute() {
+    if (!el("swConfirm").checked) {
+      BKP.toast("请先勾选二次确认", "warning");
+      return;
+    }
+    var lid = el("swLink").value;
+    var body = {
+      direction: el("swDir").value, mode: el("swMode").value,
+      scope: el("swScope").value,
+      force: el("swForce").checked, confirm: true,
+    };
+    el("swRunBtn").disabled = true;
+    BKP.api("POST", "/api/disaster-links/" + lid + "/switch", body).then(function (r) {
+      if (r.status === "blocked") {
+        BKP.toast(r.message || "预检未通过", "warning", 6000);
+        if (r.precheck) renderPre(r.precheck);
+        el("swRunBtn").disabled = false;
+        return;
+      }
+      BKP.toast(body.mode === "dry_run" ? "预检完成（未执行切换）" : "切换作业已启动", "success");
+      renderRun({ id: r.run_id, status: "running", steps: [], phase: "启动中", precheck: r.precheck });
+      poll(r.run_id);
+    }).catch(function (e) {
+      BKP.toast("发起失败: " + e.message, "danger");
+      el("swRunBtn").disabled = false;
+    });
+  }
+
+  function loadHistory() {
+    BKP.api("GET", "/api/dr/switch-runs?limit=30").then(function (d) {
+      var rows = d.items || [];
+      var tb = el("swHistory");
+      if (!rows.length) {
+        tb.innerHTML = '<tr><td colspan="10" class="text-center text-muted py-3">暂无切换作业</td></tr>';
+        return;
+      }
+      var scopeName = { full: "业务+DNS", business: "仅业务", dns_only: "仅DNS" };
+      tb.innerHTML = rows.map(function (r) {
+        return '<tr><td>' + r.id + '</td><td class="small">' + BKP.esc(r.link_name || "") + '</td>' +
+          '<td class="small">' + (r.direction === "failback" ? "回切" : "切换") + '</td>' +
+          '<td class="small">' + (r.mode === "dry_run" ? "仅预检" : "执行") + '</td>' +
+          '<td class="small">' + (scopeName[r.scope] || "业务+DNS") + '</td>' +
+          '<td>' + statusPill(r.status) + '</td>' +
+          '<td>' + (r.rto_sec ? Number(r.rto_sec).toFixed(1) + "s" : "—") + '</td>' +
+          '<td class="small">' + BKP.esc(r.operator || "-") + '</td>' +
+          '<td class="small">' + BKP.esc((r.started_at || "").slice(0, 19).replace("T", " ")) + '</td>' +
+          '<td class="text-end"><button class="btn btn-sm btn-outline-secondary" data-run="' + r.id + '">明细</button></td></tr>';
+      }).join("");
+    });
+  }
+
+  el("swLink").addEventListener("change", onLinkChange);
+  el("swDir").addEventListener("change", function () {
+    var lid = el("swLink").value;
+    if (lid) loadContext(lid);
+  });
+  el("swScope").addEventListener("change", function () {
+    var s = el("swScope").value;
+    var note = { full: "", business: "（不动 DNS：切换后应用需改连新主地址，或随后执行「仅 DNS 牵引」）",
+                 dns_only: "（不碰数据库：只改 DNS 解析，用于业务切换已完成后的流量牵引）" }[s] || "";
+    el("swScope").title = note;
+  });
+  el("swPreBtn").addEventListener("click", precheck);
+  el("swRunBtn").addEventListener("click", execute);
+  el("swHistory").addEventListener("click", function (e) {
+    var b = e.target.closest("button[data-run]");
+    if (!b) return;
+    BKP.api("GET", "/api/dr/switch-runs/" + b.dataset.run).then(renderRun)
+      .catch(function (er) { BKP.toast("加载明细失败: " + er.message, "danger"); });
+  });
+
+  loadLinks().then(loadHistory).catch(function (e) {
+    BKP.toast("加载链路失败: " + e.message, "danger");
+  });
+  var wantRun = q.get("run_id");
+  if (wantRun) {
+    BKP.api("GET", "/api/dr/switch-runs/" + wantRun).then(renderRun)
+      .catch(function () { });
+  }
+})();
+</script>
+{% endblock %}

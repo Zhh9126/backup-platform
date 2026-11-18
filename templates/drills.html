@@ -110,14 +110,20 @@
           <label class="form-label">演练名称 *</label>
           <input class="form-control" id="drill_name" placeholder="如 Q3 恢复演练">
         </div>
-        <div class="mb-3">
+        <div class="mb-3" id="drillTaskRow">
           <label class="form-label">关联备份任务</label>
           <select class="form-select" id="drill_task_id"></select>
+        </div>
+        <div class="mb-3" id="drillLinkRow" style="display:none;">
+          <label class="form-label">容灾链路 *</label>
+          <select class="form-select" id="drill_link_id"></select>
+          <div class="form-text">切换演练要求链路已配置主备连接与复制账号（当前支持 MySQL/MariaDB）；演练将真实执行「冻结旧主 → 备库追平 → 换主 → DNS 牵引 → 写入探针 → 自动回切 → 恢复原拓扑」，全程 RTO 计时与评分。</div>
         </div>
         <div class="mb-3">
           <label class="form-label">演练类型</label>
           <select class="form-select" id="drill_type">
             <option value="real_restore">真实恢复演练（真恢复到临时库+数据校验+自动销毁）</option>
+            <option value="switch">容灾切换演练（真切换 + 写入探针 + 自动回切）</option>
             <option value="full_recovery">全量恢复演练（元数据检查）</option>
             <option value="partial">对象级恢复演练</option>
             <option value="table_recovery">单表恢复演练</option>

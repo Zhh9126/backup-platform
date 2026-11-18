@@ -1,0 +1,166 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-card mb-3">
+  <div class="d-flex align-items-center mb-2">
+    <h5 class="mb-0"><i class="bi bi-hdd-stack me-2"></i>存储介质总览</h5>
+    <span class="badge bg-secondary ms-2" id="smGenAt">—</span>
+    <div class="ms-auto d-flex gap-2">
+      <button class="btn btn-sm btn-outline-secondary" id="smRefresh"><i class="bi bi-arrow-clockwise me-1"></i>刷新</button>
+      <a class="btn btn-sm btn-outline-primary" href="/storage">存储池配置</a>
+    </div>
+  </div>
+  <div class="row g-3">
+    <div class="col"><div class="card p-3"><div class="text-muted small">介质总数</div><div class="fs-4" id="smTotal">—</div></div></div>
+    <div class="col"><div class="card p-3"><div class="text-muted small">健康</div><div class="fs-4 text-success" id="smOk">—</div></div></div>
+    <div class="col"><div class="card p-3"><div class="text-muted small">异常</div><div class="fs-4 text-danger" id="smErr">—</div></div></div>
+    <div class="col"><div class="card p-3"><div class="text-muted small">未测试</div><div class="fs-4 text-warning" id="smUntested">—</div></div></div>
+    <div class="col"><div class="card p-3"><div class="text-muted small">已采集用量</div><div class="fs-4" id="smUsed">—</div></div></div>
+  </div>
+</div>
+
+<div class="page-card">
+  <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+    <select class="form-select form-select-sm" id="smCategory" style="max-width:160px">
+      <option value="">全部分类</option>
+      <option value="存储池">存储池</option>
+      <option value="磁带库">磁带库</option>
+    </select>
+    <select class="form-select form-select-sm" id="smStatus" style="max-width:160px">
+      <option value="">全部状态</option>
+      <option value="ok">健康</option>
+      <option value="error">异常</option>
+      <option value="untested">未测试</option>
+      <option value="disabled">已禁用</option>
+    </select>
+    <input class="form-control form-control-sm" id="smSearch" placeholder="搜索名称 / 类型 / 地址" style="max-width:280px">
+    <span class="text-muted small ms-auto" id="smCount">—</span>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead class="table-light"><tr>
+        <th>介质</th><th>分类</th><th>地址 / 桶</th><th>状态</th>
+        <th style="min-width:180px">用量</th><th>最近备份</th><th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="smTable">
+        <tr><td colspan="7" class="text-center text-muted py-3">加载中…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var rows = [];
+  function el(id) { return document.getElementById(id); }
+  function human(n) {
+    if (n === null || n === undefined) return "—";
+    n = Number(n);
+    if (!isFinite(n)) return "—";
+    var u = ["B", "KB", "MB", "GB", "TB", "PB"], i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return (i === 0 ? n : n.toFixed(1)) + " " + u[i];
+  }
+  function pill(st, text) {
+    var m = { ok: "badge-ok", error: "badge-fail", untested: "badge-warn", disabled: "bg-secondary" };
+    return '<span class="badge ' + (m[st] || "bg-secondary") + '">' + BKP.esc(text || st) + '</span>';
+  }
+  function usageCell(r) {
+    if (r.used_bytes === null || r.used_bytes === undefined) {
+      return '<span class="text-muted small">' + BKP.esc(r.usage_note || "未采集") + '</span>';
+    }
+    var pct = r.used_pct;
+    var bar = "";
+    if (pct !== null && pct !== undefined) {
+      var cls = pct >= 90 ? "bg-danger" : (pct >= 75 ? "bg-warning" : "bg-success");
+      bar = '<div class="progress" style="height:6px"><div class="progress-bar ' + cls +
+            '" style="width:' + Math.min(100, pct) + '%"></div></div>';
+    }
+    var cap = (r.capacity_bytes ? (" / " + human(r.capacity_bytes)) : "");
+    return '<div class="small">' + human(r.used_bytes) + cap +
+           (pct !== null && pct !== undefined ? "（" + pct + "%）" : "") + '</div>' + bar +
+           '<div class="text-muted" style="font-size:.75rem">' + BKP.esc(r.usage_note || "") + '</div>';
+  }
+  function recentCell(r) {
+    var b = r.recent_backup;
+    if (!b || !b.at) return '<span class="text-muted small">无记录</span>';
+    return '<div class="small">' + BKP.esc((b.at || "").slice(0, 19).replace("T", " ")) + '</div>' +
+           '<div class="text-muted" style="font-size:.75rem">' + BKP.esc(b.task_name || "") +
+           ' · ' + human(b.size_bytes) + '</div>';
+  }
+  function render() {
+    var cat = el("smCategory").value, st = el("smStatus").value;
+    var kw = (el("smSearch").value || "").trim().toLowerCase();
+    var list = rows.filter(function (r) {
+      if (cat && r.category !== cat) return false;
+      if (st && r.status !== st) return false;
+      if (kw) {
+        var s = ((r.name || "") + (r.type_label || "") + (r.endpoint || "") + (r.bucket || "")).toLowerCase();
+        if (s.indexOf(kw) < 0) return false;
+      }
+      return true;
+    });
+    el("smCount").textContent = "显示 " + list.length + " / " + rows.length + " 个介质";
+    var tb = el("smTable");
+    if (!list.length) {
+      tb.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-3">' +
+        (rows.length ? "没有符合筛选条件的介质" : "尚未配置存储介质，请前往「存储池配置」新建") + '</td></tr>';
+      return;
+    }
+    tb.innerHTML = list.map(function (r) {
+      var addr = r.endpoint || "-";
+      if (r.bucket) addr += (addr === "-" ? "" : " · ") + "桶:" + r.bucket;
+      var ops = '<a class="btn btn-sm btn-outline-secondary me-1" href="' + r.detail_url + '">配置</a>';
+      if (r.probe) {
+        ops += '<button class="btn btn-sm btn-outline-primary" data-probe="' + r.target_id + '">探测</button>';
+      }
+      return '<tr>' +
+        '<td><strong>' + BKP.esc(r.name) + '</strong>' +
+          (r.is_default ? ' <span class="badge bg-primary">默认</span>' : "") +
+          '<div class="text-muted small">Tier ' + (r.tier || "-") + '</div></td>' +
+        '<td class="small">' + BKP.esc(r.category) + '<div class="text-muted">' + BKP.esc(r.type_label) + '</div></td>' +
+        '<td class="small text-break">' + BKP.esc(addr) + '</td>' +
+        '<td>' + pill(r.status, r.status_text) + '</td>' +
+        '<td>' + usageCell(r) + '</td>' +
+        '<td>' + recentCell(r) + '</td>' +
+        '<td class="text-end">' + ops + '</td>' +
+        '</tr>';
+    }).join("");
+  }
+  function load() {
+    BKP.api("GET", "/api/storage/media").then(function (d) {
+      rows = d.rows || [];
+      var s = d.summary || {};
+      el("smTotal").textContent = s.total || 0;
+      el("smOk").textContent = s.ok || 0;
+      el("smErr").textContent = s.error || 0;
+      el("smUntested").textContent = s.untested || 0;
+      el("smUsed").textContent = human(s.total_used_bytes || 0) +
+        (s.total_capacity_bytes ? (" / " + human(s.total_capacity_bytes)) : "");
+      el("smGenAt").textContent = (d.generated_at || "").slice(0, 19).replace("T", " ");
+      render();
+    }).catch(function (e) {
+      BKP.toast("加载介质总览失败: " + e.message, "danger");
+    });
+  }
+  el("smRefresh").addEventListener("click", load);
+  ["smCategory", "smStatus"].forEach(function (id) { el(id).addEventListener("change", render); });
+  el("smSearch").addEventListener("input", render);
+  el("smTable").addEventListener("click", function (e) {
+    var b = e.target.closest("button[data-probe]");
+    if (!b) return;
+    b.disabled = true;
+    b.innerHTML = '<span class="spinner-border spinner-border-sm"></span>';
+    BKP.api("POST", "/api/storage/media/" + b.dataset.probe + "/probe").then(function (r) {
+      BKP.toast((r.ok ? "探测成功：" : "探测失败：") + (r.message || ""), r.ok ? "success" : "danger", 5000);
+      load();
+    }).catch(function (err) {
+      BKP.toast("探测失败: " + err.message, "danger");
+      b.disabled = false; b.textContent = "探测";
+    });
+  });
+  load();
+})();
+</script>
+{% endblock %}

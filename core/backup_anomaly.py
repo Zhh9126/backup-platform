@@ -137,6 +137,34 @@ def check_record(record: dict) -> dict:
                                   "本地安全检测跳过（完整性可走 sha256 基线复检）"})
         return {"level": "unknown", "checks": checks}
 
+    # ---- 0) 确定性核对：产物 sha256 vs 备份登记值（不是启发式，是铁证）----
+    # 启发式（体积/熵/结构）对小产物和未知二进制力不从心：2026-11-14 实测
+    # 1.2KB 的 .sql.zst 被随机数据整体覆写后，体积基线不足（<1MB 不判）、
+    # 熵检跳过（<4KB 不判）、结构嗅探对未知二进制不硬判 → 汇总成 clean，
+    # 篡改完全看不见。而备份记录里本来就存了 sha256，比对一次即可确定性
+    # 发现"文件被换/被改"——这是防勒索链路上唯一不依赖样本特征的判据。
+    _digest = str(record.get("checksum") or "").strip().lower()
+    if _digest:
+        try:
+            from core import db as _db
+            _actual = _db.sha256_file(path)
+        except Exception as _e:  # noqa: BLE001
+            _actual = ""
+            checks.append({"item": "integrity", "level": "unknown",
+                           "message": f"校验和计算失败，跳过确定性核对（{_e}）"})
+        if _actual:
+            if _actual.lower() == _digest:
+                checks.append({"item": "integrity", "level": "clean",
+                               "message": f"产物 sha256 与备份登记值一致（{_actual[:16]}…）"})
+            else:
+                checks.append({"item": "integrity", "level": "suspect",
+                               "message": f"产物 sha256 与备份登记值不符"
+                                          f"（登记 {_digest[:16]}… / 实际 {_actual[:16]}…）"
+                                          "——文件被篡改或损坏（确定性证据，非启发式推测）"})
+    else:
+        checks.append({"item": "integrity", "level": "unknown",
+                       "message": "该记录未登记 sha256，无法做确定性核对"})
+
     size = os.path.getsize(path)
     low = path.lower()
 

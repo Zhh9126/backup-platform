@@ -1,0 +1,28 @@
+{
+  "id": "kingbase-sysbackup",
+  "name": "金仓 sys_basebackup（物理备份）",
+  "version": "V9",
+  "category": "kingbase",
+  "description": "金仓物理基础备份工具（sys_basebackup/sys_ctl），支持 PITR。",
+  "required_clients": [
+    "sys_basebackup"
+  ],
+  "supports": [
+    "kingbase"
+  ],
+  "tags": [
+    "金仓",
+    "物理备份",
+    "PITR"
+  ],
+  "icon": "bi-database-fill-gear",
+  "packages": {
+    "linux": {
+      "package_managers": {}
+    }
+  },
+  "verify_after_install": [
+    "sys_basebackup --version"
+  ],
+  "fallback_note": "随金仓服务端安装，未检测到时走 sys_dump 逻辑备份"
+}

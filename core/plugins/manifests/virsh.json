@@ -1,0 +1,41 @@
+{
+  "id": "virsh",
+  "name": "libvirt 客户端（virsh）",
+  "version": "9.0",
+  "category": "vm",
+  "description": "KVM/libvirt 域管理与快照（virsh snapshot-create-as / domblklist），用于在线虚拟机备份。",
+  "required_clients": [
+    "virsh"
+  ],
+  "supports": [
+    "vm"
+  ],
+  "tags": [
+    "虚拟机",
+    "KVM",
+    "libvirt快照"
+  ],
+  "icon": "bi-pc-display",
+  "packages": {
+    "linux": {
+      "package_managers": {
+        "apt": {
+          "command": "apt-get install -y libvirt-clients",
+          "binaries": [
+            "virsh"
+          ]
+        },
+        "yum": {
+          "command": "yum install -y libvirt-client",
+          "binaries": [
+            "virsh"
+          ]
+        }
+      }
+    }
+  },
+  "verify_after_install": [
+    "virsh --version"
+  ],
+  "fallback_note": "未安装时无法做 libvirt 在线快照，只能离线冷备"
+}

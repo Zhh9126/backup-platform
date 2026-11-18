@@ -1,12 +1,21 @@
-/* 无备份目录扫描恢复：只读扫描 → 清单勾选 → SFTP 拉回 + sha256 对账。
+/* 特殊恢复（无备份救援）：只读扫描 → 按库型识别 → 清单勾选 → SFTP 拉回 + sha256 对账。
+   覆盖 Oracle / MySQL / PostgreSQL / 金仓 / openGauss / 达梦 / SQL Server / Redis / MongoDB / SQLite。
    零构建、零依赖（仅用全站已有的 Pager 组件）。 */
 (function () {
   "use strict";
 
   var STATE = { files: [], filtered: [], selected: {}, scan: null };
   var KIND = {
-    oracle_artifact: "Oracle 对象", db_file: "数据文件",
-    db_log: "日志 / binlog", file: "普通文件"
+    db_data: "数据文件", db_log: "日志 / WAL / binlog", db_control: "控制文件",
+    db_config: "配置文件", backup_artifact: "备份产物", file: "普通文件"
+  };
+  // 库型徽章配色（未知库型统一灰）
+  var DB_COLOR = {
+    oracle: "bg-danger", mysql: "bg-primary", mariadb: "bg-primary",
+    postgresql: "bg-info text-dark", kingbase: "bg-info text-dark",
+    opengauss: "bg-info text-dark", dameng: "bg-warning text-dark",
+    mssql: "bg-secondary", redis: "bg-danger", mongodb: "bg-success",
+    sqlite: "bg-dark"
   };
 
   function $(id) { return document.getElementById(id); }
@@ -30,6 +39,13 @@
     var el = $("sf_status");
     el.textContent = msg;
     el.className = "small mb-2 " + (bad ? "text-danger" : (msg.indexOf("完成") >= 0 ? "text-success" : "text-muted"));
+  }
+  function dbBadge(dbType, label) {
+    if (!dbType || dbType === "unknown") {
+      return '<span class="badge bg-light text-dark border">未识别</span>';
+    }
+    return '<span class="badge ' + (DB_COLOR[dbType] || "bg-light text-dark border") + '">' +
+      esc(label || dbType) + "</span>";
   }
   async function api(method, url, body) {
     var opt = { method: method, headers: { "Content-Type": "application/json" } };
@@ -75,18 +91,38 @@
     }).join("");
   }
 
-  function renderOracleHomes(scan) {
-    var homes = scan.oracle_homes || [];
-    var el = $("sf_ora");
-    if (!homes.length) {
-      el.innerHTML = '<tr><td colspan="5" class="text-muted small">本次扫描未发现 /etc/oratab 记录；Oracle 数据文件候选 ' +
-        ((scan.oracle_candidates || []).length) + " 个。可点「Oracle 实例清单」按实例探测。</td></tr>";
+  var SRC_LABEL = { process: "运行进程", oratab: "/etc/oratab", dir: "目录探测" };
+
+  function renderInstances(instances, emptyText) {
+    var el = $("sf_inst");
+    if (!instances || !instances.length) {
+      el.innerHTML = '<tr><td colspan="5" class="text-muted small">' +
+        esc(emptyText || "未发现数据库实例（进程未运行且常见数据目录不存在）") + "</td></tr>";
       return;
     }
-    el.innerHTML = homes.map(function (h) {
-      return "<tr><td>" + esc(h.sid) + "</td><td>-</td><td>-</td><td class='small'>" +
-        esc(h.home) + "</td><td class='small text-muted'>点「Oracle 实例清单」获取 PDB</td></tr>";
+    el.innerHTML = instances.map(function (it) {
+      return "<tr><td>" + dbBadge(it.db_type, it.db_label) + "</td><td>" +
+        esc(it.name || "-") + "</td><td class='small' style='word-break:break-all'>" +
+        esc(it.datadir || "-") + "</td><td class='small text-nowrap'>" +
+        esc(it.port || "-") + "</td><td class='small text-muted'>" +
+        esc(SRC_LABEL[it.source] || it.source || "-") + "</td></tr>";
     }).join("");
+  }
+
+  function fillDbFilter(files) {
+    var sel = $("sf_db");
+    var types = {};
+    (files || []).forEach(function (f) {
+      if (f.db_type && f.db_type !== "unknown") {
+        types[f.db_type] = f.db_label || f.db_type;
+      }
+    });
+    var cur = sel.value;
+    var opts = Object.keys(types).sort().map(function (k) {
+      return '<option value="' + esc(k) + '">' + esc(types[k]) + "</option>";
+    }).join("");
+    sel.innerHTML = '<option value="">全部库型</option>' + opts;
+    if (cur && types[cur]) sel.value = cur;
   }
 
   function selectedCount() {
@@ -111,9 +147,10 @@
       return '<tr><td><input type="checkbox" class="sf-sel" data-path="' +
         esc(f.path) + '"' + checked + '></td>' +
         '<td class="small" style="word-break:break-all">' + esc(f.path) + "</td>" +
+        "<td>" + dbBadge(f.db_type, f.db_label) + "</td>" +
         "<td>" + badge + "</td><td class='text-nowrap'>" + human(f.size) +
         "</td><td class='small text-muted text-nowrap'>" + esc(tm(f.mtime)) + "</td></tr>";
-    }).join("") : '<tr><td colspan="5" class="text-muted small">无匹配对象</td></tr>';
+    }).join("") : '<tr><td colspan="6" class="text-muted small">无匹配对象</td></tr>';
     if (typeof Pager !== "undefined") {
       Pager.attach("scanFsFiles", $("sf_filePager"), pg.page, pg.pages,
         pg.total, window.scanFsRenderPage);
@@ -124,10 +161,13 @@
   window.scanFsFilter = function () {
     var kw = ($("sf_kw").value || "").toLowerCase();
     var kind = $("sf_kind").value;
+    var db = $("sf_db").value;
     STATE.filtered = STATE.files.filter(function (f) {
       return (!kind || f.kind === kind) &&
+        (!db || f.db_type === db) &&
         (!kw || String(f.path).toLowerCase().indexOf(kw) >= 0 ||
-          String(KIND[f.kind] || "").toLowerCase().indexOf(kw) >= 0);
+          String(KIND[f.kind] || "").toLowerCase().indexOf(kw) >= 0 ||
+          String(f.db_label || "").toLowerCase().indexOf(kw) >= 0);
     });
     window.scanFsRenderPage();
   };
@@ -151,10 +191,16 @@
       STATE.files = r.files || [];
       STATE.selected = {};
       renderVolumes(r.volumes || []);
-      renderOracleHomes(r);
+      renderInstances(r.instances || [], "本次扫描未发现实例线索；可直接看下方对象清单");
+      fillDbFilter(STATE.files);
       window.scanFsFilter();
-      status("扫描完成：共 " + (r.file_count || 0) + " 个文件，Oracle 候选 " +
-        ((r.oracle_candidates || []).length) + " 个" +
+      var types = r.db_types || {};
+      var typeText = Object.keys(types).map(function (k) {
+        return k + " " + types[k];
+      }).join("、");
+      status("扫描完成：共 " + (r.file_count || 0) + " 个文件" +
+        (typeText ? "，识别到 " + typeText : "") +
+        "，实例 " + ((r.instances || []).length) + " 个" +
         (r.truncated ? "（已达最大文件数，结果被截断）" : "") +
         "；主机 " + esc(r.host || "-") + "。" + esc(r.method || ""));
     } catch (e) {
@@ -164,31 +210,18 @@
     }
   };
 
-  window.scanFsOracle = async function () {
-    var tid = $("sf_task").value;
-    if (!tid) {
-      status("请先选择备份任务（Oracle 实例清单基于任务的 SSH 凭据与目标主机）", true);
-      return;
-    }
-    status("正在探测 Oracle 实例 / ORACLE_HOME / PDB…");
+  /* 实例清单（全库型）：进程参数 + /etc/oratab + 常见目录兜底 */
+  window.scanFsInstances = async function () {
+    status("正在探测本机数据库实例（全库型）…");
     try {
-      var r = await api("GET", "/api/tasks/" + tid + "/oracle-inventory");
-      var list = r.instances || [];
-      $("sf_ora").innerHTML = list.length ? list.map(function (it) {
-        var pdbs = it.pdbs || {};
-        var pdbTxt = pdbs.supported
-          ? (pdbs.items || []).map(function (p) { return p.name + "(" + p.open_mode + ")"; }).join("、")
-          : (pdbs.note || "不支持 / 未发现");
-        return "<tr><td>" + esc(it.sid) + "</td><td>" +
-          (it.running ? '<span class="badge bg-success">运行中</span>'
-            : '<span class="badge bg-secondary">未运行</span>') +
-          "</td><td>" + esc(it.version || "-") + "</td><td class='small'>" +
-          esc(it.home || "-") + "</td><td class='small'>" + esc(pdbTxt) + "</td></tr>";
-      }).join("") : '<tr><td colspan="5" class="text-muted small">未发现 Oracle 实例</td></tr>';
-      status("Oracle 实例清单完成：发现 " + (r.instance_count || 0) + " 个实例" +
-        ((r.notes || []).length ? "；" + (r.notes || []).join("；") : ""));
+      var body = payload();
+      var r = await api("POST", "/api/scan-fs/instances", body);
+      renderInstances(r.instances || [], "未发现数据库实例（进程未运行且常见数据目录不存在）");
+      var types = (r.db_types || []).join("、");
+      status("实例清单完成：发现 " + (r.instance_count || 0) + " 个实例" +
+        (types ? "（" + types + "）" : "") + "；" + (r.method || ""));
     } catch (e) {
-      status("Oracle 实例探测失败：" + String(e.message || e), true);
+      status("实例探测失败：" + String(e.message || e), true);
     }
   };
 

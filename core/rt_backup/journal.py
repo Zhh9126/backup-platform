@@ -217,6 +217,7 @@ class RecoveryJournal:
                            f"{head.rp_kind}，请选择更晚的时间点或先做一次全量备份")
 
         prev: Optional[RecoveryPoint] = None
+        seen_ids = set()
         for point in chain:
             # ④ 产物存在性与校验和
             if point.storage_tier == 1:
@@ -234,15 +235,26 @@ class RecoveryJournal:
             if prev is not None:
                 # ② parent 连续性（允许 parent_rp_id 为空的历史数据，仅告警不阻断）
                 if point.parent_rp_id and point.parent_rp_id != prev.id:
-                    return False, (f"恢复链断裂：{point.id} 的父节点为 "
-                                   f"{point.parent_rp_id}，但链上前驱是 {prev.id}，"
-                                   f"中间存在缺失的恢复点")
+                    if point.parent_rp_id in seen_ids:
+                        # 父节点指向**更早的已入链节点**（ramp 内指针跳跃，
+                        # 多由守护进程重启后 last_rp_id 落后于 journal 造成）。
+                        # 链本身按 pit_at 升降序完整，位点连续性另有 ③ 校验，
+                        # 这里只告警不阻断，否则一次重启就会让整条链永久不可恢复。
+                        self.logger.warning(
+                            "[rt.journal] task=%s 恢复点 %s 的父节点 %s 早于前驱 %s"
+                            "（指针跳跃，按时间序继续校验）",
+                            point.task_id, point.id, point.parent_rp_id, prev.id)
+                    else:
+                        return False, (f"恢复链断裂：{point.id} 的父节点为 "
+                                       f"{point.parent_rp_id}，但链上前驱是 {prev.id}，"
+                                       f"中间存在缺失的恢复点")
                 # ③ DB 段位点连续性
                 if point.rp_kind == RP_DB_LOG and prev.rp_kind == RP_DB_LOG:
                     ok, reason = self._check_position_continuity(prev, point)
                     if not ok:
                         return False, reason
             prev = point
+            seen_ids.add(point.id)
 
         return True, ""
 

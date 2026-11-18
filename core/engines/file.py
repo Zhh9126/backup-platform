@@ -24,6 +24,7 @@ extra_options JSON 结构示例：
 import io
 import os
 import json
+import errno
 import shlex
 import socket
 import fnmatch
@@ -449,6 +450,14 @@ def _ssh_exec_stream(client, cmd: str, *, out_file=None, timeout: int = 0,
     if input_data:
         sess.sendall(input_data)
         sess.shutdown_write()
+    # 通道级超时安全网：循环里的 timeout 检查只在 recv_ready()/exit_status_ready()
+    # 返回后的下一轮才生效；若底层 transport 读取线程停摆（池化长连接偶发），
+    # recv_ready() 曾为 True 的最后一次 recv() 会无超时永久阻塞——通道级超时
+    # 使其抛 socket.timeout 走统一异常路径，而不是卡死整个工作线程。
+    # 正常流程不受影响：recv 仅在 recv_ready() 为 True 后调用，缓冲区有数据即返回。
+    # Agent 兼容层（AgentSessionChannel）无 settimeout，跳过。
+    if hasattr(sess, "settimeout"):
+        sess.settimeout(timeout if timeout else 300)
 
     buf = None if out_file is not None else bytearray()
     err = bytearray()
@@ -657,12 +666,22 @@ def _noop_logger():
 def _is_transient(err: BaseException) -> bool:
     """传输级瞬时异常（网络中断/SSH 会话断/超时）可重试；
     远端命令 rc!=0（tar 语法/权限/磁盘满）不是瞬时故障，不重试。"""
+    # 本地资源类错误重试没有意义：磁盘满/只读/配额/句柄耗尽再试 3 次只会
+    # 把失败时间拖长（实测：平台分区满时拉取白退避 2s+4s 后才报 ENOSPC）
+    if isinstance(err, OSError) and getattr(err, "errno", None) in (
+            errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.EACCES,
+            errno.EMFILE, errno.ENFILE, errno.EFBIG):
+        return False
+    msg0 = str(err).lower()
+    if any(k in msg0 for k in ("no space left", "read-only file system",
+                               "disk quota exceeded", "file too large")):
+        return False
     if isinstance(err, (EOFError, socket.timeout, ConnectionError, TimeoutError)):
         return True
     name = type(err).__name__
     if "SSHException" in name or "ChannelException" in name or "OSError" in name:
         return True
-    msg = str(err).lower()
+    msg = msg0
     return any(k in msg for k in ("eof", "socket", "timeout", "connection",
                                   "broken pipe", "reset by peer"))
 

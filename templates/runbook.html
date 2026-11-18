@@ -1,0 +1,468 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-card mb-3">
+  <div class="d-flex align-items-center mb-1">
+    <h5 class="mb-0"><i class="bi bi-journal-text me-2"></i>恢复剧本（Runbook）</h5>
+    <div class="ms-auto d-flex gap-2">
+      <a class="btn btn-sm btn-outline-secondary" href="/dr">容灾总览</a>
+      <a class="btn btn-sm btn-outline-secondary" href="/drills">切换演练</a>
+      <button class="btn btn-sm btn-primary" id="rbNewBtn"><i class="bi bi-plus-lg me-1"></i>新建剧本</button>
+    </div>
+  </div>
+  <div class="text-muted small mb-3">
+    把「备份 → 恢复 → 校验 → 通知 → 切换」串成可复用的恢复剧本：一键执行、RTO 计时、
+    高危步骤审批闸、失败如实中止。等待类步骤用于复制追平 / 应用重启窗口。
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead class="table-light"><tr>
+        <th style="width:60px">#</th><th>名称</th><th>描述</th><th>步骤</th>
+        <th>状态</th><th>更新时间</th><th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="rbList"><tr><td colspan="7" class="text-center text-muted py-3">加载中…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="page-card">
+  <div class="d-flex align-items-center mb-2">
+    <h6 class="text-muted mb-0"><i class="bi bi-clock-history me-1"></i>运行记录</h6>
+    <div class="form-check form-check-inline ms-3 small">
+      <input class="form-check-input" type="checkbox" id="rbAuto" checked>
+      <label class="form-check-label" for="rbAuto">自动刷新（3s）</label>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead class="table-light"><tr>
+        <th style="width:60px">#</th><th>剧本</th><th>状态</th><th>当前步骤</th>
+        <th>RTO</th><th>操作人</th><th>开始时间</th><th class="text-end">操作</th>
+      </tr></thead>
+      <tbody id="rbRuns"><tr><td colspan="8" class="text-center text-muted py-3">加载中…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 剧本编辑弹窗 -->
+<div class="modal fade" id="rbEditModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h6 class="modal-title" id="rbEditTitle">新建剧本</h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="row g-2 mb-2">
+          <div class="col-md-4">
+            <label class="form-label">名称 <span class="text-danger">*</span></label>
+            <input class="form-control" id="rbName" maxlength="60">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">描述</label>
+            <input class="form-control" id="rbDesc" maxlength="200">
+          </div>
+          <div class="col-md-2 d-flex align-items-end">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" id="rbEnabled" checked>
+              <label class="form-check-label" for="rbEnabled">启用</label>
+            </div>
+          </div>
+        </div>
+        <div class="d-flex align-items-center mb-1">
+          <span class="small text-muted">执行步骤（按顺序执行；高危步骤可勾选「需审批」）</span>
+          <button class="btn btn-sm btn-outline-primary ms-auto" id="rbAddStep">
+            <i class="bi bi-plus me-1"></i>添加步骤</button>
+        </div>
+        <div id="rbSteps"></div>
+      </div>
+      <div class="modal-footer py-2">
+        <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-sm btn-primary" id="rbSaveBtn">保存剧本</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 运行详情弹窗 -->
+<div class="modal fade" id="rbRunModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h6 class="modal-title">运行详情 <span id="rbRunHead" class="text-muted small"></span></h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div id="rbRunSummary" class="small mb-2"></div>
+        <ol class="list-group list-group-numbered small" id="rbRunSteps"></ol>
+        <div id="rbRunError" class="alert alert-danger py-2 px-3 small mt-2 mb-0 d-none"></div>
+      </div>
+      <div class="modal-footer py-2" id="rbRunFoot"></div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var steps = [];           // 编辑中的步骤数组
+  var editingId = null;
+  var timer = null;
+
+  function el(id) { return document.getElementById(id); }
+  function esc(s) { return BKP.esc(String(s == null ? "" : s)); }
+
+  var TYPE_LABELS = {
+    wait: "等待", run_backup: "执行备份", restore_latest: "恢复最近备份",
+    verify_rows: "行数校验", notify: "事件通知", failover: "容灾切换",
+    failback: "容灾回切", clone: "测试克隆"
+  };
+  var TYPE_ORDER = ["run_backup", "restore_latest", "verify_rows", "wait",
+                    "notify", "failover", "failback", "clone"];
+
+  var PARAM_FIELDS = {
+    wait: [{ k: "seconds", label: "等待秒数（上限 600）", type: "number", def: 10 }],
+    run_backup: [{ k: "task_id", label: "备份任务 ID（见 /tasks）", type: "number" }],
+    restore_latest: [
+      { k: "task_id", label: "备份任务 ID", type: "number" },
+      { k: "target_db", label: "目标库名（异名恢复）" },
+      { k: "target_host_id", label: "目标主机 ID（可选，见 /hosts）", type: "number" }
+    ],
+    verify_rows: [
+      { k: "task_id", label: "任务 ID（取连接凭据）", type: "number" },
+      { k: "db", label: "校验库名（默认任务库）" },
+      { k: "tables", label: "表名清单（逗号分隔）" },
+      { k: "min_rows", label: "行数下限", type: "number", def: 1 }
+    ],
+    notify: [{ k: "title", label: "标题" }, { k: "message", label: "内容" }],
+    failover: [
+      { k: "link_id", label: "容灾链路 ID（见 /dr-link）", type: "number" },
+      { k: "force", label: "强制切换（主库假死时）", type: "check" }
+    ],
+    failback: [{ k: "link_id", label: "容灾链路 ID", type: "number" }],
+    clone: [
+      { k: "record_id", label: "备份记录 ID（见 /records）", type: "number" },
+      { k: "purpose", label: "用途", type: "select",
+        opts: ["test", "emergency", "dev", "staging"], def: "test" }
+    ]
+  };
+
+  function statusPill(s) {
+    var m = { success: ["badge-ok", "成功"], failed: ["badge-fail", "失败"],
+              stopped: ["bg-secondary", "已停止"], running: ["badge-run", "执行中"],
+              pending: ["bg-secondary", "排队中"],
+              waiting_approval: ["badge-warn", "等待审批"] };
+    var x = m[s] || ["bg-secondary", s || "-"];
+    return '<span class="badge ' + x[0] + '">' + x[1] + '</span>';
+  }
+
+  // ------------------------- 剧本列表 -------------------------
+  function loadList() {
+    return BKP.api("GET", "/api/runbooks").then(function (d) {
+      var rows = d.items || [];
+      if (!rows.length) {
+        el("rbList").innerHTML =
+          '<tr><td colspan="7" class="text-center text-muted py-4">' +
+          '暂无剧本，点击右上角「新建剧本」开始编排</td></tr>';
+        return;
+      }
+      el("rbList").innerHTML = rows.map(function (r) {
+        var st = (r.steps || []).map(function (s) {
+          return '<span class="badge bg-light text-dark border me-1">' +
+            esc(TYPE_LABELS[s.type] || s.type) + '</span>';
+        }).join("");
+        return '<tr>' +
+          '<td>' + r.id + '</td>' +
+          '<td>' + esc(r.name) + '</td>' +
+          '<td class="text-muted small">' + esc(r.description || "-") + '</td>' +
+          '<td>' + st + '</td>' +
+          '<td>' + (r.enabled ? '<span class="badge badge-ok">启用</span>'
+                              : '<span class="badge bg-secondary">停用</span>') + '</td>' +
+          '<td class="small text-muted">' + esc((r.updated_at || "").slice(0, 19)) + '</td>' +
+          '<td class="text-end btn-row">' +
+            '<button class="btn btn-sm btn-outline-primary" onclick="rbRun(' + r.id + ')">执行</button>' +
+            '<button class="btn btn-sm btn-outline-secondary" onclick="rbEdit(' + r.id + ')">编辑</button>' +
+            '<button class="btn btn-sm btn-outline-danger" onclick="rbDel(' + r.id + ')">删除</button>' +
+          '</td></tr>';
+      }).join("");
+      window.__rbItems = rows;
+    });
+  }
+
+  // ------------------------- 运行记录 -------------------------
+  function loadRuns() {
+    return BKP.api("GET", "/api/runbook-runs?limit=100").then(function (d) {
+      var rows = d.items || [];
+      window.__rbRuns = rows;
+      if (!rows.length) {
+        el("rbRuns").innerHTML =
+          '<tr><td colspan="8" class="text-center text-muted py-4">暂无运行记录</td></tr>';
+        return;
+      }
+      el("rbRuns").innerHTML = rows.map(function (r) {
+        var act = '<button class="btn btn-sm btn-outline-secondary" onclick="rbShowRun(' + r.id + ')">详情</button>';
+        if (r.status === "waiting_approval") {
+          act += '<button class="btn btn-sm btn-warning" onclick="rbApprove(' + r.id + ',' +
+            (r.current_seq || 1) + ')">审批放行 ' + (r.current_seq || 1) + '</button>';
+        }
+        if (["pending", "running", "waiting_approval"].indexOf(r.status) >= 0) {
+          act += '<button class="btn btn-sm btn-outline-danger" onclick="rbStop(' + r.id + ')">停止</button>';
+        }
+        return '<tr>' +
+          '<td>' + r.id + '</td>' +
+          '<td>' + esc(r.runbook_name) + '</td>' +
+          '<td>' + statusPill(r.status) + '</td>' +
+          '<td>' + (r.current_seq ? "第 " + r.current_seq + " 步" : "-") + '</td>' +
+          '<td>' + (r.rto_sec != null ? r.rto_sec + "s" : "-") + '</td>' +
+          '<td class="small">' + esc(r.operator || "-") + '</td>' +
+          '<td class="small text-muted">' + esc((r.started_at || r.created_at || "").slice(0, 19)) + '</td>' +
+          '<td class="text-end btn-row">' + act + '</td></tr>';
+      }).join("");
+    });
+  }
+
+  function tick() {
+    var busy = (window.__rbRuns || []).some(function (r) {
+      return ["pending", "running", "waiting_approval"].indexOf(r.status) >= 0;
+    });
+    if (busy && el("rbAuto").checked) loadRuns();
+  }
+
+  // ------------------------- 步骤编辑器 -------------------------
+  function blankStep(type) {
+    var p = {};
+    (PARAM_FIELDS[type] || []).forEach(function (f) { p[f.k] = f.def != null ? f.def : ""; });
+    return { type: type, name: TYPE_LABELS[type], params: p,
+             require_confirm: false, continue_on_fail: false };
+  }
+
+  function renderSteps() {
+    if (!steps.length) {
+      el("rbSteps").innerHTML =
+        '<div class="text-muted small border rounded p-3 text-center">' +
+        '还没有步骤，点击「添加步骤」开始编排（建议：执行备份 → 恢复最近备份 → 行数校验）</div>';
+      return;
+    }
+    el("rbSteps").innerHTML = steps.map(function (s, i) {
+      var fields = (PARAM_FIELDS[s.type] || []).map(function (f) {
+        var v = s.params[f.k] != null ? s.params[f.k] : (f.def != null ? f.def : "");
+        if (f.type === "check") {
+          return '<div class="form-check form-check-inline small">' +
+            '<input class="form-check-input" type="checkbox" data-i="' + i + '" data-k="' + f.k + '"' +
+            (v ? " checked" : "") + '><label class="form-check-label">' + f.label + '</label></div>';
+        }
+        if (f.type === "select") {
+          return '<div class="col-auto"><label class="form-label small mb-0">' + f.label + '</label>' +
+            '<select class="form-select form-select-sm" data-i="' + i + '" data-k="' + f.k + '">' +
+            f.opts.map(function (o) {
+              return '<option' + (v === o ? " selected" : "") + '>' + o + '</option>';
+            }).join("") + '</select></div>';
+        }
+        return '<div class="col-auto"><label class="form-label small mb-0">' + f.label + '</label>' +
+          '<input class="form-control form-control-sm" data-i="' + i + '" data-k="' + f.k + '"' +
+          (f.type === "number" ? ' type="number"' : "") + ' value="' + esc(v) + '"></div>';
+      }).join("");
+      return '<div class="border rounded p-2 mb-2 bg-white">' +
+        '<div class="d-flex align-items-center gap-2 mb-1">' +
+          '<span class="badge bg-dark">步骤 ' + (i + 1) + '</span>' +
+          '<select class="form-select form-select-sm" style="width:auto" data-i="' + i + '" data-role="type">' +
+            TYPE_ORDER.map(function (t) {
+              return '<option value="' + t + '"' + (s.type === t ? " selected" : "") + '>' +
+                (TYPE_LABELS[t] || t) + '</option>';
+            }).join("") + '</select>' +
+          '<input class="form-control form-control-sm" style="width:180px" data-i="' + i + '" ' +
+            'data-role="name" value="' + esc(s.name) + '" placeholder="步骤名称">' +
+          '<div class="form-check form-check-inline small">' +
+            '<input class="form-check-input" type="checkbox" data-i="' + i + '" data-role="confirm"' +
+            (s.require_confirm ? " checked" : "") + '><label class="form-check-label">需审批</label></div>' +
+          '<div class="form-check form-check-inline small">' +
+            '<input class="form-check-input" type="checkbox" data-i="' + i + '" data-role="cof"' +
+            (s.continue_on_fail ? " checked" : "") + '><label class="form-check-label">失败继续</label></div>' +
+          '<div class="ms-auto btn-row">' +
+            '<button class="btn btn-sm btn-outline-secondary" data-i="' + i + '" data-role="up" ' +
+              (i === 0 ? "disabled" : "") + '><i class="bi bi-arrow-up"></i></button>' +
+            '<button class="btn btn-sm btn-outline-secondary" data-i="' + i + '" data-role="down" ' +
+              (i === steps.length - 1 ? "disabled" : "") + '><i class="bi bi-arrow-down"></i></button>' +
+            '<button class="btn btn-sm btn-outline-danger" data-i="' + i + '" data-role="rm">' +
+              '<i class="bi bi-x"></i></button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="row g-2 align-items-end">' + (fields || "") + '</div>' +
+      '</div>';
+    }).join("");
+  }
+
+  el("rbSteps").addEventListener("change", function (ev) {
+    var t = ev.target, i = +t.dataset.i;
+    if (isNaN(i) || !steps[i]) return;
+    var k = t.dataset.k, role = t.dataset.role;
+    if (role === "type") {
+      var old = steps[i];
+      steps[i] = blankStep(t.value);
+      steps[i].name = (old.name && old.name !== TYPE_LABELS[old.type]) ? old.name : TYPE_LABELS[t.value];
+      steps[i].require_confirm = old.require_confirm;
+      steps[i].continue_on_fail = old.continue_on_fail;
+    } else if (role === "name") steps[i].name = t.value;
+    else if (role === "confirm") steps[i].require_confirm = t.checked;
+    else if (role === "cof") steps[i].continue_on_fail = t.checked;
+    else if (k) steps[i].params[k] = t.type === "checkbox" ? t.checked : t.value;
+    if (role === "type") renderSteps();
+  });
+  el("rbSteps").addEventListener("input", function (ev) {
+    var t = ev.target, i = +t.dataset.i;
+    if (isNaN(i) || !steps[i]) return;
+    var k = t.dataset.k, role = t.dataset.role;
+    if (role === "name") steps[i].name = t.value;
+    else if (k && t.type !== "checkbox" && t.tagName !== "SELECT") steps[i].params[k] = t.value;
+  });
+  el("rbSteps").addEventListener("click", function (ev) {
+    var btn = ev.target.closest("button[data-role]");
+    if (!btn) return;
+    var i = +btn.dataset.i, role = btn.dataset.role;
+    if (role === "rm") steps.splice(i, 1);
+    else if (role === "up" && i > 0) steps.splice(i - 1, 0, steps.splice(i, 1)[0]);
+    else if (role === "down" && i < steps.length - 1) steps.splice(i + 1, 0, steps.splice(i, 1)[0]);
+    renderSteps();
+  });
+
+  // ------------------------- 新建 / 编辑 / 保存 -------------------------
+  function openEditor(rb) {
+    editingId = rb ? rb.id : null;
+    el("rbEditTitle").textContent = rb ? "编辑剧本 #" + rb.id : "新建剧本";
+    el("rbName").value = rb ? rb.name : "";
+    el("rbDesc").value = rb ? (rb.description || "") : "";
+    el("rbEnabled").checked = rb ? !!rb.enabled : true;
+    steps = rb ? JSON.parse(JSON.stringify(rb.steps || [])) : [];
+    renderSteps();
+    new bootstrap.Modal(el("rbEditModal")).show();
+  }
+
+  el("rbNewBtn").onclick = function () { openEditor(null); };
+  window.rbEdit = function (id) {
+    var rb = (window.__rbItems || []).filter(function (x) { return x.id === id; })[0];
+    if (rb) openEditor(rb);
+  };
+  window.rbDel = function (id) {
+    if (!confirm("确认删除该剧本及其全部运行记录？")) return;
+    BKP.api("DELETE", "/api/runbooks/" + id)
+      .then(function () { toast("剧本已删除"); loadList(); })
+      .catch(function (e) { toast(e.message || "删除失败", "danger"); });
+  };
+  window.rbRun = function (id) {
+    BKP.api("POST", "/api/runbooks/" + id + "/run", {})
+      .then(function (d) {
+        toast("剧本已启动执行（run #" + d.run.id + "）");
+        loadRuns();
+        rbShowRun(d.run.id);
+      })
+      .catch(function (e) { toast(e.message || "启动失败", "danger"); });
+  };
+  window.rbApprove = function (runId, seq) {
+    BKP.api("POST", "/api/runbook-runs/" + runId + "/approve", { seq: seq })
+      .then(function () { toast("步骤 " + seq + " 已放行"); loadRuns(); })
+      .catch(function (e) { toast(e.message || "审批失败", "danger"); });
+  };
+  window.rbStop = function (runId) {
+    if (!confirm("确认停止该运行？当前步骤跑完后中止。")) return;
+    BKP.api("POST", "/api/runbook-runs/" + runId + "/stop", {})
+      .then(function () { toast("已发送停止指令"); loadRuns(); })
+      .catch(function (e) { toast(e.message || "停止失败", "danger"); });
+  };
+
+  el("rbAddStep").onclick = function () {
+    steps.push(blankStep(TYPE_ORDER[0]));
+    renderSteps();
+  };
+
+  el("rbSaveBtn").onclick = function () {
+    var name = el("rbName").value.trim();
+    if (!name) { toast("剧本名称不能为空", "danger"); return; }
+    if (!steps.length) { toast("至少需要一个步骤", "danger"); return; }
+    for (var i = 0; i < steps.length; i++) {
+      var p = steps[i].params || {};
+      var needTask = ["run_backup", "restore_latest", "verify_rows"].indexOf(steps[i].type) >= 0;
+      var needLink = ["failover", "failback"].indexOf(steps[i].type) >= 0;
+      if (needTask && !(+p.task_id > 0)) { toast("步骤 " + (i + 1) + "：请填写备份任务 ID", "danger"); return; }
+      if (needLink && !(+p.link_id > 0)) { toast("步骤 " + (i + 1) + "：请填写容灾链路 ID", "danger"); return; }
+      if (steps[i].type === "clone" && !(+p.record_id > 0)) {
+        toast("步骤 " + (i + 1) + "：请填写备份记录 ID", "danger"); return;
+      }
+      if (steps[i].type === "verify_rows" && !String(p.tables || "").trim()) {
+        toast("步骤 " + (i + 1) + "：请填写校验表名", "danger"); return;
+      }
+    }
+    var payload = { name: name, description: el("rbDesc").value.trim(),
+                    enabled: el("rbEnabled").checked ? 1 : 0, steps: steps };
+    var req = editingId
+      ? BKP.api("PUT", "/api/runbooks/" + editingId, payload)
+      : BKP.api("POST", "/api/runbooks", payload);
+    req.then(function () {
+      toast("剧本已保存");
+      bootstrap.Modal.getInstance(el("rbEditModal")).hide();
+      loadList();
+    }).catch(function (e) { toast(e.message || "保存失败", "danger"); });
+  };
+
+  // ------------------------- 运行详情 -------------------------
+  var runModal = null, openRunId = null;
+  window.rbShowRun = function (runId) {
+    openRunId = runId;
+    runModal = runModal || new bootstrap.Modal(el("rbRunModal"));
+    runModal.show();
+    renderRun();
+  };
+
+  function renderRun() {
+    if (openRunId == null) return;
+    BKP.api("GET", "/api/runbook-runs/" + openRunId).then(function (d) {
+      var r = d.item;
+      if (!r) return;
+      el("rbRunHead").textContent = "run #" + r.id + " · " + (r.runbook_name || "");
+      el("rbRunSummary").innerHTML =
+        statusPill(r.status) + ' <span class="text-muted ms-2">RTO ' +
+        (r.rto_sec != null ? r.rto_sec + "s" : "-") +
+        ' · 操作人 ' + esc(r.operator || "-") +
+        ' · 开始 ' + esc((r.started_at || "").slice(0, 19)) +
+        (r.finished_at ? ' · 结束 ' + esc(r.finished_at.slice(0, 19)) : "") + '</span>';
+      var log = r.steps_log || [];
+      el("rbRunSteps").innerHTML = log.length ? log.map(function (s) {
+        var icon = { ok: "bi-check-circle text-success", fail: "bi-x-circle text-danger",
+                     fail_cont: "bi-exclamation-circle text-warning",
+                     timeout: "bi-clock text-warning" }[s.status] || "bi-dash";
+        return '<li class="list-group-item d-flex justify-content-between align-items-center py-2">' +
+          '<span><i class="bi ' + icon + ' me-2"></i><b>' + esc(s.name || s.type) + '</b>' +
+          '<span class="text-muted ms-2">' + esc(s.message || "") + '</span></span>' +
+          '<span class="text-muted small">' + (s.duration_sec != null ? s.duration_sec + "s" : "") + '</span></li>';
+      }).join("") : '<li class="list-group-item text-muted">尚无步骤日志</li>';
+      var err = el("rbRunError");
+      if (r.error) { err.textContent = r.error; err.classList.remove("d-none"); }
+      else err.classList.add("d-none");
+      var foot = el("rbRunFoot");
+      foot.innerHTML = "";
+      if (r.status === "waiting_approval") {
+        var b = document.createElement("button");
+        b.className = "btn btn-sm btn-warning";
+        b.textContent = "审批放行步骤 " + (r.current_seq || 1);
+        b.onclick = function () {
+          rbApprove(r.id, r.current_seq || 1);
+          setTimeout(renderRun, 1500);
+        };
+        foot.appendChild(b);
+      }
+      if (["pending", "running", "waiting_approval"].indexOf(r.status) >= 0) {
+        setTimeout(renderRun, 3000);   // 运行中每 3s 刷新详情
+      }
+    });
+  }
+
+  // ------------------------- 启动 -------------------------
+  function toast(msg, kind) {
+    if (window.BKP && BKP.toast) BKP.toast(msg, kind || "success");
+    else console.log(msg);
+  }
+
+  loadList().then(loadRuns);
+  timer = setInterval(tick, 3000);
+})();
+</script>
+{% endblock %}

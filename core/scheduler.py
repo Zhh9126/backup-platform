@@ -194,6 +194,7 @@ _BACKUP_EXECUTOR: Optional[ThreadPoolExecutor] = None
 _RUNNING_LOCK = threading.Lock()
 _RUNNING_TASKS: set = set()          # 已提交但尚未结束的 task_id（进程内去重）
 _RUNNING_IDS: dict = {}              # task_id -> 提交时间（可观测）
+_WAIT_LOCAL = threading.local()      # 每线程的排队等待秒数（drift 归因，见 _execute_backup）
 
 
 def _backup_executor() -> ThreadPoolExecutor:
@@ -398,6 +399,18 @@ def run_task_now(task_id: int, backup_type: str = None,
         _logger.warning("任务不存在: %s", task_id)
         return None
 
+    # 插件策略（2026-11-14）：use_plugin=off 或 auto 无插件时，物理备份在**执行入口**
+    # 就降级为逻辑备份（不再"策略说不行、引擎照跑物理"）；require 缺插件则跳过本次。
+    try:
+        from core import plugin_policy as _pp
+        task = _pp.effective_task(task)
+        if task.get("_plugin_downgraded"):
+            _logger.warning("任务 %s 按插件策略降级为逻辑备份：%s",
+                            task_id, task["_plugin_downgraded"])
+    except Exception as exc:                                    # noqa: BLE001
+        _logger.warning("任务 %s 插件策略未满足，本次不执行：%s", task_id, exc)
+        return None
+
     # 文件/目录备份可能耗时很长(SSH 传输大目录)，统一走并行队列
     if task.get("db_type") == "file":
         return submit_task_now(task_id, backup_type=backup_type,
@@ -489,16 +502,26 @@ def _execute_backup(task: dict, backup_type: str = None,
         _logger.debug("[source_guard] 决策跳过（不阻断备份）: %s", _ge)
     # 全局并发控制：限制同时执行的备份数量（缺省保守，不破坏旧串行行为）。
     # release 必须作用于 acquire 时拿到的那个信号量，配置热变更重建不串味。
+    # 排队等待时长单独计时：平台并发上限配小时批量/组合任务的成员会在这里
+    # 排队，排队时间正是 drift（完成时间偏离计划）的主因，必须可观测。
+    _wait_t0 = time.time()
     sem = _CONCURRENCY.acquire()
+    # 排队时长存线程局部（不改变 _execute_backup_core 的签名，避免破坏
+    # 既有替身/调用方的契约），供记录消息与操作日志归因 drift。
+    _WAIT_LOCAL.queue_wait = round(time.time() - _wait_t0, 3)
     try:
         return _execute_backup_core(task, bt, operator)
     finally:
+        _WAIT_LOCAL.queue_wait = 0.0
         _CONCURRENCY.release(sem)
 
 
 def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
     from core.engines.base import BackupResult, BackupStatus
+    # 排队等待时长（_execute_backup 在 acquire 后写入线程局部）
+    queue_wait_sec = float(getattr(_WAIT_LOCAL, "queue_wait", 0.0) or 0.0)
     # 解析保护策略：取该任务的并行度/备份策略（供调度与并发控制参考）
+    parallel = 1
     try:
         from core.policy import policy_service
         pol = policy_service.resolve(task)
@@ -507,6 +530,17 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
                      task.get("id"), pol.get("level"), parallel)
     except Exception as e:
         _logger.debug("保护策略解析失败（不影响备份）: %s", e)
+    # 并行口径（可观测）：平台并发上限 + 本次单任务引擎并行度。
+    # 平台并发被压小时，成员任务的 drift 主要来自排队——把等待时长与
+    # 实际并行模式写进记录，报告可据此归因而非猜测。
+    try:
+        from core import parallel_plan as _pp
+        _plan = _pp.resolve(task)
+        _plan_label = _plan.get("label") or ""
+        _plim = int(_plan.get("platform_limit") or 0)
+    except Exception as e:  # noqa: BLE001
+        _plan_label, _plim = "", 0
+        _logger.debug("并行口径解析失败（不影响备份）: %s", e)
     started = db.now_iso()
     t0 = _t0_monotonic()
     # 启动时立即把任务状态置为 running，让 UI 不再停留在上一次的"失败"
@@ -545,6 +579,8 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
         "触发方式": "手动触发" if operator else "调度执行",
         "操作人": operator or "-",
         "产物根目录": config.BACKUP_ROOT,
+        "并行模式": _plan_label or "-",
+        "排队等待": ("%.1fs" % queue_wait_sec) if queue_wait_sec else "0s",
     }, title="备份任务上下文")
 
     result = BackupResult(success=False, message="未执行")
@@ -609,6 +645,20 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
     checksum = getattr(result, "checksum", "")
     is_sim = 1 if getattr(result, "simulated", False) else 0
     msg = getattr(result, "message", "")
+    # 并行归因后缀：排队等待（drift 主因）+ 本次并行模式（引擎已标注则不重复）
+    try:
+        _tags = []
+        if queue_wait_sec and queue_wait_sec >= 0.5:
+            _tags.append("排队等待 %.1fs（平台并发上限 %s 路）"
+                         % (queue_wait_sec, _plim or "?"))
+        if _plan_label and "引擎并行" in _plan_label and "引擎并行" not in msg:
+            # 引擎消息里已标注 = 该通道确实按此并行执行；否则这是预算口径
+            # （单流工具无并行能力），加前缀避免误读为"已经并行跑了 N 路"。
+            _tags.append("并行预算：" + _plan_label)
+        if _tags:
+            msg = (msg + " " if msg else "") + "[" + " · ".join(_tags) + "]"
+    except Exception:  # noqa: BLE001 —— 归因文案失败不得影响备份结论
+        pass
 
     # 压缩率统计：原始数据量 / 压缩后大小
     original = int(getattr(result, "original_size_bytes", 0) or 0)
@@ -802,6 +852,29 @@ _OBJ_RESTORE_KEYS = ("target_bucket", "target_prefix", "overwrite",
                      "apply_deleted", "restore_keys")
 
 
+class RestorePrecheckBlocked(ValueError):
+    """恢复前自动预检拦截（P0-3：预检通过才允许恢复，所有库型统一）。
+
+    携带完整预检报告（backup_precheck.precheck_restore 的返回结构），
+    API 层转 400 并透出给前端弹窗展示。"""
+
+    def __init__(self, message: str, report: dict):
+        super().__init__(message)
+        self.report = report or {}
+
+
+def _restore_precheck_enabled() -> bool:
+    """恢复前自动校验开关：system_config restore_auto_precheck，默认开。
+
+    用户口径：预检没问题再恢复；提供关闭出口（设置页「恢复前自动校验」）
+    以免预检通道自身故障时阻断紧急恢复。"""
+    try:
+        return str(db.get_system_config("restore_auto_precheck") or "1") \
+            .strip().lower() not in ("0", "false", "off", "no")
+    except Exception:
+        return True
+
+
 def run_restore_now(record_id: int, target_host: str = None,
                     target_host_id: int = None, target_db: str = None,
                     target_port: int = None,
@@ -863,6 +936,20 @@ def run_restore_now(record_id: int, target_host: str = None,
                 f"禁止作为恢复目标；如确需恢复，请先在纳管主机页解除保护标记")
         target_host_label = f"{target_host_info.get('hostname')}:{target_host_info.get('port',22)} (跨主机)"
         detail_log_lines.append(f"[目标主机] 纳管主机 ID={target_host_id}, {target_host_label}")
+        # 同机判定（2026-11-13 170 真机实测缺陷）：目标主机与数据库主机是同一台
+        # 时若仍走「跨主机恢复」通道，该通道是面向异机的简化脚本——会绕过引擎
+        # 的目标库/目标 schema 语义（达梦 SCHEMAS 过滤后 rc=0 却什么都没导入，
+        # 平台报成功；PG/金仓目标库不自动创建），因此同机必须交回引擎处理。
+        # 文件/对象存储类恢复的目标是「路径/桶」，跨主机通道是正常路径，不参与判定。
+        _dbt = (rec.get("db_type") or (task or {}).get("db_type") or "")
+        if _dbt not in ("file", "object_storage"):
+            _th = (target_host_info.get("hostname") or "").strip()
+            _dh = ((task or {}).get("host") or "").strip()
+            if _th and _dh and _th == _dh:
+                detail_log_lines.append(
+                    f"[目标主机] {_th} 与数据库主机相同 → 按同机恢复处理")
+                target_host_info = None
+                target_host_label = f"{_th} (同机)"
     elif target_host and (target_host_user or target_host_password):
         # 直接输入模式：从 target_host 字符串 "user@host:port" 解析，密码独立传入
         import re
@@ -889,6 +976,36 @@ def run_restore_now(record_id: int, target_host: str = None,
                 "覆盖且不可撤销。异名恢复请指定 target_db / target_schema；"
                 "确需原地覆盖请传 confirm_same_db=True。"
                 % ((task or {}).get("db_name") or "源库"))
+
+    # 恢复前自动校验（P0-3：所有库型统一，预检通过才允许恢复）。
+    # 检测项：产物存在/非空、sha256 基线、结构嗅探、恢复目标通道、恢复工具
+    # 就绪、解包空间。fail 级拦截（抛 RestorePrecheckBlocked，API 转 400 并
+    # 透出报告），warn 放行但写入操作日志。放在 confirm_same_db 之后：
+    # 参数类拒绝优先于环境类预检。所有恢复入口（API/演练/恢复校验策略）
+    # 都走本函数，自动继承。
+    if _restore_precheck_enabled():
+        from core import backup_precheck as _bpc
+        try:
+            _pf = _bpc.precheck_restore(rec, target_host_info, target_db)
+        except Exception as _pe:  # noqa: BLE001 - 预检自身故障不放大为业务中断
+            _pf = None
+            _logger.warning("恢复前预检执行异常（放行并记录，record=%s）: %s",
+                            record_id, _pe)
+        if _pf:
+            _warns = [it.get("message", "") for it in _pf.get("items", [])
+                      if it.get("level") == "warn"]
+            if _warns:
+                detail_log_lines.append(
+                    "[恢复前预检] %d 项风险提醒: %s"
+                    % (len(_warns), "；".join(_warns)[:300]))
+            if not _pf.get("ok"):
+                _fails = [it.get("message", "") for it in _pf.get("items", [])
+                          if it.get("level") == "fail"]
+                raise RestorePrecheckBlocked(
+                    "恢复预检未通过，已拦截本次恢复（预检通过后才会执行恢复）: "
+                    + "；".join(_fails)[:400], _pf)
+            detail_log_lines.append("[恢复前预检] 通过（%d 项检测）"
+                                    % len(_pf.get("items", [])))
 
     rid = models.create_restore({
         "task_id": rec["task_id"], "record_id": record_id,
@@ -1603,6 +1720,39 @@ def _register_dr_monitor(sched):
                   max_instances=1, coalesce=True, misfire_grace_time=60)
 
 
+def _register_dr_inspection(sched):
+    """容灾巡检（2026-11-18）：按 system_config dr_inspection_cron 定时自动巡检。"""
+    from apscheduler.triggers.cron import CronTrigger
+    try:
+        sched.remove_job("dr_inspection")
+    except Exception:
+        pass
+    enabled = str(db.get_system_config("dr_inspection_enabled", "1")) not in ("0", "false", "off")
+    if not enabled:
+        return
+    cron_expr = (db.get_system_config("dr_inspection_cron", "0 8 * * *")
+                 or "0 8 * * *").split()
+    try:
+        minute, hour, day, month, day_of_week = cron_expr[:5]
+        trigger = CronTrigger(minute=minute, hour=hour, day=day,
+                              month=month, day_of_week=day_of_week)
+    except Exception as e:
+        _logger.error("容灾巡检 cron 表达式非法(%s): %s",
+                      db.get_system_config("dr_inspection_cron"), e)
+        return
+    sched.add_job(_dr_inspection_job_wrapper, trigger,
+                  id="dr_inspection", replace_existing=True,
+                  max_instances=1, coalesce=True, misfire_grace_time=300)
+
+
+def _dr_inspection_job_wrapper():
+    try:
+        from core import dr_inspection
+        dr_inspection.run_inspection(triggered_by="schedule")
+    except Exception as e:
+        _logger.error("调度容灾巡检异常: %s", e)
+
+
 def _dr_monitor_job_wrapper():
     try:
         from core import dr_monitor
@@ -1812,6 +1962,52 @@ def _register_data_compare(sched):
         _logger.info("[data_compare] 任务 %s 已注册调度(%s)", t.get("id"), st)
 
 
+# ------------------------- AI 保护计划调度 -------------------------
+def _ai_plan_job_wrapper(plan_id: int):
+    """调度触发的 AI 保护计划（与手动运行同一路径 run_plan）。"""
+    try:
+        from core import ai_protection as aip
+        report = aip.run_plan(plan_id, operator="scheduler")
+        _logger.info("[ai_plan] 计划 %s 执行完成：%s（drift=%ss, mode=%s）",
+                     plan_id, report.get("consistency"), report.get("drift_sec"),
+                     report.get("mode"))
+    except Exception:
+        _logger.exception("[ai_plan] 计划 %s 调度执行异常", plan_id)
+
+
+def _register_ai_plans(sched):
+    """注册已启用且配置了周期的 AI 保护计划（cron 为空 = 仅手动运行）。
+
+    此前计划的 cron 字段只存不用——界面上能填「0 3 * * *」但永远不执行
+    （2026-11-14 核对发现），这里补上调度注册，start/reload 双路径都调用。
+    """
+    try:
+        from core import ai_protection as aip
+        plans = aip.list_enabled_plans()
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("[ai_plan] 读取保护计划失败: %s", e)
+        return
+    for p in plans or []:
+        cron = (p.get("cron") or "").strip()
+        if not cron:
+            continue
+        job_id = "ai_plan_" + str(p["id"])
+        try:
+            sched.remove_job(job_id)
+        except Exception:
+            pass
+        try:
+            from apscheduler.triggers.cron import CronTrigger
+            trig = CronTrigger.from_crontab(cron)
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("[ai_plan] 计划 %s cron 非法（%s）: %s", p.get("id"), cron, e)
+            continue
+        sched.add_job(_ai_plan_job_wrapper, trig, id=job_id,
+                      replace_existing=True, args=[p["id"]],
+                      misfire_grace_time=3600)
+        _logger.info("[ai_plan] 计划 %s 已注册调度(cron=%s)", p.get("id"), cron)
+
+
 def _register(sched, task: dict, prefix: str = "task"):
     wrapper = _job_wrapper if prefix == "task" else _job_wrapper_sync
     if prefix != "task":
@@ -1918,11 +2114,24 @@ def _rt_prune_job_wrapper():
 
 
 def _rt_watchdog_job_wrapper():
-    """看门狗：Supervisor 仍在运行时做安全网对账（主循环每 6 tick 也对账一次）。"""
+    """看门狗：Supervisor 未运行时尝试自愈接管，运行中则做安全网对账。
+
+    自愈是必须的：``RtSupervisor.start()`` 只在服务启动时调用一次，
+    一旦这次抢锁失败（陈旧锁 / 启动期多进程竞争），此进程永远不再重试，
+    实时保护会静默停摆直到人工重启。2026-11-14 实测：锁文件里是被 kill
+    掉的旧进程 PID，112 个已启用任务全部停止捕获，而 /api/rt/status 只显示
+    running=false，UI 上没有任何异常提示。
+    """
     try:
         from core import rt_backup
         sup = rt_backup.get_supervisor()
         if not sup.is_running():
+            if not getattr(config, "RT_BACKUP_ENABLED", False):
+                return
+            if sup.start(None):
+                _logger.warning("[rt.watchdog] 守护此前未运行，已自愈接管并开始对账")
+                db.add_log("warning", "rt.supervisor",
+                           "实时备份守护自愈：此前未运行（陈旧锁/启动竞争），已由看门狗接管")
             return
         sup.reconcile()
     except Exception:
@@ -1965,8 +2174,12 @@ def _register_rt_backup(sched) -> None:
         from core import rt_backup
         ok = rt_backup.start(sched)
         if not ok:
-            _logger.info("[rt] RtSupervisor 未在本进程启动（总开关关闭或未抢到锁）")
-            return
+            # 注意：这里**不能 return**。早期实现抢锁失败就直接返回、连周期任务
+            # 都不注册，导致看门狗不存在 → 陈旧锁一旦卡住，实时保护永久停摆，
+            # 只能人工重启（2026-11-14 实测 112 个任务全停且 UI 无提示）。
+            # 现在照常注册周期任务，由 rt_watchdog 周期重试接管。
+            _logger.warning("[rt] RtSupervisor 未在本进程启动（总开关关闭或未抢到锁），"
+                            "已注册看门狗，后续每 5 分钟尝试自愈接管")
         _register_rt_periodic_jobs(sched)
     except Exception:
         _logger.exception("[rt] 调度集成 RtSupervisor 异常")
@@ -2041,8 +2254,10 @@ def start_scheduler():
     _register_immutable_check(_scheduler)
     _register_rt_backup(_scheduler)
     _register_dr_monitor(_scheduler)
+    _register_dr_inspection(_scheduler)
     _register_file_sync(_scheduler)
     _register_netdev_backup(_scheduler)
+    _register_ai_plans(_scheduler)
     _scheduler.start()
     # 实时同步任务自动恢复（重启前处于 running 的实时任务重新拉起）
     _resume_realtime_sync_tasks()
@@ -2114,8 +2329,10 @@ def _reload_scheduler_locked():
     _register_cleanup(_scheduler)
     _register_immutable_check(_scheduler)
     _register_dr_monitor(_scheduler)
+    _register_dr_inspection(_scheduler)
     _register_file_sync(_scheduler)
     _register_netdev_backup(_scheduler)
+    _register_ai_plans(_scheduler)
     # RT 周期任务幂等重注册；Supervisor 主循环 tick 已保留，不重启守护
     if config.RT_BACKUP_ENABLED:
         _register_rt_periodic_jobs(_scheduler)

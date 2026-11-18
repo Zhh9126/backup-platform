@@ -415,13 +415,62 @@
         </div>`).join("");
   }
 
-  /** 即将执行的调度任务。 */
-  function _nextRunsHtml(rows) {
-    if (!rows || !rows.length) return '<div class="dist-empty">暂无已排程任务</div>';
-    return rows.map((r) => `<div class="nr-row">
-        <span class="nr-name">${esc(r.name)}</span>
-        <span class="nr-time">${esc(fmtTime(r.next_at))}</span>
-      </div>`).join("");
+  /** 相对时间：把"下次执行时间"变成「x 分钟后 / 明天 02:00」。 */
+  function _relTime(iso) {
+    if (!iso) return "";
+    const t = new Date(String(iso).replace(" ", "T"));
+    if (isNaN(t.getTime())) return fmtTime(iso);
+    const diff = Math.round((t.getTime() - Date.now()) / 60000);
+    if (diff <= 0) return "即将执行";
+    if (diff < 60) return diff + " 分钟后";
+    if (diff < 1440) return Math.floor(diff / 60) + " 小时后";
+    return Math.floor(diff / 1440) + " 天后";
+  }
+
+  /** 已运行时长（秒 → 人话）。 */
+  function _durText(sec) {
+    if (sec == null) return "";
+    if (sec < 60) return sec + " 秒";
+    if (sec < 3600) return Math.floor(sec / 60) + " 分钟";
+    return (sec / 3600).toFixed(1) + " 小时";
+  }
+
+  /** 「正在执行 / 即将执行」两段式渲染。 */
+  function _nextRunsHtml(rows, running) {
+    const run = running || [];
+    const plan = rows || [];
+    let html = "";
+
+    // ---- 正在执行 ----
+    html += '<div class="small text-muted mb-1">正在执行 ' +
+      '<span class="badge bg-primary bg-opacity-75">' + run.length + '</span></div>';
+    if (!run.length) {
+      html += '<div class="dist-empty">当前没有正在执行的备份</div>';
+    } else {
+      html += run.map((r) => `<div class="nr-row">
+          <span class="rt-dot ok"></span>
+          <span class="nr-name" title="${esc((r.db_type || "") + " " + (r.host || ""))}">${esc(r.name)}</span>
+          <span class="nr-time text-primary">${esc(_durText(r.elapsed_sec))}</span>
+        </div>`).join("");
+    }
+
+    // ---- 即将执行 ----
+    html += '<div class="small text-muted mt-2 mb-1">即将执行 ' +
+      '<span class="badge bg-secondary">' + plan.length + '</span></div>';
+    if (!plan.length) {
+      html += '<div class="dist-empty">暂无已排程任务（任务未配置 cron/间隔，或未绑定策略）</div>';
+    } else {
+      html += plan.map((r) => {
+        const badge = r.source === "scheduler" ? ""
+          : (r.source === "policy"
+            ? '<span class="badge bg-info-subtle text-dark border ms-1">策略</span>' : "");
+        return `<div class="nr-row">
+          <span class="nr-name">${esc(r.name)}${badge}</span>
+          <span class="nr-time" title="${esc(fmtTime(r.next_at))}">${esc(_relTime(r.next_at))}</span>
+        </div>`;
+      }).join("");
+    }
+    return html;
   }
 
   async function initDashboard() {
@@ -575,7 +624,7 @@
     // ---- 容量 / 实时 / 即将执行 ----
     setHtml("capacityBox", _capacityHtml(d.capacity));
     setHtml("rtBox", _rtHtml(d.rt));
-    setHtml("nextRunsBox", _nextRunsHtml(d.next_runs));
+    setHtml("nextRunsBox", _nextRunsHtml(d.next_runs, d.running));
 
     // ---- 可信度四指标（演练通过率 / 副本复制成功率 / 环比 / 保护对象覆盖率） ----
     _renderTrustMetrics(d);
@@ -958,7 +1007,18 @@
       // 使存量任务在必填约束下仍可直接保存（设计 D2 / D-3 死锁解除）
       $("t_biz_system").value = task.biz_label || "";
       $("t_name").value = task.name || "";
-      $("t_db_type").value = task.db_type;
+      // 数据库类型下拉只列真数据库：若存量任务的类型不在选项里（如历史文件/
+      // 群晖/对象存储任务），补一个选项再选中，避免 value 赋不上导致保存时类型丢失。
+      if (task.db_type) {
+        const _sel = $("t_db_type");
+        if (_sel && !Array.prototype.some.call(_sel.options, (o) => o.value === task.db_type)) {
+          const opt = document.createElement("option");
+          opt.value = task.db_type;
+          opt.textContent = task.db_display_name || task.db_type;
+          _sel.appendChild(opt);
+        }
+        if (_sel) _sel.value = task.db_type;
+      }
       $("t_host").value = task.host || "";
       $("t_port").value = task.port || "";
       $("t_username").value = task.username || "";
@@ -1659,6 +1719,7 @@
     if ($("t_db_os_user")) $("t_db_os_user").value = "";
     if ($("t_rman_temp_dir")) $("t_rman_temp_dir").value = "";
     if ($("t_rman_channels")) $("t_rman_channels").value = "";
+    if ($("t_engine_parallel")) $("t_engine_parallel").value = "";
     if ($("t_parallel_pull")) $("t_parallel_pull").checked = false;
     if ($("t_backup_stage_dir")) $("t_backup_stage_dir").value = "";
     if ($("t_auto_discover")) $("t_auto_discover").checked = false;
@@ -1677,6 +1738,7 @@
     if ($("t_db_os_user")) $("t_db_os_user").value = eo.db_os_user || "";
     if ($("t_rman_temp_dir")) $("t_rman_temp_dir").value = eo.rman_temp_dir || "";
     if ($("t_rman_channels")) $("t_rman_channels").value = eo.rman_channels ? String(eo.rman_channels) : "";
+    if ($("t_engine_parallel")) $("t_engine_parallel").value = (eo.engine_parallel !== undefined && eo.engine_parallel !== null && eo.engine_parallel !== "") ? String(eo.engine_parallel) : "";
     if ($("t_parallel_pull")) $("t_parallel_pull").checked = !!eo.parallel_pull;
     if ($("t_backup_stage_dir")) $("t_backup_stage_dir").value = eo.backup_stage_dir || "";
     if ($("t_auto_discover")) $("t_auto_discover").checked = !!eo.auto_discover_new_dbs;
@@ -1729,6 +1791,10 @@
     const rch = ($("t_rman_channels") && $("t_rman_channels").value) || "";
     if (rch) eo.rman_channels = parseInt(rch, 10);
     else delete eo.rman_channels;
+    // 单任务引擎并行度（空 = 自动按平台并发上限推算；1 = 强制串行）
+    const ep = ($("t_engine_parallel") && $("t_engine_parallel").value) || "";
+    if (ep !== "") eo.engine_parallel = parseInt(ep, 10);
+    else delete eo.engine_parallel;
     // P1-5：备份片并行拉回
     if ($("t_parallel_pull") && $("t_parallel_pull").checked) eo.parallel_pull = true;
     else delete eo.parallel_pull;
@@ -2057,9 +2123,12 @@
     // 下钻支持：/tasks?db_type=mysql 只看该类型任务（首页分布下钻）；
     // 常规视图 = 纯数据库任务（文件任务独立在「文件备份」页管理，不混排）。
     const qDbType = new URLSearchParams(location.search).get("db_type");
+    // 常规视图 = 纯数据库任务：文件/虚拟机/对象存储/NAS 备份各有独立页面，
+    // 一律不混排进「数据库备份」（否则列表里会冒出 NAS、对象存储任务）。
+    const NON_DB_TYPES = "file,vm,object_storage,synology";
     const url = qDbType
       ? "/api/tasks?db_type=" + encodeURIComponent(qDbType)
-      : "/api/tasks?db_type_exclude=file";
+      : "/api/tasks?db_type_exclude=" + NON_DB_TYPES;
     const tasks = (await api("GET", url)) || [];
     const pg = Pager.slice("tasks", tasks);
     $("taskTable").innerHTML = pg.list.map((t, ti) =>
@@ -2345,7 +2414,12 @@
     // 全面防御：任何元素都可能为 null，全部加保护
     try {
       const dbTypeSel = $("t_db_type");
-      if (dbTypeSel) fillDbTypeSelect(dbTypeSel, ["file"]);
+      // 「数据库备份」任务的类型下拉只能是真的数据库类型：
+      // file / vm / object_storage / synology 有各自独立入口（文件备份、虚拟机备份、
+      // 对象存储备份、NAS 存储），混进这里会让人以为"数据库里能选 NAS"，语义就错了。
+      if (dbTypeSel) {
+        fillDbTypeSelect(dbTypeSel, ["file", "vm", "object_storage", "synology"]);
+      }
       bindTaskFormEvents();
       bindDbPickerEvents();  // 绑定库选择器按钮
       // 任务向导整页化：taskModal 不再是 bootstrap Modal，而是页内区块。
@@ -2668,6 +2742,11 @@
         actions.push(`<button class="btn btn-sm btn-outline-warning" onclick="runSecurityCheck(${r.id})" title="恢复点安全检测（体积突变/熵值/结构嗅探，启发式，非病毒查杀；结论落库）"><i class="bi bi-shield-check"></i></button>`);
         actions.push(`<button class="btn btn-sm btn-outline-info" onclick="BKP.runRestorePrecheck(${r.id})" title="恢复预检：先探测产物/完整性/目标端/工具/空间能否支持恢复"><i class="bi bi-clipboard2-check"></i></button>`);
         actions.push(`<button class="btn btn-sm btn-outline-secondary" onclick="openPoolReplicas(${r.id})" title="副本分布：该备份在两地三中心各池的副本与取回"><i class="bi bi-collection"></i></button>`);
+        // 克隆入口挂在记录（文件）下：直达克隆页并预填该记录
+        const _cloneable = dbType && ["file", "vm", "object_storage", "synology", "netdev"].indexOf(dbType) < 0;
+        if (_cloneable) {
+          actions.push(`<a class="btn btn-sm btn-outline-info" href="/clone?record=${r.id}" title="克隆服务：从该备份产物拉起隔离克隆库（VDB）"><i class="bi bi-layers"></i></a>`);
+        }
       }
       if (actions.length === 0) actions.push('<span class="text-muted">-</span>');
       if (canRestore && isMysqlFamily) {
@@ -3392,6 +3471,16 @@
             if (resultBar && resultBar.classList) resultBar.classList.remove("d-none");
           }
         }
+      } else if (e2 && e2.data && e2.data.precheck) {
+        // 恢复前自动预检拦截（P0-3）：弹完整预检报告（阻断项一目了然）
+        toast(e2.message, "danger", 6000);
+        restoreResultBar("danger", "恢复预检未通过，已拦截本次恢复");
+        if (resultBar && resultBar.classList) resultBar.classList.remove("d-none");
+        if (window.BKP && typeof window.BKP.renderPrecheckModal === "function") {
+          window.BKP.renderPrecheckModal(
+            '恢复前校验 <span class="badge bg-danger fs-6">未通过，已拦截</span>',
+            e2.data.precheck);
+        }
       } else {
         toast(e2.message, "danger");
         restoreResultBar("danger", "恢复失败：" + e2.message);
@@ -3586,6 +3675,13 @@
       $("n_from_addr").value = email.from_addr || "";
       $("n_to").value = (email.to || []).join(", ");
       $("n_use_tls").checked = !!email.use_tls;
+      // 短信渠道（通用 HTTP 网关）
+      const sms = (nc.channels || []).find((c) => c.type === "sms") || {};
+      $("n_sms_url").value = sms.gateway_url || "";
+      $("n_sms_method").value = (sms.method || "GET").toUpperCase();
+      $("n_sms_phones").value = Array.isArray(sms.phones) ? sms.phones.join(", ") : (sms.phones || "");
+      $("n_sms_params").value = sms.params ? JSON.stringify(sms.params) : "";
+      $("n_sms_headers").value = sms.headers ? JSON.stringify(sms.headers) : "";
       // 密码字段提示：已保存 vs 正在修改
       const pwInput = $("n_smtp_password");
       const pwStatus = $("n_pw_status");
@@ -3608,24 +3704,48 @@
           }
         });
       }
+      const _collectNotifyChannels = () => {
+        const channels = [{
+          type: "email",
+          smtp_host: $("n_smtp_host").value,
+          smtp_port: Number($("n_smtp_port").value || 25),
+          smtp_user: $("n_smtp_user").value,
+          smtp_password: $("n_smtp_password").value,
+          from_addr: $("n_from_addr").value,
+          to: $("n_to").value,
+          use_tls: $("n_use_tls").checked,
+        }];
+        // 短信渠道：填了网关地址才提交（避免空渠道覆盖已存配置）
+        const smsUrl = $("n_sms_url").value.trim();
+        if (smsUrl) {
+          const _pj = (id) => {
+            const v = $(id).value.trim();
+            if (!v) return {};
+            try { return JSON.parse(v); }
+            catch (e) { throw new Error("短信参数/请求头 JSON 格式错误: " + e.message); }
+          };
+          channels.push({
+            type: "sms",
+            gateway_url: smsUrl,
+            method: $("n_sms_method").value,
+            phones: $("n_sms_phones").value,
+            params: _pj("n_sms_params"),
+            headers: _pj("n_sms_headers"),
+          });
+        }
+        return channels;
+      };
       $("saveNotifyBtn").onclick = async () => {
-        const data = {
-          enabled: $("n_enabled").checked,
-          on_success: $("n_on_success").checked,
-          on_failure: $("n_on_failure").checked,
-          channels: [{
-            type: "email",
-            smtp_host: $("n_smtp_host").value,
-            smtp_port: Number($("n_smtp_port").value || 25),
-            smtp_user: $("n_smtp_user").value,
-            smtp_password: $("n_smtp_password").value,
-            from_addr: $("n_from_addr").value,
-            to: $("n_to").value,
-            use_tls: $("n_use_tls").checked,
-          }],
-        };
-        try { await api("POST", "/api/notify-config", data); toast("通知配置已保存"); }
-        catch (e) { toast(e.message, "danger"); }
+        try {
+          const data = {
+            enabled: $("n_enabled").checked,
+            on_success: $("n_on_success").checked,
+            on_failure: $("n_on_failure").checked,
+            channels: _collectNotifyChannels(),
+          };
+          await api("POST", "/api/notify-config", data);
+          toast("通知配置已保存");
+        } catch (e) { toast(e.message, "danger"); }
       };
       // 发送测试邮件
       const testBtn = $("testNotifyBtn");
@@ -3635,11 +3755,14 @@
           const user = $("n_smtp_user").value.trim();
           const to = $("n_to").value.trim();
           const pw = $("n_smtp_password").value;
-          if (!host || !user || !to) {
-            toast("请先填写 SMTP 主机/用户/收件人", "warning");
+          const smsUrl = $("n_sms_url").value.trim();
+          const hasEmail = host && user && to;
+          const hasSms = !!smsUrl;
+          if (!hasEmail && !hasSms) {
+            toast("请先填写邮件（SMTP 主机/用户/收件人）或短信（网关 URL+手机号）配置", "warning");
             return;
           }
-          if (!host.includes(".") || /\s/.test(host)) {
+          if (hasEmail && (!host.includes(".") || /\s/.test(host))) {
             toast("SMTP 主机格式不对，应为 smtp.xxx.com 形式（不是邮箱地址）", "warning");
             return;
           }
@@ -3652,22 +3775,16 @@
               enabled: $("n_enabled").checked,
               on_success: $("n_on_success").checked,
               on_failure: $("n_on_failure").checked,
-              channels: [{
-                type: "email",
-                smtp_host: host,
-                smtp_port: Number($("n_smtp_port").value || 25),
-                smtp_user: user,
-                smtp_password: pw,
-                from_addr: $("n_from_addr").value,
-                to: to,
-                use_tls: $("n_use_tls").checked,
-              }],
+              channels: _collectNotifyChannels(),
             });
             const r = await api("POST", "/api/notify-config/test", {});
             if (r.ok) {
-              toast(r.message || "测试邮件已发送，请检查收件箱（含垃圾邮件）", "success", 6000);
+              const per = (r.results || []).map((x) =>
+                x.type + (x.ok ? " ✓" : " ✗")).join(" / ");
+              toast((r.message || "测试通知已发送") + (per ? "  [" + per + "]" : ""),
+                "success", 8000);
             } else {
-              toast("发送失败: " + (r.error || "未知错误"), "danger", 8000);
+              toast("发送失败: " + (r.error || r.message || "未知错误"), "danger", 10000);
             }
           } catch (e) {
             const msg = (e && e.message) ? e.message : "发送失败";
@@ -5759,6 +5876,28 @@
     await rtLoadDaemon();
   }
 
+  /** 清理孤儿实时保护数据：备份任务已删除，但 rt_task / 状态 / 日志段残留。 */
+  async function rtPurgeOrphans() {
+    try {
+      const scan = await api("GET", "/api/rt/orphans");
+      const d = (scan && scan.data) || {};
+      const n = d.orphan_task_count || 0;
+      if (!n) { toast("没有需要清理的孤儿数据", "dark"); return; }
+      const msg = "发现 " + n + " 个孤儿任务（" + (d.rt_tasks_rows || 0) + " 条记录 + " +
+        (d.segment_dirs || 0) + " 个日志段目录，约 " + (d.segment_human || "0") +
+        "）。清理后不可恢复，确认继续？";
+      if (!confirm(msg)) return;
+      const res = await api("POST", "/api/rt/orphans/purge", { dry_run: false, purge_logs: true });
+      const r = (res && res.data) || {};
+      toast("已清理：记录 " + ((r.rt_tasks_deleted || 0) + (r.capture_state_deleted || 0)) +
+        " 条，日志段 " + (r.segment_dirs_deleted || 0) + " 个（" +
+        (r.segment_bytes_freed_human || "0") + "）", "success");
+      if (window.rtLoadTasks) window.rtLoadTasks();
+      if (window.rtLoadDaemon) window.rtLoadDaemon();
+    } catch (e) { toast("清理失败：" + e.message, "danger"); }
+  }
+  window.rtPurgeOrphans = rtPurgeOrphans;
+
   async function rtLoadDaemon() {
     let st = null;
     try { st = await api("GET", "/api/rt/status"); } catch (e) { st = null; }
@@ -6341,6 +6480,8 @@
         await rtLoadHealth();
       } catch (e) { toast("对账失败：" + e.message, "danger"); }
     });
+    const orphanBtn = document.getElementById("rtOrphanBtn");
+    if (orphanBtn) orphanBtn.addEventListener("click", () => rtPurgeOrphans());
     $("rtStartBtn").addEventListener("click", () => rtStartDaemon());
     const stoppedStartBtn = document.getElementById("rtStoppedHintStartBtn");
     if (stoppedStartBtn) stoppedStartBtn.addEventListener("click", () => rtStartDaemon());
@@ -6614,7 +6755,7 @@
         '<td>' + (pg.startNo + dri) + '</td>' +
         '<td>' + esc(dr.name) + '</td>' +
         '<td>' + (dr.task_id ? esc(window._taskNames[dr.task_id] || dr.task_id) : '-') + '</td>' +
-        '<td>' + esc(dr.drill_type === 'real_restore' ? '真实恢复' : dr.drill_type === 'full_recovery' ? '全量检查' : dr.drill_type === 'partial' ? '对象级' : '单表') + '</td>' +
+        '<td>' + esc(dr.drill_type === 'real_restore' ? '真实恢复' : dr.drill_type === 'switch' ? '容灾切换' : dr.drill_type === 'full_recovery' ? '全量检查' : dr.drill_type === 'partial' ? '对象级' : '单表') + '</td>' +
         '<td>' + statusBadge(dr.status) + '</td>' +
         '<td>' + scoreBadge + '</td>' +
         '<td>' + (dr.rto_actual_sec != null ? dr.rto_actual_sec.toFixed(1) + 's' : '-') + '</td>' +
@@ -6654,6 +6795,11 @@
   };
 
   let drillModal;
+  function drillTypeToggle() {
+    const isSwitch = $("drill_type").value === "switch";
+    if ($("drillTaskRow")) $("drillTaskRow").style.display = isSwitch ? "none" : "";
+    if ($("drillLinkRow")) $("drillLinkRow").style.display = isSwitch ? "" : "none";
+  }
   async function initDrills() {
     const dmEl = document.getElementById("drillModal");
     if (dmEl) drillModal = new bootstrap.Modal(dmEl);
@@ -6661,6 +6807,15 @@
     window._taskNames = Object.fromEntries(tasks.map(t => [t.id, t.name]));
     const taskOpts = tasks.map(t => '<option value="' + t.id + '">' + esc(t.name) + ' (' + esc(t.db_type) + ')</option>').join("");
     $("drill_task_id").innerHTML = taskOpts;
+    // 切换演练的容灾链路下拉（只列已配置切换参数的链路）
+    try {
+      const links = (await api("GET", "/api/dr/links")).links || [];
+      const usable = links.filter(l => l.has_failover_config);
+      $("drill_link_id").innerHTML = usable.length
+        ? usable.map(l => '<option value="' + l.id + '">' + esc(l.name) + '（' + esc(l.primary_site || '') + ' → ' + esc(l.dr_site || '') + '）</option>').join("")
+        : '<option value="">无可切换链路（请在容灾页配置主备连接）</option>';
+    } catch (e) { $("drill_link_id").innerHTML = '<option value="">容灾链路加载失败</option>'; }
+    $("drill_type").onchange = drillTypeToggle;
     // 趋势/基线/排程 的任务下拉
     const tf = $("trendTaskFilter"), bt = $("baselineTask"), st = $("schTargets");
     if (tf) tf.innerHTML = '<option value="">全部任务</option>' + taskOpts;
@@ -6669,15 +6824,24 @@
     $("newDrillBtn").onclick = () => {
       $("drill_name").value = ""; $("drill_type").value = "full_recovery";
       $("drill_scheduled").value = ""; $("drill_notes").value = "";
+      drillTypeToggle();
       drillModal.show();
     };
     $("drillSaveBtn").onclick = async () => {
+      const isSwitch = $("drill_type").value === "switch";
       const data = {
-        name: $("drill_name").value, task_id: Number($("drill_task_id").value) || null,
+        name: $("drill_name").value,
         drill_type: $("drill_type").value,
         scheduled_at: $("drill_scheduled").value || null,
         notes: $("drill_notes").value,
       };
+      if (isSwitch) {
+        const lid = Number($("drill_link_id").value) || null;
+        if (!lid) { toast("请选择容灾链路（需已配置主备连接）", "warning"); return; }
+        data.link_id = lid; data.task_id = null;
+      } else {
+        data.task_id = Number($("drill_task_id").value) || null;
+      }
       if (!data.name) { toast("请输入演练名称", "warning"); return; }
       try { const r = await api("POST", "/api/drills", data); toast("已创建演练 " + r.id); drillModal.hide(); await loadDrills(); }
       catch (e) { toast(e.message, "danger"); }
@@ -7115,7 +7279,11 @@
   };
 
   // ==================== 存储管理（三级备份体系） ====================
-  const TYPE_ICONS = { local: "bi-hdd", minio: "bi-cloud-arrow-up", s3: "bi-cloud-check" };
+  const TYPE_ICONS = {
+    local: "bi-hdd", minio: "bi-cloud-arrow-up", s3: "bi-cloud-check",
+    sftp: "bi-hdd-network", tape: "bi-cassette",
+    ftp: "bi-server", mount: "bi-usb-drive",
+  };
   const TYPE_BADGES = { local: "bg-secondary", minio: "bg-warning text-dark", s3: "bg-info" };
   const TIER_LABELS = { 1: "L1 本地", 2: "L2 热数据", 3: "L3 冷归档" };
   let storageModal;
@@ -7493,11 +7661,58 @@
     } catch (e) { toast("取回失败: " + e.message, "danger"); }
   };
 
+  // 存储介质筛选（左侧菜单「FTP 存储 / NFS 挂载 / 外挂存储」→ /storage?kind=xxx）
+  // kind → {label, 新建预置类型, 匹配函数}
+  const STORAGE_KIND_META = {
+    ftp: { label: "FTP 存储", preset: "ftp", addLabel: "新增 FTP 存储目标" },
+    nfs: { label: "NFS 挂载", preset: "mount", addLabel: "新增 NFS 挂载点", medium: ["nfs"] },
+    mount: { label: "外挂存储", preset: "mount", addLabel: "新增外挂存储目标" },
+  };
+
+  function _storageKind() {
+    let kind = "";
+    try { kind = (new URLSearchParams(location.search).get("kind") || "").toLowerCase(); } catch (e) { /* 忽略 */ }
+    return STORAGE_KIND_META[kind] ? kind : "";
+  }
+
+  function _mountMedium(t) {
+    // mount 类目标的介质类型存在 extra_options.medium（nfs/cifs/usb/disk/other）
+    const ex = (t && typeof t.extra_options === "object" && t.extra_options) ? t.extra_options
+      : (t && typeof t.extra_options === "string" ? (() => { try { return JSON.parse(t.extra_options); } catch (e) { return {}; } })() : {});
+    return String((ex && ex.medium) || "").toLowerCase();
+  }
+
+  // 按介质筛选：ftp → type=ftp；nfs → type=mount 且 medium=nfs（老数据无 medium 视为未分类，不进 NFS 视图）；
+  // mount（外挂存储）→ 所有 type=mount（含 NFS，外挂是统称）。
+  function filterTargetsByKind(list, kind) {
+    if (!kind) return list;
+    if (kind === "ftp") return list.filter(t => String(t.type || "").toLowerCase() === "ftp");
+    if (kind === "nfs") return list.filter(t => String(t.type || "").toLowerCase() === "mount" && _mountMedium(t) === "nfs");
+    if (kind === "mount") return list.filter(t => String(t.type || "").toLowerCase() === "mount");
+    return list;
+  }
+
+  function renderKindFilterBar(kind, count) {
+    if (!kind) return;
+    const meta = STORAGE_KIND_META[kind];
+    const bar = $("kindFilterBar");
+    const msg = $("kindFilterMsg");
+    const addLabel = $("kindAddLabel");
+    if (!bar || !msg) return;
+    msg.innerHTML = "当前按介质筛选：<b>" + esc(meta.label) + "</b> · 共 " + count + " 项";
+    if (addLabel) addLabel.textContent = meta.addLabel;
+    bar.classList.remove("d-none");
+  }
+
   async function loadTargets() {
     try {
       const data = await api("GET", "/api/storage/targets");
-      renderTargetList(data.targets || []);
-      updateTierOverview(data.targets || []);
+      const all = data.targets || [];
+      const kind = _storageKind();
+      const list = filterTargetsByKind(all, kind);
+      renderKindFilterBar(kind, list.length);
+      renderTargetList(list, kind);
+      updateTierOverview(list);
     } catch (e) {
       toast("加载存储目标失败: " + e.message, "danger");
     }
@@ -7514,7 +7729,7 @@
   }
 
   // 将目标卡片渲染到对应层级内部（不再有独立列表区）
-  function renderTargetList(targets) {
+  function renderTargetList(targets, kind) {
     const emptyEl = $("emptyState");
     if (!targets.length) {
       // 清空各层级的目标区
@@ -7522,10 +7737,27 @@
         const tEl = $("tier" + tier + "Targets");
         if (tEl) tEl.innerHTML = "";
       }
-      emptyEl.classList.remove("d-none");
+      // 介质筛选下空列表 → 空态给出「按该介质新增」的明确入口，避免看起来点了没反应
+      if (emptyEl) {
+        const meta = kind ? STORAGE_KIND_META[kind] : null;
+        const h = emptyEl.querySelector("h6");
+        const p = emptyEl.querySelector("p");
+        const btn = emptyEl.querySelector("button");
+        if (meta) {
+          if (h) h.textContent = "还没有" + meta.label + "目标";
+          if (p) p.innerHTML = "当前按介质筛选：<b>" + esc(meta.label) + "</b>，暂无匹配的存储目标。"
+            + "<br>点击下方按钮新增一个，或返回 <a href=\"/storage\">全部介质</a> 查看已配置的存储池。";
+          if (btn) btn.innerHTML = '<i class="bi bi-plus-lg me-1"></i>' + meta.addLabel;
+        } else {
+          if (h) h.textContent = "还没有任何存储目标";
+          if (p) p.innerHTML = "存储目标是备份文件的落点：MinIO 热数据(L1) → S3 冷归档(L2) → 源端本地路径(L3)。<br>建议先添加至少一个 MinIO 或 S3 目标。";
+          if (btn) btn.innerHTML = '<i class="bi bi-plus-lg me-1"></i>立即添加第一个存储目标';
+        }
+        emptyEl.classList.remove("d-none");
+      }
       return;
     }
-    emptyEl.classList.add("d-none");
+    if (emptyEl) emptyEl.classList.add("d-none");
 
     // 按tier分组渲染到对应层级的 tierNTargets 容器
     for (let tier = 1; tier <= 3; tier++) {
@@ -7608,13 +7840,21 @@
   }
 
   window.loadTargets = loadTargets;
-  window.openStorageModal = () => {
+  window.openStorageModal = (preType) => {
     editingStorageId = null;
+    const kind = _storageKind();
+    const preset = (typeof preType === "string" && preType)
+      || (kind ? STORAGE_KIND_META[kind].preset : "");
     $("storageModalTitle").textContent = "新增存储目标";
     $("storageForm").reset();
     $("st_id").value = "";
     $("stTestBtn").classList.add("d-none");
     $("stTestResult").innerHTML = "";
+    if (preset) {
+      $("st_type").value = preset;
+      // 介质筛选进入时按该介质预置介质类型，减少一次手工选择
+      if (preset === "mount" && kind === "nfs") $("st_medium_mount").value = "nfs";
+    }
     onStorageTypeChange();
     storageModal.show();
   };
@@ -7657,6 +7897,21 @@
         const ex = (d.extra_options && typeof d.extra_options === "object") ? d.extra_options : {};
         $("st_port_sftp").value = ex.port || 22;
       }
+      else if (d.type === "ftp") {
+        const ex = (d.extra_options && typeof d.extra_options === "object") ? d.extra_options : {};
+        $("st_endpoint_ftp").value = d.endpoint || "";
+        $("st_port_ftp").value = ex.port || 21;
+        $("st_user_ftp").value = d.username || d.access_key || "anonymous";
+        $("st_pass_ftp").value = "";   // 密码不回显，留空=不修改
+        $("st_remote_ftp").value = ex.remote_path || "";
+        $("st_timeout_ftp").value = ex.timeout || 30;
+        $("st_passive_ftp").checked = ex.passive !== false;
+        $("st_tls_ftp").checked = !!ex.tls;
+      }
+      else if (d.type === "mount") {
+        $("st_endpoint_mount").value = d.endpoint || "";
+        $("st_medium_mount").value = _mountMedium(d) || "other";
+      }
       else {
         $("st_endpoint_s3").value = d.endpoint || "";
         $("st_region").value = d.region || "";
@@ -7679,6 +7934,8 @@
     if (type === "local") $("st_fields_local").classList.remove("d-none");
     else if (type === "tape") $("st_fields_tape").classList.remove("d-none");
     else if (type === "sftp") $("st_fields_sftp").classList.remove("d-none");
+    else if (type === "ftp") $("st_fields_ftp").classList.remove("d-none");
+    else if (type === "mount") $("st_fields_mount").classList.remove("d-none");
     else if (type === "minio" || type === "s3") {
       $("st_fields_s3_compat").classList.remove("d-none");
       if (type === "s3") $("st_fields_s3_extra").classList.remove("d-none");
@@ -7712,6 +7969,23 @@
       data.prefix = $("st_prefix_sftp").value.trim();
       data.secret_key = $("st_secret_key").value;  // 留空=不修改
       data.extra_options = { port: parseInt($("st_port_sftp").value || "22", 10) || 22 };
+    } else if (type === "ftp") {
+      data.endpoint = $("st_endpoint_ftp").value.trim();
+      if (!data.endpoint) { toast("请填写 FTP 主机地址", "warning"); return; }
+      data.username = $("st_user_ftp").value.trim() || "anonymous";
+      data.access_key = data.username;            // 表无 username 列，用户名落 access_key
+      data.secret_key = $("st_pass_ftp").value;   // 留空=不修改（新建时留空=匿名）
+      data.extra_options = {
+        port: parseInt($("st_port_ftp").value || "21", 10) || 21,
+        remote_path: $("st_remote_ftp").value.trim(),
+        timeout: parseInt($("st_timeout_ftp").value || "30", 10) || 30,
+        passive: $("st_passive_ftp").checked ? 1 : 0,
+        tls: $("st_tls_ftp").checked ? 1 : 0,
+      };
+    } else if (type === "mount") {
+      data.endpoint = $("st_endpoint_mount").value.trim();
+      if (!data.endpoint) { toast("请填写挂载路径", "warning"); return; }
+      data.extra_options = { medium: $("st_medium_mount").value || "other" };
     } else {
       data.endpoint = $("st_endpoint_s3").value.trim();
       data.region = $("st_region").value.trim();
@@ -7740,9 +8014,9 @@
         await api("PUT", "/api/storage/targets/" + editingStorageId, data);
         toast("已更新: " + name);
       } else {
-        // 新建时 secret_key 必填（MinIO/S3 类型）；磁带/本地无需
-        if (type !== "local" && type !== "tape" && !data.secret_key) {
-          toast("新建 MinIO/S3 存储需填写 Secret Key", "warning");
+        // 新建时 secret_key 必填（MinIO/S3/SFTP 类型）；磁带/本地/外挂无需，FTP 允许匿名登录
+        if (["minio", "s3", "sftp"].indexOf(type) >= 0 && !data.secret_key) {
+          toast("新建 MinIO/S3/SFTP 存储需填写密码或 Secret Key", "warning");
           return;
         }
         const r = await api("POST", "/api/storage/targets", data);
@@ -8002,7 +8276,7 @@
         '<td>' + levelBadge(p.level) + '</td>' +
         '<td>' + rpoText(p.rpo_target_min) + '</td>' +
         '<td>' + rtoText(p.rto_target_min) + '</td>' +
-        '<td>' + backupModeText(p.backup_strategy) + '</td>' +
+        '<td class="small" title="' + esc((p.next_runs || []).join(' / ')) + '">' + esc(p.schedule_summary || backupModeText(p.backup_strategy)) + '</td>' +
         '<td>' + (p.enabled ? '<span class="badge badge-ok">已启用</span>' : '<span class="badge bg-secondary">' + T("已停用") + '</span>') + '</td>' +
         '<td>' + (p.bound_task_count || 0) + ' 个</td>' +
         '<td class="text-end">' +
@@ -8021,6 +8295,93 @@
     const bmEl = document.getElementById("bindModal");
     if (bmEl) bindModalInst = new bootstrap.Modal(bmEl);
 
+    // ---- 调度表单 ↔ 结构化 backup_strategy（2026-11-13 重构）----
+    function collectSchedule() {
+      const unit = $("p_sched_interval_unit").value;
+      const mult = unit === "days" ? 1440 : (unit === "hours" ? 60 : 1);
+      const val = Number($("p_sched_interval_value").value) || 1;
+      const days = Array.from(document.querySelectorAll(".p-full-day:checked"))
+        .map(function (x) { return Number(x.value); });
+      return {
+        enabled: true,
+        type: $("p_sched_type").value,
+        cron_expr: $("p_sched_cron").value.trim(),
+        interval_minutes: Math.max(1, Math.round(val * mult)),
+        full_mode: $("p_sched_mode").value,
+        full_type: $("p_full_type").value,
+        full_days: days,
+        full_time: $("p_full_time").value || "02:00",
+        full_cron_expr: $("p_full_cron").value.trim(),
+        backup_mode: $("p_backup_mode").value,
+      };
+    }
+
+    function collectRetention() {
+      return {
+        days: Number($("p_ret_days").value) || 0,
+        count: Number($("p_ret_count").value) || 0,
+        lock_days: Number($("p_ret_lock").value) || 0,
+      };
+    }
+
+    function applyScheduleToForm(bs) {
+      const b = bs || {};
+      $("p_sched_mode").value = b.full_mode === "mixed" ? "mixed" : "full_only";
+      $("p_sched_type").value = b.type === "cron" ? "cron" : "interval";
+      $("p_sched_cron").value = b.cron_expr || "";
+      const mins = Number(b.interval_minutes || 1440);
+      let unit = "minutes", val = mins;
+      if (mins % 1440 === 0) { unit = "days"; val = mins / 1440; }
+      else if (mins % 60 === 0) { unit = "hours"; val = mins / 60; }
+      $("p_sched_interval_unit").value = unit;
+      $("p_sched_interval_value").value = val;
+      $("p_full_type").value = b.full_type === "cron" ? "cron" : "week";
+      const days = (b.full_days && b.full_days.length)
+        ? b.full_days.map(Number) : [6];
+      document.querySelectorAll(".p-full-day").forEach(function (cb) {
+        cb.checked = days.indexOf(Number(cb.value)) >= 0;
+      });
+      $("p_full_time").value = b.full_time || "02:00";
+      $("p_full_cron").value = b.full_cron_expr || "";
+      $("p_backup_mode").value = b.backup_mode || "";
+      window.onSchedTypeChange();
+      window.onFullTypeChange();
+    }
+
+    window.onSchedTypeChange = function () {
+      const cron = $("p_sched_type").value === "cron";
+      $("p_interval_box").classList.toggle("d-none", cron);
+      $("p_cron_box").classList.toggle("d-none", !cron);
+    };
+
+    window.onFullTypeChange = function () {
+      const cron = $("p_full_type").value === "cron";
+      $("p_full_days_box").classList.toggle("d-none", cron);
+      $("p_full_time_box").classList.toggle("d-none", cron);
+      $("p_full_cron_box").classList.toggle("d-none", !cron);
+    };
+
+    window.previewPolicy = async function () {
+      try {
+        const pv = await api("POST", "/api/policy/preview", {
+          backup_strategy: collectSchedule(),
+          retention: collectRetention(),
+        });
+        let html = "<b>" + esc(pv.summary || "") + "</b>";
+        if (pv.next_runs && pv.next_runs.length) {
+          html += "　下次执行：" + esc(pv.next_runs.join(" / "));
+        }
+        const f = pv.task_fields || {};
+        const bits = [];
+        if (f.schedule_type) bits.push("主调度 " + (f.schedule_type === "cron" ? f.cron_expr : f.interval_minutes + " 分钟"));
+        if (f.mixed_backup) bits.push("组合备份开启（全量 " + (f.full_schedule_days ? "周" + f.full_schedule_days : f.full_schedule_expr) + "）");
+        if (f.retention_days) bits.push("保留 " + f.retention_days + " 天");
+        if (f.retention_count) bits.push(f.retention_count + " 份");
+        if (bits.length) html += "<div class=\"text-muted mt-1\">下发到任务：" + esc(bits.join(" · ")) + "</div>";
+        $("pPreviewText").innerHTML = html;
+      } catch (e) { showPolicyError("预览失败: " + e.message); }
+    };
+
     window.openPolicyModal = function () {
       currentPolicyId = null;
       $("policyModalTitle").textContent = "新建保护策略";
@@ -8029,9 +8390,12 @@
       $("p_level").value = "general";
       $("p_rpo").value = 240;
       $("p_rto").value = 240;
-      $("p_backup_strategy").value = "";
       $("p_link_strategy").value = "";
-      $("p_retention").value = "";
+      $("p_ret_days").value = 14;
+      $("p_ret_count").value = 50;
+      $("p_ret_lock").value = 0;
+      applyScheduleToForm({ type: "interval", interval_minutes: 1440, full_mode: "full_only" });
+      $("pPreviewText").textContent = "填写后点「预览生效效果」查看摘要与下次执行时间";
       $("p_enabled").checked = true;
       $("pFormError").classList.add("d-none");
       policyModalInst.show();
@@ -8049,9 +8413,12 @@
       const d = LEVEL_DEFAULTS[level] || LEVEL_DEFAULTS.general;
       $("p_rpo").value = d.rpo;
       $("p_rto").value = d.rto;
-      $("p_backup_strategy").value = JSON.stringify(d.backup_strategy, null, 2);
+      if (d.backup_strategy) applyScheduleToForm(d.backup_strategy);
       $("p_link_strategy").value = JSON.stringify(d.link_strategy, null, 2);
-      $("p_retention").value = JSON.stringify(d.retention, null, 2);
+      const r = d.retention || {};
+      $("p_ret_days").value = r.days || 0;
+      $("p_ret_count").value = r.count || 0;
+      if (!r.lock_days) $("p_ret_lock").value = 0;
     };
 
     window.savePolicy = async function () {
@@ -8063,22 +8430,25 @@
         rpo_target_min: Number($("p_rpo").value) || 0,
         rto_target_min: Number($("p_rto").value) || 0,
         enabled: $("p_enabled").checked ? 1 : 0,
+        backup_strategy: collectSchedule(),
+        retention: collectRetention(),
       };
-      for (const f of ["backup_strategy", "link_strategy", "retention"]) {
-        const raw = $("p_" + f).value.trim();
-        if (raw) {
-          try { payload[f] = JSON.parse(raw); }
-          catch (e) { showPolicyError(f + " 不是合法 JSON: " + e.message); return; }
-        }
+      const rawLink = $("p_link_strategy").value.trim();
+      if (rawLink) {
+        try { payload.link_strategy = JSON.parse(rawLink); }
+        catch (e) { showPolicyError("容灾链路策略不是合法 JSON: " + e.message); return; }
       }
       try {
+        let resp;
         if (currentPolicyId) {
-          await api("PUT", "/api/policy/" + currentPolicyId, payload);
+          resp = await api("PUT", "/api/policy/" + currentPolicyId, payload);
           toast("策略已更新", "success");
         } else {
-          await api("POST", "/api/policy", payload);
+          resp = await api("POST", "/api/policy", payload);
           toast("策略已创建", "success");
         }
+        const n = (resp && resp.sync && resp.sync.updated) || 0;
+        if (n) toast("已同步 " + n + " 个绑定任务的调度与保留", "info", 4000);
         policyModalInst.hide();
         await loadPolicies();
       } catch (e) { showPolicyError(e.message); }
@@ -8093,12 +8463,16 @@
       $("p_level").value = p.level || "general";
       $("p_rpo").value = p.rpo_target_min != null ? p.rpo_target_min : 0;
       $("p_rto").value = p.rto_target_min != null ? p.rto_target_min : 0;
-      $("p_backup_strategy").value = p.backup_strategy ? JSON.stringify(p.backup_strategy, null, 2) : "";
+      applyScheduleToForm(p.backup_strategy || {});
       $("p_link_strategy").value = p.link_strategy ? JSON.stringify(p.link_strategy, null, 2) : "";
-      $("p_retention").value = p.retention ? JSON.stringify(p.retention, null, 2) : "";
+      const r = p.retention || {};
+      $("p_ret_days").value = r.days || 0;
+      $("p_ret_count").value = r.count || 0;
+      $("p_ret_lock").value = r.lock_days || 0;
       $("p_enabled").checked = !!p.enabled;
       $("pFormError").classList.add("d-none");
       policyModalInst.show();
+      previewPolicy();
     };
 
     window.deletePolicy = async function (id) {
@@ -8588,7 +8962,7 @@
       try {
         const recs = await api("GET", "/api/records");
         CLONE_RECORDS = (recs || []).map(function (r) {
-          return { id: r.id, label: fmtRecordLabel(r), raw: (r.task_name || "") + " " + (r.db_type || "") + " " + r.id };
+          return { id: r.id, label: fmtRecordLabel(r), dbt: r.db_type || "", raw: (r.task_name || "") + " " + (r.db_type || "") + " " + r.id };
         });
       } catch (e) { CLONE_RECORDS = []; }
       hidden.value = "";
@@ -8608,6 +8982,20 @@
       }).join("") : '<span class="list-group-item text-muted py-1" style="font-size:.86rem">无匹配记录</span>';
       list.style.display = "block";
     }
+    // 选中源记录后按库型显示克隆方式提示（此前弹窗信息杂乱、用户不知道 Oracle 会怎么克隆）
+    function updateCloneHint(dbt) {
+      const el = $("c_mode_hint");
+      if (!el) return;
+      const M = {
+        oracle: "Oracle：将从备份产物导入为新 schema（clone_N，与源同实例）。",
+        dameng: "达梦：将在源实例上创建独立 schema（clone_N）完成克隆。",
+        mysql: "MySQL：将流式导入为独立克隆库 clone_N。",
+        mariadb: "MariaDB：将流式导入为独立克隆库 clone_N。",
+        postgresql: "PostgreSQL：将导入为独立克隆库 clone_N。",
+        kingbase: "金仓：将导入为独立克隆库 clone_N。"
+      };
+      el.textContent = M[dbt] || "将从备份产物真实导入拉起隔离克隆库（VDB）。";
+    }
     function bindSourceSearch() {
       const input = $("c_source_search"), list = $("c_source_list"),
         hidden = $("c_source_record_id");
@@ -8625,6 +9013,8 @@
         hidden.value = btn.dataset.id;
         input.value = btn.dataset.label;
         list.style.display = "none";
+        const hit = CLONE_RECORDS.find(function (r) { return Number(r.id) === Number(btn.dataset.id); });
+        updateCloneHint(hit ? hit.dbt : "");
       });
     }
 
@@ -8653,8 +9043,14 @@
         // VDB 连接信息：就绪时展示可直接使用的连接串
         let vdb = '-';
         if (c.status === 'ready' && c.vdb_dbname) {
+          // 整实例克隆：库名是 clone_N，实际库为 clone_N__<原库>（note 里带 scope 标记）
+          const _full = String(c.note || '').indexOf('scope=full_instance') >= 0;
+          const _tag = _full
+            ? ' <span class="badge bg-info" style="font-size:.62em" title="整实例 VDB：按库拆分为 ' +
+              esc(c.vdb_dbname) + '__&lt;原库名&gt;，校验可看库数/表数">整实例</span>'
+            : '';
           vdb = '<code title="' + esc((c.vdb_username || '') + '@' + (c.vdb_host || '127.0.0.1') + ':' + (c.vdb_port || '-') + '/' + c.vdb_dbname) + '">' +
-            esc((c.vdb_host || '127.0.0.1') + ':' + (c.vdb_port || '-') + '/' + c.vdb_dbname) + '</code>';
+            esc((c.vdb_host || '127.0.0.1') + ':' + (c.vdb_port || '-') + '/' + c.vdb_dbname) + '</code>' + _tag;
         } else if (c.vdb_instance_id) {
           vdb = "实例 " + c.vdb_instance_id;
         }
@@ -8666,6 +9062,14 @@
         if (c.status === 'ready') {
           actions.push('<button class="btn btn-sm btn-outline-success" onclick="verifyClone(' + c.id + ')">' +
             '<i class="bi bi-shield-check"></i> 校验</button>');
+          // VDB 快照（快照式备份/恢复）：仅快照引擎支持的库型展示
+          if (SNAP_SUPPORT.indexOf(c.source_db_type) >= 0) {
+            actions.push('<button class="btn btn-sm btn-outline-primary" onclick="openSnapModal(' + c.id + ')" title="VDB 快照：数据级备份，可随时恢复到该时间点">' +
+              '<i class="bi bi-camera"></i> 快照</button>');
+          }
+          if (c.source_record_id) {
+            actions.push('<a class="btn btn-sm btn-outline-primary" href="/restore?record_id=' + c.source_record_id + '" title="从源备份产物发起数据恢复">去恢复</a>');
+          }
           // B3 应急接管：emergency 用途的克隆给「接管检查」按钮
           actions.push('<button class="btn btn-sm btn-outline-warning" onclick="takeoverCheck(' + c.id + ')" title="应急接管就绪检查：直连/表数量/行数抽样">' +
             '<i class="bi bi-lightning-charge"></i> 接管检查</button>');
@@ -8748,13 +9152,94 @@
       } catch (e) { toast(e.message, "danger"); }
     };
 
-    window.openCloneModal = async function () {
+    // ---- VDB 快照（快照式备份/恢复：创建 / 恢复回滚 / 再克隆 / 删除）----
+    // 与后端 core/vdb_snapshot.py SUPPORTED 保持一致
+    const SNAP_SUPPORT = ["mysql", "mariadb", "postgresql", "kingbase"];
+    let snapModalInst = null, snapCloneId = 0;
+    function _snapHsz(b) {
+      b = Number(b) || 0;
+      if (b < 1024) return b + " B";
+      const u = ["KB", "MB", "GB", "TB"]; let i = -1;
+      do { b /= 1024; i++; } while (b >= 1024 && i < u.length - 1);
+      return b.toFixed(1) + " " + u[i];
+    }
+    window.openSnapModal = async function (id) {
+      snapCloneId = id;
+      $("snapCloneLabel").textContent = "克隆 #" + id;
+      const _n = $("snapName"); if (_n) _n.value = "";
+      if (!snapModalInst) snapModalInst = new bootstrap.Modal($("snapModal"));
+      snapModalInst.show();
+      await loadSnapshots(id);
+    };
+    window.loadSnapshots = async function (id) {
+      let rows = [];
+      try { rows = await api("GET", "/api/clone/" + id + "/snapshots") || []; }
+      catch (e) { toast(e.message, "danger"); }
+      $("snapTable").innerHTML = (rows || []).length ? rows.map(function (s, si) {
+        const acts = [];
+        if (s.status === "ready") {
+          acts.push('<button class="btn btn-sm btn-outline-warning" onclick="rollbackVdbSnap(' + id + ',' + s.id + ')" title="恢复：把 VDB 数据回滚到该快照点（需操作验证）"><i class="bi bi-arrow-counterclockwise"></i> 恢复</button>');
+          acts.push('<button class="btn btn-sm btn-outline-info" onclick="recloneVdbSnap(' + id + ',' + s.id + ')" title="从该快照再克隆一个新 VDB"><i class="bi bi-layers"></i> 再克隆</button>');
+        }
+        acts.push('<button class="btn btn-sm btn-outline-danger" onclick="deleteVdbSnap(' + id + ',' + s.id + ')" title="删除快照点（产物文件保留审计）"><i class="bi bi-trash"></i></button>');
+        return '<tr>' +
+          '<td>' + (si + 1) + '</td>' +
+          '<td>' + esc(s.name || '-') + '</td>' +
+          '<td class="small text-muted">' + esc(s.created_at || '-') + '</td>' +
+          '<td class="small">' + (s.table_count == null ? '-' : s.table_count) + ' 表 / ' + (s.row_count == null ? '-' : s.row_count) + ' 行</td>' +
+          '<td class="small">' + _snapHsz(s.size_bytes) + '</td>' +
+          '<td>' + (s.status === "ready" ? '<span class="badge bg-success">就绪</span>' : '<span class="badge bg-secondary">' + esc(s.status || '-') + '</span>') + '</td>' +
+          '<td class="text-end">' + acts.join(' ') + '</td>' +
+        '</tr>';
+      }).join("") : '<tr><td colspan="7" class="text-muted text-center">暂无快照 —— 点击上方「创建快照」为该 VDB 做一次数据级备份</td></tr>';
+    };
+    window.rollbackVdbSnap = async function (cloneId, snapId) {
+      const ok = await confirmDialog({ title: "恢复 VDB 快照", message: "确认把该 VDB 数据恢复到快照 #" + snapId + "？快照之后的变更将被清除（可先创建当前状态的新快照）。", confirmText: "恢复", danger: true });
+      if (!ok) return;
+      try {
+        const r = await verifyGate((code) =>
+          api("POST", "/api/clone/" + cloneId + "/snapshots/" + snapId + "/rollback",
+              code ? { verify_code: code } : {}));
+        toast("已恢复到快照：" + (r.message || "完成"), "success");
+      } catch (e) { toast(e.message, "danger"); }
+      await loadSnapshots(cloneId);
+    };
+    window.recloneVdbSnap = async function (cloneId, snapId) {
+      try {
+        await api("POST", "/api/clone/" + cloneId + "/snapshots/" + snapId + "/reclone", {});
+        toast("已从快照发起新克隆（列表自动刷新）", "success");
+        await loadClones();
+      } catch (e) { toast(e.message, "danger"); }
+    };
+    window.deleteVdbSnap = async function (cloneId, snapId) {
+      const ok = await confirmDialog({ title: "删除快照", message: "确认删除快照 #" + snapId + "？该快照点将不可再用于恢复（产物文件保留审计）。", confirmText: "删除", danger: true });
+      if (!ok) return;
+      try {
+        await api("DELETE", "/api/clone/" + cloneId + "/snapshots/" + snapId);
+        toast("已删除", "success");
+      } catch (e) { toast(e.message, "danger"); }
+      await loadSnapshots(cloneId);
+    };
+
+    window.openCloneModal = async function (prefillId) {
       await Promise.all([loadRecordsInto(), loadHostOptions()]);
-      $("c_target_env").value = "";
+      $("c_target_env").value = "clone";
       $("c_target_host").value = "127.0.0.1";
       $("c_target_password").value = "";
       $("c_requested_by").value = "";
       $("c_note").value = "";
+      updateCloneHint("");
+      // 深链预填：/clone?record=N（备份记录页「克隆」入口直达）
+      if (prefillId) {
+        const hit = CLONE_RECORDS.find(function (r) { return Number(r.id) === Number(prefillId); });
+        if (hit) {
+          $("c_source_record_id").value = hit.id;
+          $("c_source_search").value = hit.label;
+          updateCloneHint(hit.dbt);
+        } else {
+          toast("备份记录 #" + prefillId + " 不存在或不可克隆", "warning");
+        }
+      }
       const _pf = $("c_preflight");
       if (_pf) _pf.innerHTML = "提交前可先做只读预检：源产物 / 目标端口 / 磁盘余量 / 凭据 / 安全隔离态（不创建申请、不拉起 VDB）。";
       if (cloneModalInst) cloneModalInst.show();
@@ -8771,6 +9256,10 @@
         note: $("c_note").value,
         purpose: $("c_purpose") ? $("c_purpose").value : "test",
       };
+      // 整实例备份：可按库白名单克隆（留空=归档内全部库）
+      const _dbs = ($("c_databases") ? $("c_databases").value : "").split(/[,，\s]+/)
+        .map(s => s.trim()).filter(Boolean);
+      if (_dbs.length) payload.databases = _dbs;
       if (!payload.target_env) { toast("请填写目标环境", "warning"); return; }
       try {
         await api("POST", "/api/clone", payload);
@@ -8807,8 +9296,21 @@
     };
 
     bindSourceSearch();
-    $("newCloneBtn").addEventListener("click", window.openCloneModal);
+    $("newCloneBtn").addEventListener("click", function () { window.openCloneModal(); });
     $("cloneSaveBtn").addEventListener("click", window.saveClone);
+    $("snapCreateBtn").addEventListener("click", async function () {
+      if (!snapCloneId) return;
+      try {
+        await api("POST", "/api/clone/" + snapCloneId + "/snapshots",
+                  { name: ($("snapName") ? $("snapName").value : "").trim() });
+        toast("快照已创建", "success");
+        await loadSnapshots(snapCloneId);
+      } catch (e) { toast(e.message, "danger"); }
+    });
+
+    // 深链：/clone?record=N —— 备份记录页「克隆」入口直达并预填弹窗
+    const _qRec = Number(new URLSearchParams(location.search).get("record") || 0);
+    if (_qRec > 0) await window.openCloneModal(_qRec);
 
     await loadClones();
   }
@@ -9582,6 +10084,24 @@
     });
 
     /** 清空表单到「新增」初态。 */
+    // 地域输入 ⇆ JSON：文本 "成都,30.57,104.06" ⇆ {city:"成都",lat:30.57,lon:104.06}
+    function _regionInputToJson(text) {
+      const s = (text || "").trim();
+      if (!s) return null;
+      const parts = s.split(",").map(x => x.trim());
+      if (parts.length < 2) return { city: parts[0] || "", lat: null, lon: null };
+      const lat = parseFloat(parts[1]);
+      const lon = parseFloat(parts[2] || "");
+      return { city: parts[0], lat: isNaN(lat) ? null : lat, lon: isNaN(lon) ? null : lon };
+    }
+    function _regionJsonToInput(obj) {
+      if (!obj || typeof obj !== "object") return "";
+      const city = obj.city || "";
+      if (!city) return "";
+      return (obj.lat != null && obj.lon != null)
+        ? city + "," + obj.lat + "," + obj.lon : city;
+    }
+
     function resetLinkForm() {
       $("l_id").value = "";
       $("l_name").value = "";
@@ -9589,6 +10109,8 @@
       $("l_enabled").value = "1";
       $("l_primary_site").value = "";
       $("l_dr_site").value = "";
+      $("l_primary_region").value = "";
+      $("l_dr_region").value = "";
       $("l_route_policy").value = "";
       $("l_note").value = "";
       $("l_source_kind").value = "manual";
@@ -9633,6 +10155,8 @@
         enabled: $("l_enabled").value === "1" ? 1 : 0,
         primary_site: $("l_primary_site").value.trim(),
         dr_site: $("l_dr_site").value.trim(),
+        primary_region: _regionInputToJson($("l_primary_region").value),
+        dr_region: _regionInputToJson($("l_dr_region").value),
         note: $("l_note").value.trim(),
         // T09 后端新增字段；后端未就绪时会被忽略（白名单写入），不影响既有字段落库
         source_kind: sourceKind,
@@ -9663,6 +10187,8 @@
       $("l_enabled").value = l.enabled ? "1" : "0";
       $("l_primary_site").value = l.primary_site || "";
       $("l_dr_site").value = l.dr_site || "";
+      $("l_primary_region").value = _regionJsonToInput(l.primary_region);
+      $("l_dr_region").value = _regionJsonToInput(l.dr_region);
       $("l_route_policy").value = l.route_policy ? JSON.stringify(l.route_policy, null, 2) : "";
       $("l_note").value = l.note || "";
 
@@ -10085,12 +10611,13 @@
           return `<tr>
             <td>${i + 1}</td>
             <td><strong>${esc(p.name)}</strong>${p.enabled ? "" : ' <span class="badge bg-secondary">停用</span>'}
+              ${p.running ? ' <span class="badge bg-info text-dark">运行中</span>' : ""}
               ${p.cron ? `<div class="small text-muted">cron ${esc(p.cron)}</div>` : ""}</td>
             <td class="small">${members || "-"}</td>
             <td class="small">${p.max_drift_sec}s</td>
             <td class="small">${lastCell}</td>
             <td class="text-end text-nowrap">
-              <button class="btn btn-sm btn-outline-primary" onclick="runAiPlan(${p.id})">运行</button>
+              <button class="btn btn-sm btn-outline-primary" onclick="runAiPlan(${p.id})"${p.running ? " disabled" : ""}>${p.running ? "运行中…" : "运行"}</button>
               ${lr ? `<button class="btn btn-sm btn-outline-info" onclick='showAiReport(${JSON.stringify(lr).replace(/'/g, "&#39;")})'>报告</button>` : ""}
               <button class="btn btn-sm btn-outline-secondary" onclick="openAiPlanModal(${p.id})">编辑</button>
               <button class="btn btn-sm btn-outline-danger" onclick="delAiPlan(${p.id})">删除</button>
@@ -10099,83 +10626,191 @@
     } catch (e) { toast(e.message, "danger"); }
   };
 
+  // ---- AI 保护计划：任务缓存 / 编辑定位 / 状态层推荐 ----
+  let AI_TASKS = null;        // 任务列表缓存（打开弹窗加载一次，避免每加一行请求一次）
+  let AI_EDITING_ID = null;   // 正在编辑的计划 id（此前按"名称"反查，改名后会改错计划）
+  const AI_LAYER_HINT = {     // 任务库型 → 推荐状态层（选中任务后自动带出，仍可手改）
+    file: "weights", object_storage: "dataset",
+    qdrant: "vector_index", chroma: "vector_index",
+    mysql: "rdb_metadata", mariadb: "rdb_metadata", postgresql: "rdb_metadata",
+    oracle: "rdb_metadata", dameng: "rdb_metadata", kingbase: "rdb_metadata",
+    opengauss: "rdb_metadata", mssql: "rdb_metadata", redis: "rdb_metadata",
+    mongodb: "rdb_metadata",
+  };
+
+  async function loadAiTasks(force) {
+    if (AI_TASKS && !force) return AI_TASKS;
+    try {
+      const d = await api("GET", "/api/tasks");
+      AI_TASKS = Array.isArray(d) ? d : ((d && (d.data || d.items)) || []);
+    } catch (e) { AI_TASKS = []; }
+    return AI_TASKS;
+  }
+  function aiTaskOptions() {
+    return (AI_TASKS || []).map((t) =>
+      `<option value="${t.id}">${esc(t.name)}（${esc(t.db_display_name || t.db_type)}）</option>`).join("");
+  }
+  window.aiReloadTaskOptions = async function () {
+    await loadAiTasks(true);
+    document.querySelectorAll("#aiMemberRows .ai-m-task").forEach((sel) => {
+      const cur = sel.value;
+      sel.innerHTML = '<option value="">请选择备份任务…</option>' + aiTaskOptions();
+      if (cur) sel.value = cur;
+    });
+  };
+
   window.aiAddMemberRow = function (taskId, layer) {
     const tb = $("aiMemberRows");
     if (!tb) return;
+    const tasks = AI_TASKS || [];
     const tr = document.createElement("tr");
     tr.innerHTML =
-      '<td><select class="form-select form-select-sm ai-m-task"><option value="">选择备份任务…</option></select></td>' +
+      '<td><select class="form-select form-select-sm ai-m-task">' +
+      '<option value="">' + (tasks.length ? "请选择备份任务…" : "暂无备份任务，请先新建") + "</option>" +
+      aiTaskOptions() + "</select></td>" +
       '<td><select class="form-select form-select-sm ai-m-layer">' +
       AI_LAYERS.map(([k, v]) => `<option value="${k}" ${layer === k ? "selected" : ""}>${v}</option>`).join("") +
       '</select></td>' +
       '<td><button class="btn btn-sm btn-outline-danger" onclick="this.closest(\'tr\').remove()">删</button></td>';
     tb.appendChild(tr);
-    // 异步填充任务下拉
-    api("GET", "/api/tasks").then((tasks) => {
-      const sel = tr.querySelector(".ai-m-task");
-      sel.innerHTML = '<option value="">选择备份任务…</option>' +
-        (tasks || []).map((t) =>
-          `<option value="${t.id}" ${taskId === t.id ? "selected" : ""}>${esc(t.name)}（${esc(t.db_display_name || t.db_type)}）</option>`).join("");
-    }).catch(() => {});
+    const sel = tr.querySelector(".ai-m-task");
+    if (taskId) sel.value = String(taskId);
+    // 选中任务后按库型推荐状态层（避免"达梦库任务标成模型权重"这类错配）
+    sel.addEventListener("change", () => {
+      const t = tasks.find((x) => String(x.id) === sel.value);
+      const layerSel = tr.querySelector(".ai-m-layer");
+      if (t && layerSel && AI_LAYER_HINT[t.db_type]) {
+        layerSel.value = AI_LAYER_HINT[t.db_type];
+      }
+    });
+  };
+
+  /* 弹窗内直接创建一个文件类资产备份任务（模型权重 / 数据集 / 配置目录），
+     解决"必须先到别的页面建任务再回来选"的逻辑倒置 */
+  window.aiQuickCreateAssetTask = async function () {
+    const msg = $("ai_quick_msg");
+    if (!msg) return;
+    const name = ($("ai_q_name").value || "").trim();
+    const host = ($("ai_q_host").value || "127.0.0.1").trim() || "127.0.0.1";
+    const paths = ($("ai_q_paths").value || "").split(/[\n,]+/)
+      .map((s) => s.trim()).filter(Boolean);
+    if (!name) { msg.textContent = "请填写任务名称"; return; }
+    if (!paths.length) { msg.textContent = "请填写至少一个资产路径"; return; }
+    if (paths.some((p) => !p.startsWith("/"))) {
+      msg.textContent = "路径须为绝对路径（以 / 开头）"; return;
+    }
+    msg.textContent = "创建中…";
+    try {
+      const r = await api("POST", "/api/tasks", {
+        name: name, db_type: "file", host: host, port: 0,
+        username: "", password: "", db_name: paths[0],
+        backup_mode: "logical", backup_type: "full", enabled: 1,
+        biz_system: "AI 资产",
+        extra_options: { source_paths: paths },
+      });
+      const newId = r && (r.id || (r.data || {}).id);
+      msg.textContent = "";
+      await loadAiTasks(true);
+      const tip = $("aiNoTaskTip");
+      if (tip) tip.classList.add("d-none");
+      window.aiAddMemberRow(newId, "weights");
+      toast("资产备份任务已创建并加入成员", "success");
+    } catch (e) {
+      msg.textContent = "创建失败：" + e.message;
+    }
   };
 
   window.openAiPlanModal = async function (id) {
     $("ai_plan_msg").textContent = "";
     $("aiMemberRows").innerHTML = "";
+    AI_EDITING_ID = id || null;
     let plan = null;
     if (id) {
-      const d = await api("GET", "/api/ai-plans");
-      plan = (d.plans || []).find((p) => p.id === id);
+      try { plan = await api("GET", `/api/ai-plans/${id}`); }
+      catch (e) { toast(e.message, "danger"); return; }
       $("aiPlanTitle").textContent = "编辑保护计划";
     } else {
       $("aiPlanTitle").textContent = "新建保护计划";
     }
+    await loadAiTasks(true);   // 一次加载，成员行复用（原来每行一次请求）
     $("ai_name").value = plan ? plan.name : "";
     $("ai_drift").value = plan ? plan.max_drift_sec : 300;
     $("ai_cron").value = plan ? (plan.cron || "") : "";
     $("ai_remark").value = plan ? (plan.remark || "") : "";
+    if ($("ai_enabled")) $("ai_enabled").checked = plan ? !!plan.enabled : true;
     (plan && plan.members || []).forEach((m) => window.aiAddMemberRow(m.task_id, m.layer));
     if (!plan || !(plan.members || []).length) window.aiAddMemberRow();
+    // 平台还没有任何备份任务时，明确给出"先建资产任务"的入口
+    const tip = $("aiNoTaskTip");
+    if (tip) tip.classList.toggle("d-none", (AI_TASKS || []).length > 0);
     bootstrap.Modal.getOrCreateInstance($("aiPlanModal")).show();
   };
 
   window.saveAiPlan = async function () {
+    const msg = $("ai_plan_msg");
+    msg.textContent = "";
     const rows = [...document.querySelectorAll("#aiMemberRows tr")];
-    const members = rows.map((tr) => ({
-      task_id: parseInt(tr.querySelector(".ai-m-task").value, 10) || null,
-      layer: tr.querySelector(".ai-m-layer").value,
-    })).filter((m) => m.task_id);
+    const members = [];
+    const seen = new Set();
+    let dup = false;
+    rows.forEach((tr) => {
+      const tid = parseInt(tr.querySelector(".ai-m-task").value, 10) || null;
+      if (!tid) return;
+      if (seen.has(tid)) { dup = true; return; }   // 同一任务重复编入无意义
+      seen.add(tid);
+      members.push({ task_id: tid, layer: tr.querySelector(".ai-m-layer").value });
+    });
+    const name = $("ai_name").value.trim();
+    if (!name) { msg.textContent = "请填写计划名称"; return; }
+    if (!members.length) {
+      msg.textContent = "请至少选择一个成员资产（可先在下方新建资产备份任务）";
+      return;
+    }
     const payload = {
-      name: $("ai_name").value.trim(),
+      name: name,
       max_drift_sec: parseInt($("ai_drift").value, 10) || 300,
       cron: $("ai_cron").value.trim(),
       remark: $("ai_remark").value.trim(),
+      enabled: $("ai_enabled") ? $("ai_enabled").checked : true,
       members,
     };
     try {
-      const editing = $("aiPlanTitle").textContent.indexOf("编辑") === 0;
-      if (editing) {
-        // 从列表找回当前编辑 id
-        const d = await api("GET", "/api/ai-plans");
-        const cur = (d.plans || []).find((p) => p.name === payload.name) ||
-          (d.plans || [])[0];
-        if (!cur) throw new Error("未找到要编辑的计划");
-        await api("PUT", `/api/ai-plans/${cur.id}`, payload);
+      if (AI_EDITING_ID) {
+        await api("PUT", `/api/ai-plans/${AI_EDITING_ID}`, payload);
       } else {
         await api("POST", "/api/ai-plans", payload);
       }
-      toast("保护计划已保存", "success");
+      toast(dup ? "保护计划已保存（已忽略重复成员）" : "保护计划已保存", "success");
       bootstrap.Modal.getOrCreateInstance($("aiPlanModal")).hide();
+      AI_EDITING_ID = null;
       await loadAiPlans();
-    } catch (e) { $("ai_plan_msg").textContent = e.message; }
+    } catch (e) { msg.textContent = e.message; }
   };
 
   window.runAiPlan = async function (id) {
-    toast("保护计划运行中（按序驱动成员任务备份）…", "info");
     try {
-      const report = await api("POST", `/api/ai-plans/${id}/run`, {});
-      window.showAiReport(report);
+      const r = await api("POST", `/api/ai-plans/${id}/run`, {});
+      toast(r.message || "计划已开始运行（按序驱动成员备份）…", "info");
       await loadAiPlans();
+      // 异步执行：轮询计划列表，跑完自动弹出组恢复点报告（最长约 10 分钟）
+      let tries = 0;
+      const timer = setInterval(async () => {
+        tries += 1;
+        try {
+          const d = await api("GET", "/api/ai-plans");
+          const p = (d.plans || []).find((x) => x.id === id);
+          await loadAiPlans();
+          if (p && !p.running) {
+            clearInterval(timer);
+            if (p.last_result) window.showAiReport(p.last_result);
+            else toast("计划运行结束，但未产出组恢复点报告", "warning");
+          }
+        } catch (e) { /* 单次轮询失败忽略，下一轮继续 */ }
+        if (tries > 120) {
+          clearInterval(timer);
+          toast("计划仍在运行（成员备份较慢），请稍后刷新查看报告", "info");
+        }
+      }, 5000);
     } catch (e) { toast(e.message, "danger"); }
   };
 

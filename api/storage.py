@@ -302,7 +302,9 @@ def api_create_target():
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         data["name"], stype, data.get("tier", TYPE_META[stype]["tier"]),
-        data.get("endpoint", ""), data.get("access_key", ""),
+        # FTP / SFTP 的登录用户名复用 access_key 列（表无 username 列）：
+        # 前端历史上提交的是 username，此前被静默丢弃 → 连接恒用 root/anonymous。
+        data.get("endpoint", ""), data.get("access_key") or data.get("username") or "",
         secret, data.get("bucket", ""), data.get("region", ""),
         (data.get("prefix") or "").strip("/"),
         1 if data.get("enabled") else 0,
@@ -328,6 +330,11 @@ def api_update_target(target_id):
     now = db.now_iso()
     if "type" in data and data.get("type") not in TYPE_META:
         return jsonify({"error": "不支持的存储类型: %s" % data.get("type")}), 400
+
+    # FTP / SFTP 前端提交的是 username，落库列是 access_key（表无 username 列），这里归一
+    if "username" in data and not data.get("access_key"):
+        data = dict(data)
+        data["access_key"] = data.get("username") or ""
 
     allowed = [
         "name", "type", "tier", "endpoint", "access_key", "bucket",
@@ -434,6 +441,26 @@ def api_list_enabled_targets():
         d = _row_to_dict(t)
         result.append(d)
     return jsonify({"targets": result})
+
+
+@api_bp.route("/storage/media", methods=["GET"])
+@login_required
+def api_storage_media():
+    """存储介质统一总览：所有介质 + 状态 + 用量 + 最近备份。
+
+    供 /storage-media 页面消费；用量按介质能力如实采集（本地精确、远端按需探测）。
+    """
+    from core import storage_media
+    return jsonify(storage_media.media_overview())
+
+
+@api_bp.route("/storage/media/<int:target_id>/probe", methods=["POST"])
+@login_required
+def api_storage_media_probe(target_id: int):
+    """对单个介质做实时探测（连通性 + 用量），并刷新 last_test_at/last_error。"""
+    from core import storage_media
+    res = storage_media.probe_media(target_id)
+    return jsonify(res), (200 if res.get("ok") else 400)
 
 
 @api_bp.route("/storage/stats", methods=["GET"])

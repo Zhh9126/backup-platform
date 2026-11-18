@@ -268,7 +268,43 @@ def cross_host_restore(db_type: str, backup_path: str, target_host_info: dict,
                 continue
             log(f"REMOTE: {s}")
         ok = rc == 0
+        if not ok and db_type == "dameng":
+            # 达梦 dimp 在「导入成功但有警告」时返回 2（日志「成功终止导入」）。
+            # 跨主机恢复与引擎内通道必须同口径，否则同一份产物两条通道结论不一致。
+            try:
+                from core.engines.dameng import DamengEngine
+                _okd, _note = DamengEngine._dimp_result_ok(rc, out_s + err_s)
+                if _okd:
+                    ok = True
+                    log(f"[达梦] {_note}")
+            except Exception:  # noqa: BLE001
+                pass
         msg = f"恢复{'成功' if ok else '失败'}(rc={rc})"
+        # 达梦：dimp 在「目标模式里没有任何对象」时同样返回 0（假成功，170 实测）。
+        # 指定目标模式时回查对象数，0 即如实判失败。
+        if ok and db_type == "dameng" and (target_db or "").strip():
+            try:
+                import dmPython as _dm
+                _pwv = extra.get("source_password") or extra.get("dm_sysdba") or ""
+                _thost = ((target_host_info or {}).get("hostname")
+                          or extra.get("source_host") or "127.0.0.1")
+                _c = _dm.connect(user="SYSDBA", password=_pwv, server=_thost,
+                                 port=int(extra.get("source_port") or 5236),
+                                 login_timeout=6)
+                _cur = _c.cursor()
+                _cur.execute("SELECT COUNT(*) FROM DBA_OBJECTS WHERE OWNER='%s'"
+                             % str(target_db).upper().replace("'", "''"))
+                _n = int((_cur.fetchone() or [0])[0] or 0)
+                _cur.close()
+                _c.close()
+                if _n <= 0:
+                    ok = False
+                    msg = (f"恢复失败(rc={rc})：目标模式 {target_db} 内无任何对象"
+                           f"（dimp 未实际导入，请核对备份范围与目标模式映射）")
+                else:
+                    msg = f"恢复成功(rc={rc})：目标模式 {target_db} 对象数={_n}"
+            except Exception as _e:
+                log(f"[校验] 达梦恢复后对象校验跳过: {str(_e)[:120]}")
         return {"ok": ok, "message": msg, "rc": rc,
                 "remote_path": remote, "stdout_tail": out_s[-2000:],
                 "stderr_tail": err_s[-2000:]}
@@ -481,11 +517,26 @@ def _build_restore_cmd(db_type: str, remote_pkg: str, target_db: str,
             pre = f"bunzip2 -c '{remote_pkg}' > '{actual}' && "
         else:
             pre = ""
+        # 目标库不存在时自动创建（2026-11-13 170 真机实测缺陷：单库 dump 不含
+        # CREATE DATABASE，恢复到异名库必报 FATAL: database "xxx" does not exist；
+        # MySQL 分支早有该逻辑，PG 分支此前缺失）。
+        safe_db = ""
+        createdb = ""
+        if target_db:
+            safe_db = (str(target_db).replace('"', "").replace("'", "")
+                       .replace(";", "").replace("`", "").strip())
+            if safe_db:
+                createdb = (
+                    f"export PGPASSWORD='{pw}'; "
+                    f"{psql_bin} -h {host} -p {port} -U {user} -d postgres -tAc "
+                    f"\"SELECT 1 FROM pg_database WHERE datname='{safe_db}'\" | grep -q 1 || "
+                    f"{psql_bin} -h {host} -p {port} -U {user} -d postgres "
+                    f"-c 'CREATE DATABASE \"{safe_db}\"' || true; ")
         if remote_pkg.endswith(".dump"):
-            return (f"export PGPASSWORD='{pw}'; {pre}{pg_restore_bin} "
-                    f"-h {host} -p {port} -U {user} -d {shlex_quote(target_db or 'postgres')} -c '{actual}'")
-        target = f"-d {shlex_quote(target_db)}" if target_db else ""
-        return (f"export PGPASSWORD='{pw}'; {pre}{psql_bin} "
+            return (f"{createdb}export PGPASSWORD='{pw}'; {pre}{pg_restore_bin} "
+                    f"-h {host} -p {port} -U {user} -d {shlex_quote(safe_db or 'postgres')} -c '{actual}'")
+        target = f"-d {shlex_quote(safe_db)}" if safe_db else ""
+        return (f"{createdb}export PGPASSWORD='{pw}'; {pre}{psql_bin} "
                 f"-h {host} -p {port} -U {user} {target} -f '{actual}'")
 
     elif db_type == "oracle":
@@ -551,10 +602,26 @@ exit $RC
             pre = f"gunzip -c '{remote_pkg}' > '{actual}' && "
         else:
             pre = ""
+        # 目标库不存在时自动创建（2026-11-13 170 真机实测：单库 dump 不含
+        # CREATE DATABASE，恢复到异名库必报 database "xxx" does not exist）。
+        # 维护库用 kingbase（KingbaseES V9R1 无 postgres 维护库）。
+        safe_db = ""
+        createdb = ""
+        if target_db:
+            safe_db = (str(target_db).replace('"', "").replace("'", "")
+                       .replace(";", "").replace("`", "").strip())
+            if safe_db:
+                createdb = (
+                    f"{env} {ksql_bin} -h {host} -p {port} -U {user} -d kingbase -tAc "
+                    f"\"SELECT 1 FROM pg_database WHERE datname='{safe_db}'\" | grep -q 1 || "
+                    f"{ksql_bin} -h {host} -p {port} -U {user} -d kingbase "
+                    f"-c 'CREATE DATABASE \"{safe_db}\"' || true; ")
         if remote_pkg.endswith(".dump"):
-            return f"{env} {pre}{restore_bin} -h {host} -p {port} -U {user} -d {shlex_quote(target_db or 'kingbase')} '{actual}'"
-        target = f"-d {shlex_quote(target_db)}" if target_db else ""
-        return f"{env} {pre}{ksql_bin} -h {host} -p {port} -U {user} {target} -f '{actual}'"
+            return (f"{createdb}{env} {pre}{restore_bin} -h {host} -p {port} -U {user} "
+                    f"-d {shlex_quote(safe_db or 'kingbase')} '{actual}'")
+        target = f"-d {shlex_quote(safe_db)}" if safe_db else ""
+        return (f"{createdb}{env} {pre}{ksql_bin} -h {host} -p {port} -U {user} "
+                f"{target} -f '{actual}'")
 
     elif db_type in ("opengauss", "panwei"):
         # openGauss/磐维单库跨主机恢复：sha256 认证不读 PGPASSWORD，全部命令 -W；
@@ -615,21 +682,30 @@ exit $RC
             "SAVE=$($CLI CONFIG GET save 2>/dev/null | tail -1); "
             "[ -n \"$DATA_DIR\" ] || { echo '[ERROR] 无法读取实例数据目录"
             "（实例不可达或认证失败）'; exit 1; }; "
+            # appendonly 恒写 no：实例开启 AOF 时 Redis 启动只加载 AOF，
+            # 替换的 dump.rdb 会被忽略（2026-11-13 171 真机实测：恢复报成功
+            # 但数据没变）。起来后再按原配置把 AOF 打开（重写当前数据集）。
             f"printf 'port {port}\\nbind 0.0.0.0\\ndir %s\\ndbfilename %s\\n"
-            "appendonly %s\\nsave %s\\ndaemonize yes\\n"
+            "appendonly no\\nsave %s\\ndaemonize yes\\n"
             f"pidfile /tmp/platform_redis_{port}.pid\\n"
             f"logfile /tmp/platform_redis_{port}.log\\n' "
-            "\"$DATA_DIR\" \"${DBFN:-dump.rdb}\" \"${AOF:-no}\" \"${SAVE:-}\" "
+            "\"$DATA_DIR\" \"${DBFN:-dump.rdb}\" \"${SAVE:-}\" "
             f"> /tmp/platform_redis_restart_{port}.conf; "
             + (f"printf 'requirepass %s\\n' {shlex_quote(pw)} >> /tmp/platform_redis_restart_{port}.conf; "
                if pw else "")
             + f"$CLI SHUTDOWN NOSAVE >/dev/null 2>&1; "
             f"sleep 2; "
+            # AOF 在场时先挪开，避免重启只回放 AOF 让 rdb 替换形同无效
+            "if [ -d \"$DATA_DIR/appendonlydir\" ]; then mv -f \"$DATA_DIR/appendonlydir\" "
+            "\"$DATA_DIR/appendonlydir.bak_restore\" 2>/dev/null; fi; "
+            "if [ -f \"$DATA_DIR/appendonly.aof\" ]; then mv -f \"$DATA_DIR/appendonly.aof\" "
+            "\"$DATA_DIR/appendonly.aof.bak_restore\" 2>/dev/null; fi; "
             f"cat {pkg} > \"$DATA_DIR/${{DBFN:-dump.rdb}}\"; "
             "RC_CP=$?; "
             f"setsid \"$SRV\" /tmp/platform_redis_restart_{port}.conf >/dev/null 2>&1 & "
             "sleep 3; "
             "echo CP_RC=$RC_CP; "
+            "if [ \"$AOF\" = \"yes\" ]; then $CLI CONFIG SET appendonly yes >/dev/null 2>&1; fi; "
             "PING_OUT=$($CLI PING 2>&1); echo \"$PING_OUT\"; "
             "echo \"$PING_OUT\" | grep -q PONG")
 
@@ -655,6 +731,37 @@ exit $RC
         if dm_pwd and not dm_pwd.isalnum():
             dm_pwd = '"{0}"'.format(dm_pwd)
         dm_port = extra.get("source_port") or 5236
+        # 目标 schema 语义（2026-11-13 170 真机实测）：dimp 的 SCHEMAS= 是
+        # 「从 dump 里挑源模式」的过滤器，用它当目标模式会把对象全过滤掉且
+        # rc=0（假成功）。异名必须 REMAP_SCHEMA=源:目标，并预先建好目标模式。
+        _tgt_schema = (target_db or "").strip().upper()
+        _src_schema = ""
+        _sc = extra.get("schemas")
+        if isinstance(_sc, (list, tuple)) and _sc:
+            _src_schema = str(_sc[0]).strip().upper()
+        elif isinstance(_sc, str) and _sc:
+            _src_schema = _sc.split(",")[0].strip().upper()
+        if not _src_schema:
+            _src_schema = str(extra.get("remap_source_schema")
+                              or extra.get("schema") or extra.get("owner")
+                              or extra.get("source_db") or "").strip().upper()
+        dm_scope = ""
+        if _tgt_schema:
+            if _src_schema and _src_schema != _tgt_schema:
+                dm_scope = f"REMAP_SCHEMA={_src_schema}:{_tgt_schema}"
+            else:
+                dm_scope = f"SCHEMAS={_tgt_schema}"
+        dm_create = ""
+        if _tgt_schema and dm_scope.startswith("REMAP_SCHEMA"):
+            dm_create = (
+                f"DISQL=$(dirname \"$DIMP\")/disql\n"
+                f"if [ -x \"$DISQL\" ]; then\n"
+                f"  \"$DISQL\" SYSDBA/'{dm_pwd}'@localhost:{dm_port} <<'AIDBM_DM' >/dev/null 2>&1\n"
+                f'CREATE SCHEMA "{_tgt_schema}" AUTHORIZATION "SYSDBA";\n'
+                f"EXIT;\n"
+                f"AIDBM_DM\n"
+                f"fi\n"
+            )
         script = f"""#!/bin/bash
 set -u
 DIMP=$(su - {os_user} -c 'command -v dimp' 2>/dev/null | head -1)
@@ -668,7 +775,7 @@ fi
 echo "DIMP=$DIMP"
 DM_FDIR=$(dirname '{remote_pkg}')
 DM_FBASE=$(basename '{remote_pkg}')
-"$DIMP" SYSDBA/'{dm_pwd}'@localhost:{dm_port} FILE="$DM_FBASE" DIRECTORY="$DM_FDIR" LOG=/tmp/dm_restore_{int(time.time())}.log TABLE_EXISTS_ACTION=REPLACE
+{dm_create}"$DIMP" SYSDBA/'{dm_pwd}'@localhost:{dm_port} FILE="$DM_FBASE" DIRECTORY="$DM_FDIR" LOG=/tmp/dm_restore_{int(time.time())}.log TABLE_EXISTS_ACTION=REPLACE {dm_scope}
 exit $?
 """
         import base64

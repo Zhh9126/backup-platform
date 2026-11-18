@@ -12,9 +12,9 @@ from . import api_bp
 
 
 def _operator() -> str:
-    from auth import _current_user_dict
-    u = _current_user_dict()
-    return u.get("username") or u.get("display_name") or "unknown"
+    """当前操作人（统一走 auth.current_operator）。"""
+    from auth import current_operator
+    return current_operator()
 
 
 @api_bp.route("/ransomware/summary", methods=["GET"])

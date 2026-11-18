@@ -1,0 +1,28 @@
+{
+  "id": "dm-dmrman",
+  "name": "达梦 dmrman（物理备份/还原）",
+  "version": "DM8",
+  "category": "dameng",
+  "description": "达梦数据库物理备份还原工具（dmrman），支持全量/增量与归档恢复。",
+  "required_clients": [
+    "dmrman"
+  ],
+  "supports": [
+    "dameng"
+  ],
+  "tags": [
+    "达梦",
+    "物理备份",
+    "DM8"
+  ],
+  "icon": "bi-database-fill-gear",
+  "packages": {
+    "linux": {
+      "package_managers": {}
+    }
+  },
+  "verify_after_install": [
+    "dmrman help"
+  ],
+  "fallback_note": "随达梦服务端安装（/dm8/bin），未检测到时走 dexp/dimp 逻辑备份"
+}

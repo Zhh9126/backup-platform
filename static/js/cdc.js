@@ -160,9 +160,14 @@
       host: $('nHost').value.trim(), port: parseInt($('nPort').value || '0', 10),
       username: $('nUser').value.trim(), password: $('nPwd').value,
       db_name: $('nDb').value.trim(), purpose: $('nPurpose').value,
-      include_tables: $('nTables').value.trim()
+      include_tables: $('nTables').value.trim(),
+      ref_id: parseInt(($('nRef') && $('nRef').value) || '0', 10) || 0
     };
     if (!body.name || !body.host) { BKP.toast('名称与主机必填', 'danger'); return; }
+    if ((body.db_type === 'oracle' || body.db_type === 'dameng') && !body.ref_id) {
+      BKP.toast('Oracle/达梦需填写「实时备份任务 ID」：行级事件来自该任务的 LogMiner 段', 'danger');
+      return;
+    }
     api('POST', '/cdc/streams', body).then(function (r) {
       BKP.toast('创建成功，正在启动…');
       return api('POST', '/cdc/streams/' + r.id + '/start');
@@ -178,7 +183,8 @@
       db_type: $('nType').value, host: $('nHost').value.trim(),
       port: parseInt($('nPort').value || '0', 10),
       username: $('nUser').value.trim(), password: $('nPwd').value,
-      db_name: $('nDb').value.trim()
+      db_name: $('nDb').value.trim(),
+      ref_id: parseInt(($('nRef') && $('nRef').value) || '0', 10) || 0
     };
     $('probeMsg').textContent = '检查中…';
     api('POST', '/cdc/probe', body).then(function (r) {
@@ -204,16 +210,34 @@
     $('btnNew').onclick = function () { bootstrap.Modal.getOrCreateInstance($('newModal')).show(); };
     $('btnCreate').onclick = create;
     $('btnProbe').onclick = probe;
+
+    // Oracle/达梦走「段消费」：需要实时备份任务 ID，其余库型隐藏该项
+    var typeSel = $('nType');
+    function syncRefField() {
+      var isSeg = typeSel && (typeSel.value === 'oracle' || typeSel.value === 'dameng');
+      var wrap = $('nRefWrap');
+      if (wrap) wrap.style.display = isSeg ? '' : 'none';
+      var portEl = $('nPort');
+      if (isSeg && portEl && !portEl.value) {
+        portEl.value = typeSel.value === 'oracle' ? '1521' : '5236';
+      }
+    }
+    if (typeSel) {
+      typeSel.addEventListener('change', syncRefField);
+      syncRefField();
+    }
     $('btnRefresh').onclick = loadStreams;
     $('btnLoadEvt').onclick = loadEvents;
     $('btnPreview').onclick = function () { replay(false); };
     $('btnApply').onclick = function () { replay(true); };
     loadStreams();
-    // 面板隐藏时不轮询，避免合并页空跑请求
+    // 页面切到后台时不轮询，避免空跑请求。
+    // 注意：2026-11-14 起「变更明细」不再是独立标签页（已并入实时备份同页），
+    // 原先基于 #tabCdc 可见性的判断一并去掉，否则遗留元素缺失时会误导排查。
     setInterval(function () {
-      var pane = $('tabCdc');
-      if (pane && pane.offsetParent === null) return;
       if (document.hidden) return;
+      var box = document.getElementById('rtChangeDetail');
+      if (box && box.offsetParent === null) return;
       loadStreams();
     }, 10000);
   }

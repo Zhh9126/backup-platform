@@ -5,6 +5,18 @@
   <p class="text-muted mb-0">三重备份体系：MinIO 热数据（L1）→ S3 冷数据（L2）→ 源端本地路径导出（L3）</p>
 </div>
 
+<!-- 介质筛选条（左侧菜单「FTP 存储 / NFS 挂载 / 外挂存储」经 ?kind= 进入） -->
+<div id="kindFilterBar" class="alert alert-info py-2 px-3 mb-3 d-none" role="status">
+  <div class="d-flex align-items-center flex-wrap gap-2">
+    <i class="bi bi-funnel-fill"></i>
+    <span id="kindFilterMsg"></span>
+    <a href="/storage" class="alert-link"><i class="bi bi-x-circle me-1"></i>显示全部介质</a>
+    <button type="button" class="btn btn-primary btn-sm ms-auto" id="kindAddBtn" onclick="openStorageModal()">
+      <i class="bi bi-plus-lg me-1"></i><span id="kindAddLabel">新增</span>
+    </button>
+  </div>
+</div>
+
 <!-- 本地备份存储位置（备份第一落点，未配对象存储时的唯一落点） -->
 <div class="page-card mb-3" id="localRootCard">
   <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
@@ -237,6 +249,8 @@
                 <option value="minio">MinIO 热存储 (L1)</option>
                 <option value="s3">S3 冷存储 (L2)</option>
                 <option value="sftp">SFTP / NAS (L2)</option>
+                <option value="ftp">FTP / FTPS</option>
+                <option value="mount">外挂存储 / NFS 挂载点</option>
                 <option value="local">本地存储 (L3)</option>
                 <option value="tape">磁带库 (D2T 归档)</option>
               </select>
@@ -391,6 +405,79 @@
                   <input class="form-check-input" type="checkbox" id="st_insecure">
                   <label class="form-check-label" for="st_insecure">跳过 TLS 校验</label>
                 </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- FTP / FTPS 专用字段 -->
+          <div id="st_fields_ftp" class="storage-type-fields d-none">
+            <div class="row g-3">
+              <div class="col-md-8">
+                <label class="form-label">FTP 主机地址 *</label>
+                <input type="text" class="form-control font-code" id="st_endpoint_ftp"
+                       placeholder="192.168.1.20 或 ftp.example.com">
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">端口</label>
+                <input type="number" class="form-control" id="st_port_ftp" value="21" min="1" max="65535">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">用户名</label>
+                <input type="text" class="form-control" id="st_user_ftp" placeholder="anonymous">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">密码</label>
+                <input type="password" class="form-control" id="st_pass_ftp" autocomplete="new-password"
+                       placeholder="匿名登录可留空；编辑留空=不修改">
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">远端根目录</label>
+                <input type="text" class="form-control font-code" id="st_remote_ftp" placeholder="/backup">
+                <div class="form-text">备份产物上传到该目录下，按对象键分目录；留空=根目录 /。</div>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label">超时(秒)</label>
+                <input type="number" class="form-control" id="st_timeout_ftp" value="30" min="5" max="600">
+              </div>
+              <div class="col-md-3">
+                <label class="form-label">模式</label>
+                <div class="form-check mt-2">
+                  <input class="form-check-input" type="checkbox" id="st_passive_ftp" checked>
+                  <label class="form-check-label" for="st_passive_ftp">被动模式（PASV）</label>
+                </div>
+                <div class="form-check">
+                  <input class="form-check-input" type="checkbox" id="st_tls_ftp">
+                  <label class="form-check-label" for="st_tls_ftp">FTPS（显式 TLS）</label>
+                </div>
+              </div>
+              <div class="col-12">
+                <div class="alert alert-warning py-2 px-3 mb-0 small">
+                  <i class="bi bi-exclamation-triangle-fill me-1"></i>
+                  <span>标准库 ftplib 直连：FTP 协议无校验和，回取时只按文件大小核对（平台如实标注，不承诺哈希一致）；明文 FTP 不加密，跨网段请勾选 FTPS；主动模式在 NAT 环境常失败，默认被动模式。</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 外挂存储 / NFS 挂载点专用字段 -->
+          <div id="st_fields_mount" class="storage-type-fields d-none">
+            <div class="row g-3">
+              <div class="col-md-8">
+                <label class="form-label">挂载路径 *</label>
+                <input type="text" class="form-control font-code" id="st_endpoint_mount"
+                       placeholder="/mnt/nas_backup 或 /media/usbdisk">
+                <div class="form-text">必须是已由操作系统挂载好的目录（NFS / CIFS / USB 移动硬盘 / 本地磁盘阵列）；平台不做 mount 特权操作（离线环境安全约束），只校验目录存在、可写、是否真实挂载点——NFS 掉线时目录仍在但为空，测试连接会据此给出结论。</div>
+              </div>
+              <div class="col-md-4">
+                <label class="form-label">介质类型</label>
+                <select class="form-select" id="st_medium_mount">
+                  <option value="nfs">NFS 共享</option>
+                  <option value="cifs">CIFS / SMB 共享</option>
+                  <option value="usb">USB 移动硬盘</option>
+                  <option value="disk">本地磁盘阵列 / 扩展柜</option>
+                  <option value="other">其它已挂载介质</option>
+                </select>
+                <div class="form-text">仅用于分类展示与筛选，不影响读写语义。</div>
               </div>
             </div>
           </div>

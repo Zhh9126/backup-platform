@@ -2,12 +2,35 @@
 // 数据对比页面（Preact + htm 免构建试点版）：
 // - Preact/htm ESM 已本地化（static/vendor/preact/），配合 import map，零构建、离线可用
 // - 与原 vanilla 版（data_compare.js）API 完全一致，可随时回退
-import { h, render } from "preact";
+import { h, render, Component } from "preact";
 import { useState, useEffect, useRef, useCallback } from "preact/hooks";
 import htm from "htm";
 
 const html = htm.bind(h);
 const { api, toast, fmtTime, fmtDuration, statusBadge } = BKP;
+
+// 错误边界：弹窗渲染若抛异常，此前表现为「点了没反应」（Preact 抛错后
+// DOM 停在旧状态，用户完全看不到任何反馈）。这里捕获并显式提示，
+// 避免静默失败，也便于排查具体错误。
+class ModalBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { err: null };
+  }
+  componentDidCatch(err) {
+    try { console.error("[data-compare] 弹窗渲染异常", err); } catch (e) { /* ignore */ }
+    this.setState({ err: err || new Error("未知渲染异常") });
+    toast("弹窗渲染异常：" + ((err && err.message) || err), "danger");
+  }
+  render(props, state) {
+    if (state.err) {
+      return html`<div class="alert alert-danger mb-0">
+        报告弹窗渲染失败：${String((state.err && state.err.message) || state.err)}
+      </div>`;
+    }
+    return props.children;
+  }
+}
 
 // ---------- 工具 ----------
 const cronZh = (expr) => {
@@ -177,7 +200,7 @@ function TaskTable({ tasks, onRun, onEdit, onDelete }) {
 }
 
 // ---------- 报告表 ----------
-function ReportTable({ reports, onShow }) {
+function ReportTable({ reports, onShow, loadingId }) {
   if (!reports.length)
     return html`<tbody><tr><td colspan="6" class="text-center text-muted py-3">暂无对比报告</td></tr></tbody>`;
   return html`
@@ -197,8 +220,9 @@ function ReportTable({ reports, onShow }) {
             <td>${fmtDuration(r.duration_sec)}</td>
             <td>${r.created_at ? fmtTime(r.created_at) : "-"}</td>
             <td class="text-end">
-              <button class="btn btn-sm btn-outline-primary" onClick=${() => onShow(r.id)}>
-                <i class="bi bi-eye"></i> 明细
+              <button class="btn btn-sm btn-outline-primary" disabled=${loadingId === r.id}
+                      onClick=${() => onShow(r.id)}>
+                <i class="bi bi-eye"></i> ${loadingId === r.id ? "加载中…" : "明细"}
               </button>
             </td>
           </tr>`;
@@ -426,19 +450,50 @@ function ReportModal({ report, onClose, onRepaired }) {
   // 不会重跑 show()，表现为「点了没反应」。
   useEffect(() => {
     const el = ref.current;
-    if (!el) return;
+    if (!el) {
+      toast("报告弹窗节点未就绪，请重试", "danger");
+      return;
+    }
     let inst = null;
     try {
       inst = bootstrap.Modal.getOrCreateInstance(el);
+      // 防御：Bootstrap 实例可能残留「已显示」标记而 DOM 实际是关闭的
+      //（上次 hide 动画被打断时会发生）。此时 show() 会被直接 return，
+      // 用户表现就是「点了没反应」——先复位实例状态。
+      if (inst._isShown && !el.classList.contains("show")) {
+        inst._isShown = false;
+        inst._isTransitioning = false;
+      }
       inst.show();
     } catch (e) {
-      toast("打开报告明细失败", "danger");
+      // 兜底：Bootstrap 实例不可用时手动显示，保证「点明细一定有反应」
+      try {
+        el.style.display = "block";
+        el.classList.add("show");
+        el.removeAttribute("aria-hidden");
+        document.body.classList.add("modal-open");
+        if (!document.querySelector('.modal-backdrop[data-dc-fallback="1"]')) {
+          const bd = document.createElement("div");
+          bd.className = "modal-backdrop fade show";
+          bd.setAttribute("data-dc-fallback", "1");
+          document.body.appendChild(bd);
+        }
+      } catch (e2) { /* 兜底本身失败则仅提示 */ }
+      toast("报告弹窗降级显示：" + ((e && e.message) || e), "warning");
     }
-    const onHidden = () => { if (onClose) onClose(); };
+    const onHidden = () => {
+      // 兜底模式下必须手动清理遮罩，否则残留 backdrop 会拦截整页点击
+      const bd = document.querySelector('.modal-backdrop[data-dc-fallback="1"]');
+      if (bd && bd.parentNode) bd.parentNode.removeChild(bd);
+      document.body.classList.remove("modal-open");
+      if (onClose) onClose();
+    };
     el.addEventListener("hidden.bs.modal", onHidden);
     return () => {
       el.removeEventListener("hidden.bs.modal", onHidden);
       try { if (inst) inst.hide(); } catch (e) { /* 实例已销毁 */ }
+      const bd = document.querySelector('.modal-backdrop[data-dc-fallback="1"]');
+      if (bd && bd.parentNode) bd.parentNode.removeChild(bd);
     };
   }, []);
   if (!report) return null;
@@ -635,6 +690,7 @@ function App() {
   const [reports, setReports] = useState([]);
   const [formState, setFormState] = useState(null);   // null | {id, values}
   const [detail, setDetail] = useState(null);
+  const [detailLoading, setDetailLoading] = useState(null);
   const [taskPage, setTaskPage] = useState(1);
   const [reportPage, setReportPage] = useState(1);
 
@@ -716,12 +772,19 @@ function App() {
   const showReport = async (id) => {
     // BKP.api 对非 2xx 会抛 Error：这里必须兜住，否则点击后是
     // Unhandled Promise Rejection，页面零反馈（表现为「没反应」）。
+    setDetailLoading(id);          // 按钮立即进入「加载中…」，明确回应点击
     try {
       const res = await api("GET", "/api/data-compare-reports/" + id);
-      if (!res.success) { toast(res.message || "加载报告失败", "danger"); return; }
+      if (!res || !res.success) {
+        toast((res && res.message) || "加载报告失败", "danger");
+        return;
+      }
+      if (!res.data) { toast("报告数据为空", "danger"); return; }
       setDetail(res.data);
     } catch (e) {
       toast("加载报告异常：" + ((e && e.message) || e), "danger");
+    } finally {
+      setDetailLoading(null);
     }
   };
 
@@ -762,14 +825,17 @@ function App() {
             <thead><tr>
               <th>任务</th><th>结果</th><th>表(总/一致/差异/失败)</th><th>耗时</th><th>时间</th><th class="text-end">操作</th>
             </tr></thead>
-            <${ReportTable} reports=${reportPg.list} onShow=${showReport} />
+            <${ReportTable} reports=${reportPg.list} onShow=${showReport} loadingId=${detailLoading} />
           </table>
         </div>
         <${PagerBar} pg=${reportPg} onGo=${setReportPage} />
       </div>
 
       ${formState && html`<${TaskModal} state=${formState} onSave=${saveTask} onClose=${() => setFormState(null)} />`}
-      ${detail && html`<${ReportModal} report=${detail} onClose=${() => setDetail(null)} onRepaired=${refreshAll} />`}
+      ${detail && html`<${ModalBoundary} key=${"dcb" + detail.id}>
+        <${ReportModal} key=${"dcr" + detail.id} report=${detail}
+          onClose=${() => setDetail(null)} onRepaired=${refreshAll} />
+      </${ModalBoundary}>`}
     </div>`;
 }
 

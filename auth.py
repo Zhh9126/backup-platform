@@ -74,6 +74,15 @@ def _current_user_dict() -> dict:
     return {}
 
 
+def current_operator() -> str:
+    """当前操作人（username → display_name → unknown）。
+
+    ransomware / tape 等模块此前各写一份 ``_operator``；统一到这里。
+    """
+    u = _current_user_dict()
+    return u.get("username") or u.get("display_name") or "unknown"
+
+
 def login_required(f):
     @wraps(f)
     def decorator(*args, **kwargs):

@@ -177,6 +177,11 @@ DB_OS_USER_DEFAULTS = {
     "postgresql": "postgres",
     "mysql": "mysql",
     "mariadb": "mysql",
+    # 2026-11-13 协议兼容层（MySQL 系国产库）：OS 用户与工具族同 MySQL
+    "greatdb": "mysql",
+    "goldendb": "mysql",
+    "gaussdb": "omm",
+    "vastbase": "postgres",
 }
 
 
@@ -315,6 +320,18 @@ def current_task_env_export() -> str:
     return _task_env_export_cv.get()
 
 
+# 最近一次工具探测的失败原因（连接层问题）。remote_has_tool 只返回布尔值，
+# 但"工具不存在"与"SSH 连不上"是两类完全不同的故障：早期把连接失败也报成
+# 「缺少客户端工具」，会误导用户去装工具（2026-11-14 实测：170 被 SSH 限流，
+# Redis 备份报"缺少 redis-cli"，而该机器上工具明明存在）。
+_LAST_PROBE_ERROR = ""
+
+
+def get_last_probe_error() -> str:
+    """返回最近一次 remote_has_tool 的连接层错误（空 = 无异常）。"""
+    return _LAST_PROBE_ERROR
+
+
 def remote_has_tool(ssh_host: dict, tool: str, check_user: str = None,
                     extra_paths: str = None) -> bool:
     """检查远程 SSH 主机上是否存在指定命令（独立连接，不污染连接池）。
@@ -368,7 +385,10 @@ def remote_has_tool(ssh_host: dict, tool: str, check_user: str = None,
             _out, _err, rc = _ssh_exec_pipe(client, shell, timeout=30)
             return rc == 0
         return _resolve_remote_bin(client, tool) is not None
-    except Exception:
+    except Exception as exc:                       # noqa: BLE001
+        # 记录连接层失败原因，交由调用方区分「工具缺失」与「连不上」
+        global _LAST_PROBE_ERROR
+        _LAST_PROBE_ERROR = "%s: %s" % (type(exc).__name__, exc)
         return False
     finally:
         if client:
@@ -678,7 +698,11 @@ def _resolve_remote_bin(client, tool: str, extra_paths: str = None) -> str | Non
     #    pg_dump/psql/ksql/sys_dump 等工具位置，避免 PATH 中旧版工具
     #    导致 "invalid option" 或 rc=127 类失败。
     _pg_like = ("ksql", "sys_dump", "sys_restore", "sys_basebackup",
-                "sys_receivewal", "sys_dumpall")
+                "sys_receivewal", "sys_dumpall",
+                # 金仓物理恢复要用的实例控制工具（2026-11-13 170 实测：缺这两项
+                # 会导致 resolve_remote_tool 只走 command -v/find 而漏掉
+                # /opt/kingbase/... 小写安装目录，物理恢复直接报"远端未找到"）
+                "sys_ctl", "sys_rewind")
     # openGauss：主进程名为 gaussdb，工具名为 gs_*（gs_dump/gs_basebackup/...）
     _gs_like = ("gs_dump", "gs_dumpall", "gs_restore", "gsql", "gs_basebackup",
                 "gs_ctl", "gs_probackup", "gs_verifybackup")
@@ -730,10 +754,17 @@ def _resolve_remote_bin(client, tool: str, extra_paths: str = None) -> str | Non
         "/opt/oracle/*/bin "
         # DM 达梦
         "/dm8/bin /opt/dmdbms/bin /home/dmdba/dmdbms/bin /opt/dm*/bin "
-        # 人大金仓（V9 为 KESRealPro/<版本>/Server|ClientTools/bin 布局）
+        # 人大金仓（V9 为 KESRealPro/<版本>/Server|ClientTools/bin 布局；
+        # 170 实测 sys_ctl/ksql 在 <HOME>/ES/V9/Server/bin，与 kingbase 主进程
+        # 所在 KESRealPro/<ver>/Server/bin 不同目录，必须两个都覆盖）
         "/opt/Kingbase/ES/V*/bin /opt/kingbase/*/bin /KingbaseES/V*/bin "
+        "/opt/Kingbase/ES/V*/Server/bin /opt/kingbase/ES/V*/Server/bin "
+        "/opt/kingbase/*/V*/Server/bin /opt/Kingbase/*/V*/Server/bin "
+        "/opt/kingbase/*/V*/*/*/Server/bin /opt/Kingbase/*/V*/*/*/Server/bin "
         "/opt/Kingbase/ES/V*/KESRealPro/*/Server/bin "
+        "/opt/kingbase/ES/V*/KESRealPro/*/Server/bin "
         "/opt/Kingbase/ES/V*/KESRealPro/*/ClientTools/bin "
+        "/opt/kingbase/ES/V*/KESRealPro/*/ClientTools/bin "
         # openGauss（企业版/社区版安装布局：GAUSSHOME/bin 存放 gs_* 工具）
         "/opt/soft/openGauss/*/bin /opt/opengauss/*/bin /opt/openGauss/*/bin "
         "/usr/local/opengauss/bin /usr/local/openGauss/bin "
@@ -1420,6 +1451,39 @@ _PG_FAMILY_TOOLING = {
         "db_type": "opengauss",
         "set_lib_path": True,
     },
+    # 华为 GaussDB（openGauss 血缘）：工具族与 openGauss 同名同用法
+    "gaussdb": {
+        "label": "GaussDB",
+        "dump_tool": "gs_dump",
+        "restore_candidates": ("gs_restore",),
+        "query_candidates": ("gsql", "psql"),
+        "dumpall_candidates": ("gs_dumpall", "pg_dumpall"),
+        "catalog_table": "pg_database",
+        "dbname_positional": True,
+        "use_w_password": True,
+        "maint_candidates": ("postgres", "template1"),
+        "default_port": 8000,
+        "default_user": "omm",
+        "check_user": "omm",
+        "env_exports": ("PGPASSWORD",),
+        "db_type": "gaussdb",
+        "set_lib_path": True,
+    },
+    # 海量 Vastbase（PostgreSQL 系）：工具族同 PG（部分版本提供 vs_* 前缀）
+    "vastbase": {
+        "label": "Vastbase",
+        "dump_tool": "pg_dump",
+        "restore_candidates": ("pg_restore",),
+        "query_candidates": ("psql",),
+        "dumpall_candidates": ("pg_dumpall",),
+        "catalog_table": "pg_database",
+        "maint_candidates": ("postgres", "template1"),
+        "default_port": 5432,
+        "default_user": "postgres",
+        "check_user": None,
+        "env_exports": ("PGPASSWORD",),
+        "db_type": "vastbase",
+    },
     # 磐维 PanWeiDB（openGauss 系商业发行版，中国移动 × 华为）：
     # 工具族与 openGauss 完全同名同用法（gs_dump/gs_restore/gsql/gs_dumpall/
     # gs_basebackup），GAUSSHOME/LD_LIBRARY_PATH 环境约定一致；集中式与分布式
@@ -1686,6 +1750,12 @@ def _pg_family_dump_shell(task: dict, ssh_host: dict, db_type: str,
     spec = _dfmt.resolve(db_type, extra0, compress=bool(compress))
     fmt_flag = spec.get("flag") or ("-Fc" if compress else "-Fp")
     is_dir_fmt = bool(spec.get("dir"))
+    # 引擎并行度（单任务内部）：目录格式下 pg_dump/gs_dump -j N。
+    try:
+        from core import parallel_plan as _pp
+        jobs = int(_pp.resolve(task)["workers"])
+    except Exception:
+        jobs = 1
     extra = extra0
     schemas = [str(s).strip() for s in (extra.get("schemas") or []) if str(s).strip()]
     tables = [str(t).strip() for t in (extra.get("tables") or []) if str(t).strip()]
@@ -1750,6 +1820,7 @@ def _pg_family_dump_shell(task: dict, ssh_host: dict, db_type: str,
             # gs_dump -Fd 要求目标目录不存在（工具自行创建），只预建父目录
             f"rm -rf {work} && mkdir -p {work} && "
             f"{dump_bin} -h 127.0.0.1 -p {port} -U {shlex.quote(user)} {fmt_flag} "
+            f"{('-j %d ' % jobs) if jobs > 1 else ''}"
             f"-f {work}/db {target_args}{extra_args} > /dev/null && "
             f"tar -C {work} -czf - db; RC=$?; rm -rf {work}; exit $RC"
         )
@@ -1873,7 +1944,12 @@ def _remote_mongodb_dump_shell(task: dict, ssh_host: dict, compress: int) -> tup
         )
         compress = False
     if compress:
-        shell += " | zstd -10 -c -"
+        # 必须加 pipefail：`mongodump ... | zstd` 时 shell 的 rc 取**最后一个**
+        # 命令（zstd）的状态，mongodump 不存在/认证失败（rc=127/1）会被吞掉，
+        # 只留下一个 13 字节的空 zstd 帧并当成"备份成功"——2026-11-13
+        # MongoDB 真机实测：170 上没有 mongodump，平台却报 success、产物 13 B，
+        # 恢复时才报"解压 zstd 失败"。pipefail 让上游失败立刻冒泡回退。
+        shell = "set -o pipefail; " + shell + " | zstd -10 -c -"
     return client, shell, bool(compress)
 
 

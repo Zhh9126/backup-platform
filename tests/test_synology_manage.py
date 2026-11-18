@@ -207,7 +207,8 @@ def test_engine_registered_and_meta_honest():
     assert meta["backup_modes"] == ["logical"]
     assert "裸 LUN" in meta["description"]
     assert config.DEFAULT_PORTS["synology"] == 5000
-    assert config.DB_DISPLAY_NAMES["synology"].startswith("群晖")
+    # 2026-11-13 改名：统一为「NAS 存储（群晖 DSM）」，仍须含"群晖"以保持可辨识
+    assert "群晖" in config.DB_DISPLAY_NAMES["synology"]
 
 
 def test_preflight_requires_credentials():
@@ -428,7 +429,9 @@ def test_frontend_controls_and_cache_stamp():
     import re
     m = re.search(r"synology\.js\?v=(\d{8,10})", tpl)
     assert m and int(m.group(1)) >= 2026111002, "缓存戳不得低于清理前基线"
-    assert 'href="/synology"' in base and "群晖 NAS 纳管" in base
+    # 2026-11-13 菜单重组：群晖入口收进「存储管理」折叠组，文案改为「NAS 存储（群晖）」
+    assert 'href="/synology"' in base
+    assert "NAS 存储（群晖）" in base, "存储管理组内应有群晖 NAS 入口"
     assert "quick-task" in js and "verify_code" in js
     assert "SAN Manager" in tpl
 

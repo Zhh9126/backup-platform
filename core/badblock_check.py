@@ -104,14 +104,26 @@ def _check_mysql(task: dict, db_type: str) -> dict:
                         if "1146" in msg:  # 表不存在（并发 drop）
                             continue
                         corrupt.append("%s.%s: CHECK 执行失败 %s" % (d, tb, msg[:120]))
-            status = "corrupt" if corrupt else "clean"
+            # 一张表都没检查到 ≠ 检测通过：库名为空/配错、账号无权限、
+            # 或目标库确实没有表，都得不到任何证据（2026-11-14 实测：
+            # checked=0 时报 clean「全部 OK」属假成功）。如实标 skip。
+            if corrupt:
+                status = "corrupt"
+            elif checked == 0:
+                status = "skip"
+            else:
+                status = "clean"
             note = "（全库型超过 %d 张表已抽样）" % _MAX_TABLES if truncated else ""
+            if status == "skip":
+                message = ("MySQL 坏块检测：未枚举到任何表（库名可能配置错误、"
+                           "账号无权限或该库为空），未执行检测——不代表检测通过")
+            else:
+                message = ("MySQL 坏块检测：%d 张表 CHECK QUICK，%s%s"
+                           % (checked,
+                              "发现 %d 处异常" % len(corrupt) if corrupt else "全部 OK",
+                              note))
             return {"supported": True, "status": status,
-                    "message": "MySQL 坏块检测：%d 张表 CHECK QUICK，%s%s"
-                               % (checked,
-                                  "发现 %d 处异常" % len(corrupt) if corrupt
-                                  else "全部 OK",
-                                  note),
+                    "message": message,
                     "details": (corrupt or details)[:_MAX_CORRUPT_ROWS],
                     "checked": checked,
                     "duration_sec": round(time.time() - t0, 2)}

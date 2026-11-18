@@ -1,0 +1,28 @@
+{
+  "id": "oracle-rman",
+  "name": "Oracle RMAN（物理备份）",
+  "version": "11g-23c",
+  "category": "oracle",
+  "description": "Oracle 物理备份工具（RMAN），支持增量、归档日志与 PITR。",
+  "required_clients": [
+    "rman"
+  ],
+  "supports": [
+    "oracle"
+  ],
+  "tags": [
+    "Oracle",
+    "物理备份",
+    "RMAN"
+  ],
+  "icon": "bi-database-fill-exclamation",
+  "packages": {
+    "linux": {
+      "package_managers": {}
+    }
+  },
+  "verify_after_install": [
+    "rman version"
+  ],
+  "fallback_note": "随 Oracle 服务端安装（ORACLE_HOME/bin），未检测到时走 expdp 逻辑备份"
+}

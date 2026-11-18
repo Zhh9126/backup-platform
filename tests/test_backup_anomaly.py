@@ -109,6 +109,56 @@ class TestCheckRecord(unittest.TestCase):
         self.assertGreater((n1["n"] if n1 else 0), (n0["n"] if n0 else 0))
 
 
+
+class TestIntegrityDigest(unittest.TestCase):
+    """确定性核对：产物 sha256 与备份登记值比对（2026-11-14 新增）。
+
+    背景：1.2KB 的小产物被整体覆写后，体积基线不足、熵检跳过（<4KB）、
+    结构嗅探对未知二进制不硬判 → 纯启发式会判 clean，篡改完全看不见。
+    """
+
+    def _task(self):
+        return db.execute(
+            "INSERT INTO backup_tasks (name, db_type, host, port, username, "
+            "password, db_name, backup_mode, created_at, updated_at) "
+            "VALUES ('digest-t','mysql','h',3306,'u',?,'d','logical',?,?)",
+            (db.encrypt_secret("p"), db.now_iso(), db.now_iso()))
+
+    def _rec(self, path, digest):
+        tid = self._task()
+        return db.execute(
+            "INSERT INTO backup_records (task_id, backup_type, status, "
+            "backup_path, size_bytes, checksum, started_at, finished_at) "
+            "VALUES (?, 'full', 'success', ?, ?, ?, ?, ?)",
+            (tid, path, os.path.getsize(path), digest, db.now_iso(), db.now_iso()))
+
+    def test_untouched_artifact_digest_clean(self):
+        p = _mk(os.path.join(_TMP, "d1.sql"), 2048)
+        rid = self._rec(p, db.sha256_file(p))
+        res = check_record_by_id(rid)
+        items = {c["item"]: c["level"] for c in res["checks"]}
+        self.assertEqual(items["integrity"], "clean", json.dumps(res, ensure_ascii=False))
+
+    def test_tampered_small_artifact_detected(self):
+        """小产物（<4KB 熵检不判、体积基线不足）被篡改 → 必须靠校验和抓住。"""
+        p = _mk(os.path.join(_TMP, "d2.sql.zst"), 1200)
+        rid = self._rec(p, db.sha256_file(p))
+        with open(p, "wb") as f:
+            f.write(b"\x00" * 1200)          # 内容被整体替换
+        res = check_record_by_id(rid)
+        items = {c["item"]: c["level"] for c in res["checks"]}
+        self.assertEqual(items["integrity"], "suspect",
+                         json.dumps(res, ensure_ascii=False))
+        self.assertEqual(res["level"], "suspect")
+
+    def test_no_digest_is_unknown(self):
+        p = _mk(os.path.join(_TMP, "d3.sql"), 4096)
+        rid = self._rec(p, None)
+        res = check_record_by_id(rid)
+        items = {c["item"]: c["level"] for c in res["checks"]}
+        self.assertEqual(items["integrity"], "unknown")
+
+
 class TestApiContract(unittest.TestCase):
     def test_route_registered(self):
         import inspect

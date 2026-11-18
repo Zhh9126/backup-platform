@@ -1,0 +1,50 @@
+{
+  "id": "rclone",
+  "name": "rclone（对象存储传输/校验）",
+  "version": "1.66",
+  "category": "object",
+  "description": "多协议对象存储搬运与校验（S3/OSS/OBS/MinIO/COS），用于备份产物跨桶复制与 sha256 校验。",
+  "required_clients": [
+    "rclone"
+  ],
+  "supports": [
+    "object_storage",
+    "s3",
+    "minio"
+  ],
+  "tags": [
+    "对象存储",
+    "跨桶复制",
+    "校验"
+  ],
+  "icon": "bi-cloud-arrow-up",
+  "packages": {
+    "linux": {
+      "fallback": {
+        "url": "https://downloads.rclone.org/v1.66.0/rclone-v1.66.0-linux-amd64.zip",
+        "extract_dir": "/opt/rclone",
+        "binaries": [
+          "rclone"
+        ]
+      },
+      "package_managers": {
+        "apt": {
+          "command": "apt-get install -y rclone",
+          "binaries": [
+            "rclone"
+          ]
+        },
+        "yum": {
+          "command": "yum install -y rclone",
+          "binaries": [
+            "rclone"
+          ]
+        }
+      }
+    }
+  },
+  "verify_after_install": [
+    "rclone version"
+  ],
+  "fallback_note": "未安装时对象存储走平台内置 S3 协议客户端（零依赖），只是没有外部搬运工具"
+}

@@ -50,6 +50,18 @@ def scan_fs_scan():
         return jsonify({"ok": False, "error": str(e)}), 400
 
 
+@api_bp.route("/scan-fs/instances", methods=["POST"])
+@login_required
+def scan_fs_instances():
+    """发现本机数据库实例清单（全库型：进程 / oratab / 候选目录）。"""
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        task = _task(data)
+        return jsonify(scan_fs.scan_instances(task))
+    except (ValueError, TypeError) as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
 @api_bp.route("/scan-fs/pull", methods=["POST"])
 @login_required
 def scan_fs_pull():

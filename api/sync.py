@@ -81,6 +81,7 @@ def create_task():
              "batch_size", "error_threshold", "enabled", "realtime_enabled",
              "full_db_migrate", "validate_before_run", "verify_after_run",
              "exclude_tables", "type_mapping", "parallel_tables"}
+    data = _apply_field_aliases(data)
     unknown = [k for k in data.keys() if k not in known]
     # 类型校验：必须是同步插件注册表里的库型（前端下拉也只给这些），
     # 否则任务建出来一跑就失败，且错误信息离根因很远。
@@ -229,12 +230,20 @@ def run_task(task_id):
                     "message": res.get("message", ""),
                     "updated_at": finished_at,
                 })
+                # 统计口径必须与调度器路径（core/sync/runner.py）一致：
+                # 2026-11-13 真机暴露此处只写 rows_synced，read_rows/error_rows
+                # 恒 0，而消息里又写着"读取 5 行" —— 页面按 read_rows 展示时
+                # 出现"读取 0 / 写入 5"的自相矛盾，排障时极易误判。
                 models.create_sync_record({
                     "sync_task_id": task_id,
                     "started_at": started_at,
                     "finished_at": finished_at,
                     "status": status,
                     "rows_synced": res.get("total_write", 0),
+                    "read_rows": res.get("total_read", 0),
+                    "error_rows": res.get("errors", 0),
+                    "watermark": (str(res.get("next_value"))
+                                  if res.get("next_value") is not None else None),
                     "message": res.get("message", ""),
                 })
             except Exception:  # noqa: BLE001
@@ -386,12 +395,62 @@ def compat_run_task(task_id):
 @sync_bp.route("/sync/records", methods=["GET"])
 @login_required
 def compat_list_all_records():
-    rows = models.list_sync_records()
+    """全部同步记录；支持 task_id / sync_task_id 过滤。
+
+    2026-11-13 真机暴露：此接口此前**完全忽略 task_id 参数**，恒返回所有任务
+    的记录。前端按任务查历史会串到别的任务（真机实测：查 task=33 读到的是
+    另一任务"读取 6 行"的记录，据此判断「同步成功但目标库 0 行」），
+    属于会误导排障的严重问题。
+    """
+    raw = request.args.get("task_id") or request.args.get("sync_task_id")
+    tid = None
+    if raw not in (None, ""):
+        try:
+            tid = int(raw)
+        except (TypeError, ValueError):
+            tid = None
+    rows = models.list_sync_records(tid)
     return jsonify({"success": True, "data": rows})
+
+
+# 常见字段别名 → sync_tasks 正规字段名。
+# 现象（2026-11-14 实测）：调用方按「src_table / tgt_table」这类直观命名提交，
+# 接口只回一条 warnings 就静默丢弃，任务创建成功但 source_table 为空，
+# 一运行必失败且错误离根因很远。这里做别名映射；真正拼错的字段仍走
+# warnings 提示（不阻断，保持向后兼容）。
+_SYNC_FIELD_ALIASES = {
+    "src_table": "source_table", "source_table_name": "source_table",
+    "tgt_table": "target_table", "target_table_name": "target_table",
+    "src_tables": "source_tables_list", "tgt_tables": "source_tables_list",
+    "src_db": "src_db_name", "tgt_db": "tgt_db_name",
+    "source_db": "src_db_name", "target_db": "tgt_db_name",
+    "source_host": "src_host", "target_host": "tgt_host",
+    "source_port": "src_port", "target_port": "tgt_port",
+    "source_username": "src_username", "target_username": "tgt_username",
+    "source_password": "src_password", "target_password": "tgt_password",
+    "source_schema": "src_schema", "target_schema": "tgt_schema",
+    "source_db_type": "src_db_type", "target_db_type": "tgt_db_type",
+    "mode": "sync_mode",
+}
+
+
+def _apply_field_aliases(data: dict) -> dict:
+    """把常见别名收敛为正规字段名（正规字段已有值时以正规字段为准）。"""
+    if not isinstance(data, dict):
+        return data
+    out = dict(data)
+    for alias, real in _SYNC_FIELD_ALIASES.items():
+        if alias not in out:
+            continue
+        if out.get(real) in (None, "", [], {}):
+            out[real] = out[alias]
+        out.pop(alias, None)
+    return out
 
 
 def _prepare_payload(data: dict) -> dict:
     """把前端 payload 规范化并存入 sync_tasks 字段。"""
+    data = _apply_field_aliases(data)
     payload = {}
     # 字符串/数字字段直接透传
     for k in [

@@ -2,135 +2,631 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>AIDBM 运维大屏</title>
+<title>AIDBM · 领导驾驶舱</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link href="/static/css/app.css" rel="stylesheet">
 <style>
-  html, body { background:#0B1220; color:#E2E8F0; height:100%; margin:0;
-    font-family:"Segoe UI","Microsoft YaHei",sans-serif; overflow:hidden; }
-  .scr-head { display:flex; justify-content:space-between; align-items:center;
-    padding:14px 28px; border-bottom:1px solid #1E293B; }
-  .scr-title { font-size:22px; font-weight:700; letter-spacing:4px;
-    background:linear-gradient(90deg,#5EEAD4,#38BDF8); -webkit-background-clip:text;
-    -webkit-text-fill-color:transparent; }
-  .scr-clock { font-variant-numeric:tabular-nums; color:#94A3B8; }
-  .grid { display:grid; gap:14px; padding:16px 28px;
-    grid-template-columns:repeat(6,1fr); grid-auto-rows:minmax(120px,auto); height:calc(100vh - 66px); }
-  .card { background:linear-gradient(160deg,#101B30,#0D1526); border:1px solid #1E293B;
-    border-radius:12px; padding:16px 18px; position:relative; overflow:hidden; }
-  .card::before { content:""; position:absolute; top:0; left:0; right:0; height:2px;
-    background:linear-gradient(90deg,#5EEAD4,#38BDF8); opacity:.6; }
-  .k-num { font-size:40px; font-weight:800; color:#5EEAD4; line-height:1.1;
-    font-variant-numeric:tabular-nums; }
-  .k-label { color:#94A3B8; font-size:13px; margin-top:4px; }
-  .k-sub { color:#64748B; font-size:12px; margin-top:6px; }
-  .k-danger { color:#F87171; }
-  .k-warn { color:#FBBF24; }
-  .span2 { grid-column:span 2; } .span3 { grid-column:span 3; } .span4 { grid-column:span 4; }
-  .span6 { grid-column:span 6; } .span5 { grid-column:span 5; }
-  table.mini { width:100%; font-size:12px; border-collapse:collapse; }
-  table.mini td { padding:4px 6px; border-bottom:1px dashed #1E293B; color:#CBD5E1; }
-  table.mini tr td:first-child { color:#64748B; white-space:nowrap; }
-  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; }
-  .ok { background:rgba(94,234,212,.12); color:#5EEAD4; }
-  .bad { background:rgba(248,113,113,.14); color:#F87171; }
-  .run { background:rgba(56,189,248,.14); color:#38BDF8; }
-  .bar-row { display:flex; align-items:center; gap:8px; margin:6px 0; font-size:12px; }
-  .bar-track { flex:1; height:8px; background:#1E293B; border-radius:4px; overflow:hidden; }
-  .bar-fill { height:100%; background:linear-gradient(90deg,#5EEAD4,#38BDF8); border-radius:4px; }
-  .bar-fill.bad { background:linear-gradient(90deg,#F87171,#FB923C); }
+  :root{
+    --bg:#050B18; --panel:rgba(13,24,44,.78); --line:rgba(56,189,248,.22);
+    --cyan:#22D3EE; --teal:#2DD4BF; --blue:#3B82F6; --amber:#FBBF24;
+    --red:#F87171; --green:#34D399; --txt:#E2E8F0; --dim:#7C8FA8;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
+    font-family:"PingFang SC","Microsoft YaHei","Segoe UI",system-ui,sans-serif;overflow:hidden}
+  /* 1920x1080 设计稿，等比缩放铺满任意屏幕 */
+  #viewport{width:1920px;height:1080px;position:absolute;left:50%;top:50%;
+    transform-origin:center center;transform:translate(-50%,-50%) scale(1)}
+  /* 背景：科技网格 + 光晕 + 扫描线 */
+  .bg-grid,.bg-glow,.scan{position:fixed;inset:0;pointer-events:none}
+  .bg-grid{background-image:linear-gradient(rgba(56,189,248,.06) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(56,189,248,.06) 1px,transparent 1px);
+    background-size:48px 48px;mask-image:radial-gradient(circle at 50% 40%,#000 45%,transparent 78%)}
+  .bg-glow{background:radial-gradient(900px 520px at 50% -10%,rgba(34,211,238,.16),transparent 60%),
+    radial-gradient(700px 460px at 88% 108%,rgba(59,130,246,.14),transparent 62%)}
+  .scan{background:linear-gradient(180deg,transparent,rgba(34,211,238,.10) 50%,transparent);
+    height:220px;animation:scanMove 7s linear infinite;opacity:.5}
+  @keyframes scanMove{0%{transform:translateY(-240px)}100%{transform:translateY(1120px)}}
+
+  /* 头部 */
+  .head{height:96px;display:flex;align-items:center;justify-content:space-between;
+    padding:0 40px;position:relative}
+  .head::after{content:"";position:absolute;left:40px;right:40px;bottom:0;height:1px;
+    background:linear-gradient(90deg,transparent,rgba(34,211,238,.55),transparent)}
+  .title-wrap{display:flex;align-items:center;gap:16px}
+  .title{font-size:34px;font-weight:800;letter-spacing:6px;
+    background:linear-gradient(90deg,#67E8F9,#38BDF8 45%,#A78BFA);
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+    filter:drop-shadow(0 0 18px rgba(56,189,248,.35))}
+  .subtitle{font-size:13px;color:var(--dim);letter-spacing:3px;margin-top:4px}
+  .head-right{display:flex;align-items:center;gap:26px}
+  .clock{font-size:22px;font-variant-numeric:tabular-nums;color:#BAE6FD;letter-spacing:1px}
+  .clock small{display:block;font-size:11px;color:var(--dim);letter-spacing:2px;text-align:right}
+  .badge{display:inline-flex;align-items:center;gap:8px;padding:7px 16px;border-radius:999px;
+    border:1px solid var(--line);background:rgba(13,24,44,.7);font-size:14px}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--green);
+    box-shadow:0 0 10px currentColor;animation:pulse 1.8s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.75)}}
+
+  /* 主体三列 */
+  .body{height:calc(1080px - 96px - 62px);display:grid;gap:18px;padding:18px 40px 0;
+    grid-template-columns:1fr 1.32fr 1fr}
+  .col{display:flex;flex-direction:column;gap:18px;min-height:0}
+  .panel{position:relative;background:var(--panel);border:1px solid var(--line);
+    border-radius:14px;padding:16px 18px;backdrop-filter:blur(6px);overflow:hidden;
+    box-shadow:inset 0 0 30px rgba(34,211,238,.05)}
+  .panel::before,.panel::after{content:"";position:absolute;width:16px;height:16px;
+    border:2px solid var(--cyan);opacity:.85}
+  .panel::before{left:-1px;top:-1px;border-right:0;border-bottom:0;border-radius:14px 0 0 0}
+  .panel::after{right:-1px;bottom:-1px;border-left:0;border-top:0;border-radius:0 0 14px 0}
+  .p-title{font-size:15px;font-weight:700;color:#CBD5E1;letter-spacing:1px;
+    display:flex;align-items:center;gap:8px;margin-bottom:12px}
+  .p-title i{width:4px;height:15px;border-radius:2px;
+    background:linear-gradient(180deg,var(--cyan),var(--blue))}
+  .p-title span.tag{margin-left:auto;font-size:11px;color:var(--dim);font-weight:400}
+
+  /* KPI 大字 */
+  .kpi{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  .kpi-item{background:linear-gradient(160deg,rgba(20,38,66,.9),rgba(10,20,36,.9));
+    border:1px solid rgba(56,189,248,.16);border-radius:12px;padding:14px 16px}
+  .kpi-num{font-size:38px;font-weight:800;line-height:1.05;font-variant-numeric:tabular-nums;
+    background:linear-gradient(180deg,#E0F2FE,#38BDF8);-webkit-background-clip:text;
+    -webkit-text-fill-color:transparent}
+  .kpi-num.warn{background:linear-gradient(180deg,#FEF3C7,#FBBF24);
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  .kpi-num.bad{background:linear-gradient(180deg,#FEE2E2,#F87171);
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  .kpi-label{font-size:12px;color:var(--dim);margin-top:6px;letter-spacing:1px}
+  .kpi-sub{font-size:11px;color:#5B7290;margin-top:4px}
+
+  /* 任务分类态势（数据库 / 文件 / 对象存储 / 虚拟机） */
+  .board-head{display:flex;align-items:center;font-size:10.5px;color:#5B7290;
+    letter-spacing:1px;padding:0 10px 4px}
+  .board-head .nm{flex:1}
+  .board-head .v{width:44px;text-align:right}
+  .board{display:flex;flex-direction:column;gap:7px}
+  .board-row{display:flex;align-items:center;font-size:12.5px;
+    padding:7px 10px;border-radius:8px;background:rgba(148,163,184,.06);
+    transition:background .3s}
+  .board-row .nm{flex:1;color:#C7D7E8;display:flex;align-items:center;gap:8px}
+  .board-row .nm .pt{width:7px;height:7px;border-radius:50%;background:var(--cyan);
+    box-shadow:0 0 8px currentColor;flex:0 0 auto}
+  .board-row .v{width:44px;text-align:right;font-variant-numeric:tabular-nums;color:#9FB3C8}
+  .board-row .v.run{color:#38BDF8;font-weight:700}
+  .board-row .v.bad{color:#F87171;font-weight:700}
+  .board-row.alert{background:rgba(248,113,113,.10)}
+  .board-row.live{background:rgba(56,189,248,.10)}
+
+  /* 环形仪表 */
+  .gauge-wrap{display:flex;align-items:center;justify-content:center;gap:18px}
+  .gauge{position:relative;width:186px;height:186px;flex:0 0 auto}
+  .gauge svg{transform:rotate(-90deg)}
+  .gauge-val{position:absolute;inset:0;display:flex;flex-direction:column;
+    align-items:center;justify-content:center}
+  .gauge-val b{font-size:44px;line-height:1;font-variant-numeric:tabular-nums;
+    background:linear-gradient(180deg,#ECFEFF,#22D3EE);-webkit-background-clip:text;
+    -webkit-text-fill-color:transparent}
+  .gauge-val small{font-size:12px;color:var(--dim);letter-spacing:2px;margin-top:6px}
+  .gauge-side{flex:1;display:flex;flex-direction:column;gap:10px}
+  .mini-row{display:flex;align-items:center;gap:8px;font-size:12px;color:#A9BCD4}
+  .mini-row b{margin-left:auto;font-variant-numeric:tabular-nums;color:#E2E8F0}
+
+  /* 横向条 */
+  .bar-row{display:flex;align-items:center;gap:10px;margin:9px 0;font-size:12.5px}
+  .bar-name{width:120px;color:#A9BCD4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bar-track{flex:1;height:9px;background:rgba(148,163,184,.14);border-radius:5px;overflow:hidden}
+  .bar-fill{height:100%;border-radius:5px;width:0;transition:width 1.1s cubic-bezier(.2,.8,.2,1);
+    background:linear-gradient(90deg,#0EA5E9,#22D3EE)}
+  .bar-fill.warn{background:linear-gradient(90deg,#F59E0B,#FBBF24)}
+  .bar-fill.bad{background:linear-gradient(90deg,#DC2626,#F87171)}
+  .bar-val{width:64px;text-align:right;color:#CBD5E1;font-variant-numeric:tabular-nums}
+
+  /* 列表 */
+  .list{display:flex;flex-direction:column;gap:8px;overflow:hidden}
+  .list-row{display:flex;align-items:center;gap:10px;font-size:12.5px;
+    padding:7px 10px;border-radius:8px;background:rgba(148,163,184,.06)}
+  .list-row .name{flex:1;color:#C7D7E8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .list-row .meta{color:#5B7290;font-size:11px;font-variant-numeric:tabular-nums}
+  .pill{padding:2px 9px;border-radius:999px;font-size:11px;white-space:nowrap}
+  .pill.ok{background:rgba(52,211,153,.14);color:#34D399}
+  .pill.bad{background:rgba(248,113,113,.16);color:#F87171}
+  .pill.run{background:rgba(56,189,248,.16);color:#38BDF8}
+  .pill.warn{background:rgba(251,191,36,.16);color:#FBBF24}
+
+  /* 底部跑马灯 */
+  .ticker{height:62px;display:flex;align-items:center;gap:18px;padding:0 40px;
+    border-top:1px solid rgba(56,189,248,.18);overflow:hidden}
+  .ticker .lbl{font-size:12px;color:var(--dim);letter-spacing:2px;flex:0 0 auto}
+  .ticker-track{flex:1;overflow:hidden;white-space:nowrap}
+  .ticker-inner{display:inline-block;padding-left:100%;animation:scrollLeft 32s linear infinite;
+    font-size:13px;color:#A9BCD4}
+  .ticker-inner span{margin-right:46px}
+  .ticker-inner b{color:#E2E8F0}
+  @keyframes scrollLeft{0%{transform:translateX(0)}100%{transform:translateX(-100%)}}
+
+  .empty{color:#4C6482;font-size:12.5px;padding:10px 0}
+  .num-blink{animation:numPulse 2.4s ease-in-out infinite}
+  @keyframes numPulse{0%,100%{opacity:1}50%{opacity:.82}}
 </style>
 </head>
 <body>
-<div class="scr-head">
-  <div class="scr-title">AIDBM · 智能数据库灾备管理平台</div>
-  <div style="display:flex;gap:24px;align-items:center">
-    <span id="scrHealth" class="pill ok">健康度 --</span>
-    <span class="scr-clock" id="scrClock"></span>
+<div class="bg-grid"></div><div class="bg-glow"></div><div class="scan"></div>
+
+<div id="viewport">
+  <div class="head">
+    <div class="title-wrap">
+      <div>
+        <div class="title">数据保护指挥中心</div>
+        <div class="subtitle">AIDBM · 领导驾驶舱 / DATA PROTECTION COCKPIT</div>
+      </div>
+    </div>
+    <div class="head-right">
+      <div class="badge" id="badgeLive"><span class="dot" id="dotLive"></span><span id="txtLive">数据连接中…</span></div>
+      <div class="badge" id="badgeHealth"><span class="dot" id="dotHealth"></span><span id="txtHealth">健康度 --</span></div>
+      <div class="badge" id="badgeRpo"><span class="dot" id="dotRpo"></span><span id="txtRpo">RPO 达标 --</span></div>
+      <div class="clock"><span id="clock">--:--:--</span><small id="date">----</small></div>
+    </div>
+  </div>
+
+  <div class="body">
+    <!-- 左列 -->
+    <div class="col">
+      <div class="panel" style="flex:0 0 auto">
+        <div class="p-title"><i></i>核心指标<span class="tag" id="kpiTag">实时</span></div>
+        <div class="kpi">
+          <div class="kpi-item"><div class="kpi-num" id="kObj">-</div>
+            <div class="kpi-label">受保护对象</div><div class="kpi-sub" id="kObjSub">数据库 / 文件 / 其他</div></div>
+          <div class="kpi-item"><div class="kpi-num" id="kPoint">-</div>
+            <div class="kpi-label">可用恢复点</div><div class="kpi-sub" id="kPointSub">历史可回滚点</div></div>
+          <div class="kpi-item"><div class="kpi-num" id="kRate">-</div>
+            <div class="kpi-label">24h 备份成功率</div><div class="kpi-sub" id="kRateSub">成功 / 总次数</div></div>
+          <div class="kpi-item"><div class="kpi-num" id="kSize">-</div>
+            <div class="kpi-label">数据保护总量</div><div class="kpi-sub" id="kSizeSub">近 500 次作业累计</div></div>
+        </div>
+      </div>
+
+      <div class="panel" style="flex:0 0 auto">
+        <div class="p-title"><i></i>任务运行态势<span class="tag" id="boardTag">--</span></div>
+        <div class="board-head">
+          <span class="nm">类型</span><span class="v">总数</span><span class="v">运行</span><span class="v">异常</span>
+        </div>
+        <div class="board" id="boardBox"><div class="empty">加载中…</div></div>
+      </div>
+
+      <div class="panel" style="flex:1 1 auto;min-height:0">
+        <div class="p-title"><i></i>备份趋势（近 14 天）<span class="tag">成功 / 失败</span></div>
+        <div id="trendBox" style="height:calc(100% - 34px)"></div>
+      </div>
+    </div>
+
+    <!-- 中列 -->
+    <div class="col">
+      <div class="panel" style="flex:0 0 300px">
+        <div class="p-title"><i></i>全域健康评估<span class="tag">综合评分</span></div>
+        <div class="gauge-wrap">
+          <div class="gauge">
+            <svg width="186" height="186" viewBox="0 0 186 186">
+              <defs>
+                <linearGradient id="gGrad" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0%" stop-color="#22D3EE"/><stop offset="100%" stop-color="#3B82F6"/>
+                </linearGradient>
+              </defs>
+              <circle cx="93" cy="93" r="78" fill="none" stroke="rgba(148,163,184,.16)" stroke-width="12"/>
+              <circle id="gaugeArc" cx="93" cy="93" r="78" fill="none" stroke="url(#gGrad)"
+                stroke-width="12" stroke-linecap="round"
+                stroke-dasharray="490" stroke-dashoffset="490"
+                style="transition:stroke-dashoffset 1.4s cubic-bezier(.2,.8,.2,1);
+                       filter:drop-shadow(0 0 10px rgba(34,211,238,.55))"/>
+            </svg>
+            <div class="gauge-val"><b id="gaugeNum">--</b><small>HEALTH SCORE</small></div>
+          </div>
+          <div class="gauge-side" id="gaugeSide"></div>
+        </div>
+      </div>
+
+      <div class="panel" style="flex:1 1 auto;min-height:0">
+        <div class="p-title"><i></i>实时保护 / 容灾链路<span class="tag" id="rtTag">--</span></div>
+        <div class="list" id="rtList"></div>
+      </div>
+    </div>
+
+    <!-- 右列 -->
+    <div class="col">
+      <div class="panel" style="flex:0 0 auto">
+        <div class="p-title"><i></i>保护对象分布<span class="tag">按维度</span></div>
+        <div id="donutBox" style="display:flex;align-items:center;gap:12px"></div>
+      </div>
+
+      <div class="panel" style="flex:1 1 auto;min-height:0">
+        <div class="p-title"><i></i>业务系统 / 主机保护态势<span class="tag">近 500 次作业</span></div>
+        <div id="topBox"></div>
+      </div>
+
+      <div class="panel" style="flex:0 0 auto">
+        <div class="p-title"><i></i>需要关注<span class="tag" id="attTag">--</span></div>
+        <div class="list" id="attList"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="ticker">
+    <span class="lbl">实时动态</span>
+    <div class="ticker-track"><div class="ticker-inner" id="tickerInner"></div></div>
   </div>
 </div>
-<div class="grid">
-  <div class="card span2"><div class="k-num" id="kTasks">-</div><div class="k-label">备份任务总数</div><div class="k-sub" id="kTasksSub"></div></div>
-  <div class="card span2"><div class="k-num" id="kRecords">-</div><div class="k-label">可用恢复点</div><div class="k-sub" id="kSize"></div></div>
-  <div class="card span2"><div class="k-num" id="kRate">-</div><div class="k-label">24h 成功率</div><div class="k-sub" id="kRateSub"></div></div>
 
-  <div class="card span3"><div class="k-label" style="font-size:15px;font-weight:700;color:#CBD5E1">备份趋势（近 14 天）</div><div id="kTrend"></div></div>
-  <div class="card span3"><div class="k-label" style="font-size:15px;font-weight:700;color:#CBD5E1">保护对象分布</div><div id="kTypes"></div></div>
-
-  <div class="card span3"><div class="k-label" style="font-size:15px;font-weight:700;color:#CBD5E1">最近备份记录</div>
-    <table class="mini" id="kRecent"></table></div>
-  <div class="card span3"><div class="k-label" style="font-size:15px;font-weight:700;color:#CBD5E1">需要关注</div>
-    <table class="mini" id="kAttention"></table></div>
-</div>
 <script>
 (function () {
-  const $ = (id) => document.getElementById(id);
-  const esc = (s) => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var esc = function (s) {
+    return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  };
+
+  /* ---------- 等比缩放：1920x1080 设计稿铺满任意屏幕 ---------- */
+  function fit() {
+    var vp = $("viewport");
+    if (!vp) return;
+    var s = Math.min(window.innerWidth / 1920, window.innerHeight / 1080);
+    vp.style.transform = "translate(-50%,-50%) scale(" + s + ")";
+  }
+  window.addEventListener("resize", fit);
+  fit();
+
+  /* ---------- 时钟 ---------- */
+  var WEEK = ["日", "一", "二", "三", "四", "五", "六"];
   function tick() {
-    $("scrClock").textContent = new Date().toLocaleString("zh-CN", { hour12: false });
+    var d = new Date();
+    var p = function (n) { return n < 10 ? "0" + n : "" + n; };
+    $("clock").textContent = p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+    $("date").textContent = d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+      " 周" + WEEK[d.getDay()];
   }
   tick(); setInterval(tick, 1000);
 
-  function bars(items, fmt) {
-    const max = Math.max(1, ...items.map((x) => x[1]));
-    return items.map(([name, val, bad]) =>
-      '<div class="bar-row"><span style="width:150px;color:#94A3B8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' +
-      esc(name) + '</span><div class="bar-track"><div class="bar-fill' + (bad ? " bad" : "") +
-      '" style="width:' + Math.round((val / max) * 100) + '%"></div></div><span style="width:70px;text-align:right;color:#CBD5E1">' +
-      fmt(val) + "</span></div>").join("");
+  /* ---------- 折线图（纯 SVG：渐变面积 + 描边动画 + 数据点） ---------- */
+  function drawTrend(trend) {
+    var box = $("trendBox");
+    var data = (trend || []).map(function (t) {
+      return { d: (t.date || "").slice(5), ok: t.success || t.value || 0, bad: t.failed || 0 };
+    });
+    if (!data.length) { box.innerHTML = '<div class="empty">暂无趋势数据</div>'; return; }
+    var W = 560, H = 250, padL = 34, padR = 12, padT = 16, padB = 26;
+    var iw = W - padL - padR, ih = H - padT - padB;
+    var max = Math.max(1, Math.max.apply(null, data.map(function (x) { return x.ok + x.bad; })));
+    var step = data.length > 1 ? iw / (data.length - 1) : 0;
+    var pts = data.map(function (x, i) {
+      return [padL + step * i, padT + ih - (x.ok / max) * ih];
+    });
+    var line = pts.map(function (p, i) { return (i ? "L" : "M") + p[0].toFixed(1) + "," + p[1].toFixed(1); }).join(" ");
+    var area = line + " L" + (padL + iw).toFixed(1) + "," + (padT + ih) + " L" + padL + "," + (padT + ih) + " Z";
+    var g = "";
+    for (var i = 0; i <= 4; i++) {
+      var y = padT + (ih / 4) * i;
+      var v = Math.round(max * (1 - i / 4));
+      g += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y +
+        '" stroke="rgba(148,163,184,.13)" stroke-dasharray="4 5"/>' +
+        '<text x="' + (padL - 8) + '" y="' + (y + 4) + '" fill="#5B7290" font-size="10" text-anchor="end">' + v + '</text>';
+    }
+    var dots = pts.map(function (p, i) {
+      return '<circle cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="3.2" fill="#22D3EE"/>' +
+        '<text x="' + p[0].toFixed(1) + '" y="' + (H - 8) + '" fill="#5B7290" font-size="10" text-anchor="middle">' +
+        esc(data[i].d) + '</text>';
+    }).join("");
+    var bars = data.map(function (x, i) {
+      if (!x.bad) return "";
+      var h = (x.bad / max) * ih;
+      return '<rect x="' + (padL + step * i - 4).toFixed(1) + '" y="' + (padT + ih - h).toFixed(1) +
+        '" width="8" height="' + h.toFixed(1) + '" rx="2" fill="rgba(248,113,113,.55)"/>';
+    }).join("");
+    box.innerHTML =
+      '<svg viewBox="0 0 ' + W + " " + H + '" preserveAspectRatio="none" style="width:100%;height:100%">' +
+      '<defs><linearGradient id="aGrad" x1="0" y1="0" x2="0" y2="1">' +
+      '<stop offset="0%" stop-color="rgba(34,211,238,.42)"/><stop offset="100%" stop-color="rgba(34,211,238,0)"/>' +
+      "</linearGradient></defs>" + g + bars +
+      '<path d="' + area + '" fill="url(#aGrad)"/>' +
+      '<path d="' + line + '" fill="none" stroke="#22D3EE" stroke-width="2.4" stroke-linecap="round" ' +
+      'stroke-dasharray="2000" stroke-dashoffset="2000">' +
+      '<animate attributeName="stroke-dashoffset" from="2000" to="0" dur="1.6s" fill="freeze"/></path>' +
+      dots + "</svg>";
   }
 
-  async function load() {
-    try {
-      const r = await (await fetch("/api/dashboard", { credentials: "include" })).json();
-      $("kTasks").textContent = r.task_count ?? 0;
-      $("kTasksSub").textContent = "数据库 " + (r.db_task_count ?? 0) + " · 文件 " + (r.file_task_count ?? 0);
-      $("kRecords").textContent = r.record_count ?? 0;
-      $("kSize").textContent = r.total_size_human || "-";
-      const sr = r.success_rate_24h || {};
-      $("kRate").textContent = (sr.rate != null ? sr.rate + "%" : "-");
-      $("kRate").className = "k-num " + ((sr.rate ?? 100) >= 95 ? "" : (sr.rate ?? 0) >= 80 ? "k-warn" : "k-danger");
-      $("kRateSub").textContent = "成功 " + (sr.success ?? 0) + " / 总 " + (sr.total ?? 0);
-      const hs = r.health_score;
-      $("scrHealth").textContent = "健康度 " + (hs ?? "--");
-      $("scrHealth").className = "pill " + ((hs ?? 100) >= 90 ? "ok" : (hs ?? 0) >= 70 ? "run" : "bad");
-      // 趋势（纯 SVG 柱状）
-      const trend = r.trend || [];
-      if (trend.length) {
-        const W = 520, H = 120, bw = W / trend.length - 6;
-        let svg = '<svg viewBox="0 0 ' + W + " " + H + '" style="width:100%;height:150px;margin-top:8px">';
-        trend.forEach((t, i) => {
-          const v = t.success ?? t.value ?? 0, f = t.failed ?? 0;
-          const mx = Math.max(1, ...trend.map((x) => (x.success ?? x.value ?? 0) + (x.failed ?? 0)));
-          const h1 = Math.round((v / mx) * (H - 30));
-          const h2 = Math.round((f / mx) * (H - 30));
-          const x = i * (W / trend.length) + 3;
-          svg += '<rect x="' + x + '" y="' + (H - 18 - h1) + '" width="' + bw + '" height="' + h1 + '" fill="#5EEAD4" opacity=".85"/>';
-          if (f) svg += '<rect x="' + x + '" y="' + (H - 18 - h1 - h2) + '" width="' + bw + '" height="' + h2 + '" fill="#F87171" opacity=".9"/>';
-          svg += '<text x="' + (x + bw / 2) + '" y="' + (H - 4) + '" font-size="9" fill="#64748B" text-anchor="middle">' + esc((t.date || "").slice(5)) + "</text>";
-        });
-        $("kTrend").innerHTML = svg + "</svg>";
-      }
-      // 类型分布
-      const cnt = r.db_counter_display || r.db_counter || {};
-      const items = Object.entries(cnt).map(([k, v]) => [k, v, false]).sort((a, b) => b[1] - a[1]).slice(0, 8);
-      $("kTypes").innerHTML = bars(items, (v) => String(v));
-      // 最近记录
-      const recs = (r.recent_records || []).slice(0, 7);
-      $("kRecent").innerHTML = recs.length ? recs.map((x) =>
-        "<tr><td>" + esc((x.started_at || "").slice(5, 16)) + "</td><td>" + esc(x.task_name || "-") +
-        '</td><td><span class="pill ' + (x.status === "success" ? "ok" : x.status === "running" ? "run" : "bad") + '">' +
-        esc(x.status || "-") + "</span></td><td>" + esc(x.size_human || "-") + "</td></tr>").join("")
-        : '<tr><td class="text-muted">暂无记录</td></tr>';
-      // 需要关注
-      const att = (r.attention || []).slice(0, 7);
-      $("kAttention").innerHTML = att.length ? att.map((x) =>
-        "<tr><td>" + esc(x.title || x.kind || "-") + "</td><td>" + esc((x.message || "").slice(0, 60)) + "</td></tr>").join("")
-        : '<tr><td style="color:#5EEAD4">一切正常，无待关注风险</td></tr>';
-    } catch (e) { /* 静默重试 */ }
+  /* ---------- 环形分布图 ---------- */
+  var PALETTE = ["#22D3EE", "#3B82F6", "#A78BFA", "#34D399", "#FBBF24", "#F472B6", "#60A5FA", "#2DD4BF"];
+  function drawDonut(counter) {
+    var entries = Object.keys(counter || {}).map(function (k) { return [k, counter[k]]; })
+      .filter(function (x) { return x[1] > 0; }).sort(function (a, b) { return b[1] - a[1]; }).slice(0, 6);
+    var box = $("donutBox");
+    if (!entries.length) { box.innerHTML = '<div class="empty">暂无数据</div>'; return; }
+    var total = entries.reduce(function (s, x) { return s + x[1]; }, 0) || 1;
+    var R = 62, C = 2 * Math.PI * R, off = 0, arcs = "";
+    entries.forEach(function (e, i) {
+      var len = (e[1] / total) * C;
+      arcs += '<circle cx="80" cy="80" r="' + R + '" fill="none" stroke="' + PALETTE[i % PALETTE.length] +
+        '" stroke-width="20" stroke-dasharray="' + (len - 2).toFixed(1) + " " + (C - len + 2).toFixed(1) +
+        '" stroke-dashoffset="' + (-off).toFixed(1) + '" transform="rotate(-90 80 80)" opacity=".92"/>';
+      off += len;
+    });
+    var legend = entries.map(function (e, i) {
+      var pct = Math.round((e[1] / total) * 100);
+      return '<div class="mini-row"><span style="width:8px;height:8px;border-radius:2px;background:' +
+        PALETTE[i % PALETTE.length] + '"></span><span style="max-width:96px;overflow:hidden;' +
+        'text-overflow:ellipsis;white-space:nowrap">' + esc(e[0]) + "</span><b>" + pct + "%</b></div>";
+    }).join("");
+    box.innerHTML = '<svg width="160" height="160" viewBox="0 0 160 160" style="flex:0 0 auto">' +
+      '<circle cx="80" cy="80" r="' + R + '" fill="none" stroke="rgba(148,163,184,.12)" stroke-width="20"/>' +
+      arcs + '<text x="80" y="76" fill="#E2E8F0" font-size="22" font-weight="700" text-anchor="middle">' +
+      total + '</text><text x="80" y="96" fill="#5B7290" font-size="11" text-anchor="middle">对象</text></svg>' +
+      '<div style="flex:1">' + legend + "</div>";
   }
+
+  /* ---------- 横向排行 ---------- */
+  function drawBars(box, items, fmt, threshold) {
+    if (!items.length) { box.innerHTML = '<div class="empty">暂无数据</div>'; return; }
+    var max = Math.max.apply(null, items.map(function (x) { return x[1]; })) || 1;
+    box.innerHTML = items.map(function (x) {
+      var pct = Math.max(2, Math.round((x[1] / max) * 100));
+      var cls = threshold && x[1] >= threshold ? " bad" : "";
+      return '<div class="bar-row"><span class="bar-name" title="' + esc(x[0]) + '">' + esc(x[0]) +
+        '</span><div class="bar-track"><div class="bar-fill' + cls + '" style="width:' + pct + '%"></div></div>' +
+        '<span class="bar-val">' + fmt(x[1]) + "</span></div>";
+    }).join("");
+  }
+
+  /* ---------- 健康环形 ---------- */
+  function drawGauge(score, details) {
+    var s = Math.max(0, Math.min(100, Number(score) || 0));
+    var arc = $("gaugeArc");
+    var C = 2 * Math.PI * 78;
+    arc.setAttribute("stroke-dasharray", C.toFixed(1));
+    arc.setAttribute("stroke-dashoffset", (C * (1 - s / 100)).toFixed(1));
+    $("gaugeNum").textContent = Math.round(s);
+    var side = $("gaugeSide");
+    // 后端 health_details 是 "名称: 分子/分母 (说明)" 形式的字符串数组，
+    // 兼容未来改成 [{name,score}] 的结构化形态。
+    side.innerHTML = (details || []).slice(0, 5).map(function (d) {
+      if (typeof d === "string") {
+        var m = d.match(/^([^:：]+)[:：]\s*(.+)$/);
+        var name = m ? m[1] : d;
+        var val = m ? m[2] : "";
+        var pct = (val.match(/(\d+)\s*\//) || [])[1];
+        return '<div class="mini-row"><span>' + esc(name) + "</span><b>" +
+          esc(pct != null ? pct + "%" : val.slice(0, 12)) + "</b></div>";
+      }
+      var v = Number(d.score != null ? d.score : d.value) || 0;
+      return '<div class="mini-row"><span>' + esc(d.name || d.label || "") + "</span><b>" + v + "</b></div>";
+    }).join("") || '<div class="empty">暂无分项</div>';
+  }
+
+  /* ---------- 实时保护 / 容灾 ---------- */
+  function drawRt(rt, dr) {
+    var rows = [];
+    (rt.items || []).slice(0, 4).forEach(function (it) {
+      var ok = it.status === "running" || it.status === "ok";
+      var where = [it.host_ip, it.biz_system].filter(function (x) {
+        return x && x !== "-";
+      }).join(" · ");
+      rows.push('<div class="list-row"><span class="pill ' + (ok ? "ok" : "bad") + '">' +
+        (ok ? "运行中" : esc(it.status || "异常")) + '</span><span class="name">' + esc(it.name) +
+        '</span><span class="meta" style="font-family:ui-monospace,monospace">' + esc(where) +
+        (it.reason ? " · " + esc(it.reason.slice(0, 14)) : "") + "</span></div>");
+    });
+    (dr.links || []).slice(0, 2).forEach(function (l) {
+      var ok = l.status === "healthy" || l.health === "ok" || l.healthy;
+      rows.push('<div class="list-row"><span class="pill ' + (ok ? "ok" : "warn") + '">容灾</span>' +
+        '<span class="name">' + esc(l.name || l.link_name || "-") + '</span><span class="meta">' +
+        esc(l.primary_site || "") + " → " + esc(l.dr_site || "") + "</span></div>");
+    });
+    $("rtList").innerHTML = rows.join("") || '<div class="empty">暂无实时保护任务</div>';
+    $("rtTag").textContent = "实时 " + ((rt.items || []).length) + " · 容灾 " + ((dr.links || []).length);
+  }
+
+  /* ---------- 底部跑马灯 ---------- */
+  function drawTicker(records, attention) {
+    var parts = [];
+    (records || []).slice(0, 10).forEach(function (r) {
+      var ok = r.status === "success";
+      parts.push('<span>' + esc((r.started_at || "").slice(5, 16)) + " · <b>" + esc(r.task_name || "-") +
+        "</b>" + (r.host_ip && r.host_ip !== "-" ? " [" + esc(r.host_ip) + "]" : "") + " " +
+        (ok ? "备份成功" : (r.status === "running" ? "执行中" : "失败")) +
+        " · " + esc(r.size_human || "-") + "</span>");
+    });
+    (attention || []).slice(0, 4).forEach(function (a) {
+      parts.push('<span style="color:#FBBF24">⚠ <b>' + esc(a.title || a.kind || "风险") + "</b> " +
+        esc((a.message || "").slice(0, 40)) + "</span>");
+    });
+    $("tickerInner").innerHTML = parts.join("") || "<span>暂无动态</span>";
+  }
+
+  /* ---------- 任务运行态势（按类型：数据库/文件/对象存储/虚拟机） ---------- */
+  function drawBoard(b) {
+    b = b || {};
+    var groups = b.groups || [];
+    var tot = b.totals || {};
+    var tag = $("boardTag");
+    if (tag) {
+      tag.textContent = "运行 " + (tot.running || 0) + " · 异常 " + (tot.failed || 0);
+      tag.style.color = (Number(tot.failed) > 0) ? "#F87171"
+        : (Number(tot.running) > 0 ? "#38BDF8" : "#34D399");
+    }
+    var box = $("boardBox");
+    if (!box) return;
+    if (!groups.length) { box.innerHTML = '<div class="empty">暂无任务数据</div>'; return; }
+    var COLOR = { db: "#22D3EE", file: "#A78BFA", object: "#34D399", vm: "#FBBF24" };
+    box.innerHTML = groups.map(function (g) {
+      var run = Number(g.running || 0), bad = Number(g.failed || 0);
+      var cls = bad > 0 ? " alert" : (run > 0 ? " live" : "");
+      var c = COLOR[g.key] || "#22D3EE";
+      return '<div class="board-row' + cls + '">' +
+        '<span class="nm"><span class="pt" style="background:' + c + ';color:' + c + '"></span>' +
+        esc(g.label || g.key) + '</span>' +
+        '<span class="v">' + (g.total || 0) + '</span>' +
+        '<span class="v run">' + (run > 0 ? run : "·") + '</span>' +
+        '<span class="v' + (bad > 0 ? " bad" : "") + '">' + (bad > 0 ? bad : "·") + '</span>' +
+        '</div>';
+    }).join("");
+  }
+
+  /* ---------- 数据加载：并行 + 超时 + 独立容错 + 实时刷新 ---------- */
+  var REFRESH_MS = 5000;          /* 实时刷新间隔：大屏 5 秒一刷 */
+  var lastOkAt = 0;               /* 最近一次成功拿到数据的时间 */
+  var lastDr = { links: [] };     /* 容灾数据缓存（light 模式保留上次探测结果） */
+  var authNotified = false;       /* 会话过期只提示/跳转一次，避免刷新抖动 */
+
+  /* 带超时的 JSON 请求：401 单独标记，超时/网络错误抛可读原因 */
+  function fetchJSON(url, timeoutMs) {
+    var ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function () { ctrl.abort(); }, timeoutMs || 8000) : null;
+    return fetch(url, {
+      credentials: "include", cache: "no-store",
+      signal: ctrl ? ctrl.signal : undefined,
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (body) {
+        if (res.status === 401) {
+          var e1 = new Error("未登录或会话已过期"); e1.auth = true; throw e1;
+        }
+        if (!res.ok) { throw new Error("HTTP " + res.status); }
+        return body;
+      });
+    }).then(function (v) {
+      if (timer) clearTimeout(timer);
+      return v;
+    }).catch(function (err) {
+      if (timer) clearTimeout(timer);
+      if (err && err.name === "AbortError") { throw new Error("请求超时"); }
+      throw err;
+    });
+  }
+
+  function setLive(state, msg) {
+    var dot = $("dotLive"), txt = $("txtLive");
+    var color = state === "ok" ? "#34D399" : (state === "warn" ? "#FBBF24" : "#F87171");
+    if (dot) { dot.style.color = color; dot.style.background = color; }
+    if (txt) { txt.textContent = msg; txt.style.color = (state === "ok" ? "#34D399" : color); }
+  }
+
+  function hhmmss() {
+    var d = new Date();
+    var p = function (n) { return (n < 10 ? "0" : "") + n; };
+    return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+
+  /* ---------- 主加载 ---------- */
+  async function load() {
+    /* 三个接口并行：任何一个慢/挂都不拖住整屏（dr 走 light 模式跳过 SSH 探活） */
+    var packed = await Promise.all([
+      fetchJSON("/api/dashboard?fresh=1", 8000).catch(function (e) { return { __err: e }; }),
+      fetchJSON("/api/screen/board", 8000).catch(function (e) { return { __err: e }; }),
+      fetchJSON("/api/dr/overview?light=1", 8000).catch(function (e) { return { __err: e }; }),
+    ]);
+    var dash = packed[0] || {};
+    var board = (packed[1] && !packed[1].__err && packed[1].data) ? packed[1].data : null;
+    var dr = (packed[2] && !packed[2].__err) ? packed[2] : null;
+
+    if (dash.__err) {
+      var err = dash.__err;
+      if (err.auth) {
+        /* 会话过期：大屏不能静默留空屏，明确提示并自动回登录（带回跳） */
+        setLive("err", "会话已过期 · 即将返回登录页");
+        if (!authNotified) {
+          authNotified = true;
+          setTimeout(function () {
+            location.href = "/login?next=" + encodeURIComponent("/screen");
+          }, 2500);
+        }
+      } else {
+        var stale = lastOkAt ? Math.round((Date.now() - lastOkAt) / 1000) : null;
+        setLive("err", "数据获取失败（" + (err.message || "网络异常") + "）"
+          + (stale != null ? " · 已 " + stale + "s 未更新" : "") + " · 自动重试中");
+      }
+      return;
+    }
+
+    lastOkAt = Date.now();
+    if (dr) lastDr = dr;
+    setLive("ok", "实时 · 每 " + (REFRESH_MS / 1000) + "s · 更新 " + hhmmss());
+
+    /* KPI */
+    $("kObj").textContent = dash.task_count != null ? dash.task_count : "-";
+    $("kObjSub").textContent = "数据库 " + (dash.db_task_count || 0) +
+      " · 文件 " + (dash.file_task_count || 0) + " · 其他 " +
+      Math.max(0, (dash.task_count || 0) - (dash.db_task_count || 0) - (dash.file_task_count || 0));
+    $("kPoint").textContent = dash.record_count != null ? dash.record_count : "-";
+    $("kPointSub").textContent = "最近窗口 " + ((dash.recent_records || []).length) + " 条作业";
+    var sr = dash.success_rate_24h || {};
+    $("kRate").textContent = sr.rate != null ? sr.rate + "%" : "-";
+    $("kRate").className = "kpi-num" + (sr.rate == null ? "" : (sr.rate >= 95 ? "" : (sr.rate >= 80 ? " warn" : " bad")));
+    $("kRateSub").textContent = "成功 " + (sr.success || 0) + " / 总 " + (sr.total || 0) +
+      (sr.failed ? " · 失败 " + sr.failed : "");
+    $("kSize").textContent = dash.total_size_human || "-";
+    $("kSizeSub").textContent = "压缩率 " + (dash.compression_ratio != null ? dash.compression_ratio + "%" : "-");
+
+    /* 任务运行态势（接口失败时保留上一次渲染，不清空） */
+    if (board) drawBoard(board);
+
+    /* 健康 */
+    var hs = Number(dash.health_score);
+    $("txtHealth").textContent = "健康度 " + (isNaN(hs) ? "--" : Math.round(hs));
+    $("dotHealth").style.color = isNaN(hs) ? "#7C8FA8" : (hs >= 90 ? "#34D399" : (hs >= 70 ? "#FBBF24" : "#F87171"));
+    $("dotHealth").style.background = $("dotHealth").style.color;
+    var rpo = dash.rpo || {};
+    var rpoPct = rpo.compliance_rate != null ? rpo.compliance_rate
+      : (rpo.rate != null ? rpo.rate
+        : (rpo.enabled ? Math.round((rpo.compliant || 0) * 100 / rpo.enabled) : null));
+    $("txtRpo").textContent = "RPO 达标 " + (rpoPct == null ? "--" : rpoPct + "%");
+    $("dotRpo").style.color = rpoPct == null ? "#7C8FA8" : (rpoPct >= 95 ? "#34D399" : (rpoPct >= 80 ? "#FBBF24" : "#F87171"));
+    $("dotRpo").style.background = $("dotRpo").style.color;
+    drawGauge(hs, dash.health_details || []);
+
+    /* 图表 */
+    drawTrend(dash.trend || []);
+    drawDonut(dash.db_counter || dash.db_counter_display || {});
+    /* 业务系统 / 主机保护态势：每行 业务系统 + IP，成功/失败计数，失败红显 */
+    var bizTop = dash.biz_top || [];
+    var topBox = $("topBox");
+    if (topBox) {
+      if (!bizTop.length) {
+        topBox.innerHTML = '<div class="empty">暂无作业数据</div>';
+      } else {
+        topBox.innerHTML = bizTop.map(function (a) {
+          var bad = Number(a.failed || 0) > 0;
+          var st = bad
+            ? '<span style="color:#F87171;font-weight:600">异常 ' + a.failed + '</span>'
+            : '<span style="color:#34D399">正常</span>';
+          return '<div class="mini-row" style="padding:3px 0;border-bottom:1px dashed rgba(148,163,184,.12)">' +
+            '<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' +
+            '<b style="margin:0;color:#E2E8F0;font-weight:600">' + esc(a.biz_system || "-") + '</b>' +
+            '<span style="color:#7C8FA8;margin-left:8px;font-family:ui-monospace,monospace">' +
+            esc(a.host_ip || "-") + '</span></span>' +
+            '<span style="margin-left:auto;display:flex;gap:10px;align-items:baseline">' +
+            '<span style="color:#7C8FA8">成功 ' + (a.success || 0) + '</span>' + st +
+            '</span></div>';
+        }).join("");
+      }
+    }
+
+    /* 实时 / 容灾 / 关注（light 模式无实时探活 → 沿用上一次结果） */
+    drawRt(dash.rt || {}, lastDr || { links: [] });
+    var att = (dash.attention || []).slice(0, 3);
+    $("attTag").textContent = att.length ? att.length + " 项" : "正常";
+    $("attList").innerHTML = att.length ? att.map(function (a) {
+      var where = [a.host_ip, a.biz_system].filter(function (x) {
+        return x && x !== "-";
+      }).join(" · ");
+      return '<div class="list-row"><span class="pill warn">风险</span><span class="name">' +
+        esc(a.title || a.kind || "-") + '</span><span class="meta" style="font-family:ui-monospace,monospace">' +
+        esc(where || (a.message || "").slice(0, 16)) + "</span></div>";
+    }).join("") : '<div class="empty" style="color:#34D399">一切正常，无待关注风险</div>';
+
+    drawTicker(dash.recent_records || [], dash.attention || []);
+  }
+
+  /* 首屏立即加载，之后每 5 秒实时刷新；页面隐藏时跳过（投屏常亮不受影响） */
   load();
-  setInterval(load, 10000);
+  setInterval(function () {
+    if (document.hidden) return;
+    load();
+  }, REFRESH_MS);
 })();
 </script>
 </body>

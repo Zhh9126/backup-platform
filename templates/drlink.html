@@ -195,6 +195,48 @@
             <label class="form-label">备站点</label>
             <input class="form-control" id="l_dr_site" placeholder="如 上海 IDC-B">
           </div>
+          <div class="col-md-6">
+            <label class="form-label">主站点地域（容灾地图定位）</label>
+            <input class="form-control" id="l_primary_region" list="regionCityList" placeholder="成都,30.57,104.06">
+            <div class="form-text">格式：城市,纬度,经度（可从下拉选常用城市）；配置后显示在容灾总览地图上。</div>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">备站点地域（容灾地图定位）</label>
+            <input class="form-control" id="l_dr_region" list="regionCityList" placeholder="贵阳,26.65,106.63">
+            <div class="form-text">格式：城市,纬度,经度（可从下拉选常用城市）。</div>
+          </div>
+          <datalist id="regionCityList">
+            <option value="北京,39.90,116.40"></option>
+            <option value="上海,31.23,121.47"></option>
+            <option value="广州,23.13,113.26"></option>
+            <option value="深圳,22.54,114.06"></option>
+            <option value="成都,30.57,104.06"></option>
+            <option value="重庆,29.56,106.55"></option>
+            <option value="武汉,30.59,114.31"></option>
+            <option value="西安,34.34,108.94"></option>
+            <option value="贵阳,26.65,106.63"></option>
+            <option value="昆明,25.04,102.71"></option>
+            <option value="杭州,30.27,120.16"></option>
+            <option value="南京,32.06,118.80"></option>
+            <option value="郑州,34.75,113.63"></option>
+            <option value="长沙,28.23,112.94"></option>
+            <option value="沈阳,41.81,123.43"></option>
+            <option value="哈尔滨,45.80,126.53"></option>
+            <option value="乌鲁木齐,43.83,87.62"></option>
+            <option value="拉萨,29.65,91.14"></option>
+            <option value="兰州,36.06,103.83"></option>
+            <option value="呼和浩特,40.84,111.75"></option>
+            <option value="福州,26.07,119.30"></option>
+            <option value="南宁,22.82,108.32"></option>
+            <option value="海口,20.04,110.20"></option>
+            <option value="济南,36.65,117.12"></option>
+            <option value="合肥,31.82,117.23"></option>
+            <option value="天津,39.13,117.20"></option>
+            <option value="西宁,36.62,101.78"></option>
+            <option value="银川,38.49,106.23"></option>
+            <option value="太原,37.87,112.55"></option>
+            <option value="石家庄,38.04,114.51"></option>
+          </datalist>
           <div class="col-12">
             <label class="form-label">多专线路由策略（JSON）</label>
             <textarea class="form-control" id="l_route_policy" rows="6" placeholder='[{"provider":"联通专线","endpoint":"10.20.0.1:3306","priority":1,"enabled":true}]'></textarea>

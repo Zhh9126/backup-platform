@@ -1,5 +1,60 @@
 {% extends "base.html" %}
-{% block title %}备份插件管理{% endblock %}
+{% block title %}备份插件管理
+<script>
+(function () {
+  function el(id) { return document.getElementById(id); }
+  var ST = { ok: ["badge-ok", "正常"], outdated: ["badge-fail", "需升级"],
+             newer: ["badge-warn", "高于期望"], missing: ["bg-secondary", "未安装"],
+             unknown: ["badge-warn", "待确认"] };
+  function loadMatrix() {
+    BKP.api("GET", "/api/plugins/version-matrix").then(function (d) {
+      var rows = d.rows || [], sm = d.summary || {};
+      el("vmOk").textContent = "正常 " + (sm.ok || 0);
+      el("vmBad").textContent = "待处理 " + ((sm.missing || 0) + (sm.outdated || 0));
+      el("vmTable").innerHTML = rows.map(function (r) {
+        var st = ST[r.status] || ["bg-secondary", r.status];
+        var host = (r.hosts && r.hosts[0]) || {};
+        var advice = (r.notes && r.notes[0]) || (host.advice || "");
+        if (r.status === "missing") advice = "未安装：可在「备份插件」页安装，或用离线包一次导入";
+        if (r.status === "outdated") advice = "已装 " + host.version + " 低于期望 " + r.expected + "，建议升级";
+        return '<tr><td><strong>' + BKP.esc(r.name) + '</strong>' +
+          '<div class="small text-muted">' + BKP.esc(r.plugin) + '</div></td>' +
+          '<td class="small">' + BKP.esc(r.expected || "-") + '</td>' +
+          '<td class="small">' + BKP.esc(host.version || "-") + '</td>' +
+          '<td><span class="badge ' + st[0] + '">' + st[1] + '</span></td>' +
+          '<td class="small text-muted">' + BKP.esc(advice) + '</td></tr>';
+      }).join("") || '<tr><td colspan="5" class="text-center text-muted py-3">无插件</td></tr>';
+    }).catch(function (e) {
+      el("vmTable").innerHTML = '<tr><td colspan="5" class="text-center text-danger py-3">加载失败: ' + BKP.esc(e.message) + '</td></tr>';
+    });
+  }
+  el("vmBuildBtn").addEventListener("click", function () {
+    el("vmMsg").textContent = "正在打包常用组合…";
+    BKP.api("POST", "/api/plugins/bundle/build", {
+      plugins: ["percona-xtrabackup-80", "pgbackrest", "zstd", "lvm-snapshot"],
+      note: "常用组合"
+    }).then(function (r) {
+      el("vmBundlePath").value = r.path || "";
+      var miss = (r.missing_packages || []).length;
+      el("vmMsg").textContent = "已生成：" + (r.path || "") + "（含 " + r.with_package +
+        " 个离线安装包" + (miss ? "，" + miss + " 个插件无离线包，导入时将尝试在线安装" : "") + "）";
+    }).catch(function (e) { el("vmMsg").textContent = "打包失败: " + e.message; });
+  });
+  el("vmImportBtn").addEventListener("click", function () {
+    var path = (el("vmBundlePath").value || "").trim();
+    if (!path) { BKP.toast("请先填写或生成离线包路径", "warning"); return; }
+    el("vmMsg").textContent = "正在导入并安装…";
+    BKP.api("POST", "/api/plugins/bundle/import", { path: path, install: true })
+      .then(function (r) {
+        el("vmMsg").textContent = "导入完成：安装成功 " + r.installed + " / 共 " +
+          r.plugin_count + "（完整性错误 " + ((r.integrity_errors || []).length) + "）";
+        loadMatrix();
+      }).catch(function (e) { el("vmMsg").textContent = "导入失败: " + e.message; });
+  });
+  loadMatrix();
+})();
+</script>
+{% endblock %}
 
 {% block content %}
 <!-- 顶部工具栏：标题 + 副标题 + 操作 -->
@@ -81,6 +136,62 @@
       </div>
     </div>
   </div>
+</div>
+
+<!-- 备份类型覆盖矩阵：DB / 文件 / 对象存储 / 虚拟机 / 通用 -->
+<div class="page-card mb-3">
+  <div class="d-flex align-items-center justify-content-between mb-2">
+    <h6 class="section-title mb-0">
+      <i class="bi bi-grid-3x3-gap text-primary"></i> 备份类型覆盖矩阵
+      <span class="badge bg-secondary ms-1" id="covTotal">…</span>
+    </h6>
+    <div class="d-flex gap-2 align-items-center">
+      <span class="text-muted small" id="covHint">每类备份都可以选择「用插件增强」或「零安装通道」</span>
+      <button class="btn btn-sm btn-outline-primary" id="covBundleBtn" title="按当前任务集合推导缺失插件并一键安装（对外一个包）">
+        <i class="bi bi-box-seam me-1"></i>按任务一键补齐
+      </button>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead class="table-light"><tr>
+        <th style="width:150px">备份类型</th><th style="width:120px">插件覆盖</th>
+        <th>插件（绿=已安装 / 灰=未安装）</th>
+      </tr></thead>
+      <tbody id="covTable"><tr><td colspan="3" class="text-center text-muted py-3">加载中…</td></tr></tbody>
+    </table>
+  </div>
+  <div class="small text-muted mt-2" id="covMsg"></div>
+</div>
+
+<!-- 插件版本矩阵 + 离线插件包（2026-11-14） -->
+<div class="page-card mb-3">
+  <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
+    <h6 class="section-title mb-0">
+      <i class="bi bi-list-check text-primary"></i> 插件版本矩阵
+      <span class="badge bg-success ms-1" id="vmOk">0</span>
+      <span class="badge bg-warning text-dark ms-1" id="vmBad">0</span>
+    </h6>
+    <div class="d-flex gap-2 align-items-center">
+      <input class="form-control form-control-sm" id="vmBundlePath" placeholder="离线包路径（.tar.gz）" style="width:280px">
+      <button class="btn btn-sm btn-outline-primary" id="vmBuildBtn" title="把常用组合（xtrabackup/pgbackrest/zstd/lvm-snapshot）打成单文件离线包">
+        <i class="bi bi-box-seam me-1"></i>生成离线包
+      </button>
+      <button class="btn btn-sm btn-outline-success" id="vmImportBtn" title="导入离线包：校验 sha256 后逐个安装">
+        <i class="bi bi-box-arrow-in-down me-1"></i>导入离线包
+      </button>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead class="table-light"><tr>
+        <th style="width:220px">插件</th><th style="width:120px">期望版本</th>
+        <th style="width:120px">已装版本</th><th style="width:110px">状态</th><th>建议</th>
+      </tr></thead>
+      <tbody id="vmTable"><tr><td colspan="5" class="text-center text-muted py-3">加载中…</td></tr></tbody>
+    </table>
+  </div>
+  <div class="small text-muted mt-2" id="vmMsg"></div>
 </div>
 
 <!-- 数据库类型筛选 -->
@@ -230,4 +341,57 @@
 {% block scripts %}
 <link rel="stylesheet" href="/static/css/plugins.css?v=2026111102">
 <script src="/static/js/plugins.js?v=2026111201"></script>
+
+
+
+<script>
+(function () {
+  var TYPE_CN = {
+    mysql: "MySQL", mariadb: "MariaDB", postgresql: "PostgreSQL", oracle: "Oracle",
+    dameng: "达梦", kingbase: "金仓", redis: "Redis", mongodb: "MongoDB",
+    file: "文件备份", mount: "外挂/NFS", object_storage: "对象存储",
+    s3: "S3/OSS/OBS", minio: "MinIO", vm: "虚拟机", common: "通用增强"
+  };
+  function el(id) { return document.getElementById(id); }
+  function loadCoverage() {
+    BKP.api("GET", "/api/plugins/coverage").then(function (d) {
+      var rows = d.rows || [];
+      el("covTotal").textContent = "插件 " + (d.installed_plugins || 0) + "/" + (d.total_plugins || 0);
+      el("covTable").innerHTML = rows.map(function (r) {
+        var badges = (r.plugins || []).map(function (p) {
+          var cls = p.installed ? "bg-success-subtle text-success-emphasis border-success-subtle"
+                                : "bg-light text-muted border";
+          return '<span class="badge ' + cls + ' me-1 mb-1" title="' + BKP.esc(p.category || "") + '">' +
+                 (p.installed ? "✓ " : "") + BKP.esc(p.name || p.id) + '</span>';
+        }).join("");
+        var ratio = r.total ? Math.round(r.installed * 100 / r.total) : 0;
+        var barCls = ratio >= 100 ? "bg-success" : (ratio > 0 ? "bg-warning" : "bg-secondary");
+        return '<tr><td><strong>' + BKP.esc(TYPE_CN[r.type] || r.type) + '</strong></td>' +
+          '<td><div class="small">' + r.installed + " / " + r.total + '</div>' +
+          '<div class="progress" style="height:5px"><div class="progress-bar ' + barCls +
+          '" style="width:' + ratio + '%"></div></div></td>' +
+          '<td>' + (badges || '<span class="text-muted small">暂无插件（使用零安装通道）</span>') + '</td></tr>';
+      }).join("");
+    }).catch(function (e) {
+      el("covTable").innerHTML = '<tr><td colspan="3" class="text-center text-danger py-3">加载失败: ' +
+        BKP.esc(e.message) + '</td></tr>';
+    });
+  }
+  el("covBundleBtn").addEventListener("click", function () {
+    el("covMsg").textContent = "正在按当前任务推导所需插件…";
+    BKP.api("GET", "/api/tasks").then(function (tasks) {
+      var ids = (tasks || []).filter(function (t) { return t.enabled; }).map(function (t) { return t.id; });
+      if (!ids.length) { el("covMsg").textContent = "没有启用的备份任务"; return; }
+      return BKP.api("POST", "/api/plugins/bundle", { task_ids: ids, dry_run: true });
+    }).then(function (d) {
+      var plan = (d && d.plan) || {};
+      var names = (plan.plugins || []).map(function (p) { return p.name || p.id; });
+      el("covMsg").textContent = plan.count
+        ? ("需要补齐 " + plan.count + " 个插件：" + names.join("、") + "（点上方「一键安装所需」执行安装）")
+        : "当前任务集合所需插件均已安装，无需补齐";
+    }).catch(function (e) { el("covMsg").textContent = "推导失败: " + e.message; });
+  });
+  loadCoverage();
+})();
+</script>
 {% endblock %}

@@ -1,0 +1,48 @@
+{
+  "id": "zstd",
+  "name": "zstd（高压缩比压缩器）",
+  "version": "1.5",
+  "category": "common",
+  "description": "通用压缩器，备份产物压缩比与速度均优于 gzip，支持多线程。",
+  "required_clients": [
+    "zstd"
+  ],
+  "supports": [
+    "file",
+    "object_storage",
+    "vm",
+    "mysql",
+    "postgresql",
+    "dameng",
+    "kingbase",
+    "oracle"
+  ],
+  "tags": [
+    "压缩",
+    "通用",
+    "多线程"
+  ],
+  "icon": "bi-file-zip",
+  "packages": {
+    "linux": {
+      "package_managers": {
+        "apt": {
+          "command": "apt-get install -y zstd",
+          "binaries": [
+            "zstd"
+          ]
+        },
+        "yum": {
+          "command": "yum install -y zstd",
+          "binaries": [
+            "zstd"
+          ]
+        }
+      }
+    }
+  },
+  "verify_after_install": [
+    "zstd --version"
+  ],
+  "fallback_note": "未安装时平台自动回退 gzip（Python 内置），不影响备份可用性"
+}

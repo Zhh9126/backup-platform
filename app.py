@@ -13,7 +13,7 @@ import time
 import datetime as _dt
 
 from flask import (Flask, render_template, request, redirect,
-                   url_for, session, jsonify)
+                   url_for, session, jsonify, send_file)
 
 import logging
 import config
@@ -85,7 +85,15 @@ def create_app() -> Flask:
             _p = request.path
             if (not _p.startswith("/static/") and not _p.startswith("/api/")
                     and _p not in ("/login", "/logout", "/health")):
-                _ok, _reason = _features.can_access(_current_user_dict(), _p)
+                _user = _current_user_dict()
+                # 2026-11-14 巡检暴露：登出后点受管页面返回 403「功能项不可用」，
+                # 而正确行为是跳回登录页。原因是登出后 user={} 进 can_access，
+                # allowed_features({}) 只放行 _PROTECTED → 其余全 403，
+                # 抢在 login_required 之前拦截。这里未登录直接放行，
+                # 交给 login_required 统一重定向（API 走 401）。
+                if not _user:
+                    return None
+                _ok, _reason = _features.can_access(_user, _p)
                 if not _ok:
                     _tip = ("该功能项已被管理员停用" if _reason == "feature_disabled"
                             else "当前账号未被授予该功能项")
@@ -199,19 +207,33 @@ def create_app() -> Flask:
 
     @app.context_processor
     def _inject_bkp_meta():
+        # 品牌设置（Logo / 名称 / 首页大标题）：注入失败回落到内置默认，
+        # 任何情况下页面都能渲染（自定义只影响观感，不该阻断登录/首页）。
+        try:
+            from core import brand as _brand_mod
+            _brand = _brand_mod.get_brand()
+        except Exception as e:  # noqa: BLE001
+            print(f"[startup] 品牌设置读取失败（回落默认）: {e}")
+            _brand = {"name": "AIDBM", "title": "仪表盘",
+                      "login_logo": "", "sidebar_logo": "",
+                      "has_login_logo": False, "has_sidebar_logo": False,
+                      "defaults": {"name": "AIDBM", "title": "仪表盘"},
+                      "max_bytes": 2 * 1024 * 1024, "max_text_len": 32}
         try:
             from api.system import build_meta
             from core import license as license_mod
             return {"bkp_meta": build_meta(),
                     "platform_version": config.PLATFORM_VERSION,
                     "has_ai_agent": _has_ai_agent(),
-                    "license_info": license_mod.get_license_info()}
+                    "license_info": license_mod.get_license_info(),
+                    "brand": _brand}
         except Exception as e:  # noqa: BLE001 - 注入失败不能影响页面渲染
             print(f"[startup] bkp_meta 注入失败（前端将回退到 /api/meta）: {e}")
             return {"bkp_meta": {},
                     "platform_version": config.PLATFORM_VERSION,
                     "has_ai_agent": _has_ai_agent(),
-                    "license_info": {}}
+                    "license_info": {},
+                    "brand": _brand}
 
     app.config["BACKUP_ROOT"] = str(config.get_backup_root())
     _root_info = config.backup_root_info()
@@ -246,9 +268,9 @@ def create_app() -> Flask:
         resp.headers.setdefault("X-XSS-Protection", "1; mode=block")
         resp.headers.setdefault(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-            "font-src 'self' data:; connect-src 'self'",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'"
+            "; style-src 'self' 'unsafe-inline'; img-src 'self' data: "
+            "blob:; font-src 'self' data:; connect-src 'self'",
         )
         # HTML 页面禁缓存（2026-11-04 用户反馈：报表中心改完仍显示旧页面）：
         # 模板是动态页面，页面壳被浏览器缓存会导致服务端模板修复
@@ -259,6 +281,32 @@ def create_app() -> Flask:
             resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
             resp.headers["Pragma"] = "no-cache"
             resp.headers["Expires"] = "0"
+
+        # ---- 第三方前端库（/static/vendor）预压缩 + 长缓存 ----
+        # 走 nginx gzip_static 同类做法：优先返回同名 .gz
+        # （Content-Encoding: gzip），并给出 immutable 长缓存。
+        # 只作用于 /static/vendor/ —— 其它静态资源仍依赖 ?v= 缓存戳，行为不变。
+        try:
+            p = request.path or ""
+            if (resp.status_code == 200 and request.method == "GET"
+                    and p.startswith("/static/vendor/")
+                    and p.endswith((".js", ".css"))):
+                resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+                resp.headers["Vary"] = "Accept-Encoding"
+                if "gzip" in (request.headers.get("Accept-Encoding") or "").lower():
+                    gz_rel = p[len("/static/"):] + ".gz"
+                    gz_path = os.path.join(app.static_folder, gz_rel)
+                    if os.path.isfile(gz_path):
+                        with open(gz_path, "rb") as fh:
+                            raw = fh.read()
+                        resp.direct_passthrough = False
+                        resp.set_data(raw)
+                        resp.headers["Content-Encoding"] = "gzip"
+                        resp.headers["Content-Length"] = str(len(raw))
+                        resp.headers.pop("ETag", None)
+        except Exception:  # noqa: BLE001
+            # 压缩是纯优化：任何异常都不该影响静态资源正常返回
+            pass
         return resp
 
     # API 双前缀注册（差异 G5）：
@@ -380,6 +428,11 @@ def create_app() -> Flask:
                                     "must_change_password": must_change,
                                     "password_change_required":
                                         bool(session.get("pwd_change_required"))})
+                # 登录后进入经典控制台首页（仪表盘）。
+                # 若带安全的 next（站内相对路径）则优先回原页。
+                _nx = (request.args.get("next") or "").strip()
+                if _nx.startswith("/") and not _nx.startswith("//"):
+                    return redirect(_nx)
                 return redirect(url_for("dashboard_page"))
             _register_login_fail(ip)
             if is_json:
@@ -391,6 +444,23 @@ def create_app() -> Flask:
     def logout():
         session.clear()
         return redirect(url_for("login_page"))
+
+    @app.route("/brand/asset/<kind>")
+    def brand_asset(kind):
+        """品牌 Logo 图片（登录页左侧也要显示，故不要求登录）。
+
+        自定义图存 instance/brand/（持久化目录），不走 static/——冻结包与
+        容器镜像里的 static 是只读的。未设置或文件缺失返回 404，模板侧
+        回落内置图标（不出现裂图占位）。
+        """
+        from core import brand as _brand_mod
+        path = _brand_mod.asset_file(kind)
+        if not path:
+            return ("", 404)
+        resp = send_file(str(path), mimetype=_brand_mod.asset_mime(kind))
+        # URL 已带 ?v=<ts> 版本戳，浏览器可缓存单日内复用
+        resp.headers["Cache-Control"] = "public, max-age=86400"
+        return resp
 
     # ------------------------- 页面 -------------------------
     @app.route("/")
@@ -543,6 +613,36 @@ def create_app() -> Flask:
     @login_required
     def dr_link_page():
         return render_template("drlink.html", page="dr-link")
+
+    @app.route("/storage-media")
+    @login_required
+    def storage_media_page():
+        """存储介质统一总览：所有介质 + 状态 + 用量 + 最近备份。"""
+        return render_template("storage_media.html", page="storage-media")
+
+    @app.route("/dr")
+    @login_required
+    def dr_overview_page():
+        """容灾总览：链路健康 / RPO / 最近切换 RTO / 演练合规。"""
+        return render_template("dr_overview.html", page="dr")
+
+    @app.route("/dr-switch")
+    @login_required
+    def dr_switch_page():
+        """一键切换：预检 → 确认 → 执行 → 步骤实时进度 → RTO 结果。"""
+        return render_template("dr_switch.html", page="dr-switch")
+
+    @app.route("/runbook")
+    @login_required
+    def runbook_page():
+        """恢复剧本编排：一键执行 / 审批闸 / RTO 计时。"""
+        return render_template("runbook.html", page="runbook")
+
+    @app.route("/dr-inspection")
+    @login_required
+    def dr_inspection_page():
+        """容灾巡检：环境健康/复制状态/DNS 运行，定时巡检与报表导出。"""
+        return render_template("dr_inspection.html", page="dr-inspection")
 
     @app.route("/agent")
     @login_required

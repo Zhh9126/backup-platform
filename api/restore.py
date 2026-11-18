@@ -110,6 +110,10 @@ def create_restore():
             "hint": "如确需恢复，请勾选「已知风险，强制恢复」并重试（将留 critical 审计）",
         }), 403
     except ValueError as e:
+        # 恢复前自动预检拦截（P0-3）：透出完整预检报告供前端弹窗展示
+        report = getattr(e, "report", None)
+        if report:
+            return jsonify({"error": str(e), "precheck": report}), 400
         # 受保护主机 / 其他业务前置校验拒绝（P0-2）
         return jsonify({"error": str(e), "protected_target": "受保护" in str(e)}), 400
     if not result:

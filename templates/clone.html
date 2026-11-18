@@ -3,7 +3,7 @@
 <div class="toolbar">
   <div>
     <div class="page-title">克隆服务</div>
-    <div class="page-sub">自助克隆：选择备份记录 → 免审批直通拉起 → 校验使用 → 到期自动销毁</div>
+    <div class="page-sub">选择备份记录 → 免审批拉起隔离克隆库（VDB）→ 校验使用 → 快照 / 恢复 / 到期自动销毁</div>
   </div>
   <button class="btn btn-primary" id="newCloneBtn"><i class="bi bi-plus-lg"></i> 立即克隆</button>
   <button class="btn btn-outline-secondary btn-sm" onclick="loadClones()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
@@ -24,7 +24,7 @@
 
 <!-- 申请克隆 模态框 -->
 <div class="modal fade" id="cloneModal" tabindex="-1">
-  <div class="modal-dialog">
+  <div class="modal-dialog modal-dialog-scrollable">
     <div class="modal-content">
       <div class="modal-header">
         <h5 class="modal-title">立即克隆</h5>
@@ -38,43 +38,57 @@
           <div id="c_source_list" class="list-group position-absolute w-100 shadow"
                style="z-index:1056; max-height:260px; overflow-y:auto; display:none;"></div>
           <input type="hidden" id="c_source_record_id">
-          <div class="form-text">选择一个已生成的备份记录作为克隆源。提交后平台<b>免审批异步拉起</b>隔离克隆库（真实导入），就绪后可一键校验连接。</div>
+          <div id="c_mode_hint" class="form-text"></div>
         </div>
-        <div class="mb-3">
-          <label class="form-label">目标环境 *</label>
-          <input class="form-control" id="c_target_env" placeholder="如 test / dev / staging">
+        <div class="row g-2">
+          <div class="col-7">
+            <label class="form-label">目标环境 *</label>
+            <input class="form-control" id="c_target_env" value="clone">
+          </div>
+          <div class="col-5">
+            <label class="form-label">用途</label>
+            <select class="form-select" id="c_purpose">
+              <option value="test">测试环境</option>
+              <option value="dev">开发环境</option>
+              <option value="staging">预发布</option>
+              <option value="emergency">应急接管</option>
+            </select>
+          </div>
         </div>
-        <div class="mb-3">
-          <label class="form-label">用途</label>
-          <select class="form-select" id="c_purpose">
-            <option value="test">测试环境</option>
-            <option value="dev">开发环境</option>
-            <option value="staging">预发布</option>
-            <option value="emergency">应急接管（生产故障时临时承载业务，B3 对标一键激活）</option>
-          </select>
-          <div class="form-text">选「应急接管」时，就绪后可做接管就绪检查（直连/表数量/行数抽样），检查通过才具备临时承载业务读流量的条件。</div>
+        <div class="form-text mt-1">选「应急接管」时，就绪后可做接管就绪检查（直连 / 表数量 / 行数抽样）。</div>
+        <a class="d-inline-block mt-2 text-decoration-none" data-bs-toggle="collapse" href="#cAdvanced" role="button" aria-expanded="false" aria-controls="cAdvanced">
+          <i class="bi bi-sliders"></i> 高级选项
+        </a>
+        <div class="collapse" id="cAdvanced">
+          <div class="border rounded p-3 mt-2">
+            <div class="mb-3">
+              <label class="form-label">目标主机</label>
+              <input class="form-control" id="c_target_host" list="c_target_host_options"
+                     placeholder="默认本机 127.0.0.1，可填其他机器 IP">
+              <datalist id="c_target_host_options"></datalist>
+              <div class="form-text">克隆库拉起位置：默认本机数据库实例。</div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">目标实例密码</label>
+              <input class="form-control" type="password" id="c_target_password" placeholder="可空：沿用源任务密码">
+            </div>
+            <div class="mb-3">
+              <label class="form-label">要克隆的库（整实例备份用，留空=全部库）</label>
+              <input class="form-control" id="c_databases"
+                     placeholder="如 aidbm_t, aidbm_flash（逗号分隔）">
+              <div class="form-text">整实例备份按库逐个恢复为 clone_N__原库名；库多时建议只填需要的库。</div>
+            </div>
+            <div class="mb-3">
+              <label class="form-label">申请人</label>
+              <input class="form-control" id="c_requested_by" placeholder="默认 anonymous">
+            </div>
+            <div class="mb-1">
+              <label class="form-label">备注</label>
+              <textarea class="form-control" id="c_note" rows="2" placeholder="可填写用途说明"></textarea>
+            </div>
+          </div>
         </div>
-        <div class="mb-3">
-          <label class="form-label">目标主机</label>
-          <input class="form-control" id="c_target_host" list="c_target_host_options"
-                 placeholder="默认本机 127.0.0.1，可填其他机器 IP">
-          <datalist id="c_target_host_options"></datalist>
-          <div class="form-text">克隆库拉起位置：默认本机数据库实例；填其他机器 IP 时，要求该机器的 MySQL/PG 实例允许从本平台远程连接（已开放远程权限）。</div>
-        </div>
-        <div class="mb-3">
-          <label class="form-label">目标实例密码</label>
-          <input class="form-control" type="password" id="c_target_password" placeholder="可空：沿用源任务密码">
-          <div class="form-text">目标主机上数据库实例的管理员密码（MySQL root / PG postgres）。目标主机与源库同机且密码一致时可不填。</div>
-        </div>
-        <div class="mb-3">
-          <label class="form-label">申请人</label>
-          <input class="form-control" id="c_requested_by" placeholder="默认 anonymous">
-        </div>
-        <div class="mb-3">
-          <label class="form-label">备注</label>
-          <textarea class="form-control" id="c_note" rows="2" placeholder="可填写用途说明"></textarea>
-        </div>
-        <div id="c_preflight" class="border rounded p-2 small text-muted">
+        <div id="c_preflight" class="border rounded p-2 small text-muted mt-3">
           提交前可先做只读预检：源产物 / 目标端口 / 磁盘余量 / 凭据 / 安全隔离态（不创建申请、不拉起 VDB）。
         </div>
       </div>
@@ -87,7 +101,35 @@
   </div>
 </div>
 
+<!-- VDB 快照管理 模态框（快照式备份：创建快照，需要时一键恢复/回滚） -->
+<div class="modal fade" id="snapModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">VDB 快照管理 <span class="text-muted small" id="snapCloneLabel"></span></h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+          <input class="form-control form-control-sm" id="snapName" placeholder="快照名称（可空）" style="max-width:240px">
+          <button class="btn btn-sm btn-primary" id="snapCreateBtn"><i class="bi bi-camera"></i> 创建快照</button>
+          <span class="text-muted small">快照 = VDB 数据级全量导出（含 sha256 对账）；需要时一键恢复到该时间点。</span>
+        </div>
+        <div class="table-responsive">
+          <table class="table table-sm table-hover align-middle mb-0">
+            <thead><tr>
+              <th>#</th><th>名称</th><th>创建时间</th><th>表 / 行</th><th>大小</th><th>状态</th>
+              <th class="text-end">操作</th>
+            </tr></thead>
+            <tbody id="snapTable"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="alert alert-info mt-3" role="alert">
-  <i class="bi bi-info-circle"></i> <strong>克隆服务</strong>：选择备份记录 → 按目标主机拉起隔离克隆库（真实导入，支持本机与其他机器）→ 就绪后可校验连接并直接使用 → 到期自动销毁。历史数据中如仍有审批字段，仅为兼容保留，页面流程已全部免审批直通。
+  <i class="bi bi-info-circle"></i> <strong>克隆服务</strong>：选择备份记录 → 按目标主机拉起隔离克隆库（真实导入，支持本机与其他机器）→ 就绪后可校验连接并直接使用 → 可对 VDB 创建快照、随时一键恢复到快照时间点 → 到期自动销毁。历史数据中如仍有审批字段，仅为兼容保留，页面流程已全部免审批直通。
 </div>
 {% endblock %}

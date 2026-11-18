@@ -32,7 +32,11 @@ PATTERN_COVERED_PREFIXES = (
 # 刻意保留中文：语言切换标签、textarea 中的示例脚本内容
 KEEP_PREFIXES = ("中文 / English", "#!/bin/bash")
 # PATTERNS 中数值型动态文案（Python 不复现 JS 正则，用等价 Python 正则声明）
-PATTERN_COVERED_RES = (r"^共 \d+ 个会话$",)
+# 品牌设置：侧栏品牌名可自定义，title 属性为「<品牌名> · AI 原生智能数据库灾备管理平台」
+PATTERN_COVERED_RES = (
+    r"^共 \d+ 个会话$",
+    r"^.+ · AI 原生智能数据库灾备管理平台$",
+)
 _STAR_RE = re.compile(r"^(.*?)\s*\*+$")
 
 

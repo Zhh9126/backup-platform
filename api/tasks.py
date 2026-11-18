@@ -498,6 +498,19 @@ def get_task(task_id):
     task = models.get_task(task_id, include_secret=False)
     if not task:
         return jsonify({"error": "任务不存在"}), 404
+    # 与列表端点保持同一份派生字段：详情接口此前缺 next_run_at / last_success_at，
+    # 任何按详情页展示"下次备份时间"的调用方都会拿到 undefined（表现为空）。
+    try:
+        task["next_run_at"] = scheduler.next_run_display(task) or ""
+    except Exception:
+        task["next_run_at"] = ""
+    try:
+        _row = db.query_one(
+            "SELECT MAX(started_at) AS ls FROM backup_records "
+            "WHERE status='success' AND task_id=?", (task_id,))
+        task["last_success_at"] = str((_row or {}).get("ls") or "")[:19]
+    except Exception:
+        task["last_success_at"] = ""
     return jsonify(task)
 
 
@@ -570,7 +583,17 @@ def delete_task(task_id):
     if row:
         from core import cancel as cancel_mod
         cancel_mod.cancel(f"t{task_id}:r{row['id']}")
-    models.delete_task(task_id)
+    # 保留锁守卫（防勒索/不可变）会抛 ValueError：这是业务拒绝，必须 400 +
+    # 可读原因。此前未捕获 → 前端只看到「服务器内部错误」，用户不知道
+    # 是因为有锁定记录挡着（2026-11-14 防勒索深度测试实测）。
+    try:
+        models.delete_task(task_id)
+    except ValueError as exc:
+        return jsonify({
+            "error": str(exc),
+            "locked_records": True,
+            "hint": "在「防勒索保护 / 备份记录」里解锁（需填原因）或等待保留锁到期后重试",
+        }), 400
     scheduler.reload_scheduler()
     return jsonify({"ok": True, "stopped_running": bool(row)})
 
@@ -580,6 +603,17 @@ def delete_task(task_id):
 def run_task(task_id):
     data = request.get_json(force=True, silent=True) or {}
     backup_type = data.get("backup_type")
+    # 任务级「是否使用备份插件」：require 模式且插件缺失时直接阻止（错误前置，
+    # 避免跑一半才失败；auto/off 不影响）。
+    try:
+        from core import plugin_policy
+        _task = models.get_task(task_id, include_secret=True) or {}
+        _pol = plugin_policy.assert_task(_task)
+        if not _pol.get("ok"):
+            return jsonify({"error": _pol.get("message") or "插件策略未满足",
+                            "plugin_policy": _pol}), 400
+    except Exception:
+        pass
     # 三层 CPU 保护的 API 端实时复查：>70% 直接拒绝，不进入执行队列。
     # 探测失败/模块异常一律 fail-open，不因保护逻辑阻断正常备份。
     try:

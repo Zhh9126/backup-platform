@@ -364,6 +364,25 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
                   </div>
                 </div>
                 <div class="col-12 mt-2">
+                  <label class="form-label">引擎并行度（可选，单任务内部并行）</label>
+                  <select class="form-select form-select-sm" id="t_engine_parallel">
+                    <option value="">自动（按平台并发上限推算）</option>
+                    <option value="1">1 路（强制串行）</option>
+                    <option value="2">2 路</option>
+                    <option value="4">4 路</option>
+                    <option value="6">6 路</option>
+                    <option value="8">8 路</option>
+                  </select>
+                  <div class="small text-muted">
+                    平台并发上限（max_concurrent_backups）较小时，成员任务只能排队，drift 被排队时间拉长；
+                    单任务内部并行用来抵消这一点：MySQL 物理备份走 xtrabackup --parallel，
+                    PostgreSQL/金仓/openGauss 走 pg_dump -j（自动切换目录格式 -Fd 并打包单文件），
+                    全实例备份逐库并发 dump。自动 = 总并行预算 8 路 ÷ 平台并发上限，
+                    且不超过该任务保护策略的并行度（core 4 / important 2 / general 1）。
+                    源库 IO/CPU 紧张、或库体量很小可强制 1 路。恢复并行度仍由 RESTORE_PARALLEL 控制。
+                  </div>
+                </div>
+                <div class="col-12 mt-2">
                   <label class="form-label">在线热备表空间（可选，仅 Oracle 在线热备模式）</label>
                   <input class="form-control form-control-sm font-monospace" id="t_hot_copy_tablespaces"
                          placeholder="留空=全库；如：USERS 或 USERS,EXAMPLE">

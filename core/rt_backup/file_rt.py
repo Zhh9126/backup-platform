@@ -62,9 +62,9 @@ _PRUNE_EVERY_TICKS = 180
 
 
 def _epoch(iso: str) -> float:
-    """ISO8601 → epoch 秒；不可解析返回 0.0。"""
-    if not iso:
-        return 0.0
+    """ISO8601 → epoch 秒（统一走 common.epoch_of，消除两份重复实现）。"""
+    from core.rt_backup.common import epoch_of
+    return epoch_of(iso)
     try:
         from datetime import datetime
         return datetime.fromisoformat(str(iso)).timestamp()

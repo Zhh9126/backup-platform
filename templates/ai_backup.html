@@ -50,14 +50,49 @@
             <input class="form-control" id="ai_remark">
           </div>
         </div>
-        <label class="form-label mt-3">成员资产（把多层资产编入同一恢复单元）</label>
+        <div class="form-check form-switch mt-2">
+          <input class="form-check-input" type="checkbox" id="ai_enabled" checked>
+          <label class="form-check-label small" for="ai_enabled">启用（停用后仅保留配置，不参与 cron 周期执行）</label>
+        </div>
+        <label class="form-label mt-2">成员资产（把多层资产编入同一恢复单元）</label>
         <table class="table table-sm mb-1" id="aiMemberTable">
           <thead><tr>
             <th style="width:44%">备份任务</th><th style="width:34%">所属状态层</th><th></th>
           </tr></thead>
           <tbody id="aiMemberRows"></tbody>
         </table>
-        <button class="btn btn-sm btn-outline-secondary" onclick="aiAddMemberRow()"><i class="bi bi-plus"></i> 添加成员</button>
+        <div class="d-flex gap-2 mt-1 flex-wrap">
+          <button class="btn btn-sm btn-outline-secondary" onclick="aiAddMemberRow()"><i class="bi bi-plus"></i> 添加成员</button>
+          <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="collapse" data-bs-target="#aiQuickCreate">
+            <i class="bi bi-plus-circle"></i> 新建资产备份任务
+          </button>
+        </div>
+
+        <div id="aiNoTaskTip" class="alert alert-warning small mt-2 mb-0 d-none">平台还没有任何备份任务。AI 资产（模型权重目录、训练数据集、配置清单）可直接在这里建一个文件类备份任务：点「新建资产备份任务」填路径即可；数据库 / 向量库资产请先到「数据库备份」创建任务，再回来编组。</div>
+
+        <div class="collapse mt-2" id="aiQuickCreate">
+          <div class="border rounded-3 p-3 bg-light">
+            <div class="row g-2">
+              <div class="col-md-4">
+                <label class="form-label small">任务名称</label>
+                <input class="form-control form-control-sm" id="ai_q_name" placeholder="如：Qwen2.5-7B 权重">
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small">所在主机</label>
+                <input class="form-control form-control-sm" id="ai_q_host" value="127.0.0.1" placeholder="本机填 127.0.0.1">
+              </div>
+              <div class="col-md-5">
+                <label class="form-label small">资产路径（逗号或换行分隔，须为绝对路径）</label>
+                <input class="form-control form-control-sm" id="ai_q_paths" placeholder="/data/models/qwen2.5-7b, /data/lora">
+              </div>
+            </div>
+            <div class="d-flex align-items-center gap-2 mt-2 flex-wrap">
+              <button class="btn btn-sm btn-primary" type="button" onclick="aiQuickCreateAssetTask()"><i class="bi bi-check2"></i> 创建并加入成员</button>
+              <span class="small text-muted">创建的是「文件备份」任务；远程主机需在任务高级选项里配置 SSH 凭据。</span>
+            </div>
+            <div class="text-danger small mt-1" id="ai_quick_msg"></div>
+          </div>
+        </div>
         <div class="small text-muted mt-2">
           层次建议：模型权重/LoRA → <b>模型权重与检查点</b>；语料/标注 → <b>训练数据集</b>（建议不可变锁定）；
           Qdrant/Chroma 任务 → <b>向量索引</b>；用户/会话/审计库 → <b>关系型元数据</b>；

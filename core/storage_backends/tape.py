@@ -38,11 +38,9 @@ from core import tape_library as tl
 
 
 def _sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+    """统一委托 core.db.sha256_file（此前 7 个模块各写一份，已收敛）。"""
+    from core import db as _db
+    return _db.sha256_file(path)
 
 
 class TapeStorageBackend(StorageBackend):
@@ -226,15 +224,14 @@ class TapeStorageBackend(StorageBackend):
 
     @staticmethod
     def _verify_member(tape_path: str, member: str, checksum: str) -> bool:
+        """回读带内成员并比对 sha256（哈希统一走 db.sha256_stream）。"""
         try:
+            from core import db as _db
             with tarfile.open(tape_path, "r:") as tf:
                 f = tf.extractfile(member)
                 if f is None:
                     return False
-                h = hashlib.sha256()
-                for chunk in iter(lambda: f.read(1 << 20), b""):
-                    h.update(chunk)
-                return h.hexdigest() == checksum
+                return _db.sha256_stream(f) == checksum
         except Exception:  # noqa: BLE001
             return False
 

@@ -73,7 +73,9 @@ def api_request_clone():
             target_password=data.get("target_password") or "",
             clone_mode=data.get("clone_mode") or "logical",
             live_source_db=data.get("live_source_db") or "",
-            purpose=data.get("purpose") or "test")
+            purpose=data.get("purpose") or "test",
+            # 整实例克隆的库白名单（留空=归档内全部库；库多时强烈建议指定）
+            databases=data.get("databases") or None)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"ok": True, "id": req["id"], "request": req}), 201

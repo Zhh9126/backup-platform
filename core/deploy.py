@@ -59,7 +59,9 @@ DEPLOY_PARAMS = {
         "base_dir": "/opt/dmdbms",
         "data_dir": "/data/dmdbms",
         "port": 5236,
-        "password": "dameng123",
+        # 默认口令必须满足 dminit 的硬校验（8-48 位 + 大写/小写/数字组合），
+        # 旧默认值 "dameng123" 缺大写，dminit 会直接 fail to init db。
+        "password": "Dameng@123",
     },
     "mongodb": {
         "base_dir": "/usr/local/mongodb",
@@ -174,6 +176,15 @@ def _build_install_script(db_type: str, params: dict) -> str:
         buffer = params.get("mysql_buffer", "512")
         srv_id = params.get("mysql_server_id", "1")
         binlog = params.get("mysql_binlog", "1")
+        # X Protocol 默认关闭（避免连续端口多实例互相抢占主端口段）
+        _mx_on = str(params.get("mysqlx", "0")).lower() in ("1", "true", "yes", "on")
+        _mx_port = int(port) + 10000
+        if _mx_on:
+            mx_note = "# X Protocol 端口 %d（主端口+10000）" % _mx_port
+            mx_cfg = "mysqlx_port=%d\nmysqlx_socket=%s/mysqlx.sock" % (_mx_port, data)
+        else:
+            mx_note = "# X Protocol 关闭（需要时任务 config_json 传 mysqlx=1）"
+            mx_cfg = "mysqlx=OFF"
 
         return f"""#!/bin/bash
 # MySQL 多版本部署脚本（5.5/5.6/5.7/8.0/8.4/9.x）
@@ -182,21 +193,40 @@ set +e
 echo "[deploy] ====== MySQL {version} 部署开始 ======"
 echo "[deploy] BASE={base}  DATA={data}  PORT={port}  CHARSET={charset}"
 
-# ---------- 前置检查：避免误删用户已有数据 ----------
+# ---------- 前置检查：只校验本次的端口与目录 ----------
+# 同机已有 MySQL 实例时不再直接拒绝：多实例部署是常见场景（171 实测：
+# 旧逻辑一见 mysqld 进程就 exit 1，导致同机第二个实例永远部署不了）。
+# 真正的防护点是"目标端口未被占用" + "目标数据目录为空"，这两条足以防误删。
 echo "[deploy] 前置环境检查..."
-if pgrep -x mysqld >/dev/null 2>&1 || pgrep -x mariadbd >/dev/null 2>&1; then
-    echo "[deploy] ERROR: 检测到目标机已有 MySQL/MariaDB 进程在运行。"
-    echo "[deploy] ERROR: 请先停止并清理现有实例后再部署（systemctl stop mysql / service mysql stop）。"
+# 内存预检：MySQL 8.0 初始化 + 启动在 <256MB 可用内存下极易被 OOM 杀掉，
+# 表现为"部署长时间无输出然后卡死"（171 实测：可用内存 131MB 时解压中途进程消失）
+MEM_AVAIL_MB=$(awk '/MemAvailable/{{print int($2/1024)}}' /proc/meminfo 2>/dev/null || echo 0)
+MEM_AVAIL_MB=${{MEM_AVAIL_MB:-0}}
+echo "[deploy] 目标机可用内存: $MEM_AVAIL_MB MB"
+# 需求按实例自身配置估算：buffer_pool + 128MB 余量（initdb/启动峰值）
+NEED_MB=$(( {buffer} + 128 ))
+if [ "$MEM_AVAIL_MB" -gt 0 ] && [ "$MEM_AVAIL_MB" -lt "$NEED_MB" ]; then
+    echo "[deploy] ERROR: 可用内存不足（$MEM_AVAIL_MB MB < 需求 $NEED_MB MB = buffer_pool {buffer}MB + 128MB 余量），"
+    echo "[deploy] ERROR: MySQL 初始化/启动大概率被 OOM 杀掉。请释放内存，或把 mysql_buffer 调小（如 64）后重试。"
+    exit 1
+fi
+if [ "$MEM_AVAIL_MB" -gt 0 ] && [ "$MEM_AVAIL_MB" -lt $(( NEED_MB + 256 )) ]; then
+    echo "[deploy] 警告: 可用内存 $MEM_AVAIL_MB MB 偏紧（需求 $NEED_MB MB），初始化可能较慢。"
+fi
+if ss -lnt 2>/dev/null | grep -qE ':{port}[[:space:]]'; then
+    echo "[deploy] ERROR: 目标端口 {port} 已被占用，请更换端口后重新部署。"
+    ss -lntp 2>/dev/null | grep -E ':{port}[[:space:]]' | head -3
     exit 1
 fi
 if [ -d "{data}" ] && [ "$(ls -A {data} 2>/dev/null)" ]; then
     echo "[deploy] ERROR: 数据目录 {data} 已存在文件，为避免误删数据，请先手动清理后重新部署。"
-    echo "[deploy] ERROR: 清理命令参考：systemctl stop mysql; rm -rf {data}/* {base} /etc/my.cnf /root/.my.cnf"
+    echo "[deploy] ERROR: 清理命令参考：rm -rf {data}/* {base}"
     exit 1
 fi
-if [ -f "/etc/my.cnf" ] || [ -f "/etc/mysql/my.cnf" ]; then
-    echo "[deploy] WARN: 检测到已有 MySQL 配置文件 /etc/my.cnf 或 /etc/mysql/my.cnf。"
-    echo "[deploy] WARN: 若残留配置导致启动异常，请先备份并删除后再部署。"
+if pgrep -x mysqld >/dev/null 2>&1 || pgrep -x mariadbd >/dev/null 2>&1; then
+    echo "[deploy] 提示: 目标机已有 MySQL/MariaDB 实例在运行，本次按多实例隔离部署："
+    echo "[deploy]       配置={base}/my.cnf 数据={data} socket={data}/mysql.sock，"
+    echo "[deploy]       不改动 /etc/my.cnf 与同机其他实例（端口 {port} 独立）。"
 fi
 
 mkdir -p {base} {data} /data/backup/mysql
@@ -242,18 +272,26 @@ else
     exit 1
 fi
 
-# ---------- 写入 /etc/my.cnf ----------
-echo "[deploy] 写入 /etc/my.cnf ..."
-# mysqlx 默认端口为 33060；若用户把 MySQL 主端口也设为 33060 会冲突导致启动失败，
-# 因此显式将 mysqlx_port 设为主端口+1，避免绑定 "Address already in use"。
-MYSQLX_PORT=$(( {port} + 1 ))
-cat > /etc/my.cnf << 'EOF'
+# ---------- 写入实例级配置 {base}/my.cnf ----------
+# 不再写 /etc/my.cnf：那是全机共享配置，同机已有实例时会被覆盖（重启即
+# 指向新 datadir/port，等于把现网实例改坏）。socket/pid/error 也全部落到
+# 本实例 data 目录，避免 /tmp/mysql.sock 这类固定路径互相抢占。
+echo "[deploy] 写入实例配置 {base}/my.cnf ..."
+mkdir -p {data}
+# MySQL X Protocol（33060/mysqlx）默认关闭：X plugin 端口取"主端口+1"时，同机
+# 连续端口部署多实例会互相抢占（23306 实例的 X=23307 直接把 23307 实例的主端口
+# 占了，表现为"23307 部署失败但端口在监听"）。需要 X 时在 config_json 传
+# mysqlx=1，端口固定取主端口+10000，避开主端口段。
+{mx_note}
+cat > {base}/my.cnf << EOF
 [mysqld]
 basedir={base}
 datadir={data}
 port={port}
-mysqlx_port={int(port)+1}
-socket=/tmp/mysql.sock
+{mx_cfg}
+socket={data}/mysql.sock
+pid-file={data}/mysqld.pid
+log-error={data}/error.log
 bind-address=0.0.0.0
 character-set-server={charset}
 default-storage-engine=InnoDB
@@ -262,50 +300,62 @@ innodb_buffer_pool_size={buffer}M
 server-id={srv_id}
 {"log-bin=" + data + "/mysql-bin" if binlog == "1" else "# binlog disabled"}
 [mysql]
-socket=/tmp/mysql.sock
+socket={data}/mysql.sock
 default-character-set={charset}
 [client]
-socket=/tmp/mysql.sock
+socket={data}/mysql.sock
 EOF
 chown -R mysql:mysql {base} {data}
 
-# ---------- 安装 mysql.server 启动脚本（便于后续管理，但不一定用于启动）----------
-echo "[deploy] 安装 mysql.server 启动脚本..."
-if [ -f {base}/support-files/mysql.server ]; then
+# ---------- 实例级启动脚本（不覆盖系统 /etc/init.d/mysql）----------
+echo "[deploy] 生成实例级启动/停止脚本..."
+if [ ! -f /etc/init.d/mysql ] && [ -f {base}/support-files/mysql.server ]; then
+    # 仅当系统还没有 mysql 服务时才安装全局脚本（首次部署场景）
     cp -f {base}/support-files/mysql.server /etc/init.d/mysql
     chmod +x /etc/init.d/mysql
-    # 尝试注册为系统服务；忽略失败，某些精简系统没有 chkconfig/systemctl
     chkconfig --add mysql >/dev/null 2>&1 || systemctl enable mysql >/dev/null 2>&1 || true
 else
-    echo "[deploy] WARN: 安装包中未找到 support-files/mysql.server，将仅使用 mysqld_safe/mysqld 直接启动。"
+    echo "[deploy] 跳过 /etc/init.d/mysql（已存在其他实例的服务脚本，避免覆盖）"
 fi
+cat > {base}/start.sh << 'STARTEOF'
+#!/bin/bash
+# 本实例独立启动脚本（多实例共存时使用，端口/数据目录以 {base}/my.cnf 为准）
+{base}/bin/mysqld --defaults-file={base}/my.cnf --user=mysql --daemonize
+STARTEOF
+cat > {base}/stop.sh << 'STOPEOF'
+#!/bin/bash
+{base}/bin/mysqladmin --defaults-file={base}/my.cnf -u root -p'{pw}' shutdown
+STOPEOF
+chmod +x {base}/start.sh {base}/stop.sh
 
 # ---------- 启动 MySQL（优先 mysqld --daemonize：干净后台化，不占 SSH 通道；
 #            mysqld_safe 后台方式在远程 SSH 会话下易随通道中断被误杀）----------
 echo "[deploy] 启动 MySQL..."
 start_rc=0
 if [ -x {base}/bin/mysqld ]; then
-    echo "[deploy] 使用 mysqld --daemonize 启动 (8.0+，干净后台化)"
-    nohup {base}/bin/mysqld --user=mysql --datadir={data} --daemonize </dev/null >/var/log/mysqld.log 2>&1 &
+    echo "[deploy] 使用 mysqld --defaults-file={base}/my.cnf --daemonize 启动 (8.0+，干净后台化)"
+    # --defaults-file 必须是第一个参数：否则 mysqld 会读 /etc/my.cnf（同机其他实例
+    # 的配置），改用别人的 datadir/port/socket，等于把现网实例接管过来
+    nohup {base}/bin/mysqld --defaults-file={base}/my.cnf --user=mysql --daemonize </dev/null >{data}/mysqld.out 2>&1 &
     start_rc=0
 elif [ -x {base}/bin/mysqld_safe ]; then
     echo "[deploy] 使用 mysqld_safe 启动 (兼容 5.x)"
-    setsid nohup {base}/bin/mysqld_safe --user=mysql --datadir={data} </dev/null >/var/log/mysqld_safe.log 2>&1 &
+    setsid nohup {base}/bin/mysqld_safe --defaults-file={base}/my.cnf --user=mysql </dev/null >{data}/mysqld_safe.out 2>&1 &
     start_rc=0
 else
-    # 兜底：尝试 mysql.server
-    echo "[deploy] 使用 /etc/init.d/mysql start 兜底启动"
-    /etc/init.d/mysql start 2>&1 | head -20
-    start_rc=${{PIPESTATUS[0]}}
+    # 兜底：不带全局服务（多实例场景 /etc/init.d/mysql 属于别的实例）
+    echo "[deploy] ERROR: 安装包中既无 mysqld 也无 mysqld_safe，无法启动"
+    exit 1
 fi
 
 # 循环等待 socket 就绪（mysql 命令加 --connect-timeout，避免半开连接挂起导致无限等待）
-SOCK=/tmp/mysql.sock
+# socket 走实例目录：/tmp/mysql.sock 是同机其他实例的固定路径，会连到别人
+SOCK={data}/mysql.sock
 echo "[deploy] 等待 MySQL socket 就绪 ($SOCK)..."
 wait_ok=0
 for i in $(seq 1 60); do
     if [ -S "$SOCK" ]; then
-        {base}/bin/mysql --connect-timeout=3 -u root -e "SELECT 1;" >/dev/null 2>&1
+        {base}/bin/mysql --defaults-file={base}/my.cnf --connect-timeout=3 -u root -e "SELECT 1;" >/dev/null 2>&1
         if [ $? -eq 0 ]; then
             wait_ok=1
             break
@@ -323,7 +373,9 @@ echo "[deploy] MySQL socket 已就绪"
 
 # ---------- 设置 root 密码 + 开放远程访问 ----------
 echo "[deploy] 设置 root 密码..."
-MYSQLCLI="{base}/bin/mysql -u root"
+# 必须带实例 defaults-file：否则密码/授权语句会打到 /etc/my.cnf 指向的
+# 同机其他实例上（实测风险：把现网实例的 root 密码改掉）
+MYSQLCLI="{base}/bin/mysql --defaults-file={base}/my.cnf -u root"
 # MySQL 8.0+ 默认 caching_sha2_password，老驱动/老客户端可能连不上；
 # 显式用 mysql_native_password 以获得最大兼容性。
 if [ "$MAJOR" -ge 8 ]; then
@@ -381,16 +433,28 @@ if [ $LOGIN_OK -ne 1 ]; then
     exit 1
 fi
 
-# ---------- 写入 /root/.my.cnf 并验证 ----------
-cat > /root/.my.cnf << 'MYCNF'
+# ---------- 客户端凭据文件（不覆盖全机 /root/.my.cnf）----------
+# /root/.my.cnf 是全机共享的默认凭据，同机其他实例的运维命令都靠它；
+# 覆盖会导致那些实例连不上或连错对象。改为写本实例专属文件。
+cat > {base}/.my.cnf << 'MYCNF'
 [client]
 user=root
 password={pw}
-socket=/tmp/mysql.sock
+socket={data}/mysql.sock
 MYCNF
-chmod 600 /root/.my.cnf
+chmod 600 {base}/.my.cnf
+MYSQLD_CNT=$(pgrep -x mysqld 2>/dev/null | wc -l)
+if [ ! -f /root/.my.cnf ] && [ "$MYSQLD_CNT" -le 1 ]; then
+    # 只在这台机器上仅有本实例时才写全局默认凭据；多实例时写全局会让
+    # 运维的 mysql 命令默认连到本实例（甚至指向已删除的 socket）
+    cp -f {base}/.my.cnf /root/.my.cnf
+    chmod 600 /root/.my.cnf
+    echo "[deploy] 已写入 /root/.my.cnf（此前不存在且本机仅此实例）"
+else
+    echo "[deploy] 跳过 /root/.my.cnf（多实例或有既有配置）；本实例凭据见 {base}/.my.cnf"
+fi
 echo "[deploy] 验证 root 密码登录..."
-{base}/bin/mysql -e "SELECT VERSION();" 2>&1 | head -3
+{base}/bin/mysql --defaults-file={base}/my.cnf -e "SELECT VERSION();" 2>&1 | head -3
 if [ $? -ne 0 ]; then
     echo "[deploy] ERROR: 使用 root 密码登录验证失败。"
     exit 1
@@ -399,13 +463,20 @@ fi
 # 验证远程端口监听
 ss -lntp 2>/dev/null | grep -E ':{port}\\s' || netstat -lntp 2>/dev/null | grep -E ':{port}\\s' || true
 
-echo "[deploy] 写入 /etc/profile.d/mysql.sh ..."
-cat > /etc/profile.d/mysql.sh << 'PROFILEEOF'
+echo "[deploy] 写入实例环境变量文件 {base}/env.sh ..."
+cat > {base}/env.sh << 'PROFILEEOF'
 export MYSQL_HOME={base}
 export PATH=$MYSQL_HOME/bin:$PATH
 export MYSQL_DATADIR={data}
 PROFILEEOF
-chmod 644 /etc/profile.d/mysql.sh
+# 全局 profile 仅在首次部署（不存在）时写，避免覆盖其他实例的 PATH 指向
+if [ ! -f /etc/profile.d/mysql.sh ]; then
+    cp -f {base}/env.sh /etc/profile.d/mysql.sh
+    chmod 644 /etc/profile.d/mysql.sh
+    echo "[deploy] 已写入 /etc/profile.d/mysql.sh（此前不存在）"
+else
+    echo "[deploy] 保留现有 /etc/profile.d/mysql.sh；本实例环境：source {base}/env.sh"
+fi
 ldconfig
 
 echo "[deploy] MySQL 部署完成! 版本=$RAW_VER 端口={port}  数据目录={data}"
@@ -455,18 +526,31 @@ shared_buffers={pg_shared}
 wal_level={pg_wal}
 CONFEOF
 echo "[deploy] 启动 PostgreSQL..."
-su - postgres -c "{base}/bin/pg_ctl -D {data} -l {data}/pg.log -o '-p {port}' start" 2>&1 | head -5
+# socket 也放到实例数据目录，避免 /tmp/.s.PGSQL.<port> 与其他实例混在一起
+su - postgres -c "{base}/bin/pg_ctl -D {data} -l {data}/pg.log -o '-p {port} -k {data}' start" 2>&1 | head -5
 sleep 3
 # 设置密码（多种方式都试）
-su - postgres -c "{base}/bin/psql -c \\"ALTER USER postgres WITH PASSWORD '{pw}';\\" 2>&1" | head -3
-su - postgres -c "{base}/bin/psql -c 'SELECT version();' 2>&1" | head -3
-echo "[deploy] 写入 /etc/profile.d/postgres.sh ..."
-cat > /etc/profile.d/postgres.sh << 'PROFILEEOF'
+# 必须显式带端口/socket：不带时 psql 连默认 5432，会把 ALTER USER 打到同机
+# **已有实例**上（实测：部署 25432 时把现网 5432 的 postgres 口令改了）
+su - postgres -c "PGPORT={port} PGHOST={data} {base}/bin/psql -c \\"ALTER USER postgres WITH PASSWORD '{pw}';\\" 2>&1" | head -3
+su - postgres -c "PGPORT={port} PGHOST={data} {base}/bin/psql -c 'SELECT version();' 2>&1" | head -3
+echo "[deploy] 写入实例环境变量 {base}/env.sh ..."
+cat > {base}/env.sh << 'PROFILEEOF'
 export PG_HOME={base}
 export PGDATA={data}
+export PGHOST={data}
+export PGPORT={port}
 export PATH=$PG_HOME/bin:$PATH
 PROFILEEOF
-chmod 644 /etc/profile.d/postgres.sh
+# socket 在实例数据目录，psql 必须靠 PGHOST/PGPORT 定位；全局 profile 仅在
+# 首次部署（不存在）时写，避免把同机其他实例的默认连接参数顶掉
+if [ ! -f /etc/profile.d/postgres.sh ]; then
+    cp -f {base}/env.sh /etc/profile.d/postgres.sh
+    chmod 644 /etc/profile.d/postgres.sh
+    echo "[deploy] 已写入 /etc/profile.d/postgres.sh（此前不存在）"
+else
+    echo "[deploy] 保留现有 /etc/profile.d/postgres.sh；本实例环境：source {base}/env.sh"
+fi
 ldconfig
 echo "[deploy] PostgreSQL 部署完成! 端口={port}  数据目录={data}  环境变量: /etc/profile.d/postgres.sh"
 echo "提示：新开 SSH 终端前请先 source /etc/profile 或重新登录"
@@ -514,9 +598,20 @@ export PATH=$ORACLE_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$ORACLE_HOME/lib:$LD_LIBRARY_PATH
 PROFILEEOF
 chmod 644 /etc/profile.d/oracle.sh
-echo "[deploy] 建议参数: -silent -responseFile $ORACLE_HOME/assistants/dbca/dbca.rsp"
 echo "[deploy] 字符集: {charset}  国家字符集: {ncharset}  内存占比: {mem_pct}%"
-echo "[deploy] Oracle 部署准备完成 (SID={sid} 字符集={charset} CDB={cdb} PDB={pdb})"
+echo "[deploy] ============================================================"
+echo "[deploy] 重要（能力边界）：本部署仅完成 Oracle 安装介质解压 + 环境变量配置，"
+echo "[deploy]            **不会创建数据库实例**（Oracle 无二进制解压即用形态）。"
+echo "[deploy]            建库请执行（需 DBA 权限与/或图形环境）："
+echo "[deploy]   1) $ORACLE_HOME/runInstaller -silent -responseFile $ORACLE_HOME/assistants/db_install.rsp"
+echo "[deploy]   2) $ORACLE_HOME/bin/dbca -silent -createDatabase -gdbName {sid} \\"
+echo "[deploy]        -characterSet {charset} -nationalCharacterSet {ncharset} \\"
+echo "[deploy]        -createAsContainerDatabase {'true' if cdb == '1' else 'false'} \\"
+echo "[deploy]        -pdbName {pdb} -totalMemory {mem_pct}% -templateName General_Purpose.dbc"
+echo "[deploy]   3) $ORACLE_HOME/bin/lsnrctl start && $ORACLE_HOME/bin/sqlplus / as sysdba"
+echo "[deploy] 完成上述步骤后，实例才能被平台纳管做备份/恢复。"
+echo "[deploy] ============================================================"
+echo "[deploy] Oracle 介质与环境准备完成 (SID={sid} 字符集={charset} CDB={cdb} PDB={pdb})"
 echo "DEPLOY_OK"
 
 """
@@ -532,102 +627,294 @@ echo "[deploy] ====== Kingbase {version} 部署开始 ======"
 echo "[deploy] MODE={kb_mode}  ENCODING={kb_encoding}  PORT={port}"
 mkdir -p {base} {data}
 id kingbase &>/dev/null || useradd -r -s /bin/false kingbase
-chown -R kingbase:kingbase /opt/Kingbase
+# 只授权本实例目录：写死 /opt/Kingbase 会把同机已有安装整套 chown（慢且动别人）
+chown -R kingbase:kingbase {base} {data}
 echo "[deploy] 解压安装包..."
 tar -xf {pkg} -C {base} --strip-components=1
-echo "[deploy] 使用 sys_ctl 初始化..."
-su - kingbase -c "{base}/Server/bin/initdb -D {data} --encoding={kb_encoding} --mode={kb_mode}"
+chown -R kingbase:kingbase {base}
+echo "[deploy] 使用 initdb 初始化（超级用户 SYSTEM）..."
+# 金仓 initdb 参数随版本不同：V9R3 是 -m/--dbmode 且仅支持 mysql 兼容模式；
+# 旧脚本写死 --mode=pg 会 "unrecognized option '--mode=pg'" 直接失败（171 实测）。
+# 策略：pg 模式不传参数（默认即 PG 语义）；其他模式先探测 --dbmode 是否支持。
+KB_DBMODE_ARG=""
+if [ -n "{kb_mode}" ] && [ "{kb_mode}" != "pg" ]; then
+    if {base}/Server/bin/initdb --help 2>&1 | grep -q -- '--dbmode'; then
+        KB_DBMODE_ARG="--dbmode={kb_mode}"
+    else
+        echo "[deploy] WARN: 当前版本 initdb 不支持 --dbmode，按默认(PG 兼容)模式初始化"
+    fi
+fi
+su - kingbase -c "{base}/Server/bin/initdb -D {data} -U SYSTEM --encoding={kb_encoding} $KB_DBMODE_ARG"
 cat >> {data}/kingbase.conf << 'EOF'
 port={port}
 listen_addresses='*'
 max_connections={kb_maxconn}
 shared_buffers={kb_shared}
 EOF
-su - kingbase -c "{base}/Server/bin/sys_ctl -D {data} start" 2>&1 | head -5
+# KingbaseES 启动强依赖授权文件：缺 license.dat 时 postmaster 直接
+# "FATAL: license.dat path is dir or file does not exist"（171 实测），
+# 提前检查并给明确处置指引，而不是让用户对着 sys_ctl 的"检查日志输出"猜。
+KB_LICENSE=$(find {base} -maxdepth 2 -name 'license.dat' 2>/dev/null | head -1)
+if [ -z "$KB_LICENSE" ]; then
+    echo "[deploy] ERROR: 安装包内未找到 license.dat（KingbaseES 启动必需授权文件）。"
+    echo "[deploy] ERROR: 请把 license.dat 放到安装包顶层（与 Server 目录同级）后重新部署。"
+    exit 1
+fi
+echo "[deploy] 授权文件: $KB_LICENSE"
+su - kingbase -c "{base}/Server/bin/sys_ctl -D {data} -l {data}/kb.log start" >{data}/kb_start.out 2>&1 || true
+tail -n 5 {data}/kb_start.out
 sleep 3
+# 启动必须真校验：sys_ctl 偶发启动失败时旧脚本仍打印 DEPLOY_OK（假成功）
+if ! ss -lnt 2>/dev/null | grep -qE ':{port}[[:space:]]'; then
+    echo "[deploy] ERROR: Kingbase 未在端口 {port} 监听，启动失败。日志尾部："
+    tail -n 20 {data}/kb.log 2>/dev/null || true
+    exit 1
+fi
 # Kingbase 兼容两种 ALTER USER 语法
-su - kingbase -c "{base}/Server/bin/ksql -c \\"ALTER USER SYSTEM WITH PASSWORD '{pw}';\\"" 2>&1 | head -3
-echo "[deploy] 写入 /etc/profile.d/kingbase.sh ..."
-cat > /etc/profile.d/kingbase.sh << 'PROFILEEOF'
+# 必须显式 -p {port} + -U SYSTEM：不带端口会连默认 54321（同机已有实例）；
+# 不带用户则以 OS 用户 kingbase 连接 → "角色 kingbase 不存在"（171 实测）
+if ! su - kingbase -c "{base}/Server/bin/ksql -p {port} -U SYSTEM -d test -c \\"ALTER USER SYSTEM WITH PASSWORD '{pw}';\\"">/dev/null 2>{data}/kb_pw.err; then
+    echo "[deploy] WARN: 设置 SYSTEM 口令失败（见下），远程连接可能需要手工处理："
+    head -3 {data}/kb_pw.err 2>/dev/null || true
+fi
+echo "[deploy] 写入实例环境变量 {base}/env.sh ..."
+cat > {base}/env.sh << 'PROFILEEOF'
 export KB_HOME={base}
 export KB_DATA={data}
 export PATH=$KB_HOME/Server/bin:$PATH
 export LD_LIBRARY_PATH=$KB_HOME/Server/lib:$LD_LIBRARY_PATH
 PROFILEEOF
-chmod 644 /etc/profile.d/kingbase.sh
+if [ ! -f /etc/profile.d/kingbase.sh ]; then
+    cp -f {base}/env.sh /etc/profile.d/kingbase.sh
+    chmod 644 /etc/profile.d/kingbase.sh
+    echo "[deploy] 已写入 /etc/profile.d/kingbase.sh（此前不存在）"
+else
+    echo "[deploy] 保留现有 /etc/profile.d/kingbase.sh；本实例环境：source {base}/env.sh"
+fi
 ldconfig
 echo "[deploy] Kingbase 部署完成! 端口={port}  数据目录={data}  环境变量: /etc/profile.d/kingbase.sh"
 echo "DEPLOY_OK"
 
 """
     elif db_type == "dameng":
-        dm_instance = params.get("dm_instance", "DMSERVER")
+        dm_instance = params.get("dm_instance") or "DAMENG"
         dm_charset = params.get("dm_charset", "1")
         dm_page = params.get("dm_page", "32")
         dm_case = params.get("dm_case", "1")
-        dm_sysdba = params.get("dm_sysdba", "Dameng123")
+        dm_sysdba = params.get("dm_sysdba") or pw
 
+        # 达梦部署支持两种介质形态：
+        #   1) 目录包（tar/tar.gz，含 bin/dminit、bin/dmserver、bin/disql）——
+        #      解压即用，最贴近离线交付（现场常用 tar 灌装）；
+        #   2) ISO / DMInstall.bin —— 需图形或静默安装器，只做介质就位与环境准备。
+        # 旧实现两种都没真正跑通：找不到 DMInstall.bin 时仍打印 DEPLOY_OK（假成功）、
+        # dminit 后判断 {data}/{INSTANCE} 目录（实际是 {data}/DAMENG）、启动用
+        # 非 setsid 的 nohup（SSH 会话断开即被带走）、没有任何启动校验。
         return f"""#!/bin/bash
-set -e
+set +e
 echo "[deploy] ====== DM 达梦 {version} 部署开始 ======"
-echo "[deploy] INSTANCE={dm_instance}  CHARSET={dm_charset}  PAGE_SIZE={dm_page}"
+echo "[deploy] INSTANCE={dm_instance}  CHARSET={dm_charset}  PAGE_SIZE={dm_page}  PORT={port}"
+
+# ---------- 前置检查：端口 / 数据目录 / 内存 ----------
+MEM_AVAIL_MB=$(awk '/MemAvailable/{{print int($2/1024)}}' /proc/meminfo 2>/dev/null || echo 0)
+echo "[deploy] 目标机可用内存: $MEM_AVAIL_MB MB"
+# 混合部署机（同机已有 Oracle/PG 等实例）buff/cache 常常占掉大半内存，
+# 直接按 available 拒绝会误伤可回收的场景（171 实测 282MB→释放页缓存后 540MB）。
+if [ "$MEM_AVAIL_MB" -gt 0 ] && [ "$MEM_AVAIL_MB" -lt 512 ]; then
+    sync 2>/dev/null; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+    sleep 2
+    MEM_AVAIL_MB=$(awk '/MemAvailable/{{print int($2/1024)}}' /proc/meminfo 2>/dev/null || echo 0)
+    echo "[deploy] 已尝试释放页缓存，可用内存: $MEM_AVAIL_MB MB"
+fi
+if [ "$MEM_AVAIL_MB" -gt 0 ] && [ "$MEM_AVAIL_MB" -lt 256 ]; then
+    echo "[deploy] ERROR: 可用内存仅 $MEM_AVAIL_MB MB（< 256 MB），dmserver 启动必被 OOM 杀掉。"
+    echo "[deploy] ERROR: 请释放内存后重试（达梦实例常驻内存约 300-500MB）。"
+    exit 1
+fi
+if [ "$MEM_AVAIL_MB" -gt 0 ] && [ "$MEM_AVAIL_MB" -lt 512 ]; then
+    echo "[deploy] 警告: 可用内存 $MEM_AVAIL_MB MB < 512 MB（达梦实例常驻约 300-500MB），继续尝试部署；"
+    echo "[deploy] 警告: 若启动失败，请释放内存或调小 dm.ini 的 MEMORY_POOL / BUFFER 后重启实例。"
+fi
+if ss -lnt 2>/dev/null | grep -qE ':{port}[[:space:]]'; then
+    echo "[deploy] ERROR: 目标端口 {port} 已被占用，请更换端口后重新部署。"
+    exit 1
+fi
+INST_DIR="{data}/{dm_instance}"
+if [ -d "$INST_DIR" ] && [ -n "$(ls -A "$INST_DIR" 2>/dev/null)" ]; then
+    echo "[deploy] ERROR: 实例目录 $INST_DIR 非空（避免覆盖已有数据），请先清理。"
+    exit 1
+fi
+if pgrep -x dmserver >/dev/null 2>&1; then
+    echo "[deploy] 提示: 已有 dmserver 在运行，本次按多实例隔离部署（端口 {port} / 数据 {data}）。"
+fi
+
 mkdir -p {base} {data}
-id dmdba &>/dev/null || useradd -r -s /bin/false dmdba
-chown -R dmdba:dmdba {base} {data}
-echo "[deploy] 解压安装包..."
-if [[ "{pkg}" == *.iso ]] && command -v mount &>/dev/null; then
-    mkdir -p /tmp/dm_mnt
-    mount -o loop,ro {pkg} /tmp/dm_mnt 2>/dev/null || (mkdir -p /tmp/dm_mnt && tar -xf {pkg} -C /tmp/dm_mnt)
-    DMINST=$(ls /tmp/dm_mnt/DMInstall.bin 2>/dev/null)
-elif [[ "{pkg}" == *.iso ]] || [[ "{pkg}" == *.bin ]]; then
-    mkdir -p /tmp/dm_mnt
-    # cat 重定向而非 cp：root .bashrc 将 cp 别名为 cp -i 时目标存在会等待
-    # y/n 确认挂起（170 实测）
-    cat {pkg} > /tmp/dm_mnt/DMInstall.bin 2>/dev/null || true
-    chmod +x /tmp/dm_mnt/DMInstall.bin 2>/dev/null
-    DMINST=/tmp/dm_mnt/DMInstall.bin
-else
-    mkdir -p /tmp/dm_mnt
-    tar -xf {pkg} -C /tmp/dm_mnt 2>/dev/null
-    DMINST=$(find /tmp/dm_mnt -name "DMInstall.bin" 2>/dev/null | head -1)
+# 建组与建用户必须分别判断：`useradd -r` 在部分发行版不创建同名组，
+# 而"用户已存在但组不存在"时旧逻辑（只判断 id dmdba）会整段跳过，
+# 随后 chown dmdba:dmdba 报"无效的组"，dminit 因数据目录属 root 而 create dir failed（171 实测）。
+if ! getent group dmdba &>/dev/null; then
+    groupadd -f dmdba 2>/dev/null
 fi
-if [ -z "$DMINST" ] || [ ! -f "$DMINST" ]; then
-    echo "[deploy] 未在安装包中找到 DMInstall.bin，请手动挂载 ISO 或解压"
-    echo "[deploy] 提示: DM 8 安装需要 X 图形环境（runInstaller）或静默参数"
-    DM_HOME_BIN={base}/bin
-else
-    echo "[deploy] 检测到 DM 安装程序: $DMINST"
-    echo "[deploy] 由于达梦需要图形环境，这里只准备静默安装所需的目录与环境"
+if ! id dmdba &>/dev/null; then
+    useradd -r -g dmdba -s /bin/false dmdba 2>/dev/null || \
+        useradd -r -s /bin/false dmdba 2>/dev/null
 fi
-echo "[deploy] 准备 dminit 初始化数据库..."
-# 寻找 dminit
-DMINIT={base}/bin/dminit
-if [ ! -x "$DMINIT" ] && [ -x /opt/dmdbms/bin/dminit ]; then
-    DMINIT=/opt/dmdbms/bin/dminit
-    chown -R dmdba:dmdba /opt/dmdbms
+if ! id dmdba &>/dev/null || ! getent group dmdba &>/dev/null; then
+    echo "[deploy] ERROR: dmdba 用户/组准备失败（达梦要求非 root 运行实例）。"
+    exit 1
 fi
-if [ -x "$DMINIT" ]; then
-    echo "[deploy] 使用 dminit 初始化..."
-    su - dmdba -c "$DMINIT PATH={data} INSTANCE_NAME={dm_instance} PORT_NUM={port} CHARSET={dm_charset} PAGE_SIZE={dm_page} CASE_SENSITIVE={dm_case} SYSDBA_PWD={dm_sysdba} 2>&1" | head -20
-    echo "[deploy] 启动 DM 服务..."
-    DMSERVER={base}/bin/dmserver
-    if [ -x "$DMSERVER" ] && [ -d "{data}/{dm_instance}" ]; then
-        su - dmdba -c "nohup {base}/bin/dmserver path={data}/{dm_instance} > /var/log/dmserver.log 2>&1 &"
-        sleep 3
-        echo "[deploy] DM 服务已启动"
+
+# ---------- 介质解压 ----------
+echo "[deploy] 解压安装介质: {pkg}"
+case "{pkg}" in
+    *.tar.gz|*.tgz)
+        tar -xzf {pkg} -C {base} || {{ echo "[deploy] ERROR: 解压失败"; exit 1; }} ;;
+    *.tar)
+        tar -xf {pkg} -C {base} || {{ echo "[deploy] ERROR: 解压失败"; exit 1; }} ;;
+    *.iso)
+        mkdir -p /var/tmp/dm_mnt
+        mount -o loop,ro {pkg} /var/tmp/dm_mnt 2>/dev/null
+        DMINST=$(find /var/tmp/dm_mnt -name DMInstall.bin 2>/dev/null | head -1)
+        if [ -n "$DMINST" ]; then
+            echo "[deploy] 检测到安装器: $DMINST"
+            echo "[deploy] 提示: DM8 安装器需图形或响应文件静默安装，本脚本不代为执行；"
+            echo "[deploy] 提示: 如已有安装目录，请改用目录包（tar 含 bin/dminit）部署。"
+        fi ;;
+    *)
+        echo "[deploy] WARN: 未知介质类型，按 tar 尝试解压"; tar -xf {pkg} -C {base} 2>/dev/null ;;
+esac
+
+# 目录包归位：允许顶层带 dm8/ 目录，统一收敛到 {base}/bin
+if [ ! -x {base}/bin/dminit ]; then
+    CAND=$(find {base} -maxdepth 3 -type f -name dminit 2>/dev/null | head -1)
+    if [ -n "$CAND" ]; then
+        DMDIR=$(dirname "$CAND")
+        echo "[deploy] 安装目录归位: $DMDIR -> {base}/bin"
+        mkdir -p {base}/bin
+        for _f in "$DMDIR"/*; do /usr/bin/cp -f "$_f" {base}/bin/ 2>/dev/null; done
     fi
-else
-    echo "[deploy] 未找到 dminit，请先安装达梦数据库 (PATH=$DMINIT)"
 fi
-echo "[deploy] 写入 /etc/profile.d/dameng.sh ..."
-cat > /etc/profile.d/dameng.sh << 'PROFILEEOF'
+if [ ! -x {base}/bin/dminit ] || [ ! -x {base}/bin/dmserver ]; then
+    echo "[deploy] ERROR: 介质中未找到 dminit/dmserver（需 {base}/bin/dminit）。"
+    echo "[deploy] ERROR: 目录包请包含 bin/dminit、bin/dmserver、bin/disql（及依赖 .so）。"
+    echo "[deploy] 目录内容：" ; ls {base} 2>/dev/null | head -10
+    exit 1
+fi
+if ! chown -R dmdba:dmdba {base} {data} 2>/tmp/dm_chown.err; then
+    echo "[deploy] ERROR: 安装/数据目录授权 dmdba 失败：$(cat /tmp/dm_chown.err 2>/dev/null)"
+    exit 1
+fi
+
+# ---------- dminit 初始化 ----------
+# 达梦 dminit 强校验口令 8-48 位，短口令会 "password must between 8 and 48"
+# 直接 fail to init db（171 实测：7 位口令 Dm@2026 被拒）
+DMPW='{dm_sysdba}'
+if [ ${{#DMPW}} -lt 8 ] || [ ${{#DMPW}} -gt 48 ]; then
+    echo "[deploy] ERROR: SYSDBA 口令长度必须 8-48 位（当前 ${{#DMPW}} 位），dminit 会直接拒绝。"
+    exit 1
+fi
+# 新版 dminit（三权分立）强制要求 SYSDBA/SYSAUDITOR/SYSSSO 三个口令同时给出，
+# 只传 SYSDBA_PWD 会 "please set [SYSAUDITOR_PWD] value / fail to init db"（171 实测 V8）。
+# 口令强度同样是硬校验：必须是"大写+小写+数字"组合。
+if ! echo "$DMPW" | grep -q '[A-Z]' || ! echo "$DMPW" | grep -q '[a-z]' || ! echo "$DMPW" | grep -q '[0-9]'; then
+    echo "[deploy] 警告: 口令未同时包含大写字母/小写字母/数字，新版 dminit 会直接拒绝初始化。"
+fi
+echo "[deploy] dminit 初始化（实例目录 $INST_DIR）..."
+DMINIT_BASE="LD_LIBRARY_PATH={base}/bin {base}/bin/dminit PATH={data} DB_NAME={dm_instance} INSTANCE_NAME={dm_instance} PORT_NUM={port} CHARSET={dm_charset} PAGE_SIZE={dm_page} CASE_SENSITIVE={dm_case}"
+# 非安全版 dminit 也要求 SYSAUDITOR_PWD，但拒绝 SYSSSO_PWD
+# （"Current dminit is not a secure version, you can't set [SYSSSO_PWD]"），
+# 安全版则要求两者都给。两种版本来回试，第一次失败先清残留目录再重试。
+DMINIT_OUT=$(su - dmdba -c "$DMINIT_BASE SYSDBA_PWD=\"$DMPW\" SYSAUDITOR_PWD=\"$DMPW\" SYSSSO_PWD=\"$DMPW\"" 2>&1)
+if [ ! -f "$INST_DIR/dm.ini" ]; then
+    rm -rf "$INST_DIR"
+    DMINIT_OUT2=$(su - dmdba -c "$DMINIT_BASE SYSDBA_PWD=\"$DMPW\" SYSAUDITOR_PWD=\"$DMPW\"" 2>&1)
+    if [ -f "$INST_DIR/dm.ini" ]; then
+        DMINIT_OUT="$DMINIT_OUT2"
+    else
+        DMINIT_OUT="$DMINIT_OUT
+--- 非安全版（不带 SYSSSO_PWD）重试 ---
+$DMINIT_OUT2"
+    fi
+fi
+echo "$DMINIT_OUT" | tail -20
+if [ ! -f "$INST_DIR/dm.ini" ]; then
+    echo "[deploy] ERROR: dminit 初始化失败（未生成 $INST_DIR/dm.ini）"
+    echo "[deploy] 提示: dminit 的实例目录名取自 DB_NAME（即 $INST_DIR），不是固定 DAMENG。"
+    exit 1
+fi
+chown -R dmdba:dmdba {data}
+
+# ---------- 启动（setsid 脱离 SSH 会话，避免登出即被带走）----------
+echo "[deploy] 启动 dmserver（端口 {port}）..."
+su - dmdba -c "cd $INST_DIR && LD_LIBRARY_PATH={base}/bin setsid nohup {base}/bin/dmserver path=$INST_DIR/dm.ini -noconsole > {data}/dmserver.out 2>&1 &"
+LISTEN_OK=0
+for i in $(seq 1 30); do
+    if ss -lnt 2>/dev/null | grep -qE ':{port}[[:space:]]'; then LISTEN_OK=1; break; fi
+    sleep 2
+done
+if [ "$LISTEN_OK" != "1" ]; then
+    echo "[deploy] ERROR: 达梦实例未在端口 {port} 监听，启动失败。日志尾部："
+    tail -n 25 {data}/dmserver.out 2>/dev/null; tail -n 10 $INST_DIR/*.log 2>/dev/null
+    exit 1
+fi
+echo "[deploy] 端口 {port} 已监听"
+
+# DmAPService（dmap 辅助进程）：联机物理备份 BACKUP DATABASE 的硬依赖，
+# 未启动时备份报 [-7170] Bakres failed to connect DMAP（171 实测）。
+if ! pgrep -x dmap >/dev/null 2>&1; then
+    su - dmdba -c "LD_LIBRARY_PATH={base}/bin setsid nohup {base}/bin/dmap > {data}/dmap.out 2>&1 &" 2>/dev/null
+    sleep 1
+    if pgrep -x dmap >/dev/null 2>&1; then
+        echo "[deploy] 已启动 dmap（DmAPService，物理备份依赖）"
+    else
+        echo "[deploy] 警告: dmap 启动失败，联机物理备份将报 -7170，请手动启动 {base}/bin/dmap"
+    fi
+fi
+
+# ---------- 连通性校验（disql 真实登录）----------
+CONN_OK=0
+PROBE_FILE="{data}/dm_probe.sql"
+# 两个坑（171 实测）：
+#   1) 口令常带 @ / # 等字符，登录串里必须用双引号包裹口令，否则
+#      "SYSDBA/DmTest@2026@127.0.0.1:5238" 会被解析成 servername=2026@127.0.0.1 → -70028；
+#   2) 旧实现用 `-e 'select 1'` + grep 数字，disql 报错时的帮助文本里也有独立数字，
+#      会造成"校验通过"的假阳性。改为固定哨兵串 + stdin 重定向（避免 disql 挂住等输入）。
+cat > "$PROBE_FILE" <<PROBEEOF
+conn SYSDBA/"$DMPW"@127.0.0.1:{port}
+select 'DM_DEPLOY_PROBE_OK' as probe;
+exit
+PROBEEOF
+chmod 644 "$PROBE_FILE"
+for i in $(seq 1 10); do
+    OUT=$(su - dmdba -c "LD_LIBRARY_PATH={base}/bin {base}/bin/disql /nolog" < "$PROBE_FILE" 2>&1)
+    echo "$OUT" | grep -q 'DM_DEPLOY_PROBE_OK' && CONN_OK=1 && break
+    sleep 2
+done
+rm -f "$PROBE_FILE"
+if [ "$CONN_OK" = "1" ]; then
+    echo "[deploy] disql 登录校验通过（SYSDBA 可正常连接）"
+else
+    echo "[deploy] ERROR: disql 登录校验未通过（端口 {port} 已监听，但 SYSDBA 无法登录）。"
+    echo "[deploy] ERROR: 按不假成功原则判定部署失败，请按下列输出排查（口令/许可/初始化参数）："
+    echo "$OUT" | tail -12
+    exit 1
+fi
+
+# ---------- 环境变量（不覆盖其他实例）----------
+cat > {base}/env.sh << 'PROFILEEOF'
 export DM_HOME={base}
 export PATH=$DM_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$DM_HOME/bin:$LD_LIBRARY_PATH
 PROFILEEOF
-chmod 644 /etc/profile.d/dameng.sh
-ldconfig
-echo "[deploy] 达梦部署完成 (instance={dm_instance} SYSDBA={dm_sysdba})"
+if [ ! -f /etc/profile.d/dameng.sh ]; then
+    /usr/bin/cp -f {base}/env.sh /etc/profile.d/dameng.sh
+    chmod 644 /etc/profile.d/dameng.sh
+    echo "[deploy] 已写入 /etc/profile.d/dameng.sh（此前不存在）"
+else
+    echo "[deploy] 保留现有 /etc/profile.d/dameng.sh；本实例环境：source {base}/env.sh"
+fi
+
+echo "[deploy] 达梦部署完成! 实例={dm_instance} 端口={port} 数据目录=$INST_DIR  SYSDBA 口令见部署记录"
 echo "DEPLOY_OK"
 
 """
@@ -685,19 +972,21 @@ mkdir -p {data}
 {dep_lines}
 # 清理可能存在的旧残留目录，避免误用上次失败的源码
 echo "[deploy] 清理可能残留的旧安装目录..."
-rm -rf {base} {data}/redis_* /tmp/redis_build 2>/dev/null || true
+rm -rf {base} {data}/redis_* /var/tmp/redis_build 2>/dev/null || true
 mkdir -p {base} {data}
-echo "[deploy] 解压 Redis 源码包 -> /tmp/redis_build ..."
-mkdir -p /tmp/redis_build
-tar -xf {pkg} -C /tmp/redis_build
-SRC_DIR=$(find /tmp/redis_build -maxdepth 1 -type d -name 'redis-*' 2>/dev/null | head -1)
-[ -z "$SRC_DIR" ] && SRC_DIR=/tmp/redis_build/redis-6.2.6
+echo "[deploy] 解压 Redis 源码包 -> /var/tmp/redis_build ..."
+mkdir -p /var/tmp/redis_build
+tar -xf {pkg} -C /var/tmp/redis_build
+SRC_DIR=$(find /var/tmp/redis_build -maxdepth 1 -type d -name 'redis-*' 2>/dev/null | head -1)
+[ -z "$SRC_DIR" ] && SRC_DIR=/var/tmp/redis_build/redis-6.2.6
 echo "[deploy] 源码目录: $SRC_DIR"
 cd "$SRC_DIR"
 echo "[deploy] 编译 Redis (MALLOC=libc)..."
 make MALLOC=libc
 echo "[deploy] 安装 Redis..."
-make install
+# PREFIX 指到本实例目录：默认 make install 会装到 /usr/local/bin，
+# 覆盖目标机上已有的 redis-server/redis-cli（多实例部署时污染全局命令）。
+make PREFIX={base} install
 mkdir -p {base}/bin
 cp -f "$SRC_DIR"/src/redis-server {base}/bin/
 cp -f "$SRC_DIR"/src/redis-cli {base}/bin/
@@ -730,7 +1019,10 @@ EOF
 REDIS_PING_OK=0
 for _i in $(seq 1 10); do
   sleep 1
-  if REDISCLI_AUTH={pw} {base}/bin/redis-cli PING 2>/dev/null | grep -q PONG; then
+  # 必须显式 -p {port}：不指定端口时 redis-cli 连的是默认 6379（目标机上
+  # 已有别的实例），会拿"AUTH 密码错误/连错实例"当就绪失败——实测在 171
+  # 部署 6381 时误报"PING 未返回 PONG"，而实例实际已就绪。
+  if REDISCLI_AUTH={pw} {base}/bin/redis-cli -p {port} PING 2>/dev/null | grep -q PONG; then
     REDIS_PING_OK=1
     break
   fi
@@ -740,17 +1032,26 @@ if [ "$REDIS_PING_OK" = "1" ]; then
 else
     echo "[deploy] 警告: PING 未返回 PONG，见上方日志"
 fi
-cat > /usr/local/bin/redis-start.sh << 'STARTEOF'
+# 启动脚本落实例目录：写 /usr/local/bin/redis-start.sh 会覆盖同机其他实例的
+# 同款脚本（171 实测：部署 6381 后全局 redis-start.sh 指向了新实例）
+cat > {base}/start.sh << 'STARTEOF'
 #!/bin/bash
 {base}/bin/redis-server {base}/redis.conf --daemonize yes
 STARTEOF
-chmod +x /usr/local/bin/redis-start.sh
-echo "[deploy] 写入 /etc/profile.d/redis.sh ..."
-cat > /etc/profile.d/redis.sh << 'PROFILEEOF'
+chmod +x {base}/start.sh
+echo "[deploy] 写入实例环境变量 {base}/env.sh ..."
+cat > {base}/env.sh << 'PROFILEEOF'
 export REDIS_HOME={base}
 export PATH=$REDIS_HOME/bin:$PATH
 PROFILEEOF
-chmod 644 /etc/profile.d/redis.sh
+# 全局 profile 仅在首次部署（不存在）时写，避免覆盖其他实例的 PATH 指向
+if [ ! -f /etc/profile.d/redis.sh ]; then
+    cp -f {base}/env.sh /etc/profile.d/redis.sh
+    chmod 644 /etc/profile.d/redis.sh
+    echo "[deploy] 已写入 /etc/profile.d/redis.sh（此前不存在）"
+else
+    echo "[deploy] 保留现有 /etc/profile.d/redis.sh；本实例环境：source {base}/env.sh"
+fi
 ldconfig
 echo "[deploy] Redis 部署完成! 端口={port}  环境变量: /etc/profile.d/redis.sh"
 echo "DEPLOY_OK"
@@ -774,11 +1075,18 @@ set +e
 echo "[deploy] ====== MongoDB {version} 部署开始 ======"
 echo "[deploy] BASE={base}  DATA={data}  PORT={port}  AUTH={mongo_auth}  REPL={mongo_repl}"
 
-# ---------- 前置检查 ----------
+# ---------- 前置检查（多实例友好：只看端口/数据目录，不看进程）----------
 echo "[deploy] 前置环境检查..."
-if pgrep -x mongod >/dev/null 2>&1; then
-    echo "[deploy] ERROR: 检测到目标机已有 mongod 进程在运行，请先停止后再部署。"
+if ss -lnt 2>/dev/null | grep -qE ':{port}[[:space:]]'; then
+    echo "[deploy] ERROR: 目标端口 {port} 已被占用，请更换端口后重新部署。"
     exit 1
+fi
+if [ -d "{data}" ] && [ "$(ls -A {data} 2>/dev/null | grep -vx 'conf' | head -1)" ]; then
+    echo "[deploy] ERROR: 数据目录 {data} 非空（避免误删已有数据），请先清理后重新部署。"
+    exit 1
+fi
+if pgrep -x mongod >/dev/null 2>&1; then
+    echo "[deploy] 提示: 已有 mongod 在运行，本次按多实例隔离部署（端口 {port} / dbPath {data} / 独立配置 {base}/mongod.conf）。"
 fi
 
 # ---------- 解压安装包 ----------
@@ -880,13 +1188,13 @@ if [ "{mongo_auth}" = "1" ]; then
             echo "[deploy] 初始化副本集 {mongo_repl} ..."
             REPL_NAME="{mongo_repl}"
             REPL_PORT={port}
-            cat > /tmp/rs_init.js << RSEOF
+            cat > /var/tmp/rs_init.js << RSEOF
 rs.initiate({{
   _id: "{mongo_repl}",
   members: [{{ _id: 0, host: "127.0.0.1:{port}" }}]
 }})
 RSEOF
-            $CLI --port {port} admin --quiet --eval "$(cat /tmp/rs_init.js)" 2>&1 | head -5
+            $CLI --port {port} admin --quiet --eval "$(cat /var/tmp/rs_init.js)" 2>&1 | head -5
             echo "[deploy] 等待副本集变为 PRIMARY ..."
             for i in $(seq 1 30); do
                 role=$($CLI --port {port} --quiet --eval "rs.status().myState" 2>/dev/null | head -1)
@@ -1021,9 +1329,9 @@ if [ -n "$PKG_ARCH" ] && [ "$SYS_ARCH" != "$PKG_ARCH" ]; then
 fi
 # glibc 预检：openEuler/Ubuntu 高版本构建的包在 CentOS 7 等低 glibc 系统上无法运行。
 # GLIBC 版本行属致命（无法像普通 so 那样推补），必须提前失败并给出明确指引。
-mkdir -p /tmp/aidbm_gauss_probe
-if tar -xf "$TARBALL" -C /tmp/aidbm_gauss_probe 2>/dev/null; then
-    PROBE_BIN=$(find /tmp/aidbm_gauss_probe -name gs_ctl -type f 2>/dev/null | head -1)
+mkdir -p /var/tmp/aidbm_gauss_probe
+if tar -xf "$TARBALL" -C /var/tmp/aidbm_gauss_probe 2>/dev/null; then
+    PROBE_BIN=$(find /var/tmp/aidbm_gauss_probe -name gs_ctl -type f 2>/dev/null | head -1)
     if [ -n "$PROBE_BIN" ]; then
         # 用包自带 lib 隔离解析，避免主机上残留的同名旧库（如上次失败部署遗留）污染探测结果
         PROBE_LIB=$(dirname "$(dirname "$PROBE_BIN")")/lib
@@ -1033,18 +1341,18 @@ if tar -xf "$TARBALL" -C /tmp/aidbm_gauss_probe 2>/dev/null; then
             echo "$MISS"
             echo "[deploy] ERROR: 当前系统 $(cat /etc/os-release 2>/dev/null | grep -oE 'VERSION="[0-9.]+"' | head -1) glibc $(ldd --version | head -1 | grep -oE '[0-9]+\\.[0-9]+$')"
             echo "[deploy] ERROR: 请改用与目标 OS 匹配的 openGauss 安装包（CentOS 7 请用 openGauss CentOS 7 构建版，如 openGauss-Server-6.0.0-CentOS7-x86_64.tar.bz2）。"
-            rm -rf /tmp/aidbm_gauss_probe
+            rm -rf /var/tmp/aidbm_gauss_probe
             exit 1
         fi
     fi
 fi
-rm -rf /tmp/aidbm_gauss_probe
+rm -rf /var/tmp/aidbm_gauss_probe
 
 echo "[deploy] 5. 清理旧环境残留..."
 pkill -9 -f "$INSTALL_DIR/bin/gaussdb" 2>/dev/null
 pkill -9 -f "$INSTALL_DIR/bin/gs_ctl" 2>/dev/null
 ipcs -m | awk '$2 ~ /^[0-9]+$/ {{print $2}}' | xargs -r ipcrm -m 2>/dev/null
-rm -rf "$INSTALL_DIR" "$DATA_DIR" /tmp/aidbm_gauss_src
+rm -rf "$INSTALL_DIR" "$DATA_DIR" /var/tmp/aidbm_gauss_src
 rm -rf "/home/$DB_OS_USER/.bash_profile" 2>/dev/null
 # 上次失败部署可能遗留的 ldconfig 指向，会污染后续 glibc 预检与运行时库解析，必须一并清理
 rm -f /etc/ld.so.conf.d/gaussdb.conf
@@ -1063,9 +1371,9 @@ if [ ! -d "/home/$DB_OS_USER" ]; then
 fi
 
 echo "[deploy] 7. 解压并部署二进制文件..."
-mkdir -p /tmp/aidbm_gauss_src
-tar -xf "$TARBALL" -C /tmp/aidbm_gauss_src || {{ echo "[deploy] ERROR: 解压失败"; exit 1; }}
-BIN_GS=$(find /tmp/aidbm_gauss_src -maxdepth 4 -type f -name gs_ctl 2>/dev/null | head -1)
+mkdir -p /var/tmp/aidbm_gauss_src
+tar -xf "$TARBALL" -C /var/tmp/aidbm_gauss_src || {{ echo "[deploy] ERROR: 解压失败"; exit 1; }}
+BIN_GS=$(find /var/tmp/aidbm_gauss_src -maxdepth 4 -type f -name gs_ctl 2>/dev/null | head -1)
 if [ -z "$BIN_GS" ]; then echo "[deploy] ERROR: 解压后未找到 gs_ctl"; exit 1; fi
 GAUSSHOME=$(dirname "$(dirname "$BIN_GS")")
 if [ "$GAUSSHOME" = "/" ]; then GAUSSHOME=$(dirname "$BIN_GS"); fi
@@ -1076,8 +1384,8 @@ chown -R "$DB_OS_USER":dbgroup "$INSTALL_DIR"
 
 echo "[deploy] 8. 处理底层依赖库兼容性..."
 for lib in libssl.so.1.1 libcrypto.so.1.1; do
-    if [ -f "/tmp/aidbm_gauss_src/lib/$lib" ]; then
-        cp -a "/tmp/aidbm_gauss_src/lib/$lib" "$INSTALL_DIR/lib/"
+    if [ -f "/var/tmp/aidbm_gauss_src/lib/$lib" ]; then
+        cp -a "/var/tmp/aidbm_gauss_src/lib/$lib" "$INSTALL_DIR/lib/"
         echo "[deploy] 已从安装包提取并部署 $lib"
     fi
 done
@@ -1091,7 +1399,7 @@ done
 echo "$INSTALL_DIR/lib" > /etc/ld.so.conf.d/gaussdb.conf
 ldconfig
 # 释放磁盘：解压源目录中的 lib 兼容库已复制完毕，删除解压残留（数据目录在本盘空间紧张时必须）
-rm -rf /tmp/aidbm_gauss_src
+rm -rf /var/tmp/aidbm_gauss_src
 
 echo "[deploy] 9. 配置环境变量..."
 cat > "/home/$DB_OS_USER/.bash_profile" <<'PROFILEEOF'
@@ -1284,7 +1592,7 @@ def run_deployment(dep_id: int) -> None:
             log(f"本机部署：安装包 {pkg_path} 直接使用，无需上传")
         elif pkg_path:
             if os.path.isfile(pkg_path):
-                remote_pkg = "/tmp/" + os.path.basename(pkg_path)
+                remote_pkg = "/var/tmp/" + os.path.basename(pkg_path)
                 # 本机部署防自毁：仅当目标主机确为平台本机且 remote_pkg 与
                 # 源路径相同时才跳过上传（sftp.put 自己到自己会把包截断成 0 字节）；
                 # 远程主机即使路径同名也必须真实上传
@@ -1321,7 +1629,7 @@ def run_deployment(dep_id: int) -> None:
         dep_pkg_remote = "NONE"
         if dep_pkg_path:
             if os.path.isfile(dep_pkg_path):
-                dep_pkg_remote = "/tmp/" + os.path.basename(dep_pkg_path)
+                dep_pkg_remote = "/var/tmp/" + os.path.basename(dep_pkg_path)
                 try:
                     log(f"上传依赖包: {dep_pkg_path} -> {dep_pkg_remote}")
                     sftp = client.open_sftp()
@@ -1361,12 +1669,37 @@ def run_deployment(dep_id: int) -> None:
             models.update_deployment(dep_id, {"progress_pct": 50})
             proc = _sp.Popen(["bash", local_script], stdout=_sp.PIPE,
                              stderr=_sp.STDOUT, text=True)
-            for line in proc.stdout:
-                line = line.rstrip("\n")
+            # 本机执行也要有超时：旧实现死等 stdout，脚本卡住时页面永远"运行中"
+            import threading as _th
+            import queue as _q
+            _q_out = _q.Queue()
+
+            def _pump():
+                try:
+                    for _ln in proc.stdout:
+                        _q_out.put(_ln.rstrip("\n"))
+                finally:
+                    _q_out.put(None)
+
+            _th.Thread(target=_pump, daemon=True).start()
+            _exec_timeout = int(params.get("deploy_timeout") or 3600)
+            _deadline = time.time() + _exec_timeout
+            while True:
+                try:
+                    line = _q_out.get(timeout=1)
+                except _q.Empty:
+                    if proc.poll() is not None and _q_out.empty():
+                        break
+                    if time.time() > _deadline:
+                        proc.kill()
+                        raise RuntimeError(
+                            "本机部署执行超时（>%ds）：可能卡在解压/初始化，"
+                            "请检查磁盘与内存" % _exec_timeout)
+                    continue
+                if line is None:
+                    break
                 if line.strip():
                     log(line.strip())
-                    if line.strip() == "DEPLOY_OK":
-                        pass
             rc = proc.wait()
             os.unlink(local_script)
             finished = db.now_iso()
@@ -1381,7 +1714,7 @@ def run_deployment(dep_id: int) -> None:
                     "finished_at": finished})
                 log("部署失败（本机执行，rc=%d）" % rc)
             return
-        remote_script = "/tmp/deploy_install.sh"
+        remote_script = "/var/tmp/deploy_install.sh"
         log("上传安装脚本...")
         # 通过 echo 写入脚本到远程（多行处理）
         _ssh_exec(client, f"cat > {remote_script} << 'SCRIPTEOF'\n{script}\nSCRIPTEOF")
@@ -1398,9 +1731,32 @@ def run_deployment(dep_id: int) -> None:
         transport = client.get_transport()
         session = transport.open_session()
         session.exec_command(f"bash {remote_script}")
+        # 执行看门狗：远端脚本卡死（解压慢/OOM/等待交互/会话半死）时，旧实现会
+        # 永远停在 while 循环里等 exit_status_ready()，页面一直是「运行中」
+        # （171 实测卡死 5 分钟以上且无任何输出，最后靠人工介入）。
+        _exec_timeout = int(params.get("deploy_timeout") or 3600)
+        _idle_limit = int(params.get("deploy_idle_timeout") or 900)
+        _deadline = time.time() + _exec_timeout
+        _last_out = time.time()
         while not session.exit_status_ready():
+            _tr = client.get_transport()
+            if _tr is None or not _tr.is_active():
+                raise RuntimeError(
+                    "SSH 会话中断：部署脚本执行未完成（远端可能仍在运行，请检查 %s）"
+                    % remote_script)
+            if time.time() > _deadline:
+                raise RuntimeError(
+                    "部署执行超时（超过 %ds）：可能卡在解压/初始化/等待交互，"
+                    "请检查目标机磁盘、内存（是否被 OOM 杀掉）与安装包完整性"
+                    % _exec_timeout)
+            if time.time() - _last_out > _idle_limit:
+                raise RuntimeError(
+                    "部署执行 %ds 无任何输出，判定卡死：请检查目标机内存（dmesg | grep -i oom）"
+                    "与磁盘空间；远端脚本仍在 %s，必要时手工 kill"
+                    % (_idle_limit, remote_script))
             if session.recv_ready():
                 chunk = session.recv(4096).decode("utf-8", "replace")
+                _last_out = time.time()
                 for line in chunk.strip().split("\n"):
                     if line.strip():
                         log(line.strip())
@@ -1408,6 +1764,7 @@ def run_deployment(dep_id: int) -> None:
                             pass
             if session.recv_stderr_ready():
                 chunk = session.recv_stderr(4096).decode("utf-8", "replace")
+                _last_out = time.time()
                 for line in chunk.strip().split("\n"):
                     s = line.strip()
                     if not s:

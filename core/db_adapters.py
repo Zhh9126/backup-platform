@@ -62,11 +62,31 @@ _FIELDS = (
 _BOOL_FIELDS = ("enabled", "supports_incremental", "supports_full_instance",
                 "supports_sync", "skip_client_check", "builtin")
 
-# 内置 db_type（与 core.engines 注册表一致），不可被自定义适配器占用
+# 内置 db_type（静态清单，兼容老引用）；真正的判定走 builtin_types()——
+# 早期这里漏登记了 synology/qdrant/chroma/highgo/uxdb/tidb/oceanbase，
+# 导致这些引擎在「数据库类型」页面**整行不显示**（页面只列出 BUILTIN_TYPES 里的类型）。
 BUILTIN_TYPES = (
     "mysql", "mariadb", "postgresql", "oracle", "kingbase", "opengauss", "panwei", "dameng",
     "sqlserver", "redis", "mongodb", "neo4j", "file", "vm", "object_storage",
+    "synology", "qdrant", "chroma", "highgo", "uxdb", "tidb", "oceanbase",
 )
+
+
+def builtin_types() -> tuple:
+    """返回内置类型集合（静态清单 ∪ 运行时引擎注册表里的非适配器类型）。
+
+    动态适配器注册后也会进入 ENGINE_REGISTRY，这里要排除掉，否则
+    「新增适配器」会误报「是内置类型」。
+    """
+    try:
+        from core.engines import ENGINE_REGISTRY  # 延迟导入，避免循环依赖
+        try:
+            adapter_types = {a["db_type"] for a in list_adapters(include_disabled=True)}
+        except Exception:
+            adapter_types = set()
+        return tuple(sorted(set(BUILTIN_TYPES) | (set(ENGINE_REGISTRY) - adapter_types)))
+    except Exception:
+        return tuple(sorted(set(BUILTIN_TYPES)))
 
 
 # ============== 行 ↔ dict 转换 ==============
@@ -138,7 +158,7 @@ def validate(data: dict, existing: Optional[dict] = None) -> list[str]:
         errs.append("db_type 不能为空")
     elif not _DBTYPE_RE.match(db_type):
         errs.append(f"db_type 不合法：{db_type!r}（必须小写字母/数字/下划线，2~32 位）")
-    elif not existing and db_type in BUILTIN_TYPES:
+    elif not existing and db_type in builtin_types():
         errs.append(f"db_type {db_type!r} 是内置类型，无法新增（请在「数据库类型」选已内置的）")
     elif any(db_type.startswith(p + "_") for p in RESERVED_PREFIXES):
         errs.append(f"db_type 不允许以 {RESERVED_PREFIXES} 开头")
@@ -316,10 +336,41 @@ class CustomDBEngine(BackupEngine):
                 params = {}
         return render_template(tmpl, params)
 
+    def _params(self) -> dict:
+        """适配器级 params + 任务级覆盖（task.extra_options.adapter_params）。
+
+        为什么需要任务级覆盖：模板里的 db_file / data_dir / repo_dir / snapshot
+        这类参数是**每台机器、每个任务各不相同**的，只存在适配器级别会导致
+        同一种库型只能备份同一个路径。任务级 adapter_params 优先级更高。
+        """
+        params = self._spec.get("params") or {}
+        if isinstance(params, str):
+            try:
+                params = json.loads(params)
+            except Exception:
+                params = {}
+        params = params if isinstance(params, dict) else {}
+        extra_raw = self.task.get("extra_options") or {}
+        if isinstance(extra_raw, str):
+            try:
+                extra_raw = json.loads(extra_raw) if extra_raw.strip() else {}
+            except Exception:
+                extra_raw = {}
+        override = (extra_raw or {}).get("adapter_params") if isinstance(extra_raw, dict) else None
+        if isinstance(override, str):
+            try:
+                override = json.loads(override) if override.strip() else {}
+            except Exception:
+                override = {}
+        if isinstance(override, dict) and override:
+            params = {**params, **override}
+        return params
+
     def _build_extra(self, script: str) -> dict:
         extra = {
             "custom_script": script,
             "custom_timeout": int(self._spec.get("timeout_sec") or 7200),
+            "custom_params": self._params(),
         }
         if self._spec.get("artifact_dir"):
             extra["custom_artifact_dir"] = self._spec["artifact_dir"]
@@ -329,6 +380,7 @@ class CustomDBEngine(BackupEngine):
         return {
             "custom_restore_script": script,
             "custom_timeout": int(self._spec.get("timeout_sec") or 7200),
+            "custom_params": self._params(),
         }
 
     # ---------- backup / restore ----------

@@ -13,6 +13,32 @@
    ============================================================= */
 window.I18N = (function () {
   var EN = {
+    // ---- 实时备份页面合并（2026-11-14）----
+    "下钻：同一条日志里的行级变更": "Drill down: row-level changes from the same log",
+    "变更明细与回滚": "Change Details & Rollback",
+    "开启行级解析": "Enable row-level parsing",
+    "实时备份：持续捕获日志产出恢复点（任意时间点恢复），并可下钻到行级变更回滚": "Realtime backup: continuous log capture produces restore points (any-point-in-time restore) and allows drill-down row-level rollback",
+    "持续捕获数据库日志与文件变更：按恢复点整库恢复到任意时刻，也可下钻到行级变更做精细化回滚": "Continuously capture database logs and file changes: restore the whole database to any point via a restore point, or drill down to row-level changes for fine-grained rollback",
+    "这里看到的是与上方同一份日志解析出的行级变更（INSERT/UPDATE/DELETE + 前后镜像 + 位点），\n      可按时段生成回滚或重放 SQL。数据库源库零安装，密码不落命令行。": "Here you see the row-level changes (INSERT/UPDATE/DELETE with before/after images and positions) parsed from the same log as above;\n      rollback or replay SQL can be generated per time range. Zero installation on the source database; passwords never appear on the command line.",
+    // ---- 实时保护段消费 / 领导驾驶舱（2026-11-14）----
+    "清理孤儿数据": "Purge orphan data",
+    "清理已删除备份任务残留的实时保护记录与日志段": "Remove realtime-protection records and log segments left behind by deleted backup tasks",
+    "没有需要清理的孤儿数据": "No orphan data to purge",
+    "发现 ": "Found ",
+    " 个孤儿任务（": " orphan task(s) (",
+    " 条记录 + ": " records + ",
+    " 个日志段目录，约 ": " segment dir(s), approx. ",
+    "）。清理后不可恢复，确认继续？": "). This cannot be undone. Continue?",
+    "已清理：记录 ": "Purged: ",
+    " 条，日志段 ": " record(s), segment dir(s) ",
+    "清理失败：": "Purge failed: ",
+    "Oracle（段消费）": "Oracle (segment consumer)",
+    "达梦（段消费）": "Dameng (segment consumer)",
+    "实时备份任务 ID（Oracle/达梦必填）": "Realtime backup task ID (required for Oracle/Dameng)",
+    "这两个库的行级事件直接消费该任务已封存的 LogMiner 段，不另连数据库": "Row-level events for these two databases are read directly from the task's sealed LogMiner segments; no extra database connection is opened",
+    "如 49": "e.g. 49",
+    "任务运行态势": "Task Runtime Status",
+    "运行": "Running",
     // ---- SQL Server 旧版 TLS 兼容（2026-11-12）----
     "兼容旧版 TLS（SQL Server 2008 等仅支持 TLS 1.0）": "Legacy TLS compatibility (SQL Server 2008 etc. supporting only TLS 1.0)",
     "开启后仅放开 JVM 的 TLS 1.0/1.1 禁用，客户端仍优先协商 TLS 1.2/1.3；若 JVM 已建立过 JDBC 连接，需重启平台服务。长期方案仍建议在 SQL Server 服务端启用 TLS 1.2。": "This only removes the JVM ban on TLS 1.0/1.1; the client still prefers TLS 1.2/1.3. If the JVM has already opened JDBC connections, restart the platform service. Enabling TLS 1.2 on the SQL Server side remains the recommended long-term fix.",
@@ -29,6 +55,7 @@ window.I18N = (function () {
     "数据库备份": "Database Backup",
     "文件备份": "File Backup",
     "对象存储备份": "Object Storage",
+    "存储管理：备份落点与介质（存储池 / 磁带库 / FTP / NFS / 外挂）": "Storage: backup destinations and media (pools / tape library / FTP / NFS / external disks)",
     "存储管理": "Storage",
     "备份策略": "Backup Policies",
     "无 Agent": "Agentless",
@@ -1414,6 +1441,64 @@ window.I18N = (function () {
     "AIDBM · AI 原生智能数据库灾备管理平台": "AIDBM · AI-Native Database DR Management",
     "CDC：行级变更捕获、事件查看、撤销回滚 / 重放到目标库": "CDC: row-level change capture, event viewer, undo/rollback / replay to target DB",
     "CSV 导出": "CSV export",
+    "Excel 报表": "Excel report",
+    "品牌设置": "Brand settings",
+    "登录页 Logo": "Login page logo",
+    "页面左上角 Logo": "Sidebar logo",
+    "当前使用内置默认图标": "Using the built-in default icon",
+    "上传 Logo": "Upload logo",
+    "恢复默认": "Restore default",
+    "侧栏品牌名称": "Sidebar brand name",
+    "首页大标题": "Home page title",
+    "保存文字": "Save text",
+    "恢复默认文字": "Restore default text",
+    "支持 PNG / JPG / WEBP，单张不超过 2MB": "PNG / JPG / WEBP, max 2 MB per image",
+    "建议宽度 ≤ 320px，高度自适应": "Recommended width ≤ 320 px, height auto",
+    "建议正方形 1:1，显示尺寸 36px": "Square 1:1 recommended, rendered at 36 px",
+    "登录页与平台侧栏的 Logo、名称按此处展示（保存后刷新页面生效）": "Logos and names shown on the login page and sidebar (refresh to apply)",
+    "确定恢复为内置默认 Logo？": "Restore the built-in default logo?",
+    "确定恢复默认品牌文字？": "Restore the default brand text?",
+    "上传中…": "Uploading…",
+    "上传失败": "Upload failed",
+    "恢复失败": "Restore failed",
+    "保存失败": "Save failed",
+    "品牌文字已保存": "Brand text saved",
+    "品牌设置读取失败": "Failed to load brand settings",
+    "仅支持 PNG / JPG / WEBP 格式": "Only PNG / JPG / WEBP are supported",
+    "（刷新页面后生效）": "(refresh to apply)",
+    "默认": "Default",
+    "默认 AIDBM": "Default AIDBM",
+    "默认 仪表盘": "Default Dashboard",
+    "特殊恢复": "Special recovery",
+    "特殊恢复：常规恢复不可用时的最后手段——SSH 只读扫描文件系统，按库型列出残留的数据文件/日志/控制文件（Oracle、MySQL、PG、金仓、openGauss、达梦、SQL Server、Redis、MongoDB、SQLite）并拉回平台；不自动修复数据库一致性（文件系统层，非扇区雕刻）": "Special recovery: last resort when normal restore is unavailable - read-only SSH scan of the filesystem, list residual data / log / control files by DB type (Oracle, MySQL, PG, Kingbase, openGauss, DM, SQL Server, Redis, MongoDB, SQLite) and pull them back; does not repair database consistency (filesystem level, no sector carving)",
+    "常规恢复不可用时的最后手段：只读扫描目标主机，把残留的原始数据文件 / 日志 / 控制文件拉回平台，交由人工或既有工具装载；已覆盖 Oracle、MySQL / MariaDB、PostgreSQL、金仓、openGauss、达梦、SQL Server、Redis、MongoDB、SQLite。": "Last resort when normal restore is unavailable: read-only scan of the target host, pull residual raw data / log / control files back for manual or existing tooling to load; covers Oracle, MySQL / MariaDB, PostgreSQL, Kingbase, openGauss, DM, SQL Server, Redis, MongoDB, SQLite.",
+    "SSH 只读扫描（lsblk / blkid / find / ps / oratab），零安装、零 agent": "Read-only SSH scan (lsblk / blkid / find / ps / oratab), no install, no agent",
+    "按库型识别残留的数据文件、WAL / redo / binlog、控制文件与配置文件": "Classify residual data files, WAL / redo / binlog, control and config files by DB type",
+    "列出本机运行中的数据库实例（含数据目录与端口），进程已退出时按常见目录兜底": "List running DB instances (data directory and port); fall back to common directories when the process has exited",
+    "实例清单": "Instance list",
+    "数据库实例 / 数据目录": "DB instances / data directories",
+    "数据目录 / 安装目录": "Data directory / install directory",
+    "日志 / WAL / binlog": "Logs / WAL / binlog",
+    "控制文件": "Control file",
+    "配置文件": "Config file",
+    "全部库型": "All DB types",
+    "线索": "Source",
+    "点「实例清单」查询（需选择任务）": "Click \"Instance list\" to query (task required)",
+    "选中后 SSH 凭据复用该任务；「实例清单」也基于所选任务。": "SSH credentials are reused from the task; \"Instance list\" also uses it.",
+    "与 shell 元字符。不存在的目录会被跳过（已预置主流库型的默认数据目录）。": "and shell metacharacters. Missing directories are skipped (mainstream DB default data directories are pre-filled).",
+    "：需按库型各自前滚 — Oracle 用 RMAN、MySQL 用 redo/binlog、PG / 金仓 / openGauss 用 WAL 回放、达梦用 dmrman、SQL Server 用事务日志、Redis 直接替换 RDB / AOF": ": roll forward per DB type - RMAN for Oracle, redo/binlog for MySQL, WAL replay for PG / Kingbase / openGauss, dmrman for DM, transaction log for SQL Server, direct RDB / AOF replacement for Redis",
+    "启用（停用后仅保留配置，不参与 cron 周期执行）": "Enabled (when disabled the configuration is kept but the cron schedule does not run)",
+    "新建资产备份任务": "Create asset backup task",
+    "创建并加入成员": "Create and add as member",
+    "创建的是「文件备份」任务；远程主机需在任务高级选项里配置 SSH 凭据。": "A file backup task is created; for remote hosts configure SSH credentials in the task advanced options.",
+    "任务名称": "Task name",
+    "如：Qwen2.5-7B 权重": "e.g. Qwen2.5-7B weights",
+    "所在主机": "Host",
+    "本机填 127.0.0.1": "Use 127.0.0.1 for the local host",
+    "资产路径（逗号或换行分隔，须为绝对路径）": "Asset paths (comma or newline separated, absolute paths)",
+    "平台还没有任何备份任务。AI 资产（模型权重目录、训练数据集、配置清单）可直接在这里建一个文件类备份任务：点「新建资产备份任务」填路径即可；数据库 / 向量库资产请先到「数据库备份」创建任务，再回来编组。": "No backup tasks yet. For AI assets (model weight directories, datasets, config manifests) you can create a file backup task right here: click \"Create asset backup task\" and fill in the paths; for database / vector-store assets, create the task under \"Database backup\" first, then come back to group them.",
+    "NAS存储": "NAS storage",
+    "NAS 存储：群晖 DSM 设备探活 / 共享文件夹资产 / 全量+增量备份 / 恢复到 DSM 目录": "NAS storage: Synology DSM device probe / shared-folder assets / full+incremental backup / restore to a DSM directory",
     "INSERT INTO t_users(id,name,phone,id_card,email) VALUES (1,'张三','13812341234','110101199003074872','zhangsan@example.com');": "INSERT INTO t_users(id,name,phone,id_card,email) VALUES (1,'ZhangSan','13812341234','110101199003074872','zhangsan@example.com');",
     "IP / 主机名": "IP / hostname",
     "IP 或主机名": "IP or hostname",
@@ -1751,7 +1836,7 @@ window.I18N = (function () {
     "多层副本": "Multiple copies",
     "守护状态": "Supervisor",
     "官方离线导出（.dump，社区版/企业版）": "Official offline export (.dump, community/enterprise)",
-    "实时保护在常规备份之外持续捕获变更，把 RPO 从「小时级」压缩到「秒级 / 分钟级」，并生成可任意选点的 PITR 时间轴。": "Beyond scheduled backups, realtime protection captures changes continuously — shrinking RPO from hours to seconds/minutes with a selectable PITR timeline.",
+    "实时保护在常规备份之外持续捕获变更，把 RPO 从「小时级」压缩到「秒级 / 分钟级」，并生成可任意选点的恢复点时间轴。": "Beyond scheduled backups, realtime protection captures changes continuously — shrinking RPO from hours to seconds/minutes with a selectable restore-point timeline.",
     "对象存储恢复以「桶 + 前缀」为目标：可回写到原桶（回滚）、异桶（迁移）、 或指定前缀（并行演练）。支持颗粒级恢复——只回放指定对象 key。": "Object-storage restore targets a bucket + prefix: write back to the original bucket (rollback), another bucket (migration), or a prefix (parallel drill). Granular restore replays only chosen keys.",
     "尚未选中": "None selected",
     "已显示": "shown",
@@ -3797,6 +3882,16 @@ window.I18N = (function () {
     "验证并激活永久授权": "Verify and activate perpetual license",
     "高危操作防护": "High-risk operation protection",
     "高危操作需要验证码确认": "High-risk operations require a verification code",
+    "引擎并行度（可选，单任务内部并行）": "Engine parallelism (optional, intra-task parallelism)",
+    "自动（按平台并发上限推算）": "Auto (derived from platform concurrency limit)",
+    "1 路（强制串行）": "1 channel (forced serial)",
+    "2 路": "2 channels",
+    "4 路": "4 channels",
+    "6 路": "6 channels",
+    "8 路": "8 channels",
+    "平台并发上限（max_concurrent_backups）较小时，成员任务只能排队，drift 被排队时间拉长；\n                    单任务内部并行用来抵消这一点：MySQL 物理备份走 xtrabackup --parallel，\n                    PostgreSQL/金仓/openGauss 走 pg_dump -j（自动切换目录格式 -Fd 并打包单文件），\n                    全实例备份逐库并发 dump。自动 = 总并行预算 8 路 ÷ 平台并发上限，\n                    且不超过该任务保护策略的并行度（core 4 / important 2 / general 1）。\n                    源库 IO/CPU 紧张、或库体量很小可强制 1 路。恢复并行度仍由 RESTORE_PARALLEL 控制。": "With a small platform concurrency limit (max_concurrent_backups), member tasks queue up and drift grows with queueing; intra-task parallelism offsets this: MySQL physical backup uses xtrabackup --parallel, PostgreSQL/Kingbase/openGauss use pg_dump -j (auto-switching to directory format -Fd and packing a single file), and full-instance backup dumps databases concurrently. Auto = total parallel budget 8 channels ÷ platform concurrency limit, capped by the task protection policy parallelism (core 4 / important 2 / general 1). Force 1 channel if the source database IO/CPU is tight or the database is small. Restore parallelism is still controlled by RESTORE_PARALLEL.",
+    "恢复前自动校验（预检通过才执行恢复）": "Auto precheck before restore (restore only runs when precheck passes)",
+    "提交恢复时自动检测：产物存在与完整性（sha256）、结构嗅探、恢复目标通道、恢复工具就绪、解包空间。检测到阻断项（产物缺失/损坏/校验不一致等）直接拦截本次恢复并弹报告；所有数据库类型统一生效。默认开启。": "Automatically checks on restore submission: artifact existence and integrity (sha256), structure sniffing, restore target channel, restore tool readiness, and unpacking space. Blocking issues (missing/corrupted artifact, checksum mismatch, etc.) abort the restore and show the report; applies to all database types. Enabled by default.",
     "高级设置": "Advanced settings",
     "默认取设备名称": "Defaults to the device name",
     "默认每周日 02:00": "Defaults to Sunday 02:00",
@@ -3936,6 +4031,8 @@ window.I18N = (function () {
     "留空则使用默认路径 backups/netdev/{设备名称}/": "Empty = default path backups/netdev/{device name}/",
     "的能力决定是否启用 gzip 传输压缩、断点续传与端到端 sha256 对账；插件未自报的能力不会被乐观假设。": "capabilities decide whether gzip transfer compression, resumable transfer and end-to-end sha256 reconciliation are enabled; unreported capabilities are never optimistically assumed.",
     "真实恢复演练（真恢复到临时库+数据校验+自动销毁）": "Real restore drill (real restore into a temporary database + data verification + auto destroy)",
+    "容灾切换演练（真切换 + 写入探针 + 自动回切）": "DR switch drill (real switchover + write probe + automatic switchback)",
+    "切换演练要求链路已配置主备连接与复制账号（当前支持 MySQL/MariaDB）；演练将真实执行「冻结旧主 → 备库追平 → 换主 → DNS 牵引 → 写入探针 → 自动回切 → 恢复原拓扑」，全程 RTO 计时与评分。": "Switch drills require primary/standby connections and a replication account on the link (MySQL/MariaDB currently); the drill really executes freeze old primary, catch up, promote, DNS redirect, write probe, automatic switchback and topology restore, with full RTO timing and scoring.",
     "真实演练当前支持 MySQL/MariaDB；隔离口径为库级（drill_ 前缀临时库，不触碰生产库），演练完自动销毁。": "Real drills currently support MySQL/MariaDB; isolation is at database level (temporary drill_ prefixed database, production untouched), destroyed automatically after the drill.",
     "磁带库与介质管理：设备识别 / 机械手 / 介质轮换 / 写后校验": "Tape library and media management: device detection / changer / media rotation / post-write verification",
     "社区免费版默认各项备份与纳管功能（网络设备、数据库、文件、对象存储、虚拟机、AI 模型）每类最多支持纳管": "By default the community free edition supports up to",
@@ -3994,6 +4091,433 @@ window.I18N = (function () {
     "；凭据集中在设备表（SM4 加密），备份任务按 ID 引用。": "; credentials are centralized in the device table (SM4 encrypted) and referenced by ID from backup tasks.",
     "；对已覆盖的磁盘块无法恢复。扫描不会在目标主机写入或删除任何东西，\n  只有点击「拉回选中对象」才会把文件拉到平台侧。": "; overwritten disk blocks cannot be recovered. Scanning writes or deletes nothing on the target host,\n  only clicking \"Pull selected objects\" transfers files to the platform.",
   });
+
+  // ---- 无备份救援（特殊恢复，2026-11-13）----
+  Object.assign(EN, {
+    "无备份救援（特殊恢复）": "No-backup rescue (special recovery)",
+    "无备份救援（特殊恢复）：常规恢复不可用时的最后手段——SSH 只读扫描文件系统，把残留的原始数据文件拉回平台；不自动修复数据库一致性（文件系统层，非扇区雕刻）":
+      "No-backup rescue (special recovery): last resort when normal restore is unavailable - read-only SSH scan of the filesystem to pull residual raw data files back to the platform; no automatic consistency repair (filesystem level, not sector carving)",
+    "常规恢复不可用时的最后手段：只读扫描目标主机，把残留的原始数据文件拉回平台，再由人工或既有工具装载。":
+      "Last resort when normal restore is unavailable: read-only scan of the target host, pull residual raw data files back to the platform, then load them manually or with existing tools.",
+    "这是「特殊恢复」，不属于常规恢复链路": "This is a special recovery path, not the normal restore chain",
+    "能做": "What it does",
+    "不能做": "What it cannot do",
+    "SSH 只读扫描（lsblk / blkid / find / stat），零安装、零 agent":
+      "Read-only SSH scan (lsblk / blkid / find / stat), zero install, zero agent",
+    "列出仍存在的原始数据文件 / 归档 / 日志，按类型标注":
+      "List existing raw data files / archives / logs, tagged by type",
+    "勾选后经 SFTP 拉回平台并逐文件计算 sha256（可核对完整性）":
+      "Pull selected files back over SFTP and compute per-file sha256 for integrity checks",
+    "不读裸块设备、不做扇区级数据雕刻，已覆盖的块无法找回":
+      "No raw block reads, no sector-level carving; overwritten blocks cannot be recovered",
+    "不自动修复数据库一致性": "No automatic database consistency repair",
+    "：Oracle 需自行 RMAN 前滚、MySQL 需 redo/binlog 前滚、PG 需 WAL 回放":
+      ": Oracle requires RMAN roll-forward, MySQL requires redo/binlog roll-forward, PostgreSQL requires WAL replay",
+    "不会在目标主机写入或删除任何东西（只有「拉回」动作会落平台侧）":
+      "Nothing is written to or deleted from the target host (only the pull action writes on the platform side)",
+  });
+
+  // ---- 备份插件覆盖矩阵（2026-11-13）----
+  Object.assign(EN, {
+    "备份类型覆盖矩阵": "Backup type coverage matrix",
+    "按任务一键补齐": "Install missing for tasks",
+    "按当前任务集合推导缺失插件并一键安装（对外一个包）":
+      "Derive missing plugins from enabled tasks and install them in one bundle",
+    "插件覆盖": "Coverage",
+    "插件（绿=已安装 / 灰=未安装）": "Plugins (green = installed / grey = not installed)",
+    "每类备份都可以选择「用插件增强」或「零安装通道」":
+      "Every backup type can either use plugin enhancement or the zero-install channel",
+  });
+
+  // ---- 存储介质统一总览（2026-11-13）----
+  Object.assign(EN, {
+    "存储介质总览": "Storage media",
+    "存储介质总览：所有介质的状态 / 用量 / 最近备份（一张表看全）":
+      "Storage media: status / usage / last backup of every medium in one table",
+    "存储池配置": "Storage pools",
+    "存储池配置：本地 / MinIO / S3 / SFTP / 磁带 / FTP / 外挂挂载点，分层与保留策略":
+      "Storage pools: local / MinIO / S3 / SFTP / tape / FTP / mounted paths; tiers and retention",
+    "存储池": "Storage pool",
+    "介质": "Media",
+    "介质总数": "Total media",
+    "健康": "Healthy",
+    "全部分类": "All categories",
+    "地址 / 桶": "Address / bucket",
+    "已采集用量": "Collected usage",
+    "搜索名称 / 类型 / 地址": "Search name / type / address",
+    "用量": "Usage",
+  });
+
+  // ---- 容灾管理（一键切换，2026-11-13）----
+  Object.assign(EN, {
+    "容灾管理": "Disaster recovery",
+    "容灾管理：容灾总览 / 容灾链路 / 一键切换 / 切换演练":
+      "Disaster recovery: overview / links / one-click switchover / drills",
+    "容灾总览": "DR overview",
+    "容灾总览：链路健康 / 备库延迟 / 最近切换 RTO / 演练合规":
+      "DR overview: link health / standby lag / last switchover RTO / drill compliance",
+    "容灾链路：数据源捕获 / 智能选路 / 一致性校验 / 健康快照 / DNS 记录":
+      "DR links: source capture / smart routing / consistency check / health snapshot / DNS records",
+    "一键切换": "One-click switchover",
+    "一键切换：预检 → Fencing → 提升备库 → DNS 牵引 → 新主验证（含 RTO 与逐步明细）":
+      "One-click switchover: precheck -> fencing -> promote standby -> DNS redirect -> verify new primary (with RTO and per-step details)",
+    "一键容灾切换": "One-click DR switchover",
+    "切换演练": "Switchover drills",
+    "切换演练：真实恢复演练 / RTO·RPO 评分 / 定时演练":
+      "Drills: real restore drills / RTO & RPO scoring / scheduled drills",
+    "切换（主→备）": "Switchover (primary -> standby)",
+    "回切（备→主）": "Failback (standby -> primary)",
+    "切换前置条件": "Switchover prerequisites",
+    "切换历史": "Switchover history",
+    "切换参数": "Switchover config",
+    "切换流程：": "Flow:",
+    "切换后人工跟进清单：": "Post-switchover manual checklist:",
+    "切换后按清单人工确认：连接池重连 / 中间件重载 / 业务一致性":
+      "Manually confirm after switchover: connection-pool reconnect / middleware reload / business consistency",
+    "回切前会做 GTID 分叉检测，分叉未收敛会拒绝回切（防丢数据）":
+      "GTID divergence is checked before failback; unresolved divergence blocks failback (to prevent data loss)",
+    "主库": "Primary",
+    "备库": "Standby",
+    "备库延迟（秒）": "Standby lag (s)",
+    "备库必须处于复制状态（IO/SQL 双 Yes），延迟越小 RPO 越优":
+      "The standby must be replicating (IO/SQL both Yes); lower lag means a better RPO",
+    "复制状态": "Replication",
+    "延迟": "Lag",
+    "健康链路": "Healthy links",
+    "链路总数": "Total links",
+    "链路健康": "Link health",
+    "最近切换 RTO": "Last switchover RTO",
+    "最近切换作业": "Recent switchover jobs",
+    "近 30 天演练": "Drills (30 days)",
+    "仅预检（不切换）": "Precheck only (no switchover)",
+    "真实执行": "Execute for real",
+    "执行方式": "Mode",
+    "执行进度": "Progress",
+    "方向": "Direction",
+    "待预检": "Awaiting precheck",
+    "预检结果": "Precheck result",
+    "暂无切换记录": "No switchover records",
+    "选择要切换的链路": "Select a link to switch over",
+    "我已知晓本次操作会造成业务连接中断，并已获授权执行":
+      "I understand this will interrupt business connections and I am authorized to proceed",
+    "强制切换（主库仍可达 / 假死时使用；会先 Fencing 冻结旧主写入）":
+      "Force switchover (when the primary is still reachable or hung; old primary writes are fenced first)",
+    "链路需在「容灾链路」页配置": "Configure the link on the \"DR links\" page:",
+    "（主备连接 / 复制账号 / 可选 DNS）": " (primary/standby connections / replication account / optional DNS)",
+    "（主备可达 / 复制状态 / 延迟 / DNS）→": " (reachability / replication / lag / DNS) ->",
+    "，全过程记录 RTO 与逐步耗时。": ", with RTO and per-step timings recorded throughout.",
+    "探测 → Fencing 冻结旧主 → 提升备库 → DNS 牵引 → 新主验证":
+      "probe -> fence old primary -> promote standby -> DNS redirect -> verify new primary",
+    "DNS 牵引": "DNS redirect",
+    "Fencing 冻结旧主": "Fence old primary",
+    "提升备库": "Promote standby",
+    "新主验证": "Verify new primary",
+    "流程：": "Flow:",
+  });
+
+  // ---- 运维监控 / 系统设置 二级菜单（2026-11-13）----
+  Object.assign(EN, {
+    "运维与设置": "Operations & settings",
+    "运维监控": "Operations",
+    "运维监控：运营分析 / 巡检 / 任务监控 / 报表中心 / 智能告警 / 数据价值挖掘":
+      "Operations: analytics / inspection / job monitor / reports / alerts / data mining",
+    "系统参数": "System parameters",
+    "系统参数（备份根目录 / 调度 / 通知 / 安全）":
+      "System parameters (backup root / scheduling / notifications / security)",
+    "系统设置：系统参数 / Agent 管理 / 备份插件 / 用户与权限 / 系统日志":
+      "System settings: parameters / Agent management / backup plugins / users & roles / system logs",
+  });
+
+  Object.assign(EN, {
+    "近 500 次": "last 500 runs",
+    "近 500 次作业累计": "cumulative over the last 500 runs",
+  });
+
+  // ---- 领导驾驶舱大屏（2026-11-14）----
+  Object.assign(EN, {
+    "进入大屏": "Open cockpit",
+    "AIDBM · 领导驾驶舱": "AIDBM · Executive cockpit",
+    "AIDBM · 领导驾驶舱 / DATA PROTECTION COCKPIT": "AIDBM · Data Protection Cockpit",
+    "数据保护指挥中心": "Data Protection Command Center",
+    "核心指标": "Core metrics",
+    "受保护对象": "Protected objects",
+    "数据库 / 文件 / 其他": "Database / file / other",
+    "可用恢复点": "Available recovery points",
+    "历史可回滚点": "Historical rollback points",
+    "24h 备份成功率": "24h backup success rate",
+    "成功 / 总次数": "Success / total runs",
+    "数据保护总量": "Total protected data",
+    "全域健康评估": "Overall health assessment",
+    "综合评分": "Overall score",
+    "实时保护 / 容灾链路": "Real-time protection / DR links",
+    "实时动态": "Live feed",
+    "业务系统备份量 TOP": "Top business systems by backup volume",
+    "保护对象分布": "Protected object distribution",
+    "按维度": "By dimension",
+    "需要关注": "Needs attention",
+    "成功 / 失败": "Success / failed",
+    "实时": "Live",
+    "RPO 达标 --": "RPO compliance --",
+    "打开领导驾驶舱大屏（1920x1080 自适应，适合投屏汇报；按 F11 全屏，Esc 退出）":
+      "Open the executive cockpit (1920x1080 responsive, ideal for wall displays; F11 for fullscreen, Esc to exit)",
+  });
+
+  // ---- 插件版本矩阵 / 离线插件包（2026-11-14）----
+  Object.assign(EN, {
+    "插件版本矩阵": "Plugin version matrix",
+    "插件": "Plugin",
+    "期望版本": "Expected version",
+    "已装版本": "Installed version",
+    "建议": "Advice",
+    "生成离线包": "Build offline bundle",
+    "导入离线包": "Import offline bundle",
+    "导入离线包：校验 sha256 后逐个安装":
+      "Import an offline bundle: verify sha256, then install each plugin",
+    "把常用组合（xtrabackup/pgbackrest/zstd/lvm-snapshot）打成单文件离线包":
+      "Pack the common set (xtrabackup / pgbackrest / zstd / lvm-snapshot) into a single offline bundle",
+    "离线包路径（.tar.gz）": "Bundle path (.tar.gz)",
+    "正常": "OK",
+    "待处理": "Pending",
+    "需升级": "Upgrade needed",
+    "高于期望": "Newer than expected",
+    "未安装": "Not installed",
+    "待确认": "Needs review",
+    "未安装：可在「备份插件」页安装，或用离线包一次导入":
+      "Not installed: install from this page, or import an offline bundle",
+  });
+
+  // ---- 仪表盘：正在执行 / 即将执行（2026-11-13）----
+  Object.assign(EN, {
+    "正在执行 / 即将执行": "Running / Upcoming",
+    "正在执行": "Running",
+    "即将执行": "Upcoming",
+    "当前没有正在执行的备份": "No backup is running right now",
+    "暂无已排程任务（任务未配置 cron/间隔，或未绑定策略）":
+      "No scheduled jobs (tasks have no cron/interval configured and no policy bound)",
+    "秒": "s", "分钟": "min", "小时": "h", "天后": "days later",
+    "分钟后": "min later", "小时后": "h later", "即将执行。": "starting now",
+    "执行中": "In progress",
+  });
+
+  // ---- 备份策略重构：调度表单（2026-11-13）----
+  Object.assign(EN, {
+    "调度与频次": "Schedule & frequency",
+    "备份频次与周期（绑定任务后由策略托管）":
+      "Backup frequency & cycle (managed by the policy once bound)",
+    "调度模式": "Schedule mode",
+    "单一周期（每次都是全量）": "Single schedule (always full)",
+    "组合策略（增量节奏 + 周期全量）": "Combined (incremental cadence + periodic full)",
+    "主调度方式": "Primary schedule type",
+    "按间隔（每 N 小时/天）": "By interval (every N hours/days)",
+    "按 cron 表达式": "By cron expression",
+    "执行间隔": "Interval",
+    "cron 表达式": "Cron expression",
+    "分 时 日 月 周，例如": "min hour day month weekday, e.g.",
+    "每天 02:00。": "daily at 02:00.",
+    "全量周期": "Full backup cycle",
+    "按周": "By weekday",
+    "按 cron": "By cron",
+    "周一": "Mon", "周二": "Tue", "周三": "Wed", "周四": "Thu",
+    "周五": "Fri", "周六": "Sat", "周日": "Sun",
+    "锁定天数（不可删）": "Lock days (cannot be deleted)",
+    "备份模式（空=随任务）": "Backup mode (empty = follow task)",
+    "随任务既有设置": "Follow the task's existing setting",
+    "预览生效效果": "Preview effect",
+    "填写后点「预览生效效果」查看摘要与下次执行时间":
+      "Fill in the form, then click \"Preview effect\" to see the summary and next run times",
+    "高级：容灾链路策略（JSON）": "Advanced: DR link strategy (JSON)",
+  });
+
+  // ---- 存储管理二级菜单（2026-11-13）----
+  Object.assign(EN, {
+    "存储池总览": "Storage pools",
+    "存储池：本地 / MinIO / S3 / SFTP / 磁带 / FTP / 外挂挂载点，分层与保留策略":
+      "Storage pool: local / MinIO / S3 / SFTP / tape / FTP / mounted paths; tiers and retention",
+    "存储管理：备份落点与介质（存储池 / 对象存储 / 磁带库 / NAS / FTP / NFS / 外挂）":
+      "Storage management: backup destinations and media (pools / object storage / tape library / NAS / FTP / NFS / external)",
+    "对象存储（OSS/OBS/MinIO）": "Object storage (OSS/OBS/MinIO)",
+    "对象存储备份（MinIO / 阿里云 OSS / 腾讯云 COS / 华为云 OBS / S3 兼容，桶级保护，桶侧零安装）":
+      "Object storage backup (MinIO / Alibaba OSS / Tencent COS / Huawei OBS / S3-compatible; bucket-level protection, zero install on the bucket side)",
+    "NAS 存储（群晖）": "NAS storage (Synology)",
+    "NAS 存储（群晖 DSM）：设备探活 / 共享文件夹资产 / 全量+增量备份 / 恢复到 DSM 目录":
+      "NAS storage (Synology DSM): device probe / shared-folder assets / full+incremental backup / restore into a DSM folder",
+    "FTP 存储": "FTP storage",
+    "FTP / FTPS 存储：标准库 ftplib 直连，产物上传与回取（无校验和，仅按大小核对）":
+      "FTP / FTPS storage: direct ftplib connection; upload and fetch artifacts (no checksum, size-only verification)",
+    "NFS 挂载": "NFS mount",
+    "NFS 挂载点存储：已由操作系统挂载的共享目录，平台只校验可写与挂载状态":
+      "NFS mount storage: a share already mounted by the OS; the platform only verifies writability and mount state",
+    "外挂存储": "External storage",
+    "外挂存储：USB 移动硬盘 / 本地磁盘阵列 / CIFS 共享等已挂载介质":
+      "External storage: mounted media such as USB drives / local disk arrays / CIFS shares",
+  });
+
+  // ---- 数据库类型模板目录（2026-11-13）----
+  Object.assign(EN, {
+    "数据库类型模板目录": "Database Type Template Catalog",
+    "点击「从模板复制」可打开模板目录（协议族 / 时序 / 图 / 国产信创等），支持勾选批量导入。":
+      "Click \"Copy from template\" to open the catalog (protocol families / time-series / graph / domestic stacks) and import in bulk.",
+    "（不写明文）。": " (no plaintext).",
+    "搜索数据库名称 / db_type（如 db2、时序、国产）":
+      "Search database name / db_type (e.g. db2, time-series, domestic)",
+    "批量导入选中": "Import selected",
+    "未选择": "None selected",
+    "协议兼容：与已验证引擎同族工具（pg_dump / mysqldump / exp-imp），参数基本一致。":
+      "Protocol-compatible: same tool family as verified engines (pg_dump / mysqldump / exp-imp), arguments are basically identical.",
+    "需现场核对：厂商专有工具或 API 导出，命令骨架按官方文档给出，首次使用请先点「测试」核对工具路径。":
+      "Verify on site: vendor-specific tools or API export; the command skeleton follows official docs. Run \"Test\" first to check tool paths.",
+    "勾选后点右下「批量导入」即可一次性创建这些库型。":
+      "Select entries and click \"Import selected\" at the bottom right to create these types in one go.",
+    // 存储介质：FTP / 外挂（NFS·CIFS·USB）表单与介质筛选条
+    "外挂存储 / NFS 挂载点": "External storage / NFS mount point",
+    "显示全部介质": "Show all media",
+    "新增": "New",
+    "FTP 主机地址 *": "FTP host *",
+    "192.168.1.20 或 ftp.example.com": "192.168.1.20 or ftp.example.com",
+    "匿名登录可留空；编辑留空=不修改": "Leave empty for anonymous; leave empty when editing to keep current",
+    "远端根目录": "Remote root directory",
+    "备份产物上传到该目录下，按对象键分目录；留空=根目录 /。":
+      "Backups are uploaded under this directory by object key; empty = root /.",
+    "超时(秒)": "Timeout (s)",
+    "被动模式（PASV）": "Passive mode (PASV)",
+    "FTPS（显式 TLS）": "FTPS (explicit TLS)",
+    "标准库 ftplib 直连：FTP 协议无校验和，回取时只按文件大小核对（平台如实标注，不承诺哈希一致）；明文 FTP 不加密，跨网段请勾选 FTPS；主动模式在 NAT 环境常失败，默认被动模式。":
+      "Plain ftplib connection: FTP has no checksum, so retrieval only compares file size (reported honestly, no hash guarantee); plain FTP is unencrypted, enable FTPS across networks; active mode often fails behind NAT, passive is the default.",
+    "挂载路径 *": "Mount path *",
+    "/mnt/nas_backup 或 /media/usbdisk": "/mnt/nas_backup or /media/usbdisk",
+    "必须是已由操作系统挂载好的目录（NFS / CIFS / USB 移动硬盘 / 本地磁盘阵列）；平台不做 mount 特权操作（离线环境安全约束），只校验目录存在、可写、是否真实挂载点——NFS 掉线时目录仍在但为空，测试连接会据此给出结论。":
+      "Must be a directory already mounted by the OS (NFS / CIFS / USB drive / local disk array); the platform never runs privileged mount operations (offline safety), it only verifies existence, writability and whether it is a real mount point - when NFS drops the directory remains but is empty, and the connection test reports it.",
+    "介质类型": "Media type",
+    "NFS 共享": "NFS share",
+    "CIFS / SMB 共享": "CIFS / SMB share",
+    "USB 移动硬盘": "USB portable drive",
+    "本地磁盘阵列 / 扩展柜": "Local disk array / expansion shelf",
+    "其它已挂载介质": "Other mounted media",
+    "仅用于分类展示与筛选，不影响读写语义。":
+      "Used for classification and filtering only; does not affect read/write semantics.",
+    // 大屏（指挥中心）实时状态徽章
+    "数据连接中…": "Connecting to data…",
+    // 新版控制台（Vue3 + Ant Design Vue）
+    "新版控制台": "New console",
+    "新版控制台（Vue 3 + Ant Design Vue）：总览 / 备份任务 / 备份记录 / 存储介质 / 实时保护":
+      "New console (Vue 3 + Ant Design Vue): overview / backup tasks / records / storage media / realtime protection",
+    "AIDBM · 数据保护控制台": "AIDBM · Data Protection Console",
+    "正在加载控制台…": "Loading console…",
+
+    "要克隆的库（整实例备份用，留空=全部库）": "Databases to clone (full-instance backups; empty = all)",
+    "如 aidbm_t, aidbm_flash（逗号分隔）": "e.g. aidbm_t, aidbm_flash (comma separated)",
+    "单库备份记录：整库所有表与对象一起克隆（这里留空即可）。全实例备份记录：按库逐个恢复为 clone_N__原库名 形成整实例 VDB；库多时务必只填需要的库——全量导入会在目标实例上压出很高负载。":
+      "Single-database backups: the whole database (all tables/objects) is cloned, leave this empty. Full-instance backups: each database is restored as clone_N__<db> to form a full-instance VDB; list only the databases you need - importing everything puts heavy load on the target instance.",
+
+    // 2026-11-17 克隆服务：弹窗重排 + VDB 快照（快照式备份/恢复）
+    "选择备份记录 → 免审批拉起隔离克隆库（VDB）→ 校验使用 → 快照 / 恢复 / 到期自动销毁":
+      "Pick a backup record -> provision an isolated clone (VDB) without approval -> verify & use -> snapshot / restore / auto-expire",
+    "应急接管": "Emergency takeover",
+    "选「应急接管」时，就绪后可做接管就绪检查（直连 / 表数量 / 行数抽样）。":
+      "With Emergency takeover, a readiness check (connectivity / table count / row sampling) is available once ready.",
+    "克隆库拉起位置：默认本机数据库实例。": "Where the clone is provisioned: defaults to the local database instance.",
+    "整实例备份按库逐个恢复为 clone_N__原库名；库多时建议只填需要的库。":
+      "Full-instance backups restore each database as clone_N__<db>; list only needed databases when there are many.",
+    "VDB 快照管理": "VDB Snapshots",
+    "快照名称（可空）": "Snapshot name (optional)",
+    "创建快照": "Create snapshot",
+    "快照 = VDB 数据级全量导出（含 sha256 对账）；需要时一键恢复到该时间点。":
+      "Snapshot = full data-level export of the VDB (with sha256 verification); restore to this point with one click.",
+    "表 / 行": "Tables / Rows",
+    "：选择备份记录 → 按目标主机拉起隔离克隆库（真实导入，支持本机与其他机器）→ 就绪后可校验连接并直接使用 → 可对 VDB 创建快照、随时一键恢复到快照时间点 → 到期自动销毁。历史数据中如仍有审批字段，仅为兼容保留，页面流程已全部免审批直通。":
+      ": pick a backup record -> provision an isolated clone on the target host (real import, local or remote) -> verify and use once ready -> create VDB snapshots and restore to any snapshot point -> auto-expire. Legacy approval fields are kept only for compatibility; the flow is fully approval-free.",
+
+    "业务系统 / 主机保护态势": "Business Systems / Hosts Protection Status",
+    "近 500 次作业": "last 500 jobs",
+    "短信渠道（通用 HTTP 短信网关）": "SMS Channel (generic HTTP SMS gateway)",
+    "适配企业内自建短信网关（短信猫/运营商行业网关）：URL 与参数模板中用":
+      "Use an in-house SMS gateway (GSM modem / carrier gateway): the URL and params template accept",
+    "占位符，网关返回 HTTP 2xx 即视为成功。":
+      "placeholders ({phone}/{title}/{content}); a gateway response of HTTP 2xx counts as success.",
+    "短信网关 URL": "SMS gateway URL",
+    "如 http://sms-gw.inner:8080/send": "e.g. http://sms-gw.inner:8080/send",
+    "请求方式": "Method",
+    "手机号（逗号分隔）": "Phone numbers (comma-separated)",
+    "参数模板（POST 为 JSON body；GET 为查询串；留空则 GET 仅用 URL 占位符）":
+      "Params template (POST: JSON body; GET: query string; leave empty to use URL placeholders only)",
+    "自定义请求头 JSON（可选，用于网关鉴权）":
+      "Custom headers JSON (optional, for gateway auth)",
+    "发送测试通知（邮件+短信）": "Send Test Notification (Email + SMS)",
+
+  });
+  Object.assign(EN, {
+    "恢复剧本（Runbook）": "Recovery Runbooks",
+
+    "恢复剧本": "Recovery Runbooks",
+    "恢复剧本：备份→恢复→校验→通知→切换 一键编排，RTO 计时，高危步骤审批闸": "Recovery runbooks: chain backup/restore/verify/notify/switch, RTO timing, approval gates",
+    "把「备份 → 恢复 → 校验 → 通知 → 切换」串成可复用的恢复剧本：一键执行、RTO 计时、\n    高危步骤审批闸、失败如实中止。等待类步骤用于复制追平 / 应用重启窗口。": "Chain backup, restore, verify, notify and switch into reusable recovery runbooks: one-click execution, RTO timing, approval gates for high-risk steps, fail-fast on errors. Wait steps cover replication catch-up / app restart windows.",
+    "新建剧本": "New runbook",
+    "剧本": "Runbook",
+    "运行记录": "Run history",
+    "运行详情": "Run detail",
+    "当前步骤": "Current step",
+    "自动刷新（3s）": "Auto refresh (3s)",
+    "执行步骤（按顺序执行；高危步骤可勾选「需审批」）": "Steps (run in order; check \"approval\" on high-risk steps)",
+    "添加步骤": "Add step",
+    "保存剧本": "Save runbook",
+    "步骤": "Steps"
+  });
+  // 容灾总览地图 / 一键切换两步 / 容灾巡检（2026-11-18）
+  Object.assign(EN, {
+    "5 段：分 时 日 月 周，默认每日 08:00。": "5 fields: min hour day month weekday; default daily 08:00.",
+    "DNS 服务巡检": "DNS service check",
+    "DNS 配置：—": "DNS config: -",
+    "■=生产中心　▲=容灾中心": "■=Production ▲=DR center",
+    "业务一键切换依赖 DNS 牵引流量；两步可拆分执行。": "One-click business switch relies on DNS redirection; the two steps can run separately.",
+    "业务切换 + DNS 牵引（完整）": "Business switch + DNS redirection (full)",
+    "主站点地域（容灾地图定位）": "Primary site region (map location)",
+    "仅 DNS 牵引（业务切换已完成时）": "DNS redirection only (after business switch)",
+    "仅业务切换（主备互换，不动 DNS）": "Business switch only (primary/standby swap, no DNS)",
+    "切换范围": "Switch scope",
+    "备站点地域（容灾地图定位）": "DR site region (map location)",
+    "复制正常": "Replication OK",
+    "定时自动巡检": "Scheduled auto inspection",
+    "容灾业务": "DR businesses",
+    "容灾业务清单": "DR business list",
+    "容灾巡检": "DR Inspection",
+    "容灾巡检：环境健康 / 数据复制状态 / DNS 运行状态，定时巡检与报表导出": "DR inspection: environment health / replication status / DNS runtime, scheduled runs and report export",
+    "容灾承载": "DR active",
+    "导出 CSV": "Export CSV",
+    "巡检三块（重点容灾环境）：环境健康（生产可达 / 容灾可达）、数据复制状态（IO / SQL / 延迟）、\n    DNS 运行状态（记录一致性）。支持定时自动巡检与报表导出。巡检=只读探测，不改任何配置。": "Three inspection areas (DR focus): environment health (production/DR reachability), replication status (IO/SQL/lag), DNS runtime (record consistency). Scheduled auto runs and report export. Inspection is read-only probing - it changes nothing.",
+    "巡检周期（cron）": "Inspection schedule (cron)",
+    "巡检记录": "Inspection history",
+    "巡检详情": "Inspection detail",
+    "异常链路": "Failed links",
+    "成都,30.57,104.06": "Chengdu,30.57,104.06",
+    "承载现状": "Current bearer",
+    "摘要": "Summary",
+    "数据复制流": "Replication flow",
+    "格式：城市,纬度,经度（可从下拉选常用城市）。": "Format: city,latitude,longitude (pick a common city from the dropdown).",
+    "格式：城市,纬度,经度（可从下拉选常用城市）；配置后显示在容灾总览地图上。": "Format: city,latitude,longitude (pick a common city from the dropdown); shown on the DR overview map.",
+    "正常 / 警告 / 异常": "OK / Warn / Fail",
+    "点击站点或清单行可下钻业务明细": "Click a site or list row to drill into business detail",
+    "生产 / 容灾站点分布（示意图，按链路配置的城市经纬度定位）": "Production / DR site map (schematic, located by the city coordinates of each link)",
+    "生产承载": "Production active",
+    "结论": "Result",
+    "范围": "Scope",
+    "触发方式": "Triggered by",
+    "贵阳,26.65,106.63": "Guiyang,26.65,106.63",
+    "选择链路后自动计算": "Computed automatically after selecting a link"
+  });
+
+  // 容灾总览 echarts 省级地图（2026-11-18 r3）
+  Object.assign(EN, {
+    "生产 / 容灾站点分布（省级地图，按链路配置的城市经纬度定位）": "Production / DR site map (province-level, located by each link's city coordinates)",
+    "点击站点或清单行可下钻业务明细 · 支持缩放/拖拽": "Click a site or list row to drill into business detail · zoom/pan supported",
+    "数据复制流（流向容灾中心）": "Replication flow (towards DR center)"
+  });
+
+  // 容灾总览地图空态引导（2026-11-18 r3）
+  Object.assign(EN, {
+    "尚未配置站点地域": "No site regions configured",
+    "到「容灾链路」编辑链路，填写生产 / 容灾站点的城市（或经纬度）后，\n            地图会自动标注站点、按健康状态着色省份并绘制复制流": "Go to DR Links and edit a link with the production / DR site city (or coordinates); the map will then mark sites, tint provinces by health and draw replication flows"
+  });
+
 
   var PREFIXES = [
     "加载任务失败：", "加载日志失败:", "读取失败：", "读取失败:", "加载失败：", "加载失败:",
@@ -4071,6 +4595,8 @@ window.I18N = (function () {
   var PATTERNS = [
     [/^共 (\d+) 条 · 第 (\d+)\/(\d+) 页 · 每页 (\d+) 条$/, "Total $1 · Page $2/$3 · $4 per page"],
     // 含服务端插值的动态文案（渲染后数值/客户名已代入）
+    // 品牌设置：侧栏品牌名可自定义，title 属性拼接了固定副标题
+    [/^(.+) · AI 原生智能数据库灾备管理平台$/, "$1 · AI-Native Database DR Management"],
     [/^已激活永久商业授权（客户: (.+)）$/, "Perpetual enterprise license active (customer: $1)"],
     [/^社区免费版（每类受控功能最多纳管 (\d+) 个）$/, "Community free edition (up to $1 items per category)"],
     [/^(v[\d.]+ · AIDBM · )AI 原生智能数据库灾备管理平台( © \d+)$/, "$1AI-Native Database Backup & DR Management Platform$2"],

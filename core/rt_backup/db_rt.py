@@ -60,9 +60,9 @@ _PRUNE_EVERY_TICKS = 180
 
 
 def _epoch(iso: str) -> float:
-    """ISO8601 → epoch 秒；不可解析返回 0.0。"""
-    if not iso:
-        return 0.0
+    """ISO8601 → epoch 秒（统一走 common.epoch_of，消除两份重复实现）。"""
+    from core.rt_backup.common import epoch_of
+    return epoch_of(iso)
     try:
         from datetime import datetime
         return datetime.fromisoformat(str(iso)).timestamp()
@@ -610,11 +610,24 @@ class DbRtCapture:
         return f"{prefix}: {value}" if prefix else str(value)
 
     def _resolve_parent_id(self) -> Optional[int]:
-        """当前日志段的父节点 id：优先内存缓存，回落 journal 查询。"""
-        if self.last_rp_id:
-            return self.last_rp_id
+        """当前日志段的父节点 id：取「内存缓存」与「journal 最新点」的较大者。
+
+        2026-11-13 MySQL170 真机暴露：服务重启后守护进程从状态文件恢复的
+        ``last_rp_id`` 可能落后于 recovery_journal（如缓存 63、journal 已有 67），
+        继续用它当 parent 会写出 parent=63 的新段，恢复链直接判定「断裂」
+        （68 的父节点为 63，但链上前驱是 67），整条链无法 PITR。
+        这里始终以 journal 最新点为准，避免指针回退。
+        """
         latest = self.journal.latest(self.task_id)
-        return latest.id if latest else None
+        latest_id = int(latest.id) if latest and latest.id else None
+        if self.last_rp_id and latest_id:
+            if int(self.last_rp_id) < latest_id:
+                self.logger.info(
+                    "[rt.cdc] task=%s 父链指针自愈: %s → %s（journal 已更新）",
+                    self.task_id, self.last_rp_id, latest_id)
+                self.last_rp_id = latest_id
+            return self.last_rp_id
+        return self.last_rp_id or latest_id
 
     # ------------------------------------------------------------------
     # 健康与状态持久化

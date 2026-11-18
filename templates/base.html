@@ -39,7 +39,7 @@
   </style>
   <link href="/static/css/bootstrap.min.css?v=2026111102" rel="stylesheet">
   <link href="/static/vendor/bootstrap-icons/bootstrap-icons-inline.css?v=2026111102" rel="stylesheet">
-  <link href="/static/css/app.css?v=2026111006" rel="stylesheet">
+  <link href="/static/css/app.css?v=2026111701" rel="stylesheet">
 </head>
 <body data-page="{{ page }}">
   <!-- 语言切换：右上角悬浮按钮 -->
@@ -64,10 +64,14 @@
     <aside class="sidebar">
       <div class="brand">
         <span class="brand-logo" aria-hidden="true">
-          <i class="bi bi-database-fill-gear"></i>
+          {% if brand and brand.sidebar_logo %}
+            <img src="{{ brand.sidebar_logo }}" alt="{{ brand.name }}" class="brand-logo-img">
+          {% else %}
+            <i class="bi bi-database-fill-gear"></i>
+          {% endif %}
         </span>
         <span class="brand-text">
-          <span class="brand-name" title="AIDBM · AI 原生智能数据库灾备管理平台">AIDBM</span>
+          <span class="brand-name" title="{{ brand.name if brand else 'AIDBM' }} · AI 原生智能数据库灾备管理平台">{{ brand.name if brand else 'AIDBM' }}</span>
           <span class="brand-sub">智能灾备管理平台</span>
           {% if license_info and license_info.is_licensed %}
             <span class="brand-edition brand-edition-enterprise" id="brandEditionBadge" title="已激活永久商业授权（客户: {{ license_info.customer }}）"><i class="bi bi-shield-fill-check"></i> 企业永久版</span>
@@ -86,21 +90,29 @@
         <div class="nav-group-label">备份管理</div>
         <a class="nav-link {% if page=='tasks' %}active{% endif %}" href="/tasks" title="数据库备份" data-perm="backup.task.view"><i class="bi bi-list-check"></i> <span class="nav-label">数据库备份</span></a>
         <a class="nav-link {% if page=='file_backup' %}active{% endif %}" href="/file_backup" title="文件备份" data-perm="backup.task.view"><i class="bi bi-folder2-open"></i> <span class="nav-label">文件备份</span></a>
-        <a class="nav-link {% if page=='synology' %}active{% endif %}" href="/synology" title="群晖 NAS 纳管：DSM 设备探活 / 共享文件夹资产 / 全量+增量备份任务 / iSCSI 场景边界" data-perm="backup.task.view"><i class="bi bi-hdd-network"></i> <span class="nav-label">群晖 NAS 纳管</span></a>
+        <a class="nav-link {% if page=='object_storage' %}active{% endif %}" href="/object_storage" title="对象存储备份（MinIO / 阿里云 OSS / 腾讯云 COS / 华为云 OBS / S3 兼容，桶级保护，桶侧零安装）" data-perm="backup.task.view"><i class="bi bi-cloud-arrow-up"></i> <span class="nav-label">对象存储备份</span></a>
+        <a class="nav-link {% if page=='synology' %}active{% endif %}" href="/synology" title="NAS 存储：群晖 DSM 设备探活 / 共享文件夹资产 / 全量+增量备份 / 恢复到 DSM 目录" data-perm="backup.task.view"><i class="bi bi-hdd-network"></i> <span class="nav-label">NAS存储</span></a>
         <a class="nav-link {% if page=='netdev' %}active{% endif %}" href="/netdev" title="网络设备备份（交换机 / 路由器配置备份 / SSH / 远程 FTP）" data-perm="backup.task.view"><i class="bi bi-router"></i> <span class="nav-label">网络设备备份</span></a>
-        <a class="nav-link {% if page=='object_storage' %}active{% endif %}" href="/object_storage" title="对象存储备份（MinIO / 阿里云 OSS / 腾讯云 COS / S3 兼容，桶级保护，桶侧零安装）" data-perm="backup.task.view"><i class="bi bi-cloud-arrow-up"></i> <span class="nav-label">对象存储备份</span></a>
         <a class="nav-link {% if page=='vm' %}active{% endif %}" href="/vm" title="虚拟机备份（整机恢复点 / 永久增量 / 克隆新 VM）"><i class="bi bi-pc-display-horizontal"></i> <span class="nav-label">虚拟机备份</span></a>
         <a class="nav-link {% if page=='ai_backup' %}active{% endif %}" href="/ai_backup" title="AI 模型备份：模型权重/检查点、向量索引（Qdrant/Chroma）、训练数据集与元数据的跨层一致性保护计划"><i class="bi bi-cpu"></i> <span class="nav-label">AI 模型备份</span></a>
-        <a class="nav-link {% if page=='storage' %}active{% endif %}" href="/storage" title="存储管理" data-perm="backup.storage.manage"><i class="bi bi-hdd-rack"></i> <span class="nav-label">存储管理</span></a>
-        <a class="nav-link {% if page=='tape' %}active{% endif %}" href="/tape" title="磁带库与介质管理：设备识别 / 机械手 / 介质轮换 / 写后校验" data-perm="backup.storage.manage"><i class="bi bi-cassette"></i> <span class="nav-label">磁带库</span></a>
+        <div class="nav-parent {% if page in ('storage-media','storage','tape') %}active{% endif %}" id="storageNavParent" data-nav-group data-target="storageNavSub" role="button" tabindex="0" title="存储管理：备份落点与介质（存储池 / 磁带库 / FTP / NFS / 外挂）" data-perm="backup.storage.manage">
+          <i class="bi bi-hdd-rack"></i> <span class="nav-label">存储管理</span>
+          <i class="bi bi-chevron-down nav-caret"></i>
+        </div>
+        <div class="nav-sub" id="storageNavSub">
+          <a class="nav-link {% if page=='storage-media' %}active{% endif %}" href="/storage-media" title="存储介质总览：所有介质的状态 / 用量 / 最近备份（一张表看全）" data-perm="backup.storage.manage"><i class="bi bi-hdd-stack"></i> <span class="nav-label">存储介质总览</span></a>
+          <a class="nav-link {% if page=='storage' and not request.args.get('kind') %}active{% endif %}" href="/storage" title="存储池配置：本地 / MinIO / S3 / SFTP / 磁带 / FTP / 外挂挂载点，分层与保留策略" data-perm="backup.storage.manage"><i class="bi bi-hdd-network"></i> <span class="nav-label">存储池配置</span></a>
+          <a class="nav-link {% if page=='tape' %}active{% endif %}" href="/tape" title="磁带库与介质管理：设备识别 / 机械手 / 介质轮换 / 写后校验" data-perm="backup.storage.manage"><i class="bi bi-cassette"></i> <span class="nav-label">磁带库</span></a>
+          <a class="nav-link {% if page=='storage' and request.args.get('kind')=='ftp' %}active{% endif %}" href="/storage?kind=ftp" title="FTP / FTPS 存储：标准库 ftplib 直连，产物上传与回取（无校验和，仅按大小核对）" data-perm="backup.storage.manage"><i class="bi bi-server"></i> <span class="nav-label">FTP 存储</span></a>
+          <a class="nav-link {% if page=='storage' and request.args.get('kind')=='nfs' %}active{% endif %}" href="/storage?kind=nfs" title="NFS 挂载点存储：已由操作系统挂载的共享目录，平台只校验可写与挂载状态" data-perm="backup.storage.manage"><i class="bi bi-hdd"></i> <span class="nav-label">NFS 挂载</span></a>
+          <a class="nav-link {% if page=='storage' and request.args.get('kind')=='mount' %}active{% endif %}" href="/storage?kind=mount" title="外挂存储：USB 移动硬盘 / 本地磁盘阵列 / CIFS 共享等已挂载介质" data-perm="backup.storage.manage"><i class="bi bi-usb-drive"></i> <span class="nav-label">外挂存储</span></a>
+        </div>
         <a class="nav-link {% if page=='protection' %}active{% endif %}" href="/protection" title="备份策略" data-perm="backup.policy.manage"><i class="bi bi-shield-lock"></i> <span class="nav-label">备份策略</span></a>
-        <a class="nav-link {% if page=='agentless' %}active{% endif %}" href="/agentless" title="Agent 管理：无 Agent（SSH 通道）与有 Agent（执行器插件）两种备份方式，插件一键安装到主机"><i class="bi bi-shield-check"></i> <span class="nav-label">Agent 管理</span></a>
-        <a class="nav-link {% if page=='plugins' %}active{% endif %}" href="/plugins" title="备份依赖插件（一键安装 xtrabackup / percona / mariabackup 等）" data-perm="backup.plugins.manage"><i class="bi bi-plug"></i> <span class="nav-label">备份插件</span></a>
-        <a class="nav-link {% if page in ('rt_timeline', 'realtime', 'cdc') %}active{% endif %}" href="/realtime" title="实时备份：CDC 行级变更捕获 + CDP 恢复点时间轴（任意时间点恢复）" data-perm="rt.manage"><i class="bi bi-broadcast-pin"></i> <span class="nav-label">实时备份</span></a>
+        <a class="nav-link {% if page in ('rt_timeline', 'realtime', 'cdc') %}active{% endif %}" href="/realtime" title="实时备份：持续捕获日志产出恢复点（任意时间点恢复），并可下钻到行级变更回滚" data-perm="rt.manage"><i class="bi bi-broadcast-pin"></i> <span class="nav-label">实时备份</span></a>
         <div class="nav-group-label">数据恢复管理</div>
         <a class="nav-link {% if page=='restore' %}active{% endif %}" href="/restore" title="数据恢复" data-perm="restore.run"><i class="bi bi-arrow-counterclockwise"></i> <span class="nav-label">数据恢复</span></a>
         <a class="nav-link {% if page=='restore-verify' %}active{% endif %}" href="/restore-verify" title="恢复校验" data-perm="restore.verify.manage"><i class="bi bi-patch-check"></i> <span class="nav-label">恢复校验</span></a>
-        <a class="nav-link {% if page=='scan-fs' %}active{% endif %}" href="/scan-fs" title="无备份目录扫描恢复：SSH 只读扫描文件系统找回数据文件并拉回平台（文件系统层，非扇区雕刻）" data-perm="backup.task.view"><i class="bi bi-hdd-rack"></i> <span class="nav-label">无备份目录扫描</span></a>
+        <a class="nav-link {% if page=='scan-fs' %}active{% endif %}" href="/scan-fs" title="特殊恢复：常规恢复不可用时的最后手段——SSH 只读扫描文件系统，按库型列出残留的数据文件/日志/控制文件（Oracle、MySQL、PG、金仓、openGauss、达梦、SQL Server、Redis、MongoDB、SQLite）并拉回平台；不自动修复数据库一致性（文件系统层，非扇区雕刻）" data-perm="backup.task.view"><i class="bi bi-life-preserver"></i> <span class="nav-label">特殊恢复</span></a>
         <a class="nav-link {% if page=='data-compare' %}active{% endif %}" href="/data-compare" title="数据对比（恢复数据 vs 生产库）" data-perm="data_compare.run"><i class="bi bi-clipboard-data"></i> <span class="nav-label">数据对比</span></a>
         <a class="nav-link {% if page=='deploy' %}active{% endif %}" href="/deploy" title="数据库部署" data-perm="deploy.manage"><i class="bi bi-rocket-takeoff"></i> <span class="nav-label">数据库部署</span></a>
         <div class="nav-group-label">记录</div>
@@ -110,23 +122,83 @@
         <div class="nav-group-label">灾备管理</div>
         <a class="nav-link {% if page=='migration' %}active{% endif %}" href="/migration" title="数据迁移" data-perm="dr.migration.manage"><i class="bi bi-arrow-repeat"></i> <span class="nav-label">数据迁移</span></a>
         <a class="nav-link {% if page=='sync' %}active{% endif %}" href="/sync" title="数据同步" data-perm="dr.sync.manage"><i class="bi bi-arrow-left-right"></i> <span class="nav-label">数据同步</span></a>
-        <a class="nav-link {% if page=='dr-link' %}active{% endif %}" href="/dr-link" title="容灾链路" data-perm="dr.link.manage"><i class="bi bi-diagram-3"></i> <span class="nav-label">容灾链路</span></a>
         <a class="nav-link {% if page=='clone' %}active{% endif %}" href="/clone" title="克隆服务" data-perm="dr.clone.manage"><i class="bi bi-layers"></i> <span class="nav-label">克隆服务</span></a>
-        <div class="nav-group-label">运维</div>
-        <a class="nav-link {% if page=='operations' %}active{% endif %}" href="/operations" title="运维运营分析（超长 / 超频备份统计与阈值配置）" data-perm="operations.view"><i class="bi bi-graph-up-arrow"></i> <span class="nav-label">运维运营分析</span></a>
-        <a class="nav-link {% if page=='inspection' %}active{% endif %}" href="/inspection" title="巡检" data-perm="inspection.manage"><i class="bi bi-shield-check"></i> <span class="nav-label">巡检</span></a>
-        <a class="nav-link {% if page=='monitor' %}active{% endif %}" href="/monitor" title="备份任务监控（作业健康/连续失败/未按计划执行/RPO 逾期）" data-perm="inspection.manage"><i class="bi bi-activity"></i> <span class="nav-label">任务监控</span></a>
-        <a class="nav-link {% if page=='reports' %}active{% endif %}" href="/reports" title="报表中心" data-perm="inspection.manage"><i class="bi bi-file-earmark-bar-graph"></i> <span class="nav-label">报表中心</span></a>
+        <div class="nav-parent {% if page in ('dr','dr-link','dr-switch','drills') %}active{% endif %}"
+             id="drNavParent" data-nav-group data-target="drNavSub" role="button" tabindex="0"
+             title="容灾管理：容灾总览 / 容灾链路 / 一键切换 / 切换演练" data-perm="dr.link.manage">
+          <i class="bi bi-shield-fill-check"></i> <span class="nav-label">容灾管理</span>
+          <i class="bi bi-chevron-down nav-caret"></i>
+        </div>
+        <div class="nav-sub" id="drNavSub">
+          <a class="nav-link {% if page=='dr' %}active{% endif %}" href="/dr" title="容灾总览：链路健康 / 备库延迟 / 最近切换 RTO / 演练合规" data-perm="dr.link.manage"><i class="bi bi-speedometer"></i> <span class="nav-label">容灾总览</span></a>
+          <a class="nav-link {% if page=='dr-link' %}active{% endif %}" href="/dr-link" title="容灾链路：数据源捕获 / 智能选路 / 一致性校验 / 健康快照 / DNS 记录" data-perm="dr.link.manage"><i class="bi bi-diagram-3"></i> <span class="nav-label">容灾链路</span></a>
+          <a class="nav-link {% if page=='dr-switch' %}active{% endif %}" href="/dr-switch" title="一键切换：预检 → Fencing → 提升备库 → DNS 牵引 → 新主验证（含 RTO 与逐步明细）" data-perm="dr.link.manage"><i class="bi bi-lightning-charge"></i> <span class="nav-label">一键切换</span></a>
+          <a class="nav-link {% if page=='dr-inspection' %}active{% endif %}" href="/dr-inspection" title="容灾巡检：环境健康 / 数据复制状态 / DNS 运行状态，定时巡检与报表导出" data-perm="dr.link.manage"><i class="bi bi-clipboard2-pulse"></i> <span class="nav-label">容灾巡检</span></a>
+          <a class="nav-link {% if page=='drills' %}active{% endif %}" href="/drills" title="切换演练：真实恢复演练 / RTO·RPO 评分 / 定时演练" data-perm="dr.link.manage"><i class="bi bi-clipboard-check"></i> <span class="nav-label">切换演练</span></a>
+          <a class="nav-link {% if page=='runbook' %}active{% endif %}" href="/runbook" title="恢复剧本：备份→恢复→校验→通知→切换 一键编排，RTO 计时，高危步骤审批闸" data-perm="dr.link.manage"><i class="bi bi-journal-text"></i> <span class="nav-label">恢复剧本</span></a>
+        </div>
+        <div class="nav-group-label">运维与设置</div>
         {% if has_ai_agent %}
                 <a class="nav-link {% if page=='agent' %}active{% endif %}" href="/agent" title="AI 智能助手" data-perm="agent.use"><i class="bi bi-robot"></i> <span class="nav-label">AI 智能助手</span></a>
         {% endif %}
-        <a class="nav-link {% if page=='alert' %}active{% endif %}" href="/alert" title="智能告警" data-perm="alert.manage"><i class="bi bi-bell"></i> <span class="nav-label">智能告警</span></a>
-        <a class="nav-link {% if page=='datamining' %}active{% endif %}" href="/datamining" title="数据价值挖掘" data-perm="alert.manage"><i class="bi bi-database-check"></i> <span class="nav-label">数据价值挖掘</span></a>
-        <a class="nav-link {% if page=='logs' %}active{% endif %}" href="/logs" title="系统日志" data-perm="logs.view"><i class="bi bi-journal-text"></i> <span class="nav-label">系统日志</span></a>
-        <a class="nav-link {% if page=='settings' %}active{% endif %}" href="/settings" title="系统设置" data-perm="system.settings"><i class="bi bi-gear"></i> <span class="nav-label">系统设置</span></a>
-        <a class="nav-link {% if page=='users' %}active{% endif %}" href="/users" title="用户与角色管理（RBAC）" data-perm="users.manage"><i class="bi bi-people"></i> <span class="nav-label">用户管理</span></a>
+        <div class="nav-parent {% if page in ('operations','inspection','monitor','reports','alert','datamining') %}active{% endif %}"
+             id="opsNavParent" data-nav-group data-target="opsNavSub" role="button" tabindex="0"
+             title="运维监控：运营分析 / 巡检 / 任务监控 / 报表中心 / 智能告警 / 数据价值挖掘" data-perm="operations.view">
+          <i class="bi bi-activity"></i> <span class="nav-label">运维监控</span>
+          <i class="bi bi-chevron-down nav-caret"></i>
+        </div>
+        <div class="nav-sub" id="opsNavSub">
+          <a class="nav-link {% if page=='operations' %}active{% endif %}" href="/operations" title="运维运营分析（超长 / 超频备份统计与阈值配置）" data-perm="operations.view"><i class="bi bi-graph-up-arrow"></i> <span class="nav-label">运维运营分析</span></a>
+          <a class="nav-link {% if page=='inspection' %}active{% endif %}" href="/inspection" title="巡检" data-perm="inspection.manage"><i class="bi bi-shield-check"></i> <span class="nav-label">巡检</span></a>
+          <a class="nav-link {% if page=='monitor' %}active{% endif %}" href="/monitor" title="备份任务监控（作业健康/连续失败/未按计划执行/RPO 逾期）" data-perm="inspection.manage"><i class="bi bi-activity"></i> <span class="nav-label">任务监控</span></a>
+          <a class="nav-link {% if page=='reports' %}active{% endif %}" href="/reports" title="报表中心" data-perm="inspection.manage"><i class="bi bi-file-earmark-bar-graph"></i> <span class="nav-label">报表中心</span></a>
+          <a class="nav-link {% if page=='alert' %}active{% endif %}" href="/alert" title="智能告警" data-perm="alert.manage"><i class="bi bi-bell"></i> <span class="nav-label">智能告警</span></a>
+          <a class="nav-link {% if page=='datamining' %}active{% endif %}" href="/datamining" title="数据价值挖掘" data-perm="alert.manage"><i class="bi bi-database-check"></i> <span class="nav-label">数据价值挖掘</span></a>
+        </div>
+        <div class="nav-parent {% if page in ('settings','agentless','plugins','users','logs') %}active{% endif %}"
+             id="sysNavParent" data-nav-group data-target="sysNavSub" role="button" tabindex="0"
+             title="系统设置：系统参数 / Agent 管理 / 备份插件 / 用户与权限 / 系统日志" data-perm="system.settings">
+          <i class="bi bi-gear"></i> <span class="nav-label">系统设置</span>
+          <i class="bi bi-chevron-down nav-caret"></i>
+        </div>
+        <div class="nav-sub" id="sysNavSub">
+          <a class="nav-link {% if page=='settings' %}active{% endif %}" href="/settings" title="系统参数（备份根目录 / 调度 / 通知 / 安全）" data-perm="system.settings"><i class="bi bi-sliders"></i> <span class="nav-label">系统参数</span></a>
+          <a class="nav-link {% if page=='agentless' %}active{% endif %}" href="/agentless" title="Agent 管理：无 Agent（SSH 通道）与有 Agent（执行器插件）两种备份方式，插件一键安装到主机"><i class="bi bi-shield-check"></i> <span class="nav-label">Agent 管理</span></a>
+          <a class="nav-link {% if page=='plugins' %}active{% endif %}" href="/plugins" title="备份依赖插件（一键安装 xtrabackup / percona / mariabackup 等）" data-perm="backup.plugins.manage"><i class="bi bi-plug"></i> <span class="nav-label">备份插件</span></a>
+          <a class="nav-link {% if page=='users' %}active{% endif %}" href="/users" title="用户与角色管理（RBAC）" data-perm="users.manage"><i class="bi bi-people"></i> <span class="nav-label">用户管理</span></a>
+          <a class="nav-link {% if page=='logs' %}active{% endif %}" href="/logs" title="系统日志" data-perm="logs.view"><i class="bi bi-journal-text"></i> <span class="nav-label">系统日志</span></a>
+        </div>
         <a class="nav-link logout" href="/logout" title="退出登录"><i class="bi bi-box-arrow-right"></i> <span class="nav-label">退出登录</span></a>
       </nav>
+      <script>
+      /* 侧栏二级菜单（通用）：存储管理 / 运维监控 / 系统设置 …
+         - 当前页在组内时默认展开；否则读 localStorage 记忆；
+         - 解析期执行，避免「先展开后收起」的首帧闪动。 */
+      (function () {
+        var parents = document.querySelectorAll("[data-nav-group]");
+        Array.prototype.forEach.call(parents, function (parent) {
+          var sub = document.getElementById(parent.getAttribute("data-target") || "");
+          if (!sub) return;
+          var KEY = "nav-open:" + (parent.id || parent.getAttribute("data-target"));
+          var hasActive = !!sub.querySelector(".nav-link.active");
+          var open = false;
+          try { open = hasActive || localStorage.getItem(KEY) === "1"; } catch (e) { open = hasActive; }
+          function apply(v) {
+            sub.classList.toggle("open", v);
+            parent.classList.toggle("open", v);
+            try { localStorage.setItem(KEY, v ? "1" : "0"); } catch (e) { /* 忽略 */ }
+          }
+          apply(open);
+          parent.addEventListener("click", function () { apply(!sub.classList.contains("open")); });
+          parent.addEventListener("keydown", function (e) {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              apply(!sub.classList.contains("open"));
+            }
+          });
+        });
+      })();
+      </script>
       <script>
         /* 侧栏滚动位置跨页连续（配合 View Transitions）：解析期立即恢复上次
            滚动位置（app.js 的 active 居中只作兜底，恢复后当前项可见即不动），
@@ -175,11 +247,11 @@
   <!-- 首屏注入 META（数据库类型/显示名/默认端口）：必须在 bkp-core.js 之前，
        否则依赖 BKP.META 的下拉会被填成空（见 app.py context_processor 注释） -->
   <script>window.__BKP_META__ = {{ bkp_meta | default({}) | tojson }};</script>
-  <script src="/static/js/i18n.js?v=2026111301"></script>
+  <script src="/static/js/i18n.js?v=2026111804"></script>
   <script src="/static/js/bkp-core.js?v=2026111201"></script>
   <script src="/static/js/pager.js?v=2026111102"></script>
   <script src="/static/js/precheck.js?v=2026111301"></script>
-  <script src="/static/js/app.js?v=2026111301"></script>
+  <script src="/static/js/app.js?v=2026111801"></script>
   {% if has_ai_agent %}<script src="/static/js/ai-agent.js?v=2026111102"></script>{% endif %}
   <script>
     // 按权限隐藏菜单（每个 <a class="nav-link" data-perm="..."> 命中则可见）

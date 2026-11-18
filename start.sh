@@ -16,4 +16,14 @@ export LD_LIBRARY_PATH="$PWD/tools:$PWD/lib:${LD_LIBRARY_PATH:-}"
 export CODEBUDDY_SAFE_DELETE_ENABLED=0
 # 一级（L1）默认本地存储：所有备份文件落地到 /opt/backup-platform
 export BACKUP_ROOT="/opt/backup-platform"
+# ---------------------------------------------------------------------------
+# 重启方式（重要）：
+#   本机由 systemd 托管（/etc/systemd/system/aidbm.service，Restart=always，
+#   RestartSec=5）。**不要用 `kill <pid> && nohup bash start.sh &` 重启**——
+#   kill 之后 systemd 会在 5 秒内自动拉起一份，与手动启动的那份形成双进程，
+#   进而出现「HTTP 在 A 进程、实时备份守护在 B 进程」的分裂（2026-11-14 实测：
+#   112 个实时保护任务全部停止捕获，而 /api/rt/status 只显示 running=false）。
+#   正确做法：systemctl restart aidbm
+#   手工调试若必须直启，先 systemctl stop aidbm，再执行本脚本。
+# ---------------------------------------------------------------------------
 exec .venv/bin/python run.py

@@ -41,7 +41,7 @@
           <th>保护等级</th>
           <th>RPO 目标</th>
           <th>RTO 目标</th>
-          <th>备份方式</th>
+          <th>调度与频次</th>
           <th>状态</th>
           <th>已绑定任务</th>
           <th class="text-end">操作</th>
@@ -90,27 +90,120 @@
 
           <hr class="my-3">
           <div class="d-flex justify-content-between align-items-center mb-2">
-            <h6 class="text-muted mb-0"><i class="bi bi-gear me-1"></i>策略细节（JSON）</h6>
+            <h6 class="text-muted mb-0"><i class="bi bi-clock-history me-1"></i>备份频次与周期（绑定任务后由策略托管）</h6>
             <button type="button" class="btn btn-outline-secondary btn-sm" onclick="fillPolicyDefaults()">
               <i class="bi bi-magic me-1"></i>按等级填充默认
             </button>
           </div>
-          <div class="mb-3">
-            <label class="form-label small text-muted">备份策略（类型/模式/频率/并行度）</label>
-            <textarea class="form-control font-code" id="p_backup_strategy" rows="4" placeholder='{"type":"full","mode":"logical","frequency":"P1D","incremental":false,"parallel":1}'></textarea>
-          </div>
-          <div class="mb-3">
-            <label class="form-label small text-muted">链路策略（复制/容灾链路选择）</label>
-            <textarea class="form-control font-code" id="p_link_strategy" rows="3" placeholder='{"replication":"async","cross_site":false,"consistency":"eventual"}'></textarea>
-          </div>
-          <div class="mb-2">
-            <label class="form-label small text-muted">保留策略（保留/生命周期）</label>
-            <textarea class="form-control font-code" id="p_retention" rows="3" placeholder='{"days":14,"count":50,"lifecycle":{"l1_to_l2_days":7}}'></textarea>
+          <div class="row g-3">
+            <div class="col-md-6">
+              <label class="form-label">调度模式</label>
+              <select class="form-select" id="p_sched_mode">
+                <option value="full_only">单一周期（每次都是全量）</option>
+                <option value="mixed">组合策略（增量节奏 + 周期全量）</option>
+              </select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">主调度方式</label>
+              <select class="form-select" id="p_sched_type" onchange="onSchedTypeChange()">
+                <option value="interval">按间隔（每 N 小时/天）</option>
+                <option value="cron">按 cron 表达式</option>
+              </select>
+            </div>
+
+            <div class="col-md-6" id="p_interval_box">
+              <label class="form-label">执行间隔</label>
+              <div class="input-group">
+                <input type="number" class="form-control" id="p_sched_interval_value" min="1" value="1">
+                <select class="form-select" id="p_sched_interval_unit" style="max-width:110px">
+                  <option value="minutes">分钟</option>
+                  <option value="hours">小时</option>
+                  <option value="days" selected>天</option>
+                </select>
+              </div>
+            </div>
+            <div class="col-md-6 d-none" id="p_cron_box">
+              <label class="form-label">cron 表达式</label>
+              <input type="text" class="form-control font-code" id="p_sched_cron" placeholder="0 2 * * *">
+              <div class="form-text">分 时 日 月 周，例如 <code>0 2 * * *</code> 每天 02:00。</div>
+            </div>
+
+            <div class="col-12" id="p_full_box">
+              <label class="form-label">全量周期</label>
+              <div class="row g-2 align-items-end">
+                <div class="col-md-3">
+                  <select class="form-select" id="p_full_type" onchange="onFullTypeChange()">
+                    <option value="week">按周</option>
+                    <option value="cron">按 cron</option>
+                  </select>
+                </div>
+                <div class="col-md-5" id="p_full_days_box">
+                  <div class="d-flex flex-wrap gap-2 small">
+                    <label class="form-check form-check-inline"><input class="form-check-input p-full-day" type="checkbox" value="0" id="pfd0"><span class="form-check-label">周一</span></label>
+                    <label class="form-check form-check-inline"><input class="form-check-input p-full-day" type="checkbox" value="1" id="pfd1"><span class="form-check-label">周二</span></label>
+                    <label class="form-check form-check-inline"><input class="form-check-input p-full-day" type="checkbox" value="2" id="pfd2"><span class="form-check-label">周三</span></label>
+                    <label class="form-check form-check-inline"><input class="form-check-input p-full-day" type="checkbox" value="3" id="pfd3"><span class="form-check-label">周四</span></label>
+                    <label class="form-check form-check-inline"><input class="form-check-input p-full-day" type="checkbox" value="4" id="pfd4"><span class="form-check-label">周五</span></label>
+                    <label class="form-check form-check-inline"><input class="form-check-input p-full-day" type="checkbox" value="5" id="pfd5"><span class="form-check-label">周六</span></label>
+                    <label class="form-check form-check-inline"><input class="form-check-input p-full-day" type="checkbox" value="6" id="pfd6" checked><span class="form-check-label">周日</span></label>
+                  </div>
+                </div>
+                <div class="col-md-2" id="p_full_time_box">
+                  <input type="time" class="form-control" id="p_full_time" value="02:00">
+                </div>
+                <div class="col-md-4 d-none" id="p_full_cron_box">
+                  <input type="text" class="form-control font-code" id="p_full_cron" placeholder="0 2 * * 0">
+                </div>
+              </div>
+            </div>
+
+            <div class="col-md-3">
+              <label class="form-label">保留天数</label>
+              <input type="number" class="form-control" id="p_ret_days" min="0" value="14">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">保留份数</label>
+              <input type="number" class="form-control" id="p_ret_count" min="0" value="50">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">锁定天数（不可删）</label>
+              <input type="number" class="form-control" id="p_ret_lock" min="0" value="0">
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">备份模式（空=随任务）</label>
+              <select class="form-select" id="p_backup_mode">
+                <option value="">随任务既有设置</option>
+                <option value="logical">逻辑备份</option>
+                <option value="physical">物理备份</option>
+              </select>
+            </div>
           </div>
 
-          <div class="form-check mt-2">
+          <div class="alert alert-light border py-2 px-3 small mt-3 mb-2" id="pPreview">
+            <i class="bi bi-info-circle me-1"></i><span id="pPreviewText">填写后点「预览生效效果」查看摘要与下次执行时间</span>
+          </div>
+          <button type="button" class="btn btn-outline-primary btn-sm mb-3" onclick="previewPolicy()">
+            <i class="bi bi-eye me-1"></i>预览生效效果
+          </button>
+
+          <div class="accordion accordion-flush" id="advAcc">
+            <div class="accordion-item">
+              <h2 class="accordion-header">
+                <button class="accordion-button collapsed py-2 small" type="button" data-bs-toggle="collapse" data-bs-target="#advBody">
+                  高级：容灾链路策略（JSON）
+                </button>
+              </h2>
+              <div id="advBody" class="accordion-collapse collapse">
+                <div class="accordion-body pt-2">
+                  <textarea class="form-control font-code" id="p_link_strategy" rows="3" placeholder='{"replication":"async","cross_site":false,"consistency":"eventual"}'></textarea>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-check mt-3">
             <input class="form-check-input" type="checkbox" id="p_enabled" checked>
-            <label class="form-check-label" for="p_enabled">启用</label>
+            <label class="form-check-label" for="p_enabled">启用策略</label>
           </div>
         </form>
       </div>

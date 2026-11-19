@@ -53,6 +53,7 @@ SEGMENT_PERMS = {
     "backup-cleanup": "backup.task.manage",
     "policy": "backup.policy.manage",
     "storage": "backup.storage.manage",
+    "host-tuning": "backup.storage.manage",
     "lifecycle": "backup.storage.manage",
     "dedup": "backup.storage.manage",
     "tape": "backup.storage.manage",

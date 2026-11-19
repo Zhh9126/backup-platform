@@ -17,6 +17,7 @@
 """
 import os
 import time
+import binascii
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -1146,23 +1147,75 @@ def _parse_schedule_days(value) -> str:
     return ",".join(parts)
 
 
+def _schedule_jitter_minutes(task: dict) -> int:
+    """确定性调度抖动偏移（分钟），把同一时刻的备份洪峰摊平。
+
+    对标 PB 级方案 §5.1「分层时间轮与确定性抖动」：
+    偏移 = CRC32(任务资产标识) % 窗口，**确定性**——任务重启后仍落同一槽位，
+    运维可预期（随机抖动会让「下次备份时间」每次都变）。
+
+    默认关闭（system_config ``schedule_jitter_enabled``），窗口取
+    ``schedule_jitter_seconds``（默认 300s → 5 个分钟槽）。关闭/配置非法返回 0。
+    """
+    try:
+        flag = db.get_system_config("schedule_jitter_enabled")
+        if str(flag).strip().lower() not in ("1", "true", "on", "yes"):
+            return 0
+        win = int(db.get_system_config("schedule_jitter_seconds") or 0)
+    except Exception:
+        return 0
+    if win <= 0:
+        return 0
+    slots = max(1, win // 60)
+    key = "%s|%s" % (task.get("id") or "", task.get("name") or "")
+    return binascii.crc32(key.encode("utf-8")) % (slots + 1)
+
+
+def _apply_jitter_to_cron(expr: str, jitter_minutes: int) -> str:
+    """给 cron 的分钟位加确定性偏移。
+
+    仅在分钟位是**单一数字**（如 ``0 2 * * *``）时生效：通配（``*/5``）、
+    列表（``0,30``）、范围（``0-10``）保持原样——那些是用户显式的多触发语义，
+    加了偏移会改变触发次数。跨小时（minute+offset > 59）同样保持原样，
+    避免把 02:58 的备份挤到 03 点。
+    """
+    if not jitter_minutes:
+        return expr
+    try:
+        parts = str(expr).split()
+        if len(parts) not in (5, 6):
+            return expr
+        m_idx = 1 if len(parts) == 6 else 0  # 6 段时首段是秒
+        if not parts[m_idx].isdigit():
+            return expr
+        new_min = int(parts[m_idx]) + int(jitter_minutes)
+        if new_min > 59:
+            return expr
+        parts[m_idx] = str(new_min)
+        return " ".join(parts)
+    except Exception:
+        return expr
+
+
 def _make_trigger(task: dict, st_key: str = "schedule_type", expr_key: str = "cron_expr",
-                  minutes_key: str = "interval_minutes", days_key: str = None):
+                  minutes_key: str = "interval_minutes", days_key: str = None,
+                  jitter_minutes: int = 0):
     st = task.get(st_key)
     if st == "cron" and task.get(expr_key):
         from apscheduler.triggers.cron import CronTrigger
+        expr = _apply_jitter_to_cron(task[expr_key], jitter_minutes)
         dow = _parse_schedule_days(task.get(days_key)) if days_key else ""
         if dow:
             # 用户指定了运行星期：覆盖 cron 表达式自身的「周几」位，
             # 仅在其列出的星期触发（如全量=周一、增量=周二~周日）。
             try:
-                minute, hour, day, month, _ = str(task[expr_key]).split()
+                minute, hour, day, month, _ = str(expr).split()
                 return CronTrigger(minute=minute, hour=hour, day=day, month=month,
                                    day_of_week=dow)
             except ValueError:
                 # cron 表达式不是标准 5 段，回退到原样
-                return CronTrigger.from_crontab(task[expr_key])
-        return CronTrigger.from_crontab(task[expr_key])
+                return CronTrigger.from_crontab(expr)
+        return CronTrigger.from_crontab(expr)
     if st == "interval" and task.get(minutes_key):
         from apscheduler.triggers.interval import IntervalTrigger
         return IntervalTrigger(minutes=int(task[minutes_key]))
@@ -1179,7 +1232,8 @@ def _next_fire_naive(task: dict, st_key: str, expr_key: str, minutes_key: str,
     import datetime as _dt
     try:
         trig = _make_trigger(task, st_key=st_key, expr_key=expr_key,
-                             minutes_key=minutes_key, days_key=days_key)
+                             minutes_key=minutes_key, days_key=days_key,
+                             jitter_minutes=_schedule_jitter_minutes(task))
         if not trig:
             return None
         tz = getattr(trig, "timezone", None)
@@ -2010,8 +2064,9 @@ def _register_ai_plans(sched):
 
 def _register(sched, task: dict, prefix: str = "task"):
     wrapper = _job_wrapper if prefix == "task" else _job_wrapper_sync
+    jit = _schedule_jitter_minutes(task)
     if prefix != "task":
-        trig = _make_trigger(task)
+        trig = _make_trigger(task, jitter_minutes=jit)
         if not trig:
             return
         sched.add_job(wrapper, trig, id=f"{prefix}_{task['id']}",
@@ -2021,7 +2076,7 @@ def _register(sched, task: dict, prefix: str = "task"):
 
     # 普通任务：单一调度
     if not task.get("mixed_backup"):
-        trig = _make_trigger(task)
+        trig = _make_trigger(task, jitter_minutes=jit)
         if not trig:
             return
         sched.add_job(wrapper, trig, id=f"task_{task['id']}",
@@ -2034,7 +2089,8 @@ def _register(sched, task: dict, prefix: str = "task"):
     full_trig = _make_trigger(
         task, st_key="full_schedule_type", expr_key="full_schedule_expr",
         minutes_key="full_schedule_expr",
-        days_key="full_schedule_days")  # interval 时复用 expr 存分钟数
+        days_key="full_schedule_days",  # interval 时复用 expr 存分钟数
+        jitter_minutes=jit)
     if full_trig:
         sched.add_job(wrapper, full_trig, id=f"task_{task['id']}_full",
                       replace_existing=True, args=base_args + ["full"],
@@ -2045,9 +2101,10 @@ def _register(sched, task: dict, prefix: str = "task"):
     inc_trig = _make_trigger(
         task, st_key="incremental_schedule_type", expr_key="incremental_schedule_expr",
         minutes_key="incremental_schedule_expr",
-        days_key="incremental_schedule_days")
+        days_key="incremental_schedule_days",
+        jitter_minutes=jit)
     if not inc_trig and task.get("schedule_type") and (task.get("cron_expr") or task.get("interval_minutes")):
-        inc_trig = _make_trigger(task)
+        inc_trig = _make_trigger(task, jitter_minutes=jit)
     if inc_trig:
         sched.add_job(wrapper, inc_trig, id=f"task_{task['id']}_incremental",
                       replace_existing=True, args=base_args + ["incremental"],

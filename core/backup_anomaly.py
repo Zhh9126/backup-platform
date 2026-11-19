@@ -102,6 +102,39 @@ def sample_entropy(path: str, samples: int = 4, block: int = 65536) -> float:
         return -1.0
 
 
+def sample_chi_square(path: str, samples: int = 4, block: int = 65536) -> float:
+    """抽样计算字节分布的卡方统计量（256 桶均匀性检验）。
+
+    对标 PB 级方案 §7.1：密文/随机数据的字节分布近似均匀，理论上
+    χ² 服从自由度 255 的卡方分布（均值 255、标准差约 22.6），落点集中
+    在 [195, 315]（±2.6σ）。与香农熵联合使用可给出「像不像密文」的
+    量化证据（熵只看是否满熵，卡方看分布是否均匀）。
+
+    返回卡方值；读取失败返回 -1.0。
+    """
+    size = os.path.getsize(path)
+    if size <= 0:
+        return 0.0
+    try:
+        with open(path, "rb") as f:
+            read_at = sorted({0, size // 2, max(0, size - block), size // 4})
+            read_at = read_at[:max(1, samples)]
+            vals = []
+            for off in read_at:
+                f.seek(off)
+                data = f.read(block)
+                if not data:
+                    continue
+                counts = [0] * 256
+                for b in data:
+                    counts[b] += 1
+                expected = len(data) / 256.0
+                vals.append(sum((c - expected) ** 2 / expected for c in counts))
+            return round(statistics.mean(vals), 1) if vals else 0.0
+    except OSError:
+        return -1.0
+
+
 def _median_recent_size(task_id: int, exclude_id: int):
     """同任务近期成功备份的中位体积（供体积突变基线）。"""
     try:
@@ -207,8 +240,19 @@ def check_record(record: dict) -> dict:
         elif ent > 7.95:
             hint = ("（未压缩产物）" if not known_compressed
                     else "（压缩头不符的高熵内容）")
+            # 卡方联合判据（PB 级方案 §7.1）：密文分布近似均匀，χ² 落在
+            # 自由度 255 的 ±2.6σ 区间 [195,315]。它是「像密文」的量化
+            # 证据，不单独作为判定阈值——高熵本身就足以告警。
+            chi = sample_chi_square(path)
+            if chi < 0:
+                chi_note = "，卡方检验读取失败"
+            elif 195.0 <= chi <= 315.0:
+                chi_note = f"，卡方 χ²={chi}（分布均匀，符合密文特征）"
+            else:
+                chi_note = (f"，卡方 χ²={chi}（偏离均匀分布，也不排除压缩数据）")
             checks.append({"item": "entropy", "level": "suspect",
                            "message": f"产物抽样熵 {ent}≈满熵（8.0）{hint}"
+                                      f"{chi_note}"
                                       "——疑似内容被二次加密（勒索软件特征）"})
         else:
             checks.append({"item": "entropy", "level": "clean",

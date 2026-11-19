@@ -4519,6 +4519,16 @@ window.I18N = (function () {
   });
 
 
+  // 主机内核 / IO 调优诊断卡片（2026-11-19 PB 级方案 §3.2 吸收）
+  Object.assign(EN, {
+    "主机内核 / IO 调优诊断": "Host kernel / IO tuning diagnostics",
+    "只读检查：脏页回写、swappiness、IO 调度器、io_uring、挂载选项。平台不会自动修改系统参数，命令由运维在维护窗口执行。": "Read-only checks: dirty-page writeback, swappiness, IO scheduler, io_uring and mount options. The platform never changes system parameters automatically; run the commands in a maintenance window.",
+    "检查项": "Item",
+    "当前值": "Current",
+    "说明 / 执行命令": "Notes / command",
+    "重新检测": "Re-check"
+  });
+
   var PREFIXES = [
     "加载任务失败：", "加载日志失败:", "读取失败：", "读取失败:", "加载失败：", "加载失败:",
     "保存失败：", "保存失败:", "删除失败：", "删除失败:", "连接失败：", "连接成功：", "连接成功!",

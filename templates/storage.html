@@ -633,4 +633,76 @@
     </div>
   </div>
 </div>
+<!-- 主机内核 / IO 调优诊断（只读检查，对标 PB 级方案 §3.2） -->
+<div class="page-card mt-3">
+  <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
+    <h6 class="mb-0"><i class="bi bi-speedometer2 me-1"></i>主机内核 / IO 调优诊断</h6>
+    <div class="d-flex align-items-center gap-2">
+      <span class="badge bg-secondary" id="htVerdict">检测中…</span>
+      <button class="btn btn-sm btn-outline-secondary" onclick="htLoad()">
+        <i class="bi bi-arrow-clockwise me-1"></i>重新检测
+      </button>
+    </div>
+  </div>
+  <p class="text-muted small mb-2">
+    只读检查：脏页回写、swappiness、IO 调度器、io_uring、挂载选项。平台不会自动修改系统参数，命令由运维在维护窗口执行。
+  </p>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead>
+        <tr><th>检查项</th><th>当前值</th><th>推荐</th><th>状态</th><th>说明 / 执行命令</th></tr>
+      </thead>
+      <tbody id="htBody">
+        <tr><td colspan="5" class="text-center text-muted py-3">加载中…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+<script>
+(function () {
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+      return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c];
+    });
+  }
+  window.htLoad = function () {
+    fetch('/api/host-tuning', {credentials: 'same-origin'})
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var s = d.summary || {};
+        var v = document.getElementById('htVerdict');
+        if (v) {
+          v.textContent = (s.verdict || '-') + '（' + (s.ok || 0) + '/' + (s.total || 0) + '）';
+          v.className = 'badge ' + (s.advice ? 'bg-warning text-dark' : 'bg-success');
+        }
+        var rows = (d.checks || []).map(function (c) {
+          var st = c.ok === true
+            ? '<span class="badge bg-success">符合</span>'
+            : (c.ok === false ? '<span class="badge bg-warning text-dark">建议调整</span>'
+                              : '<span class="badge bg-secondary">未知</span>');
+          var cmd = c.apply_cmd
+            ? '<div class="font-code small text-muted mt-1">' + esc(c.apply_cmd) + '</div>' : '';
+          return '<tr><td>' + esc(c.item) + '</td><td class="font-code small">' + esc(c.actual) +
+                 '</td><td class="font-code small">' + esc(c.recommend) + '</td><td>' + st +
+                 '</td><td class="small">' + esc(c.hint) + cmd + '</td></tr>';
+        }).join('');
+        var body = document.getElementById('htBody');
+        if (body) {
+          body.innerHTML = rows || '<tr><td colspan="5" class="text-muted text-center py-3">无检查项</td></tr>';
+        }
+      })
+      .catch(function (e) {
+        var body = document.getElementById('htBody');
+        if (body) {
+          body.innerHTML = '<tr><td colspan="5" class="text-danger">加载失败：' + esc(e) + '</td></tr>';
+        }
+      });
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', window.htLoad);
+  } else {
+    window.htLoad();
+  }
+})();
+</script>
 {% endblock %}

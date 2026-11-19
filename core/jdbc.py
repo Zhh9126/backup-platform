@@ -902,10 +902,20 @@ def test_connection(db_type, host, port, db, user, password, timeout=15):
     except Exception as e:
         ms = int((time.monotonic() - t0) * 1000)
         jdbc_err = str(e) or type(e).__name__
-        if "暂不支持直连类型" in (native_err or ""):
-            # 该库型（如 SQL Server）本就不走原生 Python 驱动，原生报的
-            # 「不支持直连」只是通道不适用，不是失败原因。必须透出 JDBC 的
-            # 真实错误，否则用户会误以为平台不支持该库型。
+        native_unusable = "暂不支持直连类型" in (native_err or "")
+        if db_type == "oracle" and not native_unusable:
+            # Oracle 11.2 及更早版本不能用 thin 模式（DPY-3010）：原生通道
+            # 报的是「通道不适用」而非连接失败，此时真实原因只在 JDBC 报错里
+            # （如 ORA-01017 密码错）。若还优先展示原生错误，用户会误以为
+            # 平台不支持 11g——这正是历史上的现场误判点。
+            try:
+                from core import native_conn as _native
+                native_unusable = _native.thin_version_blocked(native_err)
+            except Exception:
+                pass
+        if native_unusable:
+            # 该库型/该版本本就不走原生 Python 驱动，原生报的「不适用」不是
+            # 失败原因。必须透出 JDBC 的真实错误。
             return False, (
                 f"JDBC 连接失败（{ms} ms）: {jdbc_err}"
                 f"（{db_type} 走 JDBC 通道，原生直连不适用）"

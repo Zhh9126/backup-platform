@@ -491,7 +491,8 @@ class DbMigrationEngine:
                 conn.commit()
                 return True, f"目标 schema {schema_name} 不存在，已自动创建（Oracle，初始密码见日志）", True
         except Exception as exc:
-            detail = str(exc)[:200]
+            from core.native_conn import compat_error
+            detail = compat_error("oracle", exc)[:230]
             try:
                 if conn:
                     conn.close()

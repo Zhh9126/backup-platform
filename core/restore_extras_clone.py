@@ -218,7 +218,9 @@ def drop_clone_extended(db_type: str, instance_name: str,
         except TypeError:
             conn = oracledb.connect(user=user, password=password, dsn=_dsn)
         except Exception as e:
-            return {"ok": False, "message": f"连接失败: {str(e)[:150]}"}
+            from core.native_conn import compat_error
+            return {"ok": False,
+                    "message": f"连接失败: {compat_error('oracle', e)[:180]}"}
         cur = conn.cursor()
         try:
             cur.execute(f'DROP USER "{instance_name}" CASCADE')

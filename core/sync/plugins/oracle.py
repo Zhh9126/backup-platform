@@ -42,6 +42,11 @@ class OracleSourceReader(SourceReader):
                                         password=cfg.src_password, dsn=dsn)
             except Exception as e:
                 last = e
+                from core.native_conn import thin_version_blocked
+                if thin_version_blocked(e):
+                    # 11g 不支持 thin：立即失败并给可操作提示，不做无谓重试
+                    from core.native_conn import oracle_thin_unsupported_hint
+                    raise RuntimeError(oracle_thin_unsupported_hint()) from e
                 time.sleep(1 * (attempt + 1))
         raise last
 
@@ -154,6 +159,10 @@ class OracleSinkWriter(SinkWriter):
                 break
             except Exception as e:
                 last = e
+                from core.native_conn import thin_version_blocked
+                if thin_version_blocked(e):
+                    from core.native_conn import oracle_thin_unsupported_hint
+                    raise RuntimeError(oracle_thin_unsupported_hint()) from e
                 time.sleep(2 * (attempt + 1))
         if conn is None:
             raise last

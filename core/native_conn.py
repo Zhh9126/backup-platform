@@ -97,7 +97,48 @@ NATIVE_DB_TYPES = tuple(NATIVE_CONFIG.keys())
 
 
 class DriverUnavailable(ConnectionError):
-    """原生驱动缺失/无法加载（区别于连接失败：调用方可据此走 JDBC 兜底）。"""
+    """原生驱动缺失/无法加载（区别于连接失败：调用方可据此走 JDBC 兜底）。
+
+    也用于「通道不适用」：例如 python-oracledb 的 thin 模式不支持 Oracle
+    11.2 及更早版本（DPY-3010）。这类错误不是账号/网络问题，必须让调用方
+    切到 JDBC / sqlplus 通道，而不是把它当成连接失败报给用户。
+    """
+
+
+# python-oracledb thin 模式的服务端版本上限报错标识
+_THIN_BLOCK_TOKENS = ("DPY-3010", "DPY-3019",
+                      "not supported by python-oracledb in thin mode")
+
+
+def thin_version_blocked(msg) -> bool:
+    """判断报错是否为「thin 模式不支持该服务端版本」（Oracle 11.x 及更早）。
+
+    与真实连接失败（ORA-01017 密码错、ORA-12514 服务名错等）区分开：
+    前者应切换通道，后者的报错才是用户要看的真原因。
+    """
+    text = str(msg or "")
+    low = text.lower()
+    return any(tok.lower() in low for tok in _THIN_BLOCK_TOKENS)
+
+
+def oracle_thin_unsupported_hint() -> str:
+    """11g 直连受限时的统一中文提示（各功能 catch 处复用）。"""
+    return ("Oracle 11.2 及更早版本不支持 python-oracledb thin 模式（DPY-3010）："
+            "该功能需要 Oracle 12.1+ 直连；备份/恢复不受影响（平台经 SSH 调用"
+            "数据库自带的 expdp/impdp/rman 执行），「测试连接」会自动改走 "
+            "JDBC 通道")
+
+
+def compat_error(db_type, exc) -> str:
+    """把「通道不适用」类异常翻译成可操作提示，其余原样返回。
+
+    供数据对比/克隆/迁移/同步等直连功能复用，避免用户只看到裸 DPY-3010
+    而误以为平台不支持该数据库。
+    """
+    if (db_type or "").lower() == "oracle" and thin_version_blocked(exc):
+        return oracle_thin_unsupported_hint()
+    msg = str(exc).strip()
+    return msg or type(exc).__name__
 
 
 def _norm_port(db_type, port):
@@ -221,13 +262,15 @@ def connect(db_type, host, port, db, user, password, timeout=10):
             except Exception as e:
                 last_exc = e
                 msg = str(e)
-                # oracledb 瘦模式仅支持 12.1+；11g 服务端给出明确指引
-                if ("DPY-3019" in msg or "unsupported" in msg.lower()
-                        or "version" in msg.lower()):
-                    raise RuntimeError(
-                        f"Oracle {service}@{host}:{port} 连接失败：{msg}；"
-                        "oracledb 瘦客户端仅支持 Oracle 12.1+，11g 请改用 "
-                        "cx_Oracle+Instant Client 或（已装 Java 时的）JDBC 兜底通道")
+                # 通道不适用 ≠ 连接失败：thin 模式连 11.2 及更早版本会直接报
+                # DPY-3010。按 DriverUnavailable 抛出，上层才会自动改用 JDBC
+                # 通道；否则这个「不支持」会掩盖 JDBC 的真实报错（历史缺陷：
+                # 11g 密码填错时界面显示「不支持 11g」，用户误判平台无能力）。
+                if thin_version_blocked(msg):
+                    raise DriverUnavailable(
+                        "python-oracledb thin 模式不支持 Oracle 11.2 及更早版本"
+                        "（DPY-3010），平台将自动改用 JDBC 通道；原始报错："
+                        + msg) from e
                 if not any(k in msg for k in ("DPY-6005", "DPY-4011",
                                               "12514", "12518", "12170")):
                     break

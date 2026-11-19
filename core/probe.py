@@ -239,32 +239,63 @@ def _probe_mongodb(h, p, u, pw, db_name, t):
 
 
 def _probe_oracle(h, p, u, pw, db_name, t):
-    """Oracle 连通性（T06）：oracledb / cx_Oracle 驱动优先，回退 sqlplus。
+    """Oracle 连通性（T06）：驱动 → JDBC → sqlplus 三层通道，兼顾 11g/12c+。
 
-    驱动与客户端都缺失时返回 ``(None, ...)``——「未知」而非「失败」，不误报警。
+    python-oracledb 的 **thin 模式不支持 Oracle 11.2 及更早版本**（DPY-3010），
+    因此 11g 现场若只走驱动通道，会被误判成「连接失败/平台不支持」。
+    正确语义：thin 被版本挡住属于「通道不适用」，此时自动切 JDBC（ojdbc +
+    JRE 随平台离线包内置，零客户端安装）再回退 sqlplus（数据库自带）。
+
+    驱动与各通道都缺失时返回 ``(None, ...)``——「未知」而非「失败」，不误报警。
     """
     service = db_name or "ORCL"
     dsn = f"{h}:{p or 1521}/{service}"
     module, reason = _try_import("oracledb", "cx_Oracle")
+    thin_blocked = ""
     if module is not None:
         ok, msg = _probe_via_driver(
             module,
             lambda: module.connect(user=u, password=pw, dsn=dsn),
             "SELECT 1 FROM DUAL",
             f"Oracle 连接正常（{module.__name__}）")
-        if ok is not None:
-            return ok, msg
+        if ok is True:
+            return True, msg
+        if ok is False:
+            from core import native_conn
+            if not native_conn.thin_version_blocked(msg):
+                # 真实失败（密码错 ORA-01017 / 服务名错 ORA-12514 等），
+                # 这条报错才是用户要看的真原因，直接返回
+                return False, msg
+            thin_blocked = msg
+
+    # 兜底 1：JDBC（11g 的唯一直连通道；平台离线包内置 ojdbc + JRE）
+    jok, jmsg = _probe_via_jdbc("oracle", h, p, u, pw, t, service)
+    if jok:
+        note = "（11g 不支持 thin 模式，已自动改走 JDBC）" if thin_blocked else ""
+        return True, f"Oracle 连接正常：JDBC 通道{note}"
+    jdbc_err = jmsg
 
     client = _first_client("sqlplus")
     if not client:
-        return None, f"缺少 oracledb/cx_Oracle 驱动与 sqlplus 客户端（{reason}），无法验证连接"
+        if "ORA-" in (jdbc_err or "").upper():
+            # JDBC 已与 Oracle 实例交互（ORA-01017 密码错 / ORA-12514 服务名错 /
+            # ORA-28000 锁定等）→ 这是明确的连接失败，不能报「无法确认」
+            return False, _clip(jdbc_err)
+        if thin_blocked:
+            return None, (
+                "Oracle 11g（11.2 及更早）不支持 thin 模式，且平台侧 JDBC / "
+                f"sqlplus 通道均不可用（{jdbc_err}），无法从平台侧验证连接；"
+                "备份/恢复走 SSH + 数据库自带 expdp/impdp/rman，不受此影响")
+        return None, (f"缺少 oracledb/cx_Oracle 驱动与 sqlplus 客户端（{reason}），"
+                      f"JDBC 通道亦不可用（{jdbc_err}），无法验证连接")
     # 密码经 stdin 传入，绝不出现在命令行（共享知识 #16）
     script = f"connect {u}/{pw}@{dsn}\nselect 1 from dual;\nexit\n"
     rc, out, err = _run([client, "-S", "-L", "/nolog"], None, t + 10, script)
     text = (out + err)
     if rc == 0 and "ORA-" not in text.upper():
-        return True, "Oracle 连接正常（sqlplus）"
-    return False, (_clip(text) or "连接失败")
+        note = "（11g 不支持 thin 模式，已回退 sqlplus）" if thin_blocked else ""
+        return True, f"Oracle 连接正常：sqlplus 通道{note}"
+    return False, (_clip(text) or f"连接失败（JDBC: {_clip(jdbc_err)}）")
 
 
 def _probe_kingbase(h, p, u, pw, db_name, t):
@@ -284,7 +315,7 @@ def _probe_kingbase(h, p, u, pw, db_name, t):
     client = _first_client("ksql", "sys_psql", "psql")
     if not client:
         # 零安装原则：平台自带 JDBC 驱动（金仓兜底 PG 驱动），缺 CLI 时兜底
-        return _probe_via_jdbc("kingbase", h, p, u, pw, t)
+        return _probe_via_jdbc("kingbase", h, p, u, pw, t, db_name)
     env = os.environ.copy()
     if pw:
         env["KINGBASE_PASSWORD"] = pw
@@ -476,13 +507,19 @@ _PROBES = {
 }
 
 
-def _probe_via_jdbc(db_type: str, h, p, u, pw, t):
+def _probe_via_jdbc(db_type: str, h, p, u, pw, t, db_name: str = ""):
     """JDBC 兜底探测：驱动 jar 随平台离线包内置（零安装原则），
-    dmPython/CLI 客户端缺失时的可靠通道。返回 (ok, msg)。"""
+    dmPython/CLI 客户端缺失、Oracle 11g 不支持 thin 时的可靠通道。
+
+    ``db_name`` 必须传真实库名/service：Oracle 的 URL 形如
+    ``jdbc:oracle:thin:@//host:port/<service>``，service 为空会直接报
+    ORA-12261（Easy Connect 语法错误）——历史实现恒传空串，导致 11g 走
+    JDBC 兜底时必然失败。返回 (ok, msg)。
+    """
     try:
         from core import jdbc
         conn = jdbc.connect(db_type, str(h), int(p or 0),
-                            "", str(u), str(pw or ""))
+                            str(db_name or ""), str(u), str(pw or ""))
         try:
             cur = conn.cursor()
             cur.execute("SELECT 1 FROM DUAL" if db_type in ("oracle", "dameng")

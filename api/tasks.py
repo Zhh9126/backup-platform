@@ -879,7 +879,8 @@ def test_task_connection():
 
     # 内置探测未覆盖（ok=None 且类型未知）→ JDBC 兜底（驱动随平台内置，零安装）
     if ok is None and "未知数据库类型" in str(message):
-        ok, message = probe._probe_via_jdbc(db_type, host, port, username, password, 8)
+        ok, message = probe._probe_via_jdbc(db_type, host, port, username,
+                                            password, 8, db_name)
 
     result = {"ok": bool(ok) if ok is not None else False,
               "known": ok is not None,

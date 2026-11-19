@@ -802,27 +802,116 @@ class OracleEngine(BackupEngine):
         return {"host_key": f"{self.task.get('host') or ''}:{self.task.get('port') or ''}"}
 
     def _check_archive_mode(self) -> dict:
-        """预检专用：查 v$database.log_mode（oracledb 直连，native-first）。
+        """预检专用：查 v$database.log_mode。
 
-        返回 {"mode": "ARCHIVELOG"|"NOARCHIVELOG"|""}，失败带 error。
+        通道顺序（兼容 11g 与 12c+）：
+        1. oracledb thin 直连——仅 Oracle 12.1+ 支持；
+        2. 11.2 及更早版本 thin 会报 DPY-3010（通道不适用，非连接失败）→
+           改走 SSH + 远端 sqlplus（数据库自带，零客户端安装）。
+        返回 {"mode": "ARCHIVELOG"|"NOARCHIVELOG"|"", "channel": ...}，失败带 error。
         """
-        import oracledb as _odb
+        from core.native_conn import thin_version_blocked
+        err = ""
         try:
-            conn = _odb.connect(
+            import oracledb as _odb
+            _kw = dict(
                 user=self.task.get("username") or "system",
                 password=db.decrypt_secret(self.task.get("password") or ""),
                 host=self.task.get("host") or "127.0.0.1",
                 port=int(self.task.get("port") or 1521),
-                service_name=self.task.get("db_name") or "orcl",
-                login_timeout=8)
+                service_name=self.task.get("db_name") or "orcl")
+            try:
+                # oracledb 4.x 无 login_timeout（cx_Oracle 才有的参数），
+                # 传错会抛 TypeError 并把「归档模式探测」整体打成失败——
+                # 非归档闸因此在 11g/19c 上全都失效过（2026-11-19 实测）。
+                conn = _odb.connect(tcp_connect_timeout=8, **_kw)
+            except TypeError:
+                conn = _odb.connect(**_kw)
             cur = conn.cursor()
             cur.execute("select log_mode from v$database")
             row = cur.fetchone()
             cur.close()
             conn.close()
-            return {"mode": (row[0] or "").strip() if row else ""}
+            return {"mode": (row[0] or "").strip() if row else "",
+                    "channel": "driver"}
         except Exception as e:
-            return {"mode": "", "error": str(e)[:160]}
+            err = str(e) or type(e).__name__
+            if not thin_version_blocked(err):
+                # 真实失败（密码错/服务名错/网络），不再兜底以免掩盖原因
+                return {"mode": "", "error": err[:160]}
+
+        # 11g：thin 不支持该服务端版本 → 远端 sqlplus 探测
+        mode = self._archive_mode_via_sqlplus()
+        if mode:
+            return {"mode": mode, "channel": "sqlplus"}
+        return {"mode": "", "error": err[:160]}
+
+    def _archive_mode_via_sqlplus(self) -> str:
+        """经 SSH + 远端 sqlplus 查 log_mode；失败返回空串（不影响主流程）。"""
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+        try:
+            ssh_host = remote_dump.resolve_ssh_host(self.task)
+        except Exception:
+            ssh_host = None
+        if not ssh_host:
+            return ""
+        try:
+            client = remote_dump._connect(ssh_host)
+        except Exception as e:
+            self.logger.warning("[%s] log_mode 探测连 SSH 失败: %s",
+                                self.task_name, e)
+            return ""
+        remote_sql = "/tmp/platform_arch_mode.sql"
+        try:
+            sqlplus = self._resolve_oracle_tool(client, "sqlplus") or "sqlplus"
+            user = self.task.get("username") or "system"
+            pw = db.decrypt_secret(self.task.get("password") or "")
+            service = self.task.get("db_name") or "orcl"
+            host = self._db_host_for_remote()
+            port = int(self.task.get("port") or 1521)
+            sql = ("whenever sqlerror exit 9\n"
+                   "set pagesize 0 linesize 200 feedback off heading off echo off\n"
+                   f'connect {user}/"{pw}"@{host}:{port}/{service}\n'
+                   "select log_mode from v$database;\n"
+                   "exit\n")
+            sftp = client.open_sftp()
+            try:
+                with sftp.open(remote_sql, "w") as f:
+                    f.write(sql)
+                try:
+                    sftp.chmod(remote_sql, 0o644)
+                except Exception:
+                    pass
+            finally:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+            shell = remote_dump._wrap_login(
+                f"su - {self._resolve_check_user()} -c "
+                + shlex.quote(f"{sqlplus} -s -L /nolog @{remote_sql}"))
+            out, _err, rc = _ssh_exec_pipe(client, shell, timeout=60)
+            text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+            upper = text.upper()
+            if "NOARCHIVELOG" in upper:
+                return "NOARCHIVELOG"
+            if "ARCHIVELOG" in upper:
+                return "ARCHIVELOG"
+            return ""
+        except Exception as e:
+            self.logger.warning("[%s] 远端 sqlplus 查 log_mode 失败: %s",
+                                self.task_name, e)
+            return ""
+        finally:
+            try:
+                client.exec_command(f"rm -f {remote_sql}")
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def _ensure_pdbs_open(self, client) -> str:
         """确保 19c（CDB 架构）下的 PDB 处于 OPEN 状态并保存状态。
@@ -1929,6 +2018,17 @@ class OracleEngine(BackupEngine):
                     src_schema = str(schemas).split(",")[0].strip()
                 else:
                     src_schema = str(extra.get("schema") or extra.get("owner") or "").strip()
+                if not src_schema:
+                    # 表模式备份（tables=SCHEMA.TABLE）时任务里没有 schemas，
+                    # 从首个表名的 schema 前缀推导——否则异名 schema 恢复必然
+                    # 报「REMAP_SCHEMA 需要源 schema」，用户被迫为一处改名去
+                    # 改任务配置（2026-11-19 Oracle 11g/19c 实测暴露）。
+                    _tbls = extra.get("tables") or kwargs.get("tables") or ""
+                    if isinstance(_tbls, (list, tuple)):
+                        _tbls = _tbls[0] if _tbls else ""
+                    _first_tbl = str(_tbls).split(",")[0].strip()
+                    if "." in _first_tbl:
+                        src_schema = _first_tbl.split(".")[0].strip().upper()
                 remap_args = ""
                 target_schema = str(kwargs.get("target_schema") or "").strip()
                 if target_schema:

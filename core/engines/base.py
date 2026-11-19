@@ -154,6 +154,21 @@ def _local_failure_hint(err) -> str:
             "可在「SSH 主机」中纳管后重试。请按上面给出的原始错误继续排查。")
 
 
+# 远端给出的「确定性结论」标记：这类失败换到本机通道也不可能成功，
+# 且用户通常已经纳管了 SSH，尾部再提示「请纳管 SSH 主机」纯属误导。
+_REMOTE_FINAL_MARKERS = (
+    "处于非归档模式",       # Oracle NOARCHIVELOG：RMAN 热备必败（ORA-19602）
+    "ORA-19602",
+    "处置三选一",
+)
+
+
+def _remote_error_is_final(err) -> bool:
+    """远端错误是否为「环境/配置层面已定性」的结论（不应回退本机）。"""
+    text = str(err or "")
+    return any(k in text for k in _REMOTE_FINAL_MARKERS)
+
+
 def _err_text(exc: BaseException) -> str:
     """异常文本；``str()`` 为空的异常（``MemoryError`` 等）退化为类型名。
 
@@ -1230,6 +1245,13 @@ class BackupEngine:
         else:
             self.logger.info("[%s] %s: 未纳管 SSH 备份机，直接在本机执行",
                              self.task_name, label)
+
+        if remote_tried and _remote_error_is_final(remote_error):
+            # 远端已给出确定性结论（如 NOARCHIVELOG 下 RMAN 必败）：回退本机
+            # 不可能成功，尾部「请纳管 SSH 主机」还会误导（本就已纳管）。
+            # 直接把远端结论透出给用户（2026-11-19 Oracle 11g 实测）。
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message=f"{label} 失败: {remote_error}")
 
         if remote_tried:
             self.logger.info("[%s] %s: 远程不可用，回退到本机执行", self.task_name, label)

@@ -975,8 +975,10 @@ def verify_clone_conn(db_type: str, host: str, port, database: str, user: str,
         except TypeError:
             conn = oracledb.connect(user=user or "system", password=password, dsn=dsn)
         except Exception as e:
+            # 11g 的 thin 版本限制要翻译成可操作提示，避免裸 DPY-3010 误导
+            from core.native_conn import compat_error
             return {"ok": False, "tables": 0,
-                    "message": f"连接失败: {str(e)[:200]}"}
+                    "message": f"连接失败: {compat_error('oracle', e)[:220]}"}
         cur = conn.cursor()
         try:
             cur.execute(

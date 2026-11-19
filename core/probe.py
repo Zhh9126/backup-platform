@@ -58,6 +58,30 @@ def _first_client(*names) -> str:
     return ""
 
 
+# 错误文本收敛参数：驱动（oracledb/psycopg2 等）的报错常常分多行，
+# 关键定位信息（at host / port / ORA-xxxxx）往往在尾部。早期实现用 [:160]
+# 硬截断，会把 "at host "192.168.204.20" port 1521" 切在 IP 中间，用户无法判读
+# （现场反馈：任务表单「测试连接」提示显示不全）。改为保留完整文本，仅在
+# 极端超长时保留 头 + 尾，中间给出省略标记。
+_ERR_MAX = 1200
+_ERR_HEAD = 780
+_ERR_TAIL = 360
+
+
+def _clip(text, limit: int = _ERR_MAX) -> str:
+    """把驱动/CLI 的错误文本收敛成可读文本，保留尾部关键信息。"""
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    if len(s) <= limit:
+        return s
+    tail = _ERR_TAIL if limit >= _ERR_TAIL * 2 else limit // 3
+    head = limit - tail
+    omitted = len(s) - head - tail
+    return (s[:head].rstrip() + "\n…（中间省略 %d 个字符）…\n" % omitted
+            + s[-tail:].lstrip())
+
+
 def _probe_via_driver(module, connect, probe_sql: str, ok_msg: str):
     """用 Python 驱动执行一次轻量查询验证连通性。
 
@@ -75,7 +99,7 @@ def _probe_via_driver(module, connect, probe_sql: str, ok_msg: str):
     try:
         conn = connect()
     except Exception as e:
-        return False, f"连接失败: {str(e).strip()[:160]}"
+        return False, f"连接失败: {_clip(e)}"
     try:
         cur = conn.cursor()
         try:
@@ -88,7 +112,7 @@ def _probe_via_driver(module, connect, probe_sql: str, ok_msg: str):
                 pass
         return True, ok_msg
     except Exception as e:
-        return False, f"探活查询失败: {str(e).strip()[:160]}"
+        return False, f"探活查询失败: {_clip(e)}"
     finally:
         try:
             conn.close()
@@ -170,7 +194,7 @@ def _probe_redis(h, p, u, pw, db_name, t):
                 except Exception:
                     pass
         except Exception as e:
-            return False, f"连接失败: {str(e).strip()[:160]}"
+            return False, f"连接失败: {_clip(e)}"
     cmd = ["redis-cli", "-h", h, "-p", str(p or 6379)]
     if pw:
         cmd += ["-a", pw]
@@ -200,7 +224,7 @@ def _probe_mongodb(h, p, u, pw, db_name, t):
                 except Exception:
                     pass
         except Exception as e:
-            return False, f"连接失败: {str(e).strip()[:160]}"
+            return False, f"连接失败: {_clip(e)}"
     uri = (f"mongodb://{u}:{pw}@{h}:{p}/{db_name or ''}" if pw
            else f"mongodb://{h}:{p}/{db_name or ''}")
     rc, out, err = _run(
@@ -240,7 +264,7 @@ def _probe_oracle(h, p, u, pw, db_name, t):
     text = (out + err)
     if rc == 0 and "ORA-" not in text.upper():
         return True, "Oracle 连接正常（sqlplus）"
-    return False, (text.strip()[:200] or "连接失败")
+    return False, (_clip(text) or "连接失败")
 
 
 def _probe_kingbase(h, p, u, pw, db_name, t):
@@ -270,7 +294,7 @@ def _probe_kingbase(h, p, u, pw, db_name, t):
          "-d", db_name or "test", "-tAc", "SELECT 1"], env, t + 5)
     if rc == 0 and "1" in (out or ""):
         return True, f"KingbaseES 连接正常（{client}）"
-    return False, ((out + err).strip()[:200] or "连接失败")
+    return False, (_clip(out + err) or "连接失败")
 
 
 def _probe_panwei(h, p, u, pw, db_name, t):
@@ -297,7 +321,7 @@ def _probe_panwei(h, p, u, pw, db_name, t):
          "-d", db_name or "postgres", "-tAc", "SELECT 1"], env, t + 5)
     if rc == 0 and "1" in (out or ""):
         return True, f"磐维 PanWeiDB 连接正常（{client}）"
-    return False, ((out + err).strip()[:200] or "连接失败")
+    return False, (_clip(out + err) or "连接失败")
 
 
 def _probe_dameng(h, p, u, pw, db_name, t):
@@ -326,7 +350,7 @@ def _probe_dameng(h, p, u, pw, db_name, t):
     text = (out + err)
     if rc == 0 and "-" not in text.split("\n")[0][:1] and "错误" not in text:
         return True, "达梦 连接正常（disql）"
-    return False, (text.strip()[:200] or "连接失败")
+    return False, (_clip(text) or "连接失败")
 
 
 # 未实现客户端级探测的库：判定为“未知”，不误报警
@@ -352,7 +376,7 @@ def _probe_neo4j(h, p, u, pw, db_name, t):
              "--non-interactive", "RETURN 1 AS ok;"], env, t + 10)
         if rc == 0:
             return True, "Neo4j 连接正常（cypher-shell，bolt）"
-        return False, ((out + err).strip()[:200] or "Neo4j 连接失败（cypher-shell）")
+        return False, (_clip(out + err) or "Neo4j 连接失败（cypher-shell）")
 
     # HTTP 通道（Neo4j 默认 7473/7474；bolt 端口 -1 的常见部署 = 7474）
     http_port = 7474
@@ -378,10 +402,10 @@ def _probe_neo4j(h, p, u, pw, db_name, t):
         with _req.urlopen(req, timeout=max(3, int(t))) as resp:
             body = _json.loads(resp.read().decode("utf-8", "ignore"))
         if body.get("errors"):
-            return False, "Neo4j 返回错误: " + str(body["errors"][0].get("message", ""))[:160]
+            return False, "Neo4j 返回错误: " + _clip(body["errors"][0].get("message", ""))
         return True, f"Neo4j 连接正常（HTTP API :{http_port}，db={database}）"
     except Exception as e:
-        return None, f"缺少 cypher-shell 且 HTTP 探测失败（{str(e)[:120]}），无法验证连接"
+        return None, f"缺少 cypher-shell 且 HTTP 探测失败（{_clip(e, 400)}），无法验证连接"
 
 
 def _guess_object_provider(endpoint: str) -> tuple[str, str]:
@@ -429,7 +453,7 @@ def _probe_object_storage(h, p, u, pw, db_name, t):
             return True, "对象存储连接正常（%s，桶 %s 可访问）" % (provider, db_name)
         return True, "对象存储连接正常（%s）：%s" % (provider, msg)
     except Exception as e:
-        return False, "对象存储连接失败: %s" % str(e)[:200]
+        return False, "对象存储连接失败: %s" % _clip(e)
 
 
 # 值为 (必需客户端列表, 探测函数)。
@@ -472,7 +496,7 @@ def _probe_via_jdbc(db_type: str, h, p, u, pw, t):
                 pass
         return True, f"{db_type} 连接正常（JDBC）"
     except Exception as e:
-        return False, f"JDBC 连接失败: {str(e)[:150]}"
+        return False, f"JDBC 连接失败: {_clip(e)}"
 
 
 def probe_db_connection(db_type: str, host: str, port, username: str,

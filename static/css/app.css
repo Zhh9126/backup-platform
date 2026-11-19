@@ -1185,6 +1185,11 @@ body {
 .task-modal-full .form-label { font-weight: 500; margin-bottom: 6px; }
 .task-modal-full .form-text { margin-top: 4px; }
 
+/* 连接测试结果：驱动报错多为多行文本（oracledb 的 DPY-xxxx、psycopg2 的 FATAL、
+   mysqli 的 1045 等），必须按原文换行完整展示，不能被 nowrap/ellipsis 裁切。 */
+.conn-msg { white-space: pre-wrap; word-break: break-word; overflow-wrap: anywhere;
+  line-height: 1.55; }
+
 /* ---------- 任务向导整页化（点新建=页内整屏展开，关闭=回列表） ---------- */
 .task-page { margin-bottom: 20px; }
 .task-page .task-page-inner { max-width: min(1400px, 100%); margin: 0 auto; }

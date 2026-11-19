@@ -187,7 +187,7 @@
                       <i class="bi bi-plug"></i> 测试连接
                     </button>
                   </div>
-                  <div class="form-text" id="t_test_conn_msg" style="display:none"></div>
+                  <div class="form-text conn-msg" id="t_test_conn_msg" style="display:none"></div>
                   <div class="form-text text-muted">全实例 = 不填库名；只备份单个库请填库名。系统库默认排除，可在「高级选项」勾选包含。</div>
                 </div>
                 <div class="col-md-3 d-flex align-items-end">
@@ -563,7 +563,7 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
                     </div>
                   </div>
                   <div id="t_jdbc_test_result" class="col-md-8 d-none">
-                    <div class="alert alert-light border small py-2 mb-0" id="t_jdbc_test_msg">
+                    <div class="alert alert-light border small py-2 mb-0 conn-msg" id="t_jdbc_test_msg">
                       <i class="bi bi-plug"></i> <span></span>
                     </div>
                   </div>

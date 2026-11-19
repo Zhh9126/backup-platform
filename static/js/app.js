@@ -1297,24 +1297,28 @@
       db_name: ($("t_db_name") || {}).value || "",
     };
     box.classList.remove("d-none");
+    msg.title = "";
     if (!body.db_type || !body.host) {
-      msg.className = "alert alert-warning small py-2 mb-0";
+      msg.className = "alert alert-warning small py-2 mb-0 conn-msg";
       msg.innerHTML = '<i class="bi bi-exclamation-triangle"></i> <span>请先填写数据库类型、主机地址（端口）后再测试。</span>';
       return;
     }
     btn.disabled = true;
-    msg.className = "alert alert-info small py-2 mb-0";
+    msg.className = "alert alert-info small py-2 mb-0 conn-msg";
     msg.innerHTML = '<i class="bi bi-plug"></i> <span>JDBC 连接测试中...</span>';
     try {
       const r = await api("POST", "/api/jdbc/test-connection", body);
       const ok = !!r.success;
-      msg.className = `alert ${ok ? "alert-success" : "alert-danger"} small py-2 mb-0`;
+      msg.className = `alert ${ok ? "alert-success" : "alert-danger"} small py-2 mb-0 conn-msg`;
       const icon = ok ? "bi-check-circle" : "bi-x-circle";
       const ms = r.info && r.info.latency_ms != null ? `（${r.info.latency_ms} ms）` : "";
+      msg.title = (r.message || "") + ms;
       msg.innerHTML = `<i class="bi ${icon}"></i> <span>${esc(r.message || "")}${ms}</span>`;
     } catch (e) {
-      msg.className = "alert alert-danger small py-2 mb-0";
-      msg.innerHTML = `<i class="bi bi-x-circle"></i> <span>JDBC 测试请求失败: ${esc(e.message || e)}</span>`;
+      const jm = String(e.message || e);
+      msg.className = "alert alert-danger small py-2 mb-0 conn-msg";
+      msg.title = "JDBC 测试请求失败: " + jm;
+      msg.innerHTML = `<i class="bi bi-x-circle"></i> <span>JDBC 测试请求失败: ${esc(jm)}</span>`;
     } finally {
       btn.disabled = false;
     }
@@ -1335,23 +1339,28 @@
       task_id: ($("t_id") || {}).value || "",
     };
     msg.style.display = "";
+    msg.title = "";
     if (!body.db_type || !body.host) {
-      msg.className = "form-text text-warning";
+      msg.className = "form-text conn-msg text-warning";
       msg.innerHTML = '<i class="bi bi-exclamation-triangle"></i> 请先选择数据库类型并填写主机地址后再测试。';
       return;
     }
     btn.disabled = true;
-    msg.className = "form-text text-info";
+    msg.className = "form-text conn-msg text-info";
     msg.innerHTML = '<i class="bi bi-plug"></i> 正在连接 ' + esc(body.host) + ":" + esc(String(body.port || "")) + " ...";
     try {
       const r = await api("POST", "/api/tasks/test-connection", body);
       const ok = !!r.ok;
-      msg.className = "form-text " + (ok ? "text-success" : "text-danger");
+      const text = r.message || r.detail || (ok ? "连接成功" : "连接失败");
+      msg.className = "form-text conn-msg " + (ok ? "text-success" : "text-danger");
       const icon = ok ? "bi-check-circle-fill" : "bi-x-circle-fill";
-      msg.innerHTML = '<i class="bi ' + icon + '"></i> ' + esc(r.message || r.detail || (ok ? "连接成功" : "连接失败"));
+      msg.title = text;                     /* 悬浮可看完整原文（含换行） */
+      msg.innerHTML = '<i class="bi ' + icon + '"></i> ' + esc(text);
     } catch (e) {
-      msg.className = "form-text text-danger";
-      msg.innerHTML = '<i class="bi bi-x-circle-fill"></i> 测试请求失败: ' + esc(e.message || e);
+      const em = String(e.message || e);
+      msg.className = "form-text conn-msg text-danger";
+      msg.title = "测试请求失败: " + em;
+      msg.innerHTML = '<i class="bi bi-x-circle-fill"></i> 测试请求失败: ' + esc(em);
     } finally {
       btn.disabled = false;
     }

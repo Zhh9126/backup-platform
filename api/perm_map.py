@@ -54,6 +54,7 @@ SEGMENT_PERMS = {
     "policy": "backup.policy.manage",
     "storage": "backup.storage.manage",
     "host-tuning": "backup.storage.manage",
+    "bw-broker": "backup.storage.manage",
     "lifecycle": "backup.storage.manage",
     "dedup": "backup.storage.manage",
     "tape": "backup.storage.manage",

@@ -444,7 +444,17 @@ class BackupEngine:
                     return 0  # 窗口外全速
         except Exception:  # noqa: BLE001
             pass  # 窗口解析失败退化为全程限速（不因限速配置影响备份）
-        return bw
+        # 全局带宽仲裁（PB 级方案 §5.1 Max-Min 公平水填充）：
+        # 未配置 global_bandwidth_kbps 时原样返回任务自身限速（零行为变化）；
+        # 配置后按权重分配总配额，多任务并发时不会把出口整体打满。
+        try:
+            from core import bw_broker
+            return bw_broker.effective_limit(
+                self.task.get("id"), bw,
+                weight=float((self.task.get("extra_options") or {}).get("bw_weight") or 1.0)
+                if isinstance(self.task.get("extra_options"), dict) else 1.0)
+        except Exception:  # noqa: BLE001
+            return bw
 
     def _pv_throttle(self) -> List[str]:
         """返回 pv 限速管道片段（KB/s → 字节/秒）。

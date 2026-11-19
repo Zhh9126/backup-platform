@@ -658,6 +658,32 @@
     </table>
   </div>
 </div>
+<!-- 并发带宽分配（Max-Min 公平仲裁，只读展示） -->
+<div class="page-card mt-3">
+  <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
+    <h6 class="mb-0"><i class="bi bi-speedometer me-1"></i>并发带宽分配（Max-Min 公平仲裁）</h6>
+    <div class="d-flex align-items-center gap-2">
+      <span class="badge bg-secondary" id="bwState">未知</span>
+      <button class="btn btn-sm btn-outline-secondary" onclick="bwLoad()">
+        <i class="bi bi-arrow-clockwise me-1"></i>刷新
+      </button>
+    </div>
+  </div>
+  <p class="text-muted small mb-2">
+    配置 <code>global_bandwidth_kbps</code> 后，多任务并发时按权重公平分配总出口配额：需求低于份额的任务先满足，剩余额度留在池中。未配置时按各任务自身的限速执行。
+  </p>
+  <div class="table-responsive">
+    <table class="table table-sm align-middle mb-0">
+      <thead>
+        <tr><th>任务</th><th>任务限速 (KB/s)</th><th>实得额度 (KB/s)</th><th>空闲 (s)</th></tr>
+      </thead>
+      <tbody id="bwBody">
+        <tr><td colspan="4" class="text-center text-muted py-3">加载中…</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="small text-muted mt-2" id="bwNote"></div>
+</div>
 <script>
 (function () {
   function esc(s) {
@@ -698,10 +724,46 @@
         }
       });
   };
+  window.bwLoad = function () {
+    fetch('/api/bw-broker', {credentials: 'same-origin'})
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var st = document.getElementById('bwState');
+        if (st) {
+          st.textContent = d.enabled
+            ? ('已启用 · 配额 ' + d.global_quota_kbps + ' KB/s')
+            : '未启用（按任务限速）';
+          st.className = 'badge ' + (d.enabled ? 'bg-success' : 'bg-secondary');
+        }
+        var rows = (d.active || []).map(function (r) {
+          return '<tr><td>#' + esc(r.task_id) +
+                 '</td><td class="font-code small">' + esc(r.task_limit_kbps) +
+                 '</td><td class="font-code small">' + esc(r.allocated_kbps) +
+                 '</td><td class="small">' + esc(r.idle_sec) + '</td></tr>';
+        }).join('');
+        var body = document.getElementById('bwBody');
+        if (body) {
+          body.innerHTML = rows ||
+            '<tr><td colspan="4" class="text-center text-muted py-3">暂无活跃备份任务</td></tr>';
+        }
+        var note = document.getElementById('bwNote');
+        if (note) { note.textContent = d.note || ''; }
+      })
+      .catch(function (e) {
+        var body = document.getElementById('bwBody');
+        if (body) {
+          body.innerHTML = '<tr><td colspan="4" class="text-danger">加载失败：' + esc(e) + '</td></tr>';
+        }
+      });
+  };
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', window.htLoad);
+    document.addEventListener('DOMContentLoaded', function () {
+      window.htLoad();
+      window.bwLoad();
+    });
   } else {
     window.htLoad();
+    window.bwLoad();
   }
 })();
 </script>

@@ -4526,7 +4526,13 @@ window.I18N = (function () {
     "检查项": "Item",
     "当前值": "Current",
     "说明 / 执行命令": "Notes / command",
-    "重新检测": "Re-check"
+    "重新检测": "Re-check",
+    "并发带宽分配（Max-Min 公平仲裁）": "Concurrent bandwidth allocation (Max-Min fair share)",
+    "任务限速 (KB/s)": "Task limit (KB/s)",
+    "实得额度 (KB/s)": "Granted (KB/s)",
+    "空闲 (s)": "Idle (s)",
+    "配置": "Configure",
+    "后，多任务并发时按权重公平分配总出口配额：需求低于份额的任务先满足，剩余额度留在池中。未配置时按各任务自身的限速执行。": " — once set, concurrent jobs share the total egress quota by weight: jobs needing less than their share are satisfied first and the remainder stays in the pool. Without it, each job uses its own limit."
   });
 
   var PREFIXES = [

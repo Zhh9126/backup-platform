@@ -4528,6 +4528,7 @@ window.I18N = (function () {
     "说明 / 执行命令": "Notes / command",
     "重新检测": "Re-check",
     "并发带宽分配（Max-Min 公平仲裁）": "Concurrent bandwidth allocation (Max-Min fair share)",
+    "全局出口带宽配额（KB/s，0 = 不限制）": "Global egress bandwidth quota (KB/s, 0 = unlimited)",
     "任务限速 (KB/s)": "Task limit (KB/s)",
     "实得额度 (KB/s)": "Granted (KB/s)",
     "空闲 (s)": "Idle (s)",

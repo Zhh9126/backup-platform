@@ -1564,6 +1564,16 @@ def api_get_concurrency():
         engine_parallel = parallel_plan.refresh_now()
     except Exception as exc:  # noqa: BLE001
         engine_parallel = {"error": str(exc)}
+    # 全局带宽配额（PB 级方案 §5.1 Max-Min 仲裁）：0/未配置 = 不启用
+    try:
+        bw_quota = int(db.get_system_config("global_bandwidth_kbps") or 0)
+    except (TypeError, ValueError):
+        bw_quota = 0
+    try:
+        from core import bw_broker as _bw
+        bw_state = _bw.snapshot()
+    except Exception as exc:  # noqa: BLE001
+        bw_state = {"error": str(exc)}
     return jsonify({
         "max_concurrent_backups": stats.get("max_concurrent_backups", 2),
         "env_override": env_override or None,
@@ -1571,6 +1581,8 @@ def api_get_concurrency():
         "range": [1, 64],
         "stats": stats,
         "engine_parallel": engine_parallel,
+        "global_bandwidth_kbps": bw_quota,
+        "bandwidth": bw_state,
     })
 
 
@@ -1588,6 +1600,19 @@ def api_set_concurrency():
         return jsonify({"error": "max_concurrent_backups 必须在 1-64 之间"}), 400
     stats = scheduler.set_concurrency_limit(limit)
     env_override = int(getattr(config, "MAX_CONCURRENT_BACKUPS", 0) or 0)
+
+    # 可选：同请求设置全局带宽配额（KB/s，0=关闭仲裁）
+    bw_saved = None
+    if "global_bandwidth_kbps" in data:
+        try:
+            bw = int(data.get("global_bandwidth_kbps") or 0)
+        except (TypeError, ValueError):
+            return jsonify({"error": "global_bandwidth_kbps 必须是整数（KB/s，0 表示不限）"}), 400
+        if bw < 0 or bw > 10485760:      # 上限 10 GB/s，防误填天文数字
+            return jsonify({"error": "global_bandwidth_kbps 须在 0-10485760 之间"}), 400
+        db.set_system_config("global_bandwidth_kbps", bw)
+        bw_saved = bw
+
     return jsonify({
         "ok": True,
         "max_concurrent_backups": limit,
@@ -1595,4 +1620,5 @@ def api_set_concurrency():
         "warning": ("环境变量 AIDBM_MAX_CONCURRENT_BACKUPS 优先级更高，"
                     "界面配置当前不会生效") if env_override else None,
         "stats": stats,
+        "global_bandwidth_kbps": bw_saved,
     })

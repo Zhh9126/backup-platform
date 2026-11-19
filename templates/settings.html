@@ -1127,6 +1127,14 @@ document.addEventListener("DOMContentLoaded", function () {
       <div class="form-text mt-1" id="cc_result"></div>
     </div>
     <div class="col-md-4">
+      <label class="form-label small">全局出口带宽配额（KB/s，0 = 不限制）</label>
+      <div class="d-flex gap-2">
+        <input type="number" min="0" max="10485760" class="form-control form-control-sm" id="cc_bw">
+        <button class="btn btn-primary btn-sm" id="bwSaveBtn">保存</button>
+      </div>
+      <div class="form-text mt-1" id="bw_result"></div>
+    </div>
+    <div class="col-md-4">
       <label class="form-label small">首次登录强制修改默认口令</label>
       <div class="form-check form-switch">
         <input class="form-check-input" type="checkbox" id="pcp_enabled">
@@ -1149,6 +1157,7 @@ document.addEventListener("DOMContentLoaded", async function () {
     try {
       const r = await (await fetch("/api/system/concurrency", { credentials: "include" })).json();
       if ($s("cc_limit")) $s("cc_limit").value = r.max_concurrent_backups || 2;
+      if ($s("cc_bw")) $s("cc_bw").value = r.global_bandwidth_kbps || 0;
       const st = r.stats || {};
       if ($s("cc_stats")) $s("cc_stats").textContent =
         "当前上限 " + (r.max_concurrent_backups || 2) + " · 队列中 " + (st.submitted || 0) +
@@ -1173,6 +1182,25 @@ document.addEventListener("DOMContentLoaded", async function () {
       })).json();
       res.textContent = r.error ? ("保存失败: " + r.error)
         : ("已保存，实际生效上限 " + r.effective + "（无需重启）");
+      res.className = "form-text mt-1 " + (r.error ? "text-danger" : "text-success");
+      loadSec();
+    } catch (e) { res.textContent = "保存失败: " + e; }
+  });
+  $s("bwSaveBtn")?.addEventListener("click", async () => {
+    const res = $s("bw_result");
+    try {
+      const r = await (await fetch("/api/system/concurrency", {
+        method: "PUT", credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          max_concurrent_backups: Number($s("cc_limit").value) || 2,
+          global_bandwidth_kbps: Number($s("cc_bw").value) || 0,
+        }),
+      })).json();
+      res.textContent = r.error ? ("保存失败: " + r.error)
+        : (r.global_bandwidth_kbps
+            ? ("已启用全局配额 " + r.global_bandwidth_kbps + " KB/s，多任务按权重公平分配")
+            : "已关闭全局配额，按各任务自身限速执行");
       res.className = "form-text mt-1 " + (r.error ? "text-danger" : "text-success");
       loadSec();
     } catch (e) { res.textContent = "保存失败: " + e; }

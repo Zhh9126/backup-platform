@@ -23,6 +23,7 @@
 | §7.1 熵 + 卡方双判据识别密文 | 熵 > 7.95 时追加字节分布卡方检验，χ²∈[195,315]（自由度 255 的 ±2.6σ）标注「分布均匀，符合密文特征」，偏离则如实说明；作为量化证据而非独立阈值（高熵本身已告警） | `core/backup_anomaly.py` `sample_chi_square()` |
 | §7.1 FastCDC 可变长分块（Gear hash + 归一化掩码） | `core/fastcdc.py`：纯 Python 实现（离线无新增原生依赖），min/avg/max 约束、内容定义边界；`estimate_reuse()` 对比「固定块 vs 可变长块」跨版复用率 | `tests/test_fastcdc.py` 8 项（实测：头部变长插入场景可变长块复用率 >70%，固定块 <30%） |
 | §3.2 内核 / IO 调优 | `core/host_tuning.py`：只读检查 8 项 sysctl、逐盘 IO 调度器（NVMe→none / HDD→mq-deadline）、io_uring 可用性、挂载 noatime、磁盘水位；给出可直接复制的命令，**平台绝不自动改系统参数** | `GET /api/host-tuning`、`/api/host-tuning/recommend`；存储管理页「主机内核 / IO 调优诊断」卡片；`tests/test_host_tuning.py` 6 项 |
+| §5.1 全局带宽 Max-Min 公平仲裁 | `core/bw_broker.py`：全局配额 `global_bandwidth_kbps` 按权重水填充分配，需求低于份额的任务先满足、剩余额度留在池中、单任务有 64 KB/s 保底、5s 重算、120s 无活跃自动剔除；未配置时完全沿用任务级限速（**零行为变化**） | `core/engines/base.py` 的 `bandwidth_limit` 统一接入（所有引擎继承）；`GET /api/bw-broker`；设置页「全局出口带宽配额」输入、存储页「并发带宽分配」卡片；`tests/test_bw_broker.py` 12 项 |
 
 ### 为什么要 FastCDC（真实教训）
 
@@ -53,8 +54,7 @@
 
 ## 五、后续路线（按投入产出排序）
 
-1. **P0 全局带宽 Max-Min 仲裁**：多任务并发时按权重分配总带宽（当前只有任务级限速）。
-2. **P1 NAS 快照差量适配层**：先做能力探测（阵列型号/API 可达性）与接口契约，拿到真机再实现，避免空承诺。
+1. **P1 NAS 快照差量适配层**：先做能力探测（阵列型号/API 可达性）与接口契约，拿到真机再实现，避免空承诺。
 3. **P1 FastCDC 接入去重主链路**：把 `estimate_reuse` 的测算能力升级为「可变长块账本 + 按需重组」，需先解决 Python 吞吐（可用 C 扩展或 Rust 扩展，但必须随离线包分发）。
 4. **P2 调度 DAG 可视化**：把 runbook 步骤依赖在页面上以图呈现（现为列表 + 顺序执行）。
 

@@ -165,4 +165,63 @@
 <div class="alert alert-info mt-3" role="alert">
   <i class="bi bi-info-circle"></i> <strong>演练机制</strong>：参考论文《标准化容灾演练体系》，核心系统建议<strong>每季度一次全流程切换演练</strong>，重要系统每半年一次。演练自动验证备份有效性并生成评分报告，得分<60 需立即整改。
 </div>
+<!-- 净室沙箱能力（只读探测，避免承诺做不到的隔离级别） -->
+<div class="page-card mt-3">
+  <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
+    <div class="card-section-title mb-0"><i class="bi bi-box-seam"></i> 净室沙箱能力（只读探测）</div>
+    <span class="badge bg-secondary" id="sbLevel">探测中…</span>
+  </div>
+  <p class="text-muted small mb-2">
+    平台演练当前是<strong>库级/文件级隔离</strong>（恢复到临时库或临时目录，校验后销毁），不依赖下列能力；这里只如实展示宿主机是否具备 netns / KVM / NBD / iSCSI。
+  </p>
+  <div class="table-responsive">
+    <table class="table table-sm mb-0">
+      <thead><tr><th>能力</th><th>状态</th><th>说明</th></tr></thead>
+      <tbody id="sbBody">
+        <tr><td colspan="3" class="text-muted text-center py-3">加载中…</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="small text-muted mt-2" id="sbNote"></div>
+</div>
+<script>
+(function () {
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+      return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c];
+    });
+  }
+  fetch('/api/sandbox/capability', {credentials: 'same-origin'})
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      var lv = document.getElementById('sbLevel');
+      if (lv) {
+        lv.textContent = '宿主能力：' + (d.isolation_level || '-') +
+                         ' · 当前演练：' + (d.current_drill_level || '-');
+        lv.className = 'badge bg-info text-dark';
+      }
+      var rows = (d.checks || []).map(function (c) {
+        var b = c.available
+          ? '<span class="badge bg-success">可用</span>'
+          : '<span class="badge bg-secondary">不可用</span>';
+        return '<tr><td>' + esc(c.name) + '</td><td>' + b + '</td>' +
+               '<td class="small">' + esc(c.reason) +
+               '<div class="text-muted">' + esc(c.hint || '') + '</div></td></tr>';
+      }).join('');
+      var body = document.getElementById('sbBody');
+      if (body) {
+        body.innerHTML = rows ||
+          '<tr><td colspan="3" class="text-muted text-center">无探测项</td></tr>';
+      }
+      var note = document.getElementById('sbNote');
+      if (note) { note.textContent = d.note || ''; }
+    })
+    .catch(function (e) {
+      var body = document.getElementById('sbBody');
+      if (body) {
+        body.innerHTML = '<tr><td colspan="3" class="text-danger">探测失败：' + esc(e) + '</td></tr>';
+      }
+    });
+})();
+</script>
 {% endblock %}

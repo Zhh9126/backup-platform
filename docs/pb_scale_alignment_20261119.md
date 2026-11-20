@@ -69,6 +69,18 @@
 - 移走原产物后调用恢复入口 → 自动回填，**回填文件 sha256 与原产物一致**；
 - 原产物恢复原位，块存储占用 3.6 MB。
 
+### 净室沙箱能力探测（§6，只探测不承诺）
+
+`core/sandbox_probe.py` 探测宿主是否具备 netns / KVM / NBD / iSCSI：
+- netns 真建一次命名空间再立即删除（确认 CAP_NET_ADMIN），失败如实报原因；
+- KVM 看 `/dev/kvm` 可读写；NBD 看设备/模块；iSCSI 看 targetcli/tgtd；
+- 结论区分「宿主能力（isolation_level）」与「平台当前演练级别（db-level）」，
+  页面明确写"平台演练是库级/文件级隔离，不依赖上述能力"——**不把宿主能力
+  包装成已实现的净室沙箱**。
+
+本机实测：netns 可用、KVM/NBD/iSCSI 不可用 → isolation_level=netns，
+current_drill_level=db-level；演练页「净室沙箱能力（只读探测）」卡片展示。
+
 ### Runbook DAG 依赖图（§5.2 入度推进）
 
 `core/runbook.py` 的步骤新增 `depends_on`（依赖的步骤号列表）：

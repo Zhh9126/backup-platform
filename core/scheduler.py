@@ -876,6 +876,40 @@ def _restore_precheck_enabled() -> bool:
         return True
 
 
+def _materialize_from_chunk_store(rec: dict) -> dict:
+    """产物缺失但存在分块存储清单时，回填还原到本地缓存。
+
+    对标 PB 级方案「块级可重组」：原产物被保留策略清理后，只要块存储里还有
+    清单与块，恢复/校验链路就能无损继续（引擎侧完全无感——它只看到一个
+    存在的文件路径）。失败时如实写日志并返回原记录，由后续逻辑报"产物不存在"。
+    """
+    try:
+        mid = (rec or {}).get("chunk_manifest_id")
+        if not mid:
+            return rec
+        p = rec.get("backup_path") or ""
+        if p and os.path.isfile(p):
+            return rec
+        from core import chunk_store
+        cache_dir = os.path.join(getattr(config, "BACKUP_ROOT", "") or "",
+                                 "chunk_store", "restored")
+        out = os.path.join(cache_dir, "%s_%s" % (rec.get("id"),
+                                                 os.path.basename(p or "artifact")))
+        res = chunk_store.restore_file(mid, out)
+        if not res.get("ok"):
+            _logger.warning("[chunk_store] 记录 %s 由块存储回填失败（缺块/损坏）: %s",
+                            rec.get("id"), res)
+            return rec
+        _logger.info("[chunk_store] 记录 %s 已由块存储回填: %s", rec.get("id"), out)
+        rec = dict(rec)
+        rec["backup_path"] = out
+        rec["chunk_restored"] = True
+        return rec
+    except Exception as exc:  # noqa: BLE001 - 回填失败不阻断后续如实报错
+        _logger.warning("[chunk_store] 回填异常 record=%s: %s", (rec or {}).get("id"), exc)
+        return rec
+
+
 def run_restore_now(record_id: int, target_host: str = None,
                     target_host_id: int = None, target_db: str = None,
                     target_port: int = None,
@@ -901,6 +935,8 @@ def run_restore_now(record_id: int, target_host: str = None,
     rec = models.get_record(record_id)
     if not rec:
         return None
+    # 分块压缩存储回填：产物已被清理但块清单仍在 → 先还原到缓存再走正常恢复
+    rec = _materialize_from_chunk_store(rec)
     # 防勒索闭环 ②：恢复统一安全门（覆盖 API / 调度 / 演练 / CLI 全部入口）。
     # 可疑/漂移/隔离产物默认拒绝；RansomwareBlocked 是 ValueError 子类，
     # 既有调用方的业务异常捕获仍生效，但会带结构化原因。

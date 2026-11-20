@@ -557,7 +557,8 @@ CREATE TABLE IF NOT EXISTS backup_records (
     security_checked_at TEXT,                    -- 最近一次安全检测时间
     security_detail TEXT,                        -- 检测逐项结果(JSON)
     quarantined   INTEGER DEFAULT 0,             -- 可疑产物逻辑隔离（禁止恢复/下载）
-    fs_immutable  INTEGER DEFAULT 0              -- 内核级 chattr +i 是否生效
+    fs_immutable  INTEGER DEFAULT 0,             -- 内核级 chattr +i 是否生效
+    chunk_manifest_id TEXT                       -- 分块压缩存储清单（产物缺失时可回填）
 );
 
 CREATE TABLE IF NOT EXISTS restore_records (
@@ -1659,6 +1660,11 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
             # 迁移：storage_tier 列
             try:
                 conn.execute("ALTER TABLE backup_records ADD COLUMN storage_tier TEXT DEFAULT 'local'")
+            except Exception:
+                pass
+            # 迁移：分块压缩存储清单（产物被 GC 后可由此回填还原）
+            try:
+                conn.execute("ALTER TABLE backup_records ADD COLUMN chunk_manifest_id TEXT")
             except Exception:
                 pass
             # 迁移：data_compare_tasks 分块/强制 PK 列（models 字段同步）

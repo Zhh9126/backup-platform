@@ -90,6 +90,12 @@ def chunk_store_store():
         rep = chunk_store.store_file(path)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": "写入块存储失败: %s" % exc}), 500
+    # 回写清单 ID：原产物日后被保留策略清理时，恢复入口可自动回填
+    try:
+        db.execute("UPDATE backup_records SET chunk_manifest_id=? WHERE id=?",
+                   (rep["manifest_id"], int(rid)))
+    except Exception as exc:  # noqa: BLE001
+        rep["warning"] = "块已写入但回写清单 ID 失败: %s" % exc
     rep["record_id"] = int(rid)
     return jsonify(rep)
 

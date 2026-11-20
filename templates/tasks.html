@@ -421,6 +421,19 @@ gunzip -c $PLATFORM_BACKUP_FILE | mysql -h $PLATFORM_DB_HOST -u $PLATFORM_DB_USE
                   </div>
                 </div>
                 <div class="col-12 mt-2">
+                  <div class="form-check">
+                    <input class="form-check-input" type="checkbox" id="t_chunk_store">
+                    <label class="form-check-label" for="t_chunk_store">
+                      备份产物块化入库（产物被清理后仍可回填恢复）
+                    </label>
+                    <div class="small text-muted">
+                      备份成功后在后台把产物按内容分块、逐块压缩写入容器存储，并记录清单；
+                      产物被保留策略清理后，恢复入口会自动回填。产物超过 512MB 自动跳过
+                      （纯 Python 分块吞吐约 3MB/s，不影响备份结果本身）。
+                    </div>
+                  </div>
+                </div>
+                <div class="col-12 mt-2">
                   <label class="form-label">远端暂存目录（可选，全数据库类型生效）</label>
                   <input class="form-control form-control-sm font-monospace" id="t_backup_stage_dir"
                          placeholder="如 /data/aidbm_stage（留空 = 数据库服务器 /tmp/bk_stage）">

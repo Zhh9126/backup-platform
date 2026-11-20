@@ -1730,6 +1730,7 @@
     if ($("t_rman_channels")) $("t_rman_channels").value = "";
     if ($("t_engine_parallel")) $("t_engine_parallel").value = "";
     if ($("t_parallel_pull")) $("t_parallel_pull").checked = false;
+    if ($("t_chunk_store")) $("t_chunk_store").checked = false;
     if ($("t_backup_stage_dir")) $("t_backup_stage_dir").value = "";
     if ($("t_auto_discover")) $("t_auto_discover").checked = false;
     toggleSshFields();
@@ -1749,6 +1750,7 @@
     if ($("t_rman_channels")) $("t_rman_channels").value = eo.rman_channels ? String(eo.rman_channels) : "";
     if ($("t_engine_parallel")) $("t_engine_parallel").value = (eo.engine_parallel !== undefined && eo.engine_parallel !== null && eo.engine_parallel !== "") ? String(eo.engine_parallel) : "";
     if ($("t_parallel_pull")) $("t_parallel_pull").checked = !!eo.parallel_pull;
+    if ($("t_chunk_store")) $("t_chunk_store").checked = !!eo.chunk_store_enabled;
     if ($("t_backup_stage_dir")) $("t_backup_stage_dir").value = eo.backup_stage_dir || "";
     if ($("t_auto_discover")) $("t_auto_discover").checked = !!eo.auto_discover_new_dbs;
     if ($("t_hot_copy_tablespaces")) $("t_hot_copy_tablespaces").value = eo.hot_copy_tablespaces || "";
@@ -1807,6 +1809,14 @@
     // P1-5：备份片并行拉回
     if ($("t_parallel_pull") && $("t_parallel_pull").checked) eo.parallel_pull = true;
     else delete eo.parallel_pull;
+    // 分块存储转存（产物被保留策略清理后可自动回填）
+    if ($("t_chunk_store") && $("t_chunk_store").checked) {
+      eo.chunk_store_enabled = true;
+      eo.chunk_store_mode = "container";
+    } else {
+      delete eo.chunk_store_enabled;
+      delete eo.chunk_store_mode;
+    }
     // Oracle 非归档应急热备（hot_copy）：表空间清单（空 = 全库）
     const hct = ($("t_hot_copy_tablespaces") && $("t_hot_copy_tablespaces").value.trim()) || "";
     if (hct) eo.hot_copy_tablespaces = hct;

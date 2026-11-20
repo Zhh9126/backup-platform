@@ -734,6 +734,13 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
             _logger.warning("[immutability] 自动锁定失败 record=%s: %s",
                             rec_id, e)
 
+    # 分块存储转存（可选）：任务开启 extra_options.chunk_store_enabled 时，
+    # 备份成功后在后台把产物块化入库，供"产物被清理后回填"使用。
+    # 绝不阻塞/影响备份结果——失败只写 WARNING。
+    if result.success and not is_sim and path:
+        _maybe_chunk_store(task, rec_id, path,
+                           int(getattr(result, "size_bytes", 0) or 0))
+
     models.set_task_status(task["id"], finished, status)
 
     if result.success and path:
@@ -874,6 +881,64 @@ def _restore_precheck_enabled() -> bool:
             .strip().lower() not in ("0", "false", "off", "no")
     except Exception:
         return True
+
+
+def _maybe_chunk_store(task: dict, rec_id: int, path: str, size: int,
+                       sync: bool = False):
+    """备份成功后把产物转存进块存储（任务级开关，默认关闭）。
+
+    开关：``extra_options.chunk_store_enabled``（1/true）；
+    模式：``chunk_store_mode`` = container（默认，64MB 封箱）| blob；
+    阈值：``chunk_store_max_mb``（默认 512，超过跳过——纯 Python 吞吐有限）。
+
+    转存成功后回写 ``backup_records.chunk_manifest_id``，产物被保留策略清理后
+    恢复入口可自动回填。整个过程后台执行，失败只写 WARNING。
+    """
+    try:
+        eo = task.get("extra_options") or {}
+        if isinstance(eo, str):
+            import json as _json
+            eo = _json.loads(eo) if eo.strip() else {}
+        if not eo.get("chunk_store_enabled"):
+            return None
+        try:
+            _raw_max = eo.get("chunk_store_max_mb")
+            # 0 表示「不限制」（配置项存在但为 0 不能被 `or 512` 吞掉）
+            limit_mb = 512 if _raw_max in (None, "") else int(_raw_max)
+        except (TypeError, ValueError):
+            limit_mb = 512
+        if limit_mb and size and size > limit_mb * 1024 * 1024:
+            _logger.info("[chunk_store] 产物 %.1fMB 超过阈值 %dMB，跳过转存 record=%s",
+                         size / 1048576.0, limit_mb, rec_id)
+            return None
+        mode = str(eo.get("chunk_store_mode") or "container").lower()
+
+        def _run():
+            try:
+                if mode == "blob":
+                    from core import chunk_store as cs
+                    rep = cs.store_file(path)
+                else:
+                    from core import container_store as cst
+                    rep = cst.store_file(path)
+                db.execute("UPDATE backup_records SET chunk_manifest_id=? WHERE id=?",
+                           (rep["manifest_id"], rec_id))
+                _logger.info(
+                    "[chunk_store] 记录 %s 已转存（%s）：%s 块，%.1fMB → %.1fMB",
+                    rec_id, mode, rep["chunks"],
+                    rep["raw_bytes"] / 1048576.0, rep["comp_bytes"] / 1048576.0)
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning("[chunk_store] 转存失败 record=%s: %s", rec_id, exc)
+
+        if sync:
+            _run()
+            return None
+        th = threading.Thread(target=_run, name="chunk-store-%s" % rec_id, daemon=True)
+        th.start()
+        return th
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("[chunk_store] 转存调度异常 record=%s: %s", rec_id, exc)
+        return None
 
 
 def _materialize_from_chunk_store(rec: dict) -> dict:

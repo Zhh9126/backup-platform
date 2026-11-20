@@ -4532,6 +4532,8 @@ window.I18N = (function () {
     "分块去重测算（可变长 vs 固定块）": "Chunk dedup estimate (variable-length vs fixed block)",
     "测算": "Estimate",
     "分块存储：加载中…": "Chunk store: loading…",
+    "备份产物块化入库（产物被清理后仍可回填恢复）": "Store artifacts in chunk form (recoverable after cleanup)",
+    "备份成功后在后台把产物按内容分块、逐块压缩写入容器存储，并记录清单；\n                      产物被保留策略清理后，恢复入口会自动回填。产物超过 512MB 自动跳过\n                      （纯 Python 分块吞吐约 3MB/s，不影响备份结果本身）。": "After a successful backup, the artifact is split by content, compressed block by block into container storage and recorded in a manifest in the background. If the artifact is later removed by retention, the restore entry point refills it automatically. Artifacts over 512 MB are skipped (pure-Python chunking is ~3 MB/s and never affects the backup result itself).",
     "选一个任务，测算它最近两次成功备份产物之间的可复用块占比。可变长分块命中率明显更高，说明启用分块去重能真正省下带宽与存储；压缩产物因字节整体移位，固定块命中率通常极低。": "Pick a task to estimate the reusable chunk ratio between its two latest successful backups. A clearly higher variable-length hit rate means chunk dedup really saves bandwidth and storage; for compressed artifacts the fixed-block rate is usually near zero because bytes shift wholesale.",
     "任务限速 (KB/s)": "Task limit (KB/s)",
     "实得额度 (KB/s)": "Granted (KB/s)",

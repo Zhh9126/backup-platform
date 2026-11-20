@@ -45,6 +45,18 @@
 
 即：用 5.7% 的体积代价，换到"跨版本只传变化块"的能力（对齐方案 §4 的密文块直通前提）。
 
+### 备份产物自动块化入库（任务级开关）
+
+任务高级选项勾选「备份产物块化入库」后（`extra_options.chunk_store_enabled`），
+备份成功即在**后台**把产物分块、逐块压缩写入容器存储并回写
+`backup_records.chunk_manifest_id`；产物被保留策略清理后恢复入口自动回填。
+默认关闭；`chunk_store_max_mb`（默认 512，显式 0 = 不限制）超过阈值跳过，
+避免拖垮大库备份；转存异常只写 WARNING，绝不影响备份结果本身。
+
+真实闭环验证（任务 732，MySQL 逻辑备份）：
+备份 success（857 B）→ 日志「记录 456 已转存（container）：1 块」→
+`chunk_manifest_id=20261120095208_12b9cf40` → 块存储 blocks_indexed 8→9。
+
 ### 产物被清理后的自动回填（块级可重组）
 
 `backup_records.chunk_manifest_id` 记录块清单：原产物被保留策略清理后，恢复入口

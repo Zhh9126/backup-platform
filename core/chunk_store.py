@@ -113,6 +113,11 @@ def _atomic_write(path: str, data: bytes):
     os.replace(tmp, path)
 
 
+def has_block(fp: str, store_root: str = "") -> bool:
+    """本端是否已存在该块（供跨站点「指纹探路」应答使用）。"""
+    return os.path.isfile(_blob_path(_root(store_root), str(fp)))
+
+
 def store_file(path: str, store_root: str = "", chunk_opts: dict = None,
                max_bytes: int = 512 * 1024 * 1024) -> dict:
     """把一个文件按 CDC 分块、逐块压缩后写入内容寻址存储。

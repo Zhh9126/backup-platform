@@ -100,6 +100,77 @@ def chunk_store_store():
     return jsonify(rep)
 
 
+@api_bp.route("/chunk-store/have", methods=["POST"])
+@login_required
+def chunk_store_have():
+    """指纹探路应答：对端告诉源端「这些块我已有哪些」（返回位图）。
+
+    跨站点复制时由目标端调用（或目标端部署同款平台，源端直接请求）。
+    单批上限 16384 个指纹（约 512KB），超出请分批。
+    """
+    payload = request.get_json(silent=True) or {}
+    fps = payload.get("fps") or []
+    if not isinstance(fps, list):
+        return jsonify({"ok": False, "error": "fps 必须是数组"}), 400
+    if len(fps) > 16384:
+        return jsonify({"ok": False,
+                        "error": "单批最多 16384 个指纹，请分批探路"}), 400
+    from core import block_transfer
+    # 本端「已有」= 块存储中实际存在的块
+    have = [str(fp) for fp in fps if chunk_store.has_block(str(fp))]
+    res = block_transfer.have_bitmap(have, [str(x) for x in fps])
+    res["ok"] = True
+    res["blocks_on_disk"] = len(have)
+    return jsonify(res)
+
+
+@api_bp.route("/chunk-store/transfer-plan", methods=["POST"])
+@login_required
+def chunk_store_transfer_plan():
+    """生成增量传输计划（两份清单 → 缺失块区间 + 节省率）。"""
+    from core import block_transfer
+    payload = request.get_json(silent=True) or {}
+    src = payload.get("source_manifest")
+    tgt = payload.get("target_manifest")
+    if not src or not tgt:
+        return jsonify({"ok": False,
+                        "error": "source_manifest 与 target_manifest 必填"}), 400
+    try:
+        plan = block_transfer.plan_transfer(src, tgt,
+                                           batch=int(payload.get("batch") or block_transfer.BATCH))
+    except FileNotFoundError:
+        return jsonify({"ok": False, "error": "清单不存在"}), 404
+    plan["transfer_human"] = db.human_size(plan.get("transfer_comp_bytes", 0))
+    plan["total_human"] = db.human_size(plan.get("target_total_comp_bytes", 0))
+    return jsonify(plan)
+
+
+@api_bp.route("/chunk-store/apply-bitmap", methods=["POST"])
+@login_required
+def chunk_store_apply_bitmap():
+    """按对端返回的位图生成区间计划（真实跨站点路径）。"""
+    from core import block_transfer
+    payload = request.get_json(silent=True) or {}
+    mid = payload.get("target_manifest")
+    bitmap = payload.get("bitmap")
+    if not mid or bitmap is None:
+        return jsonify({"ok": False,
+                        "error": "target_manifest 与 bitmap 必填"}), 400
+    try:
+        man = chunk_store.load_manifest(mid)
+    except FileNotFoundError:
+        return jsonify({"ok": False, "error": "清单不存在"}), 404
+    fps = [c["fp"] for c in man["chunks"]]
+    src_map = {c["fp"]: c for c in man["chunks"]}
+    try:
+        plan = block_transfer.apply_bitmap(fps, str(bitmap), src_map)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    plan["ok"] = True
+    plan["transfer_human"] = db.human_size(plan.get("transfer_comp_bytes", 0))
+    return jsonify(plan)
+
+
 @api_bp.route("/chunk-store/gc", methods=["POST"])
 @permission_required("system.settings")
 def chunk_store_gc():

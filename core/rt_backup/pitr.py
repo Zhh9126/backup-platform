@@ -32,6 +32,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import config
@@ -88,15 +89,14 @@ def normalize_ts(ts: str) -> str:
     s = (ts or "").strip()
     if not s:
         return db.now_iso()
-    s = s.replace(" ", "T", 1)
-    if _NAIVE_TS_RE.match(s):
-        try:
-            offset = db.now_iso()[-6:]      # 形如 +08:00
-        except Exception:
-            offset = ""
-        if offset and (offset[0] in "+-" and ":" in offset):
-            return s + offset
-    return s
+    local_zone = datetime.fromisoformat(db.now_iso()).tzinfo
+    try:
+        value = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=local_zone)
+        return value.astimezone(local_zone).isoformat(timespec="seconds")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("恢复时间点不是有效的 ISO 日期时间") from exc
 
 
 class PITRRestore:
@@ -135,11 +135,16 @@ class PITRRestore:
         earliest = self.journal.list_points(task_id, limit=1, order="asc")
         latest = self.journal.latest(task_id)
         total = self.journal.count(task_id)
+        # Bounded UI scan. Mark truncation explicitly rather than inventing a complete window.
+        points = self.journal.list_points(task_id, limit=10000, order="asc")
+        coverage = self.journal.coverage_segments(points)
         return {
             "task_id": task_id,
             "earliest": earliest[0].pit_at if earliest else "",
             "latest": latest.pit_at if latest else "",
             "total": total,
+            "coverage_segments": coverage["segments"], "coverage_gaps": coverage["gaps"],
+            "coverage_truncated": total > len(points), "coverage_validation": "metadata_only",
             "kind": (KIND_DB_LOG
                      if self.journal.count(task_id, kind=RP_DB_LOG) > 0
                      else KIND_FILE),
@@ -170,6 +175,10 @@ class PITRRestore:
                                gap_reason=f"任务 {task_id} 不存在")
 
         rt_cfg = RtConfig.from_task(task)
+        # Empty means latest captured point, not the current wall clock beyond captured logs.
+        if not target_ts:
+            latest = self.journal.latest(task_id)
+            target_ts = latest.pit_at if latest else ""
         target_ts = normalize_ts(target_ts)
 
         chain = self.journal.resolve_chain(task_id, target_ts)
@@ -180,6 +189,9 @@ class PITRRestore:
         else:
             ok, reason = self._quick_validate(chain)
 
+        if ok and kind == KIND_DB_LOG and chain:
+            if datetime.fromisoformat(target_ts) > datetime.fromisoformat(normalize_ts(chain[-1].pit_at)):
+                ok, reason = False, "目标时间超出已封存日志覆盖范围，请等待日志捕获或选择较早时间"
         base_point = chain[0] if (chain and chain[0].is_full) else None
         archives: List[str] = [p.object_key for p in chain if p.object_key]
         stop_file, stop_pos, stop_lsn = self._stop_position(chain)
@@ -229,16 +241,7 @@ class PITRRestore:
     @staticmethod
     def _quick_validate(chain: List[RecoveryPoint]) -> Tuple[bool, str]:
         """结构级快速校验：只看链头是否为全量、产物路径是否登记。"""
-        if not chain:
-            return False, "恢复链为空：该时间点之前没有任何可用恢复点"
-        head = chain[0]
-        if not head.is_full:
-            return False, (f"链头缺失基准全量：最早可用点 {head.id} 为 "
-                           f"{head.rp_kind}，请选择更晚的时间点")
-        missing = [p for p in chain if p.storage_tier == 1 and not p.object_key]
-        if missing:
-            return False, f"{len(missing)} 个恢复点未登记产物路径"
-        return True, ""
+        return RecoveryJournal().validate_chain(chain, check_artifacts=False)
 
     @staticmethod
     def _stop_position(chain: List[RecoveryPoint]) -> Tuple[str, int, str]:
@@ -254,6 +257,7 @@ class PITRRestore:
             elif point.wal_lsn:
                 stop_lsn = point.wal_lsn
         return stop_file, stop_pos, stop_lsn
+
 
     # ==================================================================
     # 恢复执行
@@ -319,6 +323,10 @@ class PITRRestore:
             outcome = {"ok": False, "message": f"恢复异常: {exc}",
                        "simulated": False}
 
+        if force and not plan.complete and outcome.get("ok"):
+            outcome["partial_recovery"] = True
+            outcome["ok"] = False
+            outcome["message"] = "已执行尽力恢复，但恢复链不完整，无法确认达到目标时间点"
         duration = round(time.time() - t0, 3)
         status = ST_SUCCESS if outcome.get("ok") else ST_FAILED
         message = outcome.get("message") or ""

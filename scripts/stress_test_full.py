@@ -87,14 +87,16 @@ class Stat:
         }
 
 
-def new_session(base=BASE):
+def new_session(base=None):
+    base = base or BASE
     s = requests.Session()
+    s.trust_env = False
     adapter = HTTPAdapter(pool_connections=POOL_SIZE, pool_maxsize=POOL_SIZE,
                           max_retries=0)
     s.mount("http://", adapter)
     s.mount("https://", adapter)
-    r = s.post(f"{base}/login", data={"username": USER, "password": PWD}, timeout=15)
-    if r.status_code != 200:
+    r = s.post(f"{base}/login", json={"username": USER, "password": PWD}, timeout=15)
+    if r.status_code != 200 or not r.json().get("ok"):
         raise RuntimeError(f"登录失败: {r.status_code} {r.text[:200]}")
     return s
 
@@ -179,6 +181,9 @@ class ResourceSampler:
 
     @staticmethod
     def _find_platform_pid():
+        explicit = os.environ.get("AIDBM_STRESS_PID")
+        if explicit:
+            return int(explicit)
         import subprocess
         try:
             out = subprocess.run(["ps", "-eo", "pid,args"], capture_output=True,
@@ -238,10 +243,7 @@ def run_pool(fn, items, concurrency):
     with ThreadPoolExecutor(max_workers=concurrency) as ex:
         futs = [ex.submit(fn, it) for it in items]
         for f in as_completed(futs):
-            try:
-                f.result()
-            except Exception:
-                pass
+            f.result()
     return time.perf_counter() - t0
 
 
@@ -331,6 +333,17 @@ def phase_run_backups(session, task_ids, concurrency):
             with lock:
                 counter["other"] += 1
             return
+        if d.get("accepted"):
+            deadline = time.monotonic() + 300
+            while time.monotonic() < deadline:
+                response = session.get(f"{BASE}/api/records", params={"task_id": tid, "limit": 1},
+                                       timeout=15)
+                response.raise_for_status()
+                rows = response.json()
+                if isinstance(rows, list) and rows and rows[0].get("status") != "running":
+                    d = rows[0]
+                    break
+                time.sleep(0.2)
         st = (d.get("status") or "").lower()
         with lock:
             if st == "success":

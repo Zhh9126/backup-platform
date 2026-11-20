@@ -24,6 +24,8 @@ from typing import List, Dict, Optional, Tuple
 
 import config
 import core.db as db
+from core.store_lock import locked
+from core.chunk_store import _atomic_write
 
 logger = logging.getLogger("core.global_dedup")
 
@@ -79,104 +81,60 @@ def dedup_bytes(data: bytes, task_id=None, set_id=None,
     if not data:
         return {"saved_bytes": 0, "blocks": 0, "new_blocks": 0,
                 "stored_path": None}
+    if int(block_size) <= 0:
+        raise ValueError("block_size 必须大于 0")
+    return _dedup_chunks((data[i:i + block_size] for i in range(0, len(data), block_size)),
+                         task_id, set_id)
+
+
+def _dedup_chunks(chunks, task_id, set_id):
     store = _store_dir()
-    saved = 0
-    blocks = 0
-    new_blocks = 0
-    for i in range(0, len(data), block_size):
-        chunk = data[i:i + block_size]
+    saved = blocks = new_blocks = 0
+    for chunk in chunks:
         h = _block_hash(chunk)
         phys = os.path.join(store, h[:2], h)
-        blocks += 1
-        if os.path.isfile(phys):
-            # 物理块已存在（任何任务/集写过），直接命中
-            saved += len(chunk)
-            new_blocks += 0
-            # 仍更新引用计数（即便物理已存在，可能来自其他任务）
-            row = db.query_one(
-                "SELECT id FROM dedup_index WHERE block_hash=?", (h,))
-            if row:
-                db.execute(
-                    "UPDATE dedup_index SET ref_count=ref_count+1 WHERE id=?",
-                    (row["id"],))
-            else:
-                # 物理存在但索引缺失（异常恢复）：补登索引，不计入 saved
-                db.execute(
-                    "INSERT INTO dedup_index "
-                    "(block_hash, size_bytes, ref_count, first_task_id, "
-                    "first_set_id, object_key, created_at) "
-                    "VALUES (?,?,?,?,?,?,?)",
-                    (h, len(chunk), 1, task_id, set_id, phys, _now_iso()))
-        else:
-            parent = os.path.dirname(phys)
-            os.makedirs(parent, exist_ok=True)
-            with open(phys, "wb") as f:
-                f.write(chunk)
-            s = _upsert_block(h, len(chunk), task_id, set_id, phys)
-            saved += s
-            if s == 0:
+        # 锁覆盖块落盘和索引记账；不同备份文件的逐块操作可交替推进。
+        with locked(store):
+            valid = False
+            if os.path.isfile(phys):
+                with open(phys, "rb") as existing:
+                    raw = existing.read(len(chunk) + 1)
+                valid = len(raw) == len(chunk) and _block_hash(raw) == h
+            if not valid:
+                _atomic_write(phys, chunk)
                 new_blocks += 1
+            _upsert_block(h, len(chunk), task_id, set_id, phys)
+            if valid:
+                saved += len(chunk)
+            blocks += 1
     return {"saved_bytes": saved, "blocks": blocks,
             "new_blocks": new_blocks, "stored_path": store}
 
 
 def dedup_file(path: str, task_id=None, set_id=None,
                block_size: int = DEFAULT_BLOCK_SIZE) -> Dict:
-    """对文件做流式切片重删（避免一次性读入大文件）。"""
+    """对文件做流式切片重删，复用前验证物理块，写入采用原子替换。"""
+    if int(block_size) <= 0:
+        raise ValueError("block_size 必须大于 0")
     if not os.path.isfile(path):
         return {"saved_bytes": 0, "blocks": 0, "new_blocks": 0,
                 "stored_path": None, "error": "missing"}
-    store = _store_dir()
-    saved = 0
-    blocks = 0
-    new_blocks = 0
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(block_size)
-            if not chunk:
-                break
-            h = _block_hash(chunk)
-            phys = os.path.join(store, h[:2], h)
-            blocks += 1
-            if os.path.isfile(phys):
-                saved += len(chunk)
-                row = db.query_one(
-                    "SELECT id FROM dedup_index WHERE block_hash=?", (h,))
-                if row:
-                    db.execute(
-                        "UPDATE dedup_index SET ref_count=ref_count+1 WHERE id=?",
-                        (row["id"],))
-                else:
-                    db.execute(
-                        "INSERT INTO dedup_index "
-                        "(block_hash, size_bytes, ref_count, first_task_id, "
-                        "first_set_id, object_key, created_at) "
-                        "VALUES (?,?,?,?,?,?,?)",
-                        (h, len(chunk), 1, task_id, set_id, phys, _now_iso()))
-            else:
-                parent = os.path.dirname(phys)
-                os.makedirs(parent, exist_ok=True)
-                with open(phys, "wb") as wf:
-                    wf.write(chunk)
-                s = _upsert_block(h, len(chunk), task_id, set_id, phys)
-                saved += s
-                if s == 0:
-                    new_blocks += 1
-    return {"saved_bytes": saved, "blocks": blocks,
-            "new_blocks": new_blocks, "stored_path": store}
+    with open(path, "rb") as stream:
+        return _dedup_chunks(iter(lambda: stream.read(block_size), b""), task_id, set_id)
 
 
 def global_stats() -> Dict:
     """全局重删统计（参照白皮书"全局重删比"指标）。"""
     row = db.query_one(
         "SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes),0) AS raw, "
-        "COALESCE(SUM(ref_count),0) AS refs "
+        "COALESCE(SUM(ref_count),0) AS refs, "
+        "COALESCE(SUM(size_bytes * ref_count),0) AS logical "
         "FROM dedup_index")
     n = int(row["n"] or 0)
     raw = int(row["raw"] or 0)
     refs = int(row["refs"] or 0)
     # 逻辑总量 = 各块原始大小 × 引用次数；物理总量 = 各块原始大小（只存一份）
-    logical = raw * (refs if refs else 0) if n else 0
+    logical = int(row["logical"] or 0)
     physical = raw
     if logical > 0 and physical > 0:
         ratio = (1 - physical / logical) * 100.0
@@ -195,17 +153,20 @@ def global_stats() -> Dict:
 
 def reset_index() -> int:
     """清空重删索引（仅测试/运维使用）。返回删除的索引条数。"""
-    row = db.query_one("SELECT COUNT(*) AS n FROM dedup_index")
-    n = int(row["n"] or 0)
-    db.execute("DELETE FROM dedup_index")
     store = _store_dir()
-    removed = 0
-    if os.path.isdir(store):
-        for root, _dirs, files in os.walk(store):
-            for fn in files:
-                try:
-                    os.remove(os.path.join(root, fn))
-                    removed += 1
-                except OSError:
-                    pass
-    return n
+    with locked(store):
+        row = db.query_one("SELECT COUNT(*) AS n FROM dedup_index")
+        n = int(row["n"] or 0)
+        db.execute("DELETE FROM dedup_index")
+        removed = 0
+        if os.path.isdir(store):
+            for root, _dirs, files in os.walk(store):
+                for fn in files:
+                    if fn == ".store.lock":
+                        continue
+                    try:
+                        os.remove(os.path.join(root, fn))
+                        removed += 1
+                    except OSError:
+                        pass
+        return n

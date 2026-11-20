@@ -670,7 +670,8 @@ def _is_transient(err: BaseException) -> bool:
     # 把失败时间拖长（实测：平台分区满时拉取白退避 2s+4s 后才报 ENOSPC）
     if isinstance(err, OSError) and getattr(err, "errno", None) in (
             errno.ENOSPC, errno.EDQUOT, errno.EROFS, errno.EACCES,
-            errno.EMFILE, errno.ENFILE, errno.EFBIG):
+            errno.EMFILE, errno.ENFILE, errno.EFBIG, errno.ENOENT,
+            errno.ENOTDIR, errno.EISDIR, errno.EPERM, errno.EINVAL):
         return False
     msg0 = str(err).lower()
     if any(k in msg0 for k in ("no space left", "read-only file system",

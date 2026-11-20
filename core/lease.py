@@ -56,12 +56,13 @@ def acquire(name: str = NAME, owner: str = None, ttl: int = DEFAULT_TTL) -> dict
                     "reason": "另一个实例持有租约（未过期）"}
         rc = db.execute_rowcount(
             "UPDATE scheduler_leases SET owner=?, heartbeat_at=?, expires_at=? "
-            "WHERE name=?", (owner, now, now + ttl, name))
+            "WHERE name=? AND (owner=? OR expires_at<=?)",
+            (owner, now, now + ttl, name, owner, now))
         if rc == 0:
-            db.execute(
-                "INSERT INTO scheduler_leases(name, owner, acquired_at, "
-                "heartbeat_at, expires_at) VALUES(?,?,?,?,?)",
-                (name, owner, now, now, now + ttl))
+            holder = _row(name) or {}
+            return {"acquired": False, "owner": owner,
+                    "holder": holder.get("owner", ""), "expires_in": 0,
+                    "reason": "租约已被其他实例抢先获取"}
         return {"acquired": True, "owner": owner, "holder": owner,
                 "expires_in": ttl, "reason": "续租成功"}
     try:
@@ -82,7 +83,7 @@ def renew(name: str = NAME, owner: str = None, ttl: int = DEFAULT_TTL) -> dict:
     now = _now()
     rc = db.execute_rowcount(
         "UPDATE scheduler_leases SET heartbeat_at=?, expires_at=? "
-        "WHERE name=? AND owner=?", (now, now + ttl, name, owner))
+        "WHERE name=? AND owner=? AND expires_at>?", (now, now + ttl, name, owner, now))
     if rc:
         return {"ok": True, "expires_in": ttl}
     row = _row(name)

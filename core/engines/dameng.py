@@ -297,7 +297,7 @@ class DamengEngine(BackupEngine):
                     snippet = online_out[-600:]
                     if "DMAP" in snippet or "-7170" in snippet:
                         hint = ("；提示：达梦联机备份依赖 DmAPService（dmap 辅助进程）。"
-                                "请在数据库服务器上启动：su - dmdba -c 'nohup <DM_HOME>/bin/dmap &'。")
+                                "请在数据库服务器上启动：使用数据库实际操作系统账号执行 nohup <DM_HOME>/bin/dmap &。")
                     elif ("归档" in snippet or "-718" in snippet or "-8003" in snippet
                             or "archive" in snippet.lower()):
                         hint = ("；提示：达梦联机备份要求数据库处于归档模式"
@@ -1295,7 +1295,7 @@ class DamengEngine(BackupEngine):
         if "DMAP" in blob or "-7170" in blob:
             hint = ("；提示：dmrman 依赖 DmAPService（dmap 辅助进程），"
                     "请在数据库服务器上启动: "
-                    "su - dmdba -c 'nohup <DM_HOME>/bin/dmap &'")
+                    "使用数据库实际操作系统账号执行 nohup <DM_HOME>/bin/dmap &")
         return BackupResult(
             success=False, status=BackupStatus.FAILED, duration_sec=duration,
             stdout=blob[-1000:],

@@ -176,7 +176,8 @@ def check_record(record: dict) -> dict:
     # 熵检跳过（<4KB 不判）、结构嗅探对未知二进制不硬判 → 汇总成 clean，
     # 篡改完全看不见。而备份记录里本来就存了 sha256，比对一次即可确定性
     # 发现"文件被换/被改"——这是防勒索链路上唯一不依赖样本特征的判据。
-    _digest = str(record.get("checksum") or "").strip().lower()
+    from core import db
+    _digest = db.normalize_sha256(record.get("checksum"))
     if _digest:
         try:
             from core import db as _db

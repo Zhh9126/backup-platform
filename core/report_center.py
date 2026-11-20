@@ -71,6 +71,7 @@ def build_summary(days: int = 7) -> Dict[str, Any]:
     out["verify"] = {
         "total": vtotal,
         "success": vagg.get("success", 0) + vagg.get("passed", 0) + vagg.get("pass", 0),
+        "partial": vagg.get("partial", 0),
         "failed": vagg.get("failed", 0) + vagg.get("error", 0),
     }
 
@@ -129,7 +130,7 @@ def export_report(fmt: str, days: int = 7) -> tuple:
         "恢复总数": r.get("total", 0),
         "恢复成功": r.get("success", 0),
         "恢复失败": r.get("failed", 0),
-        "恢复校验": f"{v.get('success', 0)}/{v.get('total', 0)} 通过",
+        "恢复校验": f"{v.get('success', 0)} 通过 / {v.get('partial', 0)} 部分通过 / {v.get('failed', 0)} 失败",
         "锁定产物": s.get("locked_records", 0),
         "生成时间": s.get("generated_at", ""),
     }

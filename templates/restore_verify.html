@@ -13,28 +13,35 @@
 
 <!-- KPI 卡片 -->
 <div class="row g-3 mb-3">
-  <div class="col-md-3">
+  <div class="col-md">
     <div class="card-stat">
       <div class="stat-icon bg-primary bg-opacity-10 text-primary"><i class="bi bi-journal-check"></i></div>
       <div class="stat-num" id="statPolicyCount">0</div>
       <div class="stat-label">校验策略</div>
     </div>
   </div>
-  <div class="col-md-3">
+  <div class="col-md">
     <div class="card-stat">
       <div class="stat-icon bg-success bg-opacity-10 text-success"><i class="bi bi-check-circle"></i></div>
       <div class="stat-num" id="statSuccessCount">0</div>
       <div class="stat-label">测试通过</div>
     </div>
   </div>
-  <div class="col-md-3">
+  <div class="col-md">
+    <div class="card-stat">
+      <div class="stat-icon bg-warning bg-opacity-10 text-warning"><i class="bi bi-exclamation-circle"></i></div>
+      <div class="stat-num" id="statPartialCount">0</div>
+      <div class="stat-label">部分通过</div>
+    </div>
+  </div>
+  <div class="col-md">
     <div class="card-stat">
       <div class="stat-icon bg-danger bg-opacity-10 text-danger"><i class="bi bi-x-circle"></i></div>
       <div class="stat-num" id="statFailedCount">0</div>
       <div class="stat-label">测试失败</div>
     </div>
   </div>
-  <div class="col-md-3">
+  <div class="col-md">
     <div class="card-stat">
       <div class="stat-icon bg-info bg-opacity-10 text-info"><i class="bi bi-clock-history"></i></div>
       <div class="stat-num" id="statLastTest">—</div>
@@ -43,6 +50,10 @@
   </div>
 </div>
 
+<div class="alert alert-info small">
+  文件、摘要与工具检查通过后显示“部分通过”。只有同一备份恢复出的隔离副本当前可查询，才显示“通过”。
+  系统会自动检查该备份的就绪测试副本；可在克隆服务中创建隔离副本后重新校验。
+</div>
 <!-- 恢复校验策略 -->
 <div class="page-card mb-3">
   <div class="d-flex justify-content-between align-items-center px-3 py-2 border-bottom">
@@ -147,5 +158,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/js/restore_verify.js?v=2026111102"></script>
+<script src="/static/js/restore_verify.js?v=2026112003"></script>
 {% endblock %}

@@ -6359,6 +6359,16 @@
     }
     try { RT.window = await api("GET", "/api/rt/window?task_id=" + RT.taskId); }
     catch (e) { RT.window = null; }
+    const coverage = $("rtCoverage");
+    if (coverage) {
+      const win = RT.window || {};
+      const segments = win.coverage_segments || [];
+      coverage.innerHTML = '<b>恢复链覆盖区间</b> · ' +
+        (segments.length ? segments.map((segment) => esc(segment.start) + ' → ' + esc(segment.end)).join('<br>') : '尚无完整基准备份链') +
+        '<div>区间来自恢复点元数据；执行前仍会校验产物和日志连续性。</div>' +
+        ((win.coverage_gaps || []).length ? '<div class="text-danger">存在日志缺口，请先补齐日志或选择其他区间。</div>' : '') +
+        (win.coverage_truncated ? '<div class="text-warning">恢复点较多，仅展示前 10000 条的覆盖分析。</div>' : '');
+    }
 
     const range = Number($("rtRangeSelect").value || 86400);
     const buckets = Number($("rtBucketSelect").value || 120);
@@ -7611,6 +7621,46 @@
   };
 
   // ---- P1-3：池复制两地三中心 ----
+  window.openReplicaImport = async function () {
+    try {
+      const [targetData, taskData] = await Promise.all([
+        api("GET", "/api/storage/targets"), api("GET", "/api/tasks")]);
+      const targets = (targetData.targets || []).filter((target) => target.enabled);
+      const tasks = Array.isArray(taskData) ? taskData : (taskData.data || taskData.tasks || []);
+      const wrap = document.createElement("div");
+      wrap.className = "modal fade";
+      wrap.innerHTML = '<div class="modal-dialog modal-dialog-centered"><div class="modal-content">' +
+        '<div class="modal-header"><h6 class="modal-title">从副本清单导入</h6><button class="btn-close" data-bs-dismiss="modal"></button></div>' +
+        '<form><div class="modal-body"><p class="small text-muted">源平台不可用时，可将完整副本校验后登记到本平台。增量副本需先补齐恢复链。</p>' +
+        '<label class="form-label">存储目标</label><select class="form-select mb-3" name="target" required>' +
+        '<option value="">请选择存储目标</option>' + targets.map((target) => '<option value="' + target.id + '">' + esc(target.name) + '</option>').join('') + '</select>' +
+        '<label class="form-label">关联备份任务</label><select class="form-select mb-3" name="task" required>' +
+        '<option value="">请选择备份任务</option>' + tasks.map((task) => '<option value="' + task.id + '">' + esc(task.name + ' (' + task.db_type + ')') + '</option>').join('') + '</select>' +
+        '<label class="form-label">副本清单对象键</label><input class="form-control mb-3" name="manifest" required placeholder="pool/...aidbm-replica.json">' +
+        '<label class="form-label">可信 SHA256（可选）</label><input class="form-control" name="checksum" pattern="[a-fA-F0-9]{64}">' +
+        '</div><div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>' +
+        '<button type="submit" class="btn btn-primary">校验并导入</button></div></form></div></div>';
+      document.body.appendChild(wrap);
+      const modal = new bootstrap.Modal(wrap);
+      wrap.addEventListener("hidden.bs.modal", () => wrap.remove());
+      wrap.querySelector("form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const form = event.currentTarget;
+        const button = form.querySelector('[type="submit"]');
+        button.disabled = true;
+        try {
+          const result = await api("POST", "/api/pool/import", {
+            target_id: Number(form.elements.target.value), task_id: Number(form.elements.task.value),
+            manifest_key: form.elements.manifest.value.trim(), expected_checksum: form.elements.checksum.value.trim()});
+          toast("副本已导入，备份记录编号：" + result.record_id, "success", 6000);
+          modal.hide();
+        } catch (error) { toast(error.message || "导入失败", "danger"); }
+        finally { button.disabled = false; }
+      });
+      modal.show();
+    } catch (error) { toast(error.message || "加载失败", "danger"); }
+  };
+
   window.loadPools = async function () {
     const box = $("poolList");
     if (!box) return;
@@ -7800,8 +7850,8 @@
           rs.map((r) => `<tr>
             <td class="small">${esc(r.chain_name)}</td>
             <td class="small">S${r.seq} ${esc(r.target_name)}<br><span class="text-muted">${esc({ production: "生产中心", same_city: "同城灾备", remote: "异地灾备" }[r.site_role] || r.site_role || "")}</span></td>
-            <td>${r.status === "success" ? '<span class="badge badge-ok">有副本</span>' : r.status === "skipped" ? '<span class="badge bg-secondary">跳过</span>' : '<span class="badge badge-fail">失败</span>'}</td>
-            <td class="small text-break" style="max-width:220px"><code>${esc(r.object_key || "-")}</code></td>
+            <td>${r.status === "success" ? (r.recoverable ? '<span class="badge badge-ok">副本已校验</span>' : '<span class="badge bg-warning text-dark">副本待校验</span>') : r.status === "skipped" ? '<span class="badge bg-secondary">跳过</span>' : '<span class="badge badge-fail">失败</span>'}</td>
+            <td class="small text-break" style="max-width:220px"><code>${esc(r.object_key || "-")}</code><div class="text-muted">${esc(r.manifest_key || "")}</div></td>
             <td class="small">${BKP.humanSize(r.size_bytes || 0)}</td>
             <td class="small">${esc((r.created_at || "").slice(0, 19))}</td>
             <td>${r.fetchable ? `<button class="btn btn-sm btn-outline-primary" data-log="${r.chain_id}" data-lid="${r.id || ""}" onclick="fetchPoolBack(${recordId}, this.dataset.lid)">取回</button>` : ""}</td>
@@ -9118,14 +9168,39 @@
         (title ? ' title="' + esc(title) + '"' : '') + '>' + pair[1] + '</span>';
     }
 
+    api("GET", "/api/clone/capabilities").then(function (caps) {
+      const el = $("cloneCapabilities");
+      if (el) el.innerHTML = (caps.items || []).map(function (c) {
+        return '<div class="mb-1"><strong>' + esc(c.name) + '</strong> · ' +
+          (c.clone ? '已接入克隆流程' : '待接入') + ' · ' + esc(c.message) + '</div>';
+      }).join("");
+    }).catch(function (e) {
+      const el = $("cloneCapabilities");
+      if (el) el.textContent = "能力读取失败：" + e.message;
+    });
+
     // ---- 源备份记录：可搜索下拉 ----
     let CLONE_RECORDS = [];
+    let CLONE_CAPABILITIES = [];
+
     async function loadRecordsInto() {
       const input = $("c_source_search"), list = $("c_source_list"),
         hidden = $("c_source_record_id");
       try {
+        const caps = await api("GET", "/api/clone/capabilities");
+        CLONE_CAPABILITIES = caps.items || [];
+        const capEl = $("cloneCapabilities");
+        if (capEl) capEl.innerHTML = CLONE_CAPABILITIES.map(function (c) {
+          return '<div class="mb-1"><strong>' + esc(c.name) + '</strong> · ' +
+            (c.clone ? '已接入克隆流程' : '待接入') + ' · ' + esc(c.message) + '</div>';
+        }).join("");
+
         const recs = await api("GET", "/api/records");
-        CLONE_RECORDS = (recs || []).map(function (r) {
+        CLONE_RECORDS = (recs || []).filter(function (r) {
+          return r.status === "success" && CLONE_CAPABILITIES.some(function (c) {
+            return c.db_type === r.db_type && c.clone;
+          });
+        }).map(function (r) {
           return { id: r.id, label: fmtRecordLabel(r), dbt: r.db_type || "", raw: (r.task_name || "") + " " + (r.db_type || "") + " " + r.id };
         });
       } catch (e) { CLONE_RECORDS = []; }
@@ -9158,7 +9233,8 @@
         postgresql: "PostgreSQL：将导入为独立克隆库 clone_N。",
         kingbase: "金仓：将导入为独立克隆库 clone_N。"
       };
-      el.textContent = M[dbt] || "将从备份产物真实导入拉起隔离克隆库（VDB）。";
+      const capability = CLONE_CAPABILITIES.find(function (c) { return c.db_type === dbt; });
+      el.textContent = M[dbt] || (capability ? capability.message : "请选择可用的源备份记录。");
     }
     function bindSourceSearch() {
       const input = $("c_source_search"), list = $("c_source_list"),

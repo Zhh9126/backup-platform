@@ -26,6 +26,16 @@ from core import global_dedup as gd  # noqa: E402
 BS = 1024 * 1024  # 1MB 块，测试提速
 
 
+import pytest
+import config
+
+
+@pytest.fixture(autouse=True)
+def isolated_block_store(tmp_path, monkeypatch):
+    # Different test modules can use the same tiny tail block; each test needs a cold store.
+    monkeypatch.setattr(config, "BACKUP_ROOT", str(tmp_path / "block-store"))
+
+
 def _local_exec(cmd, timeout=120):
     r = subprocess.run(["bash", "-c", cmd], stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, timeout=timeout)

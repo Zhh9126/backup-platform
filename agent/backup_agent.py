@@ -55,7 +55,7 @@ try:
 except Exception:
     _HAS_AES = False
 
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 MAX_BODY = 16 * 1024 * 1024      # 请求体上限（JSON/分块上传均远小于此）
 MAX_SYNC_OUT = 16 * 1024 * 1024          # /exec 同步输出上限（超出建议 exec-stream）
 CHUNK = 512 * 1024                        # 流式块大小
@@ -93,12 +93,49 @@ class AgentState:
 def _kill_proc_group(p) -> None:
     """终止子进程及其整个进程组（rman/xtrabackup 等孙进程一并杀，不留孤儿）。"""
     try:
-        os.killpg(os.getpgid(p.pid), 9)
+        os.killpg(p.pid, 9)
     except Exception:
         try:
             p.kill()
         except Exception:
             pass
+
+
+def _capture_command(cmd, timeout):
+    """持续排空输出但只保留有界前缀，超时回收整个进程组。"""
+    process = subprocess.Popen(["bash", "-lc", cmd], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                               start_new_session=True)
+    output, errors = bytearray(), bytearray()
+    def drain(stream, buffer, maximum):
+        try:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    return
+                room = max(0, maximum - len(buffer))
+                buffer.extend(chunk[:room])
+        finally:
+            stream.close()
+    readers = [threading.Thread(target=drain, args=(process.stdout, output, MAX_SYNC_OUT), daemon=True),
+               threading.Thread(target=drain, args=(process.stderr, errors, 256 * 1024), daemon=True)]
+    for reader in readers:
+        reader.start()
+    try:
+        code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_proc_group(process)
+        process.wait()
+        code = 124
+    for reader in readers:
+        reader.join(1)
+    if any(reader.is_alive() for reader in readers):
+        _kill_proc_group(process)
+        for reader in readers:
+            reader.join(1)
+    if code == 124:
+        errors.extend("\n[agent] 命令超时".encode())
+    return code, bytes(output), bytes(errors[:256 * 1024])
 
 
 def _seal(key: bytes, plaintext: bytes) -> bytes:
@@ -222,6 +259,9 @@ class Handler(BaseHTTPRequestHandler):
                 caps = {
                     "version": VERSION, "hmac": "required", "enc": bool(_HAS_AES),
                     "algo": "AES-256-GCM" if _HAS_AES else "HMAC-SHA256",
+                    "uptime_seconds": int(time.monotonic() - getattr(self.server, "started", time.monotonic())),
+                    "distribution": "single-executable" if getattr(sys, "frozen", False) else "source",
+                    "max_connections": getattr(self.server, "max_connections", 32),
                     "chunk": CHUNK, "python": sys.version.split()[0],
                     # 能力自报：平台据此做架构/压缩协商，不虚报未实现的特性
                     "os": sys.platform,
@@ -301,16 +341,9 @@ class Handler(BaseHTTPRequestHandler):
         if not cmd:
             self._respond(400, {"error": "cmd 必填"})
             return
-        self._audit("exec: %s" % cmd[:120])
+        self._audit("exec command_sha256=%s" % hashlib.sha256(cmd.encode()).hexdigest())
         # py3.6 兼容：capture_output 是 3.7+ 特性（140 实测），用 PIPE
-        try:
-            p = subprocess.run(["bash", "-lc", cmd], stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, timeout=timeout)
-            rc, out, err = p.returncode, p.stdout[:MAX_SYNC_OUT], p.stderr[:256 * 1024]
-        except subprocess.TimeoutExpired as e:
-            rc = 124
-            out = (e.stdout or b"")[:MAX_SYNC_OUT]
-            err = ((e.stderr or b"") + "\n[agent] 命令超时".encode())[:256 * 1024]
+        rc, out, err = _capture_command(cmd, max(1, timeout))
         self._respond(200, {
             "rc": rc,
             "out": base64.b64encode(out).decode(),
@@ -325,7 +358,7 @@ class Handler(BaseHTTPRequestHandler):
         if not cmd:
             self._respond(400, {"error": "cmd 必填"})
             return
-        self._audit("exec-stream: %s" % cmd[:120])
+        self._audit("exec-stream command_sha256=%s" % hashlib.sha256(cmd.encode()).hexdigest())
         # start_new_session：子进程独立进程组 —— 断连/取消/超时时 killpg
         # 把 rman/xtrabackup/mysqldump 等孙进程一并终止，不留孤儿（插件
         # 工程化第五关：协作式取消的服务端兜底，平台停止任务 → 关流 → 杀进程）
@@ -619,21 +652,65 @@ class _ChunkedSink:
             self.h.wfile.write(("%x\r\n" % len(data)).encode() + data + b"\r\n")
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """连接线程受限，闲置连接不会无限占用线程和文件描述符。"""
+    daemon_threads = True
+    request_queue_size = 128
+
+    def __init__(self, address, handler, max_connections=32):
+        self.max_connections = max_connections
+        self.started = time.monotonic()
+        self._slots = threading.BoundedSemaphore(max_connections)
+        super().__init__(address, handler)
+
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(30)
+        return connection, address
+
+    def process_request(self, request, address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\n"
+                                b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, address):
+        try:
+            super().process_request_thread(request, address)
+        finally:
+            self._slots.release()
+
+
 def main():
     ap = argparse.ArgumentParser(description="AIDBM 备份恢复 Agent")
-    ap.add_argument("--token", required=True, help="通道令牌（平台注册时生成）")
+    ap.add_argument("--version", action="version", version=VERSION)
+    ap.add_argument("--token", default=os.environ.get("AIDBM_AGENT_TOKEN", ""),
+                    help="通道令牌，也可通过 AIDBM_AGENT_TOKEN 提供")
+    ap.add_argument("--max-connections", type=int, default=32)
     ap.add_argument("--port", type=int, default=8466)
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--allow-dirs", default=",".join(DEFAULT_ALLOW),
                     help="文件操作白名单目录（逗号分隔）")
     args = ap.parse_args()
+    if not args.token:
+        ap.error("需设置 AIDBM_AGENT_TOKEN 或 --token")
+    if not 1 <= args.port <= 65535 or not 1 <= args.max_connections <= 256:
+        ap.error("port 需在 1..65535，max-connections 需在 1..256")
     AgentState.token = args.token
     AgentState.allow_dirs = [d.strip() for d in args.allow_dirs.split(",") if d.strip()]
     if _HAS_AES:
         AgentState.key = derive_key(args.token)
     else:
         AgentState.key = derive_key(args.token)  # HMAC 模式复用同一派生密钥
-    srv = ThreadingHTTPServer((args.bind, args.port), Handler)
+    srv = BoundedHTTPServer((args.bind, args.port), Handler, args.max_connections)
     srv.daemon_threads = True
     enc = "AES-256-GCM" if _HAS_AES else "HMAC-SHA256(降级)"
     print("[agent] AIDBM Agent %s listening on %s:%d enc=%s allow=%s" % (

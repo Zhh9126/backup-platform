@@ -90,6 +90,10 @@ SEGMENT_PERMS = {
     "sync-tasks": "dr.sync.manage",
     "disaster-links": "dr.link.manage",
     "dr-dns": "dr.link.manage",
+    "dr": "dr.link.manage",
+    "runbooks": "dr.link.manage",
+    "runbook-runs": "dr.link.manage",
+    "dr-inspections": "inspection.manage",
     "clone": "dr.clone.manage",
     "vdb": "dr.clone.manage",
     # 运维

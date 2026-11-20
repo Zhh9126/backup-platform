@@ -473,9 +473,37 @@ def _sftp_session_refresh(client, ssh_host=None, host_key=""):
     return client
 
 
+def _retry_wait(attempt, interval):
+    """有上限的指数退避与抖动；等待期间支持用户取消。"""
+    from core.network_retry import retry_wait
+    retry_wait(attempt, interval)
+
+
+def _sftp_prefix_matches(sftp, remote_path, local_path, size):
+    """按流校验整个续传前缀；传输异常交给外层重试，不当作不存在。"""
+    import hashlib
+    remote_hash, local_hash = hashlib.sha256(), hashlib.sha256()
+    with sftp.open(remote_path, "rb") as remote, open(local_path, "rb") as local:
+        remaining = size
+        while remaining:
+            from core import cancel
+            cancel.check()
+            amount = min(256 * 1024, remaining)
+            data = remote.read(amount)
+            if not data:
+                return False
+            other = local.read(len(data))
+            remote_hash.update(data)
+            local_hash.update(other)
+            remaining -= len(data)
+            if len(other) != len(data):
+                return False
+    return remote_hash.digest() == local_hash.digest()
+
+
 def sftp_put_resumable(client, local_path: str, remote_path: str, *,
                        rate_kbps: int = 0, attempts: int = 3,
-                       label: str = "", ssh_host=None) -> dict:
+                       label: str = "", ssh_host=None, retry_interval: float = 2) -> dict:
     """通用恢复推送通道：断点续传 + 瞬时异常退避重试 + 平台侧限速。
 
     机制：先传 remote_path + ".aidbm_part"（SFTP append 从已传字节续传），
@@ -529,7 +557,7 @@ def sftp_put_resumable(client, local_path: str, remote_path: str, *,
         return offset
 
     last_err = None
-    client = _sftp_session_refresh(client, ssh_host=ssh_host)
+    attempts = max(1, min(101, int(attempts)))
     for attempt in range(1, attempts + 1):
         sftp = None
         part = remote_path + ".aidbm_part"
@@ -539,31 +567,38 @@ def sftp_put_resumable(client, local_path: str, remote_path: str, *,
             offset = 0
             try:
                 offset = int(sftp.stat(part).st_size or 0)
-            except Exception:
-                offset = 0
+            except OSError as exc:
+                if exc.errno != 2:
+                    raise
             try:
                 lsize = os.path.getsize(local_path)
             except OSError:
                 raise RuntimeError(f"本地文件不存在，无法推送：{local_path}")
-            if offset > lsize:          # 远端残件比本地还大（脏数据）→ 重传
-                try:
-                    sftp.remove(part)
-                except Exception:
-                    pass
+            initial = os.stat(local_path)
+            if offset > lsize or (offset and not _sftp_prefix_matches(
+                    sftp, part, local_path, offset)):
                 offset = 0
             resumed = offset > 0
             size = _push(sftp, part, offset)
             if size != lsize:
                 raise RuntimeError(
                     f"推送字节数不一致（远端 {size} != 本地 {lsize}）")
-            # 原子改名到目标路径（同目录；目标已存在先清）
-            try:
-                sftp.remove(remote_path)
-            except Exception:
-                pass
+            current = os.stat(local_path)
+            if (initial.st_size, initial.st_mtime_ns, initial.st_ino) != (
+                    current.st_size, current.st_mtime_ns, current.st_ino):
+                raise RuntimeError("推送源文件在传输期间发生变化，未替换目标")
+            if int(sftp.stat(part).st_size) != lsize or not _sftp_prefix_matches(
+                    sftp, part, local_path, lsize):
+                raise RuntimeError("推送完整性校验失败，未替换目标")
+            # POSIX 原子覆盖；不支持扩展时仅在目标不存在的情况下标准 rename。
             try:
                 sftp.posix_rename(part, remote_path)
-            except Exception:
+            except OSError as exc:
+                import errno
+                unsupported = exc.errno in (errno.ENOSYS, errno.EOPNOTSUPP) or (
+                    "unsupported" in str(exc).lower())
+                if not unsupported:
+                    raise
                 sftp.rename(part, remote_path)
             if resumed:
                 log.info("[remote_dump] 恢复推送断点续传完成: %s（从 %s 处继续）",
@@ -574,10 +609,9 @@ def sftp_put_resumable(client, local_path: str, remote_path: str, *,
             from core.engines.file import _is_transient
             if attempt >= attempts or not _is_transient(e):
                 raise
-            backoff = min(2 ** attempt, 10)
-            log.warning("[remote_dump] 恢复推送中断（第 %s/%s 次），%ss 后从断点重试: %s",
-                        attempt, attempts, backoff, str(e)[:140])
-            _t.sleep(backoff)
+            log.warning("[remote_dump] 恢复推送中断（第 %s/%s 次），退避后从断点重试: %s",
+                        attempt, attempts, str(e)[:140])
+            _retry_wait(attempt, retry_interval)
         finally:
             try:
                 sftp.close()
@@ -2242,9 +2276,11 @@ def _remote_rc_ready(sftp, rc_path: str):
         if not raw:
             return False, -1
         return True, int(raw.splitlines()[-1])
-    except (IOError, OSError):
-        return False, -1
-    except Exception:
+    except OSError as exc:
+        if exc.errno == 2:
+            return False, -1
+        raise
+    except ValueError:
         return False, -1
 
 
@@ -2335,7 +2371,9 @@ def _sftp_pull_incremental(sftp, remote_path: str, rc_path: str, local_path: str
         try:
             rf = sftp.open(remote_path, "rb")
             break
-        except (IOError, OSError):
+        except OSError as exc:
+            if exc.errno != 2:
+                raise
             if has_rc:
                 _ready0, _rc0 = _remote_rc_ready(sftp, rc_path)
                 if _ready0:
@@ -2369,8 +2407,10 @@ def _sftp_pull_incremental(sftp, remote_path: str, rc_path: str, local_path: str
                 _cancel_mod.check()
                 try:
                     rsize = int(sftp.stat(remote_path).st_size)
-                except (IOError, OSError):
-                    rsize = 0
+                except OSError:
+                    raise
+                if rsize < offset:
+                    raise RuntimeError("传输期间远端文件被截断，断点保留且未发布备份")
                 if rsize > offset:
                     rf.seek(offset)
                     while offset < rsize:
@@ -2418,11 +2458,11 @@ def _sftp_pull_incremental(sftp, remote_path: str, rc_path: str, local_path: str
                     ready, rc = _remote_rc_ready(sftp, rc_path)
                     if ready:
                         if rc != 0:
-                            break
+                            raise RuntimeError(f"远端导出失败(rc={rc})，断点保留且未发布备份")
                         try:
                             rsize2 = int(sftp.stat(remote_path).st_size)
-                        except (IOError, OSError):
-                            rsize2 = offset
+                        except OSError:
+                            raise
                         if offset >= rsize2:
                             break
                         continue
@@ -2431,8 +2471,8 @@ def _sftp_pull_incremental(sftp, remote_path: str, rc_path: str, local_path: str
                     # 连续 stable_secs 秒不再增长 → 认为远端写盘结束
                     try:
                         rsize2 = int(sftp.stat(remote_path).st_size)
-                    except (IOError, OSError):
-                        rsize2 = offset
+                    except OSError:
+                        raise
                     if offset >= rsize2:
                         if _stable_since is None:
                             _stable_since = now
@@ -2805,29 +2845,41 @@ def sftp_pull_resumable(client, remote_path: str, local_path: str, *,
     # 瞬时网络故障退避重试（SSHException/socket.timeout/EOF 等）：断点保留，
     # 重试从本地半成品实际大小继续，不重跑远端备份。
     from core.engines.file import _is_transient
-    attempts = 3
-    client = _sftp_session_refresh(client, host_key=host_key)
+    attempts = 1 + max(0, min(100, int(p.get("retry_max", 3))))
     for attempt in range(1, attempts + 1):
         sftp = None
         try:
             client = _sftp_session_refresh(client, host_key=host_key)
             sftp = client.open_sftp()
             try:
-                sftp.stat(remote_path)
-            except (IOError, OSError):
-                raise RuntimeError(f"远端产物不存在，无法拉取：{remote_path}")
+                remote_stat = sftp.stat(remote_path)
+            except OSError as exc:
+                if exc.errno == 2:
+                    raise RuntimeError(f"远端产物不存在，无法拉取：{remote_path}") from exc
+                raise
+            offset = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+            if offset and (offset > remote_stat.st_size or not _sftp_prefix_matches(
+                    sftp, remote_path, part_path, offset)):
+                os.remove(part_path)
+                meta["offset"] = 0
+                resumed = False
+            elif offset:
+                resumed = True
             _sftp_pull_incremental(
                 sftp, remote_path, rc_path, part_path, meta, p,
                 label=label or db_type, rate_kbps=int(p.get("rate_kbps") or 0),
                 has_rc=bool(has_rc), stable_secs=stable_secs)
+            size = os.path.getsize(part_path)
+            if int(sftp.stat(remote_path).st_size) != size or not _sftp_prefix_matches(
+                    sftp, remote_path, part_path, size):
+                raise RuntimeError("拉取完整性校验失败，断点保留且未替换目标")
             break
         except Exception as e:                # noqa: BLE001 - 瞬时重试
             if attempt >= attempts or not _is_transient(e):
                 raise
-            backoff = min(2 ** attempt, 10)
-            log.warning("[remote_dump] 拉取中断（第 %s/%s 次），%ss 后从断点重试: %s",
-                        attempt, attempts, backoff, str(e)[:140])
-            time.sleep(backoff)
+            log.warning("[remote_dump] 拉取中断（第 %s/%s 次），退避后从断点重试: %s",
+                        attempt, attempts, str(e)[:140])
+            _retry_wait(attempt, p.get("retry_interval", 60))
         finally:
             try:
                 sftp.close()

@@ -13,7 +13,7 @@
 from flask import jsonify, request
 
 import core.db as db
-from auth import login_required, verify_code_gate
+from auth import login_required, permission_required, verify_code_gate
 from core import pool_replication
 from . import api_bp
 
@@ -25,7 +25,7 @@ def api_pool_chains():
 
 
 @api_bp.route("/pool/chains", methods=["POST"])
-@login_required
+@permission_required("system.settings")
 def api_pool_create():
     data = request.get_json(force=True, silent=True) or {}
     try:
@@ -45,7 +45,7 @@ def api_pool_get(chain_id):
 
 
 @api_bp.route("/pool/chains/<int:chain_id>", methods=["PUT"])
-@login_required
+@permission_required("system.settings")
 def api_pool_update(chain_id):
     data = request.get_json(force=True, silent=True) or {}
     try:
@@ -56,7 +56,7 @@ def api_pool_update(chain_id):
 
 
 @api_bp.route("/pool/chains/<int:chain_id>", methods=["DELETE"])
-@login_required
+@permission_required("system.settings")
 def api_pool_delete(chain_id):
     if not pool_replication.get_chain(chain_id):
         return jsonify({"error": "链不存在"}), 404
@@ -65,7 +65,7 @@ def api_pool_delete(chain_id):
 
 
 @api_bp.route("/pool/chains/<int:chain_id>/run", methods=["POST"])
-@login_required
+@permission_required("system.settings")
 def api_pool_run(chain_id):
     """手动执行一次链复制（对指定备份记录）。
 
@@ -76,12 +76,15 @@ def api_pool_run(chain_id):
     record_id = data.get("record_id")
     if not record_id:
         return jsonify({"error": "record_id 必填"}), 400
-    backup_path = data.get("backup_path") or ""
-    if not backup_path:
-        from core import db as _db
-        rec = _db.query_one(
-            "SELECT backup_path FROM backup_records WHERE id=?", (int(record_id),))
-        backup_path = (rec or {}).get("backup_path") or ""
+    try:
+        record_id = int(record_id)
+    except (TypeError, ValueError):
+        return jsonify({"error": "record_id 必须是整数"}), 400
+    rec = db.query_one("SELECT backup_path FROM backup_records WHERE id=?", (record_id,))
+    backup_path = (rec or {}).get("backup_path") or ""
+    import os
+    if data.get("backup_path") and os.path.realpath(data["backup_path"]) != os.path.realpath(backup_path):
+        return jsonify({"error": "复制路径必须与备份记录一致"}), 400
     try:
         result = pool_replication.run_chain(
             chain_id, int(record_id), backup_path)
@@ -104,7 +107,7 @@ def api_pool_replicas():
 
 
 @api_bp.route("/pool/fetch", methods=["POST"])
-@login_required
+@permission_required("restore.run")
 def api_pool_fetch():
     """异地取回：从池站点拉副本回平台恢复区（写入恢复目录供恢复选择）。"""
     data = request.get_json(force=True, silent=True) or {}
@@ -118,3 +121,17 @@ def api_pool_fetch():
     except Exception as e:
         return jsonify({"error": "取回失败: %s" % e}), 500
     return jsonify({"ok": result["ok"], "result": result})
+
+
+@api_bp.route("/pool/import", methods=["POST"])
+@permission_required("restore.run")
+def api_pool_import():
+    """Independent site import; the source site's record and chain do not need to exist."""
+    data = request.get_json(silent=True) or {}
+    try:
+        result = pool_replication.import_replica(
+            int(data.get("target_id") or 0), data.get("manifest_key") or "",
+            int(data.get("task_id") or 0), data.get("expected_checksum") or "")
+    except (ValueError, TypeError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify(result)

@@ -7,6 +7,14 @@
 或：
     gunicorn -w 2 -b 0.0.0.0:8080 run:app
 """
+import sys
+
+# 灾备校验与恢复须在应用、调度器和元数据库均不可用时仍能执行。
+if __name__ == "__main__" and sys.argv[1:2] == ["catalog"]:
+    from core.catalog_cli import main as catalog_main
+
+    sys.exit(catalog_main(sys.argv[2:]))
+
 import config
 import core.db as db
 from app import create_app

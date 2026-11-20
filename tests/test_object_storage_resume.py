@@ -272,3 +272,16 @@ def test_api_resume_routes_registered_on_both_prefixes():
         assert key in rules and "GET" in rules[key]
         key2 = prefix + "/object-storage/tasks/<int:task_id>/resume"
         assert key2 in rules and "DELETE" in rules[key2]
+
+def test_complete_partial_is_not_trusted_by_size(tmp_path, monkeypatch):
+    dest = str(tmp_path / "out")
+    data = b"correct"
+    with open(osr.part_path(dest), "wb") as f:
+        f.write(b"wrong!!")
+    cli, requests = _cli(), []
+    def fake(method, bucket, key="", query=None, headers=None, **kw):
+        requests.append(headers)
+        return _FakeResp(200, data), _FakeConn()
+    monkeypatch.setattr(cli, "_request", fake)
+    assert cli.download_to_file("b", "k", dest, resume=True, expected_size=len(data), max_retries=0) == len(data)
+    assert requests == [None] and open(dest, "rb").read() == data

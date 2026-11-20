@@ -55,6 +55,7 @@
       $("statPolicyCount").textContent = d.policy_count || 0;
       $("statSuccessCount").textContent = d.success_count || 0;
       $("statFailedCount").textContent = d.failed_count || 0;
+      $("statPartialCount").textContent = d.partial_count || 0;
       $("statLastTest").textContent = d.last_test_at ? fmtTime(d.last_test_at) : "—";
     });
   }
@@ -98,7 +99,9 @@
         return '<tr>' +
           '<td><div class="fw-bold">' + esc(inst) + '</div>' +
           '<div class="small text-muted">' + esc(r.policy_name || "-") + '</div></td>' +
-          '<td>' + statusBadge(r.status) + '</td>' +
+          '<td>' + statusBadge(r.status) +
+            '<div class="small text-muted">' + esc(r.verification_level === "runtime" ? "隔离副本查询" :
+              r.verification_level === "artifact" ? "备份产物检查" : "历史证据待补充") + '</div></td>' +
           '<td>' + fmtDuration(r.duration_sec) + '</td>' +
           '<td>' + (r.cleaned ? '<span class="badge badge-ok">已清理</span>' : '<span class="badge bg-warning text-dark">待清理</span>') + '</td>' +
           '<td>' + (r.created_at ? fmtTime(r.created_at) : "-") + '</td>' +
@@ -204,11 +207,13 @@
   function runVerify(id) {
     toast("正在执行恢复校验...", "info");
     api("POST", "/api/restore-verify-policies/" + id + "/test").then((res) => {
-      if (res.success) {
-        const d = res.data || {};
-        toast(d.success ? "校验通过" : "校验失败：" + (d.message || ""), d.success ? "success" : "danger");
+      const d = res.data || {};
+      if (d.status === "partial") {
+        toast(d.message || "部分通过", "warning", 8000);
+      } else if (d.status === "success") {
+        toast(d.message || "隔离恢复副本查询通过", "success");
       } else {
-        toast(res.message || "校验失败", "danger");
+        toast(d.message || res.message || "校验失败", "danger");
       }
       refreshAll();
     }).catch(() => toast("校验执行异常", "danger"));

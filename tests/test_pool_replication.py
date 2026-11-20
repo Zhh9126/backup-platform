@@ -44,7 +44,9 @@ def _mk_record(task_id=1):
 
 
 @pytest.fixture()
-def env():
+def env(monkeypatch):
+    import config
+    monkeypatch.setattr(config, "BACKUP_ROOT", os.path.join(_TMP, "bk"))
     # 三个站点池
     ta = _mk_target("池A-生产", "poolA")
     tb = _mk_target("池B-同城", "poolB")

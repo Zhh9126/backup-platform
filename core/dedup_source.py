@@ -20,6 +20,7 @@ import hashlib
 import logging
 import os
 import shlex
+import tempfile
 from typing import Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("core.dedup_source")
@@ -143,9 +144,14 @@ def pull_assemble_dedup(client, remote_path: str, local_path: str,
     transferred = 0
     hits = 0
     fetches = 0
-    sftp = client.open_sftp()
+    os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=".aidbm-assemble-", dir=os.path.dirname(os.path.abspath(local_path)))
+    os.close(descriptor)
+    sftp = None
+    success = False
     try:
-        with open(local_path, "wb") as out:
+        sftp = client.open_sftp()
+        with open(temporary, "wb") as out:
             for seq, h in enumerate(hashes):
                 bsize = min(block_size, size - seq * block_size)
                 data = None
@@ -162,27 +168,28 @@ def pull_assemble_dedup(client, remote_path: str, local_path: str,
                             f"块 {seq} 传输后哈希不符（期望 {h[:12]}…）")
                     transferred += len(data)
                     fetches += 1
-                    # 落块库 + 全局记账（与 global_dedup 同一套索引）
-                    os.makedirs(os.path.dirname(phys), exist_ok=True)
-                    tmp_phys = phys + ".part"
-                    with open(tmp_phys, "wb") as pf:
-                        pf.write(data)
-                    os.replace(tmp_phys, phys)
-                    gd._upsert_block(h, len(data), task_id, None, phys)
                 else:
                     hits += 1
+                # 同一块库的原子落盘与索引更新走共享锁，命中也登记引用。
+                gd._dedup_chunks((data,), task_id, None)
                 out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
         # 整文件对账：重组产物必须与远端逐字节一致
-        local_sha = _file_sha256(local_path)
+        local_sha = _file_sha256(temporary)
         if local_sha != fp["sha256"]:
             raise RuntimeError(
                 f"重组产物校验不符: local={local_sha[:12]}… remote={fp['sha256'][:12]}…")
+        os.replace(temporary, local_path)
+        success = True
     finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
         try:
             sftp.close()
         except Exception:  # noqa: BLE001
             pass
-        if cleanup_remote:
+        if cleanup_remote and success:
             try:
                 exec_fn("rm -f %s" % shlex.quote(remote_path))
             except Exception:  # noqa: BLE001

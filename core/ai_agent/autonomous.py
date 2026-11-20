@@ -534,9 +534,13 @@ def _act_restore_verify(args):
     tid = int(args.get("task_id") or 0)
     if not tid:
         raise ValueError("task_id 必填")
-    rid = restore_verify.run_restore_verify_policy(
-        task_id=tid, name="AI 自治复检", schedule_type="manual", enabled=0)
-    return {"policy_id": rid}
+    from core import models
+    if not models.get_task(tid):
+        raise ValueError("任务不存在")
+    policy_id = models.create_restore_verify_policy({
+        "task_id": tid, "name": "AI 自治复检", "schedule_type": "manual", "enabled": 0})
+    result = restore_verify.run_restore_verify_policy(policy_id)
+    return {"policy_id": policy_id, **result}
 
 
 ACTIONS = {

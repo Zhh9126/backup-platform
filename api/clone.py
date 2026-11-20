@@ -243,3 +243,10 @@ def api_delete_vdb_snapshot(request_id, snapshot_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify(res)
+
+
+@api_bp.get("/clone/capabilities")
+@login_required
+def api_clone_capabilities():
+    from core.clone_backends import capabilities
+    return jsonify({"items": capabilities()})

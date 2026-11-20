@@ -27,6 +27,30 @@ def preflight(rec: dict, target_host: str = "127.0.0.1",
     errors, warnings, checks = [], [], []
     rec = rec or {}
 
+    from core.clone_backends import ENGINE_TYPES
+    from core import clone_runtime
+    supported = ENGINE_TYPES | clone_runtime.KINDS | {"mysql", "mariadb", "postgresql", "kingbase", "dameng", "oracle"}
+    kind = rec.get("db_type") or ""
+    allowed_modes = {"logical"}
+    if kind == "postgresql":
+        allowed_modes.add("template")
+    if kind in ("mysql", "mariadb"):
+        allowed_modes.add("snapshot")
+    if kind == "oracle":
+        allowed_modes.add("schema")
+    if kind and kind not in supported:
+        errors.append(f"{kind} 需要专用隔离实例和克隆生命周期适配器")
+    if kind and clone_mode not in allowed_modes:
+        errors.append(f"{kind} 不支持克隆模式 {clone_mode}")
+
+    if kind in clone_runtime.KINDS:
+        try:
+            message = clone_runtime.preflight(rec, target_host)
+            _check(checks, "isolated_runtime", True, message)
+        except Exception as exc:
+            errors.append(str(exc))
+            _check(checks, "isolated_runtime", False, str(exc))
+
     # 1) 源记录状态：失败/隔离产物不允许作为克隆源
     status = str(rec.get("status") or "").lower()
     if status and status != "success":

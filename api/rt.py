@@ -322,6 +322,8 @@ def rt_preview():
         plan = rt_backup.get_pitr().preview(task_id,
                                             str(body.get("target_ts") or ""))
         return jsonify({"ok": True, "plan": plan})
+    except ValueError as exc:
+        return _fail(str(exc), 400)
     except Exception as exc:
         return _fail(f"生成恢复计划失败: {exc}", 500)
 

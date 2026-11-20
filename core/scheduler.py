@@ -39,18 +39,17 @@ class _ConcurrencyController:
 
     上限优先级：环境变量 AIDBM_MAX_CONCURRENT_BACKUPS（运维覆盖）>
     system_config.max_concurrent_backups（界面可改）> 缺省 2。
-    配置变更时下次获取自动重建信号量；acquire() 返回实际获取的信号量对象，
-    release() 只释放该对象——避免"执行中配置变更重建信号量"把 permit
-    还到新信号量上（旧 permit 永久泄漏 → 并发度越跑越小）。
+    使用共享活动许可集合控制并发，配置热更新时保留正在执行的任务计数。
+    上限下降时等待活动任务完成，上限上升时唤醒等待任务。
     """
 
     _CONFIG_TTL = 1.0  # 配置读取节流：高并发提交时避免每次 acquire 都查 SQLite
 
     def __init__(self):
         self._limit = None
-        self._sem = None
         self._checked = 0.0
-        self._lock = threading.Lock()
+        self._permits = set()
+        self._condition = threading.Condition()
 
     def limit(self) -> int:
         # config 在启动时统一解析环境变量（非法值已回落 0），此处只读一次
@@ -73,37 +72,32 @@ class _ConcurrencyController:
 
     def _ensure(self):
         now = time.monotonic()
-        with self._lock:
-            if self._sem is not None and now - self._checked < self._CONFIG_TTL:
-                return
+        if self._limit is None or now - self._checked >= self._CONFIG_TTL:
+            self._limit = self.limit()
             self._checked = now
-            limit = self.limit()
-            if self._sem is None or self._limit != limit:
-                self._limit = limit
-                self._sem = threading.Semaphore(limit)
 
     def acquire(self):
-        self._ensure()
-        with self._lock:
-            sem = self._sem
-        sem.acquire()
-        return sem
+        # 共用活动许可集合，热更新不会生成第二套并发预算。
+        with self._condition:
+            while True:
+                self._ensure()
+                if len(self._permits) < self._limit:
+                    permit = object()
+                    self._permits.add(permit)
+                    return permit
+                self._condition.wait(timeout=self._CONFIG_TTL)
 
     def release(self, sem=None):
-        if sem is None:
-            with self._lock:
-                sem = self._sem
-        if sem is None:
-            return
-        try:
-            sem.release()
-        except Exception:
-            pass
+        with self._condition:
+            if sem in self._permits:
+                self._permits.remove(sem)
+                self._condition.notify_all()
 
     def invalidate(self):
-        """配置刚被修改：立即让下次 acquire 重读上限（跳过 1s 节流）。"""
-        with self._lock:
+        """配置变化后唤醒等待者，按新上限重新检查活动数量。"""
+        with self._condition:
             self._checked = 0.0
+            self._condition.notify_all()
 
 
 class _BandwidthGovernor:
@@ -2042,9 +2036,13 @@ def _chunk_store_gc_job_wrapper():
         from core import chunk_store, container_store
         r1 = chunk_store.gc(dry_run=False, min_age_hours=168)
         r2 = container_store.gc(dry_run=False)
+        if r1.get("blocked") or r2.get("blocked"):
+            _logger.warning("块存储回收已阻止：清单损坏 blob=%s container=%s，数据已保留",
+                            r1.get("bad_manifests"), r2.get("bad_manifests"))
+            return
         _logger.info(
             "块存储回收完成：blob 删除 %s 块（回收 %s B）；容器索引清理 %s 条",
-            r1.get("deleted_blocks"), r1.get("reclaimable_bytes"),
+            r1.get("deleted_blocks"), r1.get("reclaimed_bytes", 0),
             r2.get("deleted_entries"))
     except Exception:  # noqa: BLE001
         _logger.exception("块存储回收异常")
@@ -2126,8 +2124,8 @@ def _restore_verify_job_wrapper(policy_id: int):
     try:
         from core import restore_verify as rv
         result = rv.run_restore_verify_policy(policy_id)
-        _logger.info("[restore_verify] 策略 %s 执行完成: success=%s",
-                     policy_id, result.get("success"))
+        _logger.info("[restore_verify] 策略 %s 执行完成: status=%s level=%s",
+                     policy_id, result.get("status"), result.get("verification_level"))
     except Exception:
         _logger.exception("[restore_verify] 策略 %s 调度执行异常", policy_id)
 

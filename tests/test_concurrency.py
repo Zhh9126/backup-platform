@@ -35,20 +35,44 @@ def test_limit_sources_and_clamp(monkeypatch):
     assert c.limit() == 2                       # 读配置异常回落缺省 2
 
 
-def test_release_uses_acquired_semaphore(monkeypatch):
-    """配置热变更重建信号量后，permit 必须还给 acquire 时的那个信号量。"""
+def test_limit_change_preserves_active_permits(monkeypatch):
     c = scheduler._ConcurrencyController()
-    monkeypatch.setattr(config, "MAX_CONCURRENT_BACKUPS", 0)
-    monkeypatch.setattr(scheduler.db, "get_system_config", lambda k, d=None: "2")
-    sem1 = c.acquire()
-    assert sem1._value == 1
-    monkeypatch.setattr(config, "MAX_CONCURRENT_BACKUPS", 5)
+    monkeypatch.setattr(config, "MAX_CONCURRENT_BACKUPS", 2)
+    first = c.acquire()
+    second = c.acquire()
+    monkeypatch.setattr(config, "MAX_CONCURRENT_BACKUPS", 1)
     c.invalidate()
-    sem2 = c.acquire()
-    assert sem1 is not sem2 and sem2._value == 4
-    c.release(sem1)
-    assert sem1._value == 2                     # 旧信号量恢复其 permit
-    assert sem2._value == 4                     # 新信号量没有被误加
+    acquired = threading.Event()
+    def wait_for_permit():
+        permit = c.acquire()
+        acquired.set()
+        c.release(permit)
+    worker = threading.Thread(target=wait_for_permit)
+    worker.start()
+    try:
+        assert not acquired.wait(0.05)
+        c.release(first)
+        assert not acquired.wait(0.05)
+        c.release(second)
+        assert acquired.wait(2)
+    finally:
+        c.release(first)
+        c.release(second)
+        worker.join(3)
+
+
+def test_increased_limit_keeps_existing_tasks_in_budget(monkeypatch):
+    c = scheduler._ConcurrencyController()
+    monkeypatch.setattr(config, "MAX_CONCURRENT_BACKUPS", 1)
+    first = c.acquire()
+    monkeypatch.setattr(config, "MAX_CONCURRENT_BACKUPS", 2)
+    c.invalidate()
+    second = c.acquire()
+    assert len(c._permits) == 2
+    c.release(first)
+    c.release(first)
+    assert len(c._permits) == 1
+    c.release(second)
 
 
 # --------------------------------------------------------------------------

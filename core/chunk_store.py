@@ -29,6 +29,8 @@
 """
 import hashlib
 import json
+import re
+import tempfile
 import os
 import shutil
 import time
@@ -36,6 +38,7 @@ import uuid
 import zlib
 
 from core import fastcdc
+from core.store_lock import coordinated
 
 DEFAULT_SUBDIR = "chunk_store"
 DEFAULT_CHUNK = {"min_size": 1024 * 1024, "avg_size": 4 * 1024 * 1024,
@@ -77,11 +80,20 @@ def _compress(data: bytes):
         return "zlib", zlib.compress(data, 6)
 
 
+def _codec(blob):
+    return "zstd" if blob.startswith(b"\x28\xb5\x2f\xfd") else "zlib"
+
+
 def _decompress(kind: str, blob: bytes) -> bytes:
-    if kind == "zstd":
-        import zstandard as zstd
-        return zstd.ZstdDecompressor().decompress(blob)
-    return zlib.decompress(blob)
+    # 已有块的真实编码优先，兼容旧清单与发布期间压缩算法切换。
+    kind = _codec(blob)
+    try:
+        if kind == "zstd":
+            import zstandard as zstd
+            return zstd.ZstdDecompressor().decompress(blob)
+        return zlib.decompress(blob)
+    except Exception as exc:
+        raise ValueError("块解压失败") from exc
 
 
 def _sha_bytes(data: bytes) -> str:
@@ -100,26 +112,75 @@ def _sha_file(path: str, buf: int = 1024 * 1024) -> str:
 
 
 def _blob_path(root: str, fp: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", fp or ""):
+        raise ValueError("非法块指纹")
     return os.path.join(root, "blobs", fp[:2], fp)
 
 
 def _atomic_write(path: str, data: bytes):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp.%s" % uuid.uuid4().hex[:8]
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    tmp = path + ".tmp.%s" % uuid.uuid4().hex
+    try:
+        with open(tmp, "xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        descriptor = os.open(os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def source_blocks(path, opts, max_bytes):
+    before = os.stat(path)
+    if max_bytes and before.st_size > int(max_bytes):
+        raise ValueError("文件超过单次分块上限（%d 字节）" % max_bytes)
+    with open(path, "rb") as stream:
+        yield from fastcdc.iter_file_chunks(stream, **opts)
+        after = os.fstat(stream.fileno())
+    if (before.st_size, before.st_mtime_ns, before.st_ino) != (
+            after.st_size, after.st_mtime_ns, after.st_ino):
+        raise ValueError("入库期间源文件发生变化，清单未发布")
+
+
+def validate_manifest(manifest):
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("chunks"), list):
+        raise ValueError("块清单结构无效")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("source_sha256") or "")):
+        raise ValueError("清单缺少有效的整体摘要")
+    offset = 0
+    for chunk in manifest["chunks"]:
+        if not isinstance(chunk, dict):
+            raise ValueError("清单包含无效块")
+        _blob_path("", chunk.get("fp"))
+        if chunk.get("offset") != offset or not isinstance(chunk.get("raw_size"), int) or chunk["raw_size"] <= 0:
+            raise ValueError("清单块边界无效")
+        offset += chunk["raw_size"]
+    if offset != manifest.get("source_size"):
+        raise ValueError("清单总长度不符")
+    return manifest
 
 
 def has_block(fp: str, store_root: str = "") -> bool:
     """本端是否已存在该块（供跨站点「指纹探路」应答使用）。"""
-    return os.path.isfile(_blob_path(_root(store_root), str(fp)))
+    path = _blob_path(_root(store_root), str(fp))
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "rb") as stream:
+            return _sha_bytes(_decompress("", stream.read())) == fp
+    except (OSError, ValueError):
+        return False
 
 
+@coordinated
 def store_file(path: str, store_root: str = "", chunk_opts: dict = None,
-               max_bytes: int = 512 * 1024 * 1024) -> dict:
+               max_bytes: int = 0) -> dict:
     """把一个文件按 CDC 分块、逐块压缩后写入内容寻址存储。
 
     返回 manifest 摘要（含新增/复用块数）。已存在的块直接复用（不重复写盘）。
@@ -130,27 +191,29 @@ def store_file(path: str, store_root: str = "", chunk_opts: dict = None,
     opts = auto_chunk_opts(size) if not chunk_opts else dict(auto_chunk_opts(size))
     if chunk_opts:
         opts.update(chunk_opts)
-    with open(path, "rb") as f:
-        data = f.read(max_bytes)
-    if len(data) < size:
-        raise ValueError("文件超过单次分块上限（%d 字节），请调大 max_bytes"
-                         % max_bytes)
-
-    source_sha = _sha_bytes(data)
-    cuts = fastcdc.cut_points(data, opts["min_size"], opts["avg_size"],
-                              opts["max_size"])
+    source_hash = hashlib.sha256()
     chunks = []
     new_blocks = reused = 0
     raw_total = comp_total = 0
     t0 = time.time()
-    for off, ln in cuts:
-        block = data[off:off + ln]
+    for off, block in source_blocks(path, opts, max_bytes):
+        ln = len(block)
+        source_hash.update(block)
         fp = _sha_bytes(block)
-        kind, blob = _compress(block)
         bp = _blob_path(root, fp)
+        valid = False
         if os.path.isfile(bp):
+            try:
+                with open(bp, "rb") as existing:
+                    blob = existing.read()
+                kind = _codec(blob)
+                valid = _sha_bytes(_decompress(kind, blob)) == fp
+            except Exception:
+                valid = False
+        if valid:
             reused += 1
         else:
+            kind, blob = _compress(block)
             _atomic_write(bp, blob)
             new_blocks += 1
         raw_total += ln
@@ -158,12 +221,14 @@ def store_file(path: str, store_root: str = "", chunk_opts: dict = None,
         chunks.append({"fp": fp, "offset": off, "raw_size": ln,
                        "comp_size": len(blob), "comp": kind})
 
+    if raw_total != size:
+        raise ValueError("入库期间源文件长度发生变化，清单未发布")
     mid = "%s_%s" % (time.strftime("%Y%m%d%H%M%S"), uuid.uuid4().hex[:8])
     manifest = {
         "id": mid,
         "source_name": os.path.basename(path),
         "source_size": size,
-        "source_sha256": source_sha,
+        "source_sha256": source_hash.hexdigest(),
         "chunk_opts": opts,
         "chunks": chunks,
         "raw_total": raw_total,
@@ -183,51 +248,58 @@ def store_file(path: str, store_root: str = "", chunk_opts: dict = None,
 
 
 def load_manifest(manifest_id: str, store_root: str = "") -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", str(manifest_id)):
+        raise ValueError("非法清单标识")
     mp = os.path.join(_root(store_root), "manifests", manifest_id + ".json")
     with open(mp, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return validate_manifest(json.load(f))
 
 
+@coordinated
 def restore_file(manifest_id: str, out_path: str, store_root: str = "",
                  verify: bool = True) -> dict:
-    """按 manifest 逐块解压拼装出原文件，并校验整体 sha256。"""
     man = load_manifest(manifest_id, store_root)
     root = _root(store_root)
+    return restore_manifest(man, manifest_id, out_path,
+                            lambda chunk: open(_blob_path(root, chunk["fp"]), "rb"),
+                            verify)
+
+
+def restore_manifest(man, manifest_id, out_path, reader, verify=True):
+    """逐块校验后原子发布，失败时保留目标原文件。reader 返回上下文管理的字节流。"""
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    h = hashlib.sha256()
+    fd, temporary = tempfile.mkstemp(prefix=".aidbm-restore-", dir=os.path.dirname(os.path.abspath(out_path)))
+    digest = hashlib.sha256()
     written = 0
-    missing = []
-    corrupt = []
-    with open(out_path, "wb") as out:
-        for c in man["chunks"]:
-            bp = _blob_path(root, c["fp"])
-            if not os.path.isfile(bp):
-                missing.append(c["fp"])
-                continue
-            try:
-                with open(bp, "rb") as f:
-                    raw = _decompress(c.get("comp") or "zlib", f.read())
-            except Exception as exc:  # noqa: BLE001 - 损坏块如实上报，不中断整包
-                corrupt.append({"fp": c["fp"], "error": str(exc)[:120]})
-                continue
-            if len(raw) != c["raw_size"]:
-                corrupt.append({"fp": c["fp"],
-                                "error": "解压后长度不符（期望 %d，实际 %d）"
-                                         % (c["raw_size"], len(raw))})
-                continue
-            out.write(raw)
-            h.update(raw)
-            written += len(raw)
-    got = h.hexdigest()
-    sha_ok = got == man["source_sha256"]
-    ok = (not missing) and (not corrupt) and (sha_ok if verify else True)
-    return {
-        "ok": bool(ok), "manifest_id": manifest_id, "out_path": out_path,
-        "bytes": written, "expected_bytes": man["source_size"],
-        "sha256_match": sha_ok,
-        "missing_blocks": missing, "corrupt_blocks": corrupt,
-        "verified": verify,
-    }
+    missing, corrupt = [], []
+    try:
+        with os.fdopen(fd, "wb") as out:
+            for chunk in man["chunks"]:
+                try:
+                    with reader(chunk) as stream:
+                        raw = _decompress(chunk.get("comp") or "zlib", stream.read())
+                    if len(raw) != chunk["raw_size"] or _sha_bytes(raw) != chunk["fp"]:
+                        raise ValueError("块长度或 SHA256 不匹配")
+                    out.write(raw)
+                    digest.update(raw)
+                    written += len(raw)
+                except FileNotFoundError:
+                    missing.append(chunk["fp"])
+                except Exception as exc:
+                    corrupt.append({"fp": chunk["fp"], "error": str(exc)[:120]})
+            out.flush()
+            os.fsync(out.fileno())
+        sha_ok = digest.hexdigest() == man["source_sha256"]
+        ok = not missing and not corrupt and written == man["source_size"] and (sha_ok or not verify)
+        if ok:
+            os.replace(temporary, out_path)
+        return {"ok": bool(ok), "manifest_id": manifest_id, "out_path": out_path,
+                "bytes": written, "expected_bytes": man["source_size"],
+                "sha256_match": sha_ok, "missing_blocks": missing,
+                "corrupt_blocks": corrupt, "verified": verify}
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def diff_manifests(a_id: str, b_id: str, store_root: str = "") -> dict:
@@ -253,6 +325,7 @@ def diff_manifests(a_id: str, b_id: str, store_root: str = "") -> dict:
     }
 
 
+@coordinated
 def stats(store_root: str = "") -> dict:
     root = _root(store_root)
     blobs_dir = os.path.join(root, "blobs")
@@ -325,13 +398,14 @@ def list_manifests(store_root: str = "", limit: int = 50) -> list:
     return out
 
 
+@coordinated
 def gc(store_root: str = "", dry_run: bool = True,
        min_age_hours: float = 0) -> dict:
     """回收「没有任何 manifest 引用」的块。
 
     内容寻址存储只增不减会把磁盘吃满，必须有回收：先全量扫描 manifest 收集
     引用集，再比对 blobs 目录。默认 ``dry_run=True``（只报数不动盘），运维确认
-    后再执行实删。损坏的 manifest 跳过并计数（不因单个坏文件删掉别人的块）。
+    后再执行实删。存在损坏清单时停止删除，保留所有可能仍被引用的块。
 
     ``min_age_hours``：只回收「最后修改时间早于该宽限期」的孤儿块。定时任务
     用它兜底（默认 168h），避免删除"正在写但清单还没落盘"的块。
@@ -350,12 +424,13 @@ def gc(store_root: str = "", dry_run: bool = True,
             try:
                 with open(os.path.join(mdir, fn), "r", encoding="utf-8") as f:
                     m = json.load(f)
+                validate_manifest(m)
                 for c in m.get("chunks") or []:
                     fp = c.get("fp")
                     if fp:
                         referenced.add(fp)
                 manifests += 1
-            except (OSError, ValueError, AttributeError):
+            except (OSError, ValueError, TypeError, AttributeError):
                 bad_manifests += 1
 
     scanned = 0
@@ -386,11 +461,14 @@ def gc(store_root: str = "", dry_run: bool = True,
                     unreferenced.append(fp)
 
     deleted = 0
-    if not dry_run:
+    reclaimed_actual = 0
+    if not dry_run and not bad_manifests:
         for fp in unreferenced:
             try:
+                amount = os.path.getsize(fp)
                 os.remove(fp)
                 deleted += 1
+                reclaimed_actual += amount
             except OSError:
                 pass
         # 清掉空的二级目录
@@ -404,15 +482,18 @@ def gc(store_root: str = "", dry_run: bool = True,
                     pass
 
     return {
-        "ok": True, "dry_run": bool(dry_run),
+        "ok": not bad_manifests, "dry_run": bool(dry_run),
+        "blocked": bool(bad_manifests),
         "manifests": manifests, "bad_manifests": bad_manifests,
         "blocks_scanned": scanned, "referenced_blocks": len(referenced),
         "unreferenced_blocks": len(unreferenced),
-        "reclaimable_bytes": reclaimed, "deleted_blocks": deleted,
+        "reclaimable_bytes": reclaimed, "reclaimed_bytes": reclaimed_actual,
+        "deleted_blocks": deleted,
         "store_root": root,
     }
 
 
+@coordinated
 def purge(store_root: str = "") -> dict:
     """清空分块存储（运维动作，测试/回收用）。"""
     root = _root(store_root)

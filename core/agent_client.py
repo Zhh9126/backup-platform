@@ -69,6 +69,11 @@ class AgentTransport:
 
     def _request(self, method: str, path: str, body: bytes = None,
                  timeout: int = None, stream: bool = False):
+        with self._lock:
+            return self._request_locked(method, path, body, timeout, stream)
+
+    def _request_locked(self, method: str, path: str, body: bytes = None,
+                        timeout: int = None, stream: bool = False):
         """返回 (status, headers, body|response)。stream=True 返回 response。
 
         流式响应（stream=True）独占新连接：长流命令（pg_basebackup 大产物）
@@ -87,12 +92,16 @@ class AgentTransport:
                 conn.request(method, path, body=body, headers=headers)
                 resp = conn.getresponse()
                 if stream:
+                    # 手工解码 chunked 不会刷新 HTTPConnection 的响应状态，
+                    # 因此流连接交由迭代器独占，绝不回收到普通请求连接。
+                    self._conn = None
+                    resp._aidbm_connection = conn
                     return resp.status, dict(resp.getheaders()), resp
                 data = resp.read()
                 return resp.status, dict(resp.getheaders()), data
             except (http.client.HTTPException, socket.error, OSError) as e:
                 self._reset()
-                if attempt == 2:
+                if attempt == 2 or method not in ("GET", "HEAD"):
                     raise AgentError(
                         "Agent %s 连接失败: %s" % (self.label, e))
                 time.sleep(1)
@@ -123,6 +132,9 @@ class AgentTransport:
         comp = caps.get("compress") or []
         return {
             "version": caps.get("version") or "",
+            "distribution": caps.get("distribution") or "",
+            "uptime_seconds": caps.get("uptime_seconds"),
+            "max_connections": caps.get("max_connections"),
             "os": caps.get("os") or "", "arch": caps.get("arch") or "",
             "python": caps.get("python") or "",
             "encryption": caps.get("algo") or "",
@@ -191,25 +203,34 @@ class AgentTransport:
     @staticmethod
     def _iter_chunked(resp):
         """HTTP chunked 解码（requests 不可用时手工实现）。"""
-        while True:
-            line = resp.fp.readline().strip()
-            if not line:
-                continue
-            try:
-                size = int(line.split(b";")[0], 16)
-            except ValueError:
-                raise AgentError("chunked 协议错误: %r" % line[:60])
-            if size == 0:
-                resp.fp.readline()  # 尾部 CRLF
-                return
-            data = b""
-            while len(data) < size:
-                blk = resp.fp.read(size - len(data))
-                if not blk:
+        try:
+            while True:
+                raw_line = resp.fp.readline()
+                if not raw_line:
                     raise AgentError("chunked 流提前结束")
-                data += blk
-            resp.fp.read(2)  # CRLF
-            yield data
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    size = int(line.split(b";")[0], 16)
+                except ValueError:
+                    raise AgentError("chunked 协议错误: %r" % line[:60])
+                if size == 0:
+                    resp.fp.readline()  # 尾部 CRLF
+                    return
+                data = b""
+                while len(data) < size:
+                    blk = resp.fp.read(size - len(data))
+                    if not blk:
+                        raise AgentError("chunked 流提前结束")
+                    data += blk
+                resp.fp.read(2)  # CRLF
+                yield data
+        finally:
+            resp.close()
+            connection = getattr(resp, "_aidbm_connection", None)
+            if connection:
+                connection.close()
 
     # ---- 文件：上传（分块，覆盖语义） ----
     def file_put(self, local_path: str, remote_path: str,
@@ -263,7 +284,7 @@ class AgentTransport:
 
     # ---- 文件：下载（Range 续传 + 可选 gzip） ----
     def file_get(self, remote_path: str, local_path: str,
-                 progress=None, label: str = "") -> int:
+                 progress=None, label: str = "", resume: bool = True) -> int:
         st, _h, data = self._request(
             "POST", "/fs", body=self._seal({"op": "stat", "path": remote_path}))
         if st != 200:
@@ -273,7 +294,9 @@ class AgentTransport:
             raise AgentError("远端文件不存在: %s" % remote_path)
         remote_size = int(r.get("size") or 0)
         offset = 0
-        if os.path.exists(local_path):
+        can_resume = (resume and remote_size <= DIGEST_MAX_BYTES and
+                      "fs-digest" in (self.caps.get("features") or []))
+        if can_resume and os.path.exists(local_path):
             offset = os.path.getsize(local_path)
             if offset > remote_size:
                 offset = 0
@@ -294,8 +317,12 @@ class AgentTransport:
             import zlib
             dec = zlib.decompressobj(16 + zlib.MAX_WBITS)
         written = offset
-        # 仅全新下载能做全文件哈希：断点续传时前 offset 字节不在本次流里。
-        hasher = hashlib.sha256() if offset == 0 else None
+        # 续传也读取并核对本地前缀，避免相同大小的旧文件被当作已下载完成。
+        hasher = hashlib.sha256()
+        if offset:
+            with open(local_path, "rb") as prefix:
+                for block in iter(lambda: prefix.read(CHUNK), b""):
+                    hasher.update(block)
         with open(local_path, "ab" if offset else "wb") as f:
             for data in self._iter_chunked(resp):
                 payload = dec.decompress(data) if dec else data
@@ -318,20 +345,22 @@ class AgentTransport:
             raise AgentError(
                 "Agent 下载产物不完整: 落盘 %d 字节，远端 %d 字节（%s）"
                 % (written, remote_size, local_path))
-        # 2) 端到端 sha256 对账：仅新插件自报 fs-digest 且非续传时启用；
-        #    大文件由插件如实返回 sha256=None，降级为上面的大小校验。
+        # 2) 新插件同时验证续传前缀和新字节；旧版本仅保留大小检查。
         if hasher and "fs-digest" in (self.caps.get("features") or []):
             st, _h, data = self._request(
                 "POST", "/fs",
                 body=self._seal({"op": "digest", "path": remote_path,
                                  "max_bytes": DIGEST_MAX_BYTES}))
-            if st == 200:
-                r = self._open_json(data)
-                remote_sha = r.get("sha256")
-                if remote_sha and hasher.hexdigest() != remote_sha:
-                    raise AgentError(
-                        "Agent 下载 sha256 对账不一致（传输损坏？）: %s"
-                        % local_path)
+            if st != 200:
+                raise AgentError("Agent 下载指纹检查失败: HTTP %s" % st)
+            r = self._open_json(data)
+            remote_sha = r.get("sha256")
+            if offset and (not remote_sha or hasher.hexdigest() != remote_sha):
+                return self.file_get(remote_path, local_path, progress, label, resume=False)
+            if remote_sha and hasher.hexdigest() != remote_sha:
+                raise AgentError(
+                    "Agent 下载 sha256 对账不一致（传输损坏？）: %s"
+                    % local_path)
         return written
 
     # ---- 文件系统操作 ----

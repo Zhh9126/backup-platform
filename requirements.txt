@@ -3,6 +3,7 @@
 
 Flask>=3.0
 APScheduler>=3.10          # 后台定时调度（必选）
+cryptography>=3.3          # 目录灾备包 AES-256-GCM 与平台 SSH 加密依赖
 paramiko>=3.0              # SSH/SFTP 远程通道（所有数据库备份/恢复/远程操作，必选）
 PyYAML>=6.0                # 支持 config.yaml 配置（当前以 config.json/环境变量为主，可注释）
 
@@ -18,6 +19,7 @@ watchdog>=4.0              # 文件事件驱动加速：Linux=inotify / Windows=
 
 # ---------- 报表导出（Word / PDF，可选）----------
 # 未安装时导出接口返回 400 与明确提示（CSV 不受影响），功能优雅降级
+openpyxl>=3.1             # 网络设备 Excel 模板和批量导入
 python-docx>=1.1           # Word(.docx) 报告生成
 reportlab>=4.0             # PDF 报告生成
 

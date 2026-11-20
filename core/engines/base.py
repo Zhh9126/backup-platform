@@ -885,7 +885,7 @@ class BackupEngine:
                                 message="备份文件大小为 0")
         # checksum 校验（简单 SHA256 或 CRC）
         checksum = record.get("checksum") or ""
-        if checksum and checksum.startswith("sha256:"):
+        if checksum:
             import hashlib
             h = hashlib.sha256()
             try:
@@ -895,7 +895,7 @@ class BackupEngine:
                         if not chunk:
                             break
                         h.update(chunk)
-                if h.hexdigest() != checksum.split(":", 1)[1]:
+                if h.hexdigest() != db.normalize_sha256(checksum):
                     return BackupResult(success=False, status=BackupStatus.FAILED,
                                         message="SHA256 校验失败")
             except Exception as e:

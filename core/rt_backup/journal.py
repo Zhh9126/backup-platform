@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import re
 import threading
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
@@ -159,7 +160,7 @@ class RecoveryJournal:
 
         # 先判定该任务属于哪种恢复语义：优先看是否存在 db-log 恢复点
         db_log_cnt = models.count_recovery_points(task_id, kind=RP_DB_LOG)
-        if db_log_cnt > 0:
+        if db_log_cnt > 0 or models.count_recovery_points(task_id, kind=RP_DB_FULL) > 0:
             full_kind, inc_kind = RP_DB_FULL, RP_DB_LOG
         else:
             full_kind, inc_kind = RP_BASE_FULL, RP_FILE_INC
@@ -199,7 +200,7 @@ class RecoveryJournal:
                 chain.append(point)
         return chain
 
-    def validate_chain(self, chain: List[RecoveryPoint]) -> Tuple[bool, str]:
+    def validate_chain(self, chain: List[RecoveryPoint], check_artifacts=True) -> Tuple[bool, str]:
         """校验链完整性。
 
         依次检查：①链头必须是 full；②相邻节点 parent_rp_id 连续；
@@ -219,14 +220,18 @@ class RecoveryJournal:
         prev: Optional[RecoveryPoint] = None
         seen_ids = set()
         for point in chain:
+            if point.id and point.id in seen_ids:
+                return False, "恢复链存在重复恢复点"
+            if point.storage_tier == 1 and not point.object_key:
+                return False, "恢复点未登记本地产物路径"
             # ④ 产物存在性与校验和
-            if point.storage_tier == 1:
+            if check_artifacts and point.storage_tier == 1:
                 if not point.object_key or not os.path.isfile(point.object_key):
                     return False, (f"恢复点 {point.id}（{point.pit_at}）产物缺失: "
                                    f"{norm_path(point.object_key)}")
                 if point.checksum:
                     actual = db.sha256_file(point.object_key)
-                    if actual != point.checksum:
+                    if actual != db.normalize_sha256(point.checksum):
                         return False, (f"恢复点 {point.id}（{point.pit_at}）校验和不匹配，"
                                        f"产物可能已损坏")
                 elif os.path.getsize(point.object_key) <= 0:
@@ -249,7 +254,7 @@ class RecoveryJournal:
                                        f"{point.parent_rp_id}，但链上前驱是 {prev.id}，"
                                        f"中间存在缺失的恢复点")
                 # ③ DB 段位点连续性
-                if point.rp_kind == RP_DB_LOG and prev.rp_kind == RP_DB_LOG:
+                if point.rp_kind == RP_DB_LOG and (prev.rp_kind == RP_DB_LOG or prev.rp_kind == RP_DB_FULL):
                     ok, reason = self._check_position_continuity(prev, point)
                     if not ok:
                         return False, reason
@@ -262,25 +267,62 @@ class RecoveryJournal:
     def _check_position_continuity(prev: RecoveryPoint,
                                    cur: RecoveryPoint) -> Tuple[bool, str]:
         """校验相邻两个 DB 日志段的位点是否连续。"""
-        # MySQL：前段 end_file/end_pos 应等于后段的起始 file/pos，
-        # 或后段起始于下一个 binlog 文件的头部（pos<=4）
-        if prev.binlog_end_file and cur.binlog_file:
-            same_file = prev.binlog_end_file == cur.binlog_file
-            if same_file and cur.binlog_pos > prev.binlog_end_pos:
-                return False, (f"binlog 位点不连续：{prev.binlog_end_file}:"
-                               f"{prev.binlog_end_pos} → {cur.binlog_file}:"
-                               f"{cur.binlog_pos}，中间有日志缺口")
-            if not same_file and cur.binlog_pos > 4:
-                return False, (f"binlog 文件切换处位点异常：{cur.binlog_file}:"
-                               f"{cur.binlog_pos}（应从文件头 4 开始）")
+        # Full backup start positions must also connect to the first archive.
+        end_file = prev.binlog_end_file or (prev.binlog_file if prev.is_full else "")
+        end_pos = prev.binlog_end_pos or (prev.binlog_pos if prev.is_full else 0)
+        if end_file and cur.binlog_file:
+            if end_file == cur.binlog_file:
+                if end_pos and cur.binlog_pos > end_pos:
+                    return False, f"binlog 位点不连续：{end_file}:{end_pos} → {cur.binlog_pos}"
+            else:
+                before = re.fullmatch(r"(.*[.])([0-9]+)", end_file)
+                after = re.fullmatch(r"(.*[.])([0-9]+)", cur.binlog_file)
+                if (not before or not after or before[1] != after[1]
+                        or int(after[2]) != int(before[2]) + 1):
+                    return False, f"binlog 文件序号不连续：{end_file} → {cur.binlog_file}"
+                if cur.binlog_pos > 4:
+                    return False, f"binlog 文件切换处位点异常：{cur.binlog_file}:{cur.binlog_pos}"
         # PG：前段 end_lsn 应 <= 后段起始 lsn（字符串比较不可靠，改为解析）
-        if prev.wal_end_lsn and cur.wal_lsn:
-            prev_val = RecoveryJournal._lsn_to_int(prev.wal_end_lsn)
+        previous_lsn = prev.wal_end_lsn or (prev.wal_lsn if prev.is_full else "")
+        if previous_lsn and cur.wal_lsn:
+            if "/" in previous_lsn or "/" in cur.wal_lsn:
+                if not all(re.fullmatch(r"[0-9A-Fa-f]{1,8}/[0-9A-Fa-f]{1,8}", v)
+                           for v in (previous_lsn, cur.wal_lsn)):
+                    return False, "WAL LSN 格式无效，无法证明日志连续性"
+            prev_val = RecoveryJournal._lsn_to_int(previous_lsn)
             cur_val = RecoveryJournal._lsn_to_int(cur.wal_lsn)
             if prev_val and cur_val and cur_val > prev_val:
                 return False, (f"WAL LSN 不连续：{prev.wal_end_lsn} → {cur.wal_lsn}，"
                                f"中间有 WAL 缺口")
         return True, ""
+
+    def coverage_segments(self, points):
+        """Metadata-contiguous ranges; actual replay still requires strict artifact checks."""
+        segments, gaps = [], []
+        seen, previous, current = set(), None, None
+        for point in points:
+            if point.is_full:
+                current = {"start": point.pit_at, "end": point.pit_at,
+                           "base_point_id": point.id, "points": 1,
+                           "validation": "metadata_only"}
+                segments.append(current)
+                seen, previous = {point.id}, point
+                continue
+            if current is None:
+                continue
+            reason = ""
+            if point.parent_rp_id and point.parent_rp_id not in seen:
+                reason = "父恢复点缺失"
+            elif point.rp_kind == RP_DB_LOG:
+                _, reason = self._check_position_continuity(previous, point)
+            if reason:
+                gaps.append({"from": previous.pit_at, "to": point.pit_at, "reason": reason})
+                current, previous = None, None
+                continue
+            current["end"], current["points"] = point.pit_at, current["points"] + 1
+            seen.add(point.id)
+            previous = point
+        return {"segments": segments, "gaps": gaps}
 
     @staticmethod
     def _lsn_to_int(lsn: str) -> int:

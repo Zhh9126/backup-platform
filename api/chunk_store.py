@@ -30,7 +30,7 @@ def _record_path(record_id):
         return None, "该记录的产物不存在（可能已清理）", 400
     try:
         root = os.path.realpath(getattr(config, "BACKUP_ROOT", "") or "/")
-        if not os.path.realpath(p).startswith(root):
+        if os.path.commonpath([os.path.realpath(p), root]) != root:
             return None, "产物不在备份根目录内，拒绝读取", 400
     except OSError:
         return None, "路径解析失败", 400
@@ -134,7 +134,10 @@ def chunk_store_have():
                         "error": "单批最多 16384 个指纹，请分批探路"}), 400
     from core import block_transfer
     # 本端「已有」= 块存储中实际存在的块
-    have = [str(fp) for fp in fps if chunk_store.has_block(str(fp))]
+    try:
+        have = [str(fp) for fp in fps if chunk_store.has_block(str(fp))]
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
     res = block_transfer.have_bitmap(have, [str(x) for x in fps])
     res["ok"] = True
     res["blocks_on_disk"] = len(have)

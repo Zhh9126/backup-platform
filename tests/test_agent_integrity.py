@@ -131,27 +131,22 @@ def test_large_file_skips_hash_honestly(tmp_path):
     assert t.digest_calls == 1
 
 
-def test_resume_skips_digest(tmp_path):
-    """断点续传时本地前段字节不在本次流里，不能做全文件哈希对账。"""
+def test_resume_validates_prefix_and_new_bytes(tmp_path):
     payload = b"tail-only"
     out = str(tmp_path / "resume.bin")
     with open(out, "wb") as f:
         f.write(b"head-")
-    t = FakeTransport(NEW_CAPS, payload, remote_sha="0" * 64)
-
+    t = FakeTransport(NEW_CAPS, payload,
+                      remote_sha=hashlib.sha256(b"head-" + payload).hexdigest())
+    original = t._request
     def patched(method, path, body=None, timeout=None, stream=False):
-        if method == "POST" and path == "/fs":
-            req = json.loads(body.decode())
-            if req.get("op") == "stat":
-                return 200, {}, json.dumps(
-                    {"exists": True, "size": 5 + len(payload)}).encode()
-        if method == "GET" and path.startswith("/file"):
-            return 200, {}, object()
-        raise AssertionError("续传路径不应请求 digest: %s" % path)
-
+        if method == "POST" and path == "/fs" and json.loads(body.decode()).get("op") == "stat":
+            return 200, {}, json.dumps({"exists": True, "size": 5 + len(payload)}).encode()
+        return original(method, path, body, timeout, stream)
     t._request = patched
     assert t.file_get("/tmp/resume.bin", out) == 5 + len(payload)
-    assert t.digest_calls == 0
+    assert t.digest_calls == 1
+    assert open(out, "rb").read() == b"head-" + payload
 
 
 def test_plugin_source_contract():
@@ -163,4 +158,4 @@ def test_plugin_source_contract():
     assert '"integrity": ["sha256"]' in src
     assert 'elif op == "digest":' in src
     assert '"sha256": None, "skipped": "over_limit"' in src
-    assert 'VERSION = "1.1.2"' in src
+    assert 'VERSION = "1.2.0"' in src

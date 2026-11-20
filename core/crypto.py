@@ -87,7 +87,7 @@ def hmac_verify(key: bytes, data: bytes, sig: str) -> bool:
 
 def generate_token() -> str:
     """生成通道 token（43 字符 URL 安全随机）。"""
-    return _b64e(os.urandom(32)).rstrip("=")
+    return base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
 
 
 # ---------------- 备份产物静态加密（可选，合规要求） ----------------

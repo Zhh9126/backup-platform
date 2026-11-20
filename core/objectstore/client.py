@@ -450,8 +450,8 @@ class ObjectStoreClient:
                         pass
                     offset = 0
                 elif offset > 0 and offset == exp:
-                    os.replace(part, dest)
-                    return offset
+                    # 大小相等不能证明残件内容正确，重新读取而不直接发布。
+                    offset = 0
             headers = {"range": "bytes=%d-" % offset} if offset else None
             conn = None
             try:
@@ -503,12 +503,17 @@ class ObjectStoreClient:
                     http.client.HTTPException, ssl.SSLError, OSError) as e:
                 # part 已写字节保留；下一轮按新的 offset 继续。
                 # CancelledError 不在捕获列表，直接穿透给调度器标记 cancelled。
+                if isinstance(e, OSError):
+                    from core.engines.file import _is_transient
+                    if not _is_transient(e):
+                        raise
                 if attempt >= attempts:
                     kept = os.path.getsize(part) if os.path.isfile(part) else 0
                     raise ObjectStoreError(
                         "对象下载中断（已保留断点 %d 字节，重跑可续传）: %s"
                         % (kept, str(e)[:200]), detail=str(e)[:300])
-                time.sleep(min(2 ** attempt, 4))
+                from core.network_retry import retry_wait
+                retry_wait(attempt + 1, 1)
             finally:
                 if conn:
                     try:

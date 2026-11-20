@@ -104,14 +104,16 @@
           <div class="input-group input-group-sm mb-3">
             <span class="input-group-text">Agent 端口</span>
             <input class="form-control" id="ai_port" value="8466" style="max-width:110px">
-            <button class="btn btn-success" id="aiBtn" onclick="remoteInstall()">
+            <button class="btn btn-outline-secondary" data-agent-deploy onclick="remoteInstall('precheck')">预检</button>
+            <button class="btn btn-outline-primary" data-agent-deploy onclick="remoteInstall('stage')">暂存</button>
+            <button class="btn btn-success" data-agent-deploy id="aiBtn" onclick="remoteInstall('install')">
               <i class="bi bi-play-fill me-1"></i>安装并启动
             </button>
           </div>
           <div id="ai_result" class="small text-muted">
-            安装内容：推送执行器脚本到 /opt/aidbm-agent → 注册 systemd 服务（开机自启）→ 自动探活。
-            主机需已纳管（凭据可测）。安装后任务执行自动优先走 Agent 通道（auto 模式），
-            目标端加密传输由执行器与平台协商（AES-256-GCM）。
+            <div>安装目录只保留 aidbm-agent 单文件程序。预检兼容性后可先暂存，再按维护窗口安装或升级。</div>
+            <div>安装会校验 SHA256、版本及 AES 能力，启动失败回滚。配置与服务由系统目录管理。</div>
+            <div id="agentPackageInfo" class="mt-2"></div>
           </div>
         </div>
       </div>
@@ -334,7 +336,7 @@
           '<div class="col-md-3"><div class="text-muted small">插件版本 / 目标平台</div><b>' +
             esc(n.version || "-") + "</b>" +
             '<div class="small">' + esc(n.os || "-") + " / " + esc(n.arch || "-") +
-            " · Python " + esc(n.python || "-") + "</div></div>" +
+            " · " + esc(n.distribution || "未自报运行形态") + "</div></div>" +
           '<div class="col-md-3"><div class="text-muted small">传输加密</div><b>' +
             esc(n.encryption || "-") + "</b></div>" +
           '<div class="col-md-2"><div class="text-muted small">传输块大小</div><b>' +
@@ -363,7 +365,7 @@
     if (/refused|Errno 111|连接失败|timed out/i.test(String(msg))) {
       return "目标机 Agent 端口未监听：执行器服务可能未启动或启动失败。" +
         "请在目标机执行 systemctl status aidbm-agent 查看原因，" +
-        "或在右侧「安装并启动」重推执行器（离线环境零第三方依赖）。";
+        "或在右侧「安装并启动」重推单文件执行器。";
     }
     return String(msg || "");
   }
@@ -386,29 +388,34 @@
     await window.loadAgents();
   };
 
-  window.remoteInstall = async function () {
+  window.remoteInstall = async function (phase) {
+    phase = phase || "install";
     const hostId = document.getElementById("ai_host").value;
     if (!hostId) { document.getElementById("ai_host").focus(); return; }
     const btn = document.getElementById("aiBtn");
     const box = document.getElementById("ai_result");
-    btn.disabled = true;
-    box.innerHTML = '<span class="text-primary">安装中：推送执行器 → 注册服务 → 启动 → 探活（约 10 秒）…</span>';
+    document.querySelectorAll("[data-agent-deploy]").forEach(el => el.disabled = true);
+    box.textContent = "正在执行部署阶段 " + phase + "…";
     try {
       const r = await api("POST", "/api/v1/agents/remote-install",
-        { host_id: parseInt(hostId, 10),
+        { host_id: parseInt(hostId, 10), phase: phase,
           agent_port: parseInt(document.getElementById("ai_port").value || "8466", 10) });
       const ins = r.install || {}, pr = r.probe || {};
       if (r.ok) {
-        box.innerHTML = '<span class="text-success">安装成功，探活在线。</span> 任务添加时该主机会自动优先走 Agent 通道。' +
-          '<div class="text-muted mt-1">载荷 ' + esc(ins.payload_format || "-") +
-          ' · Python ' + esc(ins.python || "-") + '</div>';
+        const phaseText = { precheck: "预检通过，可暂存或安装。",
+                            stage: "暂存完成，可在维护窗口安装。", install: "安装成功，探活在线。" };
+        box.innerHTML = '<span class="text-success">' + phaseText[phase] + '</span>' +
+          '<div class="text-muted mt-1">' + esc(r.package.version) + ' · ' +
+          esc(r.package.arch) + ' · 单文件程序</div>';
+        if (r.cleanup && !r.cleanup.ok) box.innerHTML +=
+          '<div class="text-warning">服务已更新，旧文件清理需重试。</div>';
       } else {
         let html = '<span class="text-danger">' +
           (ins.ok ? '执行器已推送，但探活未通过' : '安装未完成：服务启动失败') + '：</span>';
         if (r.rolled_back) html += '<div class="text-muted">' + esc(r.rolled_back) + '</div>';
         const hint = r.hint || (r.details && r.details.hint) || "";
         if (hint) html += '<div class="mt-1">' + esc(hint) + '</div>';
-        else if (pr.error || r.error) html += '<div class="mt-1">' +
+        if (pr.error || r.error) html += '<div class="mt-1">' +
           esc(agentGuidance(pr.error || r.error)) + '</div>';
         if (ins.diagnostics) html += '<details class="mt-2">' +
           '<summary class="small">查看远端服务日志</summary>' +
@@ -421,11 +428,22 @@
       box.innerHTML = '<span class="text-danger">安装失败：</span>' + esc(m) +
         '<div class="mt-1 text-muted">' + esc(agentGuidance(m)) + '</div>';
     }
-    btn.disabled = false;
+    document.querySelectorAll("[data-agent-deploy]").forEach(el => el.disabled = false);
     await window.loadAgents();
   };
 
   (async function init() {
+    try {
+      const packages = await api("GET", "/api/v1/agents/packages");
+      const element = document.getElementById("agentPackageInfo");
+      if (element) element.innerHTML = (packages.packages || []).map(p =>
+        '<div>' + esc(p.version) + ' · ' + esc(p.arch) + ' · ' +
+        '<a href="/api/v1/agents/package?arch=' + encodeURIComponent(p.arch) + '">下载单文件 Agent</a>' +
+        '<div class="text-muted text-break">SHA256 ' + esc(p.sha256) + '</div></div>'
+      ).join("") || "暂无发布包，请在平台构建对应架构。";
+    } catch (e) {
+      document.getElementById("agentPackageInfo").textContent = "发布包读取失败：" + e.message;
+    }
     try {
       const hosts = await api("GET", "/api/hosts");
       const opts = '<option value="">选择纳管主机…</option>' +

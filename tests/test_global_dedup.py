@@ -94,11 +94,11 @@ def main():
         assert stats["physical_bytes"] == 8 * BS, stats
         # 引用计数：任务A(8次) + 任务B(8次) = 16
         assert stats["total_references"] == 16, stats
-        # logical = 各块原始大小×引用次数 = 8×1024×16 = 131072
-        assert stats["logical_bytes"] == 8 * BS * 16, stats
-        # saved = logical - physical = 131072 - 8192 = 122880
-        assert stats["saved_bytes"] == 8 * BS * 15, stats
-        assert stats["dedup_ratio_pct"] > 90, stats
+        # logical = 各块大小×各自引用次数之和 = 8×1024×2 = 16384
+        assert stats["logical_bytes"] == 8 * BS * 2, stats
+        # saved = logical - physical = 16384 - 8192 = 8192
+        assert stats["saved_bytes"] == 8 * BS, stats
+        assert stats["dedup_ratio_pct"] == 50, stats
         print(f"[OK] 跨任务重删: {stats}")
 
         # 不同内容（不同基线字母）→ 不互相命中

@@ -26,16 +26,16 @@ class FakeDB:
 
     def execute_rowcount(self, sql, params=()):
         if sql.startswith("UPDATE scheduler_leases SET owner"):
-            owner, hb, exp, name = params
+            owner, hb, exp, name, contender, now = params
             r = self.rows.get(name)
-            if not r:
+            if not r or (r["owner"] != contender and r["expires_at"] > now):
                 return 0
             r.update(owner=owner, heartbeat_at=hb, expires_at=exp)
             return 1
         if sql.startswith("UPDATE scheduler_leases SET heartbeat_at"):
-            hb, exp, name, owner = params
+            hb, exp, name, owner, now = params
             r = self.rows.get(name)
-            if not r or r.get("owner") != owner:
+            if not r or r.get("owner") != owner or r["expires_at"] <= now:
                 return 0
             r.update(heartbeat_at=hb, expires_at=exp)
             return 1
@@ -120,3 +120,19 @@ def test_status_shape(fake):
     assert st["active"] is True
     assert st["expires_in"] is not None
     assert st["self"] == lease.owner_id()
+
+
+def test_expired_owner_cannot_renew(fake):
+    lease.acquire(owner="A")
+    fake.rows["scheduler"]["expires_at"] = time.time() - 1
+    assert not lease.renew(owner="A")["ok"]
+
+
+def test_concurrent_stale_reader_cannot_overwrite_new_holder(fake, monkeypatch):
+    lease.acquire(owner="old")
+    fake.rows["scheduler"]["expires_at"] = time.time() - 1
+    stale = dict(fake.rows["scheduler"])
+    assert lease.acquire(owner="winner")["acquired"]
+    monkeypatch.setattr(lease, "_row", lambda name: stale)
+    assert not lease.acquire(owner="loser")["acquired"]
+    assert fake.rows["scheduler"]["owner"] == "winner"

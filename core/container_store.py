@@ -27,6 +27,9 @@
 - 纯 Python 实现，吞吐与 chunk_store 同量级（瓶颈在 FastCDC + 压缩）。
 """
 import json
+import hashlib
+import io
+import re
 import os
 import threading
 import time
@@ -55,19 +58,20 @@ def _load_index(root: str) -> dict:
         return {}
     try:
         with open(p, "r", encoding="utf-8") as f:
-            return json.load(f) or {}
-    except (OSError, ValueError):
-        return {}
+            index = json.load(f)
+            if not isinstance(index, dict) or any(
+                    not isinstance(loc, dict) or not all(k in loc for k in
+                        ("cid", "offset", "size", "comp", "raw_size"))
+                    for loc in index.values()):
+                raise ValueError("容器索引结构无效")
+            return index
+    except (OSError, ValueError) as exc:
+        raise ValueError("容器索引损坏，停止修改并保留数据") from exc
 
 
 def _save_index(root: str, idx: dict):
     os.makedirs(root, exist_ok=True)
-    tmp = _index_path(root) + ".tmp.%s" % uuid.uuid4().hex[:8]
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(idx, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, _index_path(root))
+    chunk_store._atomic_write(_index_path(root), json.dumps(idx).encode("utf-8"))
 
 
 def _sorted_containers(root: str):
@@ -120,6 +124,10 @@ def _append_blob(root: str, blob: bytes, container_max: int) -> tuple:
 
 
 def _read_blob(root: str, cid: str, offset: int, size: int) -> bytes:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", cid or ""):
+        raise ValueError("非法容器标识")
+    if int(offset) < 0 or int(size) <= 0:
+        raise ValueError("容器块边界无效")
     for ext in (".bin", ".sealed"):
         p = os.path.join(root, cid + ext)
         if os.path.isfile(p):
@@ -133,33 +141,35 @@ def _read_blob(root: str, cid: str, offset: int, size: int) -> bytes:
     raise FileNotFoundError("容器不存在: %s" % cid)
 
 
+@chunk_store.coordinated
 def store_file(path: str, store_root: str = "", chunk_opts: dict = None,
                container_max: int = DEFAULT_CONTAINER_MAX,
-               max_bytes: int = 512 * 1024 * 1024) -> dict:
+               max_bytes: int = 0) -> dict:
     """按 CDC 分块 → 逐块压缩 → 追加进容器 → 写清单。返回存储摘要。"""
     root = _root(store_root)
     size = os.path.getsize(path)
     opts = chunk_store.auto_chunk_opts(size)
     if chunk_opts:
         opts.update(chunk_opts)
-    with open(path, "rb") as f:
-        data = f.read(max_bytes)
-    if len(data) < size:
-        raise ValueError("文件超过单次分块上限（%d 字节）" % max_bytes)
-
-    source_sha = chunk_store._sha_bytes(data)      # noqa: SLF001 - 同口径
-    cuts = fastcdc.cut_points(data, opts["min_size"], opts["avg_size"], opts["max_size"])
-
+    source_hash = hashlib.sha256()
     with _LOCK:
         idx = _load_index(root)
         chunks = []
         new_blocks = reused = 0
         raw_total = comp_total = 0
         t0 = time.time()
-        for off, ln in cuts:
-            block = data[off:off + ln]
-            fp = chunk_store._sha_bytes(block)      # noqa: SLF001
+        for off, block in chunk_store.source_blocks(path, opts, max_bytes):
+            ln = len(block)
+            source_hash.update(block)
+            fp = chunk_store._sha_bytes(block)
             loc = idx.get(fp)
+            if loc:
+                try:
+                    saved = _read_blob(root, loc["cid"], loc["offset"], loc["size"])
+                    if chunk_store._sha_bytes(chunk_store._decompress(loc["comp"], saved)) != fp:
+                        loc = None
+                except (OSError, ValueError, KeyError):
+                    loc = None
             if loc:
                 reused += 1
             else:
@@ -179,10 +189,12 @@ def store_file(path: str, store_root: str = "", chunk_opts: dict = None,
         comp_total = sum(c["comp_size"] for c in chunks)
         _save_index(root, idx)
 
+    if raw_total != size:
+        raise ValueError("入库期间源文件长度发生变化，清单未发布")
     mid = "%s_%s" % (time.strftime("%Y%m%d%H%M%S"), uuid.uuid4().hex[:8])
     manifest = {
         "id": mid, "source_name": os.path.basename(path), "source_size": size,
-        "source_sha256": source_sha, "chunk_opts": opts, "chunks": chunks,
+        "source_sha256": source_hash.hexdigest(), "chunk_opts": opts, "chunks": chunks,
         "raw_total": raw_total, "comp_total": comp_total,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "elapsed_sec": round(time.time() - t0, 2),
@@ -198,46 +210,28 @@ def store_file(path: str, store_root: str = "", chunk_opts: dict = None,
             "manifest_path": mp}
 
 
+@chunk_store.coordinated
 def restore_file(manifest_id: str, out_path: str, store_root: str = "",
                  verify: bool = True) -> dict:
-    """按清单从容器读块并拼装，校验整体 sha256。"""
-    from core import chunk_store as cs
-    man = cs.load_manifest(manifest_id, store_root)
+    man = chunk_store.load_manifest(manifest_id, store_root)
     root = _root(store_root)
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    import hashlib
-    h = hashlib.sha256()
-    written = 0
-    missing, corrupt = [], []
-    with open(out_path, "wb") as out:
-        for c in man["chunks"]:
-            try:
-                blob = _read_blob(root, c.get("container") or "",
-                                  c.get("container_offset") or 0,
-                                  c.get("comp_size") or 0)
-                raw = cs._decompress(c.get("comp") or "zlib", blob)   # noqa: SLF001
-            except FileNotFoundError:
-                missing.append(c["fp"])
-                continue
-            except Exception as exc:  # noqa: BLE001
-                corrupt.append({"fp": c["fp"], "error": str(exc)[:120]})
-                continue
-            if len(raw) != c["raw_size"]:
-                corrupt.append({"fp": c["fp"], "error": "解压长度不符"})
-                continue
-            out.write(raw)
-            h.update(raw)
-            written += len(raw)
-    got = h.hexdigest()
-    sha_ok = got == man["source_sha256"]
-    ok = (not missing) and (not corrupt) and (sha_ok if verify else True)
-    return {"ok": bool(ok), "manifest_id": manifest_id, "out_path": out_path,
-            "bytes": written, "expected_bytes": man["source_size"],
-            "sha256_match": sha_ok, "missing_blocks": missing,
-            "corrupt_blocks": corrupt, "verified": verify,
-            "storage_mode": man.get("storage_mode") or "container"}
+    try:
+        index = _load_index(root)
+    except ValueError:
+        index = {}
+    def read(chunk):
+        location = index.get(chunk["fp"])
+        if location:
+            return io.BytesIO(_read_blob(root, location["cid"], location["offset"], location["size"]))
+        return io.BytesIO(_read_blob(root, chunk.get("container") or "",
+                                    chunk.get("container_offset") or 0,
+                                    chunk.get("comp_size") or 0))
+    result = chunk_store.restore_manifest(man, manifest_id, out_path, read, verify)
+    result["storage_mode"] = man.get("storage_mode") or "container"
+    return result
 
 
+@chunk_store.coordinated
 def stats(store_root: str = "") -> dict:
     root = _root(store_root)
     idx = _load_index(root)
@@ -254,6 +248,7 @@ def stats(store_root: str = "") -> dict:
             "containers": containers, "physical_bytes": total}
 
 
+@chunk_store.coordinated
 def gc(store_root: str = "", dry_run: bool = True) -> dict:
     """清理索引中「没有任何清单引用」的块条目。
 
@@ -265,6 +260,8 @@ def gc(store_root: str = "", dry_run: bool = True) -> dict:
     mdir = os.path.join(cs._root(store_root), "manifests")    # noqa: SLF001
     referenced = set()
     manifests = 0
+    bad_manifests = 0
+    live_containers = set()
     if os.path.isdir(mdir):
         for fn in os.listdir(mdir):
             if not fn.endswith(".json"):
@@ -272,13 +269,16 @@ def gc(store_root: str = "", dry_run: bool = True) -> dict:
             try:
                 with open(os.path.join(mdir, fn), "r", encoding="utf-8") as f:
                     m = json.load(f)
+                cs.validate_manifest(m)
                 for c in m.get("chunks") or []:
                     if c.get("container") and c.get("fp"):
                         referenced.add(c["fp"])
+                        live_containers.add(c["container"])
                 manifests += 1
-            except (OSError, ValueError):
-                continue
+            except (OSError, ValueError, TypeError, AttributeError):
+                bad_manifests += 1
     idx = _load_index(root)
+    live_containers.update(loc["cid"] for fp, loc in idx.items() if fp in referenced)
     orphan = [fp for fp in idx if fp not in referenced]
     by_container = {}
     for fp in orphan:
@@ -287,16 +287,17 @@ def gc(store_root: str = "", dry_run: bool = True) -> dict:
     reclaimable = sum(by_container.values())
 
     deleted = 0
-    if not dry_run and orphan:
+    if not dry_run and orphan and not bad_manifests:
         for fp in orphan:
             idx.pop(fp, None)
             deleted += 1
         _save_index(root, idx)
 
-    return {"ok": True, "dry_run": bool(dry_run), "manifests": manifests,
+    return {"ok": not bad_manifests, "dry_run": bool(dry_run), "manifests": manifests,
+            "bad_manifests": bad_manifests, "blocked": bool(bad_manifests),
             "blocks_indexed": len(idx) + (deleted if not dry_run else 0),
             "orphan_blocks": len(orphan), "deleted_entries": deleted,
             "reclaimable_bytes": reclaimable,
-            "orphan_containers": len(by_container),
+            "orphan_containers": len(set(_sorted_containers(root)) - live_containers),
             "note": "容器数据 Append-Only，不就地搬移；整箱全孤儿时可按 "
                     "orphan_containers 人工回收"}

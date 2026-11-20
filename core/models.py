@@ -181,60 +181,82 @@ def _clamp_interval(data: dict) -> dict:
 
 
 def create_task(data: dict) -> int:
-    # 商业授权与配额强校验（社区免费版每类限 FREE_MAX_QUOTA 个）
-    from core import license as license_mod
-    _dt = data.get("db_type")
-    if _dt in ("file", "synology"):
-        # 群晖是 NAS 文件级备份，归入 file 配额，不挤占数据库任务名额
-        license_mod.check_quota("file")
-    elif _dt == "object_storage":
-        license_mod.check_quota("object_storage")
-    else:
-        license_mod.check_quota("database")
-    # 可选「按授权服务器数计量」：默认关闭，开启后同一主机多任务只占一个名额
-    license_mod.check_server_quota(data.get("host"))
+    # 配额检查与写入共用写锁，避免并发请求越过最后一个名额。
+    with db._write_lock:
+        # 商业授权与配额强校验（社区免费版每类限 FREE_MAX_QUOTA 个）
+        from core import license as license_mod
+        _dt = data.get("db_type")
+        if _dt in ("file", "synology"):
+            # 群晖是 NAS 文件级备份，归入 file 配额，不挤占数据库任务名额
+            license_mod.check_quota("file")
+        elif _dt == "object_storage":
+            license_mod.check_quota("object_storage")
+        else:
+            license_mod.check_quota("database")
+        # 可选「按授权服务器数计量」：默认关闭，开启后同一主机多任务只占一个名额
+        license_mod.check_server_quota(data.get("host"))
 
-    data = _normalize_scope_fields(dict(data))
-    data = {k: data.get(k) for k in TASK_FIELDS}
-    data = _clamp_interval(_normalize_json_fields(data))
-    # 压缩级 1~29（对标 DBackup：1-8 gzip / 9-22 zstd / 23-29 zstd 高档）
-    try:
-        _cl = int(data.get("compress_level") or 0)
-    except Exception:
-        _cl = 0
-    data["compress_level"] = max(0, min(29, _cl))
-    now = db.now_iso()
-    data["created_at"] = now
-    data["updated_at"] = now
-    data["last_status"] = "never"
-    data["last_run_at"] = None
+        data = _normalize_scope_fields(dict(data))
+        data = {k: data.get(k) for k in TASK_FIELDS}
+        data = _clamp_interval(_normalize_json_fields(data))
+        # 压缩级 1~29（对标 DBackup：1-8 gzip / 9-22 zstd / 23-29 zstd 高档）
+        try:
+            _cl = int(data.get("compress_level") or 0)
+        except Exception:
+            _cl = 0
+        data["compress_level"] = max(0, min(29, _cl))
+        now = db.now_iso()
+        data["created_at"] = now
+        data["updated_at"] = now
+        data["last_status"] = "never"
+        data["last_run_at"] = None
 
-    if not data.get("port") and data.get("db_type") in config.DEFAULT_PORTS:
-        data["port"] = config.DEFAULT_PORTS[data["db_type"]]
-    if data.get("password"):
-        data["password"] = db.encrypt_secret(data["password"])
-    if data.get("remote_password"):
-        data["remote_password"] = db.encrypt_secret(data["remote_password"])
+        if not data.get("port") and data.get("db_type") in config.DEFAULT_PORTS:
+            data["port"] = config.DEFAULT_PORTS[data["db_type"]]
+        if data.get("password"):
+            data["password"] = db.encrypt_secret(data["password"])
+        if data.get("remote_password"):
+            data["remote_password"] = db.encrypt_secret(data["remote_password"])
 
-    data["enabled"] = 1 if data.get("enabled") not in (0, False, "0", None) else 0
-    data["compress"] = 1 if data.get("compress") not in (0, False, "0", None) else 0
-    data["demo_only"] = 1 if data.get("demo_only") not in (0, False, "0", None) else 0
-    data["mixed_backup"] = 1 if data.get("mixed_backup") not in (0, False, "0", None) else 0
-    for num in ("port", "interval_minutes", "retention_days", "retention_count",
-                "remote_port"):
-        if data.get(num) in (None, ""):
-            data[num] = None
+        data["enabled"] = 1 if data.get("enabled") not in (0, False, "0", None) else 0
+        data["compress"] = 1 if data.get("compress") not in (0, False, "0", None) else 0
+        data["demo_only"] = 1 if data.get("demo_only") not in (0, False, "0", None) else 0
+        data["mixed_backup"] = 1 if data.get("mixed_backup") not in (0, False, "0", None) else 0
+        for num in ("port", "interval_minutes", "retention_days", "retention_count",
+                    "remote_port"):
+            if data.get(num) in (None, ""):
+                data[num] = None
 
-    # 策略绑定：写入派生的保护列（等级 / 适配层 / RPO / RTO）
-    if data.get("policy_id") in (0, "", None):
-        data["policy_id"] = None
-    if data.get("policy_id"):
-        _fill_policy_columns(data, data.get("policy_id"), data.get("db_type"))
+        # 策略绑定：写入派生的保护列（等级 / 适配层 / RPO / RTO）
+        if data.get("policy_id") in (0, "", None):
+            data["policy_id"] = None
+        if data.get("policy_id"):
+            _fill_policy_columns(data, data.get("policy_id"), data.get("db_type"))
 
-    cols = list(data.keys())
-    sql = "INSERT INTO backup_tasks ({}) VALUES ({})".format(
-        ",".join(cols), ",".join("?" * len(cols)))
-    return db.execute(sql, tuple(data.values()))
+        cols = list(data.keys())
+        sql = "INSERT INTO backup_tasks ({}) VALUES ({})".format(
+            ",".join(cols), ",".join("?" * len(cols)))
+        if db.current_backend() == "sqlite" and not license_mod.is_licensed():
+            # SQLite 把配额判断和 INSERT 放在同一条写语句中，
+            # 多个 Web 进程也不能同时消耗最后一个名额。
+            kind = data.get("db_type")
+            predicate = ("db_type IN ('file','synology')" if kind in ("file", "synology")
+                         else "db_type='object_storage'" if kind == "object_storage"
+                         else "db_type NOT IN ('file','synology','object_storage')")
+            guarded_sql = "INSERT INTO backup_tasks ({}) SELECT {} WHERE "                 "(SELECT COUNT(1) FROM backup_tasks WHERE {}) < ?".format(
+                    ",".join(cols), ",".join("?" * len(cols)), predicate)
+            conn = db.get_conn()
+            try:
+                cur = conn.execute(guarded_sql, (*data.values(), license_mod.FREE_MAX_QUOTA))
+                inserted = cur.rowcount
+                new_id = cur.lastrowid
+                conn.commit()
+            finally:
+                conn.close()
+            if not inserted:
+                raise license_mod.QuotaExceededError("当前任务配额已用尽，请检查授权和已纳管任务")
+            return new_id
+        return db.execute(sql, tuple(data.values()))
 
 
 def update_task(task_id: int, data: dict) -> bool:
@@ -2653,6 +2675,7 @@ def set_restore_verify_status(policy_id: int, last_run_at: str,
 _RESTORE_TEST_REPORT_FIELDS = [
     "policy_id", "task_id", "record_id", "db_type", "status",
     "duration_sec", "message", "cleaned", "created_at", "finished_at",
+    "verification_level", "evidence_json",
 ]
 
 
@@ -2663,6 +2686,13 @@ def _rtr_to_dict(row: Optional[dict]) -> Optional[dict]:
     d = dict(row)
     d["cleaned"] = bool(d.get("cleaned"))
     d["duration_sec"] = float(d.get("duration_sec") or 0)
+    try:
+        d["evidence"] = json.loads(d.get("evidence_json") or "{}")
+    except (ValueError, TypeError):
+        d["evidence"] = {}
+    # Compatibility for imported legacy reports outside schema migration.
+    if d.get("status") in ("success", "passed", "pass") and d.get("verification_level") != "runtime":
+        d["status"] = "partial"
     return d
 
 
@@ -2687,7 +2717,8 @@ def get_restore_test_report(report_id: int) -> Optional[dict]:
 
 def update_restore_test_report(report_id: int, data: dict) -> None:
     """更新测试报告（白名单）。"""
-    allow = {"status", "duration_sec", "message", "cleaned", "finished_at"}
+    allow = {"status", "duration_sec", "message", "cleaned", "finished_at",
+             "verification_level", "evidence_json"}
     updates = {k: v for k, v in data.items() if k in allow}
     if not updates:
         return
@@ -2729,6 +2760,8 @@ def get_restore_verify_stats() -> dict:
     total = db.query_one("SELECT COUNT(*) AS c FROM restore_verify_policies")
     success = db.query_one(
         "SELECT COUNT(*) AS c FROM restore_test_reports WHERE status=?", ("success",))
+    partial = db.query_one(
+        "SELECT COUNT(*) AS c FROM restore_test_reports WHERE status=?", ("partial",))
     failed = db.query_one(
         "SELECT COUNT(*) AS c FROM restore_test_reports WHERE status=?", ("failed",))
     last = db.query_one(
@@ -2737,6 +2770,7 @@ def get_restore_verify_stats() -> dict:
         "policy_count": int(total["c"] if total else 0),
         "success_count": int(success["c"] if success else 0),
         "failed_count": int(failed["c"] if failed else 0),
+        "partial_count": int(partial["c"] if partial else 0),
         "last_test_at": last["created_at"] if last else None,
     }
 

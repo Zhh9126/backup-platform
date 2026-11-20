@@ -2295,9 +2295,28 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                     conn.execute(f"ALTER TABLE restore_verify_policies ADD COLUMN {col} {typedef}")
                 except Exception:
                     pass
-            for col, typedef in [("finished_at", "TEXT")]:
+            for col, typedef in [
+                ("finished_at", "TEXT"),
+                ("verification_level", "TEXT DEFAULT 'unknown'"),
+                ("evidence_json", "TEXT DEFAULT '{}'"),
+            ]:
                 try:
                     conn.execute(f"ALTER TABLE restore_test_reports ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass
+            # 历史报告没有实启/查询证据，不继续当成已验证可恢复。
+            conn.execute("UPDATE restore_test_reports SET status='partial', "
+                         "verification_level='legacy_unverified' "
+                         "WHERE status IN ('success','passed','pass') AND "
+                         "COALESCE(verification_level,'unknown') IN ('unknown','')")
+            for col, typedef in [
+                ("checksum", "TEXT"),
+                ("verified_at", "TEXT"),
+                ("manifest_key", "TEXT"),
+                ("integrity_status", "TEXT DEFAULT 'unknown'"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE pool_replica_logs ADD COLUMN {col} {typedef}")
                 except Exception:
                     pass
 
@@ -2677,6 +2696,14 @@ def sha256_stream(fp, chunk_size: int = 1 << 20) -> str:
     for chunk in iter(lambda: fp.read(chunk_size), b""):
         h.update(chunk)
     return h.hexdigest()
+
+
+def normalize_sha256(value) -> str:
+    """兼容历史裸 SHA256 与引擎的 sha256: 前缀，未知算法返回空。"""
+    digest = str(value or "").strip().lower()
+    if digest.startswith("sha256:"):
+        digest = digest[7:]
+    return digest if re.fullmatch(r"[0-9a-f]{64}", digest) else ""
 
 
 def sha256_file(path: str) -> str:

@@ -13,6 +13,41 @@
    ============================================================= */
 window.I18N = (function () {
   var EN = {
+    "页：按策略分级检查备份产物与隔离副本查询，未完成实启验证时显示部分通过；": "page: check artifacts and isolated replicas by policy; report a partial pass until runtime recovery is verified.",
+
+    "请选择存储目标": "Select a storage target",
+
+    "从副本清单导入": "Import from replica manifest",
+    "源平台不可用时，可将完整副本校验后登记到本平台。增量副本需先补齐恢复链。": "If the source platform is unavailable, verify and register a full replica here. Incremental replicas require their complete recovery chain.",
+    "关联备份任务": "Associated backup task",
+    "副本清单对象键": "Replica manifest object key",
+    "可信 SHA256（可选）": "Trusted SHA256 (optional)",
+    "校验并导入": "Verify and import",
+    "按策略分级检查备份产物与隔离副本查询，未完成实启验证时显示部分通过；": "Check artifacts and isolated replicas by policy; report a partial pass until runtime recovery is verified.",
+
+    "恢复链覆盖区间": "Recovery chain coverage intervals",
+    "尚无完整基准备份链": "No complete baseline backup chain",
+    "区间来自恢复点元数据；执行前仍会校验产物和日志连续性。": "Intervals are based on recovery point metadata. Artifacts and log continuity are checked before execution.",
+    "存在日志缺口，请先补齐日志或选择其他区间。": "Log gaps exist. Supply missing logs or choose another interval.",
+    "恢复点较多，仅展示前 10000 条的覆盖分析。": "Coverage analysis is limited to the first 10000 recovery points.",
+    "副本已校验": "Replica integrity verified",
+    "副本待校验": "Replica integrity unverified",
+
+    "部分通过": "Partially passed",
+    "隔离副本查询": "Isolated replica query",
+    "备份产物检查": "Backup artifact check",
+    "历史证据待补充": "Historical evidence incomplete",
+    "隔离恢复副本查询通过": "Restored isolated replica query passed",
+    "文件、摘要与工具检查通过后显示“部分通过”。只有同一备份恢复出的隔离副本当前可查询，才显示“通过”。\n  系统会自动检查该备份的就绪测试副本；可在克隆服务中创建隔离副本后重新校验。": "File, checksum and tool checks are reported as partial. A pass requires a successful query against an isolated replica restored from the same backup. Create a test replica in Clone Service and run verification again.",
+
+    "暂存": "Stage",
+    "安装目录只保留 aidbm-agent 单文件程序。预检兼容性后可先暂存，再按维护窗口安装或升级。": "The installation directory contains one aidbm-agent executable. Check compatibility, stage the package, then install or upgrade during a maintenance window.",
+    "安装会校验 SHA256、版本及 AES 能力，启动失败回滚。配置与服务由系统目录管理。": "Installation verifies SHA256, version and AES support, with rollback on startup failure. Configuration and service files use system directories.",
+    "下载单文件 Agent": "Download single-file Agent",
+    "数据库克隆能力": "Database clone capabilities",
+    "正在读取数据库能力…": "Loading database capabilities…",
+    "克隆采用异名数据库、schema 或 collection 隔离。恢复和校验依赖目标实例及原生工具。网络隔离、Live Mount 需专门的执行环境。": "Clones use separate databases, schemas or collections. Restore and verification require a target instance and native tools. Network isolation and Live Mount require a dedicated runtime.",
+
     // ---- 实时备份页面合并（2026-11-14）----
     "下钻：同一条日志里的行级变更": "Drill down: row-level changes from the same log",
     "变更明细与回滚": "Change Details & Rollback",

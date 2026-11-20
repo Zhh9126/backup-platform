@@ -60,7 +60,14 @@ def create_host(data: dict) -> int:
     hostname = (data.get("hostname") or "").strip()
     if not hostname:
         raise ValueError("hostname 必填")
-    port = int(data.get("port") or 8466)
+    try:
+        port = int(data.get("port") or 8466)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("port 必须为整数") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("port 必须在 1..65535")
+    if data.get("transport", "auto") not in ("auto", "agent", "ssh"):
+        raise ValueError("transport 仅支持 auto、agent、ssh")
     # token 会写进 systemd unit 与安装脚本：换行可注入 ExecStartPre，
     # shell 元字符可注入安装命令。这里强制字符集白名单（生成值天然合规）。
     import re
@@ -80,6 +87,18 @@ def create_host(data: dict) -> int:
 
 
 def update_host(agent_id: int, data: dict):
+    import re
+    if "token" in data and data["token"]:
+        token = str(data["token"]).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", token):
+            raise ValueError("token 必须为 16-128 位字母、数字、下划线或连字符")
+        data = dict(data, token=token)
+    if "port" in data:
+        data = dict(data, port=int(data["port"]))
+        if not 1 <= data["port"] <= 65535:
+            raise ValueError("port 必须在 1..65535")
+    if "transport" in data and data["transport"] not in ("auto", "agent", "ssh"):
+        raise ValueError("transport 仅支持 auto、agent、ssh")
     fields, params = [], []
     for k in ("name", "transport", "db_type", "enabled", "port"):
         if k in data:
@@ -110,6 +129,7 @@ def probe(agent_id: int) -> dict:
     if not rec:
         return {"ok": False, "error": "注册记录不存在"}
     from core.agent_client import AgentTransport, AgentError
+    t = None
     try:
         t = AgentTransport(rec["hostname"], rec["port"], get_token(rec),
                            timeout=10)
@@ -126,6 +146,9 @@ def probe(agent_id: int) -> dict:
             "updated_at=? WHERE id=?",
             ("offline: %s" % str(e)[:120], _now(), _now(), int(agent_id)))
         return {"ok": False, "error": str(e)[:200]}
+    finally:
+        if t:
+            t._reset()
 
 
 def resolve_channel(hostname: str, db_type: str = "") -> dict:
@@ -150,14 +173,15 @@ def resolve_channel(hostname: str, db_type: str = "") -> dict:
         from core.agent_client import AgentTransport, AgentError
         t = AgentTransport(rec["hostname"], rec["port"], get_token(rec),
                            timeout=5)
-        t.health()
-        return {"channel": "agent", "agent": rec}
+        try:
+            t.health()
+            return {"channel": "agent", "agent": rec}
+        finally:
+            t._reset()
     except Exception:
         return {"channel": "ssh"}
 
 
 def install_cmd(hostname: str, port: int = 8466) -> str:
-    """生成远端安装命令行（由平台经 SSH 执行：零 SSH 场景由用户手工执行）。"""
-    return (
-        "mkdir -p /opt/aidbm-agent && echo '<AGENT_PY>' > /opt/aidbm-agent/"
-        "backup_agent.py")
+    """返回客户端单文件启动指引，安装包由平台分发接口提供。"""
+    return "/opt/aidbm-agent/aidbm-agent --port %d" % int(port)

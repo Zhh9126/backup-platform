@@ -6,3 +6,5 @@ pytest>=8.0
 pytest-cov>=5.0          # 覆盖率门槛（scripts/test_gate.sh）
 requests>=2.31           # API 压测脚本 scripts/stress_test_full.py
 playwright>=1.44         # 前端自动化（tests/e2e_frontend_smoke.py），需 playwright install chromium
+
+pyinstaller>=6.0        # 平台侧构建单文件 Agent

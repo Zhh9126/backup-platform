@@ -330,8 +330,8 @@ def precheck_restore(record: dict, target_host_info: dict = None,
     _add(items, "artifact", "pass", "产物存在（%s，%s）" % (path, _human(size)))
 
     # 2) 完整性（sha256 基线比对）
-    checksum = record.get("checksum") or ""
-    if checksum and len(checksum) == 64:
+    checksum = db.normalize_sha256(record.get("checksum"))
+    if checksum:
         try:
             from core import db as _db
             actual = _db.sha256_file(path)

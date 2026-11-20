@@ -207,6 +207,7 @@ window.BKP = (function () {
   // ---- 状态徽章 ----
   BKP.statusBadge = function (s) {
     var m = {
+      partial: ["bg-warning text-dark", "部分通过"],
       success: ["badge-ok", "成功"], failed: ["badge-fail", "失败"],
       simulated: ["badge-sim", "仿真"], running: ["badge-run", "运行中"],
       cancelled: ["bg-secondary", "已停止"],

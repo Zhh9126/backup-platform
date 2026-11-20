@@ -66,7 +66,8 @@
         ["备份总数", b.total ?? 0, "成功 " + (b.success ?? 0) + " / 失败 " + (b.failed ?? 0)],
         ["备份数据量", mb(b.size_bytes), "平均耗时 " + (b.avg_duration_sec ?? 0) + "s"],
         ["恢复", r.total ?? 0, "成功 " + (r.success ?? 0) + " / 失败 " + (r.failed ?? 0)],
-        ["恢复校验", (v.success ?? 0) + "/" + (v.total ?? 0), "通过 / 总数"],
+        ["恢复校验", (v.success ?? 0) + "/" + (v.total ?? 0),
+          "部分通过 " + (v.partial ?? 0) + " / 失败 " + (v.failed ?? 0)],
         ["锁定产物", d.locked_records ?? 0, "不可变备份（保留锁定）"],
       ];
       document.getElementById("rcCards").innerHTML = cards.map(([t, n, sub]) =>

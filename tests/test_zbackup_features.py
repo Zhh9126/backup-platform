@@ -62,10 +62,10 @@ class _FakeClient:
 
 # ---------------------------------------------------------------- scan_fs
 def test_scan_fs_kind_classification():
-    assert scan_fs._kind("/u01/oradata/ORCL/system01.dbf") == "oracle_artifact"
+    assert scan_fs._kind("/u01/oradata/ORCL/system01.dbf") == "db_data"
     assert scan_fs._kind("/data/redo01.log") == "db_log"
     assert scan_fs._kind("/etc/hosts") == "file"
-    assert scan_fs._kind("/u01/app/oracle/product/19.0.0/dbhome_1/dbs/spfileorcl.ora") == "oracle_artifact"
+    assert scan_fs._kind("/u01/app/oracle/product/19.0.0/dbhome_1/dbs/spfileorcl.ora") == "db_config"
 
 
 def test_scan_fs_rejects_unsafe_roots():
@@ -88,7 +88,7 @@ def test_scan_fs_builds_catalog(monkeypatch):
     monkeypatch.setattr(scan_fs, "_client", lambda task: cli)
     r = scan_fs.scan_host({"host": "192.0.2.5"}, roots=["/data"])
     assert r["ok"] and r["file_count"] == 2
-    assert r["files"][0]["kind"] == "oracle_artifact"
+    assert r["files"][0]["kind"] == "db_data"
     assert r["volumes"][0]["name"] == "sda"
     assert r["oracle_homes"][0]["sid"] == "orcl"
     assert r["oracle_candidates"][0]["path"] == "/data/system01.dbf"

@@ -196,7 +196,13 @@ class CloneService:
                 req = self.get_clone(request_id)
                 if not req:
                     return
-                models.update_clone_request(request_id, {"status": STATUS_CREATING})
+                claimed = db.execute_rowcount(
+                    "UPDATE clone_requests SET status='creating', updated_at=? "
+                    "WHERE id=? AND status='pending' AND vdb_instance_id IS NULL",
+                    (db.now_iso(), request_id))
+                if not claimed:
+                    return
+                req = models.get_clone_request(request_id, include_secret=True)
                 self.logger.info("[clone] 请求 %s 开始拉起 VDB", request_id)
                 vdb_id = self._launch_vdb(req)
                 ttl = _default_ttl_days()
@@ -253,9 +259,13 @@ class CloneService:
 
         # 3) 拉起 VDB 实例（异常必须落 failed，避免卡死 creating 无法重试）
         req = models.get_clone_request(request_id, include_secret=True)
+        claimed = db.execute_rowcount(
+            "UPDATE clone_requests SET status='creating', approved_by=?, updated_at=? "
+            "WHERE id=? AND status IN ('pending','failed') AND vdb_instance_id IS NULL",
+            (approved_by, db.now_iso(), request_id))
+        if not claimed:
+            raise ValueError("克隆已被其他操作处理，或仍有关联资源，请刷新后检查")
         req["status"] = STATUS_CREATING
-        models.update_clone_request(request_id, {"status": STATUS_CREATING,
-                                                  "approved_by": approved_by})
         self.logger.info("[clone] 请求 %s 审批通过，开始拉起 VDB", request_id)
         try:
             vdb_id = self._launch_vdb(req)
@@ -303,6 +313,8 @@ class CloneService:
         req = self.get_clone(request_id)
         if not req:
             raise ValueError(f"克隆请求不存在: {request_id}")
+        if req["status"] == STATUS_CREATING:
+            raise ValueError("克隆正在创建，请等待完成后销毁")
         self._release_vdb(req)
         models.update_clone_request(request_id, {"status": STATUS_DELETED})
         self.logger.info("[clone] 请求 %s 已手动销毁", request_id)
@@ -352,6 +364,12 @@ class CloneService:
             _ora_service = vrow["service"]
         if not (vdb_host and vdb_port and vdb_db):
             raise ValueError("克隆库连接信息缺失（vdb 实例未就绪）")
+        from core import clone_backends
+        if vrow.get("db_type") in clone_backends.ENGINE_TYPES | {"redis", "neo4j", "chroma", "jdbc_generic"}:
+            result = self.verify_clone(request_id)
+            return {**result, "checks": [{"item": "restored_database",
+                                         "pass": result["ok"],
+                                         "message": result["message"]}]}
         from core import native_conn
         src_type = (req.get("source_db_type") or "mysql").lower()
         checks = []
@@ -545,6 +563,8 @@ class CloneService:
         其余组合明确抛错（不降级仿真，避免"假克隆"）；
         仅 DEMO_MODE != off 时才允许仿真兜底且在 VDB note 中明确标注。
         """
+        if req.get("vdb_instance_id"):
+            raise ValueError("此申请仍有关联克隆资源，请先销毁后新建申请")
         rec = models.get_record(req["source_record_id"]) or {}
         db_type = rec.get("db_type") or "mysql"
         instance_name = f"clone_{req['id']}"
@@ -552,6 +572,23 @@ class CloneService:
         req = dict(req)
         req["note"] = user_note
         backup_path = rec.get("backup_path") or ""
+
+        from core import clone_runtime
+        if db_type in clone_runtime.KINDS:
+            if clone_mode != "logical":
+                raise ValueError("隔离实例克隆仅支持备份恢复模式")
+            allocated = []
+            def register_runtime(name, host, port, user):
+                runtime_req = dict(req, target_host=host)
+                vid = self._register_vdb(runtime_req, rec, db_type, name, port, user,
+                                         "", "隔离运行时，创建后校验")
+                db.execute("UPDATE vdb_instances SET status='creating' WHERE id=?", (vid,))
+                models.update_clone_request(req["id"], {"vdb_instance_id": vid})
+                allocated.append(vid)
+            runtime = clone_runtime.launch(req, rec, register_runtime)
+            db.execute("UPDATE vdb_instances SET host=?, port=?, status='ready' WHERE id=?",
+                       (runtime.get("host") or "127.0.0.1", runtime.get("port"), allocated[0]))
+            return allocated[0]
 
         # ---- template / snapshot / schema 模式不依赖备份产物 ----
         if clone_mode in ("template", "snapshot", "schema"):
@@ -621,7 +658,8 @@ class CloneService:
         # 默认端口一律「记录 → 源任务 → 引擎默认」三级回退（mysql/pg 与
         # 金仓/达梦/Oracle 同口径）：本机 MySQL 3307 / PG 5785 克隆实测暴露
         # 此前 mysql/postgresql 分支端口写死 3306/5432，克隆打错实例
-        port = int(rec.get("port") or src_task0.get("port") or (
+        from core import clone_backends
+        port = int(rec.get("port") or src_task0.get("port") or clone_backends.PORTS.get(db_type) or (
             3306 if db_type in ("mysql", "mariadb") else (
                 5432 if db_type == "postgresql" else (
                     54321 if db_type == "kingbase" else (
@@ -644,9 +682,25 @@ class CloneService:
             src_task = models.get_task(rec.get("task_id"), include_secret=True) or {}
             password = src_task.get("password") or ""
 
+        if (db_type in clone_backends.MYSQL_TYPES | clone_backends.PG_TYPES
+                and (rec.get("backup_mode") == "physical"
+                     or self._archive_scope(backup_path) != "single")):
+            raise ValueError("此克隆通道需要单库逻辑备份，物理或整实例备份请使用数据恢复")
+        if db_type in clone_backends.ENGINE_TYPES and config.DEMO_MODE == "off":
+            user = src_task0.get("username") or user
+            allocated = []
+            def track_allocation():
+                vid = self._register_vdb(req, rec, db_type, instance_name, port, user,
+                                         password, "恢复克隆，资源待验证")
+                models.update_clone_request(req["id"], {"vdb_instance_id": vid})
+                allocated.append(vid)
+            clone_backends.launch(rec, instance_name, target_host, port, user,
+                                  password, self._storage_root(), track_allocation)
+            return allocated[0]
+
         simulated = config.DEMO_MODE != "off"
         scope = self._archive_scope(backup_path)
-        if not simulated and scope == "full_instance":
+        if not simulated and scope == "full_instance" and db_type in ("mysql", "mariadb"):
             # 整实例克隆：全实例归档（多库 tar）按库拆开，每库落到 <prefix>__<源库>。
             # 此前把多库 tar 当单个 SQL 灌进一个库，直接报 ASCII '\0'（实测）。
             _want = self._parse_databases(req.get("databases"))
@@ -864,6 +918,9 @@ class CloneService:
         vdb = models.get_vdb(req["vdb_instance_id"])
         if not vdb:
             raise ValueError("VDB 实例元数据缺失")
+        from core import clone_runtime
+        if vdb.get("db_type") in clone_runtime.KINDS:
+            return clone_runtime.verify(request_id)
         password = self._vdb_password(vdb, req)
         if "scope=full_instance" in str(vdb.get("note") or ""):
             # 整实例克隆：库是 <prefix>__<源库>，按前缀统计库数与表数
@@ -873,6 +930,11 @@ class CloneService:
                 vdb.get("database_name") or "")
             self.logger.info("[clone] 请求 %s 整实例校验: %s", request_id, res.get("message"))
             return res
+        from core import clone_backends
+        if vdb.get("db_type") in clone_backends.ENGINE_TYPES:
+            return clone_backends.operate(
+                vdb["db_type"], vdb["host"], vdb["port"],
+                vdb["database_name"], vdb["username"], password)
         res = restore_extras.verify_clone_conn(
             vdb.get("db_type"), vdb.get("host") or "127.0.0.1",
             vdb.get("port"), vdb.get("database_name"), vdb.get("username"),
@@ -888,12 +950,24 @@ class CloneService:
             return
         vdb = models.get_vdb(vdb_id)
         if vdb:
+            from core import clone_runtime
+            if vdb.get("db_type") in clone_runtime.KINDS:
+                result = clone_runtime.destroy(req["id"])
+                if not result["ok"]:
+                    raise ValueError(result["message"])
+                models.delete_vdb(vdb_id)
+                return
             if config.DEMO_MODE == "off":
                 # 连接密码：目标实例密码优先，未填则沿用源任务密码
                 creq = models.get_clone_request(req["id"], include_secret=True) or {}
                 password = self._vdb_password(vdb, creq)
                 try:
-                    if vdb.get("db_type") == "oracle":
+                    from core import clone_backends
+                    if vdb.get("db_type") in clone_backends.ENGINE_TYPES:
+                        res = clone_backends.operate(
+                            vdb["db_type"], vdb["host"], vdb["port"],
+                            vdb["database_name"], vdb["username"], password, drop=True)
+                    elif vdb.get("db_type") == "oracle":
                         res = restore_extras_clone.drop_clone_extended(
                             "oracle", vdb.get("name"),
                             host=vdb.get("host") or "127.0.0.1",
@@ -907,10 +981,9 @@ class CloneService:
                             port=vdb.get("port"),
                             mysql_password=password, pg_password=password)
                     if not res.get("ok"):
-                        self.logger.warning("[clone] 释放 VDB %s 失败: %s",
-                                            vdb_id, res.get("message"))
+                        raise ValueError(f"释放 VDB {vdb_id} 失败: {res.get('message')}")
                 except Exception as e:
-                    self.logger.warning("[clone] 释放 VDB %s 失败（忽略）: %s", vdb_id, e)
+                    raise ValueError(f"释放 VDB {vdb_id} 失败，保留台账以便重试: {e}") from e
             try:
                 models.delete_vdb(vdb_id)
             except Exception as e:

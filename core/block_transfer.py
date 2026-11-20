@@ -86,7 +86,7 @@ def plan_transfer(source_manifest_id: str, target_manifest_id: str,
 
     src_fps = [c["fp"] for c in src["chunks"]]
     tgt_fps = [c["fp"] for c in tgt["chunks"]]
-    by_fp = {c["fp"]: c for c in src["chunks"]}
+    by_fp = {c["fp"]: c for c in tgt["chunks"]}
 
     # 目标端"已有"= 源端也有的块（内容寻址下同指纹即同内容）
     res = have_bitmap(set(src_fps), tgt_fps)

@@ -243,3 +243,30 @@ def estimate_reuse(path_a: str, path_b: str, block_size: int = 4 * 1024 * 1024,
                 "avg_chunk_kb": round(
                     (sum(c["length"] for c in ca) / len(ca) / 1024), 1) if ca else 0},
     }
+
+
+def iter_file_chunks(stream, min_size=DEFAULT_MIN_SIZE, avg_size=DEFAULT_AVG_SIZE,
+                     max_size=DEFAULT_MAX_SIZE):
+    """有界窗口分块，与 cut_points 的整文件边界保持一致。"""
+    min_size = max(64, int(min_size))
+    avg_size = max(min_size, int(avg_size))
+    max_size = max(avg_size, int(max_size))
+    buffer = b""
+    offset = 0
+    while True:
+        wanted = max_size - len(buffer)
+        data = stream.read(wanted)
+        buffer += data
+        if not buffer:
+            return
+        final = len(data) < wanted
+        cuts = cut_points(buffer, min_size, avg_size, max_size)
+        selected = cuts if final or len(cuts) == 1 else cuts[:-1]
+        consumed = 0
+        for start, length in selected:
+            yield offset + start, buffer[start:start + length]
+            consumed = start + length
+        offset += consumed
+        buffer = buffer[consumed:]
+        if final:
+            return

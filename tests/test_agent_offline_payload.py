@@ -93,16 +93,15 @@ def test_v1_aes_payload_still_supported_when_available():
 
 
 def test_systemd_unit_and_install_contract():
-    """unit 不再传 --payload，安装流程有退出码校验、回滚与分段状态。"""
-    src = open(os.path.join(ROOT, "api", "agents.py"),
-               encoding="utf-8").read()
-    assert "ExecStart=%s /opt/aidbm-agent/%s --token %s --port %d\\n" in src
-    assert "--payload /opt/aidbm-agent/%s\\n" not in src
-    assert "systemctl restart aidbm-agent" in src
-    for frag in ('"install": {"ok": False}', '"probe": {"ok": False}',
-                 "recv_exit_status()", "_rollback()", "diagnostics",
-                 '"hint"', "payload_format", "journalctl -u aidbm-agent"):
-        assert frag in src, frag
+    """新版安装入口只部署二进制，令牌来自受保护配置。"""
+    from core import agent_distribution
+    text = agent_distribution.unit_text(8466)
+    assert "ExecStart=/opt/aidbm-agent/aidbm-agent --port 8466" in text
+    assert "EnvironmentFile=/etc/aidbm-agent/agent.env" in text
+    assert "--token" not in text
+    src = open(os.path.join(ROOT, "api", "agents.py"), encoding="utf-8").read()
+    assert "agent_distribution.deploy(" in src
+    assert "build_payload(" not in src
 
 
 def test_agentless_page_shows_failure_reason():

@@ -540,6 +540,7 @@ CREATE TABLE IF NOT EXISTS backup_records (
     task_id       INTEGER,
     db_type       TEXT,
     backup_type   TEXT,
+    backup_mode   TEXT,                          -- 备份方式：physical/logical/custom/hot_copy/file/object/vm/nas
     started_at    TEXT,
     finished_at   TEXT,
     duration_sec  REAL,
@@ -1758,7 +1759,10 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
             # 迁移：backup_records CDC/校验列
             for col, typedef in [("binlog_file", "TEXT"), ("binlog_pos", "INTEGER"),
                                  ("wal_lsn", "TEXT"), ("verified", "INTEGER DEFAULT 0"),
-                                 ("verify_msg", "TEXT")]:
+                                 ("verify_msg", "TEXT"),
+                                 # 备份方式（物理/逻辑/自定义/文件…）：记录页要能
+                                 # 直接看出这条记录是物理备份还是逻辑备份
+                                 ("backup_mode", "TEXT")]:
                 try:
                     conn.execute(f"ALTER TABLE backup_records ADD COLUMN {col} {typedef}")
                 except Exception:

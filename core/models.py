@@ -755,10 +755,44 @@ def add_dedup_saved(set_id: int, extra_bytes: int) -> None:
 
 
 # ------------------------- 备份记录 -------------------------
+# 非数据库负载：没有「逻辑/物理」之分，按产物形态给一个专用值
+_MODE_BY_DB_TYPE = {
+    "file": "file",
+    "object_storage": "object",
+    "vm": "vm",
+    "synology": "nas",
+    "netdev": "nas",
+}
+_VALID_BACKUP_MODES = {"logical", "physical", "custom", "hot_copy",
+                       "file", "object", "vm", "nas"}
+
+
+def effective_backup_mode(task: dict) -> str:
+    """解析任务的备份方式（记录页「备份方式」列的唯一口径）。
+
+    优先级：task.backup_mode（physical/logical/custom/hot_copy）→ 按库型推导。
+    数据库类默认 logical（与 base.BackupEngine.backup_mode 的默认一致）。
+    ⚠ 这是「触发时刻的配置」，不是产物指纹；历史记录该列为空时按任务当前
+    配置推断（列表里会带 inferred 标记，页面 title 说明）。
+    """
+    task = task or {}
+    raw = str(task.get("backup_mode") or "").strip().lower()
+    if raw in _VALID_BACKUP_MODES:
+        return raw
+    dt = str(task.get("db_type") or "").strip().lower()
+    if dt in _MODE_BY_DB_TYPE:
+        return _MODE_BY_DB_TYPE[dt]
+    return "logical"
+
+
+def _mode_display(mode) -> str:
+    return config.BACKUP_MODE_DISPLAY_NAMES.get(mode, mode or "-")
+
+
 def create_record(data: dict) -> int:
-    fields = ["task_id", "db_type", "backup_type", "started_at", "finished_at",
-              "duration_sec", "status", "size_bytes", "backup_path", "checksum",
-              "is_simulated", "message"]
+    fields = ["task_id", "db_type", "backup_type", "backup_mode", "started_at",
+              "finished_at", "duration_sec", "status", "size_bytes",
+              "backup_path", "checksum", "is_simulated", "message"]
     # backup_records 表没有 note 列。ferry_inbox.ingest_one 等导入通道传 note
     # 作为「摆渡导入 / 异地副本」的来源标记，以前被白名单静默丢弃，导致导入
     # 记录与正常备份无法区分。成功导入时 message 通常为空，映射到它保留审计。
@@ -859,7 +893,7 @@ def count_records(task_id: int = None, keyword: str = None, policy_id: int = Non
 def list_records(task_id: int = None, keyword: str = None, policy_id: int = None,
                  db_type: str = None, limit: int = 200, offset: int = 0) -> list:
     sql = ("SELECT br.*, bt.name AS task_name, bt.host AS host_raw, "
-           "bt.biz_system AS biz_system "
+           "bt.biz_system AS biz_system, bt.backup_mode AS task_backup_mode "
            "FROM backup_records br "
            "LEFT JOIN backup_tasks bt ON br.task_id = bt.id")
     clause, params = _records_where(task_id, keyword, policy_id, db_type)
@@ -873,6 +907,17 @@ def list_records(task_id: int = None, keyword: str = None, policy_id: int = None
         r["task_name"] = r.get("task_name") or "-"
         r["db_type_display"] = _db_type_display(r.get("db_type"))
         r["backup_type_display"] = _backup_type_display(r.get("backup_type"))
+        # 备份方式（物理/逻辑/自定义/文件…）。新记录在创建时落库；
+        # 历史记录该列为空 → 按任务当前配置推断并标 inferred（不假装是事实）。
+        _rec_mode = str(r.get("backup_mode") or "").strip().lower()
+        r["backup_mode_inferred"] = not _rec_mode
+        if not _rec_mode:
+            _rec_mode = effective_backup_mode({
+                "backup_mode": r.get("task_backup_mode"),
+                "db_type": r.get("db_type"),
+            })
+        r["backup_mode"] = _rec_mode
+        r["backup_mode_display"] = _mode_display(_rec_mode)
     return rows
 
 

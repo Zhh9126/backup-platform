@@ -1261,8 +1261,11 @@
       const sel = $("t_pick_list");
       sel.innerHTML = list.map(d => `<option value="${esc(d)}">${esc(d)}</option>`).join("");
       const viaJdbc = !!r.via_jdbc;
+      const isSchema = r.type === "schemas";
       status.textContent = list.length
-        ? `拉取到 ${list.length} 个${r.type === "schemas" ? "schema" : "数据库"}（已过滤系统库${viaJdbc ? "，经 JDBC 兜底连接" : ""}）`
+        ? (isSchema
+          ? `拉取到 ${list.length} 个 schema（已过滤系统 schema${viaJdbc ? "，经 JDBC 兜底连接" : ""}）`
+          : `拉取到 ${list.length} 个数据库（已过滤系统库${viaJdbc ? "，经 JDBC 兜底连接" : ""}）`)
         : "未获取到库列表：请核对连接参数，或在「数据库/实例名」中手工填写";
       status.className = "form-control form-control-sm " + (list.length ? "text-success" : "text-warning");
       // 若有 eo.schemas/tables，恢复选中
@@ -2778,12 +2781,23 @@
           ? '<span class="badge bg-warning" title="安全检测发现可疑特征，需人工复核">可疑</span>'
           : (r.locked ? '<span class="badge bg-success" title="保留锁定中：禁止清理/删除">锁定</span>' : ""));
       const checked = window.recordSel.has(r.id) ? " checked" : "";
+      // 备份方式（物理/逻辑/自定义/文件…）：物理 vs 逻辑用不同底色区分，
+      // 历史记录该列为空时后端按任务配置推断，title 标注“推断”不冒充事实。
+      const _modeTxt = r.backup_mode_display || "-";
+      const _modeCls = r.backup_mode === "physical" ? "bg-secondary"
+        : (r.backup_mode === "logical" ? "bg-info text-dark"
+          : "bg-light text-dark border");
+      const modeCell = r.backup_mode
+        ? `<span class="badge ${_modeCls}" title="${r.backup_mode_inferred
+          ? '历史记录未单独存备份方式，此处按任务当前配置推断' : '创建记录时落库的实际备份方式'}">${esc(_modeTxt)}</span>`
+        : "-";
       return `<tr>
         <td><input type="checkbox" class="form-check-input rec-sel" data-id="${r.id}"${checked}></td>
         <td>${pg.startNo + ri}</td>
         <td>${fmtBizCell(r)}</td>
         <td><code>${esc(r.host_ip || "-")}</code></td>
         <td>${esc(r.db_type_display || r.db_type || "-")}</td>
+        <td>${modeCell}</td>
         <td>${fmtTime(r.started_at)}</td>
         <td>${esc(fmtDuration(r.duration_sec))}</td>
         <td>${statusBadge(r.status)} ${verifyBadge} ${secBadge}</td>
@@ -2793,7 +2807,7 @@
         <td class="text-end">${actions.join(' ')}</td>
       </tr>`;
     }).join("") ||
-      '<tr><td colspan="11" class="text-muted text-center">暂无记录</td></tr>';
+      '<tr><td colspan="13" class="text-muted text-center">暂无记录</td></tr>';
     Pager.attach("records", $("recordTable"), pg.page, pg.pages, pg.total, loadRecords);
     const rcnt = $("recordSelCount");
     if (rcnt) rcnt.textContent = "已选 " + window.recordSel.size + " 项";

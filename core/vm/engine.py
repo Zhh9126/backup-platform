@@ -25,6 +25,8 @@ synthesize_full:
 """
 import hashlib
 import os
+import re
+import uuid
 import time
 
 import core.db as db
@@ -148,6 +150,9 @@ class VMBackupEngine(BackupEngine):
 
         level = "full" if force_full else plan["level"]
         consistency = vm.get("consistency") or "crash"
+        if consistency not in (caps.consistency_levels or ["crash"]):
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="该平台不支持请求的一致性等级: %s" % consistency)
         work_dir = str(extra_cfg.get("work_dir") or "")
         last_rp = rows[0] if rows else None
         parent_token = (last_rp or {}).get("change_token") or ""
@@ -165,15 +170,24 @@ class VMBackupEngine(BackupEngine):
             note_msgs.append(plan.get("reason") or "按计划执行全量")
             art = provider.backup_full(vm["vm_ref"], work_dir, consistency)
 
-        # ③ 数据面拉回平台并计算真实 size/sha256
+        if art.consistency and art.consistency != consistency:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message="备份一致性不满足请求：请求 %s，实际 %s" %
+                                        (consistency, art.consistency))
+        # ③ 数据面拉回平台并独立校验；不信任 Provider 声明的 size/SHA。
         ts = self._timestamp()
-        local_name = "%s_%s_%s" % (vm.get("vm_name") or "vm",
-                                   art.kind, ts)
+        safe_name = re.sub(r"[^\w.-]+", "_", vm.get("vm_name") or "vm")[:100]
+        local_name = "%s_%s_%s_%s" % (safe_name, art.kind, ts, uuid.uuid4().hex[:10])
         ext = os.path.splitext(art.path)[1] or ".img"
         local_path = os.path.join(self._output_dir(), local_name + ext)
         dl = provider.download_artifact(art, local_path)
-        size = int(dl.get("size") or 0) or self._file_size(local_path)
-        sha = dl.get("sha256") or self._sha256(local_path)
+        try:
+            size, sha = self._validate_local_artifact({
+                "id": "new", "artifact_path": local_path,
+                "size_bytes": dl.get("size"), "checksum": dl.get("sha256")})
+        except VMProviderError as exc:
+            return BackupResult(success=False, status=BackupStatus.FAILED,
+                                message=str(exc))
         try:
             provider.cleanup_artifact(art)
         except Exception:
@@ -219,10 +233,16 @@ class VMBackupEngine(BackupEngine):
                     target_name="%s_verify_%s" % (vm.get("vm_name"), ts),
                     isolate_network=True, auto_start=True, live=False)
                 spec.network_name = extra_cfg.get("isolate_network") or ""
-                vres = vmverify.run_verify(
-                    provider, [art.path], spec,
-                    checks=(extra_cfg.get("health_checks") or None),
-                    node=vm.get("node") or "", logger=self.logger)
+                chain = journal.resolve_chain(
+                    models.list_vm_recovery_points(vm["id"]), rp_id)
+                remotes = self._ensure_remote(provider, chain)
+                try:
+                    vres = vmverify.run_verify(
+                        provider, remotes, spec,
+                        checks=(extra_cfg.get("health_checks") or None),
+                        node=vm.get("node") or "", logger=self.logger)
+                finally:
+                    self._cleanup_pushed(provider, remotes)
                 models.update_vm_recovery_point(
                     rp_id, {"verified": 1 if vres.ok else 0,
                             "verify_msg": vres.message[:500]})
@@ -330,19 +350,40 @@ class VMBackupEngine(BackupEngine):
         平台侧永远保留落盘副本（且已校验 sha256），这里只在远端副本被清理过
         时才回推一份（幂等覆盖），返回远端路径列表。
         """
-        out = []
+        # Validate the entire chain before pushing any bytes or touching a VM.
         for rp in chain:
-            local = rp.get("artifact_path") or ""
-            remote = rp.get("remote_path") or ""
-            if local and os.path.exists(local):
-                # 远端可能已清理 → 推回一份（幂等：同名覆盖）
+            self._validate_local_artifact(rp)
+        out = []
+        try:
+            for rp in chain:
+                remote = rp.get("remote_path") or ""
                 remote = provider.upload_artifact(
-                    local, os.path.dirname(remote) or provider.extra.get("work_dir")
-                    or "/var/tmp/vmbk")
-            if not remote:
-                raise VMProviderError("恢复点 %s 产物不可达（本地与远端均缺失）" % rp["id"])
-            out.append(remote)
-        return out
+                    rp["artifact_path"], os.path.dirname(remote)
+                    or provider.extra.get("work_dir") or "/var/tmp/vmbk")
+                if not remote:
+                    raise VMProviderError("恢复点 %s 回推未返回有效路径" % rp["id"])
+                out.append(remote)
+            return out
+        except Exception:
+            self._cleanup_pushed(provider, out)
+            raise
+
+    @staticmethod
+    def _validate_local_artifact(rp):
+        path = rp.get("artifact_path") or ""
+        if not path or not os.path.isfile(path):
+            raise VMProviderError("恢复点 %s 本地产物缺失，无法验证远端旧路径" % rp.get("id"))
+        size = os.path.getsize(path)
+        if size <= 0:
+            raise VMProviderError("虚拟机备份产物为空")
+        expected_size = rp.get("size_bytes")
+        if expected_size not in (None, "", 0) and size != int(expected_size):
+            raise VMProviderError("虚拟机备份产物大小不匹配")
+        actual = db.sha256_file(path)
+        expected = rp.get("checksum") or ""
+        if expected and actual != db.normalize_sha256(expected):
+            raise VMProviderError("虚拟机备份产物 SHA256 不匹配，停止恢复")
+        return size, actual
 
     @staticmethod
     def _cleanup_pushed(provider, remotes: list) -> None:
@@ -430,10 +471,13 @@ class VMBackupEngine(BackupEngine):
             target_name="%s_verify_%s" % (vm.get("vm_name"), self._timestamp()),
             isolate_network=True, auto_start=True,
             network_name=self._hv_extra(ctx["hv"]).get("isolate_network") or "")
-        vres = vmverify.run_verify(
-            provider, remotes, spec, checks=(options.get("health_checks") or None),
-            node=vm.get("node") or "", logger=self.logger,
-            cleanup=bool(options.get("cleanup", True)))
+        try:
+            vres = vmverify.run_verify(
+                provider, remotes, spec, checks=(options.get("health_checks") or None),
+                node=vm.get("node") or "", logger=self.logger,
+                cleanup=bool(options.get("cleanup", True)))
+        finally:
+            self._cleanup_pushed(provider, remotes)
         models.update_vm_recovery_point(
             target["id"], {"verified": 1 if vres.ok else 0,
                            "verify_msg": vres.message[:500]})

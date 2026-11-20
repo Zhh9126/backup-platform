@@ -320,5 +320,50 @@ class TestVMOrchestration(unittest.TestCase):
         self.assertEqual(rpo[0]["rp_count"], 1)
 
 
+    def test_10_auto_verify_repushes_complete_valid_chain(self):
+        from unittest.mock import patch
+        from core.vm.types import VerifyResult
+        models.update_vm_hypervisor(self.hv_id, {
+            "extra_config": json.dumps({"work_dir": _REMOTE, "verify_after_backup": True})})
+        lengths = []
+        def verify(provider, remotes, spec, **kwargs):
+            lengths.append(len(remotes))
+            self.assertTrue(all(os.path.isfile(path) for path in remotes))
+            self.assertTrue(spec.isolate_network)
+            return VerifyResult(ok=True, message="contract read passed")
+        with patch("core.vm.engine.vmverify.run_verify", side_effect=verify):
+            full = self._backup("full")
+            child = self._backup("incremental")
+        self.assertTrue(full.success and child.success)
+        self.assertTrue(full.verified and child.verified)
+        self.assertEqual(lengths, [1, 2])
+
+    def test_11_download_checksum_lie_does_not_publish_recovery_point(self):
+        from unittest.mock import patch
+        original = FakeProvider.download_artifact
+        def damaged(provider, artifact, local_path):
+            result = original(provider, artifact, local_path)
+            result["sha256"] = "0" * 64
+            return result
+        with patch.object(FakeProvider, "download_artifact", damaged):
+            result = self._backup("full")
+        self.assertFalse(result.success)
+        self.assertEqual(models.list_vm_recovery_points(self.vm_id), [])
+
+    def test_12_consistency_downgrade_is_rejected(self):
+        from unittest.mock import patch
+        models.update_vm_protected(self.vm_id, {"consistency": "fs"})
+        original = FakeProvider.backup_full
+        def downgraded(provider, *args, **kwargs):
+            result = original(provider, *args, **kwargs)
+            result.consistency = "crash"
+            return result
+        with patch.object(FakeProvider, "backup_full", downgraded):
+            result = self._backup("full")
+        self.assertFalse(result.success)
+        self.assertIn("一致性", result.message)
+        self.assertEqual(models.list_vm_recovery_points(self.vm_id), [])
+
+
 if __name__ == "__main__":
     unittest.main()

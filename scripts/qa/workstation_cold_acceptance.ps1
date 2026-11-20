@@ -2,7 +2,7 @@
 if(-not $env:AIDBM_VM_GUEST_PASSWORD) { throw 'AIDBM_VM_GUEST_PASSWORD required' }
 $tool='D:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe'
 $source='D:\CodexVMRecovery\vm-real-20261120\restored\backup.vmx'
-$root='D:\CodexVMRecovery\vm-cold-20261120'
+$root='D:\CodexVMRecovery\vm-cold-copy-20261120'
 if(Test-Path $root) { throw 'Acceptance path already exists; refusing overwrite' }
 New-Item -ItemType Directory -Path $root | Out-Null
 $log=Join-Path $root 'acceptance.log'
@@ -12,18 +12,29 @@ function Native([string]$exe,[string[]]$arguments) {
  if($LASTEXITCODE -ne 0) { throw ($result -join ' ') }
  return $result
 }
-Note 'Preparing canary in the isolated first-round restored guest'
+$running=(Native $tool @('list')) -join "\n"
+$sourceRunning=$running.Contains($source)
+Note 'Preparing canary and checking isolated source power state'
 foreach($name in @('payload.bin','canary.db','expected.json')) {
  $hostFile=Join-Path $root $name
  Native 'C:\Windows\System32\OpenSSH\scp.exe' @('-o','BatchMode=yes',('root@192.168.109.128:/root/backup-platform-private/build/vm-real-20261120/'+$name),$hostFile)|Out-Null
- Native $tool @('-gu','root','-gp',$env:AIDBM_VM_GUEST_PASSWORD,'copyFileFromHostToGuest',$source,$hostFile,('/root/backup-platform-private/build/vm-real-20261120/'+$name))|Out-Null
+ if($sourceRunning) { Native $tool @('-gu','root','-gp',$env:AIDBM_VM_GUEST_PASSWORD,'copyFileFromHostToGuest',$source,$hostFile,('/root/backup-platform-private/build/vm-real-20261120/'+$name))|Out-Null }
 }
-Native $tool @('-gu','root','-gp',$env:AIDBM_VM_GUEST_PASSWORD,'runProgramInGuest',$source,'/bin/sync')|Out-Null
-Note 'Guest data synced; cleanly shutting down the isolated test source'
-Native $tool @('stop',$source,'soft')|Out-Null
+if($sourceRunning) {
+ Native $tool @('-gu','root','-gp',$env:AIDBM_VM_GUEST_PASSWORD,'runProgramInGuest',$source,'/bin/sync')|Out-Null
+ Note 'Guest data synced; cleanly shutting down the isolated test source'
+ Native $tool @('stop',$source,'soft')|Out-Null
+}
+if(((Native $tool @('list')) -join "\n").Contains($source)) { throw 'Source must be powered off before cold disk copy' }
 $backup=Join-Path $root 'backup'
-Note 'Creating standalone full clone of powered-off test VM'
-Native $tool @('clone',$source,(Join-Path $backup 'backup.vmx'),'full','-cloneName=aidbm-cold-backup-20261120')|Out-Null
+Note 'Copying standalone disks and configuration of powered-off test VM'
+$sourceDir=Split-Path $source
+$descriptor=Join-Path $sourceDir 'CentOS 7 64 位.vmdk'
+if([IO.File]::ReadAllText($descriptor,[Text.Encoding]::Default) -notmatch 'parentCID=ffffffff') { throw 'Expected independent source disk without external backing chain' }
+New-Item -ItemType Directory -Path $backup | Out-Null
+Get-ChildItem -LiteralPath $sourceDir -File | Where-Object { $_.Extension -in @('.vmdk','.vmx','.nvram','.vmxf') } | ForEach-Object {
+ Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $backup $_.Name)
+}
 $archive=Join-Path $root 'vm-backup.tar.gz'
 Note 'Archiving consistent full backup'
 Native 'C:\Windows\System32\tar.exe' @('-czf',$archive,'-C',$backup,'.')|Out-Null
@@ -41,6 +52,7 @@ Native 'C:\Windows\System32\tar.exe' @('-xzf',$download,'-C',$restored)|Out-Null
 $target=Join-Path $restored 'backup.vmx'
 $encoding=[Text.Encoding]::Default
 $text=[IO.File]::ReadAllText($target,$encoding)
+$text=[regex]::Replace($text,'(?m)^memsize\s*=.*','memsize = "2048"')
 $text=[regex]::Replace($text,'(?m)^displayName\s*=.*','displayName = "aidbm-cold-restored-20261120"')
 $text=[regex]::Replace($text,'(?m)^ethernet\d+\.startConnected\s*=.*\r?\n?','')
 $text=[regex]::Replace($text,'(?m)^uuid.action\s*=.*\r?\n?','')

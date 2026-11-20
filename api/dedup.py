@@ -49,3 +49,75 @@ def api_dedup_scan():
         models.add_dedup_saved(set_id, int(res["saved_bytes"]))
     return jsonify({"ok": True, "set_id": set_id, "result": res,
                     "stats": gd.global_stats()})
+
+
+@api_bp.route("/dedup/estimate", methods=["POST"])
+@login_required
+def api_dedup_estimate():
+    """测算「固定分块 vs FastCDC 可变长分块」在两版产物间的可复用率。
+
+    请求：``{"task_id": N}``（自动取该任务最近两条成功记录）
+    或 ``{"record_ids": [a, b]}``（显式指定，a 为基线）。
+    只读取 BACKUP_ROOT 内的产物，单文件扫描上限 128MB。
+    """
+    import config
+    from core import db as _db
+    from core import fastcdc
+
+    payload = request.get_json(silent=True) or {}
+    rec_ids = payload.get("record_ids") or []
+    task_id = payload.get("task_id")
+
+    def _rooted(p):
+        try:
+            root = os.path.realpath(getattr(config, "BACKUP_ROOT", "") or "/")
+            return os.path.realpath(p).startswith(root)
+        except OSError:
+            return False
+
+    def _path_of(rid):
+        row = _db.query_one("SELECT id, backup_path, size_bytes, task_id, "
+                            "status FROM backup_records WHERE id=?", (rid,))
+        if not row or not row.get("backup_path"):
+            return None, "记录 %s 无产物路径" % rid
+        p = row["backup_path"]
+        if not os.path.isfile(p):
+            return None, "记录 %s 的产物已不存在（可能已清理）" % rid
+        if not _rooted(p):
+            return None, "记录 %s 的产物不在备份根目录内，拒绝读取" % rid
+        return p, None
+
+    if not rec_ids:
+        if not task_id:
+            return jsonify({"ok": False, "error": "task_id 或 record_ids 必填"}), 400
+        rows = _db.query(
+            "SELECT id FROM backup_records WHERE task_id=? AND status='success' "
+            "AND size_bytes>0 AND backup_path IS NOT NULL "
+            "ORDER BY id DESC LIMIT 2", (int(task_id),))
+        rec_ids = [r["id"] for r in rows]
+        if len(rec_ids) < 2:
+            return jsonify({"ok": False,
+                            "error": "该任务成功记录不足 2 条，无法测算"}), 400
+
+    if len(rec_ids) != 2:
+        return jsonify({"ok": False, "error": "record_ids 需要正好 2 个"}), 400
+
+    pa, err_a = _path_of(rec_ids[0])
+    if err_a:
+        return jsonify({"ok": False, "error": err_a}), 400
+    pb, err_b = _path_of(rec_ids[1])
+    if err_b:
+        return jsonify({"ok": False, "error": err_b}), 400
+
+    try:
+        rep = fastcdc.estimate_reuse(pa, pb,
+                                     max_bytes=int(payload.get("max_bytes") or
+                                                   128 * 1024 * 1024))
+    except OSError as exc:
+        return jsonify({"ok": False, "error": "读取产物失败: %s" % exc}), 500
+
+    rep["ok"] = True
+    rep["record_ids"] = [rec_ids[0], rec_ids[1]]
+    rep["note"] = ("cdc_reuse 高于 fixed_reuse 说明可变长分块跨版本更稳；"
+                   "压缩产物（.gz/.zst）因字节整体移位，固定块命中率通常极低")
+    return jsonify(rep)

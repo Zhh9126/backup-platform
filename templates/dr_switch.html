@@ -86,11 +86,33 @@
     <h6 class="text-muted mb-0"><i class="bi bi-activity me-1"></i>执行进度</h6>
     <span class="badge bg-secondary ms-2" id="swRunStatus">—</span>
     <span class="ms-auto small text-muted" id="swRunRto">—</span>
+    <button class="btn btn-sm btn-outline-danger ms-2 d-none" id="swCancelBtn">
+      <i class="bi bi-x-octagon me-1"></i>中止切换
+    </button>
   </div>
   <ol class="list-group list-group-numbered small" id="swSteps"></ol>
   <div class="alert alert-light border py-2 px-3 small mt-2 mb-0 d-none" id="swManual">
     <b>切换后人工跟进清单：</b><ul class="mb-0" id="swManualList"></ul>
   </div>
+  <div class="alert alert-warning border py-2 px-3 small mt-2 mb-0 d-none" id="swCompBox">
+    <b><i class="bi bi-life-preserver me-1"></i><span id="swCompTitle">失败处置建议</span></b>
+    <div class="mt-1" id="swCompDiag"></div>
+    <div id="swCompActions" class="mt-2"></div>
+    <div class="mt-2" id="swCompTools"></div>
+  </div>
+</div>
+
+<div class="page-card mb-3">
+  <div class="d-flex align-items-center mb-2">
+    <h6 class="text-muted mb-0"><i class="bi bi-graph-up me-1"></i>切换指标与 RTO 趋势</h6>
+    <select class="form-select form-select-sm ms-auto" id="swStatDays" style="width:110px">
+      <option value="7">近 7 天</option>
+      <option value="30" selected>近 30 天</option>
+      <option value="90">近 90 天</option>
+    </select>
+  </div>
+  <div class="row g-2 mb-3" id="swStatCards"></div>
+  <div id="swStatTrend"></div>
 </div>
 
 <div class="page-card">
@@ -115,8 +137,9 @@
 
   function el(id) { return document.getElementById(id); }
   function statusPill(s) {
-    var m = { success: ["badge-ok", "成功"], failed: ["badge-fail", "失败"],
-              running: ["badge-run", "执行中"], blocked: ["badge-warn", "被预检拦截"] };
+    var m = { success: ["badge-ok", T("成功")], failed: ["badge-fail", T("失败")],
+              running: ["badge-run", T("执行中")], blocked: ["badge-warn", T("被预检拦截")],
+              cancelled: ["badge-warn", T("已中止")] };
     var x = m[s] || ["bg-secondary", s || "-"];
     return '<span class="badge ' + x[0] + '">' + x[1] + '</span>';
   }
@@ -213,6 +236,18 @@
       '<div class="col-md-4">DNS：' + (d.domain ? BKP.esc(d.domain) + " → " + BKP.esc(d.resolved_ip || "-") +
         (d.in_sync ? ' <span class="badge badge-ok">一致</span>' : ' <span class="badge badge-fail">不一致</span>')
         : '<span class="text-muted">未配置</span>') + '</div></div>';
+    var pos = r.replication_position || {};
+    if (pos.gtid_enabled) {
+      var lostN = (pos.primary_missing_on_standby || []).length;
+      var lagN = (pos.standby_missing_on_primary || []).length;
+      html += '<div class="row g-2 small mt-1 pt-2 border-top">' +
+        '<div class="col-md-12"><b>' + T("复制位点（GTID）") + '</b>：' +
+        '<span>' + T("主库") + "</span> " + (pos.primary_uuids || 0) + " " + T("个 GTID 段") +
+        " / <span>" + T("备库") + "</span> " + (pos.standby_uuids || 0) + " " + T("个 GTID 段") +
+        " · <span>" + T("主库尚未到达备库") + "</span> <b class='" + (lostN ? "text-danger" : "text-success") + "'>" + lostN + "</b> " + T("GTID 段") +
+        " · <span>" + T("备库领先主库") + "</span> <b class='" + (lagN ? "text-warning" : "text-success") + "'>" + lagN + "</b> " + T("GTID 段") +
+        "</div></div>";
+    }
     el("swPreBody").innerHTML = html;
     el("swRunBtn").disabled = false;
     el("swState").textContent = ok ? "预检通过" : "预检有阻塞";
@@ -236,8 +271,10 @@
     el("swRunCard").classList.remove("d-none");
     el("swRunStatus").textContent = run.status;
     el("swRunStatus").className = "badge " + (run.status === "success" ? "badge-ok"
-      : run.status === "failed" ? "badge-fail" : "badge-run");
+      : run.status === "failed" ? "badge-fail"
+      : run.status === "cancelled" ? "badge-warn" : "badge-run");
     el("swRunRto").textContent = run.rto_sec ? ("RTO " + Number(run.rto_sec).toFixed(1) + "s") : (run.phase || "");
+    el("swCancelBtn").classList.toggle("d-none", run.status !== "running");
     var steps = run.steps || [];
     el("swSteps").innerHTML = steps.length ? steps.map(function (s) {
       var ic = s.ok ? '<span class="text-success">✔</span>' : '<span class="text-danger">✘</span>';
@@ -253,11 +290,20 @@
           return "<li>" + BKP.esc(w) + "</li>";
         }).join("");
     }
-    if (run.status === "success" || run.status === "failed" || run.status === "blocked") {
+    if (run.status === "success" || run.status === "failed" ||
+        run.status === "blocked" || run.status === "cancelled") {
       if (timer) { clearInterval(timer); timer = null; }
-      el("swState").textContent = run.status === "success" ? "切换完成" : "切换未完成";
-      el("swState").className = "badge " + (run.status === "success" ? "badge-ok" : "badge-fail");
+      el("swState").textContent = run.status === "success" ? T("切换完成")
+        : run.status === "cancelled" ? T("切换已中止") : T("切换未完成");
+      el("swState").className = "badge " + (run.status === "success" ? "badge-ok"
+        : run.status === "cancelled" ? "badge-warn" : "badge-fail");
       loadHistory();
+      loadStats();
+      if (run.id && (run.status === "failed" || run.status === "cancelled")) {
+        loadCompensation(run.id);
+      } else {
+        el("swCompBox").classList.add("d-none");
+      }
     }
   }
 
@@ -297,6 +343,173 @@
     });
   }
 
+  function cancelRun() {
+    if (!currentRun || !currentRun.id) return;
+    if (!confirm(T("确认中止本次切换？当前步骤会先执行完，随后的步骤不再执行。"))) return;
+    BKP.api("POST", "/api/dr/switch-runs/" + currentRun.id + "/cancel", {})
+      .then(function (r) {
+        BKP.toast(r.message || T("已发送中止请求"), "warning");
+        el("swCancelBtn").disabled = true;
+      })
+      .catch(function (e) {
+        BKP.toast(T("中止失败") + ": " + e.message, "danger");
+      });
+  }
+
+  function statCard(label, value, subHtml, cls) {
+    return '<div class="col-6 col-md-2"><div class="border rounded p-2 h-100">' +
+      '<div class="small text-muted">' + BKP.esc(label) + '</div>' +
+      '<div class="fs-5 fw-bold ' + (cls || "") + '">' + BKP.esc(value) + '</div>' +
+      '<div class="small text-muted">' + (subHtml || "") + '</div>' +
+      '</div></div>';
+  }
+
+  function loadStats() {
+    var days = el("swStatDays") ? el("swStatDays").value : 30;
+    BKP.api("GET", "/api/dr/switch-runs/stats?days=" + days).then(function (d) {
+      var done = d.success || 0;
+      var inSlo = done ? Math.round(done * (d.slo_hit_rate || 0) / 100) : 0;
+      var cards = "";
+      cards += statCard(T("切换次数"), String(d.total || 0),
+        '<span>' + T("成功") + "</span> " + done + " · <span>" + T("失败") + "</span> " + (d.failed || 0) +
+        " · <span>" + T("中止") + "</span> " + (d.cancelled || 0));
+      cards += statCard(T("成功率"), (d.success_rate || 0) + "%",
+        "<span>" + T("SLO 达标") + "</span> " + (d.slo_hit_rate || 0) + "%",
+        (d.success_rate || 0) >= 90 ? "text-success" : "text-warning");
+      cards += statCard(T("平均 RTO"), (d.avg_rto || 0) + "s",
+        "<span>" + T("SLO 目标") + "</span> " + (d.slo_rto_sec || 0) + "s");
+      cards += statCard(T("最大 RTO"), (d.max_rto || 0) + "s",
+        "<span>" + T("最快") + "</span> " + (d.min_rto || 0) + "s");
+      cards += statCard(T("达标次数"), String(inSlo),
+        "<span>" + T("SLO 目标内完成") + "</span> " + (d.slo_rto_sec || 0) + "s");
+      el("swStatCards").innerHTML = cards;
+      renderTrend(d.series || [], d.slo_rto_sec || 0);
+    }).catch(function () {
+      el("swStatCards").innerHTML = '<div class="col-12 text-muted small">' +
+        T("统计加载失败") + "</div>";
+    });
+  }
+
+  // RTO 趋势折线（纯 SVG，无外部依赖）
+  function renderTrend(series, slo) {
+    var pts = series.filter(function (s) { return s.rto > 0; });
+    var box = el("swStatTrend");
+    if (!pts.length) {
+      box.innerHTML = '<div class="text-muted small text-center py-3">' +
+        T("暂无成功的切换作业，无法绘制 RTO 趋势") + "</div>";
+      return;
+    }
+    var W = 900, H = 200, PL = 48, PR = 16, PT = 14, PB = 26;
+    var maxRto = 1;
+    pts.forEach(function (p) { if (p.rto > maxRto) maxRto = p.rto; });
+    if (slo > maxRto) maxRto = slo;
+    var n = pts.length;
+    var stepX = n > 1 ? (W - PL - PR) / (n - 1) : 0;
+    var xy = pts.map(function (p, i) {
+      var x = PL + (n > 1 ? stepX * i : (W - PL - PR) / 2);
+      var y = PT + (H - PT - PB) * (1 - p.rto / maxRto);
+      return { x: x, y: y, p: p };
+    });
+    var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" ' +
+      'style="width:100%;height:200px">';
+    // 网格与刻度
+    for (var g = 0; g <= 4; g++) {
+      var gy = PT + (H - PT - PB) * g / 4;
+      var gv = Math.round(maxRto * (1 - g / 4));
+      svg += '<line x1="' + PL + '" y1="' + gy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + gy.toFixed(1) +
+        '" stroke="#e5e7eb" stroke-width="1"/>';
+      svg += '<text x="4" y="' + (gy + 4).toFixed(1) + '" font-size="10" fill="#94a3b8">' + gv + 's</text>';
+    }
+    // SLO 参考线
+    if (slo > 0 && slo <= maxRto) {
+      var sy = PT + (H - PT - PB) * (1 - slo / maxRto);
+      svg += '<line x1="' + PL + '" y1="' + sy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + sy.toFixed(1) +
+        '" stroke="#f59e0b" stroke-width="1.5" stroke-dasharray="6 4"/>';
+      svg += '<text x="' + (W - PR - 58) + '" y="' + (sy - 4).toFixed(1) +
+        '" font-size="10" fill="#f59e0b">SLO ' + slo + 's</text>';
+    }
+    // 折线与点
+    var dpath = xy.map(function (q, i) {
+      return (i ? "L" : "M") + q.x.toFixed(1) + " " + q.y.toFixed(1);
+    }).join(" ");
+    svg += '<path d="' + dpath + '" fill="none" stroke="#0f766e" stroke-width="2"/>';
+    xy.forEach(function (q) {
+      var when = String(q.p.at || "").slice(5, 16).replace("T", " ");
+      svg += '<circle cx="' + q.x.toFixed(1) + '" cy="' + q.y.toFixed(1) + '" r="3.5" fill="#0f766e">' +
+        '<title>' + BKP.esc(when) + " · RTO " + q.p.rto + "s</title></circle>";
+    });
+    svg += "</svg>";
+    var cap = '<div class="small text-muted mt-1">' +
+      T("共 N 次成功切换（按时间正序）").replace("N", String(pts.length)) + "</div>";
+    box.innerHTML = svg + cap;
+  }
+
+  function loadCompensation(runId) {
+    BKP.api("GET", "/api/dr/switch-runs/" + runId + "/compensation")
+      .then(function (c) {
+        el("swCompBox").classList.remove("d-none");
+        el("swCompTitle").textContent = T("失败处置建议");
+        el("swCompDiag").innerHTML = BKP.esc(c.diagnosis || "");
+        var acts = c.actions || [];
+        el("swCompActions").innerHTML = acts.map(function (a, i) {
+          var btn = a.executable
+            ? '<button class="btn btn-sm btn-primary me-2" data-cmp="' + i + '">' +
+              BKP.esc(a.label) + "</button>"
+            : "";
+          return '<div class="mb-1">' + btn + '<span class="small text-muted">' +
+            BKP.esc(a.hint || "") + "</span></div>";
+        }).join("");
+        el("swCompActions").dataset.actions = JSON.stringify(acts);
+        el("swCompTools").dataset.runId = runId;
+        el("swCompTools").innerHTML =
+          '<button class="btn btn-sm btn-outline-warning" id="swCompRbBtn">' +
+          '<i class="bi bi-journal-text me-1"></i>' + T("生成处置剧本") + "</button>";
+      })
+      .catch(function () {
+        el("swCompBox").classList.add("d-none");
+      });
+  }
+
+  // 把补偿建议编排成可审批的恢复剧本（只生成，不自动执行）
+  function genRunbook() {
+    var rid = el("swCompTools").dataset.runId;
+    if (!rid) return;
+    if (!confirm(T("确认生成处置剧本") + "\n" +
+        T("剧本只生成不执行，需在「恢复剧本」页发起并逐步审批"))) return;
+    BKP.api("POST", "/api/dr/switch-runs/" + rid + "/compensation/runbook", {})
+      .then(function (r) {
+        BKP.toast(T("处置剧本已生成") + " #" + r.runbook_id, "success", 6000);
+        window.location.href = "/runbook";
+      })
+      .catch(function (e) {
+        BKP.toast(T("生成处置剧本失败") + ": " + e.message, "danger");
+      });
+  }
+
+  function runCompensation(idx) {
+    var acts = [];
+    try { acts = JSON.parse(el("swCompActions").dataset.actions || "[]"); } catch (e) { }
+    var a = acts[idx];
+    if (!a || !a.executable) return;
+    if (!confirm(T("确认执行补偿动作") + "：" + a.label + "\n" + (a.hint || ""))) return;
+    var lid = el("swLink").value;
+    BKP.api("POST", "/api/disaster-links/" + lid + "/switch", {
+      direction: a.direction || "failover", mode: "execute",
+      scope: a.scope || "dns_only", force: false, confirm: true,
+    }).then(function (r) {
+      if (r.status === "blocked") {
+        BKP.toast(r.message || T("预检未通过"), "warning", 6000);
+        if (r.precheck) renderPre(r.precheck);
+        return;
+      }
+      BKP.toast(T("补偿作业已启动"), "success");
+      renderRun({ id: r.run_id, status: "running", steps: [], phase: T("启动中"), precheck: r.precheck });
+      poll(r.run_id);
+    }).catch(function (e) {
+      BKP.toast(T("补偿动作发起失败") + ": " + e.message, "danger");
+    });
+  }
+
   function loadHistory() {
     BKP.api("GET", "/api/dr/switch-runs?limit=30").then(function (d) {
       var rows = d.items || [];
@@ -333,6 +546,16 @@
   });
   el("swPreBtn").addEventListener("click", precheck);
   el("swRunBtn").addEventListener("click", execute);
+  el("swCancelBtn").addEventListener("click", cancelRun);
+  el("swStatDays").addEventListener("change", loadStats);
+  el("swCompActions").addEventListener("click", function (e) {
+    var b = e.target.closest("button[data-cmp]");
+    if (!b) return;
+    runCompensation(b);
+  });
+  el("swCompTools").addEventListener("click", function (e) {
+    if (e.target.closest("#swCompRbBtn")) genRunbook();
+  });
   el("swHistory").addEventListener("click", function (e) {
     var b = e.target.closest("button[data-run]");
     if (!b) return;
@@ -343,6 +566,7 @@
   loadLinks().then(loadHistory).catch(function (e) {
     BKP.toast("加载链路失败: " + e.message, "danger");
   });
+  loadStats();
   var wantRun = q.get("run_id");
   if (wantRun) {
     BKP.api("GET", "/api/dr/switch-runs/" + wantRun).then(renderRun)

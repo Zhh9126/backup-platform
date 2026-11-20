@@ -25,6 +25,23 @@
     <div class="col"><div class="card p-3"><div class="text-muted small">容灾承载</div><div class="fs-4" id="kpiStandby">—</div></div></div>
     <div class="col"><div class="card p-3"><div class="text-muted small">最近切换 RTO</div><div class="fs-4" id="kpiRto">—</div></div></div>
   </div>
+  <div class="row g-3 mt-0">
+    <div class="col-6 col-md-4"><div class="card p-3">
+      <div class="text-muted small">演练合规率（近 30 天）</div>
+      <div class="fs-4" id="kpiDrillRate">—</div>
+      <div class="small text-muted" id="kpiDrillSub">—</div>
+    </div></div>
+    <div class="col-6 col-md-4"><div class="card p-3">
+      <div class="text-muted small">切换成功率（近 30 天）</div>
+      <div class="fs-4" id="kpiSwitchRate">—</div>
+      <div class="small text-muted" id="kpiSwitchSub">—</div>
+    </div></div>
+    <div class="col-6 col-md-4"><div class="card p-3">
+      <div class="text-muted small">平均 RTO（近 30 天）</div>
+      <div class="fs-4" id="kpiAvgRto">—</div>
+      <div class="small text-muted" id="kpiAvgRtoSub">—</div>
+    </div></div>
+  </div>
 </div>
 
 <div class="row g-3 mb-3">
@@ -86,6 +103,32 @@
       <tbody id="drRunTable"><tr><td colspan="8" class="text-center text-muted py-3">暂无切换记录</td></tr></tbody>
     </table>
   </div>
+  <div class="d-flex gap-2 mt-2">
+    <a class="btn btn-sm btn-outline-secondary" href="/api/dr/switch-runs/export?format=csv&amp;days=30">
+      <i class="bi bi-filetype-csv me-1"></i>导出 CSV</a>
+    <a class="btn btn-sm btn-outline-secondary" href="/api/dr/switch-runs/export?format=xlsx&amp;days=30">
+      <i class="bi bi-filetype-xls me-1"></i>导出 Excel</a>
+  </div>
+</div>
+
+<div class="page-card">
+  <div class="d-flex align-items-center mb-2 flex-wrap gap-2">
+    <h6 class="text-muted mb-0"><i class="bi bi-clock-history me-1"></i>容灾事件时间线</h6>
+    <div class="btn-group btn-group-sm ms-auto" id="drTlFilter">
+      <button class="btn btn-outline-secondary active" data-kind="">全部</button>
+      <button class="btn btn-outline-secondary" data-kind="switch">切换</button>
+      <button class="btn btn-outline-secondary" data-kind="drill">演练</button>
+      <button class="btn btn-outline-secondary" data-kind="inspection">巡检</button>
+      <button class="btn btn-outline-secondary" data-kind="alert">告警</button>
+      <button class="btn btn-outline-secondary" data-kind="gap">目标</button>
+    </div>
+    <select class="form-select form-select-sm" id="drTlDays" style="width:110px">
+      <option value="7">近 7 天</option>
+      <option value="14" selected>近 14 天</option>
+      <option value="30">近 30 天</option>
+    </select>
+  </div>
+  <div id="drTimeline"><div class="text-center text-muted py-4 small">加载中…</div></div>
 </div>
 {% endblock %}
 
@@ -474,6 +517,97 @@
     }).join("");
   }
 
+  // ------------------------- 合规概览 / 事件时间线 -------------------------
+  function loadCompliance() {
+    BKP.api("GET", "/api/dr/compliance?days=30").then(function (d) {
+      var dr = el("kpiDrillRate");
+      dr.textContent = d.drill_total ? (d.drill_rate || 0) + "%" : "—";
+      dr.className = "fs-4 " + (d.drill_total
+        ? (d.drill_rate >= 60 ? "text-success" : "text-warning") : "");
+      el("kpiDrillSub").textContent = d.drill_total
+        ? (d.drill_pass + " / " + d.drill_total + " " + T("次演练达标（60 分及格）"))
+        : T("近 30 天无已完成演练");
+      var sr = el("kpiSwitchRate");
+      sr.textContent = d.switch_total ? (d.switch_rate || 0) + "%" : "—";
+      sr.className = "fs-4 " + (d.switch_total
+        ? (d.switch_rate >= 90 ? "text-success" : "text-warning") : "");
+      el("kpiSwitchSub").textContent = d.switch_total
+        ? (d.switch_ok + " / " + d.switch_total + " " + T("次切换成功（不含试运行）"))
+        : T("近 30 天无切换作业");
+      el("kpiAvgRto").textContent = d.avg_rto ? (d.avg_rto + "s") : "—";
+      el("kpiAvgRtoSub").textContent = d.avg_rto
+        ? T("按成功切换作业统计") : T("暂无成功切换记录");
+    }).catch(function () { /* 合规指标失败不阻塞总览 */ });
+  }
+
+  var tlKind = "";
+  var TL_COLORS = { switch: "#0f766e", drill: "#7c3aed",
+                    inspection: "#0369a1", alert: "#dc2626", gap: "#b45309" };
+
+  function loadTimeline() {
+    var days = el("drTlDays").value;
+    var url = "/api/dr/timeline?days=" + days + (tlKind ? "&kinds=" + tlKind : "");
+    BKP.api("GET", url).then(function (d) {
+      var box = el("drTimeline");
+      var evs = d.events || [];
+      if (!evs.length) {
+        box.innerHTML = '<div class="text-center text-muted py-4 small">' +
+          T("近 14 天无容灾事件") + "</div>";
+        return;
+      }
+      box.innerHTML = evs.map(function (e) {
+        var c = TL_COLORS[e.kind] || "#64748b";
+        var sevIcon = e.severity === "error"
+          ? '<i class="bi bi-exclamation-octagon text-danger"></i>'
+          : (e.severity === "warn"
+            ? '<i class="bi bi-exclamation-triangle text-warning"></i>'
+            : '<i class="bi bi-check-circle text-success"></i>');
+        var link = "";
+        if (e.kind === "switch") {
+          link = '<a class="btn btn-sm btn-outline-secondary flex-none" href="/dr-switch?run_id=' +
+            e.id + '">' + T("查看") + "</a>";
+        } else if (e.kind === "drill") {
+          link = '<a class="btn btn-sm btn-outline-secondary flex-none" href="/drills?drill_id=' +
+            e.id + '">' + T("查看") + "</a>";
+        } else if (e.kind === "inspection") {
+          link = '<a class="btn btn-sm btn-outline-secondary flex-none" href="/dr-inspection?rid=' +
+            e.id + '">' + T("查看") + "</a>";
+        } else if (e.kind === "gap") {
+          var tid = (e.detail || {}).task_id;
+          if (tid) {
+            link = '<a class="btn btn-sm btn-outline-secondary flex-none" href="/tasks?focus=' +
+              tid + '">' + T("查看") + "</a>";
+          }
+        }
+        // 快照类事件（保护目标缺口）是「此刻的评估结果」而非历史事件
+        var snapTag = e.snapshot
+          ? '<span class="badge bg-light text-warning border flex-none">'
+            + T("当前评估") + '</span>' : "";
+        // 切换事件超出 RTO SLO 时显式标红（失败作业的 RTO 无意义，不标）
+        var sloTag = (e.detail || {}).slo_breached
+          ? '<span class="badge bg-danger-subtle text-danger flex-none">'
+            + T("超出 RTO 目标") + '</span>' : "";
+        var timeTxt = e.snapshot
+          ? (T("评估于") + " " + (e.at || "")) : (e.at || "");
+        return '<div class="d-flex align-items-start gap-2 py-2 border-bottom">' +
+          '<span class="d-inline-block mt-2 flex-none" style="width:8px;height:8px;border-radius:50%;background:' + c + '"></span>' +
+          '<div class="flex-grow-1">' +
+          '<div class="d-flex align-items-center flex-wrap gap-2">' +
+          '<span class="badge flex-none" style="background:' + c + '">' + esc(e.kind_label) + '</span>' +
+          '<b class="small">' + esc(e.title) + '</b>' +
+          (e.link_name ? '<span class="small text-muted">' + esc(e.link_name) + '</span>' : '') +
+          snapTag + sloTag +
+          '<span class="ms-auto small text-muted flex-none">' + esc(timeTxt) + '</span>' +
+          '</div>' +
+          '<div class="small text-muted mt-1">' + sevIcon + ' ' + esc(e.summary || '') + '</div>' +
+          '</div>' + link + '</div>';
+      }).join("");
+    }).catch(function () {
+      el("drTimeline").innerHTML = '<div class="text-center text-muted py-4 small">' +
+        T("时间线加载失败") + "</div>";
+    });
+  }
+
   // ------------------------- 加载 -------------------------
   function load(full) {
     // full=false：light 模式秒回（跳过逐链路探活），先把页面渲染出来；
@@ -486,6 +620,7 @@
       renderKpi(runs);
       renderRuns(runs);
       renderMap();
+      loadCompliance();
       if (selected != null) {
         var l = links.filter(function (x) { return x.id === selected; })[0];
         if (l) renderDrill(l);
@@ -498,6 +633,16 @@
   // 底图立即渲染（不依赖 API）：页面打开即出省界
   loadMap().then(function () { renderMap(); });
   load(false);
+  loadTimeline();
+  el("drTlFilter").addEventListener("click", function (e) {
+    var b = e.target.closest("button[data-kind]");
+    if (!b) return;
+    tlKind = b.dataset.kind || "";
+    Array.prototype.forEach.call(el("drTlFilter").querySelectorAll("button"),
+      function (x) { x.classList.toggle("active", x === b); });
+    loadTimeline();
+  });
+  el("drTlDays").addEventListener("change", loadTimeline);
   setTimeout(function () { load(true); }, 400);
   timer = setInterval(function () { load(true); }, 30000);
 })();

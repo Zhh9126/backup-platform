@@ -168,14 +168,32 @@ def api_list_vdb_snapshots(request_id):
 @api_bp.route("/clone/<int:request_id>/snapshots", methods=["POST"])
 @login_required
 def api_create_vdb_snapshot(request_id):
+    """创建 VDB 快照。
+
+    body.kind：``auto``（默认，优先原生产物）/ ``native``（标准备份产物，
+    含 DDL）/ ``logical``（数据级 JSON）。
+    """
     body = request.get_json(silent=True) or {}
     try:
         snap = _service.create_snapshot(
             request_id, name=body.get("name") or "",
-            created_by=body.get("created_by") or "")
+            created_by=body.get("created_by") or "",
+            kind=body.get("kind") or "auto")
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"ok": True, "snapshot": snap}), 201
+
+
+@api_bp.route("/clone/<int:request_id>/snapshots/purge", methods=["POST"])
+@login_required
+def api_purge_vdb_snapshot_files(request_id):
+    """清理该克隆下**已删除/已过期**快照遗留的产物文件（磁盘治理）。"""
+    body = request.get_json(silent=True) or {}
+    try:
+        res = _service.purge_orphan_snapshots(dry_run=bool(body.get("dry_run")))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(res)
 
 
 @api_bp.route("/clone/<int:request_id>/snapshots/<int:snapshot_id>/rollback",
@@ -216,10 +234,12 @@ def api_reclone_vdb_snapshot(request_id, snapshot_id):
               methods=["DELETE"])
 @login_required
 def api_delete_vdb_snapshot(request_id, snapshot_id):
+    """删除快照。``purge=true`` 时连同产物文件物理清理（默认仅软删）。"""
     body = request.get_json(silent=True) or {}
     try:
         res = _service.delete_snapshot(
-            request_id, snapshot_id, operator=body.get("operator") or "")
+            request_id, snapshot_id, operator=body.get("operator") or "",
+            purge=bool(body.get("purge")))
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify(res)

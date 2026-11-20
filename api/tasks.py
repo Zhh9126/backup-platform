@@ -438,9 +438,15 @@ def list_tasks():
             "WHERE status='success' GROUP BY task_id")}
     except Exception:
         _succ = {}
+    # 抖动配置在此预取一次并复用：逐个任务查库会让 60 个任务的列表执行
+    # 60+ 次 SQL（实测占单次请求耗时 83%，并发下被放大成秒级排队）。
+    try:
+        _jit = scheduler.jitter_config()
+    except Exception:  # noqa: BLE001
+        _jit = {"enabled": False, "slots": 0}
     for t in tasks:
         try:
-            t["next_run_at"] = scheduler.next_run_display(t) or ""
+            t["next_run_at"] = scheduler.next_run_display(t, jitter_cfg=_jit) or ""
         except Exception:
             t["next_run_at"] = ""
         t["last_success_at"] = _succ.get(int(t.get("id") or 0), "")

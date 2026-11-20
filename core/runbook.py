@@ -37,7 +37,7 @@ logger = logging.getLogger("runbook")
 
 # ---------------------------------------------------------------- 常量
 STEP_TYPES = ("wait", "run_backup", "restore_latest", "verify_rows",
-              "notify", "failover", "failback", "clone")
+              "notify", "failover", "failback", "clone", "dr_compensate")
 APPROVE_TIMEOUT_SEC = 3600        # 审批等待上限（1 小时）
 POLL_INTERVAL = 2.0               # 审批/停止轮询间隔
 MAX_STEPS = 50
@@ -51,6 +51,7 @@ STEP_TYPE_LABELS = {
     "failover": "容灾切换",
     "failback": "容灾回切",
     "clone": "测试克隆",
+    "dr_compensate": "失败补偿",
 }
 
 _RUNLOCK = threading.Lock()
@@ -464,6 +465,64 @@ def _step_clone(params: dict, operator: str) -> dict:
     return {"message": f"测试克隆 #{rid} 已就绪", "clone_id": rid}
 
 
+def _step_dr_compensate(params: dict, operator: str) -> dict:
+    """执行一次失败切换的**补偿动作**。
+
+    当前平台唯一可自动执行的补偿是「仅 DNS 牵引」（业务已切完、只差流量入口）；
+    其余动作（修复制、解 GTID 分叉、解除只读）平台无对应能力——此时**如实报错**，
+    绝不假装补偿成功。
+
+    执行通道复用既有的切换编排（``dr_orchestrator.start_switch``），
+    因此补偿同样有预检、事件外发与作业留痕，不另造一条切换通道。
+    """
+    from core import dr_compensation, dr_orchestrator, models
+    run_id = int(params.get("run_id") or 0)
+    if run_id <= 0:
+        raise ValueError("dr_compensate 需要 run_id")
+    run = dr_orchestrator.get_run(run_id)
+    if not run:
+        raise ValueError(f"切换作业 {run_id} 不存在")
+    link_id = int(run.get("link_id") or 0)
+    link = models.get_disaster_link(link_id) or {}
+    ana = dr_compensation.analyze(run, link)
+    acts = [a for a in (ana.get("actions") or []) if a.get("executable")]
+    if not acts:
+        raise ValueError("该作业没有平台可自动执行的补偿动作：%s"
+                         % (ana.get("diagnosis") or "-"))
+    act = acts[0]
+    scope = str(params.get("scope") or act.get("scope") or "")
+    direction = str(params.get("direction") or act.get("direction")
+                    or run.get("direction") or "failover")
+    if scope != "dns_only":
+        raise ValueError(f"平台暂不支持自动执行「{act.get('label') or act.get('id')}」"
+                         f"（scope={scope or '-'}），需人工处理")
+    res = dr_orchestrator.start_switch(
+        link_id, direction=direction, mode="execute",
+        force=bool(params.get("force")),
+        operator=operator or "runbook", scope=scope)
+    if not res.get("ok"):
+        raise ValueError(str(res.get("message") or "补偿动作发起失败"))
+    new_run = int(res.get("run_id") or 0)
+    timeout = min(float(params.get("timeout") or 180), 900)
+    deadline = time.time() + timeout
+    cur: dict = {}
+    status = "running"
+    while time.time() < deadline:
+        time.sleep(2)
+        cur = dr_orchestrator.get_run(new_run) or {}
+        status = str(cur.get("status") or "")
+        if status in ("success", "failed", "cancelled", "blocked"):
+            break
+    if status != "success":
+        raise ValueError("补偿动作未成功（status=%s）：%s"
+                         % (status or "-",
+                            str((cur or {}).get("message") or "")[:200]))
+    return {"message": "补偿动作执行完成（%s，补偿作业 #%s）"
+                        % (act.get("label") or "补偿", new_run),
+            "compensation_run_id": new_run,
+            "rto_sec": (cur or {}).get("rto_sec")}
+
+
 _STEP_HANDLERS = {
     "run_backup": _step_run_backup,
     "restore_latest": _step_restore_latest,
@@ -472,6 +531,7 @@ _STEP_HANDLERS = {
     "failover": _step_failover,
     "failback": _step_failback,
     "clone": _step_clone,
+    "dr_compensate": _step_dr_compensate,
 }
 
 

@@ -182,13 +182,17 @@ def dashboard():
         _DASH_CACHE["ts"] = now
         _DASH_CACHE["data"] = payload
         return jsonify(_with_live(payload))
-    if _DASH_CACHE["data"] is not None and now - _DASH_CACHE["ts"] < _DASH_TTL:
-        return jsonify(_with_live(_DASH_CACHE["data"]))
+    # 用 .get 而非直接下标：缓存字典被外部清理/重建（测试、未来维护脚本）
+    # 时不应把仪表盘打成 500。
+    _cached = _DASH_CACHE.get("data")
+    _cts = _DASH_CACHE.get("ts") or 0.0
+    if _cached is not None and now - _cts < _DASH_TTL:
+        return jsonify(_with_live(_cached))
     # 过期：有旧快照立即返回（stale）+ 后台重算（revalidate）——用户永远秒开；
     # 仅服务刚启动无任何快照时才同步算一次
-    if _DASH_CACHE["data"] is not None:
+    if _cached is not None:
         _dash_recalc_async()
-        return jsonify(_with_live(_DASH_CACHE["data"]))
+        return jsonify(_with_live(_cached))
     payload = _dashboard_payload()
     _DASH_CACHE["ts"] = now
     _DASH_CACHE["data"] = payload

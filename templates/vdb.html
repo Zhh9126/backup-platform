@@ -25,4 +25,53 @@
   <i class="bi bi-info-circle"></i> <strong>使用说明</strong>：在「备份记录」页选中某条成功记录 → 点击「克隆」按钮 → 填实例名和 TTL → 系统将自动创建新库并导入数据。
   过期后系统自动 DROP 清理。
 </div>
+
+<!-- VDB 快照弹窗 -->
+<div class="modal fade" id="vdbSnapModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header py-2">
+        <h6 class="modal-title">VDB 快照 <span id="vdbSnapLabel" class="text-muted small"></span></h6>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="d-flex align-items-end flex-wrap gap-2 mb-2">
+          <div>
+            <label class="form-label small mb-0">快照名称</label>
+            <input class="form-control form-control-sm" id="vdbSnapName" style="width:180px" placeholder="留空自动命名">
+          </div>
+          <div>
+            <label class="form-label small mb-0">快照类型</label>
+            <select class="form-select form-select-sm" id="vdbSnapKind" style="width:230px">
+              <option value="auto">自动（优先标准备份产物）</option>
+              <option value="native">标准备份产物（含 DDL）</option>
+              <option value="logical">数据级快照（不含 DDL）</option>
+            </select>
+          </div>
+          <button class="btn btn-sm btn-primary" id="vdbSnapCreate">
+            <i class="bi bi-camera me-1"></i>创建快照</button>
+          <button class="btn btn-sm btn-outline-secondary ms-auto" id="vdbSnapRefresh">
+            <i class="bi bi-arrow-clockwise me-1"></i>刷新</button>
+        </div>
+        <div class="small text-muted mb-2">
+          <i class="bi bi-info-circle"></i>
+          标准备份产物由数据库自带导出工具生成（含表结构与一致性快照，可被恢复引擎直接消费）；
+          数据级快照是平台自研的 gzip JSON（仅数据，不含表结构）。
+        </div>
+        <div class="table-responsive">
+          <table class="table table-sm align-middle mb-0">
+            <thead class="table-light"><tr>
+              <th style="width:50px">#</th><th>名称</th><th>类型</th><th>表数</th>
+              <th>大小</th><th>创建时间</th><th class="text-end">操作</th>
+            </tr></thead>
+            <tbody id="vdbSnapTable"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="modal-footer py-2">
+        <button class="btn btn-sm btn-outline-secondary" data-bs-dismiss="modal">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
 {% endblock %}

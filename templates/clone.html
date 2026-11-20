@@ -112,8 +112,15 @@
       <div class="modal-body">
         <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
           <input class="form-control form-control-sm" id="snapName" placeholder="快照名称（可空）" style="max-width:240px">
+          <select class="form-select form-select-sm" id="snapKind" style="max-width:230px">
+            <option value="auto">自动（优先标准备份产物）</option>
+            <option value="native">标准备份产物（含 DDL）</option>
+            <option value="logical">数据级快照（不含 DDL）</option>
+          </select>
           <button class="btn btn-sm btn-primary" id="snapCreateBtn"><i class="bi bi-camera"></i> 创建快照</button>
-          <span class="text-muted small">快照 = VDB 数据级全量导出（含 sha256 对账）；需要时一键恢复到该时间点。</span>
+          <button class="btn btn-sm btn-outline-secondary" id="snapPurgeBtn" title="清理已删除快照遗留的产物文件">
+            <i class="bi bi-trash"></i> 清理产物</button>
+          <span class="text-muted small">快照 = VDB 的时间点副本（含 sha256 对账）；「标准备份产物」由数据库自带工具生成，含表结构与一致性快照。</span>
         </div>
         <div class="table-responsive">
           <table class="table table-sm table-hover align-middle mb-0">

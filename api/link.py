@@ -470,6 +470,7 @@ def api_link_failover_config(link_id):
             "replication_user": cfg.get("replication_user") or "",
             "app_probe": cfg.get("app_probe") or {},
             "post_switch_verification": cfg.get("post_switch_verification") or {},
+            "slo_rto_sec": cfg.get("slo_rto_sec") or 0,
         })
     data = request.get_json(silent=True) or {}
     for key in ("primary_conn", "standby_conn"):
@@ -525,6 +526,14 @@ def api_link_failover_config(link_id):
             "enabled": bool(pv.get("enabled")),
             "checks": dr_app_ha.sanitize_checks(pv.get("checks")),
         }
+    # SLO 基准（秒）：单次切换耗时超过该值即视为未达标（统计页达标率用）
+    if data.get("slo_rto_sec") not in (None, ""):
+        try:
+            _slo = float(data.get("slo_rto_sec"))
+        except (TypeError, ValueError):
+            _slo = 0
+        if _slo > 0:
+            cfg["slo_rto_sec"] = _slo
     models.update_disaster_link(link_id, {
         "failover_config": _json.dumps(cfg, ensure_ascii=False)})
     return jsonify({"ok": True})

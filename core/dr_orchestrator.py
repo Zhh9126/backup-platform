@@ -27,6 +27,7 @@ import json
 import threading
 import time
 import traceback
+from datetime import datetime, timedelta
 
 import core.db as db
 import core.models as models
@@ -52,6 +53,15 @@ CREATE TABLE IF NOT EXISTS dr_switch_runs (
 """
 
 _schema_ready = False
+
+# 运行中的切换作业 → 中止信号（threading.Event）。
+# 进程内内存态：平台重启后信号丢失——诚实边界是「重启会中断进行中的切换作业」，
+# 作业记录仍在 dr_switch_runs 表内（状态如实留在 running，可人工订正）。
+_CANCEL_EVENTS: dict = {}
+
+# RTO 达标基准（秒）：单次切换耗时超过该值即视为未达标。
+# 链路可在 failover_config.slo_rto_sec 单独覆盖。
+DEFAULT_SLO_RTO_SEC = 300.0
 
 
 def ensure_schema() -> None:
@@ -177,6 +187,23 @@ def precheck(link_id: int, direction: str = "failover",
         except Exception:
             pass
 
+    # 复制位点核对（GTID 集合，只读）：把「RPO 缺口 / 回切追平量」量化出来。
+    # 拿不到位点时如实跳过（不伪造 RPO=0），探测异常不阻断预检。
+    position = {}
+    try:
+        position = _replication_position(link, snap)
+    except Exception as e:
+        position = {"error": str(e)[:160]}
+    if position and not position.get("error"):
+        lost = position.get("primary_missing_on_standby") or []
+        lag = position.get("standby_missing_on_primary") or []
+        if direction == "failover" and lost:
+            warns.append("主库有 %d 段事务尚未到达备库——切换将丢失这部分事务"
+                         "（RPO 缺口，非零丢失窗口）" % len(lost))
+        if direction == "failback" and lag:
+            warns.append("原主落后现主 %d 段事务——回切会先追平再提升，"
+                         "追平失败将拒绝回切（防丢数据）" % len(lag))
+
     return {
         "ok": True,
         "ready": not risks,
@@ -184,7 +211,42 @@ def precheck(link_id: int, direction: str = "failover",
         "warnings": warns,
         "snapshot": snap,
         "direction": direction,
+        "replication_position": position,
         "recommend_force": bool(direction == "failover" and pri.get("reachable")),
+    }
+
+
+def _replication_position(link: dict, snap: dict = None) -> dict:
+    """只读探测两端 GTID 已执行集合，量化 RPO 缺口 / 回切追平量。
+
+    返回::
+
+        {gtid_enabled, primary_uuids, standby_uuids,
+         primary_missing_on_standby: [(uuid, a, b)],  # 主有备无 → 切换会丢失
+         standby_missing_on_primary: [(uuid, a, b)]}  # 备有主无 → 旧主落后
+
+    探测不到（未开 GTID / 连接失败 / 权限不足）时返回 {}——调用方据此如实
+    跳过量化提示，绝不伪造 RPO=0。
+    """
+    from core import dr_failover
+
+    cfg = dr_failover._load_config(dict(link))
+    pc = dr_failover._decrypt_conn(cfg.get("primary_conn") or {})
+    sc = dr_failover._decrypt_conn(cfg.get("standby_conn") or {})
+    if not pc or not sc:
+        return {}
+    p_text = dr_failover._fetch_gtid_executed(pc)
+    s_text = dr_failover._fetch_gtid_executed(sc)
+    if not p_text and not s_text:
+        return {}          # 未开启 GTID：如实无量化信息
+    p_map = dr_failover._parse_gtid_set(p_text)
+    s_map = dr_failover._parse_gtid_set(s_text)
+    return {
+        "gtid_enabled": True,
+        "primary_uuids": len(p_map),
+        "standby_uuids": len(s_map),
+        "primary_missing_on_standby": dr_failover.gtid_missing(p_map, s_map),
+        "standby_missing_on_primary": dr_failover.gtid_missing(s_map, p_map),
     }
 
 
@@ -237,11 +299,18 @@ def start_switch(link_id: int, direction: str = "failover",
                 "precheck": pre, "message": "预检完成" if status != "blocked" else
                 "预检未通过：" + "；".join(pre.get("risks") or [])}
 
+    # 中止信号：登记到进程内表，POST /dr/switch-runs/<id>/cancel 触发它
+    cancel_ev = threading.Event()
+    _CANCEL_EVENTS[int(run_id)] = cancel_ev
+    _emit_switch_event("dr.switch.started", link, direction, scope,
+                       run_id=run_id, operator=operator, precheck=pre)
+
     def _runner():
         t0 = time.monotonic()
         steps: list = []
         try:
             engine = dr_failover.FailoverEngine(link)
+            engine.cancel_event = cancel_ev
             # 进度回调：FailoverEngine._step 每完成一步就刷新 DB，前端可实时看到
             def _on_step(step: dict):
                 steps.append(step)
@@ -260,26 +329,118 @@ def start_switch(link_id: int, direction: str = "failover",
             rto = float(result.get("rto_sec") or round(time.monotonic() - t0, 1))
             scope_label = {"full": "业务+DNS", "business": "仅业务",
                            "dns_only": "仅DNS"}[scope]
+            ok_msg = ("切换完成（%s）：%s → %s，RTO %.1fs" %
+                      (scope_label, direction, result.get("to") or "-", rto))
             db.execute(
                 "UPDATE dr_switch_runs SET status='success', phase='完成', steps=?, "
                 "rto_sec=?, message=?, finished_at=? WHERE id=?",
                 (json.dumps(result.get("steps") or steps, ensure_ascii=False, default=str),
-                 rto,
-                 ("切换完成（%s）：%s → %s，RTO %.1fs" %
-                  (scope_label, direction, result.get("to") or "-", rto)),
-                 db.now_iso(), run_id))
+                 rto, ok_msg, db.now_iso(), run_id))
+            _emit_switch_event("dr.switch.success", link, direction, scope,
+                               run_id=run_id, operator=operator, rto=rto,
+                               message=ok_msg, result=result)
         except Exception as e:
+            cancelled = cancel_ev.is_set() or "中止" in str(e)
+            status_txt = "cancelled" if cancelled else "failed"
+            phase_txt = "已中止" if cancelled else "失败"
+            fail_msg = ("切换被用户中止: %s" % str(e)[:400] if cancelled
+                        else "切换失败: %s" % str(e)[:400])
             db.execute(
-                "UPDATE dr_switch_runs SET status='failed', phase='失败', steps=?, "
+                "UPDATE dr_switch_runs SET status=?, phase=?, steps=?, "
                 "message=?, finished_at=? WHERE id=?",
-                (json.dumps(steps, ensure_ascii=False, default=str),
-                 "切换失败: %s" % str(e)[:400], db.now_iso(), run_id))
-            db.add_log("error", "dr.switch",
-                       "链路 %s %s 失败: %s" % (link_id, direction, str(e)[:200]))
+                (status_txt, phase_txt,
+                 json.dumps(steps, ensure_ascii=False, default=str),
+                 fail_msg, db.now_iso(), run_id))
+            db.add_log("WARNING" if cancelled else "error", "dr.switch",
+                       "链路 %s %s %s: %s" % (link_id, direction, phase_txt, str(e)[:200]))
+            _emit_switch_event(
+                "dr.switch.cancelled" if cancelled else "dr.switch.failure",
+                link, direction, scope, run_id=run_id, operator=operator,
+                message=fail_msg)
+        finally:
+            _CANCEL_EVENTS.pop(int(run_id), None)
 
     threading.Thread(target=_runner, name="dr-switch-%s" % run_id, daemon=True).start()
     return {"ok": True, "run_id": run_id, "status": "running",
             "precheck": pre, "message": "切换作业已启动"}
+
+
+def cancel_run(run_id: int) -> dict:
+    """中止一次进行中的切换作业。
+
+    中止语义（诚实边界）：信号在**步骤边界**生效——正在执行的步骤
+    （SSH/数据库操作）不强杀，该步骤跑完后停止后续步骤。作业状态置
+    ``cancelled``，已完成步骤全部留痕。
+    """
+    ensure_schema()
+    run = get_run(int(run_id))
+    if not run:
+        return {"ok": False, "error": "作业不存在"}
+    status = str(run.get("status") or "")
+    if status != "running":
+        return {"ok": False, "status": status,
+                "error": "作业当前状态为 %s，无法中止" % (status or "-")}
+    ev = _CANCEL_EVENTS.get(int(run_id))
+    if ev is None:
+        return {"ok": False, "status": status,
+                "error": "作业不在本进程内（平台重启或已结束），无法中止——请人工核对拓扑"}
+    ev.set()
+    db.execute("UPDATE dr_switch_runs SET phase='中止中' WHERE id=?", (int(run_id),))
+    db.add_log("WARNING", "dr.switch",
+               "切换作业 %s 收到中止请求（步骤边界生效）" % run_id)
+    return {"ok": True, "status": "cancelling", "run_id": int(run_id),
+            "message": "已发送中止请求：当前步骤完成后停止"}
+
+
+def _emit_switch_event(event: str, link: dict, direction: str, scope: str,
+                        run_id: int = 0, operator: str = "",
+                        rto: float = 0.0, message: str = "",
+                        precheck: dict = None, result: dict = None) -> None:
+    """切换事件外发：webhook（事件中心）+ 通知通道（邮件/短信等）。
+
+    通知是**旁路**：发送失败只记日志，绝不改变切换结果。``started`` 事件
+    只进 webhook（事件中心），不触发「失败」类通知，避免值班误判。
+    """
+    payload = {
+        "run_id": int(run_id or 0),
+        "link_id": int(link.get("id") or 0),
+        "link_name": link.get("name") or "",
+        "direction": direction,
+        "scope": scope,
+        "operator": operator or "",
+        "rto_sec": float(rto or 0),
+        "message": message or "",
+    }
+    if precheck:
+        payload["risks"] = precheck.get("risks") or []
+        payload["warnings"] = precheck.get("warnings") or []
+    if result:
+        payload["to"] = result.get("to") or ""
+    try:
+        from core import webhooks
+        webhooks.emit_async(event, payload)
+    except Exception as e:
+        try:
+            db.add_log("WARNING", "dr.switch",
+                       "切换事件 webhook 发送失败 %s: %s" % (event, str(e)[:160]))
+        except Exception:
+            pass
+    kind = ("开始" if event.endswith("started") else
+            "成功" if event.endswith("success") else
+            "中止" if event.endswith("cancelled") else "失败")
+    if kind == "开始":
+        return
+    try:
+        from core import notifier
+        title = "[%s] 容灾切换 %s" % (kind, payload.get("link_name")
+                                    or payload.get("link_id"))
+        text = payload.get("message") or ""
+        if payload.get("rto_sec"):
+            text += "\nRTO: %.1f 秒" % payload["rto_sec"]
+        notifier.Notifier(None, db.get_logger("notify")).notify_async(
+            "success" if kind == "成功" else "failure", title, text)
+    except Exception:
+        pass
 
 
 # ======================================================================
@@ -301,6 +462,89 @@ def list_runs(link_id: int = None, limit: int = 50) -> list:
     sql += " ORDER BY id DESC LIMIT ?"
     params.append(max(1, min(int(limit or 50), 500)))
     return [_decode(r) for r in db.query(sql, tuple(params))]
+
+
+def stats(link_id: int = None, days: int = 30,
+          slo_rto_sec: float = None) -> dict:
+    """切换作业统计：次数 / 成功率 / RTO 均值与极值 / SLO 达标率 / 趋势序列。
+
+    趋势序列按时间正序返回（前端直接画折线）：
+    ``[{id, at, rto, status, direction, link_name}]``。
+    SLO 基准取值：显式参数 > 链路 ``failover_config.slo_rto_sec`` > 默认 300 秒。
+    """
+    ensure_schema()
+    days = max(1, min(int(days or 30), 365))
+    # 与 db.now_iso() 的 isoformat 前缀对齐（YYYY-MM-DDTHH:MM:SS），字典序可比
+    since = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    sql = "SELECT * FROM dr_switch_runs WHERE created_at>=?"
+    params = [since]
+    if link_id:
+        sql += " AND link_id=?"
+        params.append(int(link_id))
+    sql += " ORDER BY id ASC"
+    rows = [_decode(r) for r in db.query(sql, tuple(params))]
+
+    target = slo_rto_sec
+    if target is None:
+        target = _slo_target(link_id)
+    target = float(target or DEFAULT_SLO_RTO_SEC)
+
+    cnt = {"success": 0, "failed": 0, "cancelled": 0, "blocked": 0}
+    rto_vals, series = [], []
+    for r in rows:
+        st = str(r.get("status") or "")
+        cnt[st] = cnt.get(st, 0) + 1
+        rto = float(r.get("rto_sec") or 0)
+        if st == "success" and rto > 0:
+            rto_vals.append(rto)
+        series.append({
+            "id": r.get("id"),
+            "at": r.get("created_at") or r.get("started_at") or "",
+            "rto": rto,
+            "status": st,
+            "direction": r.get("direction") or "",
+            "link_name": r.get("link_name") or "",
+        })
+    total = len(rows)
+    done = cnt.get("success", 0)
+    hit = len([v for v in rto_vals if v <= target])
+    return {
+        "days": days,
+        "total": total,
+        "success": done,
+        "failed": cnt.get("failed", 0),
+        "cancelled": cnt.get("cancelled", 0),
+        "blocked": cnt.get("blocked", 0),
+        "success_rate": round(done * 100.0 / total, 1) if total else 0.0,
+        "avg_rto": round(sum(rto_vals) / len(rto_vals), 1) if rto_vals else 0.0,
+        "max_rto": round(max(rto_vals), 1) if rto_vals else 0.0,
+        "min_rto": round(min(rto_vals), 1) if rto_vals else 0.0,
+        "slo_rto_sec": target,
+        "slo_hit_rate": round(hit * 100.0 / done, 1) if done else 0.0,
+        "series": series,
+    }
+
+
+def _slo_target(link_id: int = None) -> float:
+    """SLO 基准（秒）：链路 ``failover_config.slo_rto_sec`` 优先，其次默认值。"""
+    try:
+        links = models.list_disaster_links() or []
+        if link_id:
+            links = [l for l in links if int(l.get("id") or 0) == int(link_id)]
+        for lk in links:
+            raw = lk.get("failover_config") or ""
+            if not str(raw).strip():
+                continue
+            try:
+                cfg = json.loads(raw)
+            except Exception:
+                continue
+            v = cfg.get("slo_rto_sec")
+            if v:
+                return float(v)
+    except Exception:
+        pass
+    return DEFAULT_SLO_RTO_SEC
 
 
 def _decode(row: dict) -> dict:

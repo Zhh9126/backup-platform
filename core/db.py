@@ -581,7 +581,12 @@ CREATE TABLE IF NOT EXISTS restore_records (
     status       TEXT,
     message      TEXT,
     operator     TEXT,
-    detail_log   TEXT                            -- 恢复过程详细日志（stdout/stderr/各阶段说明）
+    detail_log   TEXT,                           -- 恢复过程详细日志（stdout/stderr/各阶段说明）
+    restored_tables     INTEGER,                 -- 实测：恢复后目标库表数
+    restored_rows       INTEGER,                 -- 实测：恢复后目标库行数（统计估算值）
+    restored_size_bytes INTEGER,                 -- 实测：恢复后目标库占用体积（字节）
+    restored_measured_at TEXT,                   -- 实测时间
+    restored_measure_note TEXT                   -- 实测口径说明 / 未采集原因
 );
 
 CREATE TABLE IF NOT EXISTS system_logs (
@@ -1499,18 +1504,96 @@ def open_sqlite_conn() -> sqlite3.Connection:
     return conn
 
 
+# ---------------- SQLite 连接复用（2026-11-20 并发压测优化） ----------------
+# 背景：原先每次 db.query 都 sqlite3.connect + 4 条 PRAGMA，实测 3.0ms，
+# 而真实查询只要 0.01ms——连接开销占单次查询耗时的 97%。建连是纯 CPU
+# （打开文件 + PRAGMA 解析），受 GIL 限制在并发下完全串行，导致
+# /api/tasks 单请求 0.19s 而 20 并发时 3.8s（近似线性排队）。
+# 做法：连接按线程复用，close() 归还而非销毁；归还前回滚未提交事务，
+# 与原「每次新连接 = 关闭即隐式回滚」语义一致。
+# 回退开关：环境变量 AIDBM_SQLITE_CONN_REUSE=0 恢复旧行为。
+_SQLITE_CONN_REUSE = os.environ.get("AIDBM_SQLITE_CONN_REUSE", "1") != "0"
+_SQLITE_PRAGMAS = (
+    "PRAGMA journal_mode=WAL;",
+    "PRAGMA busy_timeout=30000;",
+    "PRAGMA synchronous=NORMAL;",
+    "PRAGMA foreign_keys=ON;",
+)
+_conn_tls = threading.local()
+# 库文件代际：init_schema（建库/测试重建库/后端切换）后自增，
+# 使各线程缓存的旧连接失效，避免读到已被删除/替换的旧 inode。
+_conn_gen = [0]
+
+
+class _ReusableSqliteConn:
+    """线程本地 SQLite 连接的租赁包装：``close()`` 归还，不销毁底层连接。"""
+
+    __slots__ = ("_raw", "_closed")
+
+    def __init__(self, raw):
+        object.__setattr__(self, "_raw", raw)
+        object.__setattr__(self, "_closed", False)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_raw"), name)
+
+    def close(self):
+        if object.__getattribute__(self, "_closed"):
+            return
+        object.__setattr__(self, "_closed", True)
+        raw = object.__getattribute__(self, "_raw")
+        try:
+            if raw.in_transaction:      # 丢弃未提交的隐式事务（等价旧行为）
+                raw.rollback()
+        except Exception:               # noqa: BLE001
+            pass
+
+
+def reset_thread_conn() -> None:
+    """丢弃当前线程缓存的 SQLite 连接（库文件被替换/重建后调用）。"""
+    raw = getattr(_conn_tls, "conn", None)
+    _conn_tls.conn = None
+    _conn_tls.path = None
+    _conn_tls.gen = None
+    if raw is not None:
+        try:
+            raw.close()
+        except Exception:               # noqa: BLE001
+            pass
+
+
+def bump_conn_generation() -> None:
+    """使所有线程缓存的连接失效（元数据库被重建/切换后调用）。"""
+    _conn_gen[0] += 1
+
+
 def get_conn():
     # timeout/busy_timeout：多线程（Web 请求 + 调度器 + 备份线程）并发写 SQLite 时
     # 不会立刻抛 "database is locked"，而是等待锁释放（批量任务压测必需）。
     if _ACTIVE["backend"] != "sqlite":
         return open_backend_conn(dict(_ACTIVE))
-    conn = open_sqlite_conn()
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=30000;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
+    path = config.META_DB_PATH
+    if not _SQLITE_CONN_REUSE:
+        conn = open_sqlite_conn()
+        for _p in _SQLITE_PRAGMAS:
+            conn.execute(_p)
+        return conn
+    gen = _conn_gen[0]
+    raw = getattr(_conn_tls, "conn", None)
+    if raw is None or getattr(_conn_tls, "path", None) != path \
+            or getattr(_conn_tls, "gen", None) != gen:
+        if raw is not None:
+            try:
+                raw.close()
+            except Exception:           # noqa: BLE001
+                pass
+        raw = open_sqlite_conn()
+        for _p in _SQLITE_PRAGMAS:
+            raw.execute(_p)
+        _conn_tls.conn = raw
+        _conn_tls.path = path
+        _conn_tls.gen = gen
+    return _ReusableSqliteConn(raw)
 
 
 def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None:
@@ -1637,6 +1720,16 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                 conn.execute("ALTER TABLE restore_records ADD COLUMN detail_log TEXT")
             except Exception:
                 pass
+            # 迁移：恢复后实测数据量列（表数/行数/体积，口径与原因）
+            for col, typedef in [("restored_tables", "INTEGER"),
+                                 ("restored_rows", "INTEGER"),
+                                 ("restored_size_bytes", "INTEGER"),
+                                 ("restored_measured_at", "TEXT"),
+                                 ("restored_measure_note", "TEXT")]:
+                try:
+                    conn.execute(f"ALTER TABLE restore_records ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass
             # 迁移：操作日志文件路径列（备份/恢复各一份独立详细日志，便于事后回溯）
             for tbl in ("backup_records", "restore_records"):
                 try:
@@ -1653,6 +1746,10 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
             for idx_sql in (
                 "CREATE INDEX IF NOT EXISTS idx_system_logs_task ON system_logs(task_id)",
                 "CREATE INDEX IF NOT EXISTS idx_system_logs_record ON system_logs(record_id)",
+                # 日志页的「来源」下拉执行 SELECT DISTINCT source（5 万行全表
+                # 扫描实测 30~40ms，占 /api/logs 串行耗时的 70%）；since 过滤同理
+                "CREATE INDEX IF NOT EXISTS idx_system_logs_source ON system_logs(source)",
+                "CREATE INDEX IF NOT EXISTS idx_system_logs_ts ON system_logs(ts)",
             ):
                 try:
                     conn.execute(idx_sql)
@@ -2354,6 +2451,11 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
         finally:
             if close_conn:
                 conn.close()
+            if backend == "sqlite" and close_conn:
+                # schema 可能刚重建过库文件：让各线程缓存的连接失效，
+                # 否则复用连接会读到被替换掉的旧 inode（测试重建库尤甚）。
+                bump_conn_generation()
+                reset_thread_conn()
 
 
 def execute(sql: str, params: tuple = ()) -> int:

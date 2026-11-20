@@ -64,6 +64,15 @@ _CLONE_ENGINE = {
 }
 
 
+def _snapshot_keep() -> int:
+    """每个克隆请求保留的快照数量上限（环境变量可调，默认 10）。"""
+    try:
+        v = int(os.environ.get("AIDBM_VDB_SNAPSHOT_KEEP") or 10)
+    except (TypeError, ValueError):
+        v = 10
+    return v if v > 0 else 10
+
+
 def _default_ttl_days() -> int:
     try:
         return int(db.get_system_config("clone_default_ttl_days") or 7)
@@ -953,12 +962,37 @@ class CloneService:
             "AND status!='deleted' ORDER BY id DESC", (request_id,)) or [])]
 
     def create_snapshot(self, request_id: int, name: str = "",
-                        created_by: str = "") -> dict:
-        """对就绪 VDB 做一次数据级全量快照（逻辑导出 + sha256 对账）。"""
+                        created_by: str = "", kind: str = "auto") -> dict:
+        """对就绪 VDB 做一次快照。
+
+        kind：
+        - ``native``  用数据库自带导出工具产出**标准备份产物**（含 DDL +
+          一致性快照，可被平台恢复引擎直接消费）；
+        - ``logical`` 平台自研的数据级 gzip JSON（纯 Python 导出，不含 DDL，
+          受表数/行数上限约束）；
+        - ``auto``    优先 native；平台缺工具或库型不支持时**如实回退**
+          logical，并把实际产物类型与回退原因写进 note（不假装是 native）。
+        """
         from core import vdb_snapshot as vs
         req, vdb, password = self._vdb_context(request_id)
-        meta = vs.export_snapshot(vdb, password, name=name,
-                                  created_by=created_by)
+        kind = str(kind or "auto").lower()
+        if kind not in ("auto", "native", "logical"):
+            raise ValueError("快照类型不支持: %s（auto/native/logical）" % kind)
+        note = ""
+        meta = None
+        if kind in ("auto", "native"):
+            try:
+                meta = vs.export_native_snapshot(vdb, password, name=name,
+                                                 created_by=created_by)
+            except Exception as e:
+                if kind == "native":
+                    raise
+                note = ("原生导出不可用，已回退为数据级快照（不含 DDL）：%s"
+                        % str(e)[:160])
+                meta = None
+        if meta is None:
+            meta = vs.export_snapshot(vdb, password, name=name,
+                                      created_by=created_by)
         parent = None
         last = db.query("SELECT id FROM vdb_snapshots WHERE clone_request_id=? "
                         "AND status='ready' ORDER BY id DESC LIMIT 1",
@@ -972,18 +1006,35 @@ class CloneService:
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (request_id, vdb["id"], meta["name"], meta["snap_kind"], parent,
              meta["backup_path"], meta["size_bytes"], meta["checksum"],
-             meta["table_count"], meta["row_count"], "ready", "",
+             meta["table_count"], meta["row_count"], "ready",
+             note or meta.get("note") or "",
              db.now_iso(), created_by or "unknown"))
         db.add_log("INFO", "clone",
-                   "VDB 快照 %s 创建：克隆 %s，%s 表 / %s 行，%s 字节"
-                   % (sid, request_id, meta["table_count"], meta["row_count"],
-                      meta["size_bytes"]))
+                   "VDB 快照 %s 创建：克隆 %s，类型 %s，%s 表 / %s 行，%s 字节"
+                   % (sid, request_id, meta["snap_kind"], meta["table_count"],
+                      meta["row_count"], meta["size_bytes"]))
+        # 保留策略：超出上限的最旧快照连产物一起清理（防备份盘被慢慢吃满）
+        try:
+            expired = vs.apply_retention(request_id=request_id,
+                                          keep=_snapshot_keep())
+            if expired:
+                db.add_log("INFO", "clone",
+                           "VDB 快照保留策略：清理超限快照 %s（每个克隆保留 %s 个）"
+                           % (expired, _snapshot_keep()))
+        except Exception as e:
+            self.logger.warning("[clone] 快照保留策略执行失败（忽略）: %s", e)
         return self._snapshot_row(sid)
 
     def rollback_snapshot(self, request_id: int, snapshot_id: int,
                           drop_new_tables: bool = True,
                           operator: str = "") -> dict:
-        """把 VDB 数据回滚到快照点；先做 sha256 完整性复核，篡改即拒绝。"""
+        """把 VDB 回滚到快照点；先做 sha256 完整性复核，篡改即拒绝。
+
+        按快照类型分派：
+        - ``native``  标准备份产物 → 走原生恢复通道（**含 DDL**，表结构变更
+          不再是障碍；目标库会被重建）；
+        - ``logical`` 数据级 JSON → DELETE + 批量插回（结构变更时如实拒绝）。
+        """
         from core import vdb_snapshot as vs
         _req, vdb, password = self._vdb_context(request_id)
         snap = self._snapshot_row(snapshot_id, request_id)
@@ -996,13 +1047,17 @@ class CloneService:
             raise ValueError("快照产物不可读: %s" % e)
         if snap.get("checksum") and actual != snap["checksum"]:
             raise ValueError("快照产物校验和不匹配（可能被篡改），拒绝回滚")
-        res = vs.restore_snapshot(vdb, password, snap["backup_path"],
-                                  drop_new_tables=drop_new_tables)
+        kind = snap.get("snap_kind") or "logical"
+        if kind == "native":
+            res = vs.restore_native_snapshot(vdb, password, snap["backup_path"])
+        else:
+            res = vs.restore_snapshot(vdb, password, snap["backup_path"],
+                                      drop_new_tables=drop_new_tables)
         db.add_log("WARNING", "clone",
-                   "VDB 快照回滚：克隆 %s 回到快照 %s，操作人 %s，%s"
-                   % (request_id, snapshot_id, operator or "unknown",
+                   "VDB 快照回滚：克隆 %s 回到快照 %s（%s），操作人 %s，%s"
+                   % (request_id, snapshot_id, kind, operator or "unknown",
                       res.get("message")))
-        return {**res, "snapshot_id": snapshot_id}
+        return {**res, "snapshot_id": snapshot_id, "snap_kind": kind}
 
     def reclone_snapshot(self, request_id: int, snapshot_id: int,
                          target_env: str = "", requested_by: str = "",
@@ -1056,17 +1111,87 @@ class CloneService:
                 "applied": applied}
 
     def delete_snapshot(self, request_id: int, snapshot_id: int,
-                        operator: str = "") -> dict:
-        """软删快照元数据（保留产物文件与审计轨迹），不可回滚点不再可选。"""
+                        operator: str = "", purge: bool = False) -> dict:
+        """删除快照。
+
+        默认**软删**：元数据置 deleted（保留审计轨迹），产物文件留在磁盘。
+        ``purge=True`` 时连同产物文件一起物理删除——快照产物是实打实的磁盘
+        占用，只软删会让备份盘被慢慢吃满，因此另提供显式的物理清理出口。
+        """
+        from core import vdb_snapshot as vs
         snap = self._snapshot_row(snapshot_id, request_id)
         db.execute("UPDATE vdb_snapshots SET status='deleted', deleted_at=?, "
                    "note=? WHERE id=?",
                    (db.now_iso(), "由 %s 删除" % (operator or "unknown"),
                     snapshot_id))
+        purged = []
+        if purge:
+            purged = vs.purge_snapshot_files([snapshot_id])
         db.add_log("INFO", "clone",
-                   "VDB 快照 %s 已删除（产物保留）" % snapshot_id)
+                   "VDB 快照 %s 已删除（产物%s）"
+                   % (snapshot_id, "已清理" if purge else "保留"))
         return {"ok": True, "snapshot_id": snapshot_id,
-                "status": "deleted", "backup_path": snap.get("backup_path")}
+                "status": "deleted", "backup_path": snap.get("backup_path"),
+                "purged": bool(purged and purged[0].get("removed"))}
+
+    def rollback_vdb_snapshot(self, vdb_id: int, snapshot_id: int,
+                              operator: str = "") -> dict:
+        """按 **VDB 实例**回滚快照（不依赖克隆请求）。
+
+        与 ``rollback_snapshot`` 的差别：后者要求快照挂在某个克隆请求下，
+        而「VDB 管理」页创建的快照是按实例创建的（clone_request_id=0），
+        没有克隆请求可依——此前这条路径**无法回滚**（功能缺口）。
+        校验口径一致：sha256 先复核，篡改即拒。
+        """
+        from core import vdb_snapshot as vs
+        vdb = models.get_vdb(int(vdb_id))
+        if not vdb:
+            raise ValueError("VDB 不存在: %s" % vdb_id)
+        row = db.query_one("SELECT * FROM vdb_snapshots WHERE id=? "
+                           "AND vdb_instance_id=?", (int(snapshot_id), int(vdb_id)))
+        if not row:
+            raise ValueError("快照不存在: %s" % snapshot_id)
+        snap = dict(row)
+        if snap.get("status") != "ready":
+            raise ValueError("快照 %s 不是就绪状态（%s），拒绝回滚"
+                             % (snapshot_id, snap.get("status")))
+        password = self._vdb_password(vdb, None)
+        try:
+            actual = vs.sha256_file(snap["backup_path"])
+        except Exception as e:
+            raise ValueError("快照产物不可读: %s" % e)
+        if snap.get("checksum") and actual != snap["checksum"]:
+            raise ValueError("快照产物校验和不匹配（可能被篡改），拒绝回滚")
+        kind = snap.get("snap_kind") or "logical"
+        if kind == "native":
+            res = vs.restore_native_snapshot(vdb, password, snap["backup_path"])
+        else:
+            res = vs.restore_snapshot(vdb, password, snap["backup_path"])
+        db.add_log("WARNING", "clone",
+                   "VDB 快照回滚：VDB %s 回到快照 %s（%s），操作人 %s，%s"
+                   % (vdb_id, snapshot_id, kind, operator or "unknown",
+                      res.get("message")))
+        return {**res, "snapshot_id": snapshot_id, "snap_kind": kind}
+
+    def purge_orphan_snapshots(self, dry_run: bool = False) -> dict:
+        """清理**已删除 / 已过期**快照遗留的产物文件（磁盘治理）。
+
+        此前删除快照只改 status，文件永远留在磁盘——长期跑下来会把备份盘
+        吃满。本接口把「元数据已失效但文件还在」的产物清掉，元数据保留。
+        """
+        from core import vdb_snapshot as vs
+        rows = db.query("SELECT id FROM vdb_snapshots WHERE status IN "
+                        "('deleted','expired')")
+        ids = [r["id"] for r in (rows or [])]
+        cleaned = vs.purge_snapshot_files(ids, dry_run=dry_run)
+        freed = sum(int(c.get("size_bytes") or 0) for c in cleaned
+                    if c.get("removed"))
+        if not dry_run and cleaned:
+            db.add_log("INFO", "clone",
+                       "VDB 快照产物清理：%d 个文件，已释放约 %d 字节"
+                       % (len(cleaned), freed))
+        return {"ok": True, "dry_run": bool(dry_run), "count": len(cleaned),
+                "freed_bytes": freed, "items": cleaned}
 
 
 # 便捷单例

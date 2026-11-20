@@ -1196,6 +1196,33 @@ def run_restore_now(record_id: int, target_host: str = None,
         _logger.exception("恢复异常 record=%s", record_id)
         detail_log_lines.append(f"[异常] {e}")
         op.exception(e, note="[恢复流程异常]")
+    # 恢复后实测目标库数据量（表数 / 行数 / 占用体积）：只对数据库类恢复采集；
+    # 采集不到就如实留空并记录原因，绝不猜数，也不影响恢复主流程结论。
+    restored = {"tables": None, "rows": None, "size_bytes": None, "note": ""}
+    _mtype = (task.get("db_type") or "").lower()
+    if result.success and not drill_mode and _mtype not in ("file", "object_storage"):
+        try:
+            from core import restore_metrics as _rm
+            _m = _rm.measure_from_task(
+                task=task, target_host=target_host,
+                target_host_info=target_host_info, target_db=target_db,
+                target_port=target_port, target_schema=target_schema)
+            restored = _m
+            if _m.get("ok"):
+                detail_log_lines.append(
+                    "[恢复后实测] 表数=%s 行数=%s 体积=%s 字节（通道=%s；%s）"
+                    % (_m.get("tables"), _m.get("rows"), _m.get("size_bytes"),
+                       _m.get("mode"), _m.get("note") or ""))
+            else:
+                restored["note"] = _m.get("note") or "未采集"
+                detail_log_lines.append("[恢复后实测] 未采集：%s" % restored["note"])
+        except Exception as _me:  # noqa: BLE001 - 采集失败不放大为恢复失败
+            restored = {"tables": None, "rows": None, "size_bytes": None,
+                        "note": "采集异常：%s" % str(_me)[:160]}
+            detail_log_lines.append(
+                "[恢复后实测] 采集异常（不影响恢复结论）：%s" % _me)
+    elif _mtype in ("file", "object_storage"):
+        restored["note"] = "非数据库类型，无库级数据量口径"
     finished = db.now_iso()
     detail_log_lines.append(f"[结束] 完成时间: {finished}")
     detail_log = "\n".join(detail_log_lines)
@@ -1216,9 +1243,13 @@ def run_restore_now(record_id: int, target_host: str = None,
         _oplog.detach(_op_token)
     db.execute(
         "UPDATE restore_records SET finished_at=?, status=?, message=?, detail_log=?, "
-        "log_path=? WHERE id=?",
+        "log_path=?, restored_tables=?, restored_rows=?, restored_size_bytes=?, "
+        "restored_measured_at=?, restored_measure_note=? WHERE id=?",
         (finished, status, getattr(result, "message", ""), detail_log,
-         str(op.path), rid))
+         str(op.path), restored.get("tables"), restored.get("rows"),
+         restored.get("size_bytes"),
+         db.now_iso() if restored.get("ok") else None,
+         restored.get("note") or None, rid))
     db.add_log("INFO" if result.success else "ERROR", "scheduler",
                f"restore record={record_id} -> {status}",
                task_id=rec["task_id"], record_id=record_id,
@@ -1259,7 +1290,30 @@ def _parse_schedule_days(value) -> str:
     return ",".join(parts)
 
 
-def _schedule_jitter_minutes(task: dict) -> int:
+def jitter_config() -> dict:
+    """读取调度抖动配置 ``{"enabled": bool, "slots": int}``。
+
+    任务列表逐个算「下次备份时间」时会调用 ``_schedule_jitter_minutes``，
+    若每条都查一次 system_config，60 个任务 = 60 次 SQL（实测占 /api/tasks
+    单次耗时的 83%）。列表接口先调用本函数预取一次，再透传给每条任务。
+
+    不做进程内缓存：配置保存后必须立即生效（测试与运维都依赖该语义）。
+    """
+    out = {"enabled": False, "slots": 0}
+    try:
+        flag = db.get_system_config("schedule_jitter_enabled")
+        if str(flag).strip().lower() not in ("1", "true", "on", "yes"):
+            return out
+        win = int(db.get_system_config("schedule_jitter_seconds") or 0)
+    except Exception:
+        return out
+    if win > 0:
+        out["enabled"] = True
+        out["slots"] = max(1, win // 60)
+    return out
+
+
+def _schedule_jitter_minutes(task: dict, cfg: dict = None) -> int:
     """确定性调度抖动偏移（分钟），把同一时刻的备份洪峰摊平。
 
     对标 PB 级方案 §5.1「分层时间轮与确定性抖动」：
@@ -1268,17 +1322,12 @@ def _schedule_jitter_minutes(task: dict) -> int:
 
     默认关闭（system_config ``schedule_jitter_enabled``），窗口取
     ``schedule_jitter_seconds``（默认 300s → 5 个分钟槽）。关闭/配置非法返回 0。
+    ``cfg`` 可传入 ``jitter_config()`` 的预取结果，避免逐个任务查库。
     """
-    try:
-        flag = db.get_system_config("schedule_jitter_enabled")
-        if str(flag).strip().lower() not in ("1", "true", "on", "yes"):
-            return 0
-        win = int(db.get_system_config("schedule_jitter_seconds") or 0)
-    except Exception:
+    cfg = cfg if isinstance(cfg, dict) else jitter_config()
+    if not cfg.get("enabled") or not cfg.get("slots"):
         return 0
-    if win <= 0:
-        return 0
-    slots = max(1, win // 60)
+    slots = int(cfg["slots"])
     key = "%s|%s" % (task.get("id") or "", task.get("name") or "")
     return binascii.crc32(key.encode("utf-8")) % (slots + 1)
 
@@ -1335,7 +1384,7 @@ def _make_trigger(task: dict, st_key: str = "schedule_type", expr_key: str = "cr
 
 
 def _next_fire_naive(task: dict, st_key: str, expr_key: str, minutes_key: str,
-                     days_key, last_run):
+                     days_key, last_run, jitter_cfg=None):
     """单个子调度的下次触发时间（归一为本地 naive datetime；不可算返回 None）。
 
     与真实调度注册同语义（复用 _make_trigger），任何解析失败静默返回 None，
@@ -1345,7 +1394,8 @@ def _next_fire_naive(task: dict, st_key: str, expr_key: str, minutes_key: str,
     try:
         trig = _make_trigger(task, st_key=st_key, expr_key=expr_key,
                              minutes_key=minutes_key, days_key=days_key,
-                             jitter_minutes=_schedule_jitter_minutes(task))
+                             jitter_minutes=_schedule_jitter_minutes(
+                                 task, cfg=jitter_cfg))
         if not trig:
             return None
         tz = getattr(trig, "timezone", None)
@@ -1373,10 +1423,11 @@ def _next_fire_naive(task: dict, st_key: str, expr_key: str, minutes_key: str,
         return None
 
 
-def next_run_display(task: dict) -> str:
+def next_run_display(task: dict, jitter_cfg=None) -> str:
     """任务的下次备份时间（尽早的子调度），返回 'MM-DD HH:MM'；不可算返回空串。
 
     覆盖：主调度（cron/interval）；组合任务取 全量/增量 两个子调度中最早者。
+    ``jitter_cfg`` 为 ``jitter_config()`` 的预取结果（列表场景避免逐任务查库）。
     """
     import datetime as _dt
     if task.get("mixed_backup"):
@@ -1390,7 +1441,8 @@ def next_run_display(task: dict) -> str:
         candidates = [("schedule_type", "cron_expr", "interval_minutes", None)]
     best = None
     for st, ex, mi, dk in candidates:
-        nft = _next_fire_naive(task, st, ex, mi, dk, task.get("last_run_at"))
+        nft = _next_fire_naive(task, st, ex, mi, dk, task.get("last_run_at"),
+                               jitter_cfg=jitter_cfg)
         if nft is not None and (best is None or nft < best):
             best = nft
     if best is None:
@@ -2465,6 +2517,19 @@ def _start_lease_standby(interval: int = 30):
 def start_scheduler():
     global _scheduler
     if _scheduler is not None:
+        # 已有实例：若是 standby（未 start），租约一旦空闲就顺手接管启动，
+        # 避免 standby 线程异常退出后永久不接管（定时任务全部静默停摆）。
+        if not _scheduler.running:
+            try:
+                from core import lease as _lease_mod
+                _r = _lease_mod.acquire(owner=_lease_mod.owner_id())
+                if _r.get("acquired"):
+                    _start_lease_heartbeat(_scheduler, _lease_mod.owner_id())
+                    _reload_scheduler_locked()
+                    _logger.warning("调度器 standby → 已接管租约并启动"
+                                    "（%s）", _r.get("reason"))
+            except Exception:  # noqa: BLE001
+                pass
         return _scheduler
     if not config.SCHEDULER_ENABLED:
         _logger.info("调度器已禁用 (SCHEDULER_ENABLED=false)")
@@ -2612,6 +2677,12 @@ def _reload_scheduler_locked():
     # RT 周期任务幂等重注册；Supervisor 主循环 tick 已保留，不重启守护
     if config.RT_BACKUP_ENABLED:
         _register_rt_periodic_jobs(_scheduler)
+    # standby 实例（租约被别的实例持有）创建的 scheduler 从未 start()：
+    # 接管租约后重新注册 job 时必须一并启动，否则 job 停在 pending、
+    # 所有定时备份永远不触发（且 pending job 无 next_run_time）。
+    if not _scheduler.running:
+        _scheduler.start()
+        _logger.warning("调度器此前处于 standby（未启动），本次重载已接管并启动")
     _logger.info("调度器已重载，当前 %d 个任务", len(_scheduler.get_jobs()))
 
 
@@ -2667,9 +2738,26 @@ def stop_scheduler():
 
 def scheduler_status() -> dict:
     if _scheduler is None:
-        return {"running": False, "jobs": []}
+        return {"running": False, "jobs": [], "standby": False}
     jobs = []
     for j in _scheduler.get_jobs():
-        nxt = j.next_run_time.isoformat() if j.next_run_time else None
+        # APScheduler 3.11：调度器未 start 时（standby 实例）pending job 没有
+        # next_run_time 属性（只在 __slots__ 里声明，未赋值），直接取会抛
+        # AttributeError 让 /api/scheduler 500。
+        nxt_dt = getattr(j, "next_run_time", None)
+        nxt = nxt_dt.isoformat() if nxt_dt else None
         jobs.append({"id": j.id, "next_run": nxt})
-    return {"running": _scheduler.running, "jobs": jobs}
+    out = {"running": _scheduler.running, "jobs": jobs,
+           "standby": not _scheduler.running}
+    # 透出租约持有者，便于识别「多实例时谁在跑定时任务」
+    try:
+        from core import lease as _lease_mod
+        st = _lease_mod.status() if hasattr(_lease_mod, "status") else {}
+        if isinstance(st, dict) and st:
+            out["lease"] = {"owner": st.get("owner"),
+                            "self": st.get("self"),
+                            "active": st.get("active"),
+                            "expires_in": st.get("expires_in")}
+    except Exception:  # noqa: BLE001
+        pass
+    return out

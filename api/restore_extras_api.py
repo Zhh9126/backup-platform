@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """高级恢复 API：PITR / 对象级 / 副本克隆（VDB）。"""
+import os
 import re
 from datetime import datetime, timedelta
 from flask import request, jsonify
@@ -141,11 +142,21 @@ def clone_vdb():
     if not res.get("ok"):
         return jsonify(res), 500
     # 记录到 vdb_instances
+    # 密码必须落库：VDB 快照/接管检查/就绪校验都要靠它连库。
+    # 历史缺陷：本路径此前**不传 password**，导致这类 VDB 密码为空——
+    # 快照一定连不上库（连接被拒），且是「看起来创建成功」的隐性失败。
+    # models.create_vdb 已统一做幂等加密（明文才加密，密文原样存）。
+    src_pw = ""
+    try:
+        src_pw = (task or {}).get("password") or ""
+    except Exception:
+        src_pw = ""
     expires = (datetime.utcnow() + timedelta(hours=ttl_hours)).strftime("%Y-%m-%dT%H:%M:%S")
     vdb_id = models.create_vdb({
         "name": instance_name, "source_record_id": record_id, "task_id": rec["task_id"],
         "db_type": db_type, "port": port, "host": "127.0.0.1",
         "database_name": instance_name, "username": user,
+        "password": src_pw,
         "status": "ready", "expires_at": expires, "note": note,
     })
     res["vdb_id"] = vdb_id
@@ -167,4 +178,131 @@ def drop_vdb(vdb_id):
         return jsonify({"error": "VDB 不存在"}), 404
     res = restore_extras.drop_clone(v.get("db_type"), v.get("name"))
     models.delete_vdb(vdb_id)
+    return jsonify(res)
+
+
+# ------------------------- VDB 快照（按实例维度） -------------------------
+@api_bp.route("/vdb/<int:vdb_id>/snapshots", methods=["GET"])
+@login_required
+def list_vdb_snapshots(vdb_id):
+    """列出某个 VDB 实例的快照（与克隆请求维度等价，VDB 页直接用）。"""
+    v = models.get_vdb(vdb_id)
+    if not v:
+        return jsonify({"error": "VDB 不存在"}), 404
+    rows = db.query("SELECT * FROM vdb_snapshots WHERE vdb_instance_id=? "
+                    "AND status!='deleted' ORDER BY id DESC", (int(vdb_id),))
+    return jsonify([dict(r) for r in (rows or [])])
+
+
+@api_bp.route("/vdb/<int:vdb_id>/snapshots", methods=["POST"])
+@login_required
+def create_vdb_snapshot(vdb_id):
+    """对 VDB 实例创建快照。
+
+    body.kind：``auto``（默认，优先原生产物）/ ``native``（标准备份产物，
+    含 DDL + 一致性快照）/ ``logical``（数据级 JSON）。
+    """
+    v = models.get_vdb(vdb_id)
+    if not v:
+        return jsonify({"error": "VDB 不存在"}), 404
+    body = request.get_json(silent=True) or {}
+    from core import vdb_snapshot as vs
+    from core.clone_service import clone_service as _cs
+    try:
+        pw = _cs._vdb_password(v, None)
+        if not pw:
+            raise ValueError("该 VDB 没有可用密码，无法连接数据库做快照"
+                             "（请补配 VDB 凭据）")
+        meta = None
+        kind = str(body.get("kind") or "auto").lower()
+        note = ""
+        if kind in ("auto", "native"):
+            try:
+                meta = vs.export_native_snapshot(
+                    v, pw, name=body.get("name") or "",
+                    created_by=body.get("created_by") or "")
+            except Exception as e:
+                if kind == "native":
+                    raise
+                note = ("原生导出不可用，已回退为数据级快照（不含 DDL）：%s"
+                        % str(e)[:160])
+                meta = None
+        if meta is None:
+            meta = vs.export_snapshot(v, pw, name=body.get("name") or "",
+                                      created_by=body.get("created_by") or "")
+        # 快照与克隆请求解绑：clone_request_id 允许为空（历史 DDL 是 NOT NULL，
+        # 这里用 0 表示「按 VDB 实例创建」）
+        parent = None
+        last = db.query("SELECT id FROM vdb_snapshots WHERE vdb_instance_id=? "
+                        "AND status='ready' ORDER BY id DESC LIMIT 1",
+                        (int(vdb_id),))
+        if last:
+            parent = last[0]["id"]
+        sid = db.execute(
+            "INSERT INTO vdb_snapshots(clone_request_id, vdb_instance_id, name,"
+            " snap_kind, parent_snapshot_id, backup_path, size_bytes, checksum,"
+            " table_count, row_count, status, note, created_at, created_by)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (0, int(vdb_id), meta["name"], meta["snap_kind"], parent,
+             meta["backup_path"], meta["size_bytes"], meta["checksum"],
+             meta["table_count"], meta["row_count"], "ready",
+             note or meta.get("note") or "", db.now_iso(),
+             body.get("created_by") or "unknown"))
+        db.add_log("INFO", "clone",
+                   "VDB 快照 %s 创建：VDB %s，类型 %s，%s 表，%s 字节"
+                   % (sid, vdb_id, meta["snap_kind"], meta["table_count"],
+                      meta["size_bytes"]))
+        try:
+            vs.apply_retention(vdb_id=int(vdb_id),
+                               keep=int(os.environ.get(
+                                   "AIDBM_VDB_SNAPSHOT_KEEP") or 10))
+        except Exception:
+            pass
+        row = db.query_one("SELECT * FROM vdb_snapshots WHERE id=?", (sid,))
+        return jsonify({"ok": True, "snapshot": dict(row or {})}), 201
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": "创建快照失败: %s" % str(e)[:200]}), 500
+
+
+@api_bp.route("/vdb/<int:vdb_id>/snapshots/<int:snapshot_id>/rollback",
+              methods=["POST"])
+@login_required
+def rollback_vdb_snapshot(vdb_id, snapshot_id):
+    """把 VDB 回滚到指定快照点（高危操作，走操作验证码闸）。"""
+    from core.clone_service import clone_service as _cs
+    from auth import verify_code_gate
+    body = request.get_json(silent=True) or {}
+    gate = verify_code_gate(body)
+    if gate:
+        return jsonify(gate[0]), gate[1]
+    try:
+        res = _cs.rollback_vdb_snapshot(int(vdb_id), int(snapshot_id),
+                                        operator=body.get("operator") or "")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"ok": True, **res})
+
+
+@api_bp.route("/vdb/<int:vdb_id>/snapshots/<int:snapshot_id>/purge",
+              methods=["POST"])
+@login_required
+def purge_vdb_snapshot(vdb_id, snapshot_id):
+    """物理清理某个快照的产物文件。
+
+    清理后该快照**同时置为已删除**（元数据保留、审计可追溯）——否则列表里
+    会出现「有快照点但产物已不存在」的僵尸条目，点回滚只会报产物不存在。
+    """
+    from core import vdb_snapshot as vs
+    row = db.query_one("SELECT id, vdb_instance_id FROM vdb_snapshots WHERE id=?",
+                       (int(snapshot_id),))
+    if not row or int(row.get("vdb_instance_id") or 0) != int(vdb_id):
+        return jsonify({"error": "快照不存在"}), 404
+    body = request.get_json(silent=True) or {}
+    try:
+        res = vs.purge_snapshot(snapshot_id,
+                                operator=body.get("operator") or "")
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
     return jsonify(res)

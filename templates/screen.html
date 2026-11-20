@@ -11,6 +11,8 @@
     --cyan:#22D3EE; --teal:#2DD4BF; --blue:#3B82F6; --violet:#A78BFA;
     --amber:#FBBF24; --red:#F87171; --green:#34D399;
     --txt:#E6EDF6; --dim:#8299B2; --mute:#5D7490;
+    /* 两侧安全边距：1920 设计稿为 32px，超宽屏由 fit() 按设计宽等比放大 */
+    --edge:32px;
   }
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);color:var(--txt);
@@ -37,8 +39,8 @@
   @keyframes scanMove{0%{transform:translateY(-220px)}100%{transform:translateY(1100px)}}
 
   /* 头部 */
-  .head{height:84px;display:flex;align-items:center;justify-content:space-between;padding:0 32px;position:relative}
-  .head::after{content:"";position:absolute;left:32px;right:32px;bottom:0;height:1px;
+  .head{height:84px;display:flex;align-items:center;justify-content:space-between;padding:0 var(--edge);position:relative}
+  .head::after{content:"";position:absolute;left:var(--edge);right:var(--edge);bottom:0;height:1px;
     background:linear-gradient(90deg,transparent,rgba(34,211,238,.5),rgba(167,139,250,.3),transparent)}
   .title-wrap{display:flex;align-items:center;gap:14px}
   .brand{width:40px;height:40px;border-radius:11px;display:flex;align-items:center;justify-content:center;
@@ -61,7 +63,7 @@
   .clock small{display:block;font-size:11px;color:var(--mute);letter-spacing:1.6px;text-align:right;margin-top:2px}
 
   /* 主体三列 */
-  .body{height:calc(1080px - 84px - 52px);display:grid;gap:14px;padding:14px 32px 0;
+  .body{height:calc(100% - 84px - 52px);display:grid;gap:14px;padding:14px var(--edge) 0;
     grid-template-columns:1fr 1.3fr 1fr}
   .col{display:flex;flex-direction:column;gap:14px;min-height:0}
   .panel{position:relative;display:flex;flex-direction:column;min-height:0;
@@ -204,7 +206,7 @@
   .biz-num .lb{color:var(--mute);font-size:11px}
 
   /* 底部跑马灯 */
-  .ticker{height:52px;display:flex;align-items:center;gap:16px;padding:0 32px;
+  .ticker{height:52px;display:flex;align-items:center;gap:16px;padding:0 var(--edge);
     border-top:1px solid rgba(56,189,248,.16);overflow:hidden}
   .ticker .lbl{font-size:12px;color:var(--mute);letter-spacing:2px;flex:0 0 auto}
   .ticker-track{flex:1;overflow:hidden;white-space:nowrap}
@@ -346,13 +348,33 @@
       .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   };
   var ANIM = { trend: false, donut: false };
+  var LASTDRAW = null;   /* 缓存最近一次图表数据：窗口尺寸变化后重绘，避免拉伸变形 */
 
-  /* ---------- 等比缩放：1920x1080 设计稿铺满任意屏幕 ---------- */
+  /* ---------- 自适应铺满 ----------
+     高度定标等比缩放（上下不裁切）；窗口比 16:9 更宽时把设计宽度放宽到
+     vw/s，把两侧原本的黑边变成有效内容区，栅格自然铺满整屏。 */
   function fit() {
     var vp = $("viewport");
     if (!vp) return;
-    var s = Math.min(window.innerWidth / 1920, window.innerHeight / 1080);
+    var vw = window.innerWidth, vh = window.innerHeight;
+    var s = Math.min(vw / 1920, vh / 1080);
+    if (!(s > 0)) return;
+    var designW = 1920;
+    if (vw / vh > 1920 / 1080) {
+      /* 上限 1.6 倍：极端超宽屏也不把面板拉成面条 */
+      designW = Math.min(vw / s, Math.round(1920 * 1.6));
+    }
+    vp.style.width = Math.round(designW) + "px";
+    /* 边距随设计宽等比放大（32 → 上限 56），铺满后内容不贴边 */
+    vp.style.setProperty("--edge",
+      Math.min(56, Math.round(32 * designW / 1920)) + "px");
     vp.style.transform = "translate(-50%,-50%) scale(" + s + ")";
+    if (LASTDRAW) {
+      try {
+        drawTrend(LASTDRAW.trend);
+        drawDonut(LASTDRAW.donut);
+      } catch (e) { /* 重绘失败不影响布局 */ }
+    }
   }
   window.addEventListener("resize", fit);
   fit();
@@ -782,8 +804,12 @@
     drawGauge(hs, dash.health_details || []);
 
     /* 图表与列表 */
-    drawTrend(dash.trend || []);
-    drawDonut(dash.db_counter || dash.db_counter_display || {});
+    LASTDRAW = {
+      trend: dash.trend || [],
+      donut: dash.db_counter || dash.db_counter_display || {}
+    };
+    drawTrend(LASTDRAW.trend);
+    drawDonut(LASTDRAW.donut);
     drawBiz(dash.biz_top || []);
     drawRt(dash.rt || {}, lastDr || { links: [] });
     drawAttention(dash.attention || []);

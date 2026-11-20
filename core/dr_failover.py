@@ -351,6 +351,10 @@ class _FailoverEngineCore:
         # 切换范围（业务切换/DNS 切换两步拆分）：True 时 failover/failback
         # 跳过 DNS 步骤——仅做业务层主备切换（DNS 牵引由 dns_only 单独执行）
         self.skip_dns = False
+        # 中止信号（编排层注入 threading.Event）：切换执行中可由用户中止。
+        # 判据在**步骤边界**检查——正在执行的步骤（SSH/数据库操作）不强杀，
+        # 该步骤跑完即停止后续步骤（诚实边界：不承诺步骤内中断）。
+        self.cancel_event = None
 
     def _step(self, name, fn):
         t0 = time.monotonic()
@@ -360,7 +364,6 @@ class _FailoverEngineCore:
                     "ms": int((time.monotonic() - t0) * 1000), "detail": detail}
             self.steps.append(step)
             self._notify(step)
-            return detail
         except Exception as e:
             step = {"name": name, "ok": False,
                     "ms": int((time.monotonic() - t0) * 1000),
@@ -368,6 +371,21 @@ class _FailoverEngineCore:
             self.steps.append(step)
             self._notify(step)
             raise
+        # 中止判据放在 try/except 之外（步骤边界）：当前步骤已成功落账，
+        # 再抛中止异常不会被上面的 except 误记为「步骤失败」。
+        if self.cancel_requested():
+            raise FailoverError("切换已被用户中止（步骤「%s」完成后停止）" % name)
+        return detail
+
+    def cancel_requested(self) -> bool:
+        """是否收到中止请求（编排层注入 threading.Event，可为空）。"""
+        ev = self.cancel_event
+        if ev is None:
+            return False
+        try:
+            return bool(ev.is_set())
+        except Exception:
+            return False
 
     def _notify(self, step: dict) -> None:
         if not self.on_step:

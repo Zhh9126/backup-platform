@@ -924,6 +924,14 @@ def list_restores(limit: int = 100, keyword: str = None) -> list:
             _sz = 0.0
         r["restore_size_gb"] = round(_sz / (1024 ** 3), 3)
         r["restore_size_human"] = db.human_size(int(_sz)) if _sz else "-"
+        # 实测口径：恢复完成后到目标库实测的表数 / 行数 / 占用体积。
+        # 未采集到就留空（页面显示 -），并在 note 里给出真实原因，绝不猜数。
+        try:
+            r["restored_size_human"] = (db.human_size(int(r["restored_size_bytes"]))
+                                        if r.get("restored_size_bytes") else "")
+        except Exception:
+            r["restored_size_human"] = ""
+        r["restored_measure_note"] = r.get("restored_measure_note") or ""
     return rows
 
 
@@ -1324,6 +1332,27 @@ def mark_record_verified(record_id: int, ok: bool, msg: str) -> None:
 
 
 # ------------------------- 虚拟数据库（VDB / 测试库） -------------------------
+def _vdb_password_for_store(pw) -> str:
+    """VDB 密码入库前的统一处理：**幂等**加密。
+
+    历史缺陷（2026-11-20 实测修复）：``create_vdb`` 原样存密码，
+    而 ``clone_service._register_vdb`` 传的**已是密文**——两条入口口径不一，
+    轻则明文落库，重则双重加密导致密码解不开（表现为 VDB 连不上、快照必失败）。
+
+    这里统一：**已是密文（sm4v1:/enc: 前缀）就原样存，明文才加密**，
+    两条调用方都不必再各自处理。
+    """
+    s = str(pw or "")
+    if not s:
+        return ""
+    if s.startswith("sm4v1:") or s.startswith("enc:"):
+        return s
+    try:
+        return db.encrypt_secret(s)
+    except Exception:
+        return s
+
+
 def create_vdb(data: dict) -> int:
     fields = ["name", "source_record_id", "task_id", "db_type", "port", "host",
               "database_name", "username", "password", "status", "service",
@@ -1331,6 +1360,7 @@ def create_vdb(data: dict) -> int:
     row = {k: data.get(k) for k in fields}
     if not row.get("created_at"):
         row["created_at"] = db.now_iso()
+    row["password"] = _vdb_password_for_store(row.get("password"))
     cols = list(row.keys())
     sql = f"INSERT INTO vdb_instances ({','.join(cols)}) VALUES ({','.join('?'*len(cols))})"
     return db.execute(sql, tuple(row.values()))
@@ -1351,6 +1381,8 @@ def update_vdb(vdb_id: int, data: dict) -> None:
     updates = {k: v for k, v in data.items() if k in allow}
     if not updates:
         return
+    if "password" in updates:
+        updates["password"] = _vdb_password_for_store(updates["password"])
     sets = ", ".join(f"{k}=?" for k in updates)
     db.execute(f"UPDATE vdb_instances SET {sets} WHERE id=?",
                tuple(updates.values()) + (vdb_id,))

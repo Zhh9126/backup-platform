@@ -49,7 +49,7 @@ def get_inspection_schedule():
         if sch:
             j = sch.get_job("inspection_global")
             if j:
-                nrt = j.next_run_time
+                nrt = getattr(j, "next_run_time", None)
                 next_run = nrt.isoformat() if nrt else None
     except Exception:
         pass
@@ -87,8 +87,9 @@ def save_inspection_schedule():
         sch = scheduler._scheduler
         if sch:
             j = sch.get_job("inspection_global")
-            if j and j.next_run_time:
-                next_run = j.next_run_time.isoformat()
+            nrt = getattr(j, "next_run_time", None) if j else None
+            if nrt:
+                next_run = nrt.isoformat()
     except Exception:
         pass
     return jsonify({"ok": True, "enabled": enabled, "cron": cron, "next_run": next_run})

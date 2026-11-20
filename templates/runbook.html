@@ -115,10 +115,10 @@
   var TYPE_LABELS = {
     wait: "等待", run_backup: "执行备份", restore_latest: "恢复最近备份",
     verify_rows: "行数校验", notify: "事件通知", failover: "容灾切换",
-    failback: "容灾回切", clone: "测试克隆"
+    failback: "容灾回切", clone: "测试克隆", dr_compensate: "失败补偿"
   };
   var TYPE_ORDER = ["run_backup", "restore_latest", "verify_rows", "wait",
-                    "notify", "failover", "failback", "clone"];
+                    "notify", "failover", "failback", "clone", "dr_compensate"];
 
   var PARAM_FIELDS = {
     wait: [{ k: "seconds", label: "等待秒数（上限 600）", type: "number", def: 10 }],
@@ -144,6 +144,12 @@
       { k: "record_id", label: "备份记录 ID（见 /records）", type: "number" },
       { k: "purpose", label: "用途", type: "select",
         opts: ["test", "emergency", "dev", "staging"], def: "test" }
+    ],
+    dr_compensate: [
+      { k: "run_id", label: "失败的切换作业 ID（见 /dr-switch）", type: "number" },
+      { k: "action_id", label: "补偿动作 ID（dns_only=仅 DNS 牵引）" },
+      { k: "scope", label: "切换范围（dns_only=仅 DNS 牵引）" },
+      { k: "direction", label: "方向（failover=切换 / failback=回切）" }
     ]
   };
 

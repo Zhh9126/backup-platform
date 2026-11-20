@@ -3228,6 +3228,33 @@
 
   // ------------------------- 数据恢复 -------------------------
   /**
+   * 恢复数据量单元格：两个口径并列，缺一不猜。
+   * - 实测口径：恢复完成后到目标库实测（体积/表数/行数，行数为统计估算值）；
+   * - 产物口径：本次恢复所用备份产物的落盘体积（压缩后）。
+   */
+  function restoreVolumeTitle(r) {
+    const base = T("恢复数据量：实测=恢复后目标库统计（体积/表数/行数，行数为统计估算值）；产物=备份文件落盘体积（压缩后）");
+    const note = r && r.restored_measure_note ? ("；" + r.restored_measure_note) : "";
+    return base + note;
+  }
+  function restoreVolumeText(r) {
+    const has = (v) => v !== undefined && v !== null && v !== "";
+    const measured = has(r.restored_tables) || has(r.restored_rows) || has(r.restored_size_human);
+    if (measured) {
+      const parts = [];
+      if (has(r.restored_size_human)) parts.push(r.restored_size_human);
+      if (has(r.restored_tables)) parts.push(r.restored_tables + " 表");
+      if (has(r.restored_rows)) parts.push(r.restored_rows + " 行");
+      return "实测 " + (parts.length ? parts.join(" · ") : "-");
+    }
+    const art = (r.restore_size_human && r.restore_size_human !== "-") ? r.restore_size_human : "";
+    return art ? ("产物 " + art) : "";
+  }
+  function restoreVolumeCell(r) {
+    const text = restoreVolumeText(r);
+    return `<td title="${esc(restoreVolumeTitle(r))}">${esc(text || "-")}</td>`;
+  }
+  /**
    * 渲染恢复记录表。
    * @param {number} highlightId 需要高亮的恢复记录 ID（本次刚提交的记录），0 表示不高亮。
    */
@@ -3244,6 +3271,7 @@
         <td>${fmtBizCell(r)}</td>
         <td>${esc(r.db_type_display || r.db_type || "-")}</td>
         <td>${fmtTime(r.backup_started_at)}</td>
+        ${restoreVolumeCell(r)}
         <td>${esc(r.target_host || "-")}</td><td>${esc(r.target_db || "-")}</td>
         <td>${fmtTime(r.started_at)}</td><td>${statusBadge(r.status)}</td>
         <td>${esc(r.operator || "-")}</td><td>${esc(r.message || "")}</td>
@@ -3279,11 +3307,115 @@
         <td>${fmtTime(v.created_at)}</td>
         <td>${v.expires_at || '-'} ${expiresBadge}</td>
         <td class="text-end">
+          <button class="btn btn-sm btn-outline-secondary me-1" onclick="openVdbSnapshots(${v.id}, ${JSON.stringify(v.name || '')})" title="快照">
+            <i class="bi bi-camera"></i></button>
           <button class="btn btn-sm btn-outline-danger" onclick="dropVdb(${v.id})">删除</button>
         </td>
       </tr>`;
     }).join("") || '<tr><td colspan="10" class="text-muted text-center">暂无 VDB，请到【备份记录】页克隆</td></tr>';
     Pager.attach("vdbs", $("vdbTable"), pgv.page, pgv.pages, pgv.total, loadVdbs);
+  }
+
+  // ------------------------- VDB 快照（实例维度） -------------------------
+  var vdbSnapId = null;
+  const SNAP_KIND_LABEL = { native: "标准备份产物", logical: "数据级快照" };
+
+  window.openVdbSnapshots = function (id, name) {
+    vdbSnapId = id;
+    $("vdbSnapLabel").textContent = name || ("#" + id);
+    $("vdbSnapName").value = "";
+    const m = $("vdbSnapModal");
+    if (window.bootstrap && bootstrap.Modal) {
+      bootstrap.Modal.getOrCreateInstance(m).show();
+    } else {
+      m.classList.add("show");
+      m.style.display = "block";
+    }
+    loadVdbSnapshots();
+  };
+
+  async function loadVdbSnapshots() {
+    if (!vdbSnapId) return;
+    let rows = [];
+    try {
+      rows = await api("GET", "/api/vdb/" + vdbSnapId + "/snapshots");
+    } catch (e) {
+      toast("加载快照失败: " + e.message, "danger");
+      return;
+    }
+    rows = rows || [];
+    $("vdbSnapTable").innerHTML = rows.map((s, i) => {
+      const kind = SNAP_KIND_LABEL[s.snap_kind] || (s.snap_kind || "-");
+      const kb = (s.size_bytes || 0) / 1024;
+      const size = kb > 1024 ? (kb / 1024).toFixed(1) + " MB"
+        : (s.size_bytes ? kb.toFixed(1) + " KB" : "-");
+      const note = s.note ? `<div class="small text-muted">${esc(s.note)}</div>` : "";
+      return `<tr>
+        <td>${i + 1}</td>
+        <td><b class="small">${esc(s.name || "")}</b>${note}</td>
+        <td><span class="badge ${s.snap_kind === "native" ? "badge-ok" : "bg-secondary"}">${esc(kind)}</span></td>
+        <td>${s.table_count || 0}</td>
+        <td>${size}</td>
+        <td class="small text-muted">${fmtTime(s.created_at)}</td>
+        <td class="text-end">
+          <button class="btn btn-sm btn-outline-warning me-1" onclick="rollbackVdbSnap(${vdbSnapId}, ${s.id})" title="把 VDB 回滚到该快照点（需操作验证）">
+            <i class="bi bi-arrow-counterclockwise"></i></button>
+          <button class="btn btn-sm btn-outline-secondary" onclick="purgeVdbSnap(${vdbSnapId}, ${s.id})" title="清理产物文件">
+            <i class="bi bi-trash"></i></button>
+        </td>
+      </tr>`;
+    }).join("") || '<tr><td colspan="7" class="text-muted text-center">暂无快照</td></tr>';
+  }
+
+  window.rollbackVdbSnap = async function (vdbId, snapId) {
+    const ok = await confirmDialog({
+      title: "恢复 VDB 快照",
+      message: "确认把该 VDB 回滚到快照 #" + snapId + "？快照之后的变更将被清除（建议先为当前状态建快照）。",
+      confirmText: "恢复", danger: true
+    });
+    if (!ok) return;
+    try {
+      const r = await verifyGate((code) =>
+        api("POST", `/api/vdb/${vdbId}/snapshots/${snapId}/rollback`,
+          code ? { verify_code: code } : {}));
+      toast("已回滚：" + (r.message || "完成"), "success");
+      await loadVdbSnapshots();
+    } catch (e) { toast(e.message, "danger", 7000); }
+  };
+
+  window.purgeVdbSnap = async function (vdbId, snapId) {
+    const ok = await confirmDialog({
+      title: "清理快照产物",
+      message: "将物理删除该快照的产物文件（元数据与审计记录保留）。确认？",
+      confirmText: "清理", danger: true
+    });
+    if (!ok) return;
+    try {
+      const r = await api("POST", `/api/vdb/${vdbId}/snapshots/${snapId}/purge`, {});
+      toast(r.ok ? "产物已清理" : "清理未完成", r.ok ? "success" : "warning");
+      await loadVdbSnapshots();
+    } catch (e) { toast(e.message, "danger"); }
+  };
+
+  async function createVdbSnap() {
+    if (!vdbSnapId) return;
+    const kind = $("vdbSnapKind").value;
+    const name = ($("vdbSnapName").value || "").trim();
+    const btn = $("vdbSnapCreate");
+    btn.disabled = true;
+    try {
+      const r = await api("POST", "/api/vdb/" + vdbSnapId + "/snapshots",
+        { name: name, kind: kind });
+      const s = r.snapshot || {};
+      toast("快照已创建：" + (s.snap_kind === "native" ? "标准备份产物" : "数据级快照"),
+        "success");
+      $("vdbSnapName").value = "";
+      await loadVdbSnapshots();
+    } catch (e) {
+      toast("创建快照失败: " + e.message, "danger", 7000);
+    } finally {
+      btn.disabled = false;
+    }
   }
 
   window.dropVdb = async (id) => {
@@ -3299,6 +3431,16 @@
 
   async function initVdb() {
     await loadVdbs();
+    const cb = $("vdbSnapCreate");
+    const rb = $("vdbSnapRefresh");
+    if (cb && !cb.dataset.bound) {
+      cb.dataset.bound = "1";
+      cb.addEventListener("click", createVdbSnap);
+    }
+    if (rb && !rb.dataset.bound) {
+      rb.dataset.bound = "1";
+      rb.addEventListener("click", loadVdbSnapshots);
+    }
   }
 
   async function initRestore() {
@@ -3458,8 +3600,11 @@
       const okMsg = r.message || "恢复任务已提交，结果见下方恢复记录表";
       const barType = st === "failed" ? "danger" : st === "simulated" ? "warning" : "success";
       const prefix = st === "failed" ? "恢复失败：" : st === "simulated" ? "[仿真] " : "恢复完成：";
-      toast(prefix + okMsg, barType === "danger" ? "danger" : "success", 6000);
-      restoreResultBar(barType, prefix + okMsg + (newId ? "（恢复记录 " + newId + "）" : ""));
+      // 恢复成功后把实测的恢复数据量一并透出（实测口径优先，缺则退产物口径）
+      const _vol = restoreVolumeText(r);
+      const volSuffix = (_vol && st !== "failed") ? ("，恢复数据量 " + _vol) : "";
+      toast(prefix + okMsg + volSuffix, barType === "danger" ? "danger" : "success", 6000);
+      restoreResultBar(barType, prefix + okMsg + (newId ? "（恢复记录 " + newId + "）" : "") + volSuffix);
       if (resultBar && resultBar.classList) resultBar.classList.remove("d-none");
       await loadRestores(newId);
     } catch (e2) {
@@ -5152,7 +5297,7 @@
        <td><code>${esc(r.host_ip || "-")}</code></td>
        <td>${esc(r.db_type_display || r.db_type || "-")}</td>
        <td>${fmtTime(r.backup_started_at)}</td>
-       <td>${esc(r.restore_size_human || "-")}</td>
+       ${restoreVolumeCell(r)}
        <td>${esc(r.target_host || "-")}</td><td>${esc(r.target_db || "-")}</td>
        <td>${fmtTime(r.started_at)}</td><td>${statusBadge(r.status)}</td>
        <td>${esc(r.operator || "-")}</td><td>${esc(r.message || "")}</td>
@@ -9201,16 +9346,30 @@
           acts.push('<button class="btn btn-sm btn-outline-info" onclick="recloneVdbSnap(' + id + ',' + s.id + ')" title="从该快照再克隆一个新 VDB"><i class="bi bi-layers"></i> 再克隆</button>');
         }
         acts.push('<button class="btn btn-sm btn-outline-danger" onclick="deleteVdbSnap(' + id + ',' + s.id + ')" title="删除快照点（产物文件保留审计）"><i class="bi bi-trash"></i></button>');
+        const kindLabel = s.snap_kind === "native" ? "标准备份产物" : "数据级";
+        const kindBadge = s.snap_kind === "native"
+          ? '<span class="badge badge-ok">标准备份产物</span>'
+          : '<span class="badge bg-secondary">数据级</span>';
+        const noteLine = s.note ? '<div class="small text-muted">' + esc(s.note) + '</div>' : '';
         return '<tr>' +
           '<td>' + (si + 1) + '</td>' +
-          '<td>' + esc(s.name || '-') + '</td>' +
+          '<td>' + esc(s.name || '-') + '<div>' + kindBadge + '</div>' + noteLine + '</td>' +
           '<td class="small text-muted">' + esc(s.created_at || '-') + '</td>' +
           '<td class="small">' + (s.table_count == null ? '-' : s.table_count) + ' 表 / ' + (s.row_count == null ? '-' : s.row_count) + ' 行</td>' +
           '<td class="small">' + _snapHsz(s.size_bytes) + '</td>' +
           '<td>' + (s.status === "ready" ? '<span class="badge bg-success">就绪</span>' : '<span class="badge bg-secondary">' + esc(s.status || '-') + '</span>') + '</td>' +
           '<td class="text-end">' + acts.join(' ') + '</td>' +
         '</tr>';
-      }).join("") : '<tr><td colspan="7" class="text-muted text-center">暂无快照 —— 点击上方「创建快照」为该 VDB 做一次数据级备份</td></tr>';
+      }).join("") : '<tr><td colspan="7" class="text-muted text-center">暂无快照 —— 点击上方「创建快照」为该 VDB 做一次备份</td></tr>';
+    };
+    window.purgeCloneSnapFiles = async function (cloneId) {
+      const ok = await confirmDialog({ title: "清理快照产物", message: "将物理删除该克隆下已删除/已过期快照遗留的产物文件（元数据保留）。确认？", confirmText: "清理", danger: true });
+      if (!ok) return;
+      try {
+        const r = await api("POST", "/api/clone/" + cloneId + "/snapshots/purge", {});
+        toast("已清理 " + (r.count || 0) + " 个产物文件", "success");
+        await loadSnapshots(cloneId);
+      } catch (e) { toast(e.message, "danger"); }
     };
     window.rollbackVdbSnap = async function (cloneId, snapId) {
       const ok = await confirmDialog({ title: "恢复 VDB 快照", message: "确认把该 VDB 数据恢复到快照 #" + snapId + "？快照之后的变更将被清除（可先创建当前状态的新快照）。", confirmText: "恢复", danger: true });
@@ -9319,13 +9478,25 @@
     $("cloneSaveBtn").addEventListener("click", window.saveClone);
     $("snapCreateBtn").addEventListener("click", async function () {
       if (!snapCloneId) return;
+      const kind = $("snapKind") ? $("snapKind").value : "auto";
       try {
-        await api("POST", "/api/clone/" + snapCloneId + "/snapshots",
-                  { name: ($("snapName") ? $("snapName").value : "").trim() });
-        toast("快照已创建", "success");
+        const r = await api("POST", "/api/clone/" + snapCloneId + "/snapshots",
+                  { name: ($("snapName") ? $("snapName").value : "").trim(),
+                    kind: kind });
+        const s = r.snapshot || {};
+        toast("快照已创建（" +
+          (s.snap_kind === "native" ? "标准备份产物" : "数据级快照") + "）",
+          "success");
         await loadSnapshots(snapCloneId);
-      } catch (e) { toast(e.message, "danger"); }
+      } catch (e) { toast(e.message, "danger", 7000); }
     });
+
+    const _snapPurgeBtn = $("snapPurgeBtn");
+    if (_snapPurgeBtn) {
+      _snapPurgeBtn.addEventListener("click", function () {
+        if (snapCloneId) window.purgeCloneSnapFiles(snapCloneId);
+      });
+    }
 
     // 深链：/clone?record=N —— 备份记录页「克隆」入口直达并预填弹窗
     const _qRec = Number(new URLSearchParams(location.search).get("record") || 0);
@@ -9623,6 +9794,7 @@
       $("dfc_repl_user").value = d.replication_user || "";
       $("dfc_dns_domain").value = (d.dns || {}).domain || "";
       $("dfc_dns_provider").value = (d.dns || {}).provider || "";
+      $("dfc_slo").value = d.slo_rto_sec || "";
     } catch (e) { toast("读取配置失败: " + e.message, "danger"); return; }
     if (drFailCfgModalInst) drFailCfgModalInst.show();
   };
@@ -9641,6 +9813,8 @@
       replication_user: $("dfc_repl_user").value.trim(),
       dns: { domain: $("dfc_dns_domain").value.trim(), provider: $("dfc_dns_provider").value },
     };
+    const slo = Number($("dfc_slo").value);
+    if (slo > 0) body.slo_rto_sec = slo;
     if (!body.primary_conn.host) { toast("主库地址必填", "warning"); return; }
     try {
       await api("PUT", `/api/disaster-links/${id}/failover-config`, body);

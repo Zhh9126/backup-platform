@@ -1,10 +1,11 @@
-﻿$ErrorActionPreference='Stop'
+﻿param([switch]$Resume)
+$ErrorActionPreference='Stop'
 if(-not $env:AIDBM_VM_GUEST_PASSWORD) { throw 'AIDBM_VM_GUEST_PASSWORD required' }
 $tool='D:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe'
 $source='D:\CodexVMRecovery\vm-real-20261120\restored\backup.vmx'
 $root='D:\CodexVMRecovery\vm-cold-copy-20261120'
-if(Test-Path $root) { throw 'Acceptance path already exists; refusing overwrite' }
-New-Item -ItemType Directory -Path $root | Out-Null
+if((Test-Path $root) -and -not $Resume) { throw 'Acceptance path already exists; refusing overwrite' }
+New-Item -ItemType Directory -Path $root -Force | Out-Null
 $log=Join-Path $root 'acceptance.log'
 function Note([string]$message) { ('{0:o} {1}' -f (Get-Date),$message)|Tee-Object -FilePath $log -Append }
 function Native([string]$exe,[string[]]$arguments) {
@@ -12,6 +13,8 @@ function Native([string]$exe,[string[]]$arguments) {
  if($LASTEXITCODE -ne 0) { throw ($result -join ' ') }
  return $result
 }
+$backup=Join-Path $root 'backup'
+if(-not $Resume) {
 $running=(Native $tool @('list')) -join "\n"
 $sourceRunning=$running.Contains($source)
 Note 'Preparing canary and checking isolated source power state'
@@ -26,7 +29,6 @@ if($sourceRunning) {
  Native $tool @('stop',$source,'soft')|Out-Null
 }
 if(((Native $tool @('list')) -join "\n").Contains($source)) { throw 'Source must be powered off before cold disk copy' }
-$backup=Join-Path $root 'backup'
 Note 'Copying standalone disks and configuration of powered-off test VM'
 $sourceDir=Split-Path $source
 $descriptor=Join-Path $sourceDir 'CentOS 7 64 位.vmdk'
@@ -35,9 +37,15 @@ New-Item -ItemType Directory -Path $backup | Out-Null
 Get-ChildItem -LiteralPath $sourceDir -File | Where-Object { $_.Extension -in @('.vmdk','.vmx','.nvram','.vmxf') } | ForEach-Object {
  Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $backup $_.Name)
 }
+} else {
+ if(((Native $tool @('list')) -join "\n").Contains($source)) { throw 'Source must remain powered off for resume' }
+ if(-not (Test-Path (Join-Path $backup 'backup.vmx'))) { throw 'No completed backup directory to resume' }
+ if(Test-Path (Join-Path $root 'restored')) { throw 'Restore directory already exists; refusing overwrite' }
+ Note 'Resuming archive from the already completed independent cold backup'
+}
 $archive=Join-Path $root 'vm-backup.tar.gz'
 Note 'Archiving consistent full backup'
-Native 'C:\Windows\System32\tar.exe' @('-czf',$archive,'-C',$backup,'.')|Out-Null
+Native 'C:\Windows\System32\tar.exe' @('--options','gzip:compression-level=1','-czf',$archive,'-C',$backup,'.')|Out-Null
 $hash=(Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 Note ('Backup SHA256 '+$hash)
 Native 'C:\Windows\System32\OpenSSH\scp.exe' @('-o','BatchMode=yes',$archive,'root@192.168.109.128:/root/backup-platform-private/build/vm-real-20261120/vm-cold-backup.tar.gz')|Out-Null

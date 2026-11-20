@@ -2333,7 +2333,7 @@ class FileBackupEngine(BackupEngine):
         _ssh_exec(client, f'mkdir -p {shlex.quote(remote_dir)}')
         remote_dump.sftp_put_resumable(
             client, local_path, f"{remote_dir}/{name}",
-            rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+            rate_kbps=self.bandwidth_limit,
             label="文件恢复推送")
 
     def _tar_local_to_remote(self, paths: List[str], dst: dict, archive_path: str):
@@ -2380,7 +2380,8 @@ class FileBackupEngine(BackupEngine):
           平台侧限速（0=不限）。
         """
         extra = _get_extra(self.task)
-        rate = int(self.task.get("bandwidth_limit") or 0)
+        # 走 property：应用限速时段窗口 + 全局带宽仲裁（未配配额时与原值一致）
+        rate = self.bandwidth_limit
         staged = bool(extra.get("staged_pull", True))
         task_id = self.task.get("id") or "x"
         kind = "incr" if str(self.task.get("backup_type") or "") == "incremental" else "full"
@@ -2604,7 +2605,7 @@ class FileBackupEngine(BackupEngine):
             # 本机临时文件即中转，无需远端二次落盘）
             r = _pull_stream_with_retry(
                 client_src, cmd, tmp_arc,
-                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                rate_kbps=self.bandwidth_limit,
                 logger=self.logger, label=self.task_name)
             if r.get("rc") != 0:
                 raise RuntimeError(_tar_fail_msg(

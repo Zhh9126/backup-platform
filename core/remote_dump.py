@@ -978,6 +978,33 @@ def task_extra_dict(task: dict) -> dict:
     return {}
 
 
+def _arbitrate_rate(task: dict, extra: dict) -> int:
+    """任务限速经全局带宽仲裁后的实际速率（KB/s，0=不限）。
+
+    未配置 ``global_bandwidth_kbps`` 时等价于任务自身配置（零行为变化）；
+    配置后按 Max-Min 分配——多任务并发不会把总出口打满。
+    仲裁任何异常都回退任务原值：限速问题绝不影响备份主链路。
+    """
+    # 注意：_int 是 transfer_params 内部的嵌套函数，模块级这里拿不到；
+    # 直接 int() 解析（None/空串/非法 → 0 = 不限速）。
+    try:
+        _raw_bw = task.get("bandwidth_limit")
+        bw = int(_raw_bw) if _raw_bw not in (None, "") else 0
+    except (TypeError, ValueError):
+        bw = 0
+    if not bw:
+        return 0
+    try:
+        from core import bw_broker
+        try:
+            weight = float((extra or {}).get("bw_weight") or 1.0)
+        except (TypeError, ValueError):
+            weight = 1.0
+        return int(bw_broker.effective_limit(task.get("id"), bw, weight=weight) or 0)
+    except Exception:  # noqa: BLE001
+        return bw
+
+
 def transfer_params(task: dict) -> dict:
     """解析任务级「大流量传输」参数（高级选项 / extra_options 覆盖全局默认）。
 
@@ -1020,7 +1047,11 @@ def transfer_params(task: dict) -> dict:
                                getattr(config, "BACKUP_RETRY_INTERVAL", 60), default=60),
         "resume": bool(resume),
         "resume_ttl": _int(getattr(config, "BACKUP_RESUME_TTL", 43200), default=43200),
-        "rate_kbps": _int(task.get("bandwidth_limit"), default=0),
+        # 限速：任务级 bandwidth_limit 经**全局带宽仲裁**（Max-Min）后下发。
+        # 此前这里直读任务字段，形成"绕开 broker"的第二条路——多任务并发时
+        # 全局配额形同虚设（2026-11-20 真机并发实测暴露：broker active 恒空）。
+        # 未配置 global_bandwidth_kbps 时 effective_limit 原样返回，零行为变化。
+        "rate_kbps": _arbitrate_rate(task, extra),
         "stable_secs": _int(extra.get("stable_secs"),
                             getattr(config, "BACKUP_STABLE_SECS", 20), default=20),
         "keep_remote_done": str(

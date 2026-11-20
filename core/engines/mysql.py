@@ -1011,7 +1011,7 @@ class MySQLEngine(BackupEngine):
                             f"二进制，或改用逻辑备份。"))
                 remote_dump.sftp_put_resumable(
                     client, local_bin, pushed_bin,
-                    rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                    rate_kbps=self.bandwidth_limit,
                     label="xtrabackup 二进制推送")
                 try:
                     sftp.chmod(pushed_bin, 0o755)
@@ -2010,7 +2010,7 @@ class MySQLEngine(BackupEngine):
             sftp = client.open_sftp()
             remote_dump.sftp_put_resumable(
                 client, ltar, rtar,
-                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                rate_kbps=self.bandwidth_limit,
                 label="物理恢复数据包推送")
             # 上传完整性对账：远端半包会导致远端 gzip "unexpected end of
             # file"（rc=41 伪装成校验失败）——此处直接比对字节数，不匹配

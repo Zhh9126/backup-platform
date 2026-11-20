@@ -592,7 +592,7 @@ class PostgreSQLEngine(BackupEngine):
                 其他错误——实测 171 重启后 SFTP 不稳，必须显式对账）。"""
                 remote_dump.sftp_put_resumable(
                     client, local_p, remote_p,
-                    rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                    rate_kbps=self.bandwidth_limit,
                     label=label)
                 _lsize = os.path.getsize(local_p)
                 _st, _e2, _rc2 = _ssh_exec_pipe(

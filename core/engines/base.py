@@ -1883,7 +1883,7 @@ class BackupEngine:
             remote_file = f"/tmp/platform_restore_{ts}_{os.path.basename(backup_path)}"
             remote_dump.sftp_put_resumable(
                 client, backup_path, remote_file,
-                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                rate_kbps=self.bandwidth_limit,
                 label="自定义恢复备份包推送")
             remote_script = f"/tmp/platform_custom_restore_{ts}.sh"
             with sftp.open(remote_script, "w") as f:

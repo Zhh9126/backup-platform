@@ -117,3 +117,55 @@ def test_stale_task_removed(quota, monkeypatch):
         bw_broker._LAST_CALC = 0
     snap = bw_broker.snapshot()
     assert all(r["task_id"] != 51 for r in snap["active"])
+
+
+# ---------------- transfer_params 接入（remote_dump 通道） ----------------
+
+def test_transfer_params_uses_arbitration(quota, monkeypatch):
+    """remote_dump.transfer_params 必须经 broker，而不是直读任务字段。"""
+    from core import remote_dump
+    quota["v"] = 1000
+    bw_broker.reset()
+    t1 = {"id": 9001, "bandwidth_limit": 800, "extra_options": {}}
+    t2 = {"id": 9002, "bandwidth_limit": 800, "extra_options": {}}
+    remote_dump.transfer_params(t1)          # 两个任务都进入活跃集合
+    remote_dump.transfer_params(t2)
+    r1 = remote_dump.transfer_params(t1)["rate_kbps"]
+    r2 = remote_dump.transfer_params(t2)["rate_kbps"]
+    # 第二个任务加入后会重算 → 各 500；此处至少验证被配额约束
+    assert r1 + r2 <= 1000 + 2
+    assert r1 > 0 and r2 > 0
+
+
+def test_transfer_params_no_quota_keeps_task_limit(quota):
+    from core import remote_dump
+    quota["v"] = 0
+    bw_broker.reset()
+    assert remote_dump.transfer_params(
+        {"id": 9003, "bandwidth_limit": 700})["rate_kbps"] == 700
+    assert remote_dump.transfer_params(
+        {"id": 9004, "bandwidth_limit": 0})["rate_kbps"] == 0
+
+
+def test_arbitrate_rate_failure_falls_back(quota, monkeypatch):
+    """仲裁异常时回退任务原值（限速问题不能影响备份主链路）。"""
+    from core import remote_dump
+    quota["v"] = 1000
+
+    def _boom(*a, **k):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(bw_broker, "effective_limit", _boom)
+    assert remote_dump._arbitrate_rate({"id": 9005, "bandwidth_limit": 640}, {}) == 640
+
+
+def test_arbitrate_rate_weight(quota):
+    from core import remote_dump
+    quota["v"] = 900
+    bw_broker.reset()
+    remote_dump._arbitrate_rate({"id": 9010, "bandwidth_limit": 5000}, {"bw_weight": 2})
+    remote_dump._arbitrate_rate({"id": 9011, "bandwidth_limit": 5000}, {"bw_weight": 1})
+    a = remote_dump._arbitrate_rate({"id": 9010, "bandwidth_limit": 5000}, {"bw_weight": 2})
+    b = remote_dump._arbitrate_rate({"id": 9011, "bandwidth_limit": 5000}, {"bw_weight": 1})
+    assert a > b, "权重高的任务应分到更多额度"
+    assert a + b <= 902

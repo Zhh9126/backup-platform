@@ -648,7 +648,7 @@ class DamengEngine(BackupEngine):
             logs.append(f"[PITR] 推送备份集: {os.path.basename(backup_path)}")
             remote_dump.sftp_put_resumable(
                 client, backup_path, remote_pkg,
-                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                rate_kbps=self.bandwidth_limit,
                 label="达梦 PITR 备份集推送")
             out, err, rc = _ssh_exec_pipe(client, remote_dump._wrap_login(
                 f"mkdir -p {bset_dir} {_rd_q} && chown -R {_dm_os_user} {bset_dir} "
@@ -1184,7 +1184,7 @@ class DamengEngine(BackupEngine):
                 "mkdir -p {0}".format(remote_tmp)), timeout=60)
             remote_dump.sftp_put_resumable(
                 client, backup_path, remote_dmp,
-                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                rate_kbps=self.bandwidth_limit,
                 label="达梦 dmp 校验推送")
         except Exception as e:  # noqa: BLE001
             return BackupResult(success=False, status=BackupStatus.FAILED,
@@ -1247,7 +1247,7 @@ class DamengEngine(BackupEngine):
                 timeout=60)
             remote_dump.sftp_put_resumable(
                 client, backup_path, remote_pkg,
-                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                rate_kbps=self.bandwidth_limit,
                 label="达梦物理备份集校验推送")
         except Exception as e:  # noqa: BLE001
             return BackupResult(success=False, status=BackupStatus.FAILED,
@@ -1332,7 +1332,7 @@ class DamengEngine(BackupEngine):
             sftp.close()
             remote_dump.sftp_put_resumable(
                 client, backup_path, remote_dmp,
-                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                rate_kbps=self.bandwidth_limit,
                 label="达梦 dmp 恢复推送")
         except Exception as e:  # noqa: BLE001
             return BackupResult(success=False, status=BackupStatus.FAILED,

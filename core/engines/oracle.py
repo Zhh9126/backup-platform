@@ -496,7 +496,7 @@ class OracleEngine(BackupEngine):
             sqlfile = f"platform_verify_{ts}.sql"
             remote_dump.sftp_put_resumable(
                 client, local_dmp, remote_dmp,
-                rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                rate_kbps=self.bandwidth_limit,
                 label="恢复校验 dmp 推送")
             impdp_bin = self._resolve_oracle_tool(client, "impdp")
             if not impdp_bin:
@@ -682,7 +682,7 @@ class OracleEngine(BackupEngine):
                 _rp = f"{remote_dir}/{os.path.basename(_p)}"
                 remote_dump.sftp_put_resumable(
                     client, _p, _rp,
-                    rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                    rate_kbps=self.bandwidth_limit,
                     label="RMAN 备份片回推")
                 pushed.append(_rp)
             if pushed:
@@ -1994,7 +1994,7 @@ class OracleEngine(BackupEngine):
                 remote_dmp = f"{dp_dir}/{dmp_name}"
                 remote_dump.sftp_put_resumable(
                     client, local_dmp, remote_dmp,
-                    rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                    rate_kbps=self.bandwidth_limit,
                     label="impdp dmp 推送")
                 self.logger.info("[%s] dmp 已推回远端: %s (%s)", self.task_name,
                                  remote_dmp, db.human_size(os.path.getsize(local_dmp)))
@@ -2506,7 +2506,7 @@ exit;
                                          db.human_size(os.path.getsize(p)))
                         remote_dump.sftp_put_resumable(
                             client, p, rmt,
-                            rate_kbps=int(self.task.get("bandwidth_limit") or 0),
+                            rate_kbps=self.bandwidth_limit,
                             label="PITR 备份片回推")
                 finally:
                     try:

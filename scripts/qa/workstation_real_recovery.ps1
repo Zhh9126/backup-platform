@@ -1,4 +1,5 @@
 ﻿$ErrorActionPreference = 'Stop'
+if (-not $env:AIDBM_VM_GUEST_PASSWORD) { throw 'Set AIDBM_VM_GUEST_PASSWORD for guest read verification' }
 $vmrun = 'D:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe'
 $source = 'D:\Users\zhh\Documents\Virtual Machines\CentOS 7 64 位\CentOS 7 64 位.vmx'
 $testRoot = 'D:\CodexVMRecovery\vm-real-20261120'
@@ -66,14 +67,14 @@ Note 'Starting restored VM with disconnected network'
 Native $vmrun @('start',$restoredVmx,'nogui') | Out-Null
 $ready=$false
 for($i=0;$i -lt 90;$i++) {
-  $result=& $vmrun -gu root -gp 123123 fileExistsInGuest $restoredVmx '/root/backup-platform-private/build/vm-real-20261120/expected.json' 2>&1
+  $result=& $vmrun -gu root -gp $env:AIDBM_VM_GUEST_PASSWORD fileExistsInGuest $restoredVmx '/root/backup-platform-private/build/vm-real-20261120/expected.json' 2>&1
   if($LASTEXITCODE -eq 0) { $ready=$true; break }
   Start-Sleep -Seconds 3
 }
 if(-not $ready) { throw 'Restored guest did not expose canary within 270 seconds' }
 Note 'Restored guest booted; reading canary files through existing VMware Tools'
 foreach($name in @('payload.bin','canary.db','expected.json')) {
-  Native $vmrun @('-gu','root','-gp','123123','copyFileFromGuestToHost',$restoredVmx,('/root/backup-platform-private/build/vm-real-20261120/'+$name),(Join-Path $testRoot ('recovered-'+$name))) | Out-Null
+  Native $vmrun @('-gu','root','-gp',$env:AIDBM_VM_GUEST_PASSWORD,'copyFileFromGuestToHost',$restoredVmx,('/root/backup-platform-private/build/vm-real-20261120/'+$name),(Join-Path $testRoot ('recovered-'+$name))) | Out-Null
 }
 $expected=Get-Content -Raw (Join-Path $testRoot 'recovered-expected.json') | ConvertFrom-Json
 foreach($name in @('payload.bin','canary.db')) {

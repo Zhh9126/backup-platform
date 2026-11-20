@@ -176,6 +176,22 @@ def test_gc_keeps_referenced_blocks(store, tmp_path):
     assert res["ok"] and open(out, "rb").read() == data_b
 
 
+def test_gc_min_age_grace_protects_fresh_blocks(store, tmp_path):
+    """定时回收带宽限期：刚写入的孤儿块（可能清单还没落盘）不能被删。"""
+    data = _rand(1024 * 1024, seed=61)
+    p = _mkfile(tmp_path, "fresh.bin", data)
+    rep = chunk_store.store_file(p, store, chunk_opts=OPTS)
+    mpath = os.path.join(store, "chunk_store", "manifests", rep["manifest_id"] + ".json")
+    os.remove(mpath)                      # 变成孤儿
+
+    guarded = chunk_store.gc(store, dry_run=False, min_age_hours=24)
+    assert guarded["deleted_blocks"] == 0
+    assert chunk_store.stats(store)["blocks"] == rep["chunks"]
+
+    forced = chunk_store.gc(store, dry_run=False, min_age_hours=0)
+    assert forced["deleted_blocks"] == rep["chunks"]
+
+
 def test_gc_bad_manifest_does_not_delete_blocks(store, tmp_path):
     data = _rand(1024 * 1024, seed=59)
     p = _mkfile(tmp_path, "bad.bin", data)

@@ -1973,6 +1973,39 @@ def _integrity_check_job_wrapper():
         _logger.exception("[immutability] 完整性复检异常")
 
 
+def _chunk_store_gc_job_wrapper():
+    """块存储孤儿块回收（blob 模式 + 容器索引）。"""
+    try:
+        from core import chunk_store, container_store
+        r1 = chunk_store.gc(dry_run=False, min_age_hours=168)
+        r2 = container_store.gc(dry_run=False)
+        _logger.info(
+            "块存储回收完成：blob 删除 %s 块（回收 %s B）；容器索引清理 %s 条",
+            r1.get("deleted_blocks"), r1.get("reclaimable_bytes"),
+            r2.get("deleted_entries"))
+    except Exception:  # noqa: BLE001
+        _logger.exception("块存储回收异常")
+
+
+def _register_chunk_store_gc(sched):
+    """每日回收无引用的块（默认 04:20，system_config chunk_store_gc_cron 可覆盖）。
+
+    带 7 天宽限期：只回收"早于 168 小时未被引用"的块，避免删到正在写、
+    清单尚未落盘的块。start 与 reload 两条路径都要注册。
+    """
+    from apscheduler.triggers.cron import CronTrigger
+    cron = db.get_system_config("chunk_store_gc_cron") or "20 4 * * *"
+    try:
+        trig = CronTrigger.from_crontab(cron)
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("chunk_store_gc cron 非法(%s): %s", cron, e)
+        return
+    sched.add_job(_chunk_store_gc_job_wrapper, trig, id="chunk_store_gc",
+                  replace_existing=True, max_instances=1,
+                  coalesce=True, misfire_grace_time=3600)
+    _logger.info("块存储回收已注册（cron=%s，宽限期 7 天）", cron)
+
+
 def _register_immutable_check(sched):
     """注册不可变备份完整性复检任务（默认每日 04:40，system_config
     integrity_check_cron 可覆盖；start 与 reload 两条路径都要注册）。"""
@@ -2482,6 +2515,7 @@ def start_scheduler():
     _register_remote_pull(_scheduler)
     _register_cleanup(_scheduler)
     _register_immutable_check(_scheduler)
+    _register_chunk_store_gc(_scheduler)
     _register_rt_backup(_scheduler)
     _register_dr_monitor(_scheduler)
     _register_dr_inspection(_scheduler)
@@ -2558,6 +2592,7 @@ def _reload_scheduler_locked():
     _register_remote_pull(_scheduler)
     _register_cleanup(_scheduler)
     _register_immutable_check(_scheduler)
+    _register_chunk_store_gc(_scheduler)
     _register_dr_monitor(_scheduler)
     _register_dr_inspection(_scheduler)
     _register_file_sync(_scheduler)

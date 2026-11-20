@@ -325,12 +325,16 @@ def list_manifests(store_root: str = "", limit: int = 50) -> list:
     return out
 
 
-def gc(store_root: str = "", dry_run: bool = True) -> dict:
+def gc(store_root: str = "", dry_run: bool = True,
+       min_age_hours: float = 0) -> dict:
     """回收「没有任何 manifest 引用」的块。
 
     内容寻址存储只增不减会把磁盘吃满，必须有回收：先全量扫描 manifest 收集
     引用集，再比对 blobs 目录。默认 ``dry_run=True``（只报数不动盘），运维确认
     后再执行实删。损坏的 manifest 跳过并计数（不因单个坏文件删掉别人的块）。
+
+    ``min_age_hours``：只回收「最后修改时间早于该宽限期」的孤儿块。定时任务
+    用它兜底（默认 168h），避免删除"正在写但清单还没落盘"的块。
     """
     root = _root(store_root)
     mdir = os.path.join(root, "manifests")
@@ -368,6 +372,13 @@ def gc(store_root: str = "", dry_run: bool = True) -> dict:
                     continue
                 scanned += 1
                 if fn not in referenced:
+                    if min_age_hours:
+                        try:
+                            if (time.time() - os.path.getmtime(fp)) < \
+                                    float(min_age_hours) * 3600:
+                                continue    # 宽限期内：可能是正在写入的块
+                        except OSError:
+                            continue
                     try:
                         reclaimed += os.path.getsize(fp)
                     except OSError:

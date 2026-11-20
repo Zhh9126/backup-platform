@@ -132,6 +132,84 @@ def fixed_chunks(data, block_size: int):
             for o in range(0, len(data), block_size)]
 
 
+ORACLE_BLOCK_SIZE = 8 * 1024          # Oracle 默认数据块（DB_BLOCK_SIZE，常见 8KB）
+SECTOR_ALIGN_SIZES = (4096, 8192, 16384)
+
+
+def align_cut_points(size: int, block: int = ORACLE_BLOCK_SIZE):
+    """按「数据库块」对齐切分（固定边界 = 数据库块边界）。
+
+    适用对象：**块级**备份产物（RMAN 备份片、数据文件拷贝、卷级镜像）。
+    数据库更新一行只会改写 1~2 个块，块对齐后跨版本复用率接近「未变块占比」，
+    而内容定义分块（FastCDC）因为边界漂移会连带影响相邻块。
+
+    对逻辑导出（expdp dmp / mysqldump SQL）不适用——它们不是块结构，
+    仍应使用 FastCDC。
+    """
+    size = max(0, int(size))
+    block = max(512, int(block))
+    out = []
+    off = 0
+    while off < size:
+        ln = min(block, size - off)
+        out.append((off, ln))
+        off += ln
+    return out
+
+
+def chunk_bytes_aligned(data, block: int = ORACLE_BLOCK_SIZE):
+    """块对齐分块 + 指纹（返回结构与 chunk_bytes 一致）。"""
+    return [{"offset": off, "length": ln, "fp": fingerprint(data[off:off + ln])}
+            for off, ln in align_cut_points(len(data), block)]
+
+
+def compare_cutters(data_a: bytes, data_b: bytes,
+                    block_size: int = 4 * 1024 * 1024,
+                    min_size: int = None,
+                    avg_size: int = None,
+                    max_size: int = None) -> dict:
+    """三种切分方式在两版数据间的「可复用块占比」对比。
+
+    用于判断某类产物该用哪种分块：块级备份（RMAN/数据文件）→ aligned；
+    逻辑导出/压缩包 → cdc。
+
+    ``avg_size`` 缺省时按数据大小自适应（size/8，夹在 256KB~4MB）——否则小产物
+    会被整块吞掉（1 块 → 复用率恒 0），对比结果对 CDC 不公平（2026-11-20 实测）。
+    """
+    n = max(len(data_a or b""), len(data_b or b""))
+    if not avg_size:
+        avg_size = max(256 * 1024, min(4 * 1024 * 1024, max(1, n) // 8))
+    if not min_size:
+        min_size = max(64 * 1024, avg_size // 4)
+    if not max_size:
+        max_size = avg_size * 4
+
+    def _reuse(fps_a, fps_b):
+        sa, sb = set(fps_a), set(fps_b)
+        return round(len(sa & sb) / len(sa), 4) if sa else 0.0
+
+    fixed_a = fixed_chunks(data_a, block_size)
+    fixed_b = fixed_chunks(data_b, block_size)
+
+    cdc_a = [c["fp"] for c in chunk_bytes(data_a, min_size, avg_size, max_size)]
+    cdc_b = [c["fp"] for c in chunk_bytes(data_b, min_size, avg_size, max_size)]
+
+    al_a = [c["fp"] for c in chunk_bytes_aligned(data_a)]
+    al_b = [c["fp"] for c in chunk_bytes_aligned(data_b)]
+
+    return {
+        "bytes": {"a": len(data_a), "b": len(data_b)},
+        "fixed": {"block_size": block_size, "chunks": len(fixed_a),
+                  "reuse": _reuse(fixed_a, fixed_b)},
+        "cdc": {"avg_size": avg_size, "chunks": len(cdc_a),
+                "reuse": _reuse(cdc_a, cdc_b)},
+        "aligned": {"block_size": ORACLE_BLOCK_SIZE, "chunks": len(al_a),
+                    "reuse": _reuse(al_a, al_b)},
+        "note": ("块级备份产物（RMAN 备份片/数据文件）应优先 aligned；"
+                 "逻辑导出与压缩包用 cdc。真实收益需用真机 RMAN 备份片验证。"),
+    }
+
+
 def estimate_reuse(path_a: str, path_b: str, block_size: int = 4 * 1024 * 1024,
                    max_bytes: int = 128 * 1024 * 1024, **kw):
     """对比「固定块」与「FastCDC 可变长块」在两次产物间的可复用比例。

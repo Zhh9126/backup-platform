@@ -51,6 +51,81 @@ def api_dedup_scan():
                     "stats": gd.global_stats()})
 
 
+@api_bp.route("/dedup/cutters", methods=["POST"])
+@login_required
+def api_dedup_cutters():
+    """三种切分方式对比（固定块 / FastCDC / 8KB 块对齐）。
+
+    请求同 estimate（task_id 或 record_ids）。用于判断某类产物该用哪种分块：
+    块级备份（RMAN 片/数据文件）→ aligned；逻辑导出/压缩包 → cdc。
+    """
+    import config
+    from core import db as _db
+    from core import fastcdc
+
+    payload = request.get_json(silent=True) or {}
+    rec_ids = payload.get("record_ids") or []
+    task_id = payload.get("task_id")
+
+    def _rooted(p):
+        try:
+            root = os.path.realpath(getattr(config, "BACKUP_ROOT", "") or "/")
+            return os.path.realpath(p).startswith(root)
+        except OSError:
+            return False
+
+    def _read(rid):
+        row = _db.query_one("SELECT id, backup_path FROM backup_records WHERE id=?",
+                            (rid,))
+        if not row or not row.get("backup_path"):
+            return None, "记录 %s 无产物路径" % rid
+        p = row["backup_path"]
+        if not os.path.isfile(p):
+            return None, "记录 %s 的产物已不存在" % rid
+        if not _rooted(p):
+            return None, "记录 %s 的产物不在备份根目录内，拒绝读取" % rid
+        return p, None
+
+    if not rec_ids:
+        if not task_id:
+            return jsonify({"ok": False, "error": "task_id 或 record_ids 必填"}), 400
+        rows = _db.query(
+            "SELECT id FROM backup_records WHERE task_id=? AND status='success' "
+            "AND size_bytes>0 AND backup_path IS NOT NULL ORDER BY id DESC LIMIT 2",
+            (int(task_id),))
+        rec_ids = [r["id"] for r in rows]
+        if len(rec_ids) < 2:
+            return jsonify({"ok": False, "error": "成功记录不足 2 条"}), 400
+    if len(rec_ids) != 2:
+        return jsonify({"ok": False, "error": "record_ids 需要正好 2 个"}), 400
+
+    pa, err = _read(rec_ids[0])
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    pb, err = _read(rec_ids[1])
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+
+    cap = int(payload.get("max_bytes") or 64 * 1024 * 1024)
+    try:
+        with open(pa, "rb") as f:
+            da = f.read(cap)
+        with open(pb, "rb") as f:
+            db_data = f.read(cap)
+    except OSError as exc:
+        return jsonify({"ok": False, "error": "读取产物失败: %s" % exc}), 500
+
+    # 缺省参数交给 compare_cutters 自适应（小产物用 4MB 平均块会被整块吞掉）
+    rep = fastcdc.compare_cutters(
+        da, db_data,
+        min_size=int(payload["min_size"]) if payload.get("min_size") else None,
+        avg_size=int(payload["avg_size"]) if payload.get("avg_size") else None,
+        max_size=int(payload["max_size"]) if payload.get("max_size") else None)
+    rep["ok"] = True
+    rep["record_ids"] = rec_ids
+    return jsonify(rep)
+
+
 @api_bp.route("/dedup/estimate", methods=["POST"])
 @login_required
 def api_dedup_estimate():

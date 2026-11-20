@@ -95,3 +95,41 @@ def test_chunk_file(tmp_path):
     assert rep["size"] == 100 * 1024
     assert rep["truncated"] is False
     assert rep["chunks"] and all("fp" in c for c in rep["chunks"])
+
+
+# ---------------------------------------------------------------------------
+# Oracle 8KB 块对齐分块（方案 §7.3，块级备份产物）
+# ---------------------------------------------------------------------------
+
+def test_align_cut_points_exact_and_tail():
+    pts = fastcdc.align_cut_points(8 * 1024 * 3 + 100, 8192)
+    assert [ln for _o, ln in pts] == [8192, 8192, 8192, 100]
+    assert pts[0][0] == 0 and pts[-1][0] == 8 * 1024 * 3
+
+
+def test_align_cut_points_empty():
+    assert fastcdc.align_cut_points(0, 8192) == []
+
+
+def test_block_level_update_reuses_almost_everything():
+    """块级产物只改 1 个 8KB 块 → 块对齐复用率应≈99%，优于 CDC 与固定块。"""
+    block = fastcdc.ORACLE_BLOCK_SIZE
+    base = bytearray(_rand(block * 200, seed=71))     # 200 个数据库块
+    a = bytes(base)
+    base[block * 100:block * 101] = _rand(block, seed=73)   # 只改中间一个块
+    b = bytes(base)
+
+    rep = fastcdc.compare_cutters(a, b, block_size=64 * 1024,
+                                  min_size=16 * 1024, avg_size=64 * 1024,
+                                  max_size=256 * 1024)
+    assert rep["aligned"]["chunks"] == 200
+    assert rep["aligned"]["reuse"] >= 0.99            # 199/200
+    assert rep["aligned"]["reuse"] >= rep["fixed"]["reuse"]
+    assert rep["aligned"]["reuse"] >= rep["cdc"]["reuse"]
+
+
+def test_aligned_chunks_cover_all_bytes():
+    data = _rand(50 * 1024 + 7, seed=79)
+    chunks = fastcdc.chunk_bytes_aligned(data)
+    assert sum(c["length"] for c in chunks) == len(data)
+    assert [c["offset"] for c in chunks] == [c["offset"] for c in chunks]

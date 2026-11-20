@@ -960,7 +960,18 @@ def _materialize_from_chunk_store(rec: dict) -> dict:
                                  "chunk_store", "restored")
         out = os.path.join(cache_dir, "%s_%s" % (rec.get("id"),
                                                  os.path.basename(p or "artifact")))
-        res = chunk_store.restore_file(mid, out)
+        # 两种存储模式必须分别还原：blob 模式一块一个文件；container 模式块在
+        # 64MB 容器里（manifest 的 chunk 带 container 字段）。此前恒走 blob
+        # 分支，导致"容器模式转存的产物回填必然缺块"（2026-11-20 真机实测暴露）。
+        man = chunk_store.load_manifest(mid)
+        _chunks = man.get("chunks") or []
+        _is_container = (str(man.get("storage_mode") or "").startswith("container")
+                         or any(c.get("container") for c in _chunks))
+        if _is_container:
+            from core import container_store
+            res = container_store.restore_file(mid, out)
+        else:
+            res = chunk_store.restore_file(mid, out)
         if not res.get("ok"):
             _logger.warning("[chunk_store] 记录 %s 由块存储回填失败（缺块/损坏）: %s",
                             rec.get("id"), res)

@@ -79,3 +79,26 @@ def test_corrupt_store_falls_back_honestly(rooted, tmp_path):
     out = scheduler._materialize_from_chunk_store(rec)
     assert out["backup_path"] == src            # 不伪造可用路径
     assert "chunk_restored" not in out
+
+
+def test_container_mode_manifest_is_restored_via_container(rooted, tmp_path):
+    """容器模式转存的产物，回填必须走容器还原（曾经恒走 blob 分支 → 必缺块）。"""
+    from core import container_store
+
+    data = os.urandom(1024 * 1024)
+    src = tmp_path / "c.bin"
+    src.write_bytes(data)
+    want = _sha(str(src))
+    rep = container_store.store_file(str(src), "", chunk_opts=OPTS)
+    assert rep["ok"]
+
+    man = chunk_store.load_manifest(rep["manifest_id"], "")
+    assert man.get("storage_mode") == "container"
+    assert any(c.get("container") for c in man["chunks"])
+
+    os.remove(str(src))                      # 模拟产物被清理
+    rec = {"id": 9, "backup_path": str(src),
+           "chunk_manifest_id": rep["manifest_id"]}
+    out = scheduler._materialize_from_chunk_store(rec)
+    assert out.get("chunk_restored") is True
+    assert _sha(out["backup_path"]) == want

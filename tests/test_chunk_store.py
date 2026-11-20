@@ -150,6 +150,47 @@ def test_low_entropy_file_still_splits(store, tmp_path):
     assert res["ok"] and res["sha256_match"]
 
 
+def test_gc_keeps_referenced_blocks(store, tmp_path):
+    """GC 只能回收无引用的块：另一份清单引用的块必须保留且可还原。"""
+    data_a = _rand(2 * 1024 * 1024, seed=47)
+    data_b = _rand(2 * 1024 * 1024, seed=53)
+    pa = _mkfile(tmp_path, "ga.bin", data_a)
+    pb = _mkfile(tmp_path, "gb.bin", data_b)
+    ra = chunk_store.store_file(pa, store, chunk_opts=OPTS)
+    rb = chunk_store.store_file(pb, store, chunk_opts=OPTS)
+
+    # 删掉 A 的清单 → A 的块变成孤儿（B 的块仍被引用）
+    mpath = os.path.join(store, "chunk_store", "manifests", ra["manifest_id"] + ".json")
+    os.remove(mpath)
+
+    dry = chunk_store.gc(store, dry_run=True)
+    assert dry["unreferenced_blocks"] > 0
+    assert dry["deleted_blocks"] == 0                     # dry_run 不动盘
+
+    real = chunk_store.gc(store, dry_run=False)
+    assert real["deleted_blocks"] == dry["unreferenced_blocks"]
+
+    # B 仍完整可还原
+    out = str(tmp_path / "gb_out.bin")
+    res = chunk_store.restore_file(rb["manifest_id"], out, store)
+    assert res["ok"] and open(out, "rb").read() == data_b
+
+
+def test_gc_bad_manifest_does_not_delete_blocks(store, tmp_path):
+    data = _rand(1024 * 1024, seed=59)
+    p = _mkfile(tmp_path, "bad.bin", data)
+    rep = chunk_store.store_file(p, store, chunk_opts=OPTS)
+    # 写坏一个 manifest（不影响引用计数逻辑：坏文件跳过，块仍被正确清单引用）
+    mdir = os.path.join(store, "chunk_store", "manifests")
+    with open(os.path.join(mdir, "broken.json"), "w") as f:
+        f.write("{not json")
+    res = chunk_store.gc(store, dry_run=True)
+    assert res["bad_manifests"] >= 1
+    assert res["unreferenced_blocks"] == 0
+    out = str(tmp_path / "ok_out.bin")
+    assert chunk_store.restore_file(rep["manifest_id"], out, store)["ok"]
+
+
 def test_purge(store, tmp_path):
     src = _mkfile(tmp_path, "p.bin", _rand(512 * 1024, seed=43))
     chunk_store.store_file(src, store, chunk_opts=OPTS)

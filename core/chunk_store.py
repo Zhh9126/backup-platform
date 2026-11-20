@@ -320,6 +320,83 @@ def list_manifests(store_root: str = "", limit: int = 50) -> list:
     return out
 
 
+def gc(store_root: str = "", dry_run: bool = True) -> dict:
+    """回收「没有任何 manifest 引用」的块。
+
+    内容寻址存储只增不减会把磁盘吃满，必须有回收：先全量扫描 manifest 收集
+    引用集，再比对 blobs 目录。默认 ``dry_run=True``（只报数不动盘），运维确认
+    后再执行实删。损坏的 manifest 跳过并计数（不因单个坏文件删掉别人的块）。
+    """
+    root = _root(store_root)
+    mdir = os.path.join(root, "manifests")
+    bdir = os.path.join(root, "blobs")
+
+    referenced = set()
+    bad_manifests = 0
+    manifests = 0
+    if os.path.isdir(mdir):
+        for fn in os.listdir(mdir):
+            if not fn.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(mdir, fn), "r", encoding="utf-8") as f:
+                    m = json.load(f)
+                for c in m.get("chunks") or []:
+                    fp = c.get("fp")
+                    if fp:
+                        referenced.add(fp)
+                manifests += 1
+            except (OSError, ValueError, AttributeError):
+                bad_manifests += 1
+
+    scanned = 0
+    unreferenced = []
+    reclaimed = 0
+    if os.path.isdir(bdir):
+        for sub in os.listdir(bdir):
+            p = os.path.join(bdir, sub)
+            if not os.path.isdir(p):
+                continue
+            for fn in os.listdir(p):
+                fp = os.path.join(p, fn)
+                if not os.path.isfile(fp):
+                    continue
+                scanned += 1
+                if fn not in referenced:
+                    try:
+                        reclaimed += os.path.getsize(fp)
+                    except OSError:
+                        pass
+                    unreferenced.append(fp)
+
+    deleted = 0
+    if not dry_run:
+        for fp in unreferenced:
+            try:
+                os.remove(fp)
+                deleted += 1
+            except OSError:
+                pass
+        # 清掉空的二级目录
+        if os.path.isdir(bdir):
+            for sub in os.listdir(bdir):
+                sp = os.path.join(bdir, sub)
+                try:
+                    if os.path.isdir(sp) and not os.listdir(sp):
+                        os.rmdir(sp)
+                except OSError:
+                    pass
+
+    return {
+        "ok": True, "dry_run": bool(dry_run),
+        "manifests": manifests, "bad_manifests": bad_manifests,
+        "blocks_scanned": scanned, "referenced_blocks": len(referenced),
+        "unreferenced_blocks": len(unreferenced),
+        "reclaimable_bytes": reclaimed, "deleted_blocks": deleted,
+        "store_root": root,
+    }
+
+
 def purge(store_root: str = "") -> dict:
     """清空分块存储（运维动作，测试/回收用）。"""
     root = _root(store_root)

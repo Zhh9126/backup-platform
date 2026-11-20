@@ -100,6 +100,18 @@ def chunk_store_store():
     return jsonify(rep)
 
 
+@api_bp.route("/chunk-store/gc", methods=["POST"])
+@permission_required("system.settings")
+def chunk_store_gc():
+    """回收未被任何清单引用的块（默认 dry_run 只报数，确认后才实删）。"""
+    payload = request.get_json(silent=True) or {}
+    dry = payload.get("dry_run", True)
+    dry = bool(dry) if not isinstance(dry, str) else dry.lower() in ("1", "true", "yes")
+    res = chunk_store.gc(dry_run=dry)
+    res["reclaimable_human"] = db.human_size(res.get("reclaimable_bytes", 0))
+    return jsonify(res)
+
+
 @api_bp.route("/chunk-store/restore", methods=["POST"])
 @login_required
 def chunk_store_restore():

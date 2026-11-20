@@ -767,4 +767,84 @@
   }
 })();
 </script>
+<!-- 分块去重测算（FastCDC 可变长 vs 固定块，只读） -->
+<div class="page-card mt-3">
+  <div class="d-flex align-items-center justify-content-between mb-2 flex-wrap gap-2">
+    <h6 class="mb-0"><i class="bi bi-files me-1"></i>分块去重测算（可变长 vs 固定块）</h6>
+  </div>
+  <p class="text-muted small mb-2">
+    选一个任务，测算它最近两次成功备份产物之间的可复用块占比。可变长分块命中率明显更高，说明启用分块去重能真正省下带宽与存储；压缩产物因字节整体移位，固定块命中率通常极低。
+  </p>
+  <div class="d-flex gap-2 flex-wrap align-items-center">
+    <select id="ddTask" class="form-select form-select-sm" style="max-width:320px"></select>
+    <button class="btn btn-sm btn-primary" onclick="ddEstimate()">测算</button>
+    <span class="small text-muted" id="ddMsg"></span>
+  </div>
+  <div class="small mt-2" id="ddResult"></div>
+  <div class="small text-muted mt-2" id="csStats">分块存储：加载中…</div>
+</div>
+<script>
+(function () {
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+      return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c];
+    });
+  }
+  function loadTasks() {
+    fetch('/api/tasks?limit=200', {credentials: 'same-origin'})
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var arr = d.items || d.data || (Array.isArray(d) ? d : []);
+        var sel = document.getElementById('ddTask');
+        if (!sel) return;
+        sel.innerHTML = arr.map(function (t) {
+          return '<option value="' + t.id + '">' + esc(t.name) + '</option>';
+        }).join('');
+      })
+      .catch(function () { /* 任务列表不可用时保持空 */ });
+    fetch('/api/chunk-store/stats', {credentials: 'same-origin'})
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var el = document.getElementById('csStats');
+        if (!el || !d.ok) return;
+        var s = d.stats || {};
+        el.textContent = '分块存储：' + (s.blocks || 0) + ' 个块 · ' +
+          (s.manifests || 0) + ' 份清单 · 占用 ' + (s.physical_human || '0 B');
+      })
+      .catch(function () { /* 未启用块存储时保持默认文案 */ });
+  }
+  window.ddEstimate = function () {
+    var sel = document.getElementById('ddTask');
+    if (!sel || !sel.value) return;
+    var msg = document.getElementById('ddMsg');
+    var box = document.getElementById('ddResult');
+    msg.textContent = '测算中…';
+    box.innerHTML = '';
+    fetch('/api/dedup/estimate', {
+      method: 'POST', credentials: 'same-origin',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({task_id: Number(sel.value)})
+    }).then(function (r) { return r.json(); })
+      .then(function (d) {
+        msg.textContent = '';
+        if (d.ok === false || d.error) {
+          box.innerHTML = '<span class="text-danger">' + esc(d.error || '测算失败') + '</span>';
+          return;
+        }
+        box.innerHTML =
+          '<div>固定块复用率 <strong>' + (d.fixed.reuse * 100).toFixed(1) + '%</strong>' +
+          '（' + d.fixed.chunks_a + ' 块）</div>' +
+          '<div>可变长块复用率 <strong class="text-success">' + (d.cdc.reuse * 100).toFixed(1) + '%</strong>' +
+          '（' + d.cdc.chunks_a + ' 块，平均 ' + d.cdc.avg_chunk_kb + ' KB）</div>' +
+          '<div class="text-muted">扫描 ' + (d.scanned_bytes / 1048576).toFixed(1) + ' MB</div>';
+      })
+      .catch(function (e) { msg.textContent = '测算失败: ' + e; });
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', loadTasks);
+  } else {
+    loadTasks();
+  }
+})();
+</script>
 {% endblock %}

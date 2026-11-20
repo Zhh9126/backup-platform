@@ -37,4 +37,15 @@ Workstation 的运行中 full clone 被拒绝。快照基础磁盘复制为独�
 归档使用 gzip level 1 降低 CPU 开销；-Resume 只允许从已经完成的关机副本继续，且拒绝覆盖已有恢复目录。
 后续必须完成：归档 Linux 往返校验 → 新目录恢复 → 断网开机 → 三个文件 SHA256 → SQLite 实际查询 → 正常关机。
 
-当前第二轮状态：进行中。以 build/vm-real-20261120/cold-result.json 的最终结果为准。
+第二轮最终状态：passed（2026-11-20 22:49:47 +08:00）。
+
+- 冷备归档 7,087,092,209 字节；SHA256 ba5469245487f6d6b66e881e4d504c82283200a1ea5208aea195cba16470362c。
+- Linux 仓库上传和重新下载的归档 SHA256 一致。
+- 新目录恢复的客户机使用 2048 MiB 内存、断网和独立 UUID，成功开机。
+- 从实际恢复客户机取回 payload.bin、canary.db、expected.json，三个文件均与备份前数据一致。
+- 再在 Linux 以只读方式打开取回的 SQLite，integrity_check=ok，10,000 行全部与预期逐行摘要匹配。
+- 恢复 VM 已正常关机；vmrun list 确认只剩原始 192.168.109.128 对应 VM 在运行。
+- 主平台 aidbm-preview.service 为 active，新恢复页及 VM/对象目录接口正常。
+- 开机到文件读取约 19 秒，此数值不含归档搬运、下载和解包，不作为端到端 RTO。
+- 证据：build/vm-real-20261120/cold-result.json、cold-data-verification.json、cold-acceptance.log；归档 vm-cold-backup.tar.gz。
+- 该通过结论限于本地 Workstation 原生冷备/恢复流程；平台 Workstation 自动纳管及其他 Hypervisor 的实机端到端验收未在本轮完成。

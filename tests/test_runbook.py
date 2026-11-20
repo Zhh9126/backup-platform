@@ -280,3 +280,103 @@ def test_execute_run_approval_gate_flow(monkeypatch):
     run = rb.get_run(run_id)
     assert run["status"] == "success"
     assert run["steps_log"][0]["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# DAG 依赖（PB 级方案 §5.2：入度推进）
+# ---------------------------------------------------------------------------
+
+def test_norm_steps_keeps_depends_on():
+    steps = rb._norm_steps([
+        {"type": "wait", "params": {"seconds": 0}},
+        {"type": "wait", "params": {"seconds": 0}, "depends_on": [1]},
+    ])
+    assert steps[1]["depends_on"] == [1]
+    assert steps[0]["depends_on"] == []
+
+
+def test_norm_steps_rejects_self_dependency():
+    with pytest.raises(ValueError, match="依赖自己"):
+        rb._norm_steps([{"type": "wait", "depends_on": [1]}])
+
+
+def test_norm_steps_rejects_missing_dependency():
+    with pytest.raises(ValueError, match="不存在"):
+        rb._norm_steps([{"type": "wait", "depends_on": [5]}])
+
+
+def test_norm_steps_rejects_cycle():
+    with pytest.raises(ValueError, match="环"):
+        rb._norm_steps([
+            {"type": "wait", "depends_on": [2]},
+            {"type": "wait", "depends_on": [1]},
+        ])
+
+
+def test_topo_order_respects_dependencies():
+    steps = rb._norm_steps([
+        {"type": "wait", "params": {"seconds": 0}},                    # 1
+        {"type": "wait", "params": {"seconds": 0}, "depends_on": [1]},  # 2
+        {"type": "wait", "params": {"seconds": 0}, "depends_on": [1]},  # 3
+        {"type": "wait", "params": {"seconds": 0}, "depends_on": [2, 3]},  # 4
+    ])
+    order = [s["seq"] for s in rb.topo_order(steps)]
+    assert order[0] == 1 and order[-1] == 4
+    assert order.index(2) < order.index(4) and order.index(3) < order.index(4)
+    assert rb.has_dag(steps) is True
+
+
+def test_has_dag_false_for_legacy_steps():
+    steps = rb._norm_steps([{"type": "wait"}, {"type": "wait"}])
+    assert rb.has_dag(steps) is False
+
+
+def test_execute_dag_skips_downstream_and_continues_sibling(monkeypatch):
+    """1 失败 → 依赖它的 2 被跳过；3 无依赖照常执行；整体判失败。"""
+    monkeypatch.setattr(rb.time, "sleep", lambda *_: None)
+    rid = _mk_runbook([
+        {"seq": 1, "type": "notify", "name": "bad", "params": {},
+         "require_confirm": False, "continue_on_fail": False, "depends_on": []},
+        {"seq": 2, "type": "wait", "name": "child", "params": {"seconds": 0},
+         "require_confirm": False, "continue_on_fail": False, "depends_on": [1]},
+        {"seq": 3, "type": "wait", "name": "sibling", "params": {"seconds": 0},
+         "require_confirm": False, "continue_on_fail": False, "depends_on": []},
+    ])
+    run_id = _mk_run(rid)
+    old = rb._STEP_HANDLERS["notify"]
+    rb._STEP_HANDLERS["notify"] = lambda p, o: (_ for _ in ()).throw(
+        RuntimeError("上游炸了"))
+    try:
+        steps = json.loads(db.query_one(
+            "SELECT steps FROM runbooks WHERE id=?", (rid,))["steps"])
+        _run_sync(run_id, rid, steps)
+    finally:
+        rb._STEP_HANDLERS["notify"] = old
+    run = rb.get_run(run_id)
+    log = {e["seq"]: e for e in run["steps_log"]}
+    assert log[1]["status"] == "fail"
+    assert log[2]["status"] == "skipped"
+    assert "上游步骤" in log[2]["message"]
+    assert log[3]["status"] == "ok"          # 兄弟分支不受影响
+    assert run["status"] == "failed"
+
+
+def test_execute_dag_all_success(monkeypatch):
+    monkeypatch.setattr(rb.time, "sleep", lambda *_: None)
+    rid = _mk_runbook([
+        {"seq": 1, "type": "wait", "name": "a", "params": {"seconds": 0},
+         "require_confirm": False, "continue_on_fail": False, "depends_on": []},
+        {"seq": 2, "type": "wait", "name": "b", "params": {"seconds": 0},
+         "require_confirm": False, "continue_on_fail": False, "depends_on": [1]},
+        {"seq": 3, "type": "wait", "name": "c", "params": {"seconds": 0},
+         "require_confirm": False, "continue_on_fail": False, "depends_on": [1]},
+        {"seq": 4, "type": "wait", "name": "d", "params": {"seconds": 0},
+         "require_confirm": False, "continue_on_fail": False, "depends_on": [2, 3]},
+    ])
+    run_id = _mk_run(rid)
+    steps = json.loads(db.query_one(
+        "SELECT steps FROM runbooks WHERE id=?", (rid,))["steps"])
+    _run_sync(run_id, rid, steps)
+    run = rb.get_run(run_id)
+    assert run["status"] == "success"
+    assert [e["status"] for e in run["steps_log"]] == ["ok"] * 4

@@ -233,7 +233,7 @@
     var p = {};
     (PARAM_FIELDS[type] || []).forEach(function (f) { p[f.k] = f.def != null ? f.def : ""; });
     return { type: type, name: TYPE_LABELS[type], params: p,
-             require_confirm: false, continue_on_fail: false };
+             require_confirm: false, continue_on_fail: false, depends_on: [] };
   }
 
   function renderSteps() {
@@ -278,6 +278,9 @@
           '<div class="form-check form-check-inline small">' +
             '<input class="form-check-input" type="checkbox" data-i="' + i + '" data-role="cof"' +
             (s.continue_on_fail ? " checked" : "") + '><label class="form-check-label">失败继续</label></div>' +
+          '<input class="form-control form-control-sm" style="width:120px" data-i="' + i + '" ' +
+            'data-role="deps" value="' + esc((s.depends_on || []).join(",")) + '" ' +
+            'placeholder="依赖 #" title="依赖的步骤号（逗号分隔）；留空=无依赖。配置后按依赖图推进，上游失败则本步跳过">' +
           '<div class="ms-auto btn-row">' +
             '<button class="btn btn-sm btn-outline-secondary" data-i="' + i + '" data-role="up" ' +
               (i === 0 ? "disabled" : "") + '><i class="bi bi-arrow-up"></i></button>' +
@@ -302,9 +305,16 @@
       steps[i].name = (old.name && old.name !== TYPE_LABELS[old.type]) ? old.name : TYPE_LABELS[t.value];
       steps[i].require_confirm = old.require_confirm;
       steps[i].continue_on_fail = old.continue_on_fail;
+      steps[i].depends_on = old.depends_on || [];
     } else if (role === "name") steps[i].name = t.value;
     else if (role === "confirm") steps[i].require_confirm = t.checked;
     else if (role === "cof") steps[i].continue_on_fail = t.checked;
+    else if (role === "deps") {
+      // 依赖步骤号：逗号/空格分隔，去掉自身与非法值
+      steps[i].depends_on = String(t.value || "").split(/[,\s]+/)
+        .map(function (x) { return parseInt(x, 10); })
+        .filter(function (n) { return !isNaN(n) && n > 0 && n !== (i + 1); });
+    }
     else if (k) steps[i].params[k] = t.type === "checkbox" ? t.checked : t.value;
     if (role === "type") renderSteps();
   });
@@ -428,6 +438,7 @@
       el("rbRunSteps").innerHTML = log.length ? log.map(function (s) {
         var icon = { ok: "bi-check-circle text-success", fail: "bi-x-circle text-danger",
                      fail_cont: "bi-exclamation-circle text-warning",
+                     skipped: "bi-slash-circle text-secondary",
                      timeout: "bi-clock text-warning" }[s.status] || "bi-dash";
         return '<li class="list-group-item d-flex justify-content-between align-items-center py-2">' +
           '<span><i class="bi ' + icon + ' me-2"></i><b>' + esc(s.name || s.type) + '</b>' +

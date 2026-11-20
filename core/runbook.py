@@ -98,7 +98,12 @@ def _ensure_tables() -> None:
 
 # ---------------------------------------------------------------- 序列化
 def _norm_steps(steps: Any) -> List[dict]:
-    """校验/规范化 steps JSON：补 seq、剔除未知类型。"""
+    """校验/规范化 steps JSON：补 seq、剔除未知类型、校验 DAG 依赖。
+
+    ``depends_on``：依赖的 seq 列表（可为空 = 无依赖）。配置后执行器按拓扑序
+    推进；全部为空则退化为原「按 seq 顺序执行」，零行为变化。
+    依赖非法（引用不存在/自依赖/成环）直接拒绝，避免运行到一半才炸。
+    """
     if isinstance(steps, str):
         try:
             steps = json.loads(steps)
@@ -116,6 +121,17 @@ def _norm_steps(steps: Any) -> List[dict]:
         if stype not in STEP_TYPES:
             raise ValueError(f"第 {i} 个步骤类型不支持: {stype}（支持: "
                              f"{', '.join(STEP_TYPES)}）")
+        raw_deps = s.get("depends_on") or []
+        if isinstance(raw_deps, (int, str)):
+            raw_deps = [raw_deps]
+        deps = []
+        for d in raw_deps:
+            try:
+                di = int(d)
+            except (TypeError, ValueError):
+                raise ValueError(f"第 {i} 个步骤的依赖项非法: {d}")
+            if di not in deps:
+                deps.append(di)
         out.append({
             "seq": i,
             "type": stype,
@@ -123,8 +139,65 @@ def _norm_steps(steps: Any) -> List[dict]:
             "params": s.get("params") if isinstance(s.get("params"), dict) else {},
             "require_confirm": bool(s.get("require_confirm")),
             "continue_on_fail": bool(s.get("continue_on_fail")),
+            "depends_on": sorted(deps),
         })
+    _validate_dag(out)
     return out
+
+
+def _validate_dag(steps: List[dict]) -> None:
+    """依赖校验：自依赖、引用不存在、成环。"""
+    seqs = {s["seq"] for s in steps}
+    for s in steps:
+        for d in s.get("depends_on") or []:
+            if d == s["seq"]:
+                raise ValueError(f"步骤 {s['seq']}「{s['name']}」不能依赖自己")
+            if d not in seqs:
+                raise ValueError(f"步骤 {s['seq']}「{s['name']}」依赖的步骤 {d} 不存在")
+    # Kahn 拓扑排序检测环
+    indeg = {s["seq"]: len(s.get("depends_on") or []) for s in steps}
+    children = {s["seq"]: [] for s in steps}
+    for s in steps:
+        for d in s.get("depends_on") or []:
+            children[d].append(s["seq"])
+    queue = [q for q, n in indeg.items() if n == 0]
+    seen = 0
+    while queue:
+        cur = queue.pop()
+        seen += 1
+        for ch in children[cur]:
+            indeg[ch] -= 1
+            if indeg[ch] == 0:
+                queue.append(ch)
+    if seen != len(steps):
+        raise ValueError("步骤依赖存在环（循环依赖），请检查 depends_on")
+
+
+def topo_order(steps: List[dict]) -> List[dict]:
+    """按依赖生成执行顺序（同层按 seq 升序，结果稳定）。"""
+    by_seq = {s["seq"]: s for s in steps}
+    indeg = {s["seq"]: len(s.get("depends_on") or []) for s in steps}
+    children = {s["seq"]: [] for s in steps}
+    for s in steps:
+        for d in s.get("depends_on") or []:
+            if d in children:
+                children[d].append(s["seq"])
+    ready = sorted([q for q, n in indeg.items() if n == 0])
+    order = []
+    while ready:
+        cur = ready.pop(0)
+        order.append(by_seq[cur])
+        for ch in sorted(children[cur]):
+            indeg[ch] -= 1
+            if indeg[ch] == 0:
+                ready.append(ch)
+        ready.sort()
+    return order
+
+
+def has_dag(steps: List[dict]) -> bool:
+    """是否配置了依赖（否则走原顺序执行路径）。"""
+    return any(s.get("depends_on") for s in steps or [])
 
 
 def _row_to_dict(row: Optional[dict]) -> Optional[dict]:
@@ -436,8 +509,26 @@ def _execute_run(run_id: int, runbook_id: int, steps: List[dict],
     final_status = "success"
     error = ""
     try:
-        for step in steps:
+        # DAG 模式：配了 depends_on 才启用（否则保持原顺序执行，零行为变化）
+        _use_dag = has_dag(steps)
+        _exec_steps = topo_order(steps) if _use_dag else steps
+        _dep_status = {}          # seq -> 实际终态（ok/fail_cont/skipped/fail）
+        _dag_failed = False
+        for step in _exec_steps:
             seq, stype = step["seq"], step["type"]
+            if _use_dag:
+                _bad = [d for d in (step.get("depends_on") or [])
+                        if _dep_status.get(d) not in ("ok", "fail_cont")]
+                if _bad:
+                    _entry = {"seq": seq, "type": stype, "name": step["name"],
+                              "status": "skipped",
+                              "message": "上游步骤 %s 未成功，已跳过" % _bad,
+                              "duration_sec": 0.0, "at": db.now_iso()}
+                    log.append(_entry)
+                    _dep_status[seq] = "skipped"
+                    _update_run(run_id,
+                                steps_log=json.dumps(log, ensure_ascii=False))
+                    continue
             if _check_stopped(run_id):
                 final_status = "stopped"
                 error = "执行已被人工停止"
@@ -482,13 +573,24 @@ def _execute_run(run_id: int, runbook_id: int, steps: List[dict],
             entry["duration_sec"] = round(time.monotonic() - s0, 3)
             log.append(entry)
             _update_run(run_id, steps_log=json.dumps(log, ensure_ascii=False))
+            _dep_status[seq] = entry["status"]
             if entry["status"] == "fail":
                 if step.get("continue_on_fail"):
                     entry["status"] = "fail_cont"
+                    _dep_status[seq] = "fail_cont"
+                    continue
+                if _use_dag:
+                    # DAG：记录失败但继续推进其它分支（依赖它的步骤会被 skipped）
+                    _dag_failed = True
+                    if not error:
+                        error = (f"步骤 {seq}「{step['name']}」失败: "
+                                 f"{entry['message'][:200]}")
                     continue
                 final_status = "failed"
                 error = f"步骤 {seq}「{step['name']}」失败: {entry['message'][:200]}"
                 break
+        if _use_dag and _dag_failed and final_status == "success":
+            final_status = "failed"
         # ---- 收尾 ----
         rto = round(time.monotonic() - t0, 3)
         _update_run(run_id, status=final_status, rto_sec=rto,

@@ -43,6 +43,14 @@ def chunk_store_stats():
     from core import db as _db
     s = chunk_store.stats()
     s["physical_human"] = _db.human_size(s.get("physical_bytes", 0))
+    # 容器模式（Append-Only 64MB 封箱）单独统计：块都在容器里，blob 目录为空
+    try:
+        from core import container_store
+        ct = container_store.stats()
+        ct["physical_human"] = _db.human_size(ct.get("physical_bytes", 0))
+        s["containers"] = ct
+    except Exception as exc:  # noqa: BLE001
+        s["containers"] = {"error": str(exc)}
     return jsonify({"ok": True, "stats": s})
 
 
@@ -86,10 +94,19 @@ def chunk_store_store():
     path, err, code = _record_path(int(rid))
     if err:
         return jsonify({"ok": False, "error": err}), code
+    mode = str(payload.get("mode") or "blob").lower()
+    if mode not in ("blob", "container"):
+        return jsonify({"ok": False, "error": "mode 只能是 blob 或 container"}), 400
     try:
-        rep = chunk_store.store_file(path)
+        if mode == "container":
+            # Append-Only 容器封箱：块追加进 64MB 容器，显著减少小文件
+            from core import container_store
+            rep = container_store.store_file(path)
+        else:
+            rep = chunk_store.store_file(path)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": "写入块存储失败: %s" % exc}), 500
+    rep["mode"] = mode
     # 回写清单 ID：原产物日后被保留策略清理时，恢复入口可自动回填
     try:
         db.execute("UPDATE backup_records SET chunk_manifest_id=? WHERE id=?",

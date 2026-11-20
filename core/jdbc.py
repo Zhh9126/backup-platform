@@ -95,7 +95,12 @@ DRIVER_CONFIG = {
         # db 参数为 service_name（可省略时默认 XE/ORCL，由驱动决定）
         "url": "jdbc:oracle:thin:@//{host}:{port}/{db}",
         "probe": "SELECT 1 FROM DUAL",
-        "list_sql": "SELECT username FROM all_users WHERE oracle_maintained = 'N' ORDER BY 1",
+        # 候选序列：12c+ 用 ORACLE_MAINTAINED 过滤；11g/10g 无该列（ORA-00904），
+        # 回退全量 all_users，再由 list_databases 按内置 schema 名单剔除。
+        "list_sql": (
+            "SELECT username FROM all_users WHERE oracle_maintained = 'N' ORDER BY 1",
+            "SELECT username FROM all_users ORDER BY 1",
+        ),
         "filter": (),
     },
     "dameng": {
@@ -940,19 +945,45 @@ def list_databases(db_type, host, port, db, user, password, timeout=30):
         if "暂不支持直连类型" not in str(e):
             raise
     _, _, _, _, list_sql, filters = _resolve_config(db_type)
+    # list_sql 支持候选序列：逐条尝试（Oracle 11g 没有 ALL_USERS.ORACLE_MAINTAINED，
+    # 2026-11-20 实测导致“拉取库列表”整体失败），全部失败才抛出最后一条的真实错误。
+    sqls = (list_sql,) if isinstance(list_sql, str) else tuple(list_sql)
     conn = connect(db_type, host, port, db, user, password, timeout=timeout)
+    rows, last_exc = None, None
     try:
-        cur = conn.cursor()
-        cur.execute(list_sql)
-        rows = [str(_to_py(r[0])) for r in cur.fetchall()]
-        cur.close()
+        for sql in sqls:
+            cur = None
+            try:
+                cur = conn.cursor()
+                cur.execute(sql)
+                rows = [str(_to_py(r[0])) for r in cur.fetchall()]
+                break
+            except Exception as e:
+                last_exc = e
+            finally:
+                if cur is not None:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
     finally:
         try:
             conn.close()
         except Exception:
             pass
-    if filters:
-        rows = [r for r in rows if r not in filters]
+    if rows is None:
+        raise last_exc
+    _filters = list(filters or ())
+    if str(db_type).lower() == "oracle":
+        # 回退 SQL 会带出 SYS/SYSTEM/APEX_* 等内置用户，按名单+前缀剔除
+        try:
+            from core.native_conn import oracle_system_schema
+            rows = [r for r in rows if not oracle_system_schema(r)]
+        except Exception:
+            pass
+    if _filters:
+        _fs = set(_filters)
+        rows = [r for r in rows if r not in _fs]
     return rows
 
 

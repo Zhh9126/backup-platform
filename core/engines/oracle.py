@@ -784,13 +784,48 @@ class OracleEngine(BackupEngine):
     def _resolve_oracle_tool(self, client, tool: str) -> str:
         """在远端解析 Oracle 工具（expdp/impdp/rman/sqlplus）的绝对路径。
 
-        顺序：oracle 用户 profile PATH → root 视角目录 glob 枚举（覆盖各种
-        ORACLE_HOME 安装结构）→ 空（调用方报错）。绝不硬编码安装路径。
+        顺序（绝不硬编码安装路径）：
+        ① 在调用方**已建立的连接**上以数据库 OS 用户 `command -v`——Oracle
+           工具只在该用户 profile 的 PATH 中，且零额外建连；
+        ② 独立建连解析（oracle profile → 常见 ORACLE_HOME 目录 glob 枚举）；
+        ③ 兜底：现有连接上 `command -v` + 候选目录 find。
+
+        2026-11-20 修复：此前只走 ③ 的等价路径，而 ② 用「库地址:监听端口
+        1521」当 SSH 地址去新建连接，握手必然失败（每次白等约 9s），再叠加
+        调用方连接被误关（见 `_archive_mode_via_sqlplus`）就误报
+        「远端未找到 rman」。
         """
         from core import remote_dump
-        path = remote_dump.resolve_remote_tool(self._ssh_host_for_cache(), tool,
-                                               check_user="oracle")
+        from core.engines.file import _ssh_exec_pipe
+
+        path = ""
+        # ① 现有连接上以数据库 OS 用户探测（最准：oracle profile 的 PATH）
+        if client is not None:
+            try:
+                user = self._resolve_check_user() or "oracle"
+                inner = f"command -v {shlex.quote(tool)} 2>/dev/null"
+                probe = f"su - {shlex.quote(user)} -c {shlex.quote(inner)}"
+                out, _err, _rc = _ssh_exec_pipe(
+                    client, remote_dump._wrap_login(probe), timeout=30)
+                text = (out.decode("utf-8", "replace")
+                        if isinstance(out, bytes) else (out or ""))
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line.startswith("/"):
+                        path = line
+                        break
+            except Exception:
+                path = ""
+        # ② 独立建连解析（缓存于 remote_dump 内）
         if not path:
+            try:
+                path = remote_dump.resolve_remote_tool(
+                    self._ssh_host_for_cache(), tool,
+                    check_user=self._resolve_check_user() or "oracle") or ""
+            except Exception:
+                path = ""
+        # ③ 兜底：现有连接上 command -v + 候选目录 find
+        if not path and client is not None:
             try:
                 path = remote_dump._resolve_remote_bin(client, tool) or ""
             except Exception:
@@ -798,8 +833,20 @@ class OracleEngine(BackupEngine):
         return path
 
     def _ssh_host_for_cache(self) -> dict:
-        """提供缓存 key 用的主机标识（不重连）。"""
-        return {"host_key": f"{self.task.get('host') or ''}:{self.task.get('port') or ''}"}
+        """工具解析用的 SSH 主机描述。
+
+        **必须是 SSH 连接参数（默认 22 端口），不能是 Oracle 监听端口 1521**
+        ——`remote_dump.resolve_remote_tool` 会用它新建 SSH 连接。
+        """
+        from core import remote_dump
+        try:
+            sh = remote_dump.resolve_ssh_host(self.task)
+        except Exception:
+            sh = None
+        if sh:
+            return sh
+        host = self.task.get("host") or ""
+        return {"host_key": f"{host}:22", "hostname": host, "port": 22}
 
     def _check_archive_mode(self) -> dict:
         """预检专用：查 v$database.log_mode。
@@ -857,7 +904,12 @@ class OracleEngine(BackupEngine):
         if not ssh_host:
             return ""
         try:
-            client = remote_dump._connect(ssh_host)
+            # 必须用**独立连接**：remote_dump._connect 返回的是连接池中共享的
+            # client，本方法在 finally 里关闭它会把调用方（如
+            # _backup_physical_remote 主流程）持有的同一条连接一并关掉——
+            # 后续 rman/expdp 探测与 RMAN 执行全部报 "SSH transport dead"，
+            # 最终误报「远端未找到 rman」（2026-11-20 实测 133 Oracle 11g）。
+            client = remote_dump._connect_isolated(ssh_host)
         except Exception as e:
             self.logger.warning("[%s] log_mode 探测连 SSH 失败: %s",
                                 self.task_name, e)
@@ -1831,7 +1883,9 @@ class OracleEngine(BackupEngine):
         from core import remote_dump as _rd
         from core.engines.file import _ssh_exec_pipe
         try:
-            client = _rd._connect(ssh_host)
+            # 独立连接：本方法 finally 会关闭 client，不能关掉连接池里
+            # 调用方正在使用的共享连接（同 _archive_mode_via_sqlplus）。
+            client = _rd._connect_isolated(ssh_host)
         except Exception as e:
             self.logger.warning("[%s] sysdba 查询连接失败: %s", self.task_name, e)
             return ""

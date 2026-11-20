@@ -235,10 +235,17 @@ BACKUP_TYPE_DISPLAY_NAMES = {
 }
 
 # 备份模式（backup_mode）中文映射：logical / physical
+# 非数据库负载没有「逻辑/物理」之分，产物形态本身就是文件级/镜像级，
+# 单独给值（file/object/vm/nas），避免记录页把它误标成「逻辑备份」。
 BACKUP_MODE_DISPLAY_NAMES = {
     "logical": "逻辑备份",
     "physical": "物理备份",
     "custom": "自定义脚本",
+    "hot_copy": "应急热备（非归档）",
+    "file": "文件备份",
+    "object": "对象存储",
+    "vm": "虚拟机备份",
+    "nas": "NAS 快照",
 }
 
 # 备份状态（status）中文映射：仪表盘/记录页统一展示

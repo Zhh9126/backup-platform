@@ -4657,6 +4657,12 @@ window.I18N = (function () {
     "标准备份产物由数据库自带导出工具生成（含表结构与一致性快照，可被恢复引擎直接消费）；\n          数据级快照是平台自研的 gzip JSON（仅数据，不含表结构）。": "The standard backup artifact is produced by the database's own export tool (with schema and a consistent snapshot, directly consumable by the restore engine); the data-level snapshot is the platform's own gzip JSON (data only, no schema)."
   });
 
+  // 备份记录页「备份方式」列（物理/逻辑/自定义/文件…）
+  Object.assign(EN, {
+    "备份方式": "Backup method",
+    "本条记录实际使用的备份方式：物理备份（数据文件/备份片级）/ 逻辑备份（导出 SQL、dmp 等）/ 自定义脚本 / 文件备份等": "The backup method actually used by this record: physical (data files/backup pieces) / logical (SQL export, dmp, etc.) / custom script / file backup"
+  });
+
   var PREFIXES = [
     "加载任务失败：", "加载日志失败:", "读取失败：", "读取失败:", "加载失败：", "加载失败:",
     "保存失败：", "保存失败:", "删除失败：", "删除失败:", "连接失败：", "连接成功：", "连接成功!",
@@ -4776,8 +4782,8 @@ window.I18N = (function () {
     [/^已派发安装任务到(.+?)：(.+)$/, "Install task dispatched to $1: $2"],
     [/^拉取到 (\d+) 个数据库（已过滤系统库，经 JDBC 兜底连接）$/, "Fetched $1 databases (system DBs filtered, via JDBC fallback)"],
     [/^拉取到 (\d+) 个数据库（已过滤系统库）$/, "Fetched $1 databases (system DBs filtered)"],
-    [/^拉取到 (\d+) 个schema（已过滤系统库，经 JDBC 兜底连接）$/, "Fetched $1 schemas (system DBs filtered, via JDBC fallback)"],
-    [/^拉取到 (\d+) 个schema（已过滤系统库）$/, "Fetched $1 schemas (system DBs filtered)"],
+    [/^拉取到 (\d+) 个 schema（已过滤系统 schema，经 JDBC 兜底连接）$/, "Fetched $1 schemas (system schemas filtered, via JDBC fallback)"],
+    [/^拉取到 (\d+) 个 schema（已过滤系统 schema）$/, "Fetched $1 schemas (system schemas filtered)"],
     [/^共 (\d+) 张表（库: (.+?)）$/, "$1 tables (db: $2)"],
     [/^上次执行：(.+?)，清理 (\d+) 条 \/ 释放 (.+)$/, "Last run: $1, cleaned $2 records / freed $3"],
     [/^任务覆盖: (\d+)\/(\d+) \((\d+) 个任务\)$/, "Task coverage: $1/$2 ($3 tasks)"],

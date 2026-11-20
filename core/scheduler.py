@@ -542,7 +542,11 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
     models.set_task_status(task["id"], started, "running")
     rec_id = models.create_record({
         "task_id": task["id"], "db_type": task["db_type"],
-        "backup_type": bt.value, "started_at": started, "status": "running",
+        "backup_type": bt.value,
+        # 备份方式落库（物理/逻辑/自定义/热备/文件…）：记录页按它展示，
+        # 避免用户只能看到库类型、分不清这条是物理备份还是逻辑备份。
+        "backup_mode": models.effective_backup_mode(task),
+        "started_at": started, "status": "running",
     })
     # 注册协作式取消键（用户「停止」运行中任务）：绑定到当前执行上下文，
     # 传输类长循环在块边界检查（FIX-2026-001 反馈：运行中不可见不可停）

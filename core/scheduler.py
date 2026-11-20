@@ -2301,6 +2301,58 @@ def _register_netdev_backup(sched):
     _logger.info("[netdev] 已注册网络设备自动备份周期任务（每分钟轮询）")
 
 
+def _start_lease_heartbeat(sched, owner: str):
+    """leader 心跳：周期续租；续不上就暂停全部定时任务（防双活重复备份）。"""
+    from core import lease as lease_mod
+
+    def _beat():
+        while True:
+            time.sleep(lease_mod.RENEW_INTERVAL)
+            try:
+                r = lease_mod.renew(owner=owner)
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning("调度器租约续租异常: %s", exc)
+                continue
+            if not r.get("ok"):
+                _logger.error(
+                    "调度器租约已被接管（%s，当前持有者 %s）——暂停本实例全部定时任务，"
+                    "避免两个实例同时备份", r.get("reason"), r.get("holder"))
+                try:
+                    sched.pause()
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+
+    t = threading.Thread(target=_beat, name="sched-lease-beat", daemon=True)
+    t.start()
+
+
+def _start_lease_standby(interval: int = 30):
+    """standby：周期尝试抢占租约，成功后重新注册全部定时任务。"""
+    from core import lease as lease_mod
+
+    def _watch():
+        while True:
+            time.sleep(interval)
+            try:
+                r = lease_mod.acquire()
+            except Exception:  # noqa: BLE001
+                continue
+            if not r.get("acquired"):
+                continue
+            _logger.warning("本实例接管调度租约（%s），开始注册定时任务", r.get("reason"))
+            try:
+                reload_scheduler()
+                from core import lease as _lm
+                _start_lease_heartbeat(_scheduler, _lm.owner_id())
+            except Exception:  # noqa: BLE001
+                _logger.exception("接管租约后重新注册定时任务失败")
+            return
+
+    t = threading.Thread(target=_watch, name="sched-lease-standby", daemon=True)
+    t.start()
+
+
 def start_scheduler():
     global _scheduler
     if _scheduler is not None:
@@ -2310,6 +2362,26 @@ def start_scheduler():
         return None
     from apscheduler.schedulers.background import BackgroundScheduler
     _scheduler = BackgroundScheduler()
+    # ---- 单实例租约（对标 PB 级方案 §1 Etcd 选主）----
+    # 同一元数据库被两个进程接上（容器滚动更新重叠 / systemd 与手工各起一个 /
+    # 主备机挂同一个库）时，两边都会注册同一批定时任务 → 同一时刻重复备份。
+    # 只有抢到租约的实例才注册任务；单实例场景总是抢到，零行为变化。
+    from core import lease as _lease_mod
+    _lease_owner = _lease_mod.owner_id()
+    try:
+        _lk = _lease_mod.acquire(owner=_lease_owner)
+    except Exception as _exc:  # noqa: BLE001
+        _lk = {"acquired": True,
+               "reason": "租约模块不可用，按原样启动: %s" % _exc}
+    if not _lk.get("acquired"):
+        _logger.warning(
+            "调度器进入 standby：%s（持有者 %s，剩余 %ss）；本实例不注册定时任务，"
+            "每 30s 重试接管", _lk.get("reason"), _lk.get("holder"),
+            _lk.get("expires_in"))
+        _start_lease_standby()
+        return _scheduler
+    _logger.info("调度器已获取单实例租约（%s）", _lk.get("reason"))
+    _start_lease_heartbeat(_scheduler, _lease_owner)
     # 启动清道：服务中断（kill/OOM/重启）后任务表 last_status 可能僵尸停在
     # running（执行上下文已不存在）——修正为 failed，避免前端误显示「停止」
     # 按钮、点击又报「当前没有运行中的备份任务」。
@@ -2474,6 +2546,12 @@ def stop_scheduler():
             _logger.warning("[rt] 停止 RtSupervisor 异常（忽略）")
         _scheduler.shutdown(wait=False)
         _scheduler = None
+    # 主动释放租约：让备实例/重启后的新进程立即可接管，不必等 TTL 过期
+    try:
+        from core import lease as _lease_mod
+        _lease_mod.release(owner=_lease_mod.owner_id())
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def scheduler_status() -> dict:

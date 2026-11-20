@@ -1574,6 +1574,12 @@ def api_get_concurrency():
         bw_state = _bw.snapshot()
     except Exception as exc:  # noqa: BLE001
         bw_state = {"error": str(exc)}
+    # 调度器单实例租约状态（多实例部署时用来看谁是 leader）
+    try:
+        from core import lease as _lease
+        lease_state = _lease.status()
+    except Exception as exc:  # noqa: BLE001
+        lease_state = {"error": str(exc)}
     return jsonify({
         "max_concurrent_backups": stats.get("max_concurrent_backups", 2),
         "env_override": env_override or None,
@@ -1583,6 +1589,7 @@ def api_get_concurrency():
         "engine_parallel": engine_parallel,
         "global_bandwidth_kbps": bw_quota,
         "bandwidth": bw_state,
+        "scheduler_lease": lease_state,
     })
 
 

@@ -526,6 +526,15 @@ CREATE TABLE IF NOT EXISTS data_compare_reports (
     finished_at  TEXT
 );
 
+-- 调度器单实例租约（对标 Etcd 选主）：多实例接同一元数据库时只有 leader 注册定时任务
+CREATE TABLE IF NOT EXISTS scheduler_leases (
+    name          TEXT PRIMARY KEY,
+    owner         TEXT,
+    acquired_at   REAL,
+    heartbeat_at  REAL,
+    expires_at    REAL
+);
+
 CREATE TABLE IF NOT EXISTS backup_records (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id       INTEGER,

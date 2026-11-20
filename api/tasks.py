@@ -11,6 +11,9 @@ from core.engines import supported_types, get_engine
 from . import api_bp, contract
 
 # 各类型拉库时过滤的系统库/模板库
+# 注意：是否出现在本字典里 = 该库型「支持拉取列表」。Oracle/达梦 在 Oracle
+# 语境下列的是 **schema（用户）**，系统 schema 由数据层 filter 剔除（见
+# core/native_conn.ORACLE_SYSTEM_SCHEMAS），这里给空集即可。
 _LIST_DB_SKIP = {
     "mysql": {"information_schema", "performance_schema", "mysql", "sys"},
     "mariadb": {"information_schema", "performance_schema", "mysql", "sys"},
@@ -19,7 +22,13 @@ _LIST_DB_SKIP = {
     "sqlserver": {"master", "tempdb", "model", "msdb"},
     # Neo4j：system 为系统库（不可 dump），引擎经 cypher-shell SHOW DATABASES 拉取
     "neo4j": {"system"},
+    # Oracle / 达梦：拉的是 schema 列表（12c+ 用 ORACLE_MAINTAINED，11g 回退名单过滤）
+    "oracle": set(),
+    "dameng": set(),
 }
+
+# 列表语义为 schema（用户）而非 database 的库型：前端提示文案用
+_SCHEMA_LIST_TYPES = {"postgresql", "kingbase", "oracle", "dameng"}
 
 
 def _secure_ssh_cred(extra_options):
@@ -223,7 +232,7 @@ def _db_list_payload(task: dict):
     dbs = [d for d in (dbs or []) if d not in skip]
     return {
         "databases": dbs,
-        "type": "schemas" if db_type in ("postgresql", "kingbase") else "databases",
+        "type": "schemas" if db_type in _SCHEMA_LIST_TYPES else "databases",
         "via_jdbc": via_jdbc,
     }, None
 

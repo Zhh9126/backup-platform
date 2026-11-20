@@ -80,18 +80,57 @@ NATIVE_CONFIG = {
     },
     "oracle": {
         "probe": "SELECT 1 FROM DUAL",
-        "list_sql": "SELECT username FROM all_users WHERE oracle_maintained = 'N' ORDER BY 1",
-        "filter": (),
+        # list_sql 可以是候选序列：逐条尝试，前一条语法不可用则降级下一条。
+        # ALL_USERS.ORACLE_MAINTAINED 是 12c 才引入的列，11g/10g 直接报
+        # ORA-00904（2026-11-20 133 Oracle 11g 实测：拉库列表整体失败）——
+        # 12c+ 用它最准，老版本退回全量 all_users + 平台侧内置 schema 名单过滤。
+        "list_sql": (
+            "SELECT username FROM all_users WHERE oracle_maintained = 'N' ORDER BY 1",
+            "SELECT username FROM all_users ORDER BY 1",
+        ),
+        "filter": (),          # 实际过滤用 ORACLE_SYSTEM_SCHEMAS（见 list_databases）
         "default_db": None,
     },
     "dameng": {
         "probe": "SELECT 1",
-        "list_sql": "SELECT username FROM all_users ORDER BY 1",
+        "list_sql": ("SELECT username FROM all_users ORDER BY 1",),
         # 达梦的 SYSDBA 既是管理员又常被用作业务 schema，不能排除
         "filter": ("SYS", "SYSAUDITOR", "SYSSSO", "SYSDBAOPER", "CTISYS", "CJISYS"),
         "default_db": None,
     },
 }
+
+# Oracle 内置 schema（11g/12c/19c 常见）：
+# 12c+ 有 ORACLE_MAINTAINED='Y' 可直接排除；11g 没有该列，只能按名单剔除，
+# 否则「拉取库列表」会把 SYS/SYSTEM/MDSYS 等几十个内置用户全列出来。
+# ⚠ 不要按 C## 前缀一刀切——CDB 根容器下的业务用户也是 C## 开头（如 C##E2E17）。
+ORACLE_SYSTEM_SCHEMAS = (
+    "SYS", "SYSTEM", "OUTLN", "DIP", "ORACLE_OCM", "DBSNMP", "APPQOSSYS",
+    "WMSYS", "EXFSYS", "CTXSYS", "XDB", "ANONYMOUS", "XS$NULL", "ORDSYS",
+    "ORDDATA", "ORDPLUGINS", "SI_INFORMTN_SCHEMA", "MDSYS", "OLAPSYS",
+    "MDDATA", "SPATIAL_WFS_ADMIN_USR", "SPATIAL_CSW_ADMIN_USR", "SYSMAN",
+    "MGMT_VIEW", "FLOWS_FILES", "OJVMSYS", "LBACSYS", "GSMADMIN_INTERNAL",
+    "DVSYS", "DVF", "AUDSYS", "GSMCATUSER", "GSMUSER", "GSMROOTUSER",
+    "REMOTE_SCHEDULER_AGENT", "SYSBACKUP", "SYSDG", "SYSKM", "SYSRAC",
+    "SYS$UMF", "DBSFWUSER", "GGSYS", "TSMSYS", "ODM", "ODM_MTR",
+    "WK_TEST", "WKPROXY", "WKSYS", "XDBADMIN", "XDBMETADATA", "XDBPM",
+    "XDBWEB", "ORDPLUGINS", "RDSADMIN", "PUBLIC",
+)
+
+# Oracle 自带组件 schema 的**前缀**族（数量随版本/选项变化，名单列不完）：
+# APEX_030200 / APEX_PUBLIC_USER（11g 自带 APEX）、OWBSYS / OWBSYS_AUDIT（OWB）、
+# ORADICT_T（数据字典构建）。业务 schema 极少用这些前缀。
+ORACLE_SYSTEM_SCHEMA_PREFIXES = ("APEX_", "OWBSYS", "ORADICT_")
+
+
+def oracle_system_schema(name: str) -> bool:
+    """判断 Oracle schema 是否为内置/组件自带（11g 无 ORACLE_MAINTAINED 时的兜底）。"""
+    n = str(name or "").strip().upper()
+    if not n:
+        return True
+    if n in ORACLE_SYSTEM_SCHEMAS:
+        return True
+    return any(n.startswith(p) for p in ORACLE_SYSTEM_SCHEMA_PREFIXES)
 
 NATIVE_DB_TYPES = tuple(NATIVE_CONFIG.keys())
 
@@ -352,23 +391,49 @@ def test_connection(db_type, host, port, db, user, password, timeout=15):
 
 
 def list_databases(db_type, host, port, db, user, password, timeout=30):
-    """通过原生直连拉取数据库/schema 列表。"""
+    """通过原生直连拉取数据库/schema 列表。
+
+    list_sql 可以是**候选序列**：逐条尝试，前一条因版本/权限不可用
+    （如 Oracle 11g 没有 ALL_USERS.ORACLE_MAINTAINED）时自动降级下一条，
+    全部失败才抛出最后一条的真实错误。
+    """
     db_type = (db_type or "").lower()
     cfg = NATIVE_CONFIG.get(db_type)
     if not cfg:
         raise ValueError(f"暂不支持直连类型: {db_type}")
+    sqls = cfg["list_sql"]
+    if isinstance(sqls, str):
+        sqls = (sqls,)
     conn = connect(db_type, host, port, db, user, password, timeout=timeout)
+    rows, last_exc = None, None
     try:
-        cur = conn.cursor()
-        cur.execute(cfg["list_sql"])
-        rows = [str(r[0]) for r in cur.fetchall()]
-        cur.close()
+        for sql in sqls:
+            cur = None
+            try:
+                cur = conn.cursor()
+                cur.execute(sql)
+                rows = [str(r[0]) for r in cur.fetchall()]
+                break
+            except Exception as e:      # 上一条 SQL 不适用 → 尝试下一条
+                last_exc = e
+            finally:
+                if cur is not None:
+                    try:
+                        cur.close()
+                    except Exception:
+                        pass
     finally:
         try:
             conn.close()
         except Exception:
             pass
-    filters = cfg.get("filter") or ()
+    if rows is None:
+        raise last_exc
+    filters = list(cfg.get("filter") or ())
+    if db_type == "oracle":
+        # 11g 走的是不带 ORACLE_MAINTAINED 的回退 SQL，必须按名单/前缀剔内置用户
+        rows = [r for r in rows if not oracle_system_schema(r)]
     if filters:
-        rows = [r for r in rows if r not in filters]
+        _fs = set(filters)
+        rows = [r for r in rows if r not in _fs]
     return rows

@@ -72,6 +72,7 @@ SEGMENT_PERMS = {
     "cdc": "rt.manage",
     # 恢复
     "restores": "restore.run",
+    "recovery": "restore.run",
     "restore-test-reports": "restore.verify.manage",
     "restore-verify-policies": "restore.verify.manage",
     "oracle-txn": "restore.run",

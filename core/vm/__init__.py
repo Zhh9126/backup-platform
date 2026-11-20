@@ -309,32 +309,35 @@ def _start_job(vm_id: int, rp_id: int, mode: str, spec: dict, operator: str = ""
     def _work():
         vm = models.get_vm_protected(int(vm_id))
         try:
-            engine = _engine_for(vm)
-            if mode == "verify":
+            from core.operation_lease import operation_lease
+            with operation_lease("vm-recovery:%s" % vm_id) as ensure_owned:
+                ensure_owned()
+                engine = _engine_for(vm)
+                if mode == "verify":
+                    rp = models.get_vm_recovery_point(int(rp_id))
+                    res = engine.verify_record({"backup_path": rp.get("artifact_path")},
+                                               spec or {})
+                    status = "ready" if res.success else "failed"
+                    models.update_vm_job(job_id, {
+                        "status": status, "progress": 100,
+                        "message": res.message, "finished_at": db.now_iso()})
+                    return
                 rp = models.get_vm_recovery_point(int(rp_id))
-                res = engine.verify_record({"backup_path": rp.get("artifact_path")},
-                                           spec or {})
-                status = "ready" if res.success else "failed"
-                models.update_vm_job(job_id, {
-                    "status": status, "progress": 100,
-                    "message": res.message, "finished_at": db.now_iso()})
-                return
-            rp = models.get_vm_recovery_point(int(rp_id))
-            res = engine.restore(rp.get("artifact_path") or "",
-                                 job_id=job_id,
-                                 mode=("clone" if mode == "clone" else "restore_in_place"),
-                                 **{k: v for k, v in (spec or {}).items()
-                                    if k in ("target_name", "target_node",
-                                             "isolate_network", "network_name",
-                                             "auto_start", "live", "regenerate_mac",
-                                             "ttl_hours")})
-            # 引擎已按 job_id 回填作业状态，这里只兜底补齐派生对象引用
-            extra = {}
-            if getattr(res, "target_ref", ""):
-                extra["target_ref"] = res.target_ref
-            models.update_vm_job(job_id, dict({
-                "status": "ready" if res.success else "failed", "progress": 100,
-                "message": res.message, "finished_at": db.now_iso()}, **extra))
+                res = engine.restore(rp.get("artifact_path") or "",
+                                     job_id=job_id,
+                                     mode=("clone" if mode == "clone" else "restore_in_place"),
+                                     **{k: v for k, v in (spec or {}).items()
+                                        if k in ("target_name", "target_node",
+                                                 "isolate_network", "network_name",
+                                                 "auto_start", "live", "regenerate_mac",
+                                                 "ttl_hours")})
+                # 引擎已按 job_id 回填作业状态，这里只兜底补齐派生对象引用
+                extra = {}
+                if getattr(res, "target_ref", ""):
+                    extra["target_ref"] = res.target_ref
+                models.update_vm_job(job_id, dict({
+                    "status": "ready" if res.success else "failed", "progress": 100,
+                    "message": res.message, "finished_at": db.now_iso()}, **extra))
         except Exception as e:
             models.update_vm_job(job_id, {
                 "status": "failed", "message": "作业异常: %s" % str(e)[:300],

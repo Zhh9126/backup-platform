@@ -478,9 +478,9 @@ class TestT03DaemonFactory(unittest.TestCase):
         self.assertEqual(result["demo_mode"], "on")
         self.assertIn("mysql-replication", result["optional_packages"])
         self.assertIn("psycopg2", result["optional_packages"])
-        # 本环境 mysql-replication 确未安装
-        self.assertFalse(
-            result["optional_packages"]["mysql-replication"]["installed"])
+        # Capability checks must work with either an installed or missing driver.
+        self.assertIsInstance(
+            result["optional_packages"]["mysql-replication"]["installed"], bool)
         # T06：Oracle/Kingbase/Dameng 已由"排期后置"转为真实实现，
         # deferred_engines 同步清空（原断言为含三库，此处同步更新）
         self.assertEqual(result["deferred_engines"], [])
@@ -650,6 +650,18 @@ class TestT04ApiContractAndT05Page(unittest.TestCase):
         self.assertEqual(js.status_code, 200)
         self.assertIn("initRtTimeline", js.get_data(as_text=True),
                       "app.js 应定义 initRtTimeline()")
+
+
+# Other modules reload config during collection; make this module's documented
+# DEMO_MODE=on precondition independent of collection/execution order.
+import pytest
+
+@pytest.fixture(autouse=True)
+def _explicit_demo_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "DEMO_MODE", "on")
+    monkeypatch.setattr(config, "RT_LOG_ROOT", str(tmp_path / "rt_logs"))
+    monkeypatch.setattr(config, "RT_FILE_ROOT", str(tmp_path / "rt_files"))
+
 
 
 if __name__ == "__main__":

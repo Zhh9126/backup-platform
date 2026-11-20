@@ -71,6 +71,20 @@ def create_restore():
         restore_options["overwrite"] = str(data["overwrite"]).strip()
     if data.get("apply_deleted") is not None:
         restore_options["apply_deleted"] = bool(data["apply_deleted"])
+    if data.get("target_task_id") is not None:
+        try:
+            target_task_id = int(data["target_task_id"])
+        except (TypeError, ValueError):
+            return jsonify({"error": "目标存储连接无效"}), 400
+        target_task = models.get_task(target_task_id)
+        if not target_task or target_task.get("db_type") != "object_storage":
+            return jsonify({"error": "目标连接必须是对象存储备份任务"}), 400
+        restore_options["target_task_id"] = target_task_id
+    for option in ("create_bucket", "restore_to_nas"):
+        if option in data:
+            restore_options[option] = data[option] is True or str(data[option]).lower() in ("1", "true", "yes")
+    if data.get("target_nas_path"):
+        restore_options["target_nas_path"] = str(data["target_nas_path"]).strip()
     keys = data.get("restore_keys")
     if keys:
         restore_options["restore_keys"] = (

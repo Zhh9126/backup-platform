@@ -5,6 +5,7 @@ import sqlite3
 import tarfile
 from unittest.mock import Mock
 import pytest
+import config
 from core import clone_runtime as runtime
 
 
@@ -201,12 +202,16 @@ def test_docker_missing_is_actionable(monkeypatch):
         runtime._run("info")
 
 
-def test_service_routes_runtime_and_updates_endpoint(monkeypatch):
+def test_service_routes_runtime_and_updates_endpoint(monkeypatch, tmp_path):
     from core import clone_service as service
     monkeypatch.setattr(service.models, "get_record", lambda _: {
         "db_type": "redis", "backup_path": "/fixture.rdb", "task_id": 2})
     monkeypatch.setattr(service.models, "update_clone_request", Mock())
-    execute = Mock()
+    monkeypatch.setattr(config, "META_DB_PATH", str(tmp_path / "runtime-service.db"))
+    service.db.init_schema()
+    original_execute = service.db.execute
+    execute = Mock(side_effect=lambda sql, params=():
+                   original_execute(sql, params) if "scheduler_leases" in sql else None)
     monkeypatch.setattr(service.db, "execute", execute)
     svc = service.CloneService()
     register = Mock(return_value=71)
@@ -216,7 +221,8 @@ def test_service_routes_runtime_and_updates_endpoint(monkeypatch):
         return {"port": 31001}
     monkeypatch.setattr(runtime, "launch", launch)
     assert svc._launch_vdb({"id": 1, "source_record_id": 5}) == 71
-    assert execute.call_args.args[1] == ("127.0.0.1", 31001, 71)
+    assert any(call.args[1] == ("127.0.0.1", 31001, 71)
+               for call in execute.call_args_list if len(call.args) > 1)
 
 
 def test_runtime_preflight_is_visible_as_failed_check(monkeypatch, tmp_path):

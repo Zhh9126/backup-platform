@@ -26,7 +26,7 @@ from .types import (
     norm_path,
 )
 
-# 同秒序号分配的进程内互斥（SQLite 层还有唯一索引兜底）
+# 进程内合并；真正的同秒序号分配在 models 的数据库事务内完成
 _seq_lock = threading.Lock()
 
 
@@ -88,8 +88,6 @@ class RecoveryJournal:
                 data["checksum"] = db.sha256_file(object_key)
 
         with _seq_lock:
-            if data.get("pit_seq") is None:
-                data["pit_seq"] = models.next_pit_seq(int(task_id), pit_at)
             rp_id = models.create_recovery_point(data)
 
         row = models.get_recovery_point(rp_id) or {}

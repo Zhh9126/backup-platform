@@ -909,5 +909,17 @@ class TestT06FaultIsolation(unittest.TestCase):
             config.DEMO_MODE = "on"
 
 
+# Other modules reload config during collection; make this module's documented
+# DEMO_MODE=on precondition independent of collection/execution order.
+import pytest
+
+@pytest.fixture(autouse=True)
+def _explicit_demo_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "DEMO_MODE", "on")
+    monkeypatch.setattr(config, "RT_LOG_ROOT", str(tmp_path / "rt_logs"))
+    monkeypatch.setattr(config, "RT_FILE_ROOT", str(tmp_path / "rt_files"))
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

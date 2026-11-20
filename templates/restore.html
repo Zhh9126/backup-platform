@@ -1,295 +1,88 @@
 {% extends "base.html" %}
 {% block content %}
-<style>
-  /* 恢复页专属样式 —— 颜色一律引用 app.css Design Tokens，禁止硬编码 */
-  .restore-selected {
-    border: 1px solid var(--primary-light); border-left: 3px solid var(--primary);
-    border-radius: var(--radius-lg); background: var(--primary-bg);
-    padding: var(--space-md); transition: border-color .15s ease, background .15s ease;
-  }
-  .restore-selected .rs-head {
-    display: flex; align-items: center; gap: var(--space-sm); flex-wrap: wrap;
-    font-size: var(--font-size-md); font-weight: var(--weight-semibold); color: var(--text-primary);
-  }
-  .restore-selected .rs-head .bi-check-circle-fill { color: var(--primary); }
-  .restore-selected .rs-grid {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-    gap: var(--space-sm) var(--space-md); margin-top: var(--space-sm);
-  }
-  .restore-selected .rs-item { font-size: var(--font-size-xs); }
-  .restore-selected .rs-item .rs-label { color: var(--text-muted); display: block; }
-  .restore-selected .rs-item .rs-value { color: var(--text-primary); font-weight: var(--weight-medium); }
-  .restore-selected .rs-item .rs-value code { font-size: var(--font-size-xs); }
-
-  #r_progress_wrap .progress { height: 6px; background: var(--border-base); }
-  #r_progress_wrap .progress-bar { background: var(--primary); }
-  .restore-row-new { animation: restoreHighlight 3s ease-out 1; }
-  @keyframes restoreHighlight {
-    0%, 55% { background: var(--primary-light); }
-    100% { background: transparent; }
-  }
-</style>
-
-<div class="toolbar">
-  <div>
-    <div class="page-title">数据恢复</div>
-    <div class="page-sub">从备份记录恢复到源实例或跨主机恢复</div>
+<link rel="stylesheet" href="/static/css/restore-center.css?v=2026112011">
+<div class="rc-shell">
+  <header class="rc-header">
+    <div><div class="rc-eyebrow">业务连续性 · 数据恢复</div><h1>恢复工作台</h1><p>选择恢复点，确认目标，让数据与业务重新就绪。</p></div>
+    <div class="rc-header-actions"><a class="btn btn-outline-secondary btn-sm" href="/restore-verify"><i class="bi bi-shield-check"></i> 恢复校验</a><button class="btn btn-outline-secondary btn-sm" id="rcRefresh"><i class="bi bi-arrow-clockwise"></i> 刷新</button></div>
+  </header>
+  <div class="rc-types" role="group" aria-label="恢复类型">
+    {% for key,icon,title,desc in [
+      ('db','database','数据库','逻辑备份 · 物理备份 · 全量与增量'),
+      ('file','folder2-open','文件与 NAS','文件目录 · 归档 · 共享数据'),
+      ('obj','cloud-arrow-down','对象存储','OBS · OSS · COS · S3 · MinIO'),
+      ('vm','pc-display','虚拟机','整机还原 · 新虚拟机克隆')
+    ] %}
+    <button class="rc-type{% if key=='db' %} active{% endif %}" type="button" data-rc-type="{{ key }}" aria-pressed="{{ 'true' if key=='db' else 'false' }}">
+      <span class="rc-type-icon"><i class="bi bi-{{ icon }}"></i></span>
+      <span class="rc-type-copy"><strong>{{ title }}</strong><small>{{ desc }}</small></span><span class="rc-type-count" id="rcCount_{{ key }}">—</span>
+    </button>
+    {% endfor %}
   </div>
-  <button class="btn btn-outline-secondary btn-sm" onclick="loadRestoreForm()" title="刷新"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
-</div>
-
-<div class="page-card mb-3">
-  <form id="restoreForm" onsubmit="event.preventDefault();submitRestore();">
-    <!-- 恢复向导步骤条（与新建任务向导同款式，对标英方） -->
-    <div class="wiz-steps mb-3">
-      <div class="wiz-step active" onclick="document.getElementById('r_sec1').scrollIntoView({behavior:'smooth',block:'center'})"><span class="wiz-dot">1</span><span class="wiz-label">选择备份类型</span></div>
-      <div class="wiz-arrow"></div>
-      <div class="wiz-step" onclick="document.getElementById('r_sec2').scrollIntoView({behavior:'smooth',block:'center'})"><span class="wiz-dot">2</span><span class="wiz-label">选择备份记录</span></div>
-      <div class="wiz-arrow"></div>
-      <div class="wiz-step" onclick="document.getElementById('r_sec3').scrollIntoView({behavior:'smooth',block:'center'})"><span class="wiz-dot">3</span><span class="wiz-label">恢复参数&执行</span></div>
-    </div>
-    <!-- 步骤 1：选择备份类型 -->
-    <h6 class="border-bottom pb-2 mb-3" id="r_sec1"><i class="bi bi-1-circle"></i> 选择备份类型</h6>
-    <div class="row g-3 mb-3">
-      <div class="col-md-12">
-        <div class="btn-group btn-group-lg w-100" role="group">
-          <input type="radio" class="btn-check" name="r_type" id="r_type_db" value="db" checked onchange="onRestoreTypeChange()">
-          <label class="btn btn-outline-primary" for="r_type_db">
-            <i class="bi bi-database"></i> 数据库恢复 <span class="badge bg-secondary ms-2" id="r_db_count">0</span>
-          </label>
-          <input type="radio" class="btn-check" name="r_type" id="r_type_file" value="file" onchange="onRestoreTypeChange()">
-          <label class="btn btn-outline-success" for="r_type_file">
-            <i class="bi bi-folder2-open"></i> 文件恢复 <span class="badge bg-secondary ms-2" id="r_file_count">0</span>
-          </label>
-          <input type="radio" class="btn-check" name="r_type" id="r_type_obj" value="obj" onchange="onRestoreTypeChange()">
-          <label class="btn btn-outline-info" for="r_type_obj">
-            <i class="bi bi-cloud-arrow-down"></i> 对象存储恢复 <span class="badge bg-secondary ms-2" id="r_obj_count">0</span>
-          </label>
+  <div class="rc-warning d-none" id="rcLoadWarning" role="alert"></div>
+  <div class="rc-workspace">
+    <section class="rc-card rc-source">
+      <div class="rc-section-head"><div><span class="rc-step">01</span><h2>选择恢复点</h2></div><span class="rc-muted" id="rcRecordTotal">正在加载…</span></div>
+      <div class="rc-search"><i class="bi bi-search"></i><input id="rcSearch" class="form-control" aria-label="搜索恢复点" placeholder="搜索任务、主机、数据库或记录编号"><button class="btn btn-sm btn-light" id="rcSearchClear" title="清空搜索"><i class="bi bi-x-lg"></i></button></div>
+      <div id="rcRecords" class="rc-records" aria-live="polite"></div>
+      <div class="rc-pager"><span id="rcPageText">—</span><div><button id="rcPrev" class="btn btn-outline-secondary btn-sm" aria-label="上一页"><i class="bi bi-chevron-left"></i></button><button id="rcNext" class="btn btn-outline-secondary btn-sm" aria-label="下一页"><i class="bi bi-chevron-right"></i></button></div></div>
+      <div class="rc-evidence-note"><i class="bi bi-info-circle"></i><span>产物校验表示文件完整性检查，不等同于数据库或虚拟机已完成恢复验证。</span></div>
+    </section>
+    <section class="rc-card rc-target">
+      <div class="rc-section-head"><div><span class="rc-step">02</span><h2>配置恢复目标</h2></div><span class="rc-selection-dot" id="rcSelectionDot"></span></div>
+      <div id="rcTargetEmpty" class="rc-target-empty"><i class="bi bi-cursor"></i><h3>先选择一个恢复点</h3><p>目标参数会根据备份类型自动展示。</p></div>
+      <form id="rcForm" class="d-none">
+        <div class="rc-selected-summary" id="rcSelectedSummary"></div>
+        <div id="rcDbFields" class="rc-field-group d-none">
+          <label class="form-label" for="rcDbMode">恢复位置</label><select class="form-select" id="rcDbMode"><option value="same">源数据库实例</option><option value="remote">其他主机</option></select>
+          <label class="form-label" for="rcDatabase">目标数据库 / 实例</label><input id="rcDatabase" class="form-control" placeholder="留空表示恢复到源库"><div class="form-text">请核对目标库名，原位恢复可能覆盖现有数据。</div>
+          <div id="rcPitrFields" class="d-none"><label class="form-label" for="rcTargetTime">目标时间（PITR）</label><input id="rcTargetTime" class="form-control" placeholder="YYYY-MM-DD HH:MM:SS"><div class="form-text">留空恢复到最新；时间点须在备份日志覆盖范围内。</div></div>
         </div>
-      </div>
-    </div>
-
-    <!-- 步骤 2：选择备份记录 -->
-    <h6 class="border-bottom pb-2 mb-3" id="r_sec2"><i class="bi bi-2-circle"></i> 选择备份记录</h6>
-    <div class="row g-3 mb-3">
-      <div class="col-md-8">
-        <label class="form-label">搜索（业务系统名称 / IP）</label>
-        <input class="form-control" id="r_search" placeholder="输入业务系统名称或 IP 搜索（如 交易库 / 192.168.220.133）" oninput="filterRestoreRecords()"
-               onkeydown="if(event.key==='Enter'){event.preventDefault();filterRestoreRecords();}">
-      </div>
-      <div class="col-md-4">
-        <label class="form-label">备份记录 *</label>
-        <select class="form-select" id="r_record" required onchange="onRecordChange()" size="1"></select>
-      </div>
-    </div>
-    <!-- 选中记录卡片（替代原 alert-info 单行长文本） -->
-    <div class="row g-3 mb-3" id="r_record_info_row" style="display:none">
-      <div class="col-md-12">
-        <div class="restore-selected" id="r_record_card">
-          <div class="rs-head">
-            <i class="bi bi-check-circle-fill"></i>
-            <span id="rs_title">—</span>
-            <span class="ms-auto" id="rs_verified"></span>
-          </div>
-          <div class="rs-grid">
-            <div class="rs-item"><span class="rs-label">备份时间</span><span class="rs-value" id="rs_time">-</span></div>
-            <div class="rs-item"><span class="rs-label">文件大小</span><span class="rs-value" id="rs_size">-</span></div>
-            <div class="rs-item"><span class="rs-label">存储层</span><span class="rs-value" id="rs_tier">-</span></div>
-            <div class="rs-item"><span class="rs-label">源主机 / 库</span><span class="rs-value" id="rs_source">-</span></div>
-            <div class="rs-item"><span class="rs-label">记录号</span><span class="rs-value" id="rs_recno">-</span></div>
+        <div id="rcFileFields" class="rc-field-group d-none">
+          <label class="form-label" for="rcFileMode">恢复位置</label><select class="form-select" id="rcFileMode"><option value="local">平台本机</option><option value="remote">其他主机</option></select>
+          <label class="form-label" for="rcDirectory">目标恢复目录</label><input id="rcDirectory" class="form-control font-monospace" placeholder="/data/restore"><div class="form-text">建议使用独立目录，避免与现有文件混用。</div>
+        </div>
+        <div id="rcHostFields" class="rc-field-group d-none">
+          <label class="form-label" for="rcHost">目标主机</label><select id="rcHost" class="form-select"><option value="">直接输入主机信息</option></select>
+          <div id="rcDirectHost" class="rc-host-grid">
+            <input id="rcHostAddress" class="form-control" aria-label="主机地址" placeholder="IP / 主机名">
+            <input id="rcHostPort" type="number" min="1" max="65535" value="22" class="form-control" aria-label="SSH 端口">
+            <input id="rcHostUser" class="form-control" aria-label="SSH 用户" placeholder="SSH 用户">
+            <input id="rcHostPassword" type="password" class="form-control" aria-label="SSH 密码" placeholder="SSH 密码" autocomplete="off">
           </div>
         </div>
-      </div>
-    </div>
-
-    <!-- 步骤 3：恢复参数 -->
-    <h6 class="border-bottom pb-2 mb-3" id="r_sec3"><i class="bi bi-3-circle"></i> 恢复参数</h6>
-
-    <!-- ===== 数据库恢复模式选择 ===== -->
-    <div class="row g-3 mb-3" id="r_mode_db_row">
-      <div class="col-md-12">
-        <div class="form-check">
-          <input class="form-check-input" type="radio" name="r_mode" id="r_mode_same" value="same" checked onchange="onRestoreModeChange()">
-          <label class="form-check-label" for="r_mode_same">恢复到源任务（使用备份时的连接信息）</label>
+        <div id="rcObjectFields" class="rc-field-group d-none">
+          <label class="form-label" for="rcObjectConnection">目标存储连接</label><select id="rcObjectConnection" class="form-select"><option value="">使用备份任务的连接</option></select>
+          <label class="form-label" for="rcBucket">目标桶</label><input id="rcBucket" class="form-control font-monospace" placeholder="输入目标桶名称">
+          <label class="form-label" for="rcPrefix">目标前缀</label><input id="rcPrefix" class="form-control font-monospace" placeholder="例如 restored/"><div class="form-text">留空保留原始对象路径；可用独立前缀进行恢复演练。</div>
+          <label class="form-label" for="rcOverwrite">已有对象处理</label><select id="rcOverwrite" class="form-select"><option value="never">保留目标已存在的对象</option><option value="if_newer">按对象时间与内容判断</option><option value="always">覆盖目标已存在的对象</option></select>
+          <details class="rc-advanced"><summary>对象范围与高级选项</summary>
+            <label class="form-label" for="rcKeys">仅恢复指定对象</label><textarea id="rcKeys" class="form-control font-monospace" rows="3" placeholder="留空恢复全部对象；每行一个对象 key"></textarea>
+            <label class="form-check mt-3"><input id="rcCreateBucket" type="checkbox" class="form-check-input"><span class="form-check-label">目标桶不存在时尝试创建</span></label>
+            <label class="form-check mt-2"><input id="rcApplyDeleted" type="checkbox" class="form-check-input"><span class="form-check-label">同时回放备份中的删除标记</span></label>
+          </details>
         </div>
-        <div class="form-check">
-          <input class="form-check-input" type="radio" name="r_mode" id="r_mode_remote" value="remote" onchange="onRestoreModeChange()">
-          <label class="form-check-label" for="r_mode_remote">跨主机恢复（指定目标主机 + 库名）</label>
+        <div id="rcVmFields" class="rc-field-group d-none">
+          <label class="form-label" for="rcVmMode">恢复方式</label><select id="rcVmMode" class="form-select"><option value="clone">恢复为新虚拟机</option><option value="restore">还原原虚拟机</option></select>
+          <div id="rcVmCloneFields"><label class="form-label" for="rcVmName">新虚拟机名称</label><input id="rcVmName" class="form-control" placeholder="例如 recovery-app-01">
+            <label class="form-label" for="rcVmNode">目标节点</label><input id="rcVmNode" class="form-control" placeholder="留空使用原节点">
+            <label class="form-label" for="rcVmNetwork">网络名称 / 端口组</label><input id="rcVmNetwork" class="form-control" placeholder="按虚拟化平台填写">
+            <label class="form-check mt-3"><input id="rcVmIsolate" type="checkbox" checked class="form-check-input"><span class="form-check-label">隔离网络，避免影响生产虚拟机</span></label>
+            <label class="form-check mt-2"><input id="rcVmStart" type="checkbox" class="form-check-input"><span class="form-check-label">恢复完成后启动</span></label>
+          </div><div class="form-text" id="rcVmCapability">正在读取平台能力…</div>
         </div>
-      </div>
-    </div>
-
-    <!-- ===== 数据库恢复：目标库名（恢复到源任务时显示） ===== -->
-    <div class="row g-3 mb-3" id="r_db_same_row">
-      <div class="col-md-6">
-        <label class="form-label">目标库 / 实例</label>
-        <input class="form-control" id="r_target_db_same" placeholder="默认沿用备份中的库名">
-        <div class="form-text">恢复到源实例时，可指定新库名（部分数据库支持）</div>
-      </div>
-      <div class="col-md-6">
-        <label class="form-label">时点恢复 PITR（达梦物理备份）</label>
-        <input class="form-control" id="r_target_time" placeholder="YYYY-MM-DD HH:MM:SS，留空=恢复到最新">
-        <div class="form-text">达梦物理备份集 + 归档日志：恢复到指定时间点（默认还原到独立目录，不覆盖源库）</div>
-      </div>
-    </div>
-
-    <!-- ===== 数据库恢复：跨主机目标 ===== -->
-    <div class="row g-3 mb-3" id="r_db_remote_row" style="display:none">
-      <div class="col-md-12">
-        <div class="card bg-light">
-          <div class="card-body py-2">
-            <label class="form-label fw-bold">目标主机信息</label>
-            <div class="row g-2">
-              <div class="col-md-6">
-                <label class="form-label small">选择纳管主机</label>
-                <select class="form-select form-select-sm" id="r_db_target_host_sel">
-                  <option value="">— 选择已纳管 SSH 主机 —</option>
-                </select>
-              </div>
-              <div class="col-md-6 d-flex align-items-end">
-                <span class="text-muted small">或直接输入（无需纳管）:</span>
-              </div>
-            </div>
-            <div class="row g-2 mt-1">
-              <div class="col-md-4">
-                <input class="form-control form-control-sm" id="r_db_direct_host" placeholder="IP / 主机名">
-              </div>
-              <div class="col-md-2">
-                <input class="form-control form-control-sm" id="r_db_direct_port" placeholder="端口" value="22">
-              </div>
-              <div class="col-md-3">
-                <input class="form-control form-control-sm" id="r_db_direct_user" placeholder="SSH 用户" value="root">
-              </div>
-              <div class="col-md-3">
-                <input class="form-control form-control-sm" id="r_db_direct_password" type="password" placeholder="SSH 密码">
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-      <div class="col-md-6 mt-2">
-        <label class="form-label">目标库 / 实例</label>
-        <input class="form-control" id="r_target_db_remote" placeholder="指定目标数据库名">
-      </div>
-    </div>
-
-    <!-- ===== 对象存储恢复：目标桶 + 前缀 + 覆盖策略 + 颗粒级 key ===== -->
-    <div class="row g-3 mb-3" id="r_obj_row" style="display:none">
-      <div class="col-md-12">
-        <div class="alert alert-info py-2 mb-2 small">
-          <i class="bi bi-info-circle"></i>
-          对象存储恢复以「桶 + 前缀」为目标：可回写到原桶（回滚）、异桶（迁移）、
-          或指定前缀（并行演练）。支持颗粒级恢复——只回放指定对象 key。
-        </div>
-      </div>
-      <div class="col-md-4">
-        <label class="form-label">目标桶 *</label>
-        <input class="form-control font-monospace" id="r_obj_bucket" placeholder="留空=回写到源桶">
-        <div class="form-text">留空时回写到备份任务配置的源桶</div>
-      </div>
-      <div class="col-md-4">
-        <label class="form-label">目标前缀</label>
-        <input class="form-control font-monospace" id="r_obj_prefix" placeholder="如 restored/2026-09-19">
-        <div class="form-text">留空=保持原始 key 结构</div>
-      </div>
-      <div class="col-md-4">
-        <label class="form-label">覆盖策略</label>
-        <select class="form-select" id="r_obj_overwrite">
-          <option value="if_newer" selected>仅覆盖较新的对象（if_newer）</option>
-          <option value="always">总是覆盖（always）</option>
-          <option value="skip">跳过已存在（skip）</option>
-        </select>
-      </div>
-      <div class="col-md-8 mt-2">
-        <label class="form-label">颗粒级恢复：仅回放以下对象 key</label>
-        <textarea class="form-control font-monospace" id="r_obj_keys" rows="2"
-                  placeholder="留空=恢复全部对象；多个 key 用逗号或换行分隔，如 docs/a.txt,img/b.png"></textarea>
-      </div>
-      <div class="col-md-4 mt-2 d-flex align-items-end">
-        <div class="form-check">
-          <input class="form-check-input" type="checkbox" id="r_obj_apply_deleted">
-          <label class="form-check-label" for="r_obj_apply_deleted">
-            应用删除（备份后删除的对象在目标侧一并删除）
-          </label>
-        </div>
-      </div>
-    </div>
-
-    <!-- ===== 文件恢复：目标目录 + 目标主机 ===== -->
-    <div class="row g-3 mb-3" id="r_file_row" style="display:none">
-      <div class="col-md-6">
-        <label class="form-label">目标恢复目录 *</label>
-        <input class="form-control font-monospace" id="r_target_dir" placeholder="例: /data/restore 或 C:\restore">
-        <div class="form-text">tar.gz 将解压到此目录</div>
-      </div>
-      <div class="col-md-12 mt-2">
-        <div class="card bg-light">
-          <div class="card-body py-2">
-            <label class="form-label fw-bold">目标主机信息 *</label>
-            <div class="row g-2">
-              <div class="col-md-6">
-                <label class="form-label small">选择纳管主机</label>
-                <select class="form-select form-select-sm" id="r_file_target_host_sel">
-                  <option value="">— 选择已纳管 SSH 主机 —</option>
-                </select>
-              </div>
-              <div class="col-md-6 d-flex align-items-end">
-                <span class="text-muted small">或直接输入（无需纳管）:</span>
-              </div>
-            </div>
-            <div class="row g-2 mt-1">
-              <div class="col-md-4">
-                <input class="form-control form-control-sm" id="r_file_direct_host" placeholder="IP / 主机名">
-              </div>
-              <div class="col-md-2">
-                <input class="form-control form-control-sm" id="r_file_direct_port" placeholder="端口" value="22">
-              </div>
-              <div class="col-md-3">
-                <input class="form-control form-control-sm" id="r_file_direct_user" placeholder="SSH 用户" value="root">
-              </div>
-              <div class="col-md-3">
-                <input class="form-control form-control-sm" id="r_file_direct_password" type="password" placeholder="SSH 密码">
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="row g-3 mb-3">
-      <div class="col-md-4">
-        <label class="form-label">操作人</label>
-        <input class="form-control" id="r_operator" placeholder="可选">
-      </div>
-    </div>
-
-    <div class="col-12">
-      <button class="btn btn-warning" type="submit" id="r_submit_btn"><i class="bi bi-arrow-counterclockwise"></i> 执行恢复</button>
-      <span class="form-text ms-2 text-danger">⚠ 恢复会覆盖目标数据，请谨慎操作；跨主机恢复需确保目标有相应解压工具。</span>
-      <!-- 提交进度 / 结果状态条 -->
-      <div class="mt-3 d-none" id="r_progress_wrap">
-        <div class="progress" role="progressbar" aria-label="恢复进度">
-          <div class="progress-bar progress-bar-striped progress-bar-animated" style="width:100%"></div>
-        </div>
-        <div class="form-text mt-1" id="r_progress_text">正在提交恢复请求…</div>
-      </div>
-      <div class="alert py-2 mt-3 d-none" id="r_result_bar"></div>
-    </div>
-  </form>
-</div>
-
-<div class="page-card">
-  <h6 style="font-size:var(--font-size-base);font-weight:600;color:var(--text-primary);margin-bottom:var(--space-md)">恢复记录</h6>
-  <div class="table-responsive" style="flex:1">
-    <table class="table table-hover align-middle mb-0">
-      <thead><tr>
-        <th>#</th><th>记录ID</th><th>业务系统</th><th>备份类型</th><th>备份时间</th>
-        <th>恢复数据量</th>
-        <th>目标主机/目录</th><th>目标库</th>
-        <th>恢复开始</th><th>状态</th><th>操作人</th><th>说明</th>
-      </tr></thead>
-      <tbody id="restoreTable"></tbody>
-    </table>
+        <div class="rc-execute"><button id="rcPrecheck" type="button" class="btn btn-outline-secondary">恢复预检</button><button id="rcSubmit" type="submit" class="btn btn-primary"><i class="bi bi-arrow-counterclockwise"></i> 确认恢复方案</button></div>
+        <p class="rc-muted rc-execute-note">执行前将展示恢复点、目标和覆盖范围，请核对后确认。</p>
+      </form>
+    </section>
   </div>
+  <div id="rcResult" class="rc-result d-none" role="status"></div>
+  <section class="rc-card rc-history"><div class="rc-section-head"><div><i class="bi bi-clock-history"></i><h2>最近恢复作业</h2></div><button id="rcHistoryRefresh" class="btn btn-sm btn-light" title="刷新"><i class="bi bi-arrow-clockwise"></i></button></div>
+    <div class="table-responsive"><table class="table align-middle mb-0"><thead><tr><th>恢复对象</th><th>类型</th><th>目标位置</th><th>开始时间</th><th>状态</th><th>执行结果</th></tr></thead><tbody id="rcHistoryRows"></tbody></table></div>
+  </section>
+</div>
+<div class="modal fade" id="rcConfirm" tabindex="-1" aria-labelledby="rcConfirmTitle">
+  <div class="modal-dialog modal-dialog-centered"><div class="modal-content"><div class="modal-header"><h5 class="modal-title" id="rcConfirmTitle">核对恢复方案</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button></div><div class="modal-body" id="rcConfirmBody"></div><div class="modal-footer"><button class="btn btn-outline-secondary" data-bs-dismiss="modal">返回修改</button><button class="btn btn-primary" id="rcConfirmGo">开始恢复</button></div></div></div>
 </div>
 {% endblock %}
+{% block scripts %}<script src="/static/js/restore-center.js?v=2026112011"></script>{% endblock %}

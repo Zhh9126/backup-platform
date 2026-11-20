@@ -98,6 +98,7 @@ class DbRtCapture:
         self._state_lock: threading.RLock = threading.RLock()
         self._started: bool = False
         self._tick_count: int = 0
+        self._pending_segments: dict = {}  # retry publication before advancing the chain
         self._last_rpo_alert_ts: float = 0.0   # RPO 超限告警限频时间戳
 
         # 运行统计
@@ -476,13 +477,36 @@ class DbRtCapture:
     def _register_segments(self, segments: List[dict]) -> List[RecoveryPoint]:
         """把封存好的日志段登记为 ``db-log`` 恢复点。"""
         points: List[RecoveryPoint] = []
+        pending = self._pending_segments
         for seg in segments or []:
+            if seg.get("path"):
+                pending[seg["path"]] = dict(seg)
+        for path, seg in list(pending.items()):
             path = seg.get("path") or ""
             if not path or not os.path.isfile(path):
-                continue
-            size = int(seg.get("size") or 0)
+                self.last_error = "待登记日志段缺失，暂停发布后续恢复点"
+                self.consecutive_fail += 1
+                break
+            size = os.path.getsize(path)
             if size <= 0:
+                pending.pop(path, None)
                 continue  # 空段绝不入 journal（R9）
+            digest = db.sha256_file(path)
+            expected = seg.get("checksum") or ""
+            if expected and digest != db.normalize_sha256(expected):
+                self.last_error = "封存日志段 SHA256 不匹配，暂停发布后续恢复点"
+                self.consecutive_fail += 1
+                break
+            existing = db.query_one(
+                "SELECT id, checksum FROM recovery_journal WHERE task_id=? AND object_key=?",
+                (self.task_id, path))
+            if existing:
+                if existing.get("checksum") and digest != db.normalize_sha256(existing["checksum"]):
+                    self.last_error = "已登记日志段内容发生变化，暂停发布后续恢复点"
+                    self.consecutive_fail += 1
+                    break
+                pending.pop(path, None)
+                continue
             parent_id = self._resolve_parent_id()
             payload = {
                 "rp_kind": RP_DB_LOG,
@@ -493,7 +517,7 @@ class DbRtCapture:
                 "storage_tier": 1,
                 "object_key": path,
                 "size_bytes": size,
-                "checksum": seg.get("checksum") or "",
+                "checksum": digest,
                 "is_simulated": 1 if self.daemon.is_simulated else 0,
                 "message": f"日志段 {seg.get('name')}",
                 "retention_days": self.rt.log_retention_days,
@@ -505,7 +529,8 @@ class DbRtCapture:
                 self.consecutive_fail += 1
                 self.last_error = f"写入日志段恢复点失败: {exc}"
                 self.logger.error("[rt.cdc] task=%s %s", self.task_id, self.last_error)
-                continue
+                break  # retain this and later sealed segments for the next tick
+            pending.pop(path, None)
             with self._state_lock:
                 self.last_rp_id = point.id
                 self.last_rp_at = point.pit_at

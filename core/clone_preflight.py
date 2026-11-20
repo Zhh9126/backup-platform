@@ -77,6 +77,18 @@ def preflight(rec: dict, target_host: str = "127.0.0.1",
             else:
                 _check(checks, "source_artifact", True,
                        f"产物 {size} 字节: {os.path.basename(path)}")
+                expected = rec.get("checksum") or ""
+                if expected:
+                    from core import db
+                    digest = db.normalize_sha256(expected)
+                    if not digest or db.sha256_file(path) != digest:
+                        errors.append("源备份产物 SHA256 校验失败，禁止创建克隆")
+                        _check(checks, "source_checksum", False, "源产物校验值不匹配")
+                    else:
+                        _check(checks, "source_checksum", True, "源产物 SHA256 校验通过")
+                else:
+                    warnings.append("源备份缺少 SHA256 基线，无法证明产物完整性")
+
 
     # 3) 目标实例端口（显式给出才检查；未给时由 _launch_vdb 自行解析）
     if target_port:

@@ -602,6 +602,8 @@ class SynologyEngine(BackupEngine):
             elif (self.extra.get("synology_restore_to_nas") and cand.startswith("/")
                   and ".." not in cand.split("/")):
                 nas_path = cand
+        if kwargs.get("restore_to_nas") is False:
+            nas_path = ""
         if nas_path and not nas_path.startswith("/"):
             return BackupResult(False, BackupStatus.FAILED,
                                 message="DSM 恢复路径必须是绝对路径（如 /backup_restore/test）",

@@ -2181,18 +2181,49 @@ def create_recovery_point(data: dict) -> int:
     if row.get("parent_rp_id") in (0, "", None):
         row["parent_rp_id"] = None
 
-    existing = db.query_one(
-        "SELECT id FROM recovery_journal WHERE task_id=? AND object_key=?",
-        (row["task_id"], row["object_key"]))
-    if existing:
-        rp_id = int(existing["id"])
-        update_recovery_point(rp_id, row)
-        return rp_id
-
-    cols = list(row.keys())
-    sql = "INSERT INTO recovery_journal ({}) VALUES ({})".format(
-        ",".join(cols), ",".join("?" * len(cols)))
-    return db.execute(sql, tuple(row.values()))
+    # Allocation and idempotency must share one database transaction. A Python
+    # mutex cannot serialize capture workers in different server processes.
+    with db._write_lock:
+        conn = db.get_conn()
+        try:
+            if db.current_backend() == "sqlite":
+                conn.execute("BEGIN IMMEDIATE")
+            else:
+                # Stable parent row serializes writers of one task (PG/MySQL).
+                conn.execute("SELECT id FROM backup_tasks WHERE id=? FOR UPDATE",
+                             (row["task_id"],)).fetchone()
+            existing = conn.execute(
+                "SELECT id FROM recovery_journal WHERE task_id=? AND object_key=?",
+                (row["task_id"], row["object_key"])).fetchone()
+            if existing:
+                rp_id = int(existing["id"])
+                # Retries must not erase a previously verified/uploaded point
+                # with defaults for fields the caller did not send.
+                updates = {k: row[k] for k in data if k in _RJ_UPDATABLE}
+                if updates:
+                    conn.execute("UPDATE recovery_journal SET " +
+                                 ",".join(k+"=?" for k in updates) + " WHERE id=?",
+                                 tuple(updates.values()) + (rp_id,))
+            else:
+                if data.get("pit_seq") is None:
+                    latest = conn.execute(
+                        "SELECT MAX(pit_seq) AS m FROM recovery_journal "
+                        "WHERE task_id=? AND pit_at=?",
+                        (row["task_id"], row["pit_at"])).fetchone()
+                    row["pit_seq"] = int(latest["m"]) + 1 if latest["m"] is not None else 0
+                cols = list(row)
+                cur = conn.execute(
+                    "INSERT INTO recovery_journal ({}) VALUES ({})".format(
+                        ",".join(cols), ",".join("?" for _ in cols)),
+                    tuple(row.values()))
+                rp_id = cur.lastrowid
+            conn.commit()
+            return rp_id
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
 
 def get_recovery_point(rp_id: int) -> Optional[dict]:

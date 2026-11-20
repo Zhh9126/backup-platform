@@ -101,11 +101,9 @@ class LogRepository:
         try:
             os.close(fd)
             writer(tmp_path)
-            if os.path.exists(dest_path):
-                try:
-                    os.unlink(dest_path)
-                except OSError:
-                    pass  # Windows 上目标被占用时，交给 os.replace 再试一次
+            # Preserve the last valid generation if publication fails.
+            with open(tmp_path, "rb") as completed:
+                os.fsync(completed.fileno())
             os.replace(tmp_path, dest_path)
         except Exception:
             try:

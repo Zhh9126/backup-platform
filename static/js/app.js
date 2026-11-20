@@ -3458,6 +3458,7 @@
   }
 
   async function initRestore() {
+    if (window.RestoreCenter) return window.RestoreCenter.init();
     // 加载所有备份记录 + 任务信息 + SSH 纳管主机
     // /api/records/enriched 不下发 storage_tier / checksum，额外拉一次 /api/records 补齐
     // （两者同源于 backup_records，按 id 建索引即可，无需改后端）

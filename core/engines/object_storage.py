@@ -31,7 +31,7 @@ import shutil
 import tarfile
 import time
 
-from core import cancel as cancel_mod
+from core import cancel as cancel_mod, models
 from core.engines.base import (BackupEngine, BackupResult, BackupStatus,
                                BackupType)
 from core.objectstore import client as osc
@@ -440,7 +440,11 @@ class ObjectStorageEngine(BackupEngine):
         target_prefix = cfg.get("restore_prefix") if prefix_opt is None else prefix_opt
         overwrite = str(kwargs.get("overwrite") or cfg.get("restore_overwrite")
                         or "if_newer")
-        workers = max(1, int(kwargs.get("workers") or cfg.get("workers") or 8))
+        workers = max(1, min(32, int(kwargs.get("workers") or cfg.get("workers") or 8)))
+        if overwrite == "skip":
+            overwrite = "never"
+        if overwrite not in ("always", "if_newer", "never"):
+            return BackupResult(False, BackupStatus.FAILED, message="对象覆盖策略无效")
         apply_deleted = bool(kwargs.get("apply_deleted",
                                         cfg.get("restore_apply_deleted")))
         # 是否自动创建目标桶：恢复弹窗开关优先，缺省回退任务级 os_restore_create_bucket
@@ -453,7 +457,13 @@ class ObjectStorageEngine(BackupEngine):
             return BackupResult(False, BackupStatus.FAILED,
                                 message="未指定恢复目标桶")
         try:
-            cli = self._client()
+            if kwargs.get("target_task_id"):
+                target_task = models.get_task(int(kwargs["target_task_id"]), include_secret=True)
+                if not target_task or target_task.get("db_type") != "object_storage":
+                    raise ValueError("目标连接必须是对象存储备份任务")
+                cli = osp.client_from_task(target_task)
+            else:
+                cli = self._client()
         except Exception as e:
             return BackupResult(False, BackupStatus.FAILED,
                                 message="无法建立对象存储连接: %s" % e)
@@ -475,9 +485,10 @@ class ObjectStorageEngine(BackupEngine):
             return BackupResult(False, BackupStatus.FAILED,
                                 message="解析恢复链失败: %s" % e)
 
-        tmp_root = os.path.join(self.storage_root or ".",
-                                ".objrestore_%s_%s" % (self.task_id,
-                                                       time.strftime("%H%M%S")))
+        import tempfile
+        os.makedirs(self.storage_root or ".", exist_ok=True)
+        tmp_root = tempfile.mkdtemp(prefix=".objrestore_%s_" % self.task_id,
+                                    dir=self.storage_root or ".")
         written = skipped = failed = deleted_ok = 0
         failures: list[str] = []
         try:
@@ -501,6 +512,15 @@ class ObjectStorageEngine(BackupEngine):
                             obj["key"], obj.get("version_id") or ""))
                     if not os.path.exists(src):
                         failures.append("%s: 包内缺少对象数据" % obj["key"])
+                        failed += 1
+                        continue
+                    if (os.path.commonpath([os.path.realpath(src), os.path.realpath(extract)])
+                            != os.path.realpath(extract) or not os.path.isfile(src)):
+                        failures.append("%s: 包内对象路径无效" % obj["key"])
+                        failed += 1
+                        continue
+                    if obj.get("sha256") and osc.ObjectStoreClient.sha256_file(src) != obj["sha256"]:
+                        failures.append("%s: 对象 SHA256 校验失败" % obj["key"])
                         failed += 1
                         continue
                     key = obj["key"]
@@ -535,13 +555,32 @@ class ObjectStorageEngine(BackupEngine):
                             head = cli.head_object(target_bucket, key)
                             if overwrite == "never":
                                 return "skip", key
+                            if overwrite == "if_newer":
+                                from datetime import datetime, timezone
+                                from email.utils import parsedate_to_datetime
+                                def timestamp(value):
+                                    if not value:
+                                        return None
+                                    try:
+                                        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                                    except ValueError:
+                                        try:
+                                            moment = parsedate_to_datetime(str(value))
+                                        except (TypeError, ValueError):
+                                            return None
+                                    return moment.replace(tzinfo=timezone.utc) if moment.tzinfo is None else moment
+                                source_time = timestamp(obj.get("last_modified"))
+                                target_time = timestamp(head.get("last_modified"))
+                                if source_time and target_time and target_time > source_time:
+                                    return "skip", key
                             head_size = int(head["size"]) if head.get("size") is not None else -1
                             if overwrite == "if_newer" and head_size == _obj_size(obj) \
                                     and obj.get("etag") and \
                                     str(head.get("etag")) == str(obj.get("etag")):
                                 return "skip", key
-                        except osc.ObjectStoreError:
-                            pass
+                        except osc.ObjectStoreError as exc:
+                            if exc.status != 404 and exc.code not in ("NoSuchKey", "NotFound", "NoSuchObject"):
+                                return "fail", key + ": " + str(exc)
                     try:
                         cli.upload_file(target_bucket, key, src)
                         return "ok", key

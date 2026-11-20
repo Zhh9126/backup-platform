@@ -85,6 +85,20 @@ def _compute_expires(ttl_days: int) -> str:
     return (datetime.utcnow() + timedelta(days=ttl_days)).strftime("%Y-%m-%d %H:%M:%S")
 
 
+
+def _serialized_clone(action):
+    """Exclude conflicting lifecycle operations across web/scheduler processes."""
+    from functools import wraps
+    @wraps(action)
+    def guarded(self, request_id, *args, **kwargs):
+        rid = request_id.get("id") if isinstance(request_id, dict) else request_id
+        from core.operation_lease import operation_lease
+        with operation_lease("clone-request:%s" % int(rid)) as ensure_owned:
+            result = action(self, request_id, *args, **kwargs)
+            ensure_owned()
+            return result
+    return guarded
+
 class CloneService:
     """克隆服务：标准化克隆全生命周期管理。"""
 
@@ -308,6 +322,7 @@ class CloneService:
         return self.get_clone(request_id)
 
     # ------------------------- 销毁 -------------------------
+    @_serialized_clone
     def destroy_clone(self, request_id: int) -> dict:
         """手动销毁：释放 VDB 实例并置 deleted。"""
         req = self.get_clone(request_id)
@@ -320,12 +335,13 @@ class CloneService:
         self.logger.info("[clone] 请求 %s 已手动销毁", request_id)
         return self.get_clone(request_id)
 
+    @_serialized_clone
     def expire_clone(self, request_id: int) -> dict:
         """到期自动销毁：释放 VDB 实例并置 expired。"""
         req = self.get_clone(request_id)
         if not req:
             raise ValueError(f"克隆请求不存在: {request_id}")
-        if req["status"] not in (STATUS_READY, STATUS_CREATING):
+        if req["status"] != STATUS_READY:
             return req
         self._release_vdb(req)
         models.update_clone_request(request_id, {"status": STATUS_EXPIRED})
@@ -516,12 +532,20 @@ class CloneService:
         n = 0
         for r in rows:
             try:
-                models.update_clone_request(int(r["id"]), {
-                    "status": STATUS_FAILED,
-                    "note": ((r.get("note") or "") + "\n"
-                             "拉起超时（>%d 分钟未完成）：可能平台重启中断或目标实例过载，"
-                             "请核对目标实例上的 clone_* 库后重试或销毁" % minutes)[-800:]})
-                n += 1
+                # A large real restore can legitimately exceed 45 minutes.
+                # Only reclaim a stale creating row if no live provisioner owns it.
+                active = db.query_one(
+                    "SELECT expires_at FROM scheduler_leases WHERE name=?",
+                    ("clone-request:%s" % int(r["id"]),))
+                if active and float(active.get("expires_at") or 0) > __import__("time").time():
+                    continue
+                note = ((r.get("note") or "") + "\n"
+                        "拉起超时（>%d 分钟未更新且没有有效执行租约），"
+                        "请核对目标资源后重试或销毁" % minutes)[-800:]
+                n += db.execute_rowcount(
+                    "UPDATE clone_requests SET status=?, note=?, updated_at=? "
+                    "WHERE id=? AND status='creating' AND (updated_at IS NULL OR updated_at<?)",
+                    (STATUS_FAILED, note, db.now_iso(), int(r["id"]), cutoff))
             except Exception:  # noqa: BLE001
                 pass
         if n:
@@ -551,6 +575,7 @@ class CloneService:
         rest = re.sub(r"\[clone_mode=\w+\]|\[live_src=[^\]]+\]", "", note).strip()
         return (mode, src_db), rest
 
+    @_serialized_clone
     def _launch_vdb(self, req: dict) -> int:
         """按源库类型/克隆模式调用底层真实克隆引擎，并登记 VDB 实例。
 
@@ -908,6 +933,7 @@ class CloneService:
             return None
         return remote_dump.resolve_ssh_host(task)
 
+    @_serialized_clone
     def verify_clone(self, request_id: int) -> dict:
         """就绪校验：连接克隆库执行探活 + 统计表数量。"""
         req = models.get_clone_request(request_id, include_secret=True)
@@ -1034,6 +1060,7 @@ class CloneService:
             "SELECT * FROM vdb_snapshots WHERE clone_request_id=? "
             "AND status!='deleted' ORDER BY id DESC", (request_id,)) or [])]
 
+    @_serialized_clone
     def create_snapshot(self, request_id: int, name: str = "",
                         created_by: str = "", kind: str = "auto") -> dict:
         """对就绪 VDB 做一次快照。
@@ -1098,6 +1125,7 @@ class CloneService:
             self.logger.warning("[clone] 快照保留策略执行失败（忽略）: %s", e)
         return self._snapshot_row(sid)
 
+    @_serialized_clone
     def rollback_snapshot(self, request_id: int, snapshot_id: int,
                           drop_new_tables: bool = True,
                           operator: str = "") -> dict:
@@ -1132,6 +1160,7 @@ class CloneService:
                       res.get("message")))
         return {**res, "snapshot_id": snapshot_id, "snap_kind": kind}
 
+    @_serialized_clone
     def reclone_snapshot(self, request_id: int, snapshot_id: int,
                          target_env: str = "", requested_by: str = "",
                          operator: str = "") -> dict:
@@ -1183,6 +1212,7 @@ class CloneService:
                 "vdb_instance_id": vdb_id, "snapshot_id": snapshot_id,
                 "applied": applied}
 
+    @_serialized_clone
     def delete_snapshot(self, request_id: int, snapshot_id: int,
                         operator: str = "", purge: bool = False) -> dict:
         """删除快照。

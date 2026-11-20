@@ -855,7 +855,8 @@ def _execute_backup_core(task: dict, bt, operator: str = None) -> dict:
 # 对象存储恢复的可选参数白名单（由「数据恢复 → 对象存储恢复」表单提交）。
 # 走白名单而不是整体 **kwargs 展开，避免把对象存储专有参数误传给其它引擎。
 _OBJ_RESTORE_KEYS = ("target_bucket", "target_prefix", "overwrite",
-                     "apply_deleted", "restore_keys")
+                     "apply_deleted", "restore_keys", "create_bucket", "target_task_id",
+                     "restore_to_nas", "target_nas_path")
 
 
 class RestorePrecheckBlocked(ValueError):
@@ -1153,6 +1154,10 @@ def run_restore_now(record_id: int, target_host: str = None,
             raise ValueError(
                 f"备份记录 {record_id} 所属任务 {rec.get('task_id')} 缺少数据库类型"
                 "（任务数据异常或已被异常修改），无法恢复")
+        task = dict(task)
+        if rec.get("backup_mode") in ("physical", "logical", "hot_copy"):
+            # The artifact's recorded mode takes precedence over a task edited after backup.
+            task["backup_mode"] = rec["backup_mode"]
         engine = get_engine(task["db_type"], task, config.BACKUP_ROOT, _logger)
         op.info("恢复引擎: %s", engine.__class__.__name__)
         # 任务级自定义环境变量：注入本机执行与所有远程 SSH 命令
@@ -1248,6 +1253,11 @@ def run_restore_now(record_id: int, target_host: str = None,
          restored.get("size_bytes"),
          db.now_iso() if restored.get("ok") else None,
          restored.get("note") or None, rid))
+    if task.get("db_type") == "object_storage" and restore_options:
+        destination = restore_options.get("target_bucket") or ""
+        prefix = restore_options.get("target_prefix") or ""
+        db.execute("UPDATE restore_records SET target_db=? WHERE id=?",
+                   (destination + ("/" + prefix.lstrip("/") if prefix else ""), rid))
     db.add_log("INFO" if result.success else "ERROR", "scheduler",
                f"restore record={record_id} -> {status}",
                task_id=rec["task_id"], record_id=record_id,

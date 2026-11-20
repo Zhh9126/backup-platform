@@ -57,6 +57,7 @@ SEGMENT_PERMS = {
     "bw-broker": "backup.storage.manage",
     "chunk-store": "backup.storage.manage",
     "sandbox": "backup.task.manage",
+    "nas": "backup.storage.manage",
     "lifecycle": "backup.storage.manage",
     "dedup": "backup.storage.manage",
     "tape": "backup.storage.manage",

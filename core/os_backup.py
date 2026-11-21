@@ -167,15 +167,22 @@ def create_remote_backup(host,source_root,label="",excludes=None):
     import shlex,uuid
     from core import remote_dump
     host=dict(host or {});source=str(source_root or "").strip()
-    if not source or not source.startswith("/"): raise ValueError("远程源目录必须是绝对路径")
+    if not source or not source.startswith("/"): raise ValueError("远程源路径必须是绝对路径")
     name="aidbm-os-"+uuid.uuid4().hex+".tar.gz";remote="/tmp/"+name
     local_root=_root();local_root.mkdir(parents=True,exist_ok=True);local=local_root/name
-    args=["tar","--numeric-owner","--xattrs","--acls","-czf",remote,"-C",source]
+    source_is_file=False
+    probe=remote_dump.remote_exec_capture(host,"test -f "+shlex.quote(source)+" && echo FILE || echo DIR",timeout=30)
+    source_is_file=(probe.get("returncode")==0 and probe.get("stdout","").strip()=="FILE")
+    if source_is_file:
+        parent,entry=os.path.dirname(source) or "/",os.path.basename(source)
+        args=["tar","--numeric-owner","--xattrs","--acls","-czf",remote,"--transform=s,^,files/,","-C",parent,entry]
+    else:
+        args=["tar","--numeric-owner","--xattrs","--acls","-czf",remote,"--transform=s,^,files/,","-C",source]
     for item in (excludes or _DEFAULT_EXCLUDES):
         raw=str(item).strip()
         if raw.startswith("/"): raw=raw[1:]
         if raw: args.append("--exclude="+raw)
-    args.append(".")
+    if not source_is_file: args.append(".")
     command=" ".join(shlex.quote(x) for x in args)
     result=remote_dump.remote_exec_capture(host,command,timeout=7200)
     if result.get("returncode")!=0: raise ValueError("远程 OS 归档失败: "+(result.get("stderr") or result.get("stdout") or "")[-800:])

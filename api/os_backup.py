@@ -12,7 +12,13 @@ def os_records():
 def os_backup_now():
     try:
         b=request.get_json(silent=True) or {};hid=b.get("host_id")
-        if hid:
+        direct=b.get("ssh_cred") or {}
+        if direct.get("hostname") or direct.get("host"):
+            host=dict(direct);host["hostname"]=host.get("hostname") or host.get("host")
+            host["host_key"]="%s@%s:%s"%(host.get("username") or "root",host["hostname"],int(host.get("port") or 22))
+            host["auth_type"]="password"
+            result=os_backup.create_remote_backup(host,b.get("source_root"),b.get("label",""),b.get("excludes"))
+        elif hid:
             h=ssh_hosts.get_host(int(hid),include_secret=True)
             if not h:return jsonify(ok=False,error="SSH 主机不存在"),404
             result=os_backup.create_remote_backup(h,b.get("source_root"),b.get("label",""),b.get("excludes"))

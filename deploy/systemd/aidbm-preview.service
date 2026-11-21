@@ -1,0 +1,19 @@
+[Unit]
+Description=AIDBM backup platform on port 8080
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/backup-platform-private
+Environment=PYTHONUNBUFFERED=1
+Environment=WEB_HOST=0.0.0.0
+Environment=WEB_PORT=8080
+Environment=DEMO_MODE=off
+ExecStart=/root/backup-platform-private/.venv/bin/python /root/backup-platform-private/run.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

@@ -5,7 +5,7 @@ system directories over the existing SSH/local channel. It never installs an
 agent and never extracts an archive outside the requested destination.
 """
 from __future__ import annotations
-import hashlib,json,os,re,shutil,tarfile,tempfile
+import hashlib,json,os,re,shutil,tarfile,tempfile,subprocess
 from pathlib import Path
 from core import db
 
@@ -35,6 +35,18 @@ def init_schema(conn):
       file_count INTEGER DEFAULT 0, checksum TEXT DEFAULT '', created_at TEXT NOT NULL,
       finished_at TEXT DEFAULT '', message TEXT DEFAULT '', manifest_json TEXT DEFAULT '')""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_os_backup_time ON os_backup_records(created_at)")
+
+def _system_metadata():
+    def run(cmd):
+        try:
+            return subprocess.run(cmd,shell=True,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=20).stdout[-200000:]
+        except Exception as exc: return "unavailable: "+str(exc)
+    fstab=""
+    try: fstab=Path("/etc/fstab").read_text(errors="replace")
+    except Exception: pass
+    return {"uname":run("uname -a"),"lsblk":run("lsblk -e7 -J -o NAME,KNAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,UUID,PARTUUID"),
+            "blkid":run("blkid"),"boot_mode":"UEFI" if Path("/sys/firmware/efi").exists() else "BIOS",
+            "fstab":fstab,"boot_files":sorted(str(x) for x in Path("/boot").glob("*") if x.is_file())[:500]}
 
 def _manifest_files(source,excludes):
     source=source.resolve(); excluded={str(Path(x).resolve()) for x in excludes}
@@ -66,8 +78,8 @@ def create_backup(source_root,label="",excludes=None):
                 size=info.size;total+=size
                 files.append({"path":rel,"size_bytes":size,"sha256":_sha(path)})
                 if len(files)>_MAX_MEMBERS: raise ValueError("文件数量超过安全上限")
-            manifest={"format":"aidbm-os-v1","source_root":str(source),"file_count":len(files),
-                      "total_bytes":total,"created_at":db.now_iso(),"files":files}
+            manifest={"format":"aidbm-os-v2","scope":"full_system","source_root":str(source),"file_count":len(files),
+                      "total_bytes":total,"created_at":db.now_iso(),"files":files,"system_metadata":_system_metadata()}
             raw=json.dumps(manifest,ensure_ascii=False,sort_keys=True).encode()
             info=tarfile.TarInfo("manifest.json");info.size=len(raw);tf.addfile(info,__import__("io").BytesIO(raw))
         checksum=_sha(tmp)
@@ -94,7 +106,7 @@ def _load_archive(path):
         man=tf.extractfile("manifest.json") if any(m.name=="manifest.json" for m in members) else None
         if not man: raise ValueError("归档缺少 manifest.json")
         manifest=json.loads(man.read().decode("utf-8"))
-    if manifest.get("format")!="aidbm-os-v1": raise ValueError("不支持的操作系统备份格式")
+    if manifest.get("format") not in ("aidbm-os-v1","aidbm-os-v2"): raise ValueError("不支持的操作系统备份格式")
     return path,manifest
 
 def restore_backup(archive_path,target_root,dry_run=True,confirm=False):

@@ -46,3 +46,8 @@ def test_label_with_slash_is_safe_filename(env):
  result=os_backup.create_backup(str(src),"本机/etc真实备份验证",[])
  assert "/" not in Path(result["archive_path"]).name
  assert Path(result["archive_path"]).is_file()
+
+def test_system_backup_metadata_contract(env):
+ from core.os_backup import _system_metadata
+ meta=_system_metadata()
+ assert set(("uname","lsblk","blkid","boot_mode","fstab","boot_files")) <= set(meta)

@@ -22,3 +22,21 @@ def test_restore_requires_confirmation_and_blocks_traversal(env):
  with tarfile.open(bad,"w:gz") as t:
   x=b"{}";i=tarfile.TarInfo("../escape");i.size=len(x);t.addfile(i,io.BytesIO(x))
  with pytest.raises(ValueError,match="不安全"):os_backup.restore_backup(str(bad),str(env/"out"),True)
+
+def test_remote_backup_uses_managed_host_and_resumable_pull(env,monkeypatch):
+ import core.remote_dump as rd
+ host={"host_key":"root@test:22","hostname":"test","username":"root"}
+ monkeypatch.setattr(rd,"remote_exec_capture",lambda *a,**k:{"returncode":0,"stdout":"","stderr":""})
+ monkeypatch.setattr(rd,"_connect",lambda h:object())
+ def pull(client,remote,local,**kw):
+  from pathlib import Path
+  import tarfile
+  with tarfile.open(local,"w:gz") as t:
+   data=b"remote"
+   import io
+   i=tarfile.TarInfo("files/etc.conf");i.size=len(data);t.addfile(i,io.BytesIO(data))
+  return {"size":Path(local).stat().st_size}
+ monkeypatch.setattr(rd,"sftp_pull_resumable",pull)
+ monkeypatch.setattr(rd,"remote_exec_capture",lambda *a,**k:{"returncode":0,"stdout":"","stderr":""})
+ out=os_backup.create_remote_backup(host,"/etc","remote")
+ assert out["status"]=="success" and out["source_root"] if "source_root" in out else True

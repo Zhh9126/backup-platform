@@ -136,3 +136,59 @@ def restore_backup(archive_path,target_root,dry_run=True,confirm=False):
 
 def list_records(limit=100):
     return db.query("SELECT id,label,source_root,archive_path,status,size_bytes,file_count,checksum,created_at,finished_at,message FROM os_backup_records ORDER BY id DESC LIMIT ?",(max(1,min(500,int(limit))),))
+
+def _archive_manifest(path):
+    files=[];total=0
+    with tarfile.open(path,"r:*") as tf:
+        members=[m for m in tf.getmembers() if m.name.startswith("files/") and m.isfile()]
+        for m in members:
+            rel=_safe_rel(m.name[6:]);src=tf.extractfile(m);h=hashlib.sha256()
+            while src:
+                block=src.read(1024*1024)
+                if not block: break
+                h.update(block)
+            files.append({"path":rel,"size_bytes":m.size,"sha256":h.hexdigest()});total+=m.size
+    return {"format":"aidbm-os-v1","source_root":"","file_count":len(files),
+            "total_bytes":total,"created_at":db.now_iso(),"files":files}
+
+def _register_archive(path,label,source_root,manifest=None):
+    path=Path(path);manifest=manifest or _archive_manifest(path)
+    manifest["source_root"]=str(source_root);checksum=_sha(path)
+    rid=db.execute("INSERT INTO os_backup_records(label,source_root,archive_path,status,size_bytes,file_count,checksum,created_at,finished_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+      (label or "os",str(source_root),str(path),"success",path.stat().st_size,manifest["file_count"],checksum,manifest["created_at"],db.now_iso(),"远程操作系统备份完成",json.dumps(manifest,ensure_ascii=False)))
+    return {"id":rid,"status":"success","archive_path":str(path),"checksum":checksum,
+            "file_count":manifest["file_count"],"size_bytes":path.stat().st_size,"manifest":manifest}
+
+def create_remote_backup(host,source_root,label="",excludes=None):
+    """Create a tar on a managed Linux host and pull it with resumable SFTP.
+    No package or agent is installed on the target."""
+    import shlex,uuid
+    from core import remote_dump
+    host=dict(host or {});source=str(source_root or "").strip()
+    if not source or not source.startswith("/"): raise ValueError("远程源目录必须是绝对路径")
+    name="aidbm-os-"+uuid.uuid4().hex+".tar.gz";remote="/tmp/"+name
+    local_root=_root();local_root.mkdir(parents=True,exist_ok=True);local=local_root/name
+    args=["tar","--numeric-owner","--xattrs","--acls","-czf",remote,"-C",source]
+    for item in (excludes or _DEFAULT_EXCLUDES):
+        raw=str(item).strip()
+        if raw.startswith("/"): raw=raw[1:]
+        if raw: args.append("--exclude="+raw)
+    args.append(".")
+    command=" ".join(shlex.quote(x) for x in args)
+    result=remote_dump.remote_exec_capture(host,command,timeout=7200)
+    if result.get("returncode")!=0: raise ValueError("远程 OS 归档失败: "+(result.get("stderr") or result.get("stdout") or "")[-800:])
+    client=None
+    try:
+        client=remote_dump._connect(host)
+        pulled=remote_dump.sftp_pull_resumable(client,remote,str(local),
+          task={"id":0,"extra_options":{"transfer_resume":True,"transfer_retry_max":3}},
+          host_key=host.get("host_key") or "",db_type="os",label=label or source)
+        if int(pulled.get("size") or 0)<=0: raise ValueError("远程 OS 归档为空")
+        return _register_archive(local,label or source,host.get("host_key") or host.get("hostname") or source)
+    finally:
+        try:
+            remote_dump.remote_exec_capture(host,"rm -f "+shlex.quote(remote),timeout=60)
+        except Exception: pass
+        try:
+            if client: client.close()
+        except Exception: pass

@@ -484,3 +484,29 @@ class RecoveryJournal:
                     "reason": f"间隔 {int(delta)}s 超过正常节奏（约 {int(median)}s）的 3 倍",
                 })
         return gaps
+
+    def integrity(self, task_id: int, limit: int = 10000) -> dict:
+        """Independent publication audit used by the health page and preflight.
+        It never mutates capture state and explicitly reports truncation."""
+        task_id=int(task_id); total=self.count(task_id)
+        points=self.list_points(task_id,limit=max(1,min(10000,int(limit))),order="asc")
+        issues=[];seen=set()
+        for p in points:
+            key=(p.pit_at,p.pit_seq)
+            if key in seen: issues.append("恢复点序号重复: %s#%s"%key)
+            seen.add(key)
+            if not p.object_key or not os.path.isfile(p.object_key):
+                issues.append("产物缺失: %s"%p.id);continue
+            try:
+                if p.checksum and db.sha256_file(p.object_key)!=db.normalize_sha256(p.checksum):
+                    issues.append("SHA256不匹配: %s"%p.id)
+            except OSError as exc: issues.append("产物不可读 %s: %s"%(p.id,exc))
+        if points:
+            try:
+                ok,reason=self.validate_chain(points)
+                if not ok: issues.append(reason or "恢复链校验失败")
+            except Exception as exc: issues.append("恢复链校验异常: %s"%exc)
+        return {"task_id":task_id,"status":"failed" if issues else "passed",
+                "points_checked":len(points),"points_total":total,
+                "truncated":total>len(points),"issues":issues[:100],
+                "verified_at":db.now_iso()}

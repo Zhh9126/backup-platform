@@ -40,6 +40,7 @@ SEGMENT_PERMS = {
     # 备份管理
     "tasks": "backup.task.manage",
     "test-records": "system.settings",
+    "os-backup": "backup.task.manage",
     # 源端资源保护配置（阈值/开关）属系统级设置
     "source-guard": "system.settings",
     # 无备份目录扫描恢复（pull 会拉回数据，按任务管理权限校验）

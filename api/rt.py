@@ -512,3 +512,13 @@ def rt_orphans_purge():
         return jsonify({"ok": True, "data": res})
     except Exception as exc:
         return _fail(f"清理孤儿数据失败: {exc}", 500)
+
+@api_bp.route("/rt/integrity", methods=["GET"])
+@login_required
+def rt_integrity():
+    try:
+        task_id=_int_arg("task_id",0)
+        if task_id<=0: return _fail("task_id 必须为正整数")
+        return jsonify(ok=True, result=rt_backup.get_pitr().journal.integrity(task_id,_int_arg("limit",10000)))
+    except Exception as exc:
+        return _fail("实时恢复链完整性校验失败: %s"%exc,500)

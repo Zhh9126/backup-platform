@@ -2472,6 +2472,8 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
 
             from core.test_records import init_schema as init_acceptance_schema
             init_acceptance_schema(conn)
+            from core.os_backup import init_schema as init_os_backup_schema
+            init_os_backup_schema(conn)
 
             conn.commit()
         finally:

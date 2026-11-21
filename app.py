@@ -694,6 +694,11 @@ def create_app() -> Flask:
         """备份依赖插件管理（一键安装 xtrabackup / percona / mariabackup / pgbackrest 等）。"""
         return render_template("plugins.html", page="plugins")
 
+    @app.route("/os-backup")
+    @login_required
+    def os_backup_page():
+        return render_template("os_backup.html", page="os_backup")
+
     @app.route("/test-records")
     @login_required
     def test_records_page():

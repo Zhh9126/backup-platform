@@ -265,6 +265,16 @@ class PITRRestore:
     def restore(self, task_id: int, target_ts: str = "", target: dict = None,
                 operator: str = "", dry_run: bool = False,
                 force: bool = False) -> dict:
+        """串行执行同一任务的 PITR，避免并发覆盖同一目标库/目录。"""
+        from core.operation_lease import operation_lease
+        with operation_lease("rt-pitr:%s" % int(task_id), ttl=300) as ensure_owned:
+            result = self._restore_locked(task_id, target_ts, target, operator, dry_run, force)
+            ensure_owned()
+            return result
+
+    def _restore_locked(self, task_id: int, target_ts: str = "", target: dict = None,
+                        operator: str = "", dry_run: bool = False,
+                        force: bool = False) -> dict:
         """执行 PITR 恢复。
 
         Args:

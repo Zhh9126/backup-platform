@@ -5,7 +5,7 @@ system directories over the existing SSH/local channel. It never installs an
 agent and never extracts an archive outside the requested destination.
 """
 from __future__ import annotations
-import hashlib,json,os,shutil,tarfile,tempfile
+import hashlib,json,os,re,shutil,tarfile,tempfile
 from pathlib import Path
 from core import db
 
@@ -70,7 +70,9 @@ def create_backup(source_root,label="",excludes=None):
                       "total_bytes":total,"created_at":db.now_iso(),"files":files}
             raw=json.dumps(manifest,ensure_ascii=False,sort_keys=True).encode()
             info=tarfile.TarInfo("manifest.json");info.size=len(raw);tf.addfile(info,__import__("io").BytesIO(raw))
-        checksum=_sha(tmp);name=(label.strip() or "os")+"_"+stamp+".tar.gz"
+        checksum=_sha(tmp)
+        safe_label=re.sub(r"[^A-Za-z0-9_.-]+","_",label.strip() or "os").strip("._") or "os"
+        name=safe_label+"_"+stamp+".tar.gz"
         dest=root/name;os.replace(tmp,dest)
         rid=db.execute("INSERT INTO os_backup_records(label,source_root,archive_path,status,size_bytes,file_count,checksum,created_at,finished_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
           (label.strip() or "os",str(source),str(dest),"success",dest.stat().st_size,len(files),checksum,manifest["created_at"],db.now_iso(),"操作系统备份完成",json.dumps(manifest,ensure_ascii=False)))

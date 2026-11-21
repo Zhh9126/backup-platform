@@ -35,3 +35,5 @@
 @media(max-width:800px){.rc-workspace{grid-template-columns:1fr}.rc-target-empty{padding:45px var(--space-lg)}}
 .rc-workspace { align-items: start; }
 .rc-target { align-self: start; }
+.rc-shell { width:100%; }
+.rc-workspace { grid-template-columns: minmax(0,1fr) minmax(0,1fr); }

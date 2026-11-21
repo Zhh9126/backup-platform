@@ -40,3 +40,9 @@ def test_remote_backup_uses_managed_host_and_resumable_pull(env,monkeypatch):
  monkeypatch.setattr(rd,"remote_exec_capture",lambda *a,**k:{"returncode":0,"stdout":"","stderr":""})
  out=os_backup.create_remote_backup(host,"/etc","remote")
  assert out["status"]=="success" and out["source_root"] if "source_root" in out else True
+
+def test_label_with_slash_is_safe_filename(env):
+ src=env/"src";src.mkdir();(src/"x").write_text("x")
+ result=os_backup.create_backup(str(src),"本机/etc真实备份验证",[])
+ assert "/" not in Path(result["archive_path"]).name
+ assert Path(result["archive_path"]).is_file()

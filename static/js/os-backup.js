@@ -1,6 +1,6 @@
 (function(){
  const $=id=>document.getElementById(id), esc=v=>String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
- let rows=[]; async function loadHosts(){try{const r=await fetch("/api/hosts",{credentials:"same-origin"}),items=await r.json();$("osHost").innerHTML="<option value="">本机</option>"+(items||[]).map(x=>"<option value=""+x.id+"">"+esc(x.name||x.host_key)+"</option>").join("")}catch(e){}}
+ let rows=[]; async function loadHosts(){try{const r=await fetch("/api/hosts",{credentials:"same-origin"}),items=await r.json();$("osHost").innerHTML='<option value="">本机</option>'+(items||[]).map(x=>'<option value="'+x.id+'">'+esc(x.name||x.host_key)+'</option>').join("")}catch(e){}}
  async function api(path,opt){const r=await fetch(path,Object.assign({credentials:"same-origin",headers:{"Content-Type":"application/json"}},opt||{}));const d=await r.json();if(!r.ok||d.ok===false)throw Error(d.error||"请求失败");return d}
  async function load(){const d=await api("/api/os-backup/records"),items=d.items||[];rows=items;$("osRows").innerHTML=items.length?items.map((x,i)=>"<tr><td>"+esc(x.label)+"</td><td>"+esc(x.source_root)+"</td><td>"+esc(x.status)+"</td><td>"+(x.file_count||0)+"</td><td>"+(x.size_bytes||0)+"</td><td class='small'>"+esc(x.checksum)+"</td><td><button class='btn btn-sm btn-outline-primary' data-os='"+i+"'>恢复</button></td></tr>").join(""):"<tr><td colspan=7>暂无操作系统备份记录</td></tr>"}
  $("osRefresh").onclick=load;

@@ -6,4 +6,4 @@
 <div class="page-card p-3"><h5>操作系统备份记录</h5><div class="table-responsive"><table class="table align-middle"><thead><tr><th>名称</th><th>源目录</th><th>状态</th><th>文件数</th><th>大小</th><th>SHA256</th><th>操作</th></tr></thead><tbody id="osRows"></tbody></table></div></div>
 <div class="modal fade" id="osRestoreModal"><div class="modal-dialog"><div class="modal-content"><div class="modal-header"><h5>恢复操作系统文件</h5></div><div class="modal-body"><input type="hidden" id="osArchive"><label class="form-label">目标目录</label><input class="form-control" id="osTarget" value="/tmp/aidbm-os-restore"><div class="form-text">先预览校验，确认后恢复到目标目录。</div><pre class="small bg-light p-2 mt-2" id="osPlan"></pre></div><div class="modal-footer"><button class="btn btn-outline-secondary" id="osPlanBtn">预览校验</button><button class="btn btn-warning" id="osRestoreBtn">确认恢复</button></div></div></div></div>
 {% endblock %}
-{% block scripts %}<script src="{{ url_for('static', filename='js/os-backup.js') }}?v=2026112101"></script>{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/os-backup.js') }}?v=2026112102"></script>{% endblock %}

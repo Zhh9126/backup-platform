@@ -1664,7 +1664,7 @@ window.I18N = (function () {
     "本机填 127.0.0.1": "Use 127.0.0.1 for the local host",
     "资产路径（逗号或换行分隔，须为绝对路径）": "Asset paths (comma or newline separated, absolute paths)",
     "平台还没有任何备份任务。AI 资产（模型权重目录、训练数据集、配置清单）可直接在这里建一个文件类备份任务：点「新建资产备份任务」填路径即可；数据库 / 向量库资产请先到「数据库备份」创建任务，再回来编组。": "No backup tasks yet. For AI assets (model weight directories, datasets, config manifests) you can create a file backup task right here: click \"Create asset backup task\" and fill in the paths; for database / vector-store assets, create the task under \"Database backup\" first, then come back to group them.",
-    "NAS存储": "NAS storage",
+    "NAS备份": "NAS Backup",
     "NAS 存储：群晖 DSM 设备探活 / 共享文件夹资产 / 全量+增量备份 / 恢复到 DSM 目录": "NAS storage: Synology DSM device probe / shared-folder assets / full+incremental backup / restore to a DSM directory",
     "INSERT INTO t_users(id,name,phone,id_card,email) VALUES (1,'张三','13812341234','110101199003074872','zhangsan@example.com');": "INSERT INTO t_users(id,name,phone,id_card,email) VALUES (1,'ZhangSan','13812341234','110101199003074872','zhangsan@example.com');",
     "IP / 主机名": "IP / hostname",
@@ -4869,6 +4869,9 @@ window.I18N = (function () {
 
   // 动态模式：整段文本按正则翻译（数字/变量混排）
   var PATTERNS = [
+    [/^请求失败（HTTP (\d+)）$/, "Request failed (HTTP $1)"],
+    [/^校验通过：共 (\d+) 个文件，目标目录 (.+)$/, "Verification passed: $1 files, target $2"],
+    [/^恢复任务已提交（记录 #(\d+)），完成后可在下方记录列表查看结果。$/, "Restore job submitted (record #$1); check the list below for the result."],
     [/^共 (\d+) 条 · 第 (\d+)\/(\d+) 页 · 每页 (\d+) 条$/, "Total $1 · Page $2/$3 · $4 per page"],
     // 含服务端插值的动态文案（渲染后数值/客户名已代入）
     // 品牌设置：侧栏品牌名可自定义，title 属性拼接了固定副标题
@@ -5199,6 +5202,90 @@ window.I18N = (function () {
         setLang(lang === "zh" ? "en" : "zh");
       });
     }
+  });
+
+  // 2026-11-21 操作系统备份页新增文案
+  Object.assign(EN, {
+    "Agentless Linux 整机系统保护 · 系统盘/引导/配置元数据 · 安全恢复准备": "Agentless Linux whole-system protection · system disk / boot / config metadata · safe recovery preparation",
+    "例如 192.168.109.130": "e.g. 192.168.109.130",
+    "保护范围": "Protection scope",
+    "先预览校验，确认后恢复到目标系统根目录。": "Preview and verify first, then restore to the target system root.",
+    "其他机器": "Other machine",
+    "备份主机": "Backup host",
+    "备份源（绝对路径）": "Backup source (absolute path)",
+    "已纳管 SSH 主机（可选）": "Managed SSH host (optional)",
+    "手工填写连接地址": "Enter connection details manually",
+    "操作系统备份": "Operating system backup",
+    "整机保护默认排除 proc、sys、dev、run、tmp 等运行时目录，同时保存磁盘布局、引导配置和系统清单。完整裸机恢复需要启动恢复介质并按恢复方案执行。": "Whole-system protection excludes runtime directories such as proc, sys, dev, run and tmp by default, while saving disk layout, boot configuration and a system inventory. Full bare-metal recovery requires booting a recovery medium and following the recovery plan.",
+    "整机系统恢复准备": "Whole-system recovery preparation",
+    "整机系统默认 / ；可指定系统目录（如 /etc）。": "Whole-system backup defaults to / ; you can specify a system directory such as /etc.",
+    "目标系统根目录": "Target system root",
+    "远程 IP / 主机名": "Remote IP / hostname",
+    "选择后会自动带入远程 IP、SSH 用户和密码；PVE 默认生成 https://IP:8006，其他平台按 SSH 主机连接。": "Selecting an entry auto-fills the remote IP, SSH user and password; PVE defaults to https://IP:8006, other platforms connect through the SSH host record.",
+    "（/ + 引导/磁盘布局元数据）": "(/ + boot / disk layout metadata)",
+  });
+
+  // 2026-11-21 操作系统备份页交互文案
+  Object.assign(EN, {
+    "本机": "Local host",
+    "已纳管：": "Managed: ",
+    "执行中": "Running",
+    "成功": "Success",
+    "失败": "Failed",
+    "备份": "Backup",
+    "恢复": "Restore",
+    "暂无操作系统备份记录": "No operating system backup records yet",
+    "提交中…": "Submitting…",
+    "备份任务已提交": "Backup job submitted",
+    "校验通过": "Verification passed",
+    "恢复任务已提交": "Restore job submitted",
+    "已处理": "Processed",
+    "个文件": "files",
+    "确认恢复到指定目标目录？": "Restore to the specified target directory?",
+  });
+
+  // 2026-11-21 整机恢复作业单文案
+  Object.assign(EN, {
+    "内容": "Detail",
+    "可执行脚本骨架": "Executable script skeleton",
+    "命令模板": "Command template",
+    "复制脚本": "Copy script",
+    "恢复作业单": "Restore job sheet",
+    "整机恢复作业单": "Bare-metal restore job sheet",
+  });
+
+  // 2026-11-21 保护范围输入说明
+  Object.assign(EN, {
+    "整机系统默认 /（含引导与磁盘布局元数据）；也可指定系统目录。": "Whole-system backup defaults to / (including boot and disk-layout metadata); you can also specify a system directory.",
+  });
+
+  // ---- 2026-11-21 新增：克隆件容量视图 / Workstation 纳管 ----
+  Object.assign(EN, {
+    "克隆件详情": "Clone Instance Details",
+    "重新实测数据量": "Re-measure Data Size",
+    "数据量": "Data Size",
+    "克隆容量视图（提交前评估）": "Clone Capacity Estimate (before submit)",
+    "源备份产物占用": "Source Backup Artifact Size",
+    "源库原始体量（未压缩）": "Source DB Raw Size (uncompressed)",
+    "克隆件逻辑数据量（估算）": "Clone Logical Data Size (estimated)",
+    "目标端预计占用": "Estimated Target Footprint",
+    "目标端可用空间": "Target Free Space",
+    "实测口径：克隆完成后对目标库实测的数据量": "Measured: actual data size of the target database after cloning",
+    "Workstation 虚拟机库目录": "Workstation VM Library Directories",
+    "vmrun.exe 路径（可选）": "vmrun.exe Path (optional)",
+    "留空自动从注册表探测：D:\\Program Files (x86)\\VMware\\VMware Workstation\\vmrun.exe": "Leave empty to auto-detect from registry: D:\\Program Files (x86)\\VMware\\VMware Workstation\\vmrun.exe",
+    "D:\\Users\\xxx\\Documents\\Virtual Machines（多个用逗号分隔，留空自动扫描）": "D:\\Users\\xxx\\Documents\\Virtual Machines (comma-separated; auto-scan when empty)",
+    "不支持块级增量": "no block-level incremental",
+    "目录级全量备份": "directory-level full backup",
+  });
+  // Workstation 说明段（多行文本节点：保留模板换行与缩进）
+  Object.assign(EN, {
+    "VMware Workstation 说明：桌面级虚拟化，无 vCenter/CBT 接口。本平台通过": "VMware Workstation note: desktop virtualization, no vCenter/CBT API. This platform uses",
+    "（控制面）+ 安装目录自带": "(control plane) + the bundled",
+    "（数据面打包）实现": "(data-plane packaging) to implement",
+    "，被管主机无需安装任何 agent；一致性为": "; no agent is installed on managed hosts; consistency is",
+    "（不含内存态），": "(memory state excluded),",
+    "（增量任务会如实回退全量）。": "(incremental jobs honestly fall back to full).",
   });
 
   return {

@@ -228,6 +228,13 @@ class CloneService:
                 })
                 self.logger.info("[clone] 请求 %s VDB %s 已就绪，到期 %s",
                                  request_id, vdb_id, expires)
+                # 交付即测数据量（对标国际先进克隆服务的克隆件容量视图）：
+                # 采不到如实记原因，不阻塞克隆成功判定。
+                try:
+                    self.measure_clone_size(request_id)
+                except Exception as exc:
+                    self.logger.warning("[clone] 请求 %s 数据量实测失败（忽略）: %s",
+                                        request_id, exc)
             except Exception as exc:
                 self.logger.error("[clone] 请求 %s 拉起失败: %s", request_id, exc)
                 cur = self.get_clone(request_id) or {}
@@ -555,10 +562,106 @@ class CloneService:
     def list_clones(self) -> list:
         # 列表是最高频入口：顺带把卡死的 creating 兜底置失败（幂等，成本一条 SQL）
         self._sweep_stuck_creating()
-        return models.list_clone_requests()
+        rows = models.list_clone_requests()
+        for r in rows:
+            self._decorate_sizes(r)
+        return rows
+
+    @staticmethod
+    def _decorate_sizes(row: dict) -> dict:
+        """给克隆行补派生字段：数据量口径、源产物大小、剩余有效期。
+
+        口径（页面必须如实区分，不能混为一谈）：
+        - source_size_bytes   源备份产物占用（磁盘上的压缩产物）
+        - source_original_size_bytes 源产物**原始**大小（未压缩，数据库真实体量近似值）
+        - data_size_bytes     克隆完成后**实测**的目标库数据量
+        """
+        try:
+            from core import db as _db
+            row["source_size_human"] = _db.human_size(row.get("source_size_bytes") or 0)
+            row["source_original_size_human"] = _db.human_size(
+                row.get("source_original_size_bytes") or 0)
+            row["data_size_human"] = _db.human_size(row.get("data_size_bytes") or 0)
+        except Exception:
+            row["source_size_human"] = row.get("source_size_human") or ""
+            row["source_original_size_human"] = row.get("source_original_size_human") or ""
+            row["data_size_human"] = row.get("data_size_human") or ""
+        # 剩余有效期（小时）；未设置到期时间=不回收
+        exp = str(row.get("expires_at") or "").strip()
+        row["ttl_hours"] = None
+        if exp:
+            try:
+                from datetime import datetime, timedelta
+                fmt = "%Y-%m-%d %H:%M:%S"
+                dt = datetime.strptime(exp[:19], fmt)
+                row["ttl_hours"] = round(
+                    (dt - datetime.now()).total_seconds() / 3600.0, 1)
+            except Exception:
+                row["ttl_hours"] = None
+        row["expired"] = (row.get("ttl_hours") is not None
+                          and row["ttl_hours"] <= 0)
+        return row
+
+    def measure_clone_size(self, request_id: int) -> dict:
+        """实测克隆件（目标库）数据量并回写克隆行。
+
+        对标国际先进克隆服务（Rubrik/Veeam Instant Clone、Zerto virtual clone）
+        的「克隆实例容量视图」：克隆件一交付就要能看到它到底占了多少数据，
+        而不是等用户去连库自己看。采不到就如实记录原因，不猜数。
+        """
+        from core import models as _models
+        req = _models.get_clone_request(request_id, include_secret=True)
+        if not req:
+            raise ValueError("克隆请求不存在: %s" % request_id)
+        vdb_id = req.get("vdb_instance_id")
+        if not vdb_id:
+            raise ValueError("该克隆请求尚未拉起实例，无可测量的目标库")
+        vdb = _models.get_vdb(vdb_id) or {}
+        rec = _models.get_record(req.get("source_record_id")) or {}
+        db_type = (vdb.get("db_type") or rec.get("db_type") or "").lower()
+        password = self._vdb_password(vdb, req)
+        try:
+            from core import restore_metrics
+            m = restore_metrics.measure(
+                db_type,
+                vdb.get("host") or req.get("target_host") or "127.0.0.1",
+                vdb.get("port"), vdb.get("database_name"),
+                vdb.get("username"), password,
+                schema=(vdb.get("service") or None),
+                timeout=25)
+        except Exception as e:
+            m = {"ok": False, "tables": None, "rows": None, "size_bytes": None,
+                 "mode": "", "note": "实测异常: %s" % str(e)[:160]}
+        size = int(m.get("size_bytes") or 0)
+        tables = int(m.get("tables") or 0)
+        rows = int(m.get("rows") or 0)
+        note = m.get("note") or ""
+        if m.get("ok"):
+            note = "实测口径：%s；表 %s，行 %s" % (
+                m.get("mode") or "direct", m.get("tables"), m.get("rows"))
+            if size <= 0 and tables > 0:
+                # InnoDB 对刚建的小表在 information_schema 里的 data_length 往往
+                # 还是 0（统计信息未刷新）——如实说明，不拿行数冒充字节数
+                note += "；库级体积暂记 0B（InnoDB 统计信息未刷新，以表/行数为准）"
+        _models.update_clone_request(request_id, {
+            "data_size_bytes": size,
+            "data_tables": tables,
+            "data_rows": rows,
+            "data_measured_at": db.now_iso(),
+            "data_note": note[:400],
+        })
+        row = _models.get_clone_request(request_id, include_secret=False) or {}
+        self._decorate_sizes(row)
+        row["measure"] = m
+        return row
 
     def get_clone(self, request_id: int) -> Optional[dict]:
-        return models.get_clone_request(request_id)
+        # 注意：对外返回**不带**明文口令（include_secret=False），
+        # 只补派生字段（数据量口径/源产物大小/剩余有效期）。
+        row = models.get_clone_request(request_id, include_secret=False)
+        if row:
+            self._decorate_sizes(row)
+        return row
 
     # ------------------------- 内部：拉起 / 释放 VDB -------------------------
     @staticmethod

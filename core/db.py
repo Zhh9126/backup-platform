@@ -1042,6 +1042,11 @@ CREATE TABLE IF NOT EXISTS clone_requests (
     approved_by    TEXT,
     expires_at     TEXT,                             -- 自动销毁到期时间
     vdb_instance_id INTEGER,                         -- 拉起的 VDB 实例 id
+    data_size_bytes INTEGER DEFAULT 0,               -- 克隆完成后实测的目标库数据量
+    data_tables    INTEGER DEFAULT 0,                -- 实测表数
+    data_rows      INTEGER DEFAULT 0,                -- 实测行数
+    data_measured_at TEXT,                          -- 数据量实测时间
+    data_note      TEXT,                            -- 实测口径/未采到原因
     note           TEXT,
     created_at     TEXT,
     updated_at     TEXT
@@ -1940,6 +1945,12 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                 ("target_host", "TEXT DEFAULT '127.0.0.1'"),
                 ("target_password", "TEXT"),
                 ("databases", "TEXT"),
+                # 克隆件数据量（实测目标库口径）+ 实测时间与口径说明
+                ("data_size_bytes", "INTEGER DEFAULT 0"),
+                ("data_tables", "INTEGER DEFAULT 0"),
+                ("data_rows", "INTEGER DEFAULT 0"),
+                ("data_measured_at", "TEXT"),
+                ("data_note", "TEXT"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE clone_requests ADD COLUMN {col} {typedef}")

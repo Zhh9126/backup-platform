@@ -724,6 +724,29 @@ class AgentSFTP:
     def rename(self, src: str, dst: str):
         self.t.fs("rename", src, dst)
 
+    def posix_rename(self, src: str, dst: str):
+        """原子改名（覆盖目标）——paramiko SFTPClient 的 posix_rename。
+
+        2026-11-22 实测缺失后果：走 Agent 通道的物理备份在「拉回落盘」阶段
+        报 "'AgentSFTP' object has no attribute 'posix_rename'"，任务直接失败。
+        Agent 端只有 rename（不覆盖已存在目标），这里先删目标再改名，保持
+        posix 语义（覆盖）。
+        """
+        try:
+            self.t.fs("remove", dst)
+        except Exception:
+            pass
+        self.t.fs("rename", src, dst)
+
+    def utime(self, path: str, times=None):
+        return None
+
+    def lstat(self, path: str):
+        return self.stat(path)
+
+    def rmdir(self, path: str):
+        self.t.fs("remove", path)
+
     def mkdir(self, path: str):
         self.t.fs("mkdir", path)
 

@@ -12,6 +12,10 @@ mssql-jdbc jar + JRE，零客户端安装）把库表结构+数据拉取为 T-SQ
     GO
 解析端用单引号状态机按 GO 分段（数据值中的 "GO" 不会误分段）。
 
+版本兼容：列/主键/自增元数据一律走 INFORMATION_SCHEMA 与 sys.* 目录视图，
+SQL Server 2005 与 2008+ 同一条代码路径（JDBC DatabaseMetaData 在 2005 上
+会因驱动内部调用 sp_columns 而失败，故不使用）。
+
 诚实边界：仅表结构（列/主键/IDENTITY/默认值）+ 表数据；不包含存储过程、
 触发器、视图、索引（主键除外）、外键——需要完整对象请使用物理备份
 （BACKUP DATABASE，需 SSH 通道）。大库性能受批大小限制（200 行/批）。
@@ -78,65 +82,150 @@ def list_tables(conn, db_name=None):
             pass
 
 
-def _table_ddl(jconn, catalog, schema, table):
-    """经 DatabaseMetaData 生成 CREATE TABLE（列/类型/可空/默认/IDENTITY/主键）。"""
-    md = jconn.getMetaData()
-    cols = []
-    pk_cols = []
-    rs = md.getColumns(catalog, schema, table, "%")
+def _server_version(conn):
+    """探测 SQL Server 版本，返回 (major, full)。
+
+    2005 没有 SERVERPROPERTY('ProductMajorVersion')（2008 才有），
+    因此以 ProductVersion 前缀解析，major=9 即 SQL Server 2005。
+    """
+    import re as _re
+    cur=conn.cursor();full="";major=0
     try:
-        while rs.next():
-            name = rs.getString("COLUMN_NAME")
-            tname = (rs.getString("TYPE_NAME") or "nvarchar").upper()
-            # SQL Server JDBC 对 IDENTITY 列 TYPE_NAME 返回 "int identity"
-            #（自带 identity 字样）——剥掉后缀，IDENTITY(1,1) 统一由
-            # IS_AUTOINCREMENT 分支补一次，避免"多个 IDENTITY 约束"。
-            autoinc = False
-            if tname.endswith(" IDENTITY"):
-                tname = tname[:-len(" IDENTITY")].strip()
-                autoinc = True
-            size = rs.getInt("COLUMN_SIZE")
-            size = None if rs.wasNull() else size
-            scale = rs.getInt("DECIMAL_DIGITS")
-            scale = None if rs.wasNull() else scale
-            nullable = (rs.getString("IS_NULLABLE") or "YES").upper() != "NO"
-            dflt = rs.getString("COLUMN_DEF")
-            if (rs.getString("IS_AUTOINCREMENT") or "NO").upper() == "YES":
-                autoinc = True
-            # 精度拼接：数值/时间类带 scale，字符/二进制类带 size
-            if tname in ("DECIMAL", "NUMERIC") and size is not None:
-                t = f"{tname}({size},{scale if scale is not None else 0})"
-            elif tname in ("DATETIME2", "TIME", "DATETIMEOFFSET") and scale is not None and scale != 6:
-                t = f"{tname}({scale})"
-            elif size is not None and tname in (
-                    "CHAR", "VARCHAR", "NCHAR", "NVARCHAR", "BINARY",
-                    "VARBINARY", "VARCHAR2"):
-                t = f"{tname}({'MAX' if size >= 8000 and 'VAR' in tname else size})"
-            else:
-                t = tname
-            parts = f"[{name}] {t}"
-            if autoinc:
-                parts += " IDENTITY(1,1)"
-            if not nullable:
-                parts += " NOT NULL"
-            if dflt:
-                parts += f" DEFAULT {dflt}"
-            cols.append(parts)
+        cur.execute("SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(64))")
+        row=cur.fetchone()
+        if row: full=str(row[0] or "")
+        try:
+            cur.execute("SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS int)")
+            row=cur.fetchone()
+            if row and row[0] is not None: major=int(row[0])
+        except Exception:
+            major=0
+    except Exception:
+        return (0,"")
     finally:
-        rs.close()
-    rs = md.getPrimaryKeys(catalog, schema, table)
+        try: cur.close()
+        except Exception: pass
+    if not major:
+        m=_re.match(r"(\d+)",full or "")
+        major=int(m.group(1)) if m else 0
+    return (major,full)
+
+
+def _columns_via_information_schema(conn,schema,table):
+    """INFORMATION_SCHEMA.COLUMNS 取列定义（SQL Server 2005 起全部支持）。"""
+    sql=("SELECT COLUMN_NAME, DATA_TYPE, ISNULL(CHARACTER_MAXIMUM_LENGTH,-1), "
+         "ISNULL(NUMERIC_PRECISION,0), ISNULL(NUMERIC_SCALE,0), IS_NULLABLE, "
+         "ISNULL(COLUMN_DEFAULT,'') FROM INFORMATION_SCHEMA.COLUMNS "
+         "WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION")
+    cur=conn.cursor();out=[]
     try:
-        pks = []
-        while rs.next():
-            pks.append((rs.getInt("KEY_SEQ"), rs.getString("COLUMN_NAME")))
-        pk_cols = [c for _seq, c in sorted(pks)]
+        cur.execute(sql,[schema,table])
+        for r in cur.fetchall():
+            out.append({"name":str(r[0]),"type":str(r[1] or "").strip().lower(),
+                        "size":r[2],"prec":r[3],"scale":r[4],
+                        "nullable":str(r[5] or "YES").strip().upper()!="NO",
+                        "default":r[6]})
     finally:
-        rs.close()
-    if pk_cols:
-        cols.append("PRIMARY KEY (" + ", ".join(f"[{c}]" for c in pk_cols) + ")")
-    has_identity = " IDENTITY(1,1)" in "\n  ".join(cols)
-    return ("CREATE TABLE [{}].[{}] (\n  {}\n)".format(
-        schema, table, ",\n  ".join(cols)), has_identity)
+        try: cur.close()
+        except Exception: pass
+    return out
+
+
+def _identity_columns(conn,schema,table):
+    """自增列：sys.identity_columns（2005 引入的目录视图）。"""
+    sql=("SELECT c.name FROM sys.identity_columns c "
+         "JOIN sys.tables t ON t.object_id = c.object_id "
+         "JOIN sys.schemas s ON s.schema_id = t.schema_id "
+         "WHERE s.name = ? AND t.name = ? AND c.is_identity = 1")
+    try:
+        cur=conn.cursor()
+        try:
+            cur.execute(sql,[schema,table])
+            return [str(r[0]) for r in cur.fetchall()]
+        finally:
+            try: cur.close()
+            except Exception: pass
+    except Exception:
+        return []
+
+
+def _primary_key_columns(conn,schema,table):
+    """主键列：INFORMATION_SCHEMA（2000 起即支持，2005 兼容）+ sys.* 回退。"""
+    sql=("SELECT kcu.COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu "
+         "JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc "
+         "ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME "
+         "AND tc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA "
+         "WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' "
+         "AND kcu.TABLE_SCHEMA = ? AND kcu.TABLE_NAME = ? "
+         "ORDER BY kcu.ORDINAL_POSITION")
+    try:
+        cur=conn.cursor()
+        try:
+            cur.execute(sql,[schema,table])
+            rows=[str(r[0]) for r in cur.fetchall()]
+            if rows: return rows
+        finally:
+            try: cur.close()
+            except Exception: pass
+    except Exception:
+        pass
+    # 回退：sys.key_constraints + sys.index_columns（部分版本视图列名有差异）
+    try:
+        cur=conn.cursor()
+        try:
+            cur.execute("SELECT kcu.name FROM sys.key_constraints kcu "
+                        "JOIN sys.tables t ON t.object_id = kcu.parent_object_id "
+                        "JOIN sys.schemas s ON s.schema_id = t.schema_id "
+                        "JOIN sys.index_columns ic ON ic.object_id = t.object_id "
+                        "AND ic.index_id = kcu.unique_index_id "
+                        "WHERE kcu.type = 'PK' AND s.name = ? AND t.name = ? "
+                        "ORDER BY ic.key_ordinal",[schema,table])
+            return [str(r[0]) for r in cur.fetchall()]
+        finally:
+            try: cur.close()
+            except Exception: pass
+    except Exception:
+        return []
+
+
+def _table_ddl(conn, schema, table):
+    """生成 CREATE TABLE（列/类型/可空/默认/IDENTITY/主键）。
+
+    元数据全部来自 INFORMATION_SCHEMA 与 sys.* 目录视图，SQL Server 2005
+    与 2008+ 走完全相同的路径；不使用 JDBC DatabaseMetaData——微软驱动
+    实现 getColumns() 时内部调用 sp_columns（2008 才提供的存储过程），
+    在 2005 实例上会直接报「找不到存储过程 'sp_columns'」。
+    """
+    metas=_columns_via_information_schema(conn,schema,table)
+    if not metas:
+        raise ValueError("无法读取表结构: %s.%s（INFORMATION_SCHEMA 无数据）"%(schema,table))
+    idents=set(_identity_columns(conn,schema,table))
+    pks=_primary_key_columns(conn,schema,table)
+    parts=[]
+    for c in metas:
+        t=c["type"]
+        if t in ("decimal","numeric"):
+            ty="%s(%s,%s)"%(t.upper(),c["prec"],c["scale"])
+        elif t in ("char","varchar","nchar","nvarchar","binary","varbinary"):
+            size=c["size"]
+            try: size=int(size)
+            except Exception: size=None
+            if size is not None and size<0: ty="%s(MAX)"%t.upper()
+            elif size: ty="%s(%s)"%(t.upper(),size)
+            else: ty=t.upper()
+        elif t in ("datetime2","time","datetimeoffset"):
+            ty="%s(%s)"%(t.upper(),c["scale"] if c["scale"] is not None else 6)
+        else:
+            ty=t.upper()
+        seg="[%s] %s"%(c["name"],ty)
+        if c["name"] in idents: seg+=" IDENTITY(1,1)"
+        if not c["nullable"]: seg+=" NOT NULL"
+        if c["default"]: seg+=" DEFAULT %s"%c["default"]
+        parts.append(seg)
+    if pks:
+        parts.append("PRIMARY KEY ("+", ".join("[%s]"%c for c in pks)+")")
+    has_identity=bool(idents)
+    return ("CREATE TABLE [%s].[%s] (\n  %s\n)"%(schema,table,",\n  ".join(parts)),has_identity)
 
 
 def _literal(v):
@@ -191,7 +280,7 @@ def export_db(task, out_path: str, tables=None) -> dict:
             f.write("-- 诚实边界: 含表结构(列/主键/IDENTITY/默认值)+表数据；"
                     "不含存储过程/触发器/视图/索引/外键\n\n")
             for schema, table in tlist:
-                ddl, has_identity = _table_ddl(jconn, catalog, schema, table)
+                ddl, has_identity = _table_ddl(conn, schema, table)
                 full = f"[{schema}].[{table}]"
                 f.write(ddl + "\nGO\n")
                 # IDENTITY 列数据保真：显式插入原自增值需会话级 IDENTITY_INSERT

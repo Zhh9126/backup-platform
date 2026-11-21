@@ -14,7 +14,7 @@
     <table class="table table-hover align-middle mb-0">
       <thead><tr>
         <th>#</th><th>源备份记录</th><th>源库类型</th><th>目标环境</th><th>目标主机</th><th>状态</th>
-        <th>申请人</th><th>到期</th><th>VDB 连接</th>
+        <th>申请人</th><th>到期</th><th>VDB 连接</th><th>数据量</th>
         <th class="text-end">操作</th>
       </tr></thead>
       <tbody id="cloneTable"></tbody>
@@ -29,6 +29,27 @@
     <div id="cloneCapabilities" class="small">正在读取数据库能力…</div>
   </div>
 </details>
+
+<!-- 克隆件详情 模态框 -->
+<div class="modal fade" id="cloneDetailModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">克隆件详情</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div id="cloneDetailBody"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-outline-secondary" id="cloneDetailMeasureBtn">
+          <i class="bi bi-rulers"></i> 重新实测数据量
+        </button>
+        <button type="button" class="btn btn-primary" data-bs-dismiss="modal">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
 
 <!-- 申请克隆 模态框 -->
 <div class="modal fade" id="cloneModal" tabindex="-1">

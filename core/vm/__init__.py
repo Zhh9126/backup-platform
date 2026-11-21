@@ -122,6 +122,21 @@ def test_hypervisor(payload: dict) -> dict:
     pid = (payload.get("provider") or "").strip()
     if not get_provider_class(pid):
         return {"ok": False, "message": "不支持的虚拟化平台类型: %s" % pid}
+    payload = dict(payload or {})
+    # 选了已纳管 SSH 主机时，用主机上的凭据补齐（否则密码为空必然连不上）
+    ssh_host_id = payload.get("ssh_host_id")
+    if ssh_host_id:
+        try:
+            host = __import__("core.ssh_hosts", fromlist=["get_host"]).get_host(
+                int(ssh_host_id), include_secret=True)
+        except Exception:
+            host = None
+        if host:
+            payload.setdefault("username", host.get("username") or "root")
+            if not payload.get("password"):
+                payload["password"] = host.get("password") or ""
+            if not payload.get("endpoint"):
+                payload["endpoint"] = host.get("hostname") or ""
     try:
         p = provider_for(payload)
         ok, msg = p.connect()

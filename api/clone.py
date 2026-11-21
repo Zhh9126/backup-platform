@@ -135,6 +135,24 @@ def api_clone_takeover_check(request_id):
     return jsonify({"ok": res.get("ok"), **res})
 
 
+@api_bp.route("/clone/<int:request_id>/measure", methods=["POST"])
+@login_required
+def api_clone_measure(request_id):
+    """实测克隆件（目标库）数据量并回写。
+
+    对标国际先进克隆服务的克隆件容量视图：交付后随时能回答
+    「这个克隆件到底多大、数据在哪个口径下量出来的」。
+    """
+    try:
+        row = _service.measure_clone_size(request_id)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+    except Exception as e:  # noqa: BLE001
+        return jsonify({"ok": False, "error": "实测失败: %s" % str(e)[:200]}), 500
+    return jsonify({"ok": True, "clone": row,
+                    "message": "已实测：%s" % (row.get("data_size_human") or "-")})
+
+
 @api_bp.route("/clone/<int:request_id>/verify", methods=["POST"])
 @login_required
 def api_verify_clone(request_id):

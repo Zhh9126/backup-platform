@@ -2113,6 +2113,38 @@ def _remote_stage_dir() -> str:
     return getattr(config, "BACKUP_REMOTE_STAGE", "/tmp/bk_stage")
 
 
+
+def ssh_host_for_stdin(ssh_host: dict) -> dict:
+    """需要 stdin 灌入的操作（mysqldump 导入 / pg_restore COPY / impdp USERID）。
+
+    Agent 协议不传 stdin（agent 侧 subprocess 用 stdin=DEVNULL），因此这些操作
+    在 Agent 通道上必然失败（"agent 通道暂不支持 stdin 灌入"）。这里把通道
+    换成同机已纳管的 SSH 主机——功能等价，且不违反「目标端零安装」。
+    找不到 SSH 主机时原样返回（让调用方如实报错）。
+    """
+    h = dict(ssh_host or {})
+    if str(h.get("transport") or "").lower() != "agent":
+        return h
+    host = str(h.get("hostname") or h.get("host") or "").strip()
+    port = int(h.get("port") or 22)
+    if not host:
+        return h
+    try:
+        from core import ssh_hosts
+        for row in ssh_hosts.list_hosts(include_secret=True):
+            if str(row.get("hostname") or "") != host:
+                continue
+            if int(row.get("port") or 22) != port:
+                continue
+            out = dict(row)
+            out["transport"] = "ssh"
+            out["_stdin_fallback"] = True
+            return out
+    except Exception:
+        pass
+    return h
+
+
 def cleanup_remote_stage_dirs(client, *paths, timeout: int = 40) -> None:
     """回收平台自己在远端 mkdir 出来的暂存目录（**只删空目录**）。
 
@@ -2541,6 +2573,85 @@ def task_stage_dir(task: dict) -> str:
     return _remote_stage_dir().rstrip("/")
 
 
+_STAGE_AUTO_CACHE: dict = {}
+
+
+def resolve_stage_dir(client, task: dict, db_type: str = "") -> str:
+    """任务级远端暂存目录 + **tmpfs 规避**（2026-11-22 实测缺陷）。
+
+    实测事故：170/171 的 /tmp 是 1.5G tmpfs，物理备份的整库产物（xtrabackup
+    tar ≈ 774MB）落进去等于吃内存——170 主机可用内存掉到 48MB、load 30，
+    sshd 连 banner 都不发（表现为「SSH 连接超时」「备份任务卡死」）。
+
+    规则：
+      1) 任务显式配置 extra_options.backup_stage_dir → 尊重用户选择（不探测）
+      2) 否则探测默认暂存目录所在文件系统；**是 tmpfs 就换到非 tmpfs 的数据盘**
+         （依次尝试 /var/tmp、/data、/opt、$HOME/.aidbm_stage，取可用空间最大的）
+      3) 探测结果按主机缓存 30 分钟，避免每次备份多一次 SSH 往返
+    """
+    extra = {}
+    raw = task.get("extra_options")
+    if isinstance(raw, dict):
+        extra = raw
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            extra = json.loads(raw)
+        except Exception:
+            extra = {}
+    if str(extra.get("backup_stage_dir") or "").strip():
+        return task_stage_dir(task)
+
+    stage = task_stage_dir(task)
+    try:
+        host_key = str((task.get("ssh_host_key") or task.get("host") or "")).strip()
+    except Exception:
+        host_key = ""
+    ck = (host_key, stage)
+    hit = _STAGE_AUTO_CACHE.get(ck)
+    if hit and (time.time() - hit[0]) < 1800:
+        return hit[1]
+    chosen = stage
+    try:
+        from core.engines.file import _ssh_exec_pipe
+        cmd = ("stat -f -c %%T %s 2>/dev/null; df -P -B1 %s 2>/dev/null | tail -1 | "
+               "awk '{print $4}'" % (shlex.quote(stage), shlex.quote(stage)))
+        out, _e, rc = _ssh_exec_pipe(client, _wrap_login(cmd), timeout=20)
+        txt = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+        lines = [x.strip() for x in txt.splitlines() if x.strip()]
+        fstype = lines[0].lower() if lines else ""
+        free = int(lines[1]) if len(lines) > 1 and lines[1].isdigit() else 0
+        if "tmpfs" in fstype:
+            log = logging.getLogger(__name__)
+            best, best_free = "", 0
+            for cand in ("/var/tmp", "/data", "/opt", "/data/backup"):
+                if cand in (stage,):
+                    continue
+                c2 = ("stat -f -c %%T %s 2>/dev/null; df -P -B1 %s 2>/dev/null | tail -1 | "
+                      "awk '{print $4}'" % (shlex.quote(cand), shlex.quote(cand)))
+                o2, _e2, _rc2 = _ssh_exec_pipe(client, _wrap_login(c2), timeout=15)
+                t2 = o2.decode("utf-8", "replace") if isinstance(o2, bytes) else (o2 or "")
+                ls2 = [x.strip() for x in t2.splitlines() if x.strip()]
+                ft2 = ls2[0].lower() if ls2 else ""
+                fr2 = int(ls2[1]) if len(ls2) > 1 and ls2[1].isdigit() else 0
+                if "tmpfs" in ft2:
+                    continue
+                if fr2 > best_free:
+                    best, best_free = cand, fr2
+            if best and best_free > 0:
+                newdir = best.rstrip("/") + "/aidbm_stage"
+                _ssh_exec_pipe(client, _wrap_login("mkdir -p %s" % shlex.quote(newdir)),
+                               timeout=20)
+                chosen = newdir
+                log.warning("[remote_dump] 远端 %s 是 tmpfs（可用 %.1fGB），"
+                            "已自动改用非 tmpfs 暂存目录 %s（可用 %.1fGB）——"
+                            "否则大库备份会把数据库服务器内存吃光",
+                            stage, free / 1024 ** 3, chosen, best_free / 1024 ** 3)
+    except Exception as e:  # noqa: BLE001 - 探测失败沿用默认，不阻断备份
+        logging.getLogger(__name__).debug("[remote_dump] tmpfs 探测失败: %s", str(e)[:120])
+    _STAGE_AUTO_CACHE[ck] = (time.time(), chosen)
+    return chosen
+
+
 def _probe_datadir(client, db_type: str, os_user: str,
                    foreign: bool = False, datadir: str = "") -> tuple:
     """PG 系/金仓：定位数据目录 / 扫描不属于数据库 OS 用户的文件（卫生检查）。
@@ -2644,16 +2755,21 @@ def ensure_remote_stage_ok(client, task: dict, dir_path: str,
     return w
 
 
-def fixed_remote_path(task: dict, db_type: str, name: str) -> str:
+def fixed_remote_path(task: dict, db_type: str, name: str, client=None) -> str:
     """固定产物的确定性远端路径（**不含随机时间戳**）。
 
     基座 = 任务级暂存目录（task_stage_dir）：任务配置了 backup_stage_dir 时
     整库大小的临时产物（xtrabackup/mysqldump/pg_basebackup 等）落在指定分区。
+
+    传入 client 时启用 **tmpfs 规避**（resolve_stage_dir）：默认 /tmp 常是
+    tmpfs（内存盘），整库产物落进去等于吃数据库服务器内存（实测 170 可用
+    内存掉到 48MB、sshd 无响应）。
     """
     tid = int(task.get("id") or 0)
     safe = re.sub(r"[^0-9A-Za-z._-]", "_", str(name or "artifact"))[:80]
-    return (task_stage_dir(task).rstrip("/")
-            + f"/fixed/t{tid}_{db_type}_{safe}")
+    base = (resolve_stage_dir(client, task) if client is not None
+            else task_stage_dir(task))
+    return base.rstrip("/") + f"/fixed/t{tid}_{db_type}_{safe}"
 
 
 def marker_path(target: str, is_dir: bool = False) -> str:
@@ -3031,7 +3147,7 @@ def _remote_mysql_dump_to_file(task: dict, ssh_host: dict, final_path: str,
                     "fmt": "multi-db-tar", "suffix": ".tar.gz",
                     "sha256": db.sha256_file(final_path), "resumed": False}
 
-        stage = task_stage_dir(task)
+        stage = resolve_stage_dir(client, task)
         stage_warn = ""
         if not (meta and _meta_usable(meta, ssh_host, spec, p)):
             # 全新导出前：空间/分区安全检查（断点续传复用时不重复写盘，跳过）

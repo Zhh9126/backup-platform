@@ -933,7 +933,7 @@ class MySQLEngine(BackupEngine):
         # 命中率极高；传输压缩交给 rsync -z，落盘压缩在平台侧 gzip 完成
         # （产物仍为 .tar.gz，恢复/增量链语义零改动）。
         remote_tar = remote_dump.fixed_remote_path(
-            self.task, f"{self.db_type}_phys", f"{kind}.tar")
+            self.task, f"{self.db_type}_phys", f"{kind}.tar", client=client)
         remote_cnf = "/tmp/bk_xtrabackup.cnf"
         pushed_bin = None
         pushed_libs_dir = None
@@ -1637,6 +1637,7 @@ class MySQLEngine(BackupEngine):
         reason = (result.message or "未知错误")
         from core import remote_dump
         ssh_host = remote_dump.resolve_ssh_host(self.task)
+        ssh_host = remote_dump.ssh_host_for_stdin(ssh_host)
         if ssh_host and os.path.exists(backup_path):
             hk = ssh_host.get("host_key")
             logs.append(f"[远程恢复] 本机恢复失败({reason})，改用 SSH 在数据库服务器执行恢复 (host={hk})")

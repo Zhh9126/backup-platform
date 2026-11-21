@@ -217,6 +217,11 @@ class VMBackupEngine(BackupEngine):
 
         message = "虚拟机备份完成：%s（%s，%.1fMB）" % (
             art.kind, vm.get("vm_name"), size / 1048576.0)
+        # Provider 如实说明（如「备份时 VM 在运行 → 崩溃一致」）必须透出，
+        # 不能只写「备份完成」让人误以为拿到了文件系统一致的数据。
+        prov_note = str((art.extra or {}).get("note") or "")
+        if prov_note:
+            message += "；%s" % prov_note[:200]
         if note_msgs:
             message += "；" + "；".join(note_msgs)[:300]
 

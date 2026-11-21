@@ -106,6 +106,33 @@ def preflight(rec: dict, target_host: str = "127.0.0.1",
         _check(checks, "target_port", True, "未指定端口，跳过连通性检查",
                hard=False)
 
+    # 3.5) 数据量与空间需求（对标国际先进克隆服务的「克隆前容量视图」：
+    #      提交前就要告诉用户这份克隆有多大、目标端要腾多少空间）
+    estimate = estimate_clone_size(rec, clone_mode=clone_mode,
+                                   target_host=target_host)
+    if estimate.get("source_artifact_bytes"):
+        _check(checks, "data_size", True,
+               "源产物 %s，克隆件逻辑数据量约 %s，目标端预计占用 %s%s"
+               % (estimate.get("source_artifact_human"),
+                  estimate.get("estimated_data_human"),
+                  estimate.get("estimated_disk_human"),
+                  ("；目标端可用 %s" % estimate["target_free_human"])
+                  if estimate.get("target_free_human") else
+                  "（目标端空间无法探测）"))
+        if estimate.get("target_free_bytes") and \
+                estimate.get("estimated_disk_bytes") and \
+                estimate["target_free_bytes"] < estimate["estimated_disk_bytes"]:
+            warnings.append(
+                "目标端可用空间 %s 小于克隆预计占用 %s，克隆可能失败"
+                % (estimate["target_free_human"], estimate["estimated_disk_human"]))
+            _check(checks, "target_space", False,
+                   "可用 %s < 预计 %s" % (estimate["target_free_human"],
+                                          estimate["estimated_disk_human"]),
+                   hard=False)
+    else:
+        _check(checks, "data_size", True, "活库克隆模式，无备份产物可估算",
+               hard=False)
+
     # 4) 平台暂存盘余量（克隆解包/导入需要落盘）
     try:
         root = str(getattr(config, "BACKUP_ROOT", "/tmp") or "/tmp")
@@ -136,4 +163,66 @@ def preflight(rec: dict, target_host: str = "127.0.0.1",
 
     return {"ok": not errors, "errors": errors,
             "warnings": warnings, "checks": checks,
+            "estimate": estimate,
             "note": str(note or "")[:200]}
+
+
+def estimate_clone_size(rec: dict, clone_mode: str = "logical",
+                        target_host: str = "127.0.0.1") -> dict:
+    """估算克隆件的数据量与目标端空间需求。
+
+    口径说明（页面如实展示，不混算）：
+    - source_artifact_bytes   源备份产物在磁盘上的占用（压缩后）
+    - source_original_bytes   源产物**原始**大小（未压缩），最接近库真实体量
+    - estimated_data_bytes    克隆件逻辑数据量估算（= 原始大小）
+    - estimated_disk_bytes    克隆件在目标端的磁盘占用估算
+                              （逻辑导入按 1.3 倍膨胀估；template/snapshot 活库克隆
+                                走 COW，初始占用≈0，增长量取决于写增量）
+    - target_free_bytes       目标端可用空间（本机可探测；远端无法探测时为 None）
+    """
+    out = {"source_artifact_bytes": 0, "source_artifact_human": "-",
+           "source_original_bytes": 0, "source_original_human": "-",
+           "estimated_data_bytes": 0, "estimated_data_human": "-",
+           "estimated_disk_bytes": 0, "estimated_disk_human": "-",
+           "target_free_bytes": None, "target_free_human": "",
+           "mode": clone_mode or "logical"}
+    rec = rec or {}
+    try:
+        from core import db as _db
+        human = _db.human_size
+    except Exception:
+        human = lambda n: "%d B" % int(n or 0)
+    path = str(rec.get("backup_path") or "")
+    try:
+        if path and os.path.isfile(path):
+            out["source_artifact_bytes"] = os.path.getsize(path)
+    except Exception:
+        pass
+    try:
+        out["source_original_bytes"] = int(rec.get("original_size_bytes") or 0)
+    except Exception:
+        out["source_original_bytes"] = 0
+    if not out["source_original_bytes"]:
+        # 没有原始大小基线时用压缩产物 × 经验膨胀系数估算（压缩比未知，取 3 倍）
+        out["source_original_bytes"] = int(out["source_artifact_bytes"] * 3)
+    out["source_artifact_human"] = human(out["source_artifact_bytes"])
+    out["source_original_human"] = human(out["source_original_bytes"])
+    out["estimated_data_bytes"] = out["source_original_bytes"]
+    out["estimated_data_human"] = human(out["estimated_data_bytes"])
+    if clone_mode in ("template", "snapshot", "schema"):
+        # 活库克隆：COW 共享底层数据块，初始占用≈0
+        out["estimated_disk_bytes"] = 0
+        out["estimated_disk_human"] = "≈0（COW 共享，仅按写增量增长）"
+    else:
+        out["estimated_disk_bytes"] = int(out["estimated_data_bytes"] * 1.3)
+        out["estimated_disk_human"] = human(out["estimated_disk_bytes"])
+    # 目标端可用空间：仅本机可探测
+    if str(target_host or "") in ("127.0.0.1", "localhost", "::1", ""):
+        try:
+            root = str(getattr(config, "BACKUP_ROOT", "/tmp") or "/tmp")
+            os.makedirs(root, exist_ok=True)
+            out["target_free_bytes"] = shutil.disk_usage(root).free
+            out["target_free_human"] = human(out["target_free_bytes"])
+        except Exception:
+            pass
+    return out

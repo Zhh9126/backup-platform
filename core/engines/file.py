@@ -391,6 +391,32 @@ def _tune_ssh_transport(client, window_mb: int = _SSH_WINDOW_MB,
         pass
 
 
+
+def _ssh_client_by_hostname(hostname: str, port: int = 22):
+    """按主机名找已纳管 SSH 主机并建立连接（用于 Agent 通道能力不足时回退）。
+
+    背景（2026-11-22 实测）：Agent 协议不传 stdin（agent 侧 subprocess 用
+    stdin=DEVNULL），因此 MySQL/PG 导入类恢复（需要把 dump 灌进客户端 stdin）
+    在 Agent 通道上必然失败（"agent 通道暂不支持 stdin 灌入"）。此时回退到
+    同一台机器已纳管的 SSH 通道执行——功能等价，且不违反「目标端零安装」。
+    """
+    host = str(hostname or "").strip()
+    if not host:
+        return None
+    try:
+        from core import ssh_hosts
+        for h in ssh_hosts.list_hosts(include_secret=True):
+            if str(h.get("hostname") or "") != host:
+                continue
+            if int(h.get("port") or 22) != int(port or 22):
+                continue
+            pw = h.get("password") or ""
+            return _get_ssh_client(h.get("host_key"), password=pw)
+    except Exception:
+        return None
+    return None
+
+
 def _ssh_exec_stream(client, cmd: str, *, out_file=None, timeout: int = 0,
                      idle_timeout: int = 0, input_data: bytes = None,
                      note: str = "SSH 数据管道", label: str = "",
@@ -410,6 +436,20 @@ def _ssh_exec_stream(client, cmd: str, *, out_file=None, timeout: int = 0,
     返回 dict(out, err, rc, written, cost, sha256, speed_mbps)。
     """
     import time as _time
+    # Agent 通道不支持 stdin（协议层就是 DEVNULL）→ 需要灌 stdin 的操作
+    # （mysqldump 导入 / pg_restore COPY / impdp USERID）自动改走同机 SSH 通道
+    if input_data:
+        _agent_host = getattr(getattr(client, "t", None), "host", None)
+        _agent_port = getattr(getattr(client, "t", None), "port", None)
+        if _agent_host:
+            _cli = _ssh_client_by_hostname(_agent_host, _agent_port or 22)
+            if _cli is not None:
+                return _ssh_exec_stream(
+                    _cli, cmd, out_file=out_file, timeout=timeout,
+                    idle_timeout=idle_timeout, input_data=input_data,
+                    note=(note or "") + "（Agent 通道不支持 stdin → 已改走同机 SSH 通道）",
+                    label=label, progress_every=progress_every,
+                    rate_kbps=rate_kbps, want_digest=want_digest)
     t = client.get_transport()
     if not t or not t.is_active():
         raise RuntimeError("SSH transport dead")

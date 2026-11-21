@@ -9290,10 +9290,109 @@
       }).join("");
     }
 
-    window.loadClones = async function () {
+    // 克隆前容量视图（数据量口径 + 目标端空间需求）
+  function cloneEstimateHtml(est) {
+    if (!est) return "";
+    const items = [
+      ["源备份产物占用", est.source_artifact_human || "-"],
+      ["源库原始体量（未压缩）", est.source_original_human || "-"],
+      ["克隆件逻辑数据量（估算）", est.estimated_data_human || "-"],
+      ["目标端预计占用", est.estimated_disk_human || "-"]
+    ];
+    if (est.target_free_human) items.push(["目标端可用空间", est.target_free_human]);
+    return '<div class="mt-2 pt-2 border-top"><div class="small fw-semibold mb-1">' +
+      '克隆容量视图（提交前评估）</div><div class="row g-2 small">' +
+      items.map(it => '<div class="col-6"><span class="text-muted">' + esc(it[0]) +
+        '：</span><b>' + esc(it[1]) + '</b></div>').join("") +
+      '</div></div>';
+  }
+
+  // ---- 克隆件容量/有效期视图（对标国际先进克隆服务的克隆实例容量视图） ----
+  function cloneSizeCell(c) {
+    const measured = Number(c.data_size_bytes || 0);
+    const src = Number(c.source_size_bytes || 0);
+    const orig = Number(c.source_original_size_bytes || 0);
+    const tip = [
+      '实测口径：克隆完成后对目标库实测的数据量',
+      '源备份产物占用（压缩后）：' + (c.source_size_human || '-'),
+      '源库原始体量（未压缩）：' + (c.source_original_size_human || '-'),
+      c.data_note ? ('实测说明：' + c.data_note) : ''
+    ].filter(Boolean).join('\n');
+    if (measured > 0) {
+      return '<div style="font-weight:600" title="' + esc(tip) + '">' + esc(c.data_size_human || '-') + '</div>' +
+        '<div class="text-muted" style="font-size:.72rem">实测 · 源产物 ' + esc(c.source_size_human || '-') + '</div>';
+    }
+    if (Number(c.data_tables || 0) > 0 || Number(c.data_rows || 0) > 0) {
+      // 体积统计为 0（小库/InnoDB 统计未刷新）时，如实给出表/行数，不冒充字节数
+      return '<div style="font-weight:600" title="' + esc(tip) + '">' +
+        esc(c.data_tables || 0) + ' 表 / ' + esc(c.data_rows || 0) + ' 行</div>' +
+        '<div class="text-muted" style="font-size:.72rem">实测 · 体积统计未刷新</div>';
+    }
+    if (orig > 0) {
+      return '<div style="font-weight:600" title="' + esc(tip) + '">' + esc(c.source_original_size_human || '-') + '</div>' +
+        '<div class="text-muted" style="font-size:.72rem">估算 · 源库原始体量</div>';
+    }
+    if (src > 0) {
+      return '<div style="font-weight:600" title="' + esc(tip) + '">' + esc(c.source_size_human || '-') + '</div>' +
+        '<div class="text-muted" style="font-size:.72rem">源备份产物占用</div>';
+    }
+    return '<span class="text-muted" title="' + esc(tip) + '">-</span>';
+  }
+
+  function ttlBadge(c) {
+    const h = c.ttl_hours;
+    if (h === null || h === undefined) return '';
+    if (h <= 0) return ' <span class="badge bg-secondary" title="已超过自动销毁时间，等待回收">已过期</span>';
+    if (h <= 24) return ' <span class="badge bg-warning" title="' + Math.round(h) + ' 小时后自动销毁">剩 ' + Math.round(h) + 'h</span>';
+    return ' <span class="badge bg-info" title="' + Math.round(h / 24) + ' 天后自动销毁">剩 ' + Math.round(h / 24) + '天</span>';
+  }
+
+  window.openCloneDetail = async function (id) {
+    let c = null;
+    try {
+      const res = await api("GET", "/api/clone/" + id);
+      c = res && res.id ? res : (res && res.clone ? res.clone : null);
+    } catch (e) { window.BKP.toast("读取克隆详情失败: " + e.message, "danger"); return; }
+    if (!c) { window.BKP.toast("未找到克隆请求", "danger"); return; }
+    const rows = [
+      ['克隆编号', '#' + c.id],
+      ['状态', c.status + (c.vdb_status ? '（实例 ' + c.vdb_status + '）' : '')],
+      ['源备份记录', (c.task_name || '-') + (c.source_record_id ? '（记录 ' + c.source_record_id + '）' : '')],
+      ['源库类型', c.source_db_type || '-'],
+      ['目标环境 / 用途', (c.target_env || '-') + (c.purpose ? ' / ' + c.purpose : '')],
+      ['目标主机', c.target_host || '127.0.0.1'],
+      ['VDB 连接', (c.vdb_host || '127.0.0.1') + ':' + (c.vdb_port || '-') + '/' + (c.vdb_dbname || '-')],
+      ['数据量（实测）', (c.data_size_human || '-') + (Number(c.data_tables || 0) > 0
+        ? ('（' + (c.data_tables || 0) + ' 表 / ' + (c.data_rows || 0) + ' 行）') : '')],
+      ['数据量实测时间', c.data_measured_at || '-'],
+      ['源备份产物占用', c.source_size_human || '-'],
+      ['源库原始体量（未压缩）', c.source_original_size_human || '-'],
+      ['有效期至', c.expires_at || '不自动回收'],
+      ['申请人 / 审批人', (c.requested_by || '-') + ' / ' + (c.approved_by || '-')],
+      ['创建时间', c.created_at || '-']
+    ];
+    const body = rows.map(function (r) {
+      return '<tr><td class="text-muted" style="width:190px">' + esc(r[0]) + '</td><td>' + esc(r[1]) + '</td></tr>';
+    }).join('');
+    const note = c.data_note ? ('<div class="alert alert-info py-2 mt-2 mb-0" style="font-size:.8rem">' + esc(c.data_note) + '</div>') : '';
+    const m = $("cloneDetailModal");
+    $("cloneDetailBody").innerHTML = '<table class="table table-sm mb-0">' + body + '</table>' + note;
+    $("cloneDetailMeasureBtn").onclick = async function () {
+      try {
+        const res = await api("POST", "/api/clone/" + id + "/measure", {});
+        window.BKP.toast(res.message || "已实测", "dark");
+        $("cloneDetailBody").innerHTML = '<div class="text-center py-3"><div class="spinner-border spinner-border-sm"></div> 正在实测…</div>';
+        await openCloneDetail(id);
+        window.loadClones();
+      } catch (e) { window.BKP.toast("实测失败: " + e.message, "danger"); }
+    };
+    bootstrap.Modal.getOrCreateInstance(m).show();
+  };
+
+  window.loadClones = async function () {
       const rows = await api("GET", "/api/clone");
       let provisioning = false;
-      const pg = Pager.slice("clones", rows);
+      const pg = Pager.slice("clones", rows, 15);
       $("cloneTable").innerHTML = pg.list.map(function (c, cii) {
         // VDB 连接信息：就绪时展示可直接使用的连接串
         let vdb = '-';
@@ -9325,6 +9424,8 @@
           if (c.source_record_id) {
             actions.push('<a class="btn btn-sm btn-outline-primary" href="/restore?record_id=' + c.source_record_id + '" title="从源备份产物发起数据恢复">去恢复</a>');
           }
+          actions.push('<button class="btn btn-sm btn-outline-secondary" onclick="openCloneDetail(' + c.id + ')" title="克隆件详情：数据量口径、来源链路、有效期与空间占用">' +
+            '<i class="bi bi-info-circle"></i> 详情</button>');
           // B3 应急接管：emergency 用途的克隆给「接管检查」按钮
           actions.push('<button class="btn btn-sm btn-outline-warning" onclick="takeoverCheck(' + c.id + ')" title="应急接管就绪检查：直连/表数量/行数抽样">' +
             '<i class="bi bi-lightning-charge"></i> 接管检查</button>');
@@ -9352,11 +9453,12 @@
           '<td>' + esc(c.target_host || '127.0.0.1') + '</td>' +
           '<td>' + badge + verifyHtml + '</td>' +
           '<td>' + esc(c.requested_by || '-') + '</td>' +
-          '<td>' + esc(c.expires_at || '-') + '</td>' +
+          '<td>' + esc(c.expires_at || '-') + ttlBadge(c) + '</td>' +
           '<td>' + vdb + '</td>' +
+          '<td>' + cloneSizeCell(c) + '</td>' +
           '<td class="text-end">' + (actions.join(' ') || '-') + '</td>' +
         '</tr>';
-      }).join("") || '<tr><td colspan="10" class="text-muted text-center">暂无克隆请求</td></tr>';
+      }).join("") || '<tr><td colspan="11" class="text-muted text-center">暂无克隆请求</td></tr>';
       Pager.attach("clones", $("cloneTable"), pg.page, pg.pages, pg.total, window.loadClones);
       // 有克隆正在拉起时每 3 秒自动刷新，直到终态
       if (provisioning) {
@@ -9558,7 +9660,8 @@
           '</div><ul class="list-unstyled mb-0 small">' +
           (r.checks || []).map(c => `<li class="mb-1"><span class="badge bg-${LV[c.level] || "secondary"}">${esc(c.level)}</span> <b>${esc(c.item)}</b>：${esc(c.message)}</li>`).join("") +
           '</ul>' + ((r.warnings || []).length
-            ? `<div class="alert alert-warning small mt-2 mb-0">提示：${(r.warnings || []).map(esc).join("<br>")}</div>` : "");
+            ? `<div class="alert alert-warning small mt-2 mb-0">提示：${(r.warnings || []).map(esc).join("<br>")}</div>` : "") +
+          cloneEstimateHtml(r.estimate);
       } catch (e) {
         box.innerHTML = '<span class="text-danger">预检失败：' + esc(e.message) + "</span>";
       }

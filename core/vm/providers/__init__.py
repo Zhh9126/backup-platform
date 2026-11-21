@@ -14,6 +14,9 @@ PROVIDER_META = [
     {"id": "hyperv_ssh", "name": "Microsoft Hyper-V (SSH)", "module": "hyperv_ssh",
      "cls": "HyperVSSHProvider",
      "desc": "PowerShell Export-VM 全量 + 生产检查点（VSS 应用一致）。"},
+    {"id": "workstation_ssh", "name": "VMware Workstation (SSH)", "module": "workstation_ssh",
+     "cls": "WorkstationSSHProvider",
+     "desc": "桌面级 Workstation：vmrun 控制面 + 7za 目录级全量备份，崩溃一致，无块级增量。"},
 ]
 
 PROVIDER_IDS = [p["id"] for p in PROVIDER_META]

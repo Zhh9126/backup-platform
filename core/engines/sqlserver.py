@@ -431,16 +431,23 @@ class SQLServerEngine(BackupEngine):
                     pass
 
         # 官方 T-SQL：BACKUP DATABASE/LOG ... TO DISK WITH COMPRESSION/CHECKSUM
+        # 版本自适应：COMPRESSION 自 SQL Server 2008 起提供，2005(major=9) 必须去掉，
+        # 否则 BACKUP 直接语法报错（2026-11-21 用户现场 2005 备份失败根因之一）。
+        major = self._server_major(ssh_host)
+        compress = self._compress_option(major)
+        ver_note = ""
+        if major == 9:
+            ver_note = "；检测到 SQL Server 2005，已按版本关闭 COMPRESSION（2008 才支持）"
         if bt == BackupType.INCREMENTAL:
             tsql = (f"BACKUP LOG [{db_name}] TO DISK = N'{disk_path}' "
-                    f"WITH NAME = N'backup-platform', COMPRESSION, CHECKSUM, "
+                    f"WITH NAME = N'backup-platform', {compress}CHECKSUM, "
                     f"STATS = 10, INIT")
         elif bt == BackupType.DIFFERENTIAL:
             tsql = (f"BACKUP DATABASE [{db_name}] TO DISK = N'{disk_path}' "
-                    f"WITH DIFFERENTIAL, COMPRESSION, CHECKSUM, STATS = 10, INIT")
+                    f"WITH DIFFERENTIAL, {compress}CHECKSUM, STATS = 10, INIT")
         else:
             tsql = (f"BACKUP DATABASE [{db_name}] TO DISK = N'{disk_path}' "
-                    f"WITH NAME = N'backup-platform', COMPRESSION, CHECKSUM, "
+                    f"WITH NAME = N'backup-platform', {compress}CHECKSUM, "
                     f"STATS = 10, INIT")
 
         # 复用探测：上次 BACKUP 已完成但产物拉回中断 → 跳过重跑 BACKUP
@@ -560,7 +567,8 @@ class SQLServerEngine(BackupEngine):
                f"经 SSH 自 {hk} 拉回"
                f"{'（' + stage_note + '）' if stage_note else ''}"
                f"{'（复用上次远端产物，未重跑备份）' if reuse else ''}"
-               f"{'（断点续传）' if resumed else ''}")
+               f"{'（断点续传）' if resumed else ''}"
+               f"{ver_note}")
         return BackupResult(
             success=True, status=BackupStatus.SUCCESS,
             backup_path=local_path, size_bytes=size,
@@ -716,6 +724,44 @@ class SQLServerEngine(BackupEngine):
             dest = f"{dest_dir}{sep}{fname}"
             moves.append(f"MOVE N'{logical}' TO N'{dest}',")
         return " ".join(moves) + " " if moves else ""
+
+    def _compress_option(self, major: int) -> str:
+        """BACKUP 的 COMPRESSION 选项：SQL Server 2008 起支持，2005(major=9) 必须关闭。
+
+        major=0 表示版本探测失败：保持旧行为（带 COMPRESSION），由 SQL Server
+        自己报错，不在这里猜测。
+        """
+        return "COMPRESSION, " if (major == 0 or major >= 10) else ""
+
+    def _server_major(self, ssh_host: dict = None) -> int:
+        """探测 SQL Server 主版本：9=2005、10=2008、11=2012…，失败返回 0。
+
+        2005 没有 SERVERPROPERTY('ProductMajorVersion')（2008 才有），
+        因此用 ProductVersion 前缀解析；探测失败按 0 处理（保持旧行为）。
+        """
+        import re as _re
+        try:
+            rc, out, _e = self._exec_tsql(
+                "SELECT CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(64));",
+                ssh_host=ssh_host, timeout=60)
+        except Exception:
+            return 0
+        if rc != 0:
+            return 0
+        for ln in (out or "").splitlines():
+            s = ln.strip()
+            if not s or s.lower() == "null":
+                continue
+            if s.startswith("(") or set(s) <= {"-"}:
+                continue
+            m = _re.match(r"(\d+)", s)
+            if m:
+                try:
+                    return int(m.group(1))
+                except Exception:
+                    return 0
+        return 0
+
 
     def _instance_path(self, ssh_host: dict, prop: str) -> str:
         """查询 SERVERPROPERTY 路径属性，过滤 sqlcmd 表头/分隔线/行数脚注。"""

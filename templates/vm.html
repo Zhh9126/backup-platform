@@ -153,6 +153,22 @@
             <input class="form-control" id="hv_storage"
                    placeholder="PVE 填 PBS/本地存储名；KVM 可填 qemu+ssh://host/system">
           </div>
+          <div class="col-md-6 d-none" id="hv_ws_box">
+            <label class="form-label">Workstation 虚拟机库目录</label>
+            <input class="form-control" id="hv_ws_lib"
+                   placeholder="D:\Users\xxx\Documents\Virtual Machines（多个用逗号分隔，留空自动扫描）">
+          </div>
+          <div class="col-md-6 d-none" id="hv_ws_box2">
+            <label class="form-label">vmrun.exe 路径（可选）</label>
+            <input class="form-control" id="hv_ws_vmrun"
+                   placeholder="留空自动从注册表探测：D:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe">
+          </div>
+        </div>
+        <div class="alert alert-info py-2 d-none" id="hv_ws_tip">
+          VMware Workstation 说明：桌面级虚拟化，无 vCenter/CBT 接口。本平台通过
+          <b>vmrun</b>（控制面）+ 安装目录自带 <b>7za</b>（数据面打包）实现
+          <b>目录级全量备份</b>，被管主机无需安装任何 agent；一致性为
+          <b>崩溃一致</b>（不含内存态），<b>不支持块级增量</b>（增量任务会如实回退全量）。
         </div>
       </div>
       <div class="modal-footer">
@@ -279,5 +295,5 @@
 
 {% block scripts %}
 <script src="{{ url_for('static', filename='js/test-records.js') }}?v=2026112101"></script>
-<script src="{{ url_for('static', filename='js/vm.js') }}?v={{ ts }}"></script>
+<script src="{{ url_for('static', filename='js/vm.js') }}?v=2026112201"></script>
 {% endblock %}

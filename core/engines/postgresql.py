@@ -532,6 +532,7 @@ class PostgreSQLEngine(BackupEngine):
         import time as _t
 
         ssh_host = remote_dump.resolve_ssh_host(self.task)
+        ssh_host = remote_dump.ssh_host_for_stdin(ssh_host)
         if not ssh_host:
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,

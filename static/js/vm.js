@@ -86,6 +86,9 @@
           <td class="text-end">
             <button class="btn btn-sm btn-outline-primary" onclick="vmDiscover(${r.id})">
               <i class="bi bi-search"></i> 资产发现</button>
+            <button class="btn btn-sm btn-outline-secondary" onclick="vmEditHv(${r.id})"
+                    title="修改纳管配置（名称/地址/凭据/暂存目录等）">
+              <i class="bi bi-pencil-square"></i> 编辑</button>
             <button class="btn btn-sm btn-outline-danger" onclick="vmDelHv(${r.id})">
               <i class="bi bi-trash3"></i></button>
           </td>
@@ -379,6 +382,53 @@
     vmLoadJobs();
   };
 
+  // 纳管/编辑共用一个弹窗：hvEditId 为空=新建，否则=更新
+  let hvEditId = null;
+
+  window.vmEditHv = async function (id) {
+    let row = null;
+    try {
+      const rows = await window.BKP.api("GET", "/api/vm/hypervisors");
+      row = (rows || []).find((r) => String(r.id) === String(id));
+    } catch (e) { window.BKP.toast("读取纳管配置失败: " + e.message, "danger"); return; }
+    if (!row) { window.BKP.toast("未找到该虚拟化平台", "danger"); return; }
+    let ex = {};
+    try {
+      ex = (typeof row.extra_config === "string")
+        ? (JSON.parse(row.extra_config || "{}") || {})
+        : (row.extra_config || {});
+    } catch (e) { ex = {}; }
+    hvEditId = row.id;
+    $("hv_name").value = row.name || "";
+    $("hv_provider").value = row.provider || "";
+    $("hv_endpoint").value = row.endpoint || "";
+    $("hv_username").value = row.username || "";
+    $("hv_password").value = "";          // 留空=不修改已存口令
+    $("hv_ssl").value = row.verify_ssl ? "1" : "0";
+    $("hv_ssh_host").value = row.ssh_host_id || "";
+    $("hv_iso").value = ex.isolate_network || "";
+    $("hv_work").value = ex.work_dir || "";
+    $("hv_storage").value = ex.storage || ex.uri || "";
+    $("hv_ws_lib").value = ex.library_dirs || "";
+    $("hv_ws_vmrun").value = ex.vmrun_path || "";
+    const title = document.querySelector("#hvModal .modal-title");
+    if (title) title.textContent = "编辑虚拟化平台 · " + (row.name || "");
+    syncWsFields();
+    bootstrap.Modal.getOrCreateInstance($("hvModal")).show();
+  };
+
+  function resetHvForm() {
+    hvEditId = null;
+    const title = document.querySelector("#hvModal .modal-title");
+    if (title) title.textContent = "纳管虚拟化平台";
+    ["hv_name", "hv_endpoint", "hv_username", "hv_password", "hv_iso",
+     "hv_work", "hv_storage", "hv_ws_lib", "hv_ws_vmrun"].forEach((id) => {
+      const el = $(id); if (el) el.value = "";
+    });
+    const ss = $("hv_ssh_host"); if (ss) ss.value = "";
+    syncWsFields();
+  }
+
   async function saveHv() {
     const extra = {};
     if ($("hv_iso").value) extra.isolate_network = $("hv_iso").value;
@@ -389,17 +439,53 @@
       else if (p === "libvirt_ssh") extra.uri = $("hv_storage").value;
       else extra.storage = $("hv_storage").value;
     }
+    if ($("hv_provider").value === "workstation_ssh") {
+      if ($("hv_ws_lib").value) extra.library_dirs = $("hv_ws_lib").value;
+      if ($("hv_ws_vmrun").value) extra.vmrun_path = $("hv_ws_vmrun").value;
+    }
+    const payload = {
+      name: $("hv_name").value, provider: $("hv_provider").value,
+      endpoint: $("hv_endpoint").value, username: $("hv_username").value,
+      verify_ssl: $("hv_ssl").value === "1",
+      extra_config: JSON.stringify(extra), ssh_host_id: $("hv_ssh_host").value || null
+    };
+    // 口令：新建必填；编辑留空=保持原口令（不覆盖）
+    const pw = $("hv_password").value;
+    if (pw) payload.password = pw;
+    else if (!hvEditId) payload.password = "";
     try {
-      const res = await window.BKP.api("POST", "/api/vm/hypervisors", {
-        name: $("hv_name").value, provider: $("hv_provider").value,
-        endpoint: $("hv_endpoint").value, username: $("hv_username").value,
-        password: $("hv_password").value, verify_ssl: $("hv_ssl").value === "1",
-        extra_config: JSON.stringify(extra), ssh_host_id: $("hv_ssh_host").value || null
-      });
-      window.BKP.toast(res.message || "已纳管");
+      if (hvEditId) {
+        await window.BKP.api("PUT", "/api/vm/hypervisors/" + hvEditId, payload);
+        window.BKP.toast("已保存修改");
+      } else {
+        await window.BKP.api("POST", "/api/vm/hypervisors", payload);
+        window.BKP.toast("已纳管");
+      }
       bootstrap.Modal.getInstance($("hvModal")).hide();
+      resetHvForm();
       vmLoadAll();
-    } catch (e) { window.BKP.toast("纳管失败: " + e.message, "danger", 6000); }
+    } catch (e) {
+      window.BKP.toast((hvEditId ? "保存失败: " : "纳管失败: ") + e.message, "danger", 6000);
+    }
+  }
+
+  function hvExtraPayload() {
+    const extra = {};
+    if ($("hv_iso").value) extra.isolate_network = $("hv_iso").value;
+    if ($("hv_work").value) extra.work_dir = $("hv_work").value;
+    if ($("hv_provider").value === "workstation_ssh") {
+      if ($("hv_ws_lib").value) extra.library_dirs = $("hv_ws_lib").value;
+      if ($("hv_ws_vmrun").value) extra.vmrun_path = $("hv_ws_vmrun").value;
+    }
+    return extra;
+  }
+
+  function syncWsFields() {
+    const on = $("hv_provider").value === "workstation_ssh";
+    const b1 = $("hv_ws_box"), b2 = $("hv_ws_box2"), tip = $("hv_ws_tip");
+    if (b1) b1.classList.toggle("d-none", !on);
+    if (b2) b2.classList.toggle("d-none", !on);
+    if (tip) tip.classList.toggle("d-none", !on);
   }
 
   async function testHv() {
@@ -407,7 +493,9 @@
       const res = await window.BKP.api("POST", "/api/vm/hypervisors/test", {
         provider: $("hv_provider").value, endpoint: $("hv_endpoint").value,
         username: $("hv_username").value, password: $("hv_password").value,
-        verify_ssl: $("hv_ssl").value === "1"
+        verify_ssl: $("hv_ssl").value === "1",
+        ssh_host_id: $("hv_ssh_host").value || null,
+        extra_config: JSON.stringify(hvExtraPayload())
       });
       window.BKP.toast((res.ok ? "连接成功：" : "连接失败：") + (res.message || ""),
         res.ok ? "dark" : "danger", 6000);
@@ -418,7 +506,10 @@
     loadProviders();
     loadVmSshHosts();
     vmLoadAll();
+    $("hv_provider").addEventListener("change", syncWsFields);
+    syncWsFields();
     $("newHvBtn").addEventListener("click", function () {
+      resetHvForm();
       bootstrap.Modal.getOrCreateInstance($("hvModal")).show();
     });
     $("hvSaveBtn").addEventListener("click", saveHv);

@@ -1605,6 +1605,9 @@ def get_clone_request(request_id: int, include_secret: bool = False) -> Optional
     """
     row = db.query_one(
         "SELECT cr.*, br.db_type AS source_db_type, br.task_id AS source_task_id, "
+        "br.size_bytes AS source_size_bytes, br.backup_path AS source_artifact_path, "
+        "br.original_size_bytes AS source_original_size_bytes, "
+        "br.backup_type AS source_backup_type, "
         "t.name AS task_name, "
         "v.host AS vdb_host, v.port AS vdb_port, v.database_name AS vdb_dbname, "
         "v.status AS vdb_status, v.username AS vdb_username "
@@ -1626,6 +1629,9 @@ def get_clone_request(request_id: int, include_secret: bool = False) -> Optional
 def list_clone_requests() -> list:
     rows = db.query(
         "SELECT cr.*, br.db_type AS source_db_type, br.task_id AS source_task_id, "
+        "br.size_bytes AS source_size_bytes, br.backup_path AS source_artifact_path, "
+        "br.original_size_bytes AS source_original_size_bytes, "
+        "br.backup_type AS source_backup_type, "
         "t.name AS task_name, "
         "v.host AS vdb_host, v.port AS vdb_port, v.database_name AS vdb_dbname, "
         "v.status AS vdb_status, v.username AS vdb_username "
@@ -1641,7 +1647,8 @@ def update_clone_request(request_id: int, data: dict) -> None:
     """更新克隆请求字段（白名单）。target_password 自动加密。"""
     allow = {"status", "itsm_ticket_id", "approved_by", "expires_at",
              "vdb_instance_id", "note", "target_host", "target_password",
-             "databases"}
+             "databases", "data_size_bytes", "data_tables", "data_rows",
+             "data_measured_at", "data_note"}
     updates = {k: v for k, v in data.items() if k in allow}
     if not updates:
         return

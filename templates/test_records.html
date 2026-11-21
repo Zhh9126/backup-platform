@@ -1,0 +1,6 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar"><div><div class="page-title">测试记录</div><div class="page-sub">备份、恢复、克隆、存储及系统测试的执行结果与验收证据</div></div></div>
+{% include "partials/test_records_panel.html" %}
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='js/test-records.js') }}?v=2026112101"></script>{% endblock %}

@@ -352,6 +352,7 @@
   }
 
   window.vmLoadAll = function () {
+    if (window.TestRecords) window.TestRecords.load();
     vmLoadHv();
     vmLoadProtected();
     vmLoadRps();

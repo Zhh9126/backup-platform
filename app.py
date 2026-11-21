@@ -694,11 +694,20 @@ def create_app() -> Flask:
         """备份依赖插件管理（一键安装 xtrabackup / percona / mariabackup / pgbackrest 等）。"""
         return render_template("plugins.html", page="plugins")
 
+    @app.route("/test-records")
+    @login_required
+    def test_records_page():
+        return render_template("test_records.html", page="test_records")
+
     @app.route("/vm")
     @login_required
     def vm_page():
         """虚拟机备份：虚拟化平台纳管 → 保护策略 → 恢复点（PITR）→ 还原 / 克隆 / 恢复验证。"""
-        return render_template("vm.html", page="vm")
+        from core.test_records import list_runs
+        evidence = list_runs(category="vm", size=1)
+        from core import models as vm_models
+        return render_template("vm.html", page="vm", test_count=evidence["total"],
+                               evidence_default=bool(evidence["total"] and not vm_models.list_vm_hypervisors()))
 
     @app.route("/db-adapters")
     @login_required

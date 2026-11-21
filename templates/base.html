@@ -94,6 +94,7 @@
         <a class="nav-link {% if page=='synology' %}active{% endif %}" href="/synology" title="NAS 存储：群晖 DSM 设备探活 / 共享文件夹资产 / 全量+增量备份 / 恢复到 DSM 目录" data-perm="backup.task.view"><i class="bi bi-hdd-network"></i> <span class="nav-label">NAS存储</span></a>
         <a class="nav-link {% if page=='netdev' %}active{% endif %}" href="/netdev" title="网络设备备份（交换机 / 路由器配置备份 / SSH / 远程 FTP）" data-perm="backup.task.view"><i class="bi bi-router"></i> <span class="nav-label">网络设备备份</span></a>
         <a class="nav-link {% if page=='vm' %}active{% endif %}" href="/vm" title="虚拟机备份（整机恢复点 / 永久增量 / 克隆新 VM）"><i class="bi bi-pc-display-horizontal"></i> <span class="nav-label">虚拟机备份</span></a>
+        <a class="nav-link {% if page=='test_records' %}active{% endif %}" href="/test-records" data-perm="backup.task.view"><i class="bi bi-clipboard-check"></i> <span class="nav-label">测试记录</span></a>
         <a class="nav-link {% if page=='ai_backup' %}active{% endif %}" href="/ai_backup" title="AI 模型备份：模型权重/检查点、向量索引（Qdrant/Chroma）、训练数据集与元数据的跨层一致性保护计划"><i class="bi bi-cpu"></i> <span class="nav-label">AI 模型备份</span></a>
         <div class="nav-parent {% if page in ('storage-media','storage','tape') %}active{% endif %}" id="storageNavParent" data-nav-group data-target="storageNavSub" role="button" tabindex="0" title="存储管理：备份落点与介质（存储池 / 磁带库 / FTP / NFS / 外挂）" data-perm="backup.storage.manage">
           <i class="bi bi-hdd-rack"></i> <span class="nav-label">存储管理</span>

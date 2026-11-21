@@ -1,0 +1,33 @@
+<div class="page-card p-3" id="testRecordsRoot" data-category="{{ 'vm' if page=='vm' else '' }}">
+  <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+    <div><h5 class="mb-1">测试记录</h5><div class="text-muted small">实机测试与自动化回归分别标注，失败和部分通过结果保留。</div></div>
+    {% if page=='vm' %}<a class="btn btn-outline-primary btn-sm" href="/test-records">查看全部测试</a>{% endif %}
+  </div>
+  <div class="alert alert-info py-2 small">外部实机测试表示使用原生工具完成的真实验证，不代表已经通过平台自动纳管或调度。</div>
+  <div class="d-flex flex-wrap gap-2 mb-3" id="testRecordCounts"></div>
+  <div class="d-flex flex-wrap gap-2 mb-3">
+    <input id="testRecordSearch" class="form-control form-control-sm" style="max-width:320px" placeholder="搜索测试名称或对象">
+    {% if page!='vm' %}<select id="testRecordCategory" class="form-select form-select-sm" style="max-width:150px">
+      <option value="">全部分类</option><option value="vm">虚拟机</option><option value="database">数据库</option>
+      <option value="clone">克隆</option><option value="storage">存储</option><option value="agent">Agent</option>
+      <option value="recovery">恢复</option><option value="system">系统回归</option>
+    </select>{% endif %}
+    <select id="testRecordStatus" class="form-select form-select-sm" style="max-width:150px">
+      <option value="">全部状态</option><option value="passed">通过</option><option value="partial">部分通过</option>
+      <option value="failed">失败</option><option value="skipped">跳过</option><option value="running">进行中</option>
+    </select>
+    <button id="testRecordRefresh" class="btn btn-outline-secondary btn-sm">刷新记录</button>
+  </div>
+  <div class="table-responsive"><table class="table align-middle">
+    <thead><tr><th>测试 / 对象</th><th>验证方式</th><th>状态</th><th>测试时间</th><th>结果</th><th>操作</th></tr></thead>
+    <tbody id="testRecordRows"><tr><td colspan="6">正在读取测试记录…</td></tr></tbody>
+  </table></div>
+  <div class="d-flex justify-content-between align-items-center"><span id="testRecordPage" class="small text-muted"></span>
+    <div><button id="testRecordPrev" class="btn btn-sm btn-outline-secondary">上一页</button>
+    <button id="testRecordNext" class="btn btn-sm btn-outline-secondary">下一页</button></div>
+  </div>
+</div>
+<div class="modal fade" id="testRecordModal" tabindex="-1"><div class="modal-dialog modal-xl modal-dialog-scrollable"><div class="modal-content">
+  <div class="modal-header"><h5 class="modal-title">测试详情与证据</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+  <div class="modal-body" id="testRecordDetail"></div>
+</div></div></div>

@@ -92,4 +92,5 @@ $result|ConvertTo-Json -Depth 5|Set-Content -Encoding UTF8 (Join-Path $root 'res
 foreach($name in @('result.json','recovered-canary.db','acceptance.log')) {
  Native 'C:\Windows\System32\OpenSSH\scp.exe' @('-o','BatchMode=yes',(Join-Path $root $name),('root@192.168.109.128:/root/backup-platform-private/build/vm-real-20261120/cold-'+$name))|Out-Null
 }
+Native 'C:\Windows\System32\OpenSSH\ssh.exe' @('-o','BatchMode=yes','root@192.168.109.128','cd /root/backup-platform-private && .venv/bin/python scripts/qa/register_results.py')|Out-Null
 Note 'Consistent VM backup and recovery acceptance passed'

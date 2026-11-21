@@ -2470,6 +2470,9 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                 except Exception:
                     pass
 
+            from core.test_records import init_schema as init_acceptance_schema
+            init_acceptance_schema(conn)
+
             conn.commit()
         finally:
             if close_conn:

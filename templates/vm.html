@@ -10,15 +10,19 @@
 </div>
 
 <ul class="nav nav-tabs mb-3" id="vmTabs">
-  <li class="nav-item"><a class="nav-link active" href="#tab-hv" data-bs-toggle="tab">虚拟化平台</a></li>
+  <li class="nav-item"><a class="nav-link {% if not evidence_default %}active{% endif %}" href="#tab-hv" data-bs-toggle="tab">虚拟化平台</a></li>
   <li class="nav-item"><a class="nav-link" href="#tab-protected" data-bs-toggle="tab">受保护虚拟机</a></li>
   <li class="nav-item"><a class="nav-link" href="#tab-rp" data-bs-toggle="tab">恢复点</a></li>
   <li class="nav-item"><a class="nav-link" href="#tab-jobs" data-bs-toggle="tab">作业 / 验证</a></li>
+  <li class="nav-item"><a class="nav-link {% if evidence_default %}active{% endif %}" href="#tab-tests" data-bs-toggle="tab">测试记录 <span class="badge bg-secondary">{{ test_count }}</span></a></li>
 </ul>
 
 <div class="tab-content">
+  <div class="tab-pane fade {% if evidence_default %}show active{% endif %}" id="tab-tests">
+    {% include "partials/test_records_panel.html" %}
+  </div>
   <!-- ① 虚拟化平台 -->
-  <div class="tab-pane fade show active" id="tab-hv">
+  <div class="tab-pane fade {% if not evidence_default %}show active{% endif %}" id="tab-hv">
     <div class="page-card">
       <div class="table-responsive">
         <table class="table table-hover align-middle mb-0">
@@ -269,5 +273,6 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="{{ url_for('static', filename='js/test-records.js') }}?v=2026112101"></script>
 <script src="{{ url_for('static', filename='js/vm.js') }}?v={{ ts }}"></script>
 {% endblock %}

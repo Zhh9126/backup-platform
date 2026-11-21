@@ -34,6 +34,9 @@ def init_schema(conn):
       archive_path TEXT NOT NULL, status TEXT NOT NULL, size_bytes INTEGER DEFAULT 0,
       file_count INTEGER DEFAULT 0, checksum TEXT DEFAULT '', created_at TEXT NOT NULL,
       finished_at TEXT DEFAULT '', message TEXT DEFAULT '', manifest_json TEXT DEFAULT '')""")
+    for col,typ in (("started_at","TEXT DEFAULT ''"),("duration_sec","REAL DEFAULT 0")):
+        try: conn.execute("ALTER TABLE os_backup_records ADD COLUMN %s %s"%(col,typ))
+        except Exception: pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_os_backup_time ON os_backup_records(created_at)")
 
 def _system_metadata():
@@ -68,6 +71,7 @@ def create_backup(source_root,label="",excludes=None):
     # Excludes are interpreted relative to / for root backups and relative to source otherwise.
     root=_root();root.mkdir(parents=True,exist_ok=True)
     stamp=db.now_iso().replace(":","").replace("+","_")
+    started_at=db.now_iso();started_ts=__import__("time").time()
     fd,tmp=tempfile.mkstemp(prefix=".os-",suffix=".tar.gz",dir=root);os.close(fd)
     files=[];total=0
     try:
@@ -86,14 +90,16 @@ def create_backup(source_root,label="",excludes=None):
         safe_label=re.sub(r"[^A-Za-z0-9_.-]+","_",label.strip() or "os").strip("._") or "os"
         name=safe_label+"_"+stamp+".tar.gz"
         dest=root/name;os.replace(tmp,dest)
-        rid=db.execute("INSERT INTO os_backup_records(label,source_root,archive_path,status,size_bytes,file_count,checksum,created_at,finished_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-          (label.strip() or "os",str(source),str(dest),"success",dest.stat().st_size,len(files),checksum,manifest["created_at"],db.now_iso(),"操作系统备份完成",json.dumps(manifest,ensure_ascii=False)))
+        finished_at=db.now_iso();duration=round(__import__("time").time()-started_ts,3)
+        rid=db.execute("INSERT INTO os_backup_records(label,source_root,archive_path,status,size_bytes,file_count,checksum,created_at,started_at,finished_at,duration_sec,message,manifest_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          (label.strip() or "os",str(source),str(dest),"success",dest.stat().st_size,len(files),checksum,manifest["created_at"],started_at,finished_at,duration,"操作系统备份完成",json.dumps(manifest,ensure_ascii=False)))
         return {"id":rid,"status":"success","archive_path":str(dest),"checksum":checksum,"file_count":len(files),"size_bytes":dest.stat().st_size,"manifest":manifest}
     except Exception as exc:
         try: os.unlink(tmp)
         except OSError: pass
-        db.execute("INSERT INTO os_backup_records(label,source_root,archive_path,status,created_at,finished_at,message) VALUES(?,?,?,?,?,?,?)",
-          (label.strip() or "os",str(source),"","failed",db.now_iso(),db.now_iso(),str(exc)[:500]))
+        finished_at=db.now_iso();duration=round(__import__("time").time()-started_ts,3)
+        db.execute("INSERT INTO os_backup_records(label,source_root,archive_path,status,created_at,started_at,finished_at,duration_sec,message) VALUES(?,?,?,?,?,?,?,?,?)",
+          (label.strip() or "os",str(source),"","failed",finished_at,started_at,finished_at,duration,str(exc)[:500]))
         raise
 
 def _load_archive(path):
@@ -149,7 +155,7 @@ def restore_backup(archive_path,target_root,dry_run=True,confirm=False):
         shutil.rmtree(stage,ignore_errors=True);raise
 
 def list_records(limit=100):
-    return db.query("SELECT id,label,source_root,archive_path,status,size_bytes,file_count,checksum,created_at,finished_at,message FROM os_backup_records ORDER BY id DESC LIMIT ?",(max(1,min(500,int(limit))),))
+    return db.query("SELECT id,label,source_root,archive_path,status,size_bytes,file_count,checksum,created_at,started_at,finished_at,duration_sec,message FROM os_backup_records ORDER BY id DESC LIMIT ?",(max(1,min(500,int(limit))),))
 
 def _archive_manifest(path):
     files=[];total=0
@@ -166,10 +172,12 @@ def _archive_manifest(path):
             "total_bytes":total,"created_at":db.now_iso(),"files":files}
 
 def _register_archive(path,label,source_root,manifest=None):
+    started_at=db.now_iso();started_ts=__import__("time").time()
     path=Path(path);manifest=manifest or _archive_manifest(path)
     manifest["source_root"]=str(source_root);checksum=_sha(path)
-    rid=db.execute("INSERT INTO os_backup_records(label,source_root,archive_path,status,size_bytes,file_count,checksum,created_at,finished_at,message,manifest_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-      (label or "os",str(source_root),str(path),"success",path.stat().st_size,manifest["file_count"],checksum,manifest["created_at"],db.now_iso(),"远程操作系统备份完成",json.dumps(manifest,ensure_ascii=False)))
+    finished_at=db.now_iso();duration=round(__import__("time").time()-started_ts,3)
+    rid=db.execute("INSERT INTO os_backup_records(label,source_root,archive_path,status,size_bytes,file_count,checksum,created_at,started_at,finished_at,duration_sec,message,manifest_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      (label or "os",str(source_root),str(path),"success",path.stat().st_size,manifest["file_count"],checksum,manifest["created_at"],started_at,finished_at,duration,"远程操作系统备份完成",json.dumps(manifest,ensure_ascii=False)))
     return {"id":rid,"status":"success","archive_path":str(path),"checksum":checksum,
             "file_count":manifest["file_count"],"size_bytes":path.stat().st_size,"manifest":manifest}
 

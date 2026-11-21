@@ -6,3 +6,32 @@
 @media(min-width:1400px){.rc-workspace{grid-template-columns:minmax(0,1.8fr) minmax(370px,1fr)}}
 @media(max-width:1100px){.rc-types{gap:10px}.rc-type{padding:15px 12px;gap:9px}.rc-type-copy small{font-size:10px}.rc-type-icon{width:34px;height:34px;font-size:18px}.rc-type-count{font-size:20px}.rc-workspace{grid-template-columns:minmax(0,1.2fr) minmax(320px,1fr);gap:14px}}
 @media(max-width:800px){.rc-types{grid-template-columns:repeat(2,minmax(0,1fr))}.rc-workspace{grid-template-columns:1fr}.rc-header{align-items:start;gap:12px}.rc-header h1{font-size:22px}.rc-header-actions{flex-direction:column}.rc-target-empty{padding:45px 20px}.rc-records{min-height:240px}.rc-history th,.rc-history td{white-space:nowrap}.rc-record-size{display:none}}
+
+/* 恢复工作台按全站排版契约收敛：平铺、同层卡片、避免空状态撑满页面 */
+.rc-shell { max-width: none; font-size: var(--font-size-base); }
+.rc-header { margin: 0 0 var(--space-lg); }
+.rc-header h1 { font-size: var(--font-size-xxl); line-height: 1.3; font-weight: var(--weight-bold); letter-spacing: -.01em; }
+.rc-header p { font-size: var(--font-size-sm); line-height: 1.6; }
+.rc-eyebrow { font-size: var(--font-size-xs); }
+.rc-types { gap: var(--space-md); margin-bottom: var(--space-lg); }
+.rc-type { min-height: 84px; padding: var(--space-md); border-radius: var(--radius-lg); }
+.rc-type-copy strong { font-size: var(--font-size-base); font-weight: var(--weight-semibold); }
+.rc-type-copy small { font-size: var(--font-size-xs); }
+.rc-workspace { grid-template-columns: repeat(2,minmax(0,1fr)); gap: var(--space-lg); align-items: stretch; }
+.rc-card { border-radius: var(--radius-lg); box-shadow: var(--shadow-card); }
+.rc-section-head { padding: var(--space-md) var(--space-lg); }
+.rc-section-head h2 { font-size: var(--font-size-md); font-weight: var(--weight-semibold); }
+.rc-records { min-height: 220px; }
+.rc-target-empty { padding: 68px var(--space-lg); }
+.rc-target-empty h3 { font-size: var(--font-size-base); font-weight: var(--weight-semibold); }
+.rc-target-empty p, .rc-muted, .rc-form-text { font-size: var(--font-size-xs); }
+.rc-record-title { font-size: var(--font-size-base); }
+.rc-record-sub, .rc-record-meta, .rc-record-size { font-size: var(--font-size-xs); }
+.rc-field-group .form-label { font-size: var(--font-size-xs); }
+.rc-field-group .form-control, .rc-field-group .form-select { font-size: var(--font-size-base); }
+.rc-field-group .form-text, .rc-execute-note, .rc-evidence-note { font-size: var(--font-size-xs); }
+.rc-history { margin-top: var(--space-lg); }
+.rc-history th, .rc-history td { font-size: var(--font-size-xs); padding: var(--space-md) var(--space-lg)!important; }
+@media(max-width:800px){.rc-workspace{grid-template-columns:1fr}.rc-target-empty{padding:45px var(--space-lg)}}
+.rc-workspace { align-items: start; }
+.rc-target { align-self: start; }

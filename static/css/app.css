@@ -1259,3 +1259,34 @@ body {
 .layout.sidebar-collapsed .sidebar .nav-parent .nav-label { opacity: 0; width: 0; overflow: hidden; }
 .layout.sidebar-collapsed .sidebar .nav-parent .nav-caret { display: none; }
 
+
+/* ---------- 全站排版契约（2026-11-21） ----------
+   页面标题 24px/700；区块标题 16px/600；正文 14px/400；
+   辅助文字 12px/400；导航一级 14px/500；导航二级 13px/400。
+   页面不得自行重新定义基础层级，只允许用组件类表达状态。
+*/
+.content-inner > .toolbar .page-title,
+.content-inner > .page-header .page-title,
+.content-inner > .page-title {
+  font-size: var(--font-size-xxl);
+  line-height: 1.3;
+  font-weight: var(--weight-bold);
+  letter-spacing: -.01em;
+}
+.content-inner > .toolbar .page-sub,
+.content-inner > .page-header .page-sub,
+.content-inner > .page-sub {
+  font-size: var(--font-size-sm);
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+.content-inner h1 { font-size: var(--font-size-xxl); line-height: 1.3; font-weight: var(--weight-bold); }
+.content-inner h2 { font-size: var(--font-size-md); line-height: 1.45; font-weight: var(--weight-semibold); }
+.content-inner h3 { font-size: var(--font-size-base); line-height: 1.5; font-weight: var(--weight-semibold); }
+.content-inner p, .content-inner td, .content-inner th, .content-inner label,
+.content-inner .form-control, .content-inner .form-select, .content-inner .btn {
+  font-size: var(--font-size-base);
+}
+.content-inner .form-text, .content-inner small, .content-inner .text-muted { font-size: var(--font-size-xs); }
+.sidebar .nav-link { font-size: var(--font-size-sm); font-weight: var(--weight-medium); }
+.sidebar .nav-sub .nav-link { font-size: var(--font-size-xs); font-weight: var(--weight-normal); }

@@ -1,4 +1,4 @@
-<div class="page-card p-3" id="testRecordsRoot" data-category="{{ 'vm' if page=='vm' else '' }}">
+<div class="page-card p-3" id="testRecordsRoot" data-category="{{ test_record_category or ('vm' if page=='vm' else '') }}">
   <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
     <div><h5 class="mb-1">测试记录</h5><div class="text-muted small">实机测试与自动化回归分别标注，失败和部分通过结果保留。</div></div>
     {% if page=='vm' %}<a class="btn btn-outline-primary btn-sm" href="/test-records">查看全部测试</a>{% endif %}

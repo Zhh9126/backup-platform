@@ -120,6 +120,11 @@
                    placeholder="PVE: https://10.0.0.5:8006 | KVM: root@10.0.0.6 | ESXi: 10.0.0.7 | Hyper-V: 10.0.0.8">
             <div class="form-text" id="hv_provider_hint"></div>
           </div>
+          <div class="col-md-12">
+            <label class="form-label">已纳管 SSH 主机（可选）</label>
+            <select class="form-select" id="hv_ssh_host"><option value="">手工填写连接地址</option></select>
+            <div class="form-text">选择后会自动带入远程 IP、SSH 用户和密码；PVE 默认生成 https://IP:8006，其他平台按 SSH 主机连接。</div>
+          </div>
           <div class="col-md-6">
             <label class="form-label">用户名 / Token ID</label>
             <input class="form-control" id="hv_username" placeholder="root 或 root@pam!token">

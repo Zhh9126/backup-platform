@@ -49,6 +49,26 @@
     }
   }
 
+  async function loadVmSshHosts() {
+    try {
+      const hosts = await window.BKP.api("GET", "/api/hosts");
+      const sel = $("hv_ssh_host");
+      if (!sel) return;
+      sel.innerHTML = '<option value="">手工填写连接地址</option>' +
+        (hosts || []).map(h => '<option value="' + h.id + '">' +
+          esc(h.name || h.host_key) + ' · ' + esc(h.hostname || '') + '</option>').join("");
+      sel.addEventListener("change", async function () {
+        if (!this.value) return;
+        const h = await window.BKP.api("GET", "/api/hosts/" + this.value);
+        const provider = $("hv_provider").value;
+        $("hv_endpoint").value = provider === "pve"
+          ? "https://" + h.hostname + ":8006" : h.hostname;
+        $("hv_username").value = h.username || "";
+        $("hv_password").value = "";
+      });
+    } catch (e) { /* 无纳管主机时保留手工输入 */ }
+  }
+
   // ---------------- 虚拟化平台 ----------------
   async function vmLoadHv() {
     try {
@@ -374,7 +394,7 @@
         name: $("hv_name").value, provider: $("hv_provider").value,
         endpoint: $("hv_endpoint").value, username: $("hv_username").value,
         password: $("hv_password").value, verify_ssl: $("hv_ssl").value === "1",
-        extra_config: JSON.stringify(extra)
+        extra_config: JSON.stringify(extra), ssh_host_id: $("hv_ssh_host").value || null
       });
       window.BKP.toast(res.message || "已纳管");
       bootstrap.Modal.getInstance($("hvModal")).hide();
@@ -396,6 +416,7 @@
 
   document.addEventListener("DOMContentLoaded", function () {
     loadProviders();
+    loadVmSshHosts();
     vmLoadAll();
     $("newHvBtn").addEventListener("click", function () {
       bootstrap.Modal.getOrCreateInstance($("hvModal")).show();

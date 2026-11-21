@@ -63,6 +63,19 @@ def list_hypervisors() -> list:
 
 
 def create_hypervisor(data: dict) -> dict:
+    data = dict(data or {})
+    ssh_host_id = data.get("ssh_host_id")
+    if ssh_host_id:
+        host = __import__("core.ssh_hosts", fromlist=["get_host"]).get_host(int(ssh_host_id), include_secret=True)
+        if not host:
+            raise VMProviderError("选择的 SSH 主机不存在")
+        data.setdefault("username", host.get("username") or "root")
+        if not data.get("password"):
+            data["password"] = host.get("password") or ""
+        pid0 = (data.get("provider") or "").strip()
+        if not data.get("endpoint"):
+            data["endpoint"] = ("https://" + host["hostname"] + ":8006"
+                                if pid0 == "pve" else host["hostname"])
     pid = (data.get("provider") or "").strip()
     if not get_provider_class(pid):
         raise VMProviderError("不支持的虚拟化平台类型: %s" % pid)

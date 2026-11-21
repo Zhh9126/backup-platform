@@ -507,7 +507,7 @@ def create_app() -> Flask:
     @app.route("/file_backup")
     @login_required
     def file_backup_page():
-        return render_template("file_backup.html", page="file_backup")
+        return render_template("file_backup.html", page="file_backup", test_record_category="storage")
 
     @app.route("/synology")
     @login_required
@@ -697,7 +697,7 @@ def create_app() -> Flask:
     @app.route("/os-backup")
     @login_required
     def os_backup_page():
-        return render_template("os_backup.html", page="os_backup")
+        return render_template("os_backup.html", page="os_backup", test_record_category="system")
 
     @app.route("/test-records")
     @login_required

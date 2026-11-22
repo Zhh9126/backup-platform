@@ -2126,7 +2126,6 @@ def ssh_host_for_stdin(ssh_host: dict) -> dict:
     if str(h.get("transport") or "").lower() != "agent":
         return h
     host = str(h.get("hostname") or h.get("host") or "").strip()
-    port = int(h.get("port") or 22)
     if not host:
         return h
     try:
@@ -2134,8 +2133,10 @@ def ssh_host_for_stdin(ssh_host: dict) -> dict:
         for row in ssh_hosts.list_hosts(include_secret=True):
             if str(row.get("hostname") or "") != host:
                 continue
-            if int(row.get("port") or 22) != port:
-                continue
+            # 不能按端口匹配：Agent 描述符的 port 是 agent 服务端口（8466），
+            # 同机纳管 SSH 的 port 是 22，强求一致会导致回退永远找不到主机，
+            # 恢复继续走 Agent 通道并报「不支持 stdin 灌入」（171 实测）。
+            # 只按 hostname 匹配：同机 SSH 即为所需通道。
             out = dict(row)
             out["transport"] = "ssh"
             out["_stdin_fallback"] = True

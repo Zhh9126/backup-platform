@@ -9094,6 +9094,9 @@
       $("dm_tgt_db_name").value = "";
       $("dm_note").value = "";
       ["dm_t_structure", "dm_t_full", "dm_t_verify"].forEach(function (id) { $("#" + id).checked = true; });
+      if ($("dm_t_incremental")) $("dm_t_incremental").checked = false;
+      if ($("dm_inc_column")) $("dm_inc_column").value = "";
+      if ($("dmIncWrap")) $("dmIncWrap").style.display = "none";
       // 保险：类型下拉若仍是空的（首次进入/接口异常后重进）立刻补齐
       dmFillTypeSelects();
       if (dmModalInst) dmModalInst.show();
@@ -9120,6 +9123,8 @@
       if ($("dm_t_structure").checked) payload.migrate_types.push("structure");
       if ($("dm_t_full").checked) payload.migrate_types.push("full");
       if ($("dm_t_verify").checked) payload.migrate_types.push("verify");
+      const dmInc = $("dm_t_incremental") && $("dm_t_incremental").checked;
+      if (dmInc) payload.migrate_types.push("incremental");
       // 迁移对象（表之外）+ 排除表（对标 KDTS）
       const mo = { views: $("dm_o_views").checked, sequences: $("dm_o_sequences").checked,
         comments: $("dm_o_comments").checked, routines: $("dm_o_routines").checked,
@@ -9137,13 +9142,15 @@
       } catch (e) { toast("类型映射不是合法 JSON", "warning"); return; }
       const sIndexes = $("dm_s_indexes") ? $("dm_s_indexes").checked : true;
       const sConstraints = $("dm_s_constraints") ? $("dm_s_constraints").checked : true;
+      const incCol = $("dm_inc_column") ? $("dm_inc_column").value.trim() : "";
       if (Object.values(mo).some(Boolean) || excl.length || typeMapping || dmParallel > 1
-          || !sIndexes || !sConstraints) {
+          || !sIndexes || !sConstraints || (dmInc && incCol)) {
         payload.extra_options = {};
         if (Object.values(mo).some(Boolean)) payload.extra_options.migrate_objects = mo;
         if (excl.length) payload.extra_options.exclude_tables = excl;
         if (typeMapping) payload.extra_options.type_mapping = typeMapping;
         if (dmParallel > 1) payload.extra_options.parallel_tables = dmParallel;
+        if (dmInc && incCol) payload.extra_options.incremental_column = incCol;
         if (!sIndexes || !sConstraints)
           payload.extra_options.migrate_structure =
             { indexes: sIndexes, constraints: sConstraints };
@@ -9159,6 +9166,11 @@
       } catch (e) { toast(e.message, "danger"); }
     };
 
+    if ($("dm_t_incremental")) {
+      $("dm_t_incremental").addEventListener("change", function () {
+        if ($("dmIncWrap")) $("dmIncWrap").style.display = this.checked ? "block" : "none";
+      });
+    }
     $("newDbMigrateBtn").addEventListener("click", window.openDbMigrateModal);
     $("dbMigrateSaveBtn").addEventListener("click", window.saveDbMigrate);
 

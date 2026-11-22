@@ -22,6 +22,7 @@
   // 同步=持续性任务（incremental/realtime，常驻运行保持两端一致）
   const MODES = [
     { value: "full", label: "数据迁移（一次性全量）" },
+    { value: "full_incremental", label: "全量+增量追平（一次性不停机）" },
     { value: "incremental", label: "数据同步（周期增量）" },
     { value: "realtime", label: "数据同步（实时 CDC）" },
   ];
@@ -166,7 +167,9 @@
     const syncModeSel = $("syncMode");
     if (syncModeSel) {
       const toggleOverwrite = function () {
-        const isMigration = syncModeSel.value === "full";
+        // 全量+增量追平也是「先全量重建、再增量追平」的一次性迁移语义，
+        // 允许 overwrite（全量阶段重建目标表，追平阶段引擎强制 upsert）
+        const isMigration = ["full", "full_incremental"].indexOf(syncModeSel.value) >= 0;
         Array.from($("saveMode").options).forEach(function (o) {
           if (o.value === "overwrite") o.disabled = !isMigration;
         });
@@ -278,7 +281,8 @@
 
   function onSyncModeChange() {
     const mode = $("syncMode").value;
-    $("incrementalWrap").style.display = mode === "incremental" ? "block" : "none";
+    $("incrementalWrap").style.display =
+      (mode === "incremental" || mode === "full_incremental") ? "block" : "none";
     $("realtimeWrap").style.display = mode === "realtime" ? "block" : "none";
   }
 

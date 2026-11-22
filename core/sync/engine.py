@@ -76,6 +76,11 @@ _SYNC_MODE_ALIASES = {
     "incremental": "incremental", "增量": "incremental", "增量同步": "incremental",
     "realtime": "realtime", "实时": "realtime", "实时同步": "realtime",
     "实时同步（Flink CDC）": "realtime", "flink cdc": "realtime", "flink_cdc": "realtime",
+    # 全量+增量追平（一次性任务；与常驻 realtime 区分）
+    "full_incremental": "full_incremental", "全量增量": "full_incremental",
+    "全量+增量": "full_incremental", "全量加增量": "full_incremental",
+    "全量+增量追平": "full_incremental", "full_and_incremental": "full_incremental",
+    "full_then_incremental": "full_incremental",
 }
 _SAVE_MODE_ALIASES = {
     "append": "append", "追加": "append", "追加写入": "append", "insert": "append",
@@ -276,6 +281,8 @@ class SyncEngine:
             }
         if cfg.sync_mode == "realtime":
             return self._run_realtime(progress_callback)
+        if cfg.sync_mode == "full_incremental":
+            return self._run_full_incremental(progress_callback)
         if cfg.full_db_migrate:
             return self._run_full_migration(progress_callback)
 
@@ -317,8 +324,13 @@ class SyncEngine:
                 "parallel": _workers,
             }
 
-        # 多表：逐个同步并聚合结果
+        # 多表：逐个同步并聚合结果（与全量+增量模式共用同一实现）
+        return self.run_full_tables_only(progress_callback)
+
+    def run_full_tables_only(self, progress_callback=None) -> Dict[str, Any]:
+        """多表串行全量同步（run 与全量+增量模式共用，避免逻辑分叉）。"""
         start = datetime.now()
+        tables = self._get_tables_to_sync()
         total_read = total_write = errors = 0
         per_table = []
         for tbl in tables:
@@ -512,6 +524,102 @@ class SyncEngine:
                 "error_details": error_details,
                 "duration": (datetime.now() - start).total_seconds(),
             }
+
+    # ------------------------------------------------------------------ #
+    # 全量 + 增量追平（一次性任务，对标 DTS 不停机迁移）
+    #   快照前取交接位点 → 全量 → 追平增量到最新 → 返回（不常驻）
+    # ------------------------------------------------------------------ #
+    def _run_full_incremental(self, progress_callback=None) -> Dict[str, Any]:
+        cfg = self.config
+        start = datetime.now()
+        if not cfg.incremental_column:
+            return {"success": False,
+                    "message": "全量+增量一体化需要配置增量列"
+                               "（时间戳列如 updated_at 或自增列 id）",
+                    "total_read": 0, "total_write": 0, "errors": 0,
+                    "duration": 0.0}
+
+        from .catchup import run_catchup, snapshot_watermark
+        tables = self._get_tables_to_sync()
+        if not tables:
+            return {"success": False,
+                    "message": "未指定要同步的表（source_table / source_tables_list 为空）",
+                    "total_read": 0, "total_write": 0, "errors": 0,
+                    "duration": 0.0}
+
+        # 1) 关键：所有表的交接位点必须在任何全量写入【之前】取，
+        #    否则快照期间新写入的行会被水位越过而永久漏掉。
+        schema = cfg.src_schema or cfg.src_db_name
+        watermarks = {t: snapshot_watermark(cfg, t, schema) for t in tables}
+        logger.info("[sync%s] 全量+增量：快照前交接水位 %s",
+                    cfg.task_id, watermarks)
+
+        # 2) 全量阶段：复用既有单表/多表/全库入口（含结构对象、断点续跑）
+        if len(tables) == 1:
+            full = self._run_single_table(
+                tables[0], cfg.target_table or tables[0], progress_callback)
+        elif cfg.full_db_migrate:
+            full = self._run_full_migration(progress_callback)
+        else:
+            full = self.run_full_tables_only(progress_callback)
+        if not full.get("success"):
+            return full
+
+        # 3) 增量追平：逐表从交接水位追到最新（串行是必要的——
+        #    水位回写共享任务行，并行会产生竞态）
+        reader = registry.create_reader(cfg.src_db_type, cfg)
+        writer = registry.create_writer(cfg.tgt_db_type, cfg)
+        src_conn = tgt_conn = None
+        catchups = []
+        try:
+            src_conn = reader.connect()
+            tgt_conn = writer.connect()
+            for t in tables:
+                target = (cfg.target_table or t) if len(tables) == 1 else t
+                res = run_catchup(
+                    cfg, reader, writer, src_conn, tgt_conn,
+                    watermarks.get(t, ""), t, target,
+                    max_rounds=config.SYNC_CATCHUP_MAX_ROUNDS,
+                    max_seconds=config.SYNC_CATCHUP_MAX_SECONDS,
+                    on_watermark=lambda c, v, tid=cfg.task_id:
+                        self._save_persisted_watermark(tid, c, v),
+                    progress_callback=progress_callback)
+                res["table"] = t
+                res["start_watermark"] = watermarks.get(t, "")
+                catchups.append(res)
+                if not res.get("success"):
+                    break
+        except Exception as e:
+            logger.exception("[sync%s] 增量追平异常", cfg.task_id)
+            return {"success": False, "message": "增量追平异常: %s" % e,
+                    "total_read": full.get("total_read", 0),
+                    "total_write": full.get("total_write", 0), "errors": 0,
+                    "full": full, "catchup": catchups,
+                    "duration": (datetime.now() - start).total_seconds()}
+        finally:
+            reader.close(conn=src_conn)
+            writer.close(conn=tgt_conn)
+
+        ok = all(c.get("success") for c in catchups) and bool(catchups)
+        caught = all(c.get("caught_up") for c in catchups) and bool(catchups)
+        total_read = full.get("total_read", 0) + sum(
+            c.get("rows_read", 0) for c in catchups)
+        total_write = full.get("total_write", 0) + sum(
+            c.get("rows_written", 0) for c in catchups)
+        msg = ("全量+增量完成：全量写入 %s 行，增量追平 %s 轮 / %s 行，%s"
+               % (full.get("total_write", 0),
+                  sum(c.get("rounds", 0) for c in catchups),
+                  sum(c.get("rows_written", 0) for c in catchups),
+                  "已追平" if caught else "未确认追平（见提示）"))
+        return {
+            "success": ok, "message": msg,
+            "total_read": total_read, "total_write": total_write,
+            "errors": full.get("errors", 0),
+            "full": full, "catchup": catchups,
+            "watermarks": watermarks,
+            "caught_up": caught,
+            "duration": (datetime.now() - start).total_seconds(),
+        }
 
     # ------------------------------------------------------------------ #
     # 实时同步（Binlog CDC，参考 Flink CDC 思路在平台内实现）

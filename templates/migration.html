@@ -95,8 +95,14 @@
               <label class="form-check-label" for="dm_t_full">全量数据迁移</label></div>
             <div class="form-check"><input class="form-check-input" type="checkbox" id="dm_t_verify" checked>
               <label class="form-check-label" for="dm_t_verify">数据校验（逐表行数比对）</label></div>
+            <div class="form-check"><input class="form-check-input" type="checkbox" id="dm_t_incremental">
+              <label class="form-check-label" for="dm_t_incremental">增量追平（全量后自动追至最新）</label></div>
           </div>
-          <div class="form-text">提交后立即执行：预检查 → 所选阶段顺序编排，进度与报告实时展示；增量/不停机由「数据同步」realtime 模式承接。</div>
+          <div class="form-text">提交后立即执行：预检查 → 所选阶段顺序编排，进度与报告实时展示。勾选增量追平后，在全量开始前记录源端水位、全量完成后追平其间新增变更（DTS 不停机迁移语义）。</div>
+          <div class="mt-2" id="dmIncWrap" style="display:none">
+            <label class="form-label">增量列（时间戳列如 update_time 或自增列 id）</label>
+            <input type="text" class="form-control" id="dm_inc_column" placeholder="id" style="max-width:260px">
+          </div>
         </div>
         <div class="mt-3">
           <label class="form-label">表级完整性对象（结构迁移补齐）</label>

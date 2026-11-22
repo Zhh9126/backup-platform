@@ -231,6 +231,9 @@ MIG_LIST_LIMIT = 100               # 计划列表默认条数
 MIG_STRUCTURE_INDEXES_DEFAULT = True
 MIG_STRUCTURE_CONSTRAINTS_DEFAULT = True
 MIG_STRUCTURE_MAX_OBJECTS = 200     # 每表抽取上限（硬上限 2000）
+SYNC_CATCHUP_MAX_ROUNDS = 200       # 全量+增量追平最大轮次
+SYNC_CATCHUP_MAX_SECONDS = 900      # 全量+增量追平最大耗时（秒）
+SYNC_DEFAULT_INC_COLUMN = "id"      # 未显式配置时的默认增量列（追平用）
 
 
 def resolve_port(db_type, port=None):

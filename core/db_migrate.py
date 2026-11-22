@@ -35,7 +35,7 @@ ST_VERIFYING = "verifying"
 ST_COMPLETED = "completed"
 ST_FAILED = "failed"
 
-_VALID_TYPES = ("structure", "full", "verify")
+_VALID_TYPES = ("structure", "full", "verify", "incremental")
 
 # 取消请求（进程内）：_run_all 在阶段边界检查，避免中途 DROP/TRUNCATE 被打断
 _CANCELLED_PLANS = set()
@@ -167,6 +167,10 @@ class DbMigrationEngine:
             raise ValueError(f"迁移内容非法: {bad}（允许 {list(_VALID_TYPES)}）")
         if not types:
             raise ValueError("至少选择一项迁移内容")
+        if ("incremental" in types
+                and not ({"structure", "full"} & set(types))):
+            raise ValueError("增量追平（incremental）必须与结构迁移或全量迁移同时选择："
+                             "它需要先有一次全量基线，再追平其间的新增变更")
         now = db.now_iso()
         extra = data.get("extra_options")
         if not isinstance(extra, dict):
@@ -285,10 +289,19 @@ class DbMigrationEngine:
                 self._fail(plan_id, phases, "precheck", pre.get("message", "预检查失败"))
                 return
 
+            # 交接水位必须在全量快照【开始前】取：快照期间新写入的行若大于
+            # 快照后取的 MAX，会被水位越过而永久漏掉（DTS 一体化首要正确性）
+            watermarks: Dict[str, str] = {}
+            if "incremental" in types:
+                watermarks = self._snapshot_watermarks(plan)
+                phases["watermarks"] = watermarks
+                self._set(plan_id, phases_json=json.dumps(phases, ensure_ascii=False))
+
             # ---------- 阶段 2：结构迁移 + 全量迁移 ----------
             if self._check_cancel(plan_id, phases, "migrate"):
                 return
-            if "structure" in types or "full" in types:
+            needs_full = bool({"structure", "full", "incremental"} & set(types))
+            if needs_full:
                 _cur_phase = "migrate"
                 self._set(plan_id, status=ST_MIGRATING, current_phase="migrate")
                 # 断点续跑：上次执行失败且留有 manifest → 只补失败表
@@ -305,6 +318,26 @@ class DbMigrationEngine:
                 self._set(plan_id, phases_json=json.dumps(phases, ensure_ascii=False))
                 if not mig["ok"]:
                     self._fail(plan_id, phases, "migrate", mig.get("message", "迁移失败"))
+                    return
+
+            # ---------- 阶段 2.2：增量追平（DTS 不停机迁移：全量 → 增量 → 校验） ----------
+            # 激活 db_migration_plans 上原有但从未被读取的 inc_* 字段。
+            if "incremental" in types and mig.get("ok"):
+                if self._check_cancel(plan_id, phases, "catchup"):
+                    return
+                _cur_phase = "catchup"
+                self._set(plan_id, status=ST_MIGRATING, current_phase="catchup")
+                catch = self._phase_catchup(plan, watermarks)
+                phases["catchup"] = catch
+                self._set(
+                    plan_id, phases_json=json.dumps(phases, ensure_ascii=False),
+                    inc_enabled=1,
+                    inc_events=int(catch.get("total_written", 0)),
+                    inc_last_apply_at=db.now_iso(),
+                    full_done_at=catch.get("full_done_at") or db.now_iso())
+                if not catch["ok"]:
+                    self._fail(plan_id, phases, "catchup",
+                               catch.get("message", "增量追平失败"))
                     return
 
             # ---------- 阶段 2.5：非表对象迁移（视图/序列/注释/例程/触发器） ----------
@@ -801,6 +834,133 @@ class DbMigrationEngine:
         if res.get("precheck_failed") and res.get("precheck"):
             result["precheck"] = res["precheck"]
         return result
+
+    # ================= 全量 + 增量追平（DTS 不停机迁移） =================
+    def _migrate_synthetic_task(self, plan: dict, inc_col: str = "") -> dict:
+        """构造迁移用的 synthetic task（负 id，不落真实 sync_tasks 行）。"""
+        extra = plan.get("extra_options") or {}
+        if not isinstance(extra, dict):
+            try:
+                extra = json.loads(extra) if extra else {}
+            except Exception:
+                extra = {}
+        return {
+            "id": -int(plan["id"]),
+            "name": f"迁移计划-{plan['name']}",
+            "src_db_type": plan["src_db_type"], "src_host": plan["src_host"],
+            "src_port": plan["src_port"], "src_username": plan["src_username"],
+            "src_password": plan["src_password"], "src_db_name": plan["src_db_name"],
+            "src_schema": plan.get("src_schema") or "",
+            "tgt_db_type": plan["tgt_db_type"], "tgt_host": plan["tgt_host"],
+            "tgt_port": plan["tgt_port"], "tgt_username": plan["tgt_username"],
+            "tgt_password": plan["tgt_password"], "tgt_db_name": plan["tgt_db_name"],
+            "tgt_schema": plan.get("tgt_schema") or "",
+            "sync_mode": "full", "save_mode": "upsert",
+            "incremental_column": inc_col,
+            "type_mapping": extra.get("type_mapping") or {},
+            "validate_before_run": False, "verify_after_run": False,
+            "skip_precheck": True,
+        }
+
+    def _migrate_inc_column(self, plan: dict) -> str:
+        extra = plan.get("extra_options") or {}
+        if not isinstance(extra, dict):
+            try:
+                extra = json.loads(extra) if extra else {}
+            except Exception:
+                extra = {}
+        return str(extra.get("incremental_column") or config.SYNC_DEFAULT_INC_COLUMN)
+
+    def _snapshot_watermarks(self, plan: dict) -> Dict[str, str]:
+        """全量前逐表取 MAX(incremental_column) 交接水位。
+
+        枚举源表用同步插件 list_tables（与全量阶段口径一致）；排除表按
+        extra_options.exclude_tables 过滤。取不到的表留空串（退化为从头
+        追平），并在 phases.watermarks 中如实可见，绝不伪造位点。
+        """
+        from core.sync.engine import _task_to_config
+        from core.sync.plugins import registry
+        from core.sync.catchup import snapshot_watermark
+
+        inc_col = self._migrate_inc_column(plan)
+        cfg = _task_to_config(self._migrate_synthetic_task(plan, inc_col))
+        reader = registry.create_reader(cfg.src_db_type, cfg)
+        conn = None
+        try:
+            conn = reader.connect()
+            tables = list(reader.list_tables() or [])
+        except Exception as e:
+            self.logger.warning("[db_migrate] 计划 %s 交接水位表枚举失败: %s",
+                                plan["id"], str(e)[:200])
+            return {}
+        finally:
+            reader.close(conn=conn)
+        extra = plan.get("extra_options") or {}
+        if not isinstance(extra, dict):
+            extra = {}
+        excluded = {str(t).strip() for t in (extra.get("exclude_tables") or [])
+                    if isinstance(t, str)}
+        tables = [t for t in tables if str(t) not in excluded]
+        schema = cfg.src_schema or cfg.src_db_name
+        return {t: snapshot_watermark(cfg, t, schema) for t in tables}
+
+    def _phase_catchup(self, plan: dict, watermarks: Dict[str, str]) -> dict:
+        """全量后从交接水位逐表追平到最新（不常驻、不写 sync_tasks 水位）。"""
+        from core.sync.engine import _task_to_config
+        from core.sync.plugins import registry
+        from core.sync.catchup import run_catchup
+
+        inc_col = self._migrate_inc_column(plan)
+        cfg = _task_to_config(self._migrate_synthetic_task(plan, inc_col))
+        cfg.incremental_column = inc_col
+        extra = plan.get("extra_options") or {}
+        if not isinstance(extra, dict):
+            extra = {}
+        max_rounds = int(extra.get("catchup_max_rounds")
+                         or config.SYNC_CATCHUP_MAX_ROUNDS)
+        max_seconds = int(extra.get("catchup_max_seconds")
+                          or config.SYNC_CATCHUP_MAX_SECONDS)
+        reader = registry.create_reader(cfg.src_db_type, cfg)
+        writer = registry.create_writer(cfg.tgt_db_type, cfg)
+        src_conn = tgt_conn = None
+        per_table = []
+        try:
+            src_conn = reader.connect()
+            tgt_conn = writer.connect()
+            for table, wm in (watermarks or {}).items():
+                res = run_catchup(
+                    cfg, reader, writer, src_conn, tgt_conn,
+                    wm, table, table,
+                    max_rounds=max_rounds, max_seconds=max_seconds)
+                res["table"] = table
+                res["start_watermark"] = wm
+                per_table.append(res)
+                if not res.get("success"):
+                    break
+        except Exception as e:
+            self.logger.exception("[db_migrate] 计划 %s 增量追平异常", plan["id"])
+            return {"ok": False, "phase": "catchup", "per_table": per_table,
+                    "message": "增量追平异常: %s" % str(e)[:240],
+                    "started_at": db.now_iso()}
+        finally:
+            reader.close(conn=src_conn)
+            writer.close(conn=tgt_conn)
+
+        ok = bool(per_table) and all(t.get("success") for t in per_table)
+        caught = bool(per_table) and all(t.get("caught_up") for t in per_table)
+        total = sum(t.get("rows_written", 0) for t in per_table)
+        return {
+            "ok": ok, "caught_up": caught, "phase": "catchup",
+            "incremental_column": inc_col,
+            "per_table": per_table,
+            "total_written": total,
+            "tables": len(per_table),
+            "full_done_at": db.now_iso(),
+            "message": ("增量追平完成：%d 张表，写入 %d 行，%s"
+                        % (len(per_table), total,
+                           "已追平" if caught else "未确认完全追平（见明细）")),
+            "started_at": db.now_iso(),
+        }
 
     # ================= 非表对象迁移（对标 KDTS 迁移对象种类） =================
     _PG_FAMILY = ("postgresql", "kingbase", "opengauss", "panwei")

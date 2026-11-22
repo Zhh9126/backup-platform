@@ -5294,6 +5294,9 @@ window.I18N = (function () {
     "索引（含唯一索引）": "Indexes (including unique indexes)",
     "唯一 / 外键 / CHECK 约束": "UNIQUE / FOREIGN KEY / CHECK constraints",
     "数据写入完成后建索引与约束；单个对象失败只提示不阻断迁移。Oracle/达梦仅抽取对象清单，需复核目标 DDL。": "Indexes and constraints are created after data load; a single object failure only warns and never blocks the migration. Oracle/Dameng extract object lists only; review target DDL.",
+    "增量追平（全量后自动追至最新）": "Incremental catch-up (auto-catch-up after full load)",
+    "提交后立即执行：预检查 → 所选阶段顺序编排，进度与报告实时展示。勾选增量追平后，在全量开始前记录源端水位、全量完成后追平其间新增变更（DTS 不停机迁移语义）。": "Runs immediately after submission: precheck, selected phases in order, with live progress and reports. With incremental catch-up enabled, the source watermark is captured before the full load and changes made during it are caught up afterwards (DTS zero-downtime migration semantics).",
+    "增量列（时间戳列如 update_time 或自增列 id）": "Incremental column (timestamp like update_time or auto-increment id)",
   });
 
   return {

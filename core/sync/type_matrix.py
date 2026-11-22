@@ -313,6 +313,22 @@ def _datetime_target(tgt: str, t: dict):
         return ("VARCHAR2(16)", "warn",
                 "Oracle 无 TIME 类型：按字符串承载 'HH:MM:SS'（保留超 24h/负值语义，"
                 "需人工确认是否改按 DATE 处理）")
+    if base == "time":
+        # MySQL/PG/金仓/达梦/SQL Server 都有原生 TIME 类型：必须映射成 TIME。
+        # 此前缺此分支 → 落到「其它时间类型别名」兜底成 DATETIME/TIMESTAMP，
+        # 而插件建表路径（_map_to_xxx_type）建的是原生 TIME 列 —— 两条路径口径
+        # 不一致，导致预检试写把 '08:13:13' 写进 DATETIME/TIMESTAMP 列被拒
+        # （MySQL 1292 / PG "invalid input syntax for type timestamp"），
+        # 预检误判失败并拦死本可成功的迁移。
+        if tgt in ("mysql", "mariadb"):
+            return ("TIME", "ok", "")
+        if tgt in ("postgresql", "kingbase"):
+            return ("TIME", "ok", "")
+        if tgt == "dameng":
+            return ("TIME", "ok", "")
+        if tgt == "sqlserver":
+            return ("TIME", "ok", "")
+        return ("TIME", "warn", "TIME → TIME（目标库型未显式支持，按标准时间类型承载）")
     if base == "datetime":
         if tgt in ("oracle", "dameng"):
             p = t["prec"]

@@ -523,9 +523,33 @@ def _norm_val(v) -> str:
     """将 DB-API 返回值归一化为可比对字符串。"""
     if v is None:
         return _NULL_MARK
-    if isinstance(v, bytes):
-        return "0x" + v[:32].hex() + ("…" if len(v) > 32 else "")
-    if hasattr(v, "isoformat"):           # datetime.date / datetime / time
+    # psycopg2 读 bytea 返回 memoryview；str() 得到 '<memory at 0x…>'，与
+    # MySQL 侧 bytes→hex 永不相等 → bytea 列 100% 抽样误报差异。
+    if isinstance(v, memoryview):
+        v = v.tobytes()
+    # JSON/JSONB：不同驱动返回形态不同（MySQL 给 JSON 文本 str，psycopg2
+    # 给 dict/list）。此前 dict 走 str(v) 产出单引号字面量，与 JSON 文本
+    # 永不相等 → 含 jsonb 列的表 100% 抽样误报差异。统一解析后按规范 JSON
+    # 序列化（键排序、无多余空白）再比对。
+    import json as _json
+    if isinstance(v, (dict, list)):
+        return _json.dumps(v, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"), default=str)
+    if isinstance(v, (bytes, bytearray)):
+        b = bytes(v)
+        return "0x" + b[:32].hex() + ("…" if len(b) > 32 else "")
+    from datetime import time as _time, timedelta as _td
+    # MySQL TIME 驱动返回 timedelta（str 是 'H:MM:SS' 不补零），PG TIME 返回
+    # datetime.time。两者必须归一到同一个 'HH:MM:SS'；此前 time 落到下面的
+    # datetime 分支被套上 '1900-01-01 ' 日期前缀，含 TIME 列的表抽样 100% 误报。
+    if isinstance(v, _td):
+        total = int(v.total_seconds())
+        sign = "-" if total < 0 else ""
+        total = abs(total)
+        return "%s%02d:%02d:%02d" % (sign, total // 3600, (total % 3600) // 60, total % 60)
+    if isinstance(v, _time) and not hasattr(v, "year"):
+        return "%02d:%02d:%02d" % (v.hour, v.minute, v.second)
+    if hasattr(v, "isoformat"):           # datetime.date / datetime
         # datetime 统一为 "YYYY-MM-DD HH:MM:SS[.ffffff]"（空格分隔）——
         # 修复：此前 isoformat(sep="T")，与部分驱动/表结构返回的字符串
         # 形式（空格分隔）不一致，异构对比（MySQL↔金仓/达梦）时间列
@@ -539,6 +563,14 @@ def _norm_val(v) -> str:
     if isinstance(v, float):
         return repr(round(v, 6))
     if isinstance(v, str):
+        # JSON 文本 → 规范 JSON（与 dict/list 侧同口径）
+        s = v.strip()
+        if len(s) >= 2 and s[0] in "{[" and s[-1] in "}]":
+            try:
+                return _json.dumps(_json.loads(s), ensure_ascii=False,
+                                   sort_keys=True, separators=(",", ":"))
+            except Exception:
+                pass
         # 字符串形式的时间戳统一 T→空格（两侧驱动行为不一致时防误报）
         if len(v) == 19 and v[10] == "T" and v[4] == "-" and v[13] == ":":
             return v[:10] + " " + v[11:]

@@ -66,6 +66,12 @@ def to_db(value: Any, target_type: str = "STRING") -> Any:
     """把平台统一值转换回目标数据库可接受的 Python 值。"""
     if value is None:
         return None
+    # JSON/JSONB 源列经 psycopg2 等驱动会解析成 Python dict/list；直接 str()
+    # 产出单引号字面量（"{'id': 1}"），写入 MySQL JSON 列报 3140 Invalid JSON
+    # text。统一按 JSON 序列化（双引号、合法 JSON），对 TEXT 目标同样安全。
+    if isinstance(value, (dict, list)):
+        import json as _json
+        return _json.dumps(value, ensure_ascii=False, default=str)
     if target_type == JavaType.BOOLEAN:
         return bool(value)
     if target_type == JavaType.LONG:

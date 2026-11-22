@@ -40,6 +40,19 @@ def _to_bindable(v, src_type: str = "", keep_datetime: bool = False):
         return 1 if v else 0
     if isinstance(v, (bytes, bytearray)):
         return bytes(v)              # JDBC BINARY → setBytes
+    # JSON/JSONB 源列（psycopg2 自动解析为 dict/list）：str(dict) 产出单引号
+    # 字面量，写入 MySQL JSON 列报 3140 Invalid JSON text。统一 JSON 序列化。
+    if isinstance(v, (dict, list)):
+        import json as _json
+        return _json.dumps(v, ensure_ascii=False, default=str)
+    # MySQL TIME 源返回 timedelta，str() 是 'H:MM:SS'（不补零），部分目标
+    # （PG/达梦 TIME 列）判非法；统一补零格式。
+    from datetime import timedelta as _td
+    if isinstance(v, _td):
+        total = int(v.total_seconds())
+        sign = "-" if total < 0 else ""
+        total = abs(total)
+        return "%s%02d:%02d:%02d" % (sign, total // 3600, (total % 3600) // 60, total % 60)
     if isinstance(v, (datetime, date, time)):
         if keep_datetime:
             return v

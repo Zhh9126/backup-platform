@@ -93,7 +93,8 @@ class OracleSourceReader(SourceReader):
         finally:
             conn.close()
 
-    def _build_select_sql(self, table: str, columns: List[str]) -> str:
+    def _build_select_sql(self, table: str, columns: List[str],
+                          use_offset: bool = False) -> str:
         owner = _upper(self.config.src_schema or self.config.src_username)
         table_ref = f'{owner}.{_upper(table)}'
         col_str = ", ".join(c for c in columns) if columns else "*"
@@ -112,20 +113,37 @@ class OracleSourceReader(SourceReader):
         # ORDER BY 仅增量模式需要（且必须有排序列）；full 模式/列未知时
         # 不加（空 ORDER BY → ORA-00936 missing expression，实测踩坑）
         order_col = cfg.incremental_column or (columns[0] if columns else "")
-        if cfg.sync_mode == "incremental" and order_col:
+        binds = {}
+        if use_offset:
+            # 全量模式每次 read_batch 都重新 execute（cursor 不跨批保留结果集），
+            # 必须用 12c+ 分页语法推进；ORDER BY 1 保证顺序稳定。
+            sql += " ORDER BY 1 OFFSET :off ROWS FETCH NEXT :lim ROWS ONLY"
+            binds["off"], binds["lim"] = 0, cfg.batch_size
+        elif cfg.sync_mode == "incremental" and order_col:
             sql += " ORDER BY " + order_col
-        return sql, ({"iv": cfg.incremental_value} if
-                     (cfg.sync_mode == "incremental" and
-                      cfg.incremental_column and cfg.incremental_value) else {})
+        if (cfg.sync_mode == "incremental" and cfg.incremental_column
+                and cfg.incremental_value):
+            binds["iv"] = cfg.incremental_value
+        return sql, binds
 
     def read_batch(self, cursor: Any) -> ReadResult:
         cfg = self.config
         table = (cfg.source_tables_list or [cfg.source_table])[0] \
             if (cfg.source_tables_list or cfg.source_table) else ""
-        sql, binds = self._build_select_sql(table, [])
-        cursor.execute(sql, binds or {})
+        use_offset = not (cfg.sync_mode == "incremental" and cfg.incremental_column
+                          and cfg.incremental_value)
+        if use_offset:
+            if getattr(self, "_offset_table", None) != table:
+                self._offset_table = table
+                self._offset = 0
+        sql, binds = self._build_select_sql(table, [], use_offset)
+        if use_offset:
+            binds["off"] = self._offset
+        cursor.execute(sql, binds)
         columns = [d[0] for d in cursor.description]
-        rows = cursor.fetchmany(cfg.batch_size)
+        rows = cursor.fetchall() if use_offset else cursor.fetchmany(cfg.batch_size)
+        if use_offset:
+            self._offset += len(rows)
         # oracledb 的 description[i][1] 是 DbType 枚举（非 str）→ 取 .name 归一
         col_types = []
         for d in cursor.description:

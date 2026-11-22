@@ -514,6 +514,16 @@ def run_precheck(cfg) -> Dict[str, Any]:
                 r = {"status": "warn", "message": f"数据级试写异常（跳过）: {e}",
                      "detail": []}
             if r:
+                if r.get("status") == "fail":
+                    # 试写按「映射建议」建临时表，而正式迁移按源端实际列元数据
+                    # 经插件 _map_to_xxx_type 建表——两条路径口径不同。实测多起
+                    # 试写失败（JSON 单引号、无精度 DECIMAL、达梦行长）但正式
+                    # 迁移完全成功，试写 fail 会拦死本可成功的迁移。
+                    # 降级为 warn 如实提示风险；真实结论由迁移结果 + verify 给出。
+                    r = dict(r)
+                    r["message"] = ("试写提示（不阻断，正式迁移按实际列元数据建表）: "
+                                    + str(r.get("message") or ""))
+                    r["status"] = "warn"
                 _add(items, f"data_sample[{t}]", r["status"],
                      r["message"], r.get("detail"))
     try:

@@ -94,13 +94,17 @@ class PostgreSQLSourceReader(SourceReader):
                         arr_sfx = ""
                     ctype = base + arr_sfx
                     prec = scale = None
-                    if inner and re.fullmatch(r"\s*\d+\s*(?:,\s*\d+)?\s*", inner):
-                        parts = inner.split(",")
-                        try: prec = int(parts[0])
-                        except Exception: pass
-                        if len(parts) > 1:
-                            try: scale = int(parts[1])
-                            except Exception: pass
+                    # 金仓 V9 的 format_type 输出形如 'character varying(4000 char)'
+                    # / 'numeric(20,4)'：括号里带 char/byte 单位后缀。此前正则
+                    # 只认纯数字，导致 max_length=None、目标 MySQL 兜底成
+                    # varchar(255)，长文本列写入直接报 1406 Data too long。
+                    if inner:
+                        pm = re.fullmatch(
+                            r"\s*(\d+)\s*(?:,\s*(\d+))?\s*(?:char|byte)?\s*",
+                            inner, re.IGNORECASE)
+                        if pm:
+                            prec = int(pm.group(1))
+                            scale = int(pm.group(2)) if pm.group(2) else None
                     cols.append(ColumnMeta(
                         name=row[0], type=ctype, nullable=row[2], default=row[3],
                         max_length=prec if base in _CHAR_BASES else None,
@@ -113,7 +117,8 @@ class PostgreSQLSourceReader(SourceReader):
         finally:
             conn.close()
 
-    def _build_select_sql(self, table: str, columns: List[str]) -> str:
+    def _build_select_sql(self, table: str, columns: List[str],
+                          use_offset: bool = False) -> str:
         schema = self.config.src_schema or "public"
         table_ref = f'"{schema}"."{table}"'
         col_str = ", ".join(f'"{c}"' for c in columns) if columns else "*"
@@ -130,7 +135,13 @@ class PostgreSQLSourceReader(SourceReader):
             sql += " WHERE " + " AND ".join(where_parts)
         if self.config.incremental_column:
             sql += f' ORDER BY "{self.config.incremental_column}"'
+        elif use_offset:
+            # 全量模式必须稳定排序 + OFFSET 推进，否则每轮 LIMIT 重查返回同一批，
+            # 超过 batch_size 的表被引擎「分批读取未推进」护栏拦死。
+            sql += " ORDER BY 1"
         sql += " LIMIT %s"
+        if use_offset:
+            sql += " OFFSET %s"
         return sql
 
     def read_batch(self, cursor: Any) -> ReadResult:
@@ -140,14 +151,25 @@ class PostgreSQLSourceReader(SourceReader):
         # 无 mapping 时不限定列（SELECT *）；空列表语义=全列
         source_cols = [m.get("source") for m in mapping if m.get("source")]
 
-        sql = self._build_select_sql(table, source_cols)
+        # 有增量水位按水位分页；否则（全量 / 增量首轮快照）用 OFFSET 推进。
+        use_offset = not (cfg.sync_mode == "incremental" and cfg.incremental_column
+                          and cfg.incremental_value)
+        if use_offset:
+            if getattr(self, "_offset_table", None) != table:
+                self._offset_table = table
+                self._offset = 0
+        sql = self._build_select_sql(table, source_cols, use_offset)
         params = []
-        if cfg.sync_mode == "incremental" and cfg.incremental_column and cfg.incremental_value:
+        if not use_offset:
             params.append(cfg.incremental_value)
         params.append(cfg.batch_size)
+        if use_offset:
+            params.append(self._offset)
 
         cursor.execute(sql, tuple(params))
         rows = cursor.fetchall()
+        if use_offset:
+            self._offset += len(rows)
         desc = cursor.description
         if not desc:
             return ReadResult(has_more=False)
@@ -554,6 +576,12 @@ class PostgreSQLPlugin(BasePlugin):
         jt = db_type_to_java_type(db_type)
         if value is None:
             return None
+        # psycopg2 读 bytea 返回 memoryview，且 PG 类型码 17 不在 pymysql
+        # 类型码表里 → jt 被推成 STRING，str(memoryview) 得到
+        # '<memory at 0x…>' 写进目标 blob 列（数据真实损坏）。
+        # 驱动已按列类型给出二进制值，以实际值类型为准原样透传。
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            return bytes(value)
         if jt == JavaType.BOOLEAN:
             return bool(value)
         if jt == JavaType.LONG:
@@ -566,6 +594,12 @@ class PostgreSQLPlugin(BasePlugin):
             return bytes(value) if not isinstance(value, (bytes, bytearray)) else value
         if jt in (JavaType.DATE, JavaType.TIME, JavaType.DATETIME):
             return str(value)
+        # jsonb/json 列经 psycopg2 自动解析成 dict/list；str(dict) 是单引号
+        # 字面量（"{'id': 1}"），写进 MySQL JSON 列报 3140 Invalid JSON text。
+        # 必须在源侧就序列化成合法 JSON 字符串。
+        if isinstance(value, (dict, list)):
+            import json as _json
+            return _json.dumps(value, ensure_ascii=False, default=str)
         return str(value)
 
     def java_to_db(self, java_value: Any, target_type: str) -> Any:

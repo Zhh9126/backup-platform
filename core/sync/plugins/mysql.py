@@ -11,6 +11,34 @@ from ..type_mapper import JavaType, db_type_to_java_type, to_db, to_java
 logger = logging.getLogger(__name__)
 
 
+def _format_time_value(v: Any) -> str:
+    """把 MySQL TIME 列的值规范成 'HH:MM:SS'。
+
+    pymysql 对 TIME 列返回 datetime.timedelta，而 str(timedelta) 是 'H:MM:SS'
+    —— 小时不补零（'8:13:13'），且 MySQL TIME 允许超 24h / 负值。目标列若是
+    PG/金仓/达梦的 TIME 或 Oracle 的 VARCHAR2 承载，'8:13:13' 会被判非法时间
+    格式而整批写入失败（PG: invalid input syntax for type time）。这里统一成
+    补零的 'HH:MM:SS'，负值保留符号、超 24h 保留真实小时数。
+    """
+    from datetime import time as _time, timedelta as _td
+    if isinstance(v, _td):
+        total = int(v.total_seconds())
+        sign = "-" if total < 0 else ""
+        total = abs(total)
+        return "%s%02d:%02d:%02d" % (sign, total // 3600, (total % 3600) // 60, total % 60)
+    if isinstance(v, _time):
+        return "%02d:%02d:%02d" % (v.hour, v.minute, v.second)
+    s = str(v)
+    m = re.match(r"^(-?)(\d{1,2}):(\d{1,2}):(\d{1,2})(?:\.(\d+))?$", s.strip())
+    if m:
+        sign, h, mi, sec, frac = m.groups()
+        out = "%s%02d:%02d:%02d" % (sign or "", int(h), int(mi), int(sec))
+        if frac:
+            out += "." + frac
+        return out
+    return s
+
+
 class MySQLSourceReader(SourceReader):
     def connect(self) -> Any:
         import pymysql
@@ -96,7 +124,8 @@ class MySQLSourceReader(SourceReader):
         finally:
             conn.close()
 
-    def _build_select_sql(self, table: str, columns: List[str]) -> str:
+    def _build_select_sql(self, table: str, columns: List[str],
+                          use_offset: bool = False) -> str:
         db = self.config.src_db_name or self.config.src_schema
         table_ref = f"`{db}`.`{table}`" if db else f"`{table}`"
         if columns and columns != ["*"]:
@@ -117,7 +146,14 @@ class MySQLSourceReader(SourceReader):
             sql += " WHERE " + " AND ".join(where_parts)
         if self.config.incremental_column:
             sql += f" ORDER BY `{self.config.incremental_column}`"
+        elif use_offset:
+            # 全量模式必须稳定排序 + OFFSET 推进：否则每轮 LIMIT 重查都返回
+            # 同一批，超过 batch_size 的表被引擎「分批读取未推进」护栏拦死
+            # （此前 5~11 行小表从不触发，20K 行大表必现）。
+            sql += " ORDER BY 1"
         sql += " LIMIT %s"
+        if use_offset:
+            sql += " OFFSET %s"
         return sql
 
     def read_batch(self, cursor: Any) -> ReadResult:
@@ -128,14 +164,26 @@ class MySQLSourceReader(SourceReader):
         if not source_cols:
             source_cols = ["*"]
 
-        sql = self._build_select_sql(table, source_cols)
+        # 有增量水位时按水位分页；否则（全量 / 增量首轮快照）用 OFFSET 推进。
+        use_offset = not (cfg.sync_mode == "incremental" and cfg.incremental_column
+                          and cfg.incremental_value)
+        if use_offset:
+            # 同一个 reader 实例会依次处理多张表，换表必须重置偏移。
+            if getattr(self, "_offset_table", None) != table:
+                self._offset_table = table
+                self._offset = 0
+        sql = self._build_select_sql(table, source_cols, use_offset)
         params = []
-        if cfg.sync_mode == "incremental" and cfg.incremental_column and cfg.incremental_value:
+        if not use_offset:
             params.append(cfg.incremental_value)
         params.append(cfg.batch_size)
+        if use_offset:
+            params.append(self._offset)
 
         cursor.execute(sql, tuple(params))
         rows = cursor.fetchall()
+        if use_offset:
+            self._offset += len(rows)
         desc = cursor.description
         if not desc:
             return ReadResult(has_more=False)
@@ -572,6 +620,13 @@ class MySQLPlugin(BasePlugin):
         jt = db_type_to_java_type(db_type)
         if value is None:
             return None
+        # pymysql 的 BINARY/VARBINARY 与 VARCHAR 共用类型码 15/253，description
+        # 不暴露字符集，无法靠类型码区分；但驱动已按列字符集把文本解码为 str，
+        # 值仍是 bytes 就只可能是二进制列——必须原样透传，否则 str(bytes)
+        # 变成 "b'\\x01'" 字面量，写入 PG/金仓 bytea 列报
+        # "invalid input syntax for type bytea"（与 TEXT/BLOB 共用码 252 同款处理）。
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
         if jt == JavaType.BOOLEAN:
             return bool(value)
         if jt == JavaType.LONG:
@@ -595,8 +650,10 @@ class MySQLPlugin(BasePlugin):
             # 否则 str 会被 encode 成 bytes，目标端再 str() 成 "b'\xe6\x96\x87...'"
             # 字面量，导致中文文本损坏。
             return value
-        if jt in (JavaType.DATE, JavaType.TIME, JavaType.DATETIME):
+        if jt in (JavaType.DATE, JavaType.DATETIME):
             return str(value)
+        if jt == JavaType.TIME:
+            return _format_time_value(value)
         return str(value)
 
     def java_to_db(self, java_value: Any, target_type: str) -> Any:

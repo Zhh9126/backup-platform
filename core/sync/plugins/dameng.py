@@ -240,7 +240,8 @@ class DamengSourceReader(SourceReader):
         finally:
             conn.close()
 
-    def _build_select_sql(self, table: str, columns: List[str]) -> tuple:
+    def _build_select_sql(self, table: str, columns: List[str],
+                          use_offset: bool = False, offset: int = 0) -> tuple:
         schema = _upper(self.config.src_schema or self.config.src_username
                         or "SYSDBA")
         table_ref = f'{schema}.{_upper(table)}'
@@ -252,7 +253,12 @@ class DamengSourceReader(SourceReader):
                 and cfg.incremental_value:
             sql += (f" WHERE {cfg.incremental_column} > ?")
             binds["1"] = cfg.incremental_value
-        if cfg.incremental_column:
+        if use_offset:
+            # 全量模式每次 read_batch 都重新 execute，必须 OFFSET 推进。
+            # dmPython 的 dict 数字绑定在 LIMIT/OFFSET 上失效（实测绑定后
+            # fetchall=0 行），batch_size/offset 都是平台内部整数，直接内联。
+            sql += " ORDER BY 1 LIMIT %d OFFSET %d" % (int(cfg.batch_size), int(offset))
+        elif cfg.incremental_column:
             sql += f" ORDER BY {cfg.incremental_column}"
         return sql, binds
 
@@ -260,10 +266,19 @@ class DamengSourceReader(SourceReader):
         cfg = self.config
         table = (cfg.source_tables_list or [cfg.source_table])[0] \
             if (cfg.source_tables_list or cfg.source_table) else ""
-        sql, binds = self._build_select_sql(table, [])
+        use_offset = not (cfg.sync_mode == "incremental" and cfg.incremental_column
+                          and cfg.incremental_value)
+        if use_offset:
+            if getattr(self, "_offset_table", None) != table:
+                self._offset_table = table
+                self._offset = 0
+        sql, binds = self._build_select_sql(
+            table, [], use_offset, offset=(self._offset if use_offset else 0))
         cursor.execute(sql, binds or {})
         columns = [_s(d[0]) for d in cursor.description]
-        rows = cursor.fetchmany(cfg.batch_size)
+        rows = cursor.fetchall() if use_offset else cursor.fetchmany(cfg.batch_size)
+        if use_offset:
+            self._offset += len(rows)
         records = [[self.plugin.type_to_java(
             str(cursor.description[i][1] or ''), _s(v))
             for i, v in enumerate(row)] for row in rows]

@@ -71,6 +71,10 @@ class SyncConfig:
     # 引擎配置实例隔离——每个 worker 独立 SyncEngine（浅拷贝 config + 独立连接），
     # 因为 _run_single_table 会改写共享 config 的 source_table/target_table。
     parallel_tables: int = 1
+    # 表级完整性对象迁移（对标 DTS/KDTS）：索引（含唯一索引）与
+    # 唯一/外键/CHECK 约束。默认关闭以免影响普通同步任务；迁移计划显式开启。
+    migrate_indexes: bool = False
+    migrate_constraints: bool = False
 
 
 @dataclass

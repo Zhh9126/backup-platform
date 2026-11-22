@@ -5288,6 +5288,14 @@ window.I18N = (function () {
     "（增量任务会如实回退全量）。": "(incremental jobs honestly fall back to full).",
   });
 
+  // 数据迁移：表级完整性对象（索引/唯一/外键/CHECK）
+  Object.assign(EN, {
+    "表级完整性对象（结构迁移补齐）": "Table-level Integrity Objects (structure migration)",
+    "索引（含唯一索引）": "Indexes (including unique indexes)",
+    "唯一 / 外键 / CHECK 约束": "UNIQUE / FOREIGN KEY / CHECK constraints",
+    "数据写入完成后建索引与约束；单个对象失败只提示不阻断迁移。Oracle/达梦仅抽取对象清单，需复核目标 DDL。": "Indexes and constraints are created after data load; a single object failure only warns and never blocks the migration. Oracle/Dameng extract object lists only; review target DDL.",
+  });
+
   return {
     t: t,
     apply: apply,

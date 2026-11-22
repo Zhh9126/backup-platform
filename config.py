@@ -226,6 +226,11 @@ MIG_OBJECT_LIMIT = 500             # 每类非表对象迁移上限
 MIG_VERIFY_SAMPLE_ROWS = 100       # 校验随机抽样行数
 MIG_VERIFY_MAX_TABLES = 50         # 内容抽样最多表数
 MIG_LIST_LIMIT = 100               # 计划列表默认条数
+# 表级完整性对象迁移（索引/唯一/外键/CHECK）：迁移计划默认随结构一起迁，
+# 可通过 extra_options.migrate_structure 逐项关闭；普通同步任务默认关闭。
+MIG_STRUCTURE_INDEXES_DEFAULT = True
+MIG_STRUCTURE_CONSTRAINTS_DEFAULT = True
+MIG_STRUCTURE_MAX_OBJECTS = 200     # 每表抽取上限（硬上限 2000）
 
 
 def resolve_port(db_type, port=None):

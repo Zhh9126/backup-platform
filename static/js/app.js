@@ -9135,12 +9135,18 @@
         if ($("dm_type_mapping") && ($("dm_type_mapping").value || "").trim())
           typeMapping = JSON.parse($("dm_type_mapping").value);
       } catch (e) { toast("类型映射不是合法 JSON", "warning"); return; }
-      if (Object.values(mo).some(Boolean) || excl.length || typeMapping || dmParallel > 1) {
+      const sIndexes = $("dm_s_indexes") ? $("dm_s_indexes").checked : true;
+      const sConstraints = $("dm_s_constraints") ? $("dm_s_constraints").checked : true;
+      if (Object.values(mo).some(Boolean) || excl.length || typeMapping || dmParallel > 1
+          || !sIndexes || !sConstraints) {
         payload.extra_options = {};
         if (Object.values(mo).some(Boolean)) payload.extra_options.migrate_objects = mo;
         if (excl.length) payload.extra_options.exclude_tables = excl;
         if (typeMapping) payload.extra_options.type_mapping = typeMapping;
         if (dmParallel > 1) payload.extra_options.parallel_tables = dmParallel;
+        if (!sIndexes || !sConstraints)
+          payload.extra_options.migrate_structure =
+            { indexes: sIndexes, constraints: sConstraints };
       }
       if (!payload.name) { toast("请填写计划名称", "warning"); return; }
       if (!payload.src_host || !payload.src_db_name) { toast("请填写源端主机与数据库", "warning"); return; }

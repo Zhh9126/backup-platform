@@ -684,6 +684,16 @@ class DbMigrationEngine:
                 extra = {}
         exclude_tables = [t.strip() for t in (extra.get("exclude_tables") or [])
                           if isinstance(t, str) and t.strip()]
+
+        def _struct_opt(key: str, default: bool) -> bool:
+            """extra.migrate_structure.{indexes,constraints} 逐项开关，缺省回退默认值。"""
+            if key in extra:
+                return bool(extra.get(key))
+            st = extra.get("migrate_structure")
+            if isinstance(st, dict) and key in st:
+                return bool(st.get(key))
+            return default
+
         skip_tables: list = []
         cleared_tables: list = []
         clear_warnings: list = []
@@ -732,6 +742,12 @@ class DbMigrationEngine:
             "type_mapping": extra.get("type_mapping") or {},
             # 多表并行迁移（对标 DTS 并行度）：并行度上限 8
             "parallel_tables": max(1, min(8, int(extra.get("parallel_tables") or 1))),
+            # 表级完整性对象（对标 DTS/KDTS）：结构迁移默认补齐索引/唯一/外键/CHECK，
+            # 逐项开关由 extra.migrate_structure 控制，绝不写死在引擎里
+            "migrate_indexes": bool(_struct_opt("indexes",
+                                                 config.MIG_STRUCTURE_INDEXES_DEFAULT)),
+            "migrate_constraints": bool(_struct_opt(
+                "constraints", config.MIG_STRUCTURE_CONSTRAINTS_DEFAULT)),
         }
         started = time.monotonic()
         res = run_sync_task_with_task(synthetic_task)
@@ -770,6 +786,7 @@ class DbMigrationEngine:
             "skipped_tables": skip_tables,
             "cleared_tables": cleared_tables,
             "stats_init": stats_init,
+            "structure_extras": res.get("structure_extras") or [],
             "manifest": manifest,
             "message": res.get("message", ""),
             "total_read": res.get("total_read", 0),

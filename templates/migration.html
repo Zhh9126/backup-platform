@@ -99,6 +99,16 @@
           <div class="form-text">提交后立即执行：预检查 → 所选阶段顺序编排，进度与报告实时展示；增量/不停机由「数据同步」realtime 模式承接。</div>
         </div>
         <div class="mt-3">
+          <label class="form-label">表级完整性对象（结构迁移补齐）</label>
+          <div class="d-flex gap-3 flex-wrap">
+            <div class="form-check"><input class="form-check-input" type="checkbox" id="dm_s_indexes" checked>
+              <label class="form-check-label" for="dm_s_indexes">索引（含唯一索引）</label></div>
+            <div class="form-check"><input class="form-check-input" type="checkbox" id="dm_s_constraints" checked>
+              <label class="form-check-label" for="dm_s_constraints">唯一 / 外键 / CHECK 约束</label></div>
+          </div>
+          <div class="form-text">数据写入完成后建索引与约束；单个对象失败只提示不阻断迁移。Oracle/达梦仅抽取对象清单，需复核目标 DDL。</div>
+        </div>
+        <div class="mt-3">
           <label class="form-label">迁移对象（表之外，对标金仓 KDTS 对象覆盖）</label>
           <div class="d-flex gap-3 flex-wrap">
             <div class="form-check"><input class="form-check-input" type="checkbox" id="dm_o_views">

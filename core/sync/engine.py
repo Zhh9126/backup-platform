@@ -135,6 +135,8 @@ def _task_to_config(task: Dict[str, Any]) -> SyncConfig:
         skip_tables=list(task.get("skip_tables") or []),
         exclude_tables=list(task.get("exclude_tables") or []),
         parallel_tables=max(1, min(8, int(task.get("parallel_tables") or 1))),
+        migrate_indexes=bool(task.get("migrate_indexes")),
+        migrate_constraints=bool(task.get("migrate_constraints")),
     )
     # managed 源：从 backup_tasks 读取连接信息
     if cfg.source_type == "managed" and cfg.source_task_id:
@@ -305,9 +307,12 @@ class SyncEngine:
                 "duration": agg["duration"],
                 "per_table": [
                     {k: t.get(k) for k in ("table", "success", "message",
-                                           "total_read", "total_write", "errors")}
+                                           "total_read", "total_write", "errors",
+                                           "structure_extras")}
                     for t in agg["tables"]
                 ],
+                "structure_extras": [t["structure_extras"] for t in agg["tables"]
+                                     if t.get("structure_extras")],
                 "failed_tables": agg["failed_tables"],
                 "parallel": _workers,
             }
@@ -327,6 +332,7 @@ class SyncEngine:
                 "total_read": res.get("total_read", 0),
                 "total_write": res.get("total_write", 0),
                 "errors": res.get("errors", 0),
+                "structure_extras": res.get("structure_extras"),
             })
             total_read += res.get("total_read", 0)
             total_write += res.get("total_write", 0)
@@ -341,6 +347,8 @@ class SyncEngine:
             "errors": errors,
             "duration": duration,
             "per_table": per_table,
+            "structure_extras": [t["structure_extras"] for t in per_table
+                                 if t.get("structure_extras")],
         }
 
     def _run_single_table(self, src_table: str, dst_table: str,
@@ -451,6 +459,25 @@ class SyncEngine:
             # 写入后：恢复约束
             self._enable_constraints(tgt_conn)
 
+            # 表级完整性对象（对标 DTS/KDTS）：数据落库后再建索引/约束，
+            # 与新库导入惯例一致（先灌数据后建索引，避免逐行维护索引）。
+            # 逐对象容错：失败只记录，不改变本表数据迁移的成功判定。
+            structure_extras = None
+            if (getattr(cfg, "migrate_indexes", False)
+                    or getattr(cfg, "migrate_constraints", False)):
+                from .structure_extras import extract_structure, apply_structure
+                extras = extract_structure(
+                    src_conn, cfg.src_db_type, src_table,
+                    schema=cfg.src_schema or cfg.src_db_name,
+                    max_objects=config.MIG_STRUCTURE_MAX_OBJECTS)
+                if not getattr(cfg, "migrate_indexes", False):
+                    extras["indexes"] = []
+                if not getattr(cfg, "migrate_constraints", False):
+                    extras["constraints"] = []
+                structure_extras = apply_structure(
+                    tgt_conn, cfg.tgt_db_type, table, extras,
+                    name_prefix=table)
+
             src_cur.close()
             self.reader.close(conn=src_conn)
             self.writer.close(conn=tgt_conn)
@@ -472,6 +499,7 @@ class SyncEngine:
                 "error_details": error_details,
                 "duration": duration,
                 "next_value": next_value,
+                "structure_extras": structure_extras,
             }
         except Exception as e:
             logger.exception("sync run failed")
@@ -1185,6 +1213,8 @@ class SyncEngine:
             "errors": grand_errors,
             "duration": duration,
             "tables": results,
+            "structure_extras": [r["structure_extras"] for r in results
+                                 if r.get("structure_extras")],
             "failed_tables": failed_tables,
             "skipped_tables": skipped_tables,
             "excluded_tables": excluded_tables,
@@ -1273,6 +1303,8 @@ class SyncEngine:
             "errors": grand_errors,
             "duration": duration,
             "tables": results,
+            "structure_extras": [r["structure_extras"] for r in results
+                                 if r.get("structure_extras")],
             "failed_tables": failed_tables,
             "skipped_tables": skipped_tables,
             "excluded_tables": excluded_tables,

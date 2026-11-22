@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """PostgreSQL 同步插件。"""
+import config
 import logging
 import re
 from datetime import date, datetime, time, timedelta
@@ -17,7 +18,7 @@ class PostgreSQLSourceReader(SourceReader):
     def connect(self) -> Any:
         import psycopg2
         cfg = self.config
-        port = cfg.src_port or 5432
+        port = config.resolve_port(cfg.src_db_type, cfg.src_port)
         return psycopg2.connect(
             host=cfg.src_host,
             port=port,
@@ -190,7 +191,7 @@ class PostgreSQLSinkWriter(SinkWriter):
     def connect(self) -> Any:
         import psycopg2
         cfg = self.config
-        port = cfg.tgt_port or 5432
+        port = config.resolve_port(cfg.tgt_db_type, cfg.tgt_port)
         return psycopg2.connect(
             host=cfg.tgt_host,
             port=port,
@@ -564,7 +565,7 @@ class PostgreSQLSinkWriter(SinkWriter):
 
 class PostgreSQLPlugin(BasePlugin):
     db_type = "postgresql"
-    default_ports = {"postgresql": 5432}
+    default_ports = {k: v for k, v in config.DEFAULT_PORTS.items() if k == "postgresql"}
 
     def create_reader(self, config: SyncConfig) -> SourceReader:
         return PostgreSQLSourceReader(config, self)

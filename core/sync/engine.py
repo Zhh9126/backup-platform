@@ -24,6 +24,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from core import db, models
+import config
 from .plugins import registry
 from .plugins.base import SyncConfig
 from .schema_compare import (
@@ -123,14 +124,14 @@ def _task_to_config(task: Dict[str, Any]) -> SyncConfig:
         field_ide=task.get("field_ide") or "origin",
         incremental_column=task.get("incremental_column", ""),
         incremental_value=task.get("incremental_value", ""),
-        batch_size=task.get("batch_size") or 1000,
+        batch_size=task.get("batch_size") or config.SYNC_BATCH_SIZE,
         error_threshold=task.get("error_threshold") or 0,
         realtime_enabled=bool(task.get("realtime_enabled")),
         flink_config=task.get("flink_config") or {},
         full_db_migrate=bool(task.get("full_db_migrate")),
         validate_before_run=bool(task.get("validate_before_run")),
         verify_after_run=bool(task.get("verify_after_run")),
-        precheck_sample_rows=int(task.get("precheck_sample_rows") or 20),
+        precheck_sample_rows=int(task.get("precheck_sample_rows") or config.SYNC_PRECHECK_SAMPLE_ROWS),
         skip_tables=list(task.get("skip_tables") or []),
         exclude_tables=list(task.get("exclude_tables") or []),
         parallel_tables=max(1, min(8, int(task.get("parallel_tables") or 1))),
@@ -522,7 +523,7 @@ class SyncEngine:
         from .realtime_runners import get_stop_event
 
         stop = get_stop_event(cfg.task_id)
-        poll_interval = int((cfg.flink_config or {}).get("poll_interval", 5))
+        poll_interval = int((cfg.flink_config or {}).get("poll_interval", config.SYNC_POLL_INTERVAL))
         # 回看窗口（秒）：时间戳水位向前重叠读取，重叠部分由目标端 upsert
         # 幂等吸收，消除同秒多条记录/时间精度不足造成的边界丢数
         overlap = int((cfg.flink_config or {}).get("poll_overlap_seconds", 0) or 0)
@@ -585,7 +586,7 @@ class SyncEngine:
         # 周期对账：每 N 轮轮询做一次源/目标行数比对，检测轮询模式
         # 无法捕获的 DELETE（目标<源）与重复/脏数据（目标>源）
         reconcile_every = int((cfg.flink_config or {}).get(
-            "reconcile_every_polls", 720) or 0)
+            "reconcile_every_polls", config.SYNC_RECONCILE_EVERY_POLLS) or 0)
         logger.info("[sync%s] 轮询实时同步进入增量循环（间隔 %ss）",
                     cfg.task_id, poll_interval)
         while not stop.is_set():
@@ -875,9 +876,9 @@ class SyncEngine:
 
         # 1) 检查源库 binlog 与当前位点
         src_conn = pymysql.connect(
-            host=cfg.src_host, port=cfg.src_port or 3306,
+            host=cfg.src_host, port=config.resolve_port(cfg.src_db_type, cfg.src_port),
             user=cfg.src_username, password=cfg.src_password,
-            charset="utf8mb4", connect_timeout=8,
+            charset="utf8mb4", connect_timeout=config.SYNC_CONNECT_TIMEOUT,
         )
         try:
             with src_conn.cursor() as cur:
@@ -955,7 +956,7 @@ class SyncEngine:
             stream = BinLogStreamReader(
                 connection_settings={
                     "host": cfg.src_host,
-                    "port": cfg.src_port or 3306,
+                    "port": config.resolve_port(cfg.src_db_type, cfg.src_port),
                     "user": cfg.src_username,
                     "passwd": cfg.src_password,
                     "charset": "utf8mb4",
@@ -1489,9 +1490,9 @@ def _ensure_target_database(cfg: SyncConfig) -> Dict[str, Any]:
     try:
         import pymysql
         conn = pymysql.connect(
-            host=cfg.tgt_host, port=int(cfg.tgt_port or 3306),
+            host=cfg.tgt_host, port=config.resolve_port(cfg.tgt_db_type, cfg.tgt_port),
             user=cfg.tgt_username, password=cfg.tgt_password or "",
-            connect_timeout=5, charset="utf8mb4")
+            connect_timeout=config.SYNC_CONNECT_TIMEOUT, charset="utf8mb4")
     except Exception as e:
         return {"created": False, "message": f"目标实例连接失败: {e}"}
     try:
@@ -1655,7 +1656,7 @@ def generate_flink_config(task_id: int) -> Dict[str, Any]:
             f"\n) WITH (\n"
             f"  'connector' = 'mysql-cdc',\n"
             f"  'hostname' = '{cfg.src_host}',\n"
-            f"  'port' = '{cfg.src_port or 3306}',\n"
+            f"  'port' = '{config.resolve_port(cfg.src_db_type, cfg.src_port)}',\n"
             f"  'username' = '{cfg.src_username}',\n"
             f"  'password' = '<请在 Flink 侧填入源库口令>',\n"
             f"  'database-name' = '{cfg.src_db_name}',\n"
@@ -1669,7 +1670,7 @@ def generate_flink_config(task_id: int) -> Dict[str, Any]:
             f"\n) WITH (\n"
             f"  'connector' = 'postgres-cdc',\n"
             f"  'hostname' = '{cfg.src_host}',\n"
-            f"  'port' = '{cfg.src_port or 5432}',\n"
+            f"  'port' = '{config.resolve_port(cfg.src_db_type, cfg.src_port)}',\n"
             f"  'username' = '{cfg.src_username}',\n"
             f"  'password' = '<请在 Flink 侧填入源库口令>',\n"
             f"  'database-name' = '{cfg.src_db_name}',\n"
@@ -1690,7 +1691,7 @@ def generate_flink_config(task_id: int) -> Dict[str, Any]:
         ",\n".join(f"  `{c}` STRING" for c in sink_cols) +
         f"\n) WITH (\n"
         f"  'connector' = 'jdbc',\n"
-        f"  'url' = 'jdbc:mysql://{cfg.tgt_host}:{cfg.tgt_port or 3306}/{cfg.tgt_db_name}',\n"
+        f"  'url' = 'jdbc:mysql://{cfg.tgt_host}:{config.resolve_port(cfg.tgt_db_type, cfg.tgt_port)}/{cfg.tgt_db_name}',\n"
         f"  'table-name' = '{target}',\n"
         f"  'username' = '{cfg.tgt_username}',\n"
         f"  'password' = '{cfg.tgt_password}'\n);"

@@ -5,6 +5,7 @@
 - 模式（schema）即 Oracle user，大小写默认按大写处理（Oracle 惯例）；
 - 增量同步：基于时间戳/数值增量列（incremental_column + incremental_value）。
 """
+import config
 import logging
 import re
 import time
@@ -27,7 +28,7 @@ class OracleSourceReader(SourceReader):
     def connect(self) -> Any:
         import oracledb
         cfg = self.config
-        port = cfg.src_port or 1521
+        port = config.resolve_port(cfg.src_db_type, cfg.src_port)
         dsn = f"{cfg.src_host}:{port}/{cfg.src_db_name or 'ORCL'}"
         # oracledb 瘦客户端不支持 timeout 关键字（老版本 cx_Oracle 同样不支持）
         # 跨虚拟机 1521 偶发被网络重置（DPY-6005/12514）→ 自动重试
@@ -162,7 +163,7 @@ class OracleSinkWriter(SinkWriter):
     def connect(self) -> Any:
         import oracledb
         cfg = self.config
-        port = cfg.tgt_port or 1521
+        port = config.resolve_port(cfg.tgt_db_type, cfg.tgt_port)
         dsn = f"{cfg.tgt_host}:{port}/{cfg.tgt_db_name or 'ORCL'}"
         # oracledb 瘦客户端不支持 timeout 关键字（老版本 cx_Oracle 同样不支持）
         # 跨虚拟机 1521 偶发被网络重置（DPY-6005/12514）→ 自动重试
@@ -449,7 +450,7 @@ class OracleSinkWriter(SinkWriter):
 
 class OraclePlugin(BasePlugin):
     db_type = "oracle"
-    default_ports = {"sync": 1521}
+    default_ports = {"sync": config.DEFAULT_PORTS["oracle"]}
 
     def create_reader(self, config: SyncConfig) -> SourceReader:
         return OracleSourceReader(config, self)

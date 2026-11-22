@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """SQL Server 同步插件（pymssql 驱动，离线包随附 wheel）。"""
+import config
 import logging
 from typing import Any, List
 
@@ -14,7 +15,7 @@ class SQLServerSourceReader(SourceReader):
     def connect(self) -> Any:
         import pymssql
         cfg = self.config
-        return pymssql.connect(server=cfg.src_host, port=str(cfg.src_port or 1433),
+        return pymssql.connect(server=cfg.src_host, port=str(config.resolve_port(cfg.src_db_type, cfg.src_port)),
                                user=cfg.src_username, password=cfg.src_password,
                                database=cfg.src_db_name, timeout=15,
                                login_timeout=15, as_dict=False)
@@ -99,7 +100,7 @@ class SQLServerSinkWriter(SinkWriter):
     def connect(self) -> Any:
         import pymssql
         cfg = self.config
-        return pymssql.connect(server=cfg.tgt_host, port=str(cfg.tgt_port or 1433),
+        return pymssql.connect(server=cfg.tgt_host, port=str(config.resolve_port(cfg.tgt_db_type, cfg.tgt_port)),
                                user=cfg.tgt_username, password=cfg.tgt_password,
                                database=cfg.tgt_db_name, timeout=15,
                                login_timeout=15, as_dict=False)
@@ -292,7 +293,7 @@ class SQLServerSinkWriter(SinkWriter):
 
 class SQLServerPlugin(BasePlugin):
     db_type = "sqlserver"
-    default_ports = {"sync": 1433}
+    default_ports = {"sync": config.DEFAULT_PORTS["sqlserver"]}
 
     def create_reader(self, config: SyncConfig) -> SourceReader:
         return SQLServerSourceReader(config, self)

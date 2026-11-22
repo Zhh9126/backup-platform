@@ -5,6 +5,7 @@
 （<DM_HOME>/drivers/python/dmPython，pip install 或拷贝 .egg 到离线包）。
 导入失败时给出明确指引，插件注册不受影响（运行时才报错）。
 """
+import config
 import logging
 import os
 import re
@@ -148,7 +149,7 @@ def _connect_dameng(host: str, port: int, user: str, password: str,
 class DamengSourceReader(SourceReader):
     def connect(self) -> Any:
         cfg = self.config
-        return _connect_dameng(cfg.src_host, cfg.src_port or 5236,
+        return _connect_dameng(cfg.src_host, config.resolve_port(cfg.src_db_type, cfg.src_port),
                                cfg.src_username, cfg.src_password,
                                cfg.src_db_name or cfg.src_schema or "")
 
@@ -298,7 +299,7 @@ class DamengSinkWriter(SinkWriter):
 
     def connect(self) -> Any:
         cfg = self.config
-        return _connect_dameng(cfg.tgt_host, cfg.tgt_port or 5236,
+        return _connect_dameng(cfg.tgt_host, config.resolve_port(cfg.tgt_db_type, cfg.tgt_port),
                                cfg.tgt_username, cfg.tgt_password,
                                cfg.tgt_db_name or cfg.tgt_schema or "")
 
@@ -584,7 +585,7 @@ class DamengSinkWriter(SinkWriter):
 
 class DamengPlugin(BasePlugin):
     db_type = "dameng"
-    default_ports = {"sync": 5236}
+    default_ports = {"sync": config.DEFAULT_PORTS["dameng"]}
 
     def create_reader(self, config: SyncConfig) -> SourceReader:
         return DamengSourceReader(config, self)

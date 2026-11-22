@@ -198,7 +198,7 @@ class DbMigrationEngine:
              (data.get("note") or "").strip(), now, now))
         return pid
 
-    def list_plans(self, limit: int = 100) -> list:
+    def list_plans(self, limit: int = config.MIG_LIST_LIMIT) -> list:
         rows = db.query("SELECT * FROM db_migration_plans ORDER BY id DESC LIMIT ?",
                         (int(limit),))
         return [_row_to_dict(r, hide_secret=True) for r in rows]
@@ -463,7 +463,7 @@ class DbMigrationEngine:
             if dbtype == "dameng":
                 import dmPython
                 conn = dmPython.connect(user=user, password=pwd,
-                                        server=host, port=int(port or 5236))
+                                        server=host, port=config.resolve_port(dbtype, port))
                 cur = conn.cursor()
                 cur.execute("SELECT COUNT(*) FROM dba_users WHERE username=?",
                             (schema_name.upper(),))
@@ -477,7 +477,7 @@ class DbMigrationEngine:
             else:  # oracle
                 import oracledb
                 conn = oracledb.connect(user=user, password=pwd,
-                                        host=host, port=int(port or 1521),
+                                        host=host, port=config.resolve_port(dbtype, port),
                                         service_name=schema_name or "orcl")
                 cur = conn.cursor()
                 cur.execute("SELECT COUNT(*) FROM all_users WHERE username=:u",
@@ -529,9 +529,9 @@ class DbMigrationEngine:
             try:
                 import pymysql
                 conn = pymysql.connect(
-                    host=host, port=port or 3306,
+                    host=host, port=config.resolve_port(tgt_type, port),
                     user=user, password=pwd,
-                    connect_timeout=5, charset="utf8mb4")
+                    connect_timeout=config.SYNC_CONNECT_TIMEOUT, charset="utf8mb4")
             except Exception as e:  # noqa: BLE001
                 return False, f"目标实例连接失败: {e}"
             try:
@@ -788,7 +788,7 @@ class DbMigrationEngine:
     # ================= 非表对象迁移（对标 KDTS 迁移对象种类） =================
     _PG_FAMILY = ("postgresql", "kingbase", "opengauss", "panwei")
     _MYSQL_FAMILY = ("mysql", "mariadb")
-    _OBJECT_LIMIT = 500          # 每类对象提取上限（防超大库拖垮迁移窗口）
+    _OBJECT_LIMIT = config.MIG_OBJECT_LIMIT          # 每类对象提取上限（防超大库拖垮迁移窗口）
 
     def _obj_conn(self, plan: dict, side: str):
         """对象迁移用原生连接（复用统计连接的建连逻辑）。"""
@@ -1422,9 +1422,9 @@ class DbMigrationEngine:
         if db_type in ("mysql", "mariadb"):
             import pymysql
             conn = pymysql.connect(
-                host=plan["src_host"], port=int(plan["src_port"] or 3306),
+                host=plan["src_host"], port=config.resolve_port(db_type, plan.get("src_port")),
                 user=plan["src_username"], password=plan["src_password"],
-                database=plan["src_db_name"], connect_timeout=5, charset="utf8mb4")
+                database=plan["src_db_name"], connect_timeout=config.SYNC_CONNECT_TIMEOUT, charset="utf8mb4")
             try:
                 with conn.cursor() as cur:
                     cur.execute("SELECT table_name FROM information_schema.tables"
@@ -1436,9 +1436,9 @@ class DbMigrationEngine:
         elif db_type in ("postgresql", "kingbase", "highgo", "uxdb"):
             import psycopg2
             conn = psycopg2.connect(
-                host=plan["src_host"], port=int(plan["src_port"] or 5432),
+                host=plan["src_host"], port=config.resolve_port(db_type, plan.get("src_port")),
                 user=plan["src_username"], password=plan["src_password"],
-                dbname=plan["src_db_name"], connect_timeout=5)
+                dbname=plan["src_db_name"], connect_timeout=config.SYNC_CONNECT_TIMEOUT)
             try:
                 with conn.cursor() as cur:
                     cur.execute("SELECT table_name FROM information_schema.tables"
@@ -1455,14 +1455,14 @@ class DbMigrationEngine:
                 if db_type == "dameng":
                     import dmPython
                     conn = dmPython.connect(server=plan["src_host"],
-                                            port=int(plan["src_port"] or 5236),
+                                            port=config.resolve_port(db_type, plan.get("src_port")),
                                             user=plan["src_username"],
                                             password=plan["src_password"] or "")
                 else:
                     import oracledb
                     conn = oracledb.connect(user=plan["src_username"],
                                             password=plan["src_password"] or "",
-                                            dsn=f"{plan['src_host']}:{plan['src_port'] or 1521}"
+                                            dsn=f"{plan['src_host']}:{config.resolve_port(db_type, plan.get('src_port'))}"
                                                 f"/{plan['src_db_name']}")
                 try:
                     cur = conn.cursor()
@@ -1493,7 +1493,7 @@ class DbMigrationEngine:
         all_match = True
         # 抽样内容比对：行数一致不能证明内容一致（金额截断、状态映射错位、
         # 时区偏移只有内容级校验能发现）。verify_sample_rows=0 可关闭。
-        sample_rows = 100 if plan.get("verify_sample_rows") is None \
+        sample_rows = config.MIG_VERIFY_SAMPLE_ROWS if plan.get("verify_sample_rows") is None \
             else int(plan.get("verify_sample_rows") or 0)
         sampled = 0
         content_diffs = 0
@@ -1542,7 +1542,7 @@ class DbMigrationEngine:
                     if mw != tgt_cnt:
                         entry["manifest_diff"] = True
                         manifest_diffs += 1
-            if match and sample_rows > 0 and sampled < 50:
+            if match and sample_rows > 0 and sampled < config.MIG_VERIFY_MAX_TABLES:
                 try:
                     src_rows = self._fetch_sample(
                         plan["src_db_type"], plan["src_host"], plan["src_port"],
@@ -1633,14 +1633,14 @@ class DbMigrationEngine:
         db_type = (db_type or "").lower()
         if db_type in ("mysql", "mariadb"):
             import pymysql
-            conn = pymysql.connect(host=host, port=int(port or 3306), user=user,
+            conn = pymysql.connect(host=host, port=config.resolve_port(db_type, port), user=user,
                                    password=password, database=database,
-                                   connect_timeout=5, charset="utf8mb4")
+                                   connect_timeout=config.SYNC_CONNECT_TIMEOUT, charset="utf8mb4")
         elif db_type == "postgresql":
             import psycopg2
-            conn = psycopg2.connect(host=host, port=int(port or 5432), user=user,
+            conn = psycopg2.connect(host=host, port=config.resolve_port(db_type, port), user=user,
                                     password=password, dbname=database,
-                                    connect_timeout=5)
+                                    connect_timeout=config.SYNC_CONNECT_TIMEOUT)
         else:
             return None
         try:
@@ -1668,9 +1668,9 @@ class DbMigrationEngine:
         # ——此前 kingbase 走 JDBC 分支拼前缀，报 relation does not exist）
         if db_type in ("kingbase", "postgresql", "highgo", "uxdb"):
             import psycopg2
-            conn = psycopg2.connect(host=host, port=int(port or 5432), user=user,
+            conn = psycopg2.connect(host=host, port=config.resolve_port(db_type, port), user=user,
                                     password=password, dbname=database,
-                                    connect_timeout=5)
+                                    connect_timeout=config.SYNC_CONNECT_TIMEOUT)
             try:
                 with conn.cursor() as cur:
                     cur.execute('SELECT COUNT(*) FROM "{}"'.format(
@@ -1704,9 +1704,9 @@ class DbMigrationEngine:
                     pass
         if db_type in ("mysql", "mariadb"):
             import pymysql
-            conn = pymysql.connect(host=host, port=int(port or 3306), user=user,
+            conn = pymysql.connect(host=host, port=config.resolve_port(db_type, port), user=user,
                                    password=password, database=database,
-                                   connect_timeout=5, charset="utf8mb4")
+                                   connect_timeout=config.SYNC_CONNECT_TIMEOUT, charset="utf8mb4")
             try:
                 with conn.cursor() as cur:
                     cur.execute("SELECT COUNT(*) FROM `{}`".format(table.replace("`", "")))
@@ -1715,9 +1715,9 @@ class DbMigrationEngine:
                 conn.close()
         if db_type == "postgresql":
             import psycopg2
-            conn = psycopg2.connect(host=host, port=int(port or 5432), user=user,
+            conn = psycopg2.connect(host=host, port=config.resolve_port(db_type, port), user=user,
                                     password=password, dbname=database,
-                                    connect_timeout=5)
+                                    connect_timeout=config.SYNC_CONNECT_TIMEOUT)
             try:
                 with conn.cursor() as cur:
                     cur.execute('SELECT COUNT(*) FROM "{}"'.format(table.replace('"', "")))

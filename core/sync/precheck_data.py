@@ -11,6 +11,7 @@
 4. check_fk_parents   外键父表完整性（DTS 检查项）：子表依赖的父表不在
    同步列表 → warn。
 """
+import config
 import logging
 import re
 from typing import Any, Dict, List, Optional
@@ -100,7 +101,7 @@ def build_sample_ddl(src_db: str, tgt_db: str, src_cols: list,
 
 
 def check_data_sample(cfg, src_conn, tgt_conn, table: str,
-                      sample_rows: int = 20) -> Dict[str, Any]:
+                      sample_rows: int = config.SYNC_PRECHECK_SAMPLE_ROWS) -> Dict[str, Any]:
     """数据级试写：源采样 → 目标临时表 → 对账 → 清理。"""
     from core.data_compare import _get_pk_column, _table_ref
     from core.sync.precheck import _get_cols_typed, _norm_name

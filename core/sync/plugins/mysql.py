@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """MySQL / MariaDB 同步插件。"""
+import config
 import logging
 import re
 from typing import Any, List
@@ -43,7 +44,7 @@ class MySQLSourceReader(SourceReader):
     def connect(self) -> Any:
         import pymysql
         cfg = self.config
-        port = cfg.src_port or 3306
+        port = config.resolve_port(cfg.src_db_type, cfg.src_port)
         return pymysql.connect(
             host=cfg.src_host,
             port=port,
@@ -205,7 +206,7 @@ class MySQLSinkWriter(SinkWriter):
     def connect(self) -> Any:
         import pymysql
         cfg = self.config
-        port = cfg.tgt_port or 3306
+        port = config.resolve_port(cfg.tgt_db_type, cfg.tgt_port)
         return pymysql.connect(
             host=cfg.tgt_host,
             port=port,
@@ -608,7 +609,7 @@ class MySQLSinkWriter(SinkWriter):
 
 class MySQLPlugin(BasePlugin):
     db_type = "mysql"
-    default_ports = {"mysql": 3306, "mariadb": 3306}
+    default_ports = {k: v for k, v in config.DEFAULT_PORTS.items() if k in ("mysql", "mariadb")}
 
     def create_reader(self, config: SyncConfig) -> SourceReader:
         return MySQLSourceReader(config, self)

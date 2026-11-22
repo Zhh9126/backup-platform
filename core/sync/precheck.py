@@ -9,6 +9,7 @@
 
 结论：任一 fail → 拒绝启动迁移；warn 允许继续但提示风险。
 """
+import config
 from typing import Any, Dict, List
 
 # ---------------------------------------------------------------------------
@@ -505,9 +506,9 @@ def run_precheck(cfg) -> Dict[str, Any]:
 
     # ---- 6) 数据级试写 / 容量预估 / 字符集 / 外键完整性 ----
     from core.sync import precheck_data as _pd
-    sample_n = int(getattr(cfg, "precheck_sample_rows", 20) or 0)
+    sample_n = int(getattr(cfg, "precheck_sample_rows", config.SYNC_PRECHECK_SAMPLE_ROWS) or 0)
     if sample_n > 0:
-        for t in tables[:5]:                 # 最多试写 5 张表（控制预检耗时）
+        for t in tables[:config.SYNC_PRECHECK_MAX_TABLES]:                 # 最多试写 5 张表（控制预检耗时）
             try:
                 r = _pd.check_data_sample(cfg, src_conn, tgt_conn, t, sample_n)
             except Exception as e:

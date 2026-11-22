@@ -214,6 +214,35 @@ DEFAULT_PORTS = {
     "neo4j": 7687, "object_storage": 9000, "synology": 5000,
 }
 
+# ---- 数据迁移 / 同步可调参数（原散落在 engine/db_migrate/precheck 各处的硬编码）----
+SYNC_BATCH_SIZE = 1000             # 单批读写行数
+SYNC_PRECHECK_SAMPLE_ROWS = 20     # 数据级试写采样行数
+SYNC_PRECHECK_MAX_TABLES = 5       # 预检最多试写的表数
+SYNC_CONNECT_TIMEOUT = 8           # 源/目标连接超时秒数
+SYNC_RETRY_BACKOFF_SEC = 1         # 批次写入失败重试退避
+SYNC_POLL_INTERVAL = 5             # 实时轮询间隔
+SYNC_RECONCILE_EVERY_POLLS = 720   # 周期对账间隔（0=关闭）
+MIG_OBJECT_LIMIT = 500             # 每类非表对象迁移上限
+MIG_VERIFY_SAMPLE_ROWS = 100       # 校验随机抽样行数
+MIG_VERIFY_MAX_TABLES = 50         # 内容抽样最多表数
+MIG_LIST_LIMIT = 100               # 计划列表默认条数
+
+
+def resolve_port(db_type, port=None):
+    """按库型解析连接端口：显式 port 优先，未填则取 DEFAULT_PORTS。
+
+    禁止在迁移/同步代码里写死 `or 3306` / `or 5432`：非默认端口的实例
+    （如 170 的 3307、PG 5785、达梦 5238）会被打错端口，且预检与执行
+    各自写死不同值导致"预检通过但迁移失败"。此函数集中口径。
+    """
+    if port is not None and str(port).strip():
+        try:
+            return int(port)
+        except (TypeError, ValueError):
+            pass
+    return DEFAULT_PORTS.get(str(db_type or "").strip().lower())
+
+
 # 各类型显示名
 DB_DISPLAY_NAMES = {
     "mysql": "MySQL", "mariadb": "MariaDB", "postgresql": "PostgreSQL",

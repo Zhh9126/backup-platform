@@ -2145,7 +2145,12 @@ class OracleEngine(BackupEngine):
                 if rc != 0:
                     _probe = ((out.decode("utf-8", "replace") if isinstance(out, bytes)
                                else (out or "")) + (err or ""))
-                    if any(p in _probe for p in ("01017", "12154", "12514", "12541", "12170")):
+                    # 口令含 @ 时 Data Pump 会把连接串拆断并交互提示 "Password:"，
+                    # 无 ORA 错误码（171 19c 实测 rc=5 + Password:），此前兜底条件
+                    # 只认 01017/12154/... 导致兜底从不触发。
+                    if any(p in _probe for p in (
+                            "01017", "12154", "12514", "12541", "12170",
+                            "Password:", "password:")):
                         self.logger.warning(
                             "[%s] impdp 主连接认证/解析失败，尝试 / as sysdba 兜底导入",
                             self.task_name)

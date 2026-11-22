@@ -128,8 +128,10 @@ class OracleSourceReader(SourceReader):
 
     def read_batch(self, cursor: Any) -> ReadResult:
         cfg = self.config
-        table = (cfg.source_tables_list or [cfg.source_table])[0] \
-            if (cfg.source_tables_list or cfg.source_table) else ""
+        # 优先 cfg.source_table（逐表任务会设置它），避免全库清单首项导致
+        # 跨表 offset 不重置、后续表读 0 行（与达梦插件同款修复）。
+        table = cfg.source_table or (
+            (cfg.source_tables_list or [None])[0] if cfg.source_tables_list else "") or ""
         use_offset = not (cfg.sync_mode == "incremental" and cfg.incremental_column
                           and cfg.incremental_value)
         if use_offset:

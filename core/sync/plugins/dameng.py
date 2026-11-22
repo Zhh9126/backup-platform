@@ -264,8 +264,11 @@ class DamengSourceReader(SourceReader):
 
     def read_batch(self, cursor: Any) -> ReadResult:
         cfg = self.config
-        table = (cfg.source_tables_list or [cfg.source_table])[0] \
-            if (cfg.source_tables_list or cfg.source_table) else ""
+        # 优先 cfg.source_table：_run_single_table 逐表设置它，而
+        # source_tables_list 可能是全库清单。此前取清单首项导致每张表都按
+        # 首表算 offset，越积越大，最后一张表读 0 行（迁移 T_TYPES 实测）。
+        table = cfg.source_table or (
+            (cfg.source_tables_list or [None])[0] if cfg.source_tables_list else "") or ""
         use_offset = not (cfg.sync_mode == "incremental" and cfg.incremental_column
                           and cfg.incremental_value)
         if use_offset:
@@ -441,7 +444,11 @@ class DamengSinkWriter(SinkWriter):
                 src_db = getattr(src_t, "src_db_type", "") if src_t else ""
                 ln = scale_char_length(ln, src_db, dst_by_bytes=True,
                                        dst_charset_factor=self._charset_factor)
-            if ln > 3900:                       # 达梦 VARCHAR 上限 3900
+            # 达梦单行长度上限约 8KB（页大小相关），多个大 VARCHAR 列即使
+            # 各自未超 3900 也会整行超限（-2665 Record length exceed maximum
+            # size，PG→达梦 t_edge 两个 VARCHAR2(4000) 实测）。超长文本一律
+            # 用 TEXT/CLOB 承载（行外存储），既保真又规避行长限制。
+            if ln > 1000 or (c.max_length or 0) > 1000:
                 return "TEXT"
             return f"VARCHAR2({ln})" if base == "VARCHAR2" else f"{base}({ln})"
         # 大对象

@@ -55,3 +55,9 @@
 
 - Asynchronous backup submissions now acquire a persistent per-task lease in the metadata database, preventing duplicate execution across service instances.
 - The lease is released in the worker finally path and expires after 24 hours for crash recovery.
+
+## CDC implementation update
+
+- Added a real SQL Server CDC polling worker based on `cdc.change_tables` and `cdc.fn_cdc_get_all_changes_*`. It validates database CDC enablement, persists the last LSN, applies table filters, and writes unified row events.
+- Existing real channels remain MySQL/MariaDB binlog, PostgreSQL/Kingbase WAL, Oracle LogMiner, and Dameng LogMiner.
+- SQL Server requires `pymssql`, database-level CDC, and at least one capture instance.

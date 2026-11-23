@@ -1097,7 +1097,7 @@ class RowCDCStream:
         # 段消费模式（Oracle/达梦）没有子进程，运行态由消费线程决定；
         # 只看 proc 会让「明明在消费」的流被判定为未运行（前端红灯 +
         # manager.start 重复建实例），2026-11-14 实测暴露。
-        if self.db_type in _SEGMENT_CONSUMER_TYPES:
+        if self.db_type in _SEGMENT_CONSUMER_TYPES or self.db_type == "sqlserver":
             return bool(self.thread and self.thread.is_alive())
         return bool(self.proc and self.proc.poll() is None)
 
@@ -1178,6 +1178,119 @@ class RowCDCStream:
                            " updated_at=? WHERE id=?",
                            (err[:500], db.now_iso(), self.stream_id))
                 db.add_log("ERROR", "cdc", f"CDC 流 {self.stream_id} 异常退出: {err[:200]}")
+
+    # ---------------- SQL Server 原生 CDC ----------------
+    def _sqlserver_connect(self):
+        try:
+            import pymssql
+        except ImportError:
+            self.last_error = "未安装 pymssql，无法进行 SQL Server CDC"
+            return None
+        try:
+            return pymssql.connect(server=str(self.cfg.get("host") or ""),
+                                    port=int(self.cfg.get("port") or 1433),
+                                    user=str(self.cfg.get("username") or "sa"),
+                                    password=str(self.cfg.get("password") or ""),
+                                    database=str(self.cfg.get("db_name") or "master"),
+                                    login_timeout=10, timeout=30, as_dict=True)
+        except Exception as exc:
+            self.last_error = "SQL Server CDC 连接失败: %s" % str(exc)[:300]
+            return None
+
+    def _sqlserver_position(self):
+        try:
+            pos = self.cfg.get("position_json") or {}
+            return dict(pos) if isinstance(pos, dict) else json.loads(pos or "{}")
+        except Exception:
+            return {}
+
+    def _start_sqlserver(self) -> bool:
+        if self.thread and self.thread.is_alive():
+            return True
+        conn = self._sqlserver_connect()
+        if conn is None:
+            return False
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(1) AS n FROM sys.databases WHERE name=DB_NAME() AND is_cdc_enabled=1")
+            row = cur.fetchone() or {}
+            if int(row.get("n") or 0) != 1:
+                self.last_error = "SQL Server 数据库未开启 CDC，请执行 sys.sp_cdc_enable_db"
+                return False
+            cur.execute("SELECT capture_instance FROM cdc.change_tables")
+            if not cur.fetchall():
+                self.last_error = "SQL Server 未配置任何 CDC 捕获实例"
+                return False
+        except Exception as exc:
+            self.last_error = "SQL Server CDC 预检失败: %s" % str(exc)[:300]
+            return False
+        finally:
+            try: conn.close()
+            except Exception: pass
+        self._stop_evt.clear(); self.started_at = db.now_iso()
+        self.thread = threading.Thread(target=self._sqlserver_reader, daemon=True,
+                                       name="cdc-sqlserver-%s" % self.stream_id)
+        self.thread.start()
+        db.execute("UPDATE cdc_streams SET status='running', last_error=NULL, pid=NULL, updated_at=? WHERE id=?",
+                   (db.now_iso(), self.stream_id))
+        db.add_log("INFO", "cdc", "CDC 流 %s 已启动（SQL Server 原生 CDC）" % self.stream_id)
+        return True
+
+    def _sqlserver_reader(self):
+        """轮询 SQL Server CDC 捕获表，按 LSN 记录位点并写入统一事件存储。"""
+        pos = self._sqlserver_position(); last_lsn = str(pos.get("lsn") or "")
+        include = set(_split_list(self.cfg.get("include_tables")))
+        exclude = set(_split_list(self.cfg.get("exclude_tables")))
+        try:
+            while not self._stop_evt.is_set():
+                conn = self._sqlserver_connect()
+                if conn is None:
+                    time.sleep(5); continue
+                try:
+                    cur = conn.cursor(); cur.execute("SELECT capture_instance FROM cdc.change_tables")
+                    instances = [str(r.get("capture_instance") or "") for r in cur.fetchall()]
+                    batch=[]
+                    for inst in instances:
+                        if not re.fullmatch(r"[A-Za-z0-9_]+", inst): continue
+                        cur.execute("SELECT sys.fn_cdc_get_max_lsn() AS max_lsn")
+                        mx = (cur.fetchone() or {}).get("max_lsn")
+                        if not mx: continue
+                        if last_lsn:
+                            start = bytes.fromhex(last_lsn)
+                        else:
+                            cur.execute("SELECT sys.fn_cdc_get_min_lsn(%s) AS min_lsn", (inst,))
+                            start = (cur.fetchone() or {}).get("min_lsn")
+                        if not start: start = mx
+                        sql = "SELECT * FROM cdc.fn_cdc_get_all_changes_%s(%%s, %%s, 'all update old')" % inst
+                        cur.execute(sql, (start, mx))
+                        rows = cur.fetchall(); columns = [d[0] for d in cur.description or []]
+                        for row in rows:
+                            op = int(row.get("__$operation") or 0)
+                            table = inst.split("_", 1)[-1]
+                            if include and table not in include: continue
+                            if table in exclude: continue
+                            before = {k:v for k,v in row.items() if not k.startswith("__")}
+                            after = dict(before)
+                            kind = {1:"DELETE",2:"INSERT",3:"UPDATE",4:"UPDATE"}.get(op)
+                            if not kind: continue
+                            ev = {"op": kind, "schema": "dbo", "table": table,
+                                  "ts": db.now_iso(), "position": (row.get("__$start_lsn") or b"").hex(),
+                                  "before": before if op in (1,3) else {},
+                                  "after": after if op in (2,4) else {},
+                                  "pk": {}, "before_partial": False, "sql_text":"", "sql_undo":""}
+                            batch.append(ev)
+                            last_lsn = (row.get("__$start_lsn") or mx).hex()
+                    if batch:
+                        STORE.save(self.stream_id, batch); self.events_captured += len(batch)
+                        payload=json.dumps({"lsn":last_lsn})
+                        db.execute("UPDATE cdc_streams SET position_json=?, updated_at=? WHERE id=?", (payload, db.now_iso(), self.stream_id))
+                finally:
+                    try: conn.close()
+                    except Exception: pass
+                time.sleep(float(self.cfg.get("poll_interval") or 2))
+        except Exception as exc:
+            self.last_error = "SQL Server CDC 读取异常: %s" % str(exc)[:400]
+            db.execute("UPDATE cdc_streams SET status='error', last_error=?, updated_at=? WHERE id=?", (self.last_error, db.now_iso(), self.stream_id))
 
     # ---------------- 段消费模式（Oracle / 达梦 LogMiner jsonl） ----------------
     def _start_segment_consumer(self) -> bool:

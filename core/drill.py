@@ -275,6 +275,10 @@ def _run_real_restore_drill(d: dict, drill_id: int) -> dict:
     report_extra = {"mode": "real"}
     status = "failed"
     pw_plain = ""
+    # 必须在外层 try 之前初始化：_pick_latest_restore_record / import scheduler
+    # 等任一步抛异常都会走 except 兜底，那里要读 created_ok 决定是否销毁临时库。
+    # 此前只在内层赋初值，早异常触发 UnboundLocalError 使演练永久 running（P1-11）。
+    created_ok = False
 
     def _finish(score_, status_, issues_, report_):
         rto = round(time.time() - rto_start, 1)
@@ -610,7 +614,8 @@ def run_scheduled_drill(force: bool = False) -> dict:
     if not enabled and not force:
         return {"ok": True, "skipped": True, "reason": "排程未启用", "ran": []}
     target_ids = list(cfg.get("target_task_ids") or [])
-    if not target_ids and not force:
+    if not target_ids:
+        # force 也不能把空目标推进 next_run——那会静默跳过本次演练（P2-23）
         return {"ok": True, "skipped": True, "reason": "未配置目标任务", "ran": []}
 
     now = datetime.now(timezone.utc).astimezone()

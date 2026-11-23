@@ -92,7 +92,9 @@ NATIVE_CONFIG = {
         "default_db": None,
     },
     "dameng": {
-        "probe": "SELECT 1",
+        # DM7 / 老 build 对无 FROM 的 SELECT 1 兼容性不一：逐条尝试，
+        # 任一成功即视为连通；全部失败才保留真实错误。
+        "probe": ("SELECT 1", "SELECT 1 FROM DUAL"),
         "list_sql": ("SELECT username FROM all_users ORDER BY 1",),
         # 达梦的 SYSDBA 既是管理员又常被用作业务 schema，不能排除
         "filter": ("SYS", "SYSAUDITOR", "SYSSSO", "SYSDBAOPER", "CTISYS", "CJISYS"),
@@ -317,9 +319,18 @@ def connect(db_type, host, port, db, user, password, timeout=10):
         last_err = last_exc
 
     elif db_type == "dameng":
+        # DM7 / 旧版 dmPython 的 connect() 只认位置参数，新版 DM8 才支持
+        # server/port/user/password 关键字。签名不符时按旧式签名重试一次，
+        # 避免把驱动兼容问题误报成「Invalid username or password」。
         try:
             return mod.connect(
                 server=host, port=port or 5236, user=user or "", password=password or "")
+        except TypeError:
+            try:
+                return mod.connect(
+                    user or "", password or "", f"{host}:{port or 5236}")
+            except Exception as e:
+                last_err = e
         except Exception as e:
             last_err = e
 
@@ -339,6 +350,14 @@ def _driver_hint(db_type: str, exc: Exception) -> str:
                    "缺失时也可（装 Java 后）走 JDBC 兜底通道"),
     }.get(db_type, "")
     return f"{exc}。{hint}" if hint else str(exc)
+
+
+def _probe_sqls(db_type: str) -> tuple:
+    """探活 SQL 候选序列：老版本实例可能不支持无 FROM 的 SELECT 1。"""
+    raw = NATIVE_CONFIG.get((db_type or "").lower(), {}).get("probe", "SELECT 1")
+    if isinstance(raw, str):
+        return (raw,)
+    return tuple(x for x in raw if x)
 
 
 # ---------------------------------------------------------------------------
@@ -363,12 +382,28 @@ def test_connection(db_type, host, port, db, user, password, timeout=15):
             "请确认数据库实例已启动、监听端口填写正确，且防火墙已放行该端口"), None
     try:
         conn = connect(db_type, host, port, db, user, password, timeout=timeout)
-        cfg = NATIVE_CONFIG.get((db_type or "").lower(), {})
-        cur = conn.cursor()
-        cur.execute(cfg.get("probe", "SELECT 1"))
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
+        try:
+            cur = conn.cursor()
+            row = None
+            probe_err = None
+            try:
+                for sql in _probe_sqls(db_type):
+                    try:
+                        cur.execute(sql)
+                        row = cur.fetchone()
+                        probe_err = None
+                        break
+                    except Exception as e:
+                        probe_err = e
+                if probe_err is not None:
+                    raise probe_err
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+        finally:
+            conn.close()
         ms = int((time.monotonic() - t0) * 1000)
         driver_name = getattr(_import_driver(db_type), "__name__", "?")
         info = {

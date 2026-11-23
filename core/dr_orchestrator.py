@@ -139,12 +139,22 @@ def precheck(link_id: int, direction: str = "failover",
         else:
             if not std.get("is_replica"):
                 warns.append("备库当前不是复制角色（可能已是主库），请核对拓扑")
-            if int(std.get("behind") or 0) > 0:
+            try:
+                behind_num = int(float(std.get("behind") or 0))
+            except (TypeError, ValueError):
+                behind_num = 0
+                warns.append("备库延迟值无法解析（%s），请人工核对复制状态"
+                             % std.get("behind"))
+            if behind_num > 0:
                 warns.append("备库延迟 %s 秒，切换可能丢最近事务（RPO 受影响）"
                              % std.get("behind"))
     else:  # failback
-        if std.get("reachable"):
-            pass
+        # std = 当前承载写入的一方（角色感知健康快照），回切必须能对它
+        # 做 fencing；不可达时引擎会拒绝回切，预检要提前如实暴露（P1-15）。
+        if not std.get("reachable"):
+            risks.append("现主 %s 不可达：回切前无法对其执行 fencing，"
+                         "直接提升原主会造成双写——请人工确认现主已隔离"
+                         % (std.get("host") or "-"))
         if pri.get("reachable"):
             warns.append("原主可达：回切会先检查 GTID 分叉再追平，过程中写入会短暂中断")
 
@@ -204,6 +214,40 @@ def precheck(link_id: int, direction: str = "failover",
             warns.append("原主落后现主 %d 段事务——回切会先追平再提升，"
                          "追平失败将拒绝回切（防丢数据）" % len(lag))
 
+    # RTO/RPO 目标驱动（对标英方/航天云网）：目标来自链路配置，不伪造物理承诺。
+    # 复制延迟与 RPO 目标比对，超标升级为风险提示（不直接阻断，由用户确认）。
+    targets, candidate_pool = {}, {}
+    try:
+        from core import dr_topology as topo
+        targets = topo.get_targets(int(link_id))
+        if targets.get("rpo_target_min") is not None and direction == "failover":
+            behind = std.get("behind")
+            verdict = topo.judge_rpo(behind, targets.get("rpo_target_min"))
+            if verdict.get("status") == "breached":
+                warns.append("复制延迟 %ss 超过 RPO 目标 %s 分钟——切换将丢失超出目标的数据"
+                             % (verdict.get("behind_sec"), verdict.get("target_min")))
+        # 候选备机池：严格按接管条件判定（复制角色 + IO/SQL 双 Yes + 延迟阈值），
+        # 与 readiness 口径一致；check_replica=False 只探 TCP 会把已下线/主库
+        # 误报成"可用备机"（P1-D7）。
+        candidate_pool = topo.ranked_candidates(int(link_id), check_replica=True)
+        if std.get("reachable") is False:
+            usable = candidate_pool.get("usable") or []
+            if usable:
+                names = "、".join(str(c.get("name") or c.get("host"))
+                                 for c in usable[:3])
+                warns.append("主备机不可达，但候选池有 %d 台具备接管条件的备机（%s）——"
+                             "可在容灾切换向导核对候选池后再执行"
+                             % (len(usable), names))
+            else:
+                skipped = candidate_pool.get("skipped") or []
+                reasons = "；".join("%s:%s" % (c.get("name") or c.get("host"),
+                                              c.get("reason") or "未知")
+                                   for c in skipped[:3])
+                warns.append("主备机不可达，且候选池无具备接管条件的备机"
+                             + ("（跳过原因：%s）" % reasons if reasons else ""))
+    except Exception as _topo_exc:  # noqa: BLE001
+        warns.append("目标/候选池探测跳过: %s" % str(_topo_exc)[:120])
+
     return {
         "ok": True,
         "ready": not risks,
@@ -213,6 +257,8 @@ def precheck(link_id: int, direction: str = "failover",
         "direction": direction,
         "replication_position": position,
         "recommend_force": bool(direction == "failover" and pri.get("reachable")),
+        "targets": targets,
+        "candidate_pool": candidate_pool,
     }
 
 
@@ -308,7 +354,11 @@ def start_switch(link_id: int, direction: str = "failover",
     def _runner():
         t0 = time.monotonic()
         steps: list = []
+        lk = None
         try:
+            # 链路级非阻塞锁：自动监控/演练/手工向导三套入口必须互斥，
+            # 否则两个线程同时提升、同时改 DNS 并各自翻转角色（P0-5）。
+            lk = dr_failover._acquire_link_lock(int(link_id))
             engine = dr_failover.FailoverEngine(link)
             engine.cancel_event = cancel_ev
             # 进度回调：FailoverEngine._step 每完成一步就刷新 DB，前端可实时看到
@@ -331,6 +381,18 @@ def start_switch(link_id: int, direction: str = "failover",
                            "dns_only": "仅DNS"}[scope]
             ok_msg = ("切换完成（%s）：%s → %s，RTO %.1fs" %
                       (scope_label, direction, result.get("to") or "-", rto))
+            # RTO 目标判定写入结果：只报达标/超标事实，不篡改实测 RTO。
+            try:
+                from core import dr_topology as topo
+                _tgt = topo.get_targets(int(link_id))
+                _judge = topo.judge_rto(rto, _tgt.get("rto_target_sec"))
+                result["rto_verdict"] = _judge
+                if _judge.get("status") == "breached":
+                    ok_msg += "（RTO 超标：目标 %.1fs）" % _judge["target_sec"]
+                elif _judge.get("status") == "met":
+                    ok_msg += "（RTO 达标）"
+            except Exception:  # noqa: BLE001
+                pass
             db.execute(
                 "UPDATE dr_switch_runs SET status='success', phase='完成', steps=?, "
                 "rto_sec=?, message=?, finished_at=? WHERE id=?",
@@ -358,6 +420,8 @@ def start_switch(link_id: int, direction: str = "failover",
                 link, direction, scope, run_id=run_id, operator=operator,
                 message=fail_msg)
         finally:
+            if lk is not None:
+                lk.release()
             _CANCEL_EVENTS.pop(int(run_id), None)
 
     threading.Thread(target=_runner, name="dr-switch-%s" % run_id, daemon=True).start()

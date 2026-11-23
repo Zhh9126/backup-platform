@@ -327,5 +327,8 @@ def test_api_contract_for_cancel_and_source_guards():
                       encoding="utf-8").read()
     assert "cfg.incremental_value = str(result.next_value)" in engine_src
     assert "'col' == \"binlog\"" not in engine_src   # 不是死字符串
-    assert 'saved or {}).get("col") == "binlog"' in engine_src
+    # 位点续传必须真实接线：快照完成标记 + 位点文件有效性校验（防 purge 后盲续）
+    assert 'saved.get("col") == "binlog"' in engine_src
+    assert 'saved.get("snapshot_done")' in engine_src
+    assert "SHOW BINARY LOGS" in engine_src
     assert "batch_max" in engine_src

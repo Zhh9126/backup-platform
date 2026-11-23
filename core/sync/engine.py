@@ -266,6 +266,17 @@ class SyncEngine:
             if report.get("warn"):
                 logging.getLogger("sync").info(
                     "[precheck] 通过，%s 项警告", report.get("warn"))
+        # 水位统一：incremental 历史上只用 incremental_value，与 realtime /
+        # 全量+增量模式的 realtime_watermark 割裂，任务切换模式后无法续传。
+        # 统一以 realtime_watermark 为权威；旧列仅作为首次迁移的回退来源。
+        if (cfg.sync_mode == "incremental" and cfg.incremental_column
+                and not cfg.incremental_value):
+            saved = self._load_persisted_watermark(cfg.task_id)
+            if (saved and saved.get("col") == cfg.incremental_column
+                    and saved.get("value") is not None):
+                cfg.incremental_value = str(saved["value"])
+                logger.info("[sync%s] 增量模式从统一水位续传 %s=%s",
+                            cfg.task_id, cfg.incremental_column, cfg.incremental_value)
         # ---- 概念区分（业界定义）：迁移=一次性任务（full，跑完即止）；
         #      同步=持续性任务（incremental/realtime，常驻保持一致）。
         #      同步任务禁止 overwrite——覆盖写入只对一次性迁移有意义，
@@ -494,9 +505,12 @@ class SyncEngine:
             self.reader.close(conn=src_conn)
             self.writer.close(conn=tgt_conn)
 
-            # 更新增量起始值
+            # 更新增量起始值：旧列保留兼容，同时写入统一水位（权威）
             if cfg.sync_mode == "incremental" and cfg.incremental_column and next_value is not None:
                 models.update_sync_task(cfg.task_id, {"incremental_value": str(next_value)})
+                self._save_persisted_watermark(
+                    cfg.task_id, cfg.incremental_column, str(next_value),
+                    kind="incremental")
 
             duration = (datetime.now() - start).total_seconds()
             message = f"同步完成：读取 {total_read} 行，写入 {total_write} 行，错误 {errors} 行"
@@ -582,7 +596,8 @@ class SyncEngine:
                     max_rounds=config.SYNC_CATCHUP_MAX_ROUNDS,
                     max_seconds=config.SYNC_CATCHUP_MAX_SECONDS,
                     on_watermark=lambda c, v, tid=cfg.task_id:
-                        self._save_persisted_watermark(tid, c, v),
+                        self._save_persisted_watermark(
+                            tid, c, v, kind="full_incremental"),
                     progress_callback=progress_callback)
                 res["table"] = t
                 res["start_watermark"] = watermarks.get(t, "")
@@ -888,14 +903,51 @@ class SyncEngine:
         return None
 
     @staticmethod
-    def _save_persisted_watermark(task_id, col: str, value) -> None:
-        """持久化水位（写入成功后调用，断点提交顺序：目标先落库再推位点）。"""
+    def _save_persisted_watermark(task_id, col: str, value, **extra) -> None:
+        """持久化水位（写入成功后调用，断点提交顺序：目标先落库再推位点）。
+
+        统一水位模型：sync_tasks.realtime_watermark 是唯一权威位点，
+        同一 JSON 可携带 kind / snapshot_done 等状态；extra 仅在首次写入时
+        带状态，后续纯位点更新必须保留原状态（否则 binlog 重启会误判未快照）。
+        """
         try:
+            payload = {"col": col, "value": str(value)}
+            payload.update(extra)
+            if extra:
+                prev = SyncEngine._load_persisted_watermark(task_id) or {}
+                if prev.get("col") == col:
+                    for k in ("kind", "snapshot_done", "snapshot_at"):
+                        if k in prev and k not in payload:
+                            payload[k] = prev[k]
             models.update_sync_task(task_id, {"realtime_watermark": json.dumps(
-                {"col": col, "value": str(value)}, ensure_ascii=False)})
+                payload, ensure_ascii=False)})
         except Exception:
             logger.warning("[sync%s] 水位持久化失败（不影响本轮数据）",
                            task_id, exc_info=True)
+
+    @staticmethod
+    def _binlog_resume_decision(saved: Optional[dict], live_file: str,
+                                live_pos: int, available_files: set) -> tuple:
+        """binlog 续传决策（纯函数，便于单测覆盖正确性边界）。
+
+        只有同时满足：水位为 binlog 类型、快照已完成标记存在、位点格式合法、
+        位点文件仍在源库（未被 purge），才跳过全量从该位点续传；
+        任何一项不满足都必须重做全量——绝不带着未知位点盲续。
+        """
+        fallback = (False, live_file, live_pos)
+        if not saved or saved.get("col") != "binlog" or not saved.get("snapshot_done"):
+            return fallback
+        sv = str(saved.get("value") or "")
+        if ":" not in sv:
+            return fallback
+        f, _, p = sv.rpartition(":")
+        try:
+            pos = int(p)
+        except ValueError:
+            return fallback
+        if not available_files or f not in available_files:
+            return fallback
+        return True, f, pos
 
     @staticmethod
     def _shift_watermark_back(value: str, seconds: int) -> str:
@@ -1033,29 +1085,43 @@ class SyncEngine:
                 if not ms:
                     return {"success": False, "message": "无法获取源库 binlog 位点"}
                 live_file, live_pos = ms[0], int(ms[1])
-                # 断点续传：优先用上次已成功应用并持久化的位点，
-                # 否则停机期间的 binlog 变更全部丢失。
-                saved = self._load_persisted_watermark(cfg.task_id)
-                sv = str((saved or {}).get("value") or "")
-                if (saved or {}).get("col") == "binlog" and ":" in sv:
+                # 断点续传：只有「快照已完成」且位点文件仍在（未被 purge）
+                # 才跳过全量。否则必须重做全量——老实现每次重启都重做全量，
+                # 既浪费时间又在低流量库上反复 TRUNCATE 目标表。
+                saved = self._load_persisted_watermark(cfg.task_id) or {}
+                sv = str(saved.get("value") or "")
+                resume_ok = False
+                if saved.get("col") == "binlog" and ":" in sv and saved.get("snapshot_done"):
                     _f, _, _p = sv.rpartition(":")
                     try:
-                        log_file, log_pos = _f, int(_p)
-                        logger.info("[sync%s] 从持久化 binlog 位点续传 %s:%s",
-                                    cfg.task_id, log_file, log_pos)
-                    except ValueError:
-                        log_file, log_pos = live_file, live_pos
-                else:
+                        cand_file, cand_pos = _f, int(_p)
+                        cur.execute("SHOW BINARY LOGS")
+                        files = {str(r[0]) for r in cur.fetchall()}
+                        if cand_file in files:
+                            log_file, log_pos = cand_file, cand_pos
+                            resume_ok = True
+                            logger.info("[sync%s] 快照已完成，从持久化 binlog 位点续传 %s:%s",
+                                        cfg.task_id, log_file, log_pos)
+                        else:
+                            logger.warning("[sync%s] 持久化位点 %s 已被 purge，重做全量快照",
+                                           cfg.task_id, cand_file)
+                    except Exception:
+                        # 位点检测失败（格式非法 / SHOW BINARY LOGS 权限不足）
+                        # 一律保守重做全量，绝不带着未知位点盲目续传
+                        logger.warning("[sync%s] 持久化位点校验失败，重做全量快照",
+                                       cfg.task_id, exc_info=True)
+                if not resume_ok:
+                    # 快照前取位点：全量期间新写入的事件由 binlog 从此处回放覆盖
                     log_file, log_pos = live_file, live_pos
-                    self._save_persisted_watermark(
-                        cfg.task_id, "binlog", f"{log_file}:{log_pos}")
         finally:
             src_conn.close()
 
-        logger.info("[sync%s] 实时同步：binlog 位点 %s:%s，先做全量快照", cfg.task_id, log_file, log_pos)
-        models.update_sync_task(cfg.task_id, {
-            "message": f"实时同步启动：全量快照（binlog 位点 {log_file}:{log_pos}）...",
-        })
+        if not resume_ok:
+            logger.info("[sync%s] 实时同步：binlog 位点 %s:%s，先做全量快照",
+                        cfg.task_id, log_file, log_pos)
+            models.update_sync_task(cfg.task_id, {
+                "message": f"实时同步启动：全量快照（binlog 位点 {log_file}:{log_pos}）...",
+            })
 
         # 2) 全量快照（initial 语义：先快照，再按位点追增量，upsert 幂等不重不漏）
         # 注意：_run_single_table/_run_full_migration 会修改共享 cfg.source_table/target_table
@@ -1069,13 +1135,26 @@ class SyncEngine:
             except Exception:
                 tables = []
         snapshot = None
-        if tables:
-            snapshot = self._run_full_migration(progress_callback)
-            if not snapshot.get("success") and snapshot.get("errors", 0) > 0:
-                return {"success": False,
-                        "message": f"实时同步全量快照失败：{snapshot.get('message')}"}
+        if resume_ok:
+            # 已确认快照完成且位点有效：直接从位点续传，重做全量是老实现的弱点
+            snap_msg = "断点续传（跳过全量快照）"
+            logger.info("[sync%s] %s，位点 %s:%s", cfg.task_id,
+                        snap_msg, log_file, log_pos)
+        else:
+            if tables:
+                snapshot = self._run_full_migration(progress_callback)
+                if not snapshot.get("success") and snapshot.get("errors", 0) > 0:
+                    return {"success": False,
+                            "message": f"实时同步全量快照失败：{snapshot.get('message')}"}
+            # 快照完成后才打标记；标记与快照前位点一起持久化，
+            # 下次启动据此跳过全量（位点仍在，增量从此处回放不漏）
+            self._save_persisted_watermark(
+                cfg.task_id, "binlog", f"{log_file}:{log_pos}",
+                kind="binlog", snapshot_done=True,
+                snapshot_at=datetime.now().isoformat(timespec="seconds"))
+            snap_msg = (f"全量快照完成（{snapshot.get('total_write', 0)} 行）"
+                        if snapshot else "无表，仅监听增量")
         cfg.source_table, cfg.target_table = orig_source_table, orig_target_table
-        snap_msg = f"全量快照完成（{snapshot.get('total_write', 0)} 行）" if snapshot else "无表，仅监听增量"
 
         # 3) 增量监听（阻塞循环，直到 stop_event 置位）
         models.update_sync_task(cfg.task_id, {

@@ -145,6 +145,10 @@ ACTION_RULES = tuple((re.compile(p), perm) for p, perm in (
     (r"^/api/tasks/quick-backup$", "backup.run"),
     (r"^/api/tasks/\d+/run$", "backup.run"),
     (r"^/api/tasks/\d+/stop$", "backup.run"),
+    # 剧本"定义"与"执行/审批"分权：三员分立不能被一级模块映射击穿
+    # （否则只有 restore.run 的执行人反被 403，P1-12）
+    (r"^/api/runbooks/\d+/run$", "restore.run"),
+    (r"^/api/runbook-runs/\d+/(approve|stop)$", "restore.run"),
     # 防勒索扫描是只读探测（附带检测结论落库/隔离），operator 也要能发起
     (r"^/api/ransomware/(scan/\d+|scan-recent)$", "backup.task.manage"),
     # 把推荐窗口写入任务 cron 属于任务配置变更

@@ -867,6 +867,18 @@ def _to_py(value):
     return value
 
 
+def _dameng_error_hint(native_err: str, jdbc_err: str) -> str:
+    """达梦常见错误码的可执行排查提示（保留原始错误，不替代结论）。"""
+    text = f"{native_err or ''} {jdbc_err or ''}"
+    hints = []
+    if "-2501" in text or "Invalid username or password" in text:
+        hints.append("请核对用户名/密码；DM7 或大小写敏感实例的用户名通常为大写（如 SYSDBA）")
+    if "-7002" in text or "create SOCKET connection failure" in text:
+        hints.append("请核对 host/port、实例是否已启动并监听、防火墙是否放行（达梦默认端口 5236）")
+        hints.append("若确认为 DM7 且仍失败，可将对应版本 JDBC 驱动放入 drivers/ 后在插件页注册绑定")
+    return "；提示: " + "；".join(hints) if hints else ""
+
+
 def test_connection(db_type, host, port, db, user, password, timeout=15):
     """测试直连：原生驱动优先，JDBC 兜底，返回 (ok, message, info)。"""
     # 1) 原生直连优先（无 Java 依赖）；驱动缺失抛 DriverUnavailable
@@ -886,11 +898,32 @@ def test_connection(db_type, host, port, db, user, password, timeout=15):
         conn = connect(db_type, host, port, db, user, password, timeout=timeout)
         cfg = effective_config(db_type)
         probe = cfg.get("probe", "SELECT 1")
-        cur = conn.cursor()
-        cur.execute(probe)
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
+        sqls = (probe,) if isinstance(probe, str) else tuple(probe)
+        if db_type == "dameng":
+            # DM7 老实例对无 FROM 的 SELECT 1 兼容不一，追加 DUAL 候选
+            sqls = tuple(dict.fromkeys(sqls + ("SELECT 1 FROM DUAL",)))
+        try:
+            cur = conn.cursor()
+            row = None
+            probe_err = None
+            try:
+                for sql in sqls:
+                    try:
+                        cur.execute(sql)
+                        row = cur.fetchone()
+                        probe_err = None
+                        break
+                    except Exception as e:
+                        probe_err = e
+                if probe_err is not None:
+                    raise probe_err
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+        finally:
+            conn.close()
         ms = int((time.monotonic() - t0) * 1000)
         info = {
             "db_type": db_type,
@@ -924,6 +957,15 @@ def test_connection(db_type, host, port, db, user, password, timeout=15):
             return False, (
                 f"JDBC 连接失败（{ms} ms）: {jdbc_err}"
                 f"（{db_type} 走 JDBC 通道，原生直连不适用）"
+                + tls_error_hint(jdbc_err)), None
+        if db_type == "dameng":
+            # DM7 现场原生 dmPython 与 JDBC 错误码体系不同（-2501 认证失败 /
+            # -7002 socket 建连失败），只展示其中一条会让用户误判平台能力。
+            # 双通道摘要 + 排查提示，真实原因全部保留。
+            return False, (
+                f"连接失败（{ms} ms）: 原生 {native_err or '无可用信息'}；"
+                f"JDBC {jdbc_err}"
+                + _dameng_error_hint(native_err, jdbc_err)
                 + tls_error_hint(jdbc_err)), None
         # 两条通道都失败时优先返回原生通道的错误（更贴近真实原因）
         return False, (f"连接失败（{ms} ms）: {native_err or jdbc_err}"

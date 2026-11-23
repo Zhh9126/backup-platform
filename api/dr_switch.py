@@ -24,12 +24,11 @@ from . import api_bp
 
 
 def _operator() -> str:
+    # auth 模块只提供 current_operator()（session['user'] 已标准化为 dict）。
+    # 此前误调不存在的 current_user，ImportError 被吞导致切换审计人恒为空。
     try:
-        from auth import current_user
-        u = current_user()
-        if isinstance(u, dict):
-            return u.get("username") or ""
-        return getattr(u, "username", "") or ""
+        from auth import current_operator
+        return current_operator()
     except Exception:
         return ""
 
@@ -50,7 +49,9 @@ def dr_switch_precheck(link_id: int):
                         direction=str(body.get("direction") or "failover"),
                         force=bool(body.get("force")),
                         scope=str(body.get("scope") or "full"))
-    return jsonify(res), (200 if res.get("ok") else 400)
+    # 结构化预检结果通过 HTTP 200 + ok/ready 字段表达：BKP.api 对 4xx
+    # 直接抛错，若这里返回 400，前端拿不到 risks/快照明细（P1-14）。
+    return jsonify(res), 200
 
 
 @api_bp.route("/disaster-links/<int:link_id>/switch", methods=["POST"])
@@ -75,7 +76,9 @@ def dr_switch_start(link_id: int):
                             force=bool(body.get("force")),
                             operator=_operator(),
                             scope=str(body.get("scope") or "full"))
-    return jsonify(res), (200 if res.get("ok") else 400)
+    # blocked 是结构化业务结果（含 precheck 快照/风险），不是传输错误；
+    # 返回 200 让前端能渲染明细而非只剩一条 toast（P1-14）。
+    return jsonify(res), 200
 
 
 @api_bp.route("/dr/switch-context/<int:link_id>", methods=["GET"])

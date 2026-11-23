@@ -10300,6 +10300,7 @@
               '<button class="btn btn-sm btn-outline-warning" onclick="openFailoverWizard(' + l.id + ')" title="切换向导：预检→确认→执行→RTO 报告"><i class="bi bi-arrow-left-right me-1"></i>切换</button>' +
               '<button class="btn btn-sm btn-outline-secondary" onclick="openDrAuto(' + l.id + ')" title="自动切换策略：连续 N 次探测失败告警/自动切换"><i class="bi bi-activity me-1"></i>策略</button>' +
               '<button class="btn btn-sm btn-outline-secondary" onclick="openFailCfg(' + l.id + ')" title="切换引擎配置：主备连接 / 复制账号 / DNS"><i class="bi bi-diagram-3 me-1"></i>配置</button>' +
+              '<button class="btn btn-sm btn-outline-primary" onclick="openDrCandidates(' + l.id + ')" title="站点与候选备机池：按优先级多级接管 / RTO·RPO 目标"><i class="bi bi-diagram-2 me-1"></i>候选池</button>' +
               '<button class="btn btn-sm btn-outline-success" onclick="runFailback(' + l.id + ')" title="一键回切：旧主追平→提升→现主转从→DNS 切回"><i class="bi bi-arrow-counterclockwise me-1"></i>回切</button>' +
               '<button class="btn btn-sm btn-outline-primary" onclick="selectRoute(' + l.id + ')"><i class="bi bi-signpost-split me-1"></i>选路</button>' +
               '<button class="btn btn-sm btn-outline-info" onclick="fillGap(' + l.id + ')"><i class="bi bi-arrow-down-up me-1"></i>填补</button>' +
@@ -10322,6 +10323,164 @@
     if (typeof v === "object") return v;
     try { return JSON.parse(v); } catch (e) { return fallback; }
   }
+
+  // 站点与候选备机池（对标英方多对多池化接管 / 航天云网节点故障重调度）
+  window.openDrCandidates = async function (id) {
+    let box = document.getElementById("drCandModal");
+    if (!box) {
+      box = document.createElement("div");
+      box.className = "modal fade";
+      box.id = "drCandModal";
+      box.tabIndex = -1;
+      box.innerHTML = '<div class="modal-dialog modal-xl modal-dialog-scrollable"><div class="modal-content">' +
+        '<div class="modal-header"><h5 class="modal-title">站点与候选备机池 · 多级接管</h5>' +
+        '<button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>' +
+        '<div class="modal-body" id="drCandBody"></div>' +
+        '<div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">关闭</button></div>' +
+        '</div></div>';
+      document.body.appendChild(box);
+    }
+    new bootstrap.Modal(box).show();
+    await window.renderDrCandidates(id);
+  };
+
+  window.renderDrCandidates = async function (id) {
+    const body = document.getElementById("drCandBody");
+    if (!body) return;
+    body.innerHTML = '<div class="text-center text-muted py-4"><span class="spinner-border spinner-border-sm me-2"></span>加载中…</div>';
+    try {
+      const [cands, targets, sites] = await Promise.all([
+        api("GET", "/api/dr/links/" + id + "/candidates"),
+        api("GET", "/api/dr/links/" + id + "/targets"),
+        api("GET", "/api/dr/sites"),
+      ]);
+      const ci = (cands && cands.candidates) || [];
+      const si = (sites && sites.sites) || [];
+      let h = '<div class="alert alert-info py-2 small">' +
+        '候选池按优先级（数字小者优先）尝试接管：第一台不具备条件时由下一台接管（英方池化思路）。' +
+        '探测只判健康不执行切换；站点为配置实体，不代表生产可切换承诺。</div>';
+      h += '<div class="card mb-3"><div class="card-header py-2 small"><b>RTO / RPO 目标</b></div><div class="card-body py-2">' +
+        '<div class="row g-2"><div class="col-md-4"><label class="form-label small mb-0">RTO 目标（秒）</label>' +
+        '<input class="form-control form-control-sm" id="drCandRto" type="number" min="1" value="' + esc(String(targets.rto_target_sec || 300)) + '"></div>' +
+        '<div class="col-md-4"><label class="form-label small mb-0">RPO 目标（分钟）</label>' +
+        '<input class="form-control form-control-sm" id="drCandRpo" type="number" min="0" value="' + esc(String(targets.rpo_target_min == null ? 15 : targets.rpo_target_min)) + '"></div>' +
+        '<div class="col-md-4 d-flex align-items-end"><button class="btn btn-sm btn-primary" onclick="saveDrTargets(' + id + ')">保存目标</button></div></div>' +
+        '<div class="small text-muted mt-1">来源：' + esc(targets.source === "link_column" ? "链路目标字段" : "配置默认值") + '</div></div></div>';
+      h += '<div class="card mb-3"><div class="card-header py-2 d-flex justify-content-between align-items-center"><b class="small">候选备机（' + ci.length + '）</b>' +
+        '<button class="btn btn-sm btn-outline-primary" onclick="showDrCandAdd(' + id + ')">新增候选</button></div><div class="card-body py-2">';
+      h += ci.length ? '<table class="table table-sm table-hover mb-0"><thead><tr><th>优先级</th><th>名称</th><th>主机</th><th>站点</th><th>账号</th><th>操作</th></tr></thead><tbody>' :
+        '<div class="text-muted small">暂无候选——新增后可在预检中看到多级接管备选</div>';
+      ci.forEach(function (c) {
+        const site = si.find((s) => s.id === c.site_id);
+        h += '<tr><td>' + esc(String(c.priority)) + '</td><td>' + esc(c.name || "-") + '</td><td>' +
+          esc(c.host) + ':' + esc(String(c.port)) + '</td><td>' + esc(site ? site.name : "-") + '</td><td>' +
+          esc(c.username || "-") + (c.has_password ? ' <i class="bi bi-key" title="已配置密码"></i>' : '') +
+          '</td><td><button class="btn btn-sm btn-outline-info" onclick="probeDrCand(' + c.id + ')">探测</button> ' +
+          '<button class="btn btn-sm btn-outline-danger" onclick="delDrCand(' + c.id + ',' + id + ')">删除</button></td></tr>' +
+          '<tr id="drCandProbe' + c.id + '"><td colspan="6" class="small text-muted p-1"></td></tr>';
+      });
+      h += ci.length ? '</tbody></table>' : '';
+      h += '</div></div>';
+      h += '<div class="card"><div class="card-header py-2 small"><b>站点台账（' + si.length + '）</b></div><div class="card-body py-2">' +
+        (si.length ? '<table class="table table-sm mb-0"><thead><tr><th>名称</th><th>角色</th><th>类型</th><th>城市</th><th>主机</th></tr></thead><tbody>' +
+          si.map((s) => '<tr><td>' + esc(s.name) + '</td><td>' + esc(s.site_role) + '</td><td>' + esc(s.site_type) +
+            '</td><td>' + esc(s.city || "-") + '</td><td>' + esc(s.host || "-") + '</td></tr>').join("") + '</tbody></table>' :
+          '<div class="text-muted small">暂无站点。可在下方新增主/备站点。</div>') +
+        '<div class="row g-2 mt-2"><div class="col-md-3"><input class="form-control form-control-sm" id="drSiteName" placeholder="站点名称"></div>' +
+        '<div class="col-md-2"><select class="form-select form-select-sm" id="drSiteRole"><option value="primary">主</option><option value="standby" selected>备</option><option value="tertiary">三级</option></select></div>' +
+        '<div class="col-md-2"><input class="form-control form-control-sm" id="drSiteCity" placeholder="城市"></div>' +
+        '<div class="col-md-3"><input class="form-control form-control-sm" id="drSiteHost" placeholder="主机 IP"></div>' +
+        '<div class="col-md-2"><button class="btn btn-sm btn-outline-primary" onclick="addDrSite()">新增站点</button></div></div></div></div>';
+      body.innerHTML = h;
+    } catch (e) {
+      body.innerHTML = '<div class="alert alert-danger">加载失败：' + esc(e.message || String(e)) + '</div>';
+    }
+  };
+
+  window.saveDrTargets = async function (id) {
+    const rto = document.getElementById("drCandRto").value;
+    const rpo = document.getElementById("drCandRpo").value;
+    try {
+      await api("PUT", "/api/dr/links/" + id + "/targets", {rto_target_sec: Number(rto), rpo_target_min: Number(rpo)});
+      toast("目标已保存", "success");
+    } catch (e) { toast("保存失败：" + (e.message || ""), "error"); }
+  };
+
+  window.addDrSite = async function () {
+    const name = document.getElementById("drSiteName").value.trim();
+    if (!name) { toast("请填写站点名称", "warning"); return; }
+    try {
+      await api("POST", "/api/dr/sites", {
+        name: name, site_role: document.getElementById("drSiteRole").value,
+        city: document.getElementById("drSiteCity").value.trim(),
+        host: document.getElementById("drSiteHost").value.trim()});
+      toast("站点已新增", "success");
+      const link = (DR_LINKS || [])[0];
+      await window.renderDrCandidates(link ? link.id : 1);
+    } catch (e) { toast("新增失败：" + (e.message || ""), "error"); }
+  };
+
+  window.showDrCandAdd = async function (id) {
+    const sites = await api("GET", "/api/dr/sites");
+    const si = (sites && sites.sites) || [];
+    const opts = si.map((s) => '<option value="' + s.id + '">' + esc(s.name) + '</option>').join("");
+    const html = '<div class="modal fade" id="drCandAddModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content">' +
+      '<div class="modal-header"><h6 class="modal-title">新增候选备机</h6><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>' +
+      '<div class="modal-body">' +
+      '<div class="mb-2"><label class="form-label small">名称</label><input class="form-control form-control-sm" id="dcaName" placeholder="如 上海备机"></div>' +
+      '<div class="mb-2"><label class="form-label small">站点</label><select class="form-select form-select-sm" id="dcaSite"><option value="">不关联</option>' + opts + '</select></div>' +
+      '<div class="row g-2 mb-2"><div class="col-8"><label class="form-label small">主机 IP</label><input class="form-control form-control-sm" id="dcaHost"></div>' +
+      '<div class="col-4"><label class="form-label small">端口</label><input class="form-control form-control-sm" id="dcaPort" type="number" value="3306"></div></div>' +
+      '<div class="row g-2 mb-2"><div class="col-6"><label class="form-label small">用户</label><input class="form-control form-control-sm" id="dcaUser" value="root"></div>' +
+      '<div class="col-6"><label class="form-label small">密码</label><input class="form-control form-control-sm" id="dcaPass" type="password"></div></div>' +
+      '<div class="mb-2"><label class="form-label small">优先级（小者优先）</label><input class="form-control form-control-sm" id="dcaPrio" type="number" value="100"></div>' +
+      '</div><div class="modal-footer"><button class="btn btn-secondary btn-sm" data-bs-dismiss="modal">取消</button>' +
+      '<button class="btn btn-primary btn-sm" onclick="saveDrCand(' + id + ')">保存</button></div></div></div></div>';
+    let m = document.getElementById("drCandAddModal");
+    if (m) m.remove();
+    document.body.insertAdjacentHTML("beforeend", html);
+    new bootstrap.Modal(document.getElementById("drCandAddModal")).show();
+  };
+
+  window.saveDrCand = async function (id) {
+    const payload = {
+      site_id: document.getElementById("dcaSite").value || null,
+      name: document.getElementById("dcaName").value.trim(),
+      host: document.getElementById("dcaHost").value.trim(),
+      port: Number(document.getElementById("dcaPort").value),
+      username: document.getElementById("dcaUser").value.trim(),
+      password: document.getElementById("dcaPass").value,
+      priority: Number(document.getElementById("dcaPrio").value),
+    };
+    if (!payload.host) { toast("请填写主机 IP", "warning"); return; }
+    try {
+      await api("POST", "/api/dr/links/" + id + "/candidates", payload);
+      const bm = bootstrap.Modal.getInstance(document.getElementById("drCandAddModal"));
+      if (bm) bm.hide();
+      toast("候选已新增", "success");
+      await window.renderDrCandidates(id);
+    } catch (e) { toast("新增失败：" + (e.message || ""), "error"); }
+  };
+
+  window.probeDrCand = async function (cid) {
+    const td = document.getElementById("drCandProbe" + cid);
+    if (!td) return;
+    td.innerHTML = '<span class="spinner-border spinner-border-sm"></span> 探测中…';
+    try {
+      const r = await api("POST", "/api/dr/candidates/" + cid + "/probe", {check_replica: true});
+      td.innerHTML = (r && r.healthy ? '<span class="text-success">具备接管条件</span>' :
+        '<span class="text-danger">不具备接管条件</span>') + ' · ' + esc(r && r.reason ? r.reason : "—") +
+        (r && r.io ? ' · IO=' + esc(String(r.io)) + ' SQL=' + esc(String(r.sql)) : '');
+    } catch (e) { td.innerHTML = '<span class="text-danger">探测失败：' + esc(e.message || "") + '</span>'; }
+  };
+
+  window.delDrCand = async function (cid, linkId) {
+    try {
+      await api("DELETE", "/api/dr/candidates/" + cid);
+      toast("候选已删除", "success");
+      await window.renderDrCandidates(linkId);
+    } catch (e) { toast("删除失败：" + (e.message || ""), "error"); }
+  };
 
   window.openDrTopo = async function (id) {
     DR_TOPO_LINK_ID = id;

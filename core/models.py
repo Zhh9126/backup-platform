@@ -1803,6 +1803,13 @@ def _dl_to_dict(row: Optional[dict]) -> Optional[dict]:
             d["route_policy"] = json.loads(d["route_policy"])
         except (json.JSONDecodeError, TypeError):
             pass
+    # region 与 map 前端按对象消费，读回时反序列化（P2 契约一致）
+    for _rk in ("primary_region", "dr_region"):
+        if isinstance(d.get(_rk), str) and d[_rk]:
+            try:
+                d[_rk] = json.loads(d[_rk])
+            except (json.JSONDecodeError, TypeError):
+                pass
     d["enabled"] = bool(d.get("enabled"))
     d["source_kind"] = d.get("source_kind") or "manual"
     try:
@@ -1836,6 +1843,12 @@ def create_disaster_link(data: dict) -> int:
         data["route_policy"] = json.dumps(_default_route_policy(), ensure_ascii=False)
     else:
         data["route_policy"] = _dl_json(data, "route_policy")
+    # region 前端传对象（地图定位），必须序列化后再绑定 SQLite；
+    # 否则 dict 直接入参触发 ProgrammingError（P2 数据模型）。
+    data["primary_region"] = _dl_json(data, "primary_region")
+    data["dr_region"] = _dl_json(data, "dr_region")
+    data["failover_config"] = _dl_json(data, "failover_config")
+    data["failover_history"] = _dl_json(data, "failover_history")
     cols = list(data.keys())
     sql = "INSERT INTO disaster_links ({}) VALUES ({})".format(
         ",".join(cols), ",".join("?" * len(cols)))
@@ -1865,6 +1878,9 @@ def update_disaster_link(link_id: int, data: dict) -> bool:
         updates["route_policy"] = _dl_json(updates, "route_policy")
     if "failover_config" in updates:
         updates["failover_config"] = _dl_json(updates, "failover_config")
+    for _rk in ("primary_region", "dr_region", "failover_history"):
+        if _rk in updates:
+            updates[_rk] = _dl_json(updates, _rk)
     if "source_kind" in updates:
         kind = str(updates.get("source_kind") or "manual")
         updates["source_kind"] = kind if kind in DISASTER_LINK_SOURCE_KINDS else "manual"

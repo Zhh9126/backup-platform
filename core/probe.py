@@ -82,13 +82,14 @@ def _clip(text, limit: int = _ERR_MAX) -> str:
             + s[-tail:].lstrip())
 
 
-def _probe_via_driver(module, connect, probe_sql: str, ok_msg: str):
+def _probe_via_driver(module, connect, probe_sql, ok_msg: str):
     """用 Python 驱动执行一次轻量查询验证连通性。
 
     Args:
         module: 已导入的驱动模块（仅用于判空）。
         connect: 无参可调用对象，返回连接。
-        probe_sql: 探活语句。
+        probe_sql: 探活语句；可传候选序列（如 DM7 的 SELECT 1 / FROM DUAL），
+                   逐条尝试、任一成功即通过，全部失败才保留最后一条真实错误。
         ok_msg: 成功时的中文提示。
 
     Returns:
@@ -100,19 +101,24 @@ def _probe_via_driver(module, connect, probe_sql: str, ok_msg: str):
         conn = connect()
     except Exception as e:
         return False, f"连接失败: {_clip(e)}"
+    sqls = (probe_sql,) if isinstance(probe_sql, str) else tuple(probe_sql)
     try:
         cur = conn.cursor()
+        last_err = None
         try:
-            cur.execute(probe_sql)
-            cur.fetchall()
+            for sql in sqls:
+                try:
+                    cur.execute(sql)
+                    cur.fetchall()
+                    return True, ok_msg
+                except Exception as e:
+                    last_err = e
+            return False, f"探活查询失败: {_clip(last_err)}"
         finally:
             try:
                 cur.close()
             except Exception:
                 pass
-        return True, ok_msg
-    except Exception as e:
-        return False, f"探活查询失败: {_clip(e)}"
     finally:
         try:
             conn.close()
@@ -367,7 +373,8 @@ def _probe_dameng(h, p, u, pw, db_name, t):
             except TypeError:
                 return module.connect(u, pw, f"{h}:{port}")
         ok, msg = _probe_via_driver(
-            module, _connect, "SELECT 1", f"达梦 连接正常（{module.__name__}）")
+            module, _connect, ("SELECT 1", "SELECT 1 FROM DUAL"),
+            f"达梦 连接正常（{module.__name__}）")
         if ok is not None:
             return ok, msg
 
@@ -375,13 +382,16 @@ def _probe_dameng(h, p, u, pw, db_name, t):
     if not client:
         # 零安装原则：平台自带 JDBC 驱动，缺原生驱动/CLI 时自动兜底
         return _probe_via_jdbc("dameng", h, p, u, pw, t)
-    # 密码经 stdin 传入，不进命令行
-    script = f"conn {u}/\"{pw}\"@{h}:{port}\nselect 1;\nexit\n"
-    rc, out, err = _run([client, "/nolog"], None, t + 10, script)
-    text = (out + err)
-    if rc == 0 and "-" not in text.split("\n")[0][:1] and "错误" not in text:
-        return True, "达梦 连接正常（disql）"
-    return False, (_clip(text) or "连接失败")
+    # 密码经 stdin 传入，不进命令行；DM7 老实例对无 FROM 的 select 1 兼容不一
+    last_text = ""
+    for sql in ("select 1;", "select 1 from dual;"):
+        script = f"conn {u}/\"{pw}\"@{h}:{port}\n{sql}\nexit\n"
+        rc, out, err = _run([client, "/nolog"], None, t + 10, script)
+        text = (out + err)
+        if rc == 0 and "-" not in text.split("\n")[0][:1] and "错误" not in text:
+            return True, "达梦 连接正常（disql）"
+        last_text = text
+    return False, (_clip(last_text) or "连接失败")
 
 
 # 未实现客户端级探测的库：判定为“未知”，不误报警

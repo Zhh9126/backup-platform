@@ -15,7 +15,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 容灾切换 · 恢复演练 · 预校验 · 克隆（VDB） · 不可变备份 · 巡检 · 监控 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v2.4.0-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v2.4.6-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -25,15 +25,18 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 ---
 
-> **v2.4.0 本轮要点**：22 项业务/系统缺陷集中修复——保留链安全（最少保留份数回落、增量链基备护栏、
-> 保留位只算磁盘上真实存在的产物）、拒绝假成功（Redis rdb 替换失败、MySQL 物理校验缺工具如实失败）、
-> 恢复安全加固（目标库名白名单 + `shlex.quote`、达梦 PITR 目录校验、文件删除清单越界护栏、原位覆盖需二次确认）、
-> 演练与生产隔离（随机演练库名、演练模式禁止 `RESET MASTER`/GTID 清理）、并发去重与多实例心跳、
-> 口令全链路脱敏与 SSH 指纹严格模式、前端四处未定义回调。
-> 新增回归 `tests/test_bugfix_20261113.py` 23 项，cleanup / immutability / license / ransomware / op_guard /
-> i18n / 文件传输 / API 契约等 130+ 用例全绿；`v*` tag 自动发布离线包并清理历史 Release 附件。
+> **当前能力要点（2.4.6）**：在 v2.4.6 基础上追加工程化能力与容灾/连接兼容修复——
+> **跨实例持久化执行队列**（`task_execution_queue` 租约领取、重复提交合并、崩溃 24h 租约回收）、
+> **统一资源准入**（内存/备份盘空闲阈值 `AIDBM_MIN_FREE_MEMORY_MB` / `AIDBM_MIN_FREE_DISK_GB`，不足即如实阻断）、
+> **SQL Server 原生 CDC**（基于 `cdc.change_tables` 拉取行级变更、LSN 持久化、表过滤）、
+> **P1 能力真实就绪探测**（`GET /api/system/p1-capabilities`，只报实际依赖/运行时状态，不把规划能力说成可用）、
+> **安全加固**（shell 执行路径收敛、FTP 默认关闭需 `AIDBM_ENABLE_INSECURE_FTP=true`、管理员首次口令轮换 + `must_change_password`），
+> 以及 shell 执行/任务租约/资源预算相关修复。
 >
-> **最新动态**：v2.4.0（2026-11-13）已发布（22 项业务/系统缺陷修复：保留链安全 / 拒绝假成功 / 恢复安全加固 / 演练隔离 / 并发去重 / 口令脱敏 / 离线包自动发布）；
+> **最新动态**：v2.4.6（2026-11-23，本次发布）在 v2.4.6 私有仓库增量之上补齐**容灾 P0/P1 缺陷修复**（切换后 active_role 翻转使自动监控跟随当前主、failover/failback 双向 fencing、提升失败硬中止、链路锁互斥、候选池判定与探测修复、审计操作人/权限分立）与**达梦 DM7 连接兼容**（旧版 dmPython 位置参数、`SELECT 1 FROM DUAL` 候选、双通道错误摘要）；
+> v2.4.6（2026-11-20）已发布标签并产出离线包（`aidbm_2.4.6_offline.tar.gz`，VDB 快照 native 通道 + 恢复实测数据量 + 容灾域第二轮）；
+> v2.4.3 / v2.4.4 / v2.4.6 tag 均已打；私有仓库 2026-11-23 增量（上段 8 项）尚未打 tag，仅在私有仓库与本地工作区生效；
+> v2.4.0（2026-11-13）已发布（22 项业务/系统缺陷修复：保留链安全 / 拒绝假成功 / 恢复安全加固 / 演练隔离 / 并发去重 / 口令脱敏 / 离线包自动发布）；
 > v2.3.11（2026-11-12）已发布（SQL Server 旧版 TLS/JDBC 兼容 / AI 模型超时与存储容量可读化 / 克隆服务小库真机验证 / 离线发布链路修复）；
 > v2.3.10（2026-11-12）已发布（170/171 五库型迁移同步全面真机验收 / 6 个真实缺陷修复 / 离线镜像包交付）；
 > v2.3.9（2026-11-12）完成功能项按需启用与权限分离 / AI 结果与模型接入修复 / 迁移同步 P0；
@@ -68,6 +71,7 @@ v2.2.0（2026-11-05）——近两个月主线：AI 大模型数据备份（v2.0
 | 虚拟机 | KVM/PVE/ESXi/Hyper-V 整机备份、克隆、原位还原、TTL 回收 | libvirt 通道真机端到端（业务无停机） |
 | 智能运维 | 任务监控分诊、报表中心、巡检、数据价值挖掘（GB/T 43697 分级）、AI 助手（商业版）、AI 告警 | 失败分诊真机检出、报表导出三格式 |
 | 平台化 | RBAC（24 权限点/3 角色）、可插拔元数据库（SQLite/PG/MySQL）、完全离线交付、外部 API、Webhook 事件中心 | 全站冒烟 0 命中 5xx |
+| 执行与资源治理（私有仓库增量） | 跨实例持久化任务队列（租约领取/重复合并/崩溃回收）、每任务执行租约防并发、统一内存与备份盘准入闸、SQL Server 原生 CDC、能力真实就绪探测 API | 队列 enqueue→claim→done 全链路实测；170/171 全库型 48/48 全绿 |
 
 ## 平台特色
 
@@ -86,6 +90,11 @@ v2.2.0（2026-11-05）——近两个月主线：AI 大模型数据备份（v2.0
 - **真实恢复演练**：不止元数据评估——真恢复到临时库 → 逐表行数校验 → 评分（100 分制，RPO 阈值扣分）→ 兜底销毁，支持 weekly/monthly/quarterly 排程；克隆服务可把备份拉起为可查询的虚拟数据库（VDB）。
 - **不可变备份（防勒索纵深）**：保留锁定（只许延长不许缩短、强制审计）→ 产物 chmod 写保护 → sha256 基线周期复检 → 删除路径四路拦截；叠加恢复点安全检测三查（体积突变/熵值/结构嗅探）。
 - **自定义适配器（无限扩展库型）**：界面新增数据库类型 + 脚本模板即刻获得与内置引擎同等的备份/恢复/调度能力——已以 TDengine（时序库，taosdump/REST 双通道）与 CouchDB（文档库，_bulk_docs 回放）完成端到端实证；平台同机（回环）任务免 SSH 直接执行。
+- **跨实例持久执行队列与资源准入（私有仓库增量）**：`submit_task_now` / 显式 `async` / 一键备份进入 `task_execution_queue`——带租约领取（owner = 主机:PID）、同任务重复提交合并、崩溃后 24h 租约回收，任一实例均可 claim 执行；每任务持久化执行租约防止重复触发；`core/resource_budget` 统一检查可用内存与备份盘空闲（`AIDBM_MIN_FREE_MEMORY_MB` 默认 512、`AIDBM_MIN_FREE_DISK_GB` 默认 5，环境变量可调），不足时任务如实 `blocked` 而非带病运行。`run_task_now` 保持同步语义兼容既有 API/调度契约。
+  > **诚实边界**：队列为**单元数据库上的多实例租约模型**，不是分布式消息中间件；元数据库为 SQLite 时多机共享需挂在共享存储上才生效。磁盘准入默认值高（5GB），小容量环境需通过环境变量下调，否则备份会被阻断。
+- **能力真实就绪探测（私有仓库增量）**：`GET /api/system/p1-capabilities` 返回运行时/依赖/OS Agent/群晖/VM Live Mount 的实际探测结果，**只报真实状态**——VMDK DirectSAN、VSS/BMR、Live Mount、mTLS 插件等未落地能力如实标 `false`，UI 可据此收敛入口，不把规划能力呈现为可用。
+- **SQL Server 原生 CDC（私有仓库增量）**：`core/cdc/rowlevel.py` 基于 `cdc.change_tables` + `cdc.fn_cdc_get_all_changes_*` 拉取行级变更，校验库级 CDC 开启与捕获实例，LSN 位点持久化、表过滤后写入统一行事件。
+  > **前置条件**：需 `pymssql` 驱动、目标库开启 CDC 且至少有一个捕获实例；缺失时如实失败，不降级仿真。
 
 ---
 
@@ -406,8 +415,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v2.4.0   # 固定版本（可回滚）
-# 当前最新版本：v2.4.0（2026-11-13，22 项业务/系统缺陷修复 / 演练隔离 / 口令脱敏 / 离线包自动发布）
+docker pull ghcr.io/zhh9126/backup-platform:v2.4.6   # 固定版本（可回滚）
+# 当前最新版本：v2.4.6（2026-11-23，容灾 P0/P1 修复 / DM7 兼容 / 私有仓库工程化增量）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -427,9 +436,9 @@ python tools/check_env.py
 {"registry-mirrors": ["https://docker.m.daocloud.io", "https://dockerproxy.com"]}
 ```
 
-> **离线交付包版本说明**：**v2.4.0 离线包由 tag 自动发布**（`aidbm_2.4.0_offline.tar.gz` 与 `.sha256`，
+> **离线交付包版本说明**：**v2.4.6 离线包由 tag 自动发布**（`aidbm_2.4.6_offline.tar.gz` 与 `.sha256`，
 > `manifest.json` 内含 4 个 RepoTag，可直接 `docker load`）。
-> GHCR 同步提供 `v2.4.0` / `2.4.0` / `2.4.0-r<run_number>` / `latest` / `community` 在线 tag。
+> GHCR 同步提供 `v2.4.6` / `2.4.6` / `2.4.6-r<run_number>` / `latest` / `community` 在线 tag。
 > **历史产物保留策略**：每个离线包约 1.3GB，发布流程在附件上传成功后会自动清理仅保留当前版本的
 > Release 附件，并清理 GHCR 历史版本 manifest（`latest` / `community` 与当前版本 tag 不动）。
 > **git tag 一律保留**，旧版本仍可用源码回溯；需要旧离线包请在对应 Release 被清理前自行归档。
@@ -437,17 +446,17 @@ python tools/check_env.py
 ### 离线导入
 
 ```bash
-# 交付包：aidbm_2.4.0_offline.tar.gz（gzip 压缩的完整镜像，含全部运行依赖与备份工具）
-docker load -i aidbm_2.4.0_offline.tar.gz
+# 交付包：aidbm_2.4.6_offline.tar.gz（gzip 压缩的完整镜像，含全部运行依赖与备份工具）
+docker load -i aidbm_2.4.6_offline.tar.gz
 
 # 导入后确认镜像名（离线环境不会自动去公网拉取）
 docker images | grep -E 'backup-platform|aidbm'
 ```
 
 > **导入后可用 4 个镜像名（同一镜像 ID，任选其一启动，全程零联网）**：
-> `ghcr.io/zhh9126/backup-platform:v2.4.0`、`ghcr.io/zhh9126/backup-platform:latest`、
-> `aidbm:2.4.0`、`aidbm:latest`。
-> **v2.4.0 交付包已把这 4 个 tag 全部打进 `manifest.json` 的 `RepoTags`**，
+> `ghcr.io/zhh9126/backup-platform:v2.4.6`、`ghcr.io/zhh9126/backup-platform:latest`、
+> `aidbm:2.4.6`、`aidbm:latest`。
+> **v2.4.6 交付包已把这 4 个 tag 全部打进 `manifest.json` 的 `RepoTags`**，
 > `docker load` 时会输出 4 行 `Loaded image:`，直接 `docker run` 任一名字都不会访问公网。
 >
 > 若遇到 `Unable to find image 'xxx' locally` 后跟着
@@ -455,19 +464,19 @@ docker images | grep -E 'backup-platform|aidbm'
 > 说明**启动命令用的镜像名不在包内 tag 里**（Docker 找不到本地镜像就会去公网），
 > 不是包损坏。先 `docker images` 查实际 tag，或补一条：
 > ```bash
-> docker tag ghcr.io/zhh9126/backup-platform:v2.4.0 aidbm:2.4.0
+> docker tag ghcr.io/zhh9126/backup-platform:v2.4.6 aidbm:2.4.6
 > ```
 
 自行导出（有网机器上**先打齐 tag 再 save**，否则包内只带单个 tag）：
 
 ```bash
-docker pull ghcr.io/zhh9126/backup-platform:v2.4.0
-docker tag ghcr.io/zhh9126/backup-platform:v2.4.0 ghcr.io/zhh9126/backup-platform:latest
-docker tag ghcr.io/zhh9126/backup-platform:v2.4.0 aidbm:2.4.0
-docker tag ghcr.io/zhh9126/backup-platform:v2.4.0 aidbm:latest
-docker save ghcr.io/zhh9126/backup-platform:v2.4.0 ghcr.io/zhh9126/backup-platform:latest aidbm:2.4.0 aidbm:latest | gzip > aidbm_2.4.0_offline.tar.gz
-gzip -t aidbm_2.4.0_offline.tar.gz    # 必须输出 OK，否则包被截断不可交付
-sha256sum aidbm_2.4.0_offline.tar.gz > aidbm_2.4.0_offline.tar.gz.sha256
+docker pull ghcr.io/zhh9126/backup-platform:v2.4.6
+docker tag ghcr.io/zhh9126/backup-platform:v2.4.6 ghcr.io/zhh9126/backup-platform:latest
+docker tag ghcr.io/zhh9126/backup-platform:v2.4.6 aidbm:2.4.6
+docker tag ghcr.io/zhh9126/backup-platform:v2.4.6 aidbm:latest
+docker save ghcr.io/zhh9126/backup-platform:v2.4.6 ghcr.io/zhh9126/backup-platform:latest aidbm:2.4.6 aidbm:latest | gzip > aidbm_2.4.6_offline.tar.gz
+gzip -t aidbm_2.4.6_offline.tar.gz    # 必须输出 OK，否则包被截断不可交付
+sha256sum aidbm_2.4.6_offline.tar.gz > aidbm_2.4.6_offline.tar.gz.sha256
 ```
 
 ### 磁带库 / 可移动介质接入（离线容器部署）
@@ -511,7 +520,7 @@ docker run -d --name aidbm -p 8080:8080 \
   --device /dev/sg2:/dev/sg2:rwm \
   -v /opt/backup-platform/data:/data \
   -e BACKUP_ROOT=/data/backups -e TZ=Asia/Shanghai \
-  aidbm:2.4.0
+  aidbm:2.4.6
 ```
 
 离线安装脚本支持 `TAPE_DEVICES="/dev/tape/by-id/scsi-XXXX-nst /dev/sg2" ./install.sh`，
@@ -539,11 +548,11 @@ docker run -d --name backup-platform \
   -v backup-data:/data \
   -e BACKUP_ROOT=/data/backups \
   --restart unless-stopped \
-  ghcr.io/zhh9126/backup-platform:v2.4.0
+  ghcr.io/zhh9126/backup-platform:v2.4.6
 ```
 
 > 离线环境请用**固定版本 tag**（不要用 `:latest` 指代"从公网拉最新"）。
-> 交付包内 `aidbm:2.4.0`、`aidbm:latest`、`ghcr.io/zhh9126/backup-platform:latest`
+> 交付包内 `aidbm:2.4.6`、`aidbm:latest`、`ghcr.io/zhh9126/backup-platform:latest`
 > 均与上面这个镜像名指向同一个镜像 ID，替换使用完全等效。
 
 > **备份文件存在哪？** 镜像默认把备份产物写到容器内 `/data/backups`（布局 `<该路径>/<数据库类型>/<任务ID_任务名>/`）。
@@ -554,14 +563,14 @@ docker run -d --name backup-platform \
 
 ```bash
 # 1. 导入新版本镜像（把交付包拷入离线机器）
-docker load -i aidbm_2.4.0_offline.tar.gz
+docker load -i aidbm_2.4.6_offline.tar.gz
 
 # 2. 停止并删除旧容器（备份数据在 backup-data 卷中，不受影响）
 docker stop backup-platform
 docker rm backup-platform
 
 # 3. 用新版本镜像启动（命令与首次部署完全一致，仅换镜像 tag）
-docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.4.0
+docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.4.6
 
 # 4.（可选）删除旧版本镜像释放空间
 docker rmi ghcr.io/zhh9126/backup-platform:v2.3.11
@@ -579,7 +588,7 @@ docker stop backup-platform
 docker rm backup-platform
 
 # 2. 删除镜像
-docker rmi ghcr.io/zhh9126/backup-platform:v2.4.0
+docker rmi ghcr.io/zhh9126/backup-platform:v2.4.6
 
 # 3.（谨慎）删除数据卷 —— 会清掉全部备份产物与元数据，操作前务必
 #    先把备份文件拷贝转移！
@@ -703,6 +712,27 @@ docker build -t backup-platform:local .
 - 默认账号请立即修改（首登会标记 `must_change_password`）；生产环境建议限制来源 IP
 
 ## 更新日志
+
+### v2.4.6（2026-11-23，已打 tag）
+
+> 本版在 v2.4.5 之上整合私有仓库 8 项工程化提交（2db8278 → 29ec144）与 2026-11-23 容灾/连接兼容修复，已产出离线包并推送公开镜像仓库。
+
+- **跨实例持久化执行队列**：新增 `core/task_queue.py`（`task_execution_queue` 表）与 `core/scheduler._queue_loop` worker——`submit_task_now` / 显式 `async` / 一键备份投递后由任一实例带租约领取，同一任务重复提交合并，崩溃任务 24h 租约回收后重投；`run_task_now` 仍走同步通道，兼容既有 API/调度/E2E 契约。实测 `enqueue → claim(slave:PID) → done` 全链路，备份记录正常落库。
+- **每任务执行租约**：异步备份提交先在元数据库获取 `task_leases` 租约，worker `finally` 释放，防止多实例重复执行同一任务。
+- **统一资源准入**：新增 `core/resource_budget.py`，备份执行前检查可用内存与备份盘空闲空间，低于阈值如实 `blocked`（不写假成功记录）；阈值经 `AIDBM_MIN_FREE_MEMORY_MB`（默认 512）/ `AIDBM_MIN_FREE_DISK_GB`（默认 5）配置。
+- **SQL Server 原生 CDC**：`core/cdc/rowlevel.py` 增加基于 `cdc.change_tables` / `cdc.fn_cdc_get_all_changes_*` 的轮询 worker，校验库级 CDC 与捕获实例、LSN 位点持久化、表过滤后写统一行事件；真实链路需 `pymssql` + 库级 CDC，缺失如实失败。
+- **能力真实就绪探测**：新增 `GET /api/system/p1-capabilities`（`core/p1_capabilities.snapshot`），返回运行时/依赖/OS Agent/群晖/VM 能力实际探测结果，未落地项如实 `false`，供 UI 收敛入口。
+- **安全加固**：`core/plugin_installer.py` / `core/sandbox_probe.py` / 元数据平台等处 `shell=True` 收敛为显式 `/bin/bash -c` 参数执行（可信内部模板）；FTP 后端注册与工厂访问需 `AIDBM_ENABLE_INSECURE_FTP=true` 显式开启；管理员首次口令轮换并标记 `must_change_password`。详见 `SECURITY_SCAN_20261122.md` / `SECURITY_SCAN_20261123.md`。
+- **真实验收（2026-11-23）**：170/171 全库型走生产 API 端到端 **48/48 全绿**——MySQL170 / PG170 / 金仓170 / 金仓171 / 达梦170 / Oracle171 / Redis（备份 + 异名恢复 + 中文硬核对）、MySQL170→PG170 数据迁移 completed + 硬核对、MySQL170→PG170 数据同步读 3 写 3 错 0 + 硬核对；现网 DR 拓扑未扰动（MySQL170 主可写、171 从只读）。日志：`/root/e2e/e2e_live_170171_full_1123_rerun.log`。
+- **容灾管理 P0/P1 修复（2026-11-23 深度审查后）**：新增 `core/dr_topology.py` + `api/dr_topology.py`（站点/候选备机池/RTO·RPO 目标/就绪度，对标航天云网 V5.0 与英方 i2Availability）；修复切换后主备角色不翻转导致自动监控探测旧主（`active_role` 原子翻转、健康快照跟随当前主）、failover/failback 双向 fencing（不可达须人工 force 确认、提升失败硬中止、现主先冻结再提升）、编排层绕过链路锁、自动切换计数不清零、候选池"未知当可用"/探测用掩码密码/编辑永远新增、Runbook 执行权限被模块映射击穿、切换审计操作人恒为空、演练早异常卡 running。容灾域专项 **134 passed**，全量 `53 failed / 2017 passed`（失败均为既有 UI/VM 类，与本次改动无关）。
+- **达梦 DM7 连接兼容**：原生直连旧版 dmPython 位置参数兜底、探活 SQL 候选 `SELECT 1 → SELECT 1 FROM DUAL`（原生/JDBC/T06 三通道）、`-2501/-7002` 双通道错误摘要与可执行提示；DM8 170:5236 三通道回归无退化，DM7 mock 单测 9 条。
+- **已知边界**：功能差距审计 `FUNCTIONAL_GAP_ANALYSIS_20261123.md` 如实列出——OS Agent 块级 CBT/BMR、群晖 DSM 插件与 ACL、VM Live Mount、统一即时恢复、CDC 真值闸门仍为规划/部分实现；磁盘准入默认值 5GB 在小容量环境需下调，否则备份被阻断（本轮 4.7GB 环境临时设 2GB 完成测试）；DM7 真机（非 DM8）尚未提供实例，兼容修复为代码级+ mock 验证。候选池多级接管在预检层给出严格判定与提示，未做静默自动换机切换。
+
+### v2.4.5（2026-11-20，已打 tag）
+
+- 版本演进 v2.4.0 → v2.4.2 → v2.4.3 → v2.4.4 → v2.4.5 均已打 tag；离线包 `aidbm_2.4.5_offline.tar.gz`（1.2G）已产出。
+- 期间能力：VDB 快照 native 通道（数据库原生工具产物、客户端版本匹配服务端、生命周期治理与回滚）、恢复记录实测数据量列、容灾时间线主动告警与补偿建议一键生成可审批恢复剧本、全量+增量一体化（同步追平模式 + 迁移追平阶段）、表级完整性对象迁移（索引/唯一/外键/CHECK）、迁移同步变量化与前序缺陷修复。
+- 上述能力细节见本仓库对应提交与 `readme_20261114.md` 等历史归档；本节仅作版本对齐，不重复虚构验证结论。
 
 ### v2.4.0（2026-11-13，已发布）
 

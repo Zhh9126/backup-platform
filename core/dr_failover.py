@@ -45,6 +45,37 @@ def _decrypt_conn(conn_cfg: dict) -> dict:
     return out
 
 
+def _role_conns(cfg: dict):
+    """按 active_role 返回 (当前主, 当前备) 的明文连接配置。
+
+    failover_config 的 primary_conn/standby_conn 是稳定的拓扑定义
+    （"原始主" / "原始备"），切换后不物理交换——否则 GTID 分叉检测、
+    failback 回切语义会随之漂移。新增 active_role 标记当前承载写入的
+    一方，切换成功后原子翻转。健康探测、DNS 期望 IP 全部以当前主为准
+    （2026-11-23 容灾审查 P0-1：此前切换后监控仍探测旧主，自动容灾空转）。
+    """
+    active = (cfg.get("active_role") or "primary")
+    if active == "standby":
+        return (_decrypt_conn(cfg.get("standby_conn") or {}),
+                _decrypt_conn(cfg.get("primary_conn") or {}))
+    return (_decrypt_conn(cfg.get("primary_conn") or {}),
+            _decrypt_conn(cfg.get("standby_conn") or {}))
+
+
+def _commit_switch_topology(link: dict, cfg: dict, active_role: str,
+                            primary_host: str, dr_host: str) -> dict:
+    """切换成功后原子写入 active_role + 站点字段，避免"角色已换配置未换"。"""
+    new_cfg = dict(cfg)
+    new_cfg["active_role"] = active_role
+    new_cfg["last_role_change_at"] = db.now_iso()
+    db.execute(
+        "UPDATE disaster_links SET failover_config=?, status='active', "
+        "primary_site=?, dr_site=?, updated_at=? WHERE id=?",
+        (json.dumps(new_cfg, ensure_ascii=False),
+         primary_host or "", dr_host or "", db.now_iso(), link.get("id")))
+    return {"active_role": active_role, "primary": primary_host, "dr": dr_host}
+
+
 def _probe_mysql(host, port, user, password, timeout=3) -> dict:
     """MySQL 实例健康探测。返回 {reachable, error}。"""
     try:
@@ -58,8 +89,17 @@ def _probe_mysql(host, port, user, password, timeout=3) -> dict:
         return {"reachable": False, "error": str(e)[:160]}
 
 
+# 提升时必须成功的语句：只读解除失败意味着"提升后的主库仍不可写"，
+# 绝不能被当作可忽略错误吞掉后继续切流量（2026-11-23 容灾审查 P0-4）。
+_REQUIRED_PROMOTE_STMTS = ("SET GLOBAL read_only=0", "SET GLOBAL super_read_only=0")
+
+
 def _promote_mysql(host, port, user, password):
-    """MySQL 备库提升为主：停复制 + 清残留复制配置 + 关只读。返回执行的语句清单。"""
+    """MySQL 备库提升为主：停复制 + 清残留复制配置 + 关只读。返回执行的语句清单。
+
+    STOP/RESET REPLICA 在非复制实例上报错可忽略；但只读解除失败必须
+    抛错中止——否则 DNS 把流量引到只读节点，全量写失败。
+    """
     conn = native_conn.connect("mysql", host, port, None, user, password, timeout=8)
     stmts = []
     try:
@@ -71,6 +111,10 @@ def _promote_mysql(host, port, user, password):
                 cur.execute(stmt)
                 stmts.append((stmt, "ok"))
             except Exception as e:
+                if stmt in _REQUIRED_PROMOTE_STMTS:
+                    raise FailoverError(
+                        "提升失败：%s 执行失败（%s）——节点仍处于只读，"
+                        "禁止继续切换流量" % (stmt, str(e)[:120])) from e
                 # STOP/RESET REPLICA 在非复制实例上会报错——视为已停，不阻断提升。
                 # RESET REPLICA ALL 清掉提升后残留的复制元数据（否则新主上会
                 # 留一条 No/No 的僵尸复制配置行，170/171 切换演练实测暴露）
@@ -400,8 +444,7 @@ class _FailoverEngineCore:
         if not self.primary or not self.standby:
             raise FailoverError("链路缺少 failover_config（primary_conn/standby_conn）")
         t0 = time.monotonic()
-        pc = self.primary
-        sc = self.standby
+        pc, sc = _role_conns(self.cfg)   # 以 active_role 判定当前主/备（切换后不失效）
 
         # 步骤 0：主库健康探测（可达时拒绝切换，防误操作）
         def _probe():
@@ -423,7 +466,17 @@ class _FailoverEngineCore:
             r = _probe_mysql(pc.get("host"), pc.get("port"),
                              pc.get("user"), pc.get("password"), timeout=5)
             if not r["reachable"]:
-                return {"fenced": "unreachable（已不可达，无需围栏）"}
+                # 不可达 ≠ 已冻结：网络单向分区/主机假死时，旧主可能仍在接写。
+                # 生产环境唯一可靠的 fencing 是 STONITH，平台做不到就必须把
+                # 确认闸门交还人工——绝不静默当"无需围栏"放过（P0-3）。
+                if not force:
+                    raise FailoverError(
+                        "旧主 %s:%s 不可达，平台无法执行 read_only 围栏——"
+                        "网络分区/假死场景下旧主可能仍在写入，直接提升会造成双写。"
+                        "请人工确认旧主已断电/隔离后使用 force=true 重试，"
+                        "或先恢复旧主可达性。" % (pc.get("host"), pc.get("port")))
+                return {"fenced": "unreachable_force（人工 force 越过围栏，"
+                                  "须自行确认旧主已隔离）", "force_override": True}
             conn = native_conn.connect("mysql", pc.get("host"), pc.get("port"),
                                        None, pc.get("user"), pc.get("password"), timeout=5)
             try:
@@ -482,13 +535,12 @@ class _FailoverEngineCore:
                       "确认后尽快在原主侧重新配置反向复制，保持持续保护",
                   ]}
         self._save_history(result)
-        # 链路状态更新：主备站点互换，状态 active
-        db.execute(
-            "UPDATE disaster_links SET status='active', primary_site=?, dr_site=?, "
-            "updated_at=? WHERE id=?",
-            (self.link.get("dr_site") or sc.get("host"),
-             self.link.get("primary_site") or pc.get("host"),
-             db.now_iso(), self.link.get("id")))
+        # 切换成功后翻转 active_role（原子落库）——否则自动监控仍探测旧主，
+        # 新主故障时永不触发下一次切换（P0-1）。
+        new_role = "standby" if (self.cfg.get("active_role") or "primary") == "primary" else "primary"
+        result["topology"] = _commit_switch_topology(
+            self.link, self.cfg, new_role,
+            sc.get("host"), pc.get("host"))
         return result
 
     # ---- 仅 DNS 切换（业务切换已完成时的 DNS 牵引 / 补偿执行）----
@@ -529,8 +581,11 @@ class _FailoverEngineCore:
         if not self.primary or not self.standby:
             raise FailoverError("链路缺少 failover_config")
         t0 = time.monotonic()
-        pc = self.primary      # 原（旧）主——即将重新提升
-        sc = self.standby      # 现主（failover 后）
+        # pc = 配置中的原主（回切目标），sc = 当前承载写入的一方。
+        # 用角色感知取 sc：failover 后 active_role=standby，若仍写死
+        # self.standby 就会把"已被提升的备库"当现主重复提升（P0-1）。
+        pc = self.primary
+        sc, _ = _role_conns(self.cfg)
         # replication_user 密码同为密文存储，必须解密——否则密文被当明文
         # 传给 CHANGE REPLICATION SOURCE，MySQL 8 报 3056（超 32 字符）
         # （170/171 容灾 E2E 实测暴露）
@@ -578,6 +633,19 @@ class _FailoverEngineCore:
             sc.get("host"), sc.get("port"),
             repl.get("user") or "repl", repl.get("password") or ""))
 
+        # 步骤 1.5：Fencing 现主（回切同样不能省）——在提升旧主前先冻结当前
+        # 写入点，否则 pc 提升后 sc 仍可写，出现分钟级双写窗口（P0-2）。
+        def _fence_current():
+            r = _probe_mysql(sc.get("host"), sc.get("port"),
+                             sc.get("user"), sc.get("password"), timeout=5)
+            if not r["reachable"]:
+                raise FailoverError(
+                    "现主 %s:%s 不可达，无法执行 fencing（回切会让旧主与新主同时可写）。"
+                    "请人工确认现主已隔离后重试。" % (sc.get("host"), sc.get("port")))
+            _set_read_only(sc, True)
+            return {"fenced": True, "note": "回切前现主 read_only=1 + super_read_only=1"}
+        self._step("Fencing 现主写入冻结（回切防双写）", _fence_current)
+
         # 步骤 2：提升旧主为主
         self._step("提升旧主为主库", lambda: {
             "stmts": _promote_mysql(pc.get("host"), pc.get("port"),
@@ -623,12 +691,9 @@ class _FailoverEngineCore:
                       "确认反向复制（现主→原主）运行正常，保持持续保护",
                   ]}
         self._save_history(result)
-        db.execute(
-            "UPDATE disaster_links SET status='active', primary_site=?, dr_site=?, "
-            "updated_at=? WHERE id=?",
-            (self.link.get("primary_site") or pc.get("host"),
-             self.link.get("dr_site") or sc.get("host"),
-             db.now_iso(), self.link.get("id")))
+        # 回切后当前主恢复为配置中的原主 → active_role 归位 primary
+        result["topology"] = _commit_switch_topology(
+            self.link, self.cfg, "primary", pc.get("host"), sc.get("host"))
         return result
 
     def _save_history(self, result: dict):
@@ -779,8 +844,9 @@ def health_snapshot(link_id: int) -> dict:
     if not link:
         raise FailoverError("容灾链路不存在: %s" % link_id)
     cfg = _load_config(dict(link))
-    p = _decrypt_conn(cfg.get("primary_conn") or {})
-    s = _decrypt_conn(cfg.get("standby_conn") or {})
+    # 以 active_role 判定当前主/备：切换成功后角色翻转，监控必须跟着走，
+    # 否则探测旧只读主永远"健康"，新主故障被漏报（P0-1）。
+    p, s = _role_conns(cfg)
     if not p.get("host"):
         raise FailoverError("链路缺少 failover_config.primary_conn，无法探测")
     snap = {"link_id": link_id, "link_name": link.get("name"),
@@ -859,10 +925,12 @@ def _wait_standby_catchup(primary: dict, standby: dict,
     判据：备库已执行事务集 ⊇ 旧主已执行事务集（gtid_missing(primary, standby)
     为空）。超时抛 FailoverError——**追不平绝不提升**（RPO=0 的前提）。
     """
-    p_map = _parse_gtid_set(_fetch_gtid_executed(primary))
     deadline = time.time() + timeout
     s_map = {}
     while True:
+        # 每轮重取主库 GTID：只读化如果失效（权限/绕过），等待窗口内的
+        # 新事务不在首轮快照里，会被误判已追平而提升、丢数据（P1-16）。
+        p_map = _parse_gtid_set(_fetch_gtid_executed(primary))
         s_map = _parse_gtid_set(_fetch_gtid_executed(standby))
         missing = gtid_missing(p_map, s_map)
         if not missing:

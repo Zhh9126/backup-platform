@@ -193,16 +193,25 @@ def check_once() -> list:
                 link.get("name"), fails)
             res = dr_failover.run_failover(link.get("id"), force=False)
             item["action"] = "auto_failover"
+            # 如实取引擎结果：run_failover 无 success 字段，且业务验证可能失败；
+            # 硬编码 True 会让业务未恢复也报成功（P2-15）。
+            biz_ok = res.get("business_ok")
             item["result"] = {"rto_sec": res.get("rto_sec"),
                               "to": res.get("to"),
-                              "success": True}
+                              "success": biz_ok is not False,
+                              "business_ok": biz_ok,
+                              "active_role": (res.get("topology") or {}).get("active_role")}
             with _lock:
                 st_all = _load_state()
                 cur = st_all[lid]
                 cur["auto_running"] = False
                 cur["last_failover_at"] = db.now_iso()
+                # 成功后必须清零失败计数：否则 fails 仍 >= threshold，
+                # 下一轮（旧主被 fence 后仍可达时）会重复触发整轮切换（P0-6）。
+                cur["fails"] = 0
+                cur["last_ok_at"] = db.now_iso()
                 for k in ("failover_backoff_until", "failover_fail_count",
-                          "auto_failover_error"):
+                          "auto_failover_error", "alerted"):
                     cur.pop(k, None)
                 _save_state(st_all)
         except Exception as e:

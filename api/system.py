@@ -1633,3 +1633,11 @@ def api_set_concurrency():
         "stats": stats,
         "global_bandwidth_kbps": bw_saved,
     })
+
+
+@api_bp.route("/system/p1-capabilities", methods=["GET"])
+@login_required
+def api_p1_capabilities():
+    """真实探测 P1 运行时、资源和底层能力，供管理界面阻断不可用操作。"""
+    from core.p1_capabilities import snapshot
+    return jsonify(snapshot())

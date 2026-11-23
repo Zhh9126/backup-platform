@@ -65,3 +65,8 @@
 ## P1 capability probe
 
 Added `GET /api/system/p1-capabilities`, which reports actual runtime, dependency, resource budget, OS Agent, Synology, and VM Live Mount readiness. The endpoint is intended to gate UI actions and prevent planned capabilities from being presented as available.
+
+## Distributed queue and resource budget
+
+- Added a persistent `task_execution_queue` table and worker loop. Any service instance can claim queued work with a lease, and duplicate submissions are coalesced.
+- Added unified memory and backup-disk admission checks with configurable `AIDBM_MIN_FREE_MEMORY_MB` and `AIDBM_MIN_FREE_DISK_GB` thresholds.

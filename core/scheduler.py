@@ -212,6 +212,30 @@ def _release_task_lease(task_id: int, owner: str) -> None:
         except Exception:
             _logger.warning("任务租约释放失败 task=%s", task_id, exc_info=True)
 
+_QUEUE_THREAD = None
+_QUEUE_LOCK = threading.Lock()
+
+def _queue_loop():
+    from core import task_queue
+    while True:
+        row = task_queue.claim()
+        if not row:
+            task_queue.wait(2); continue
+        task = models.get_task(int(row["task_id"]), include_secret=True)
+        if not task:
+            task_queue.complete(row["id"], False, "任务不存在"); continue
+        try:
+            _backup_executor().submit(_bg_execute_backup, task, row.get("backup_type"), row.get("operator"), True, None, int(row["id"]))
+        except Exception as exc:
+            task_queue.complete(row["id"], False, str(exc)); _logger.exception("队列任务提交失败")
+
+def _ensure_queue_worker():
+    global _QUEUE_THREAD
+    with _QUEUE_LOCK:
+        if _QUEUE_THREAD and _QUEUE_THREAD.is_alive(): return
+        _QUEUE_THREAD=threading.Thread(target=_queue_loop, name="aidbm-task-queue", daemon=True)
+        _QUEUE_THREAD.start()
+
 
 def _backup_executor() -> ThreadPoolExecutor:
     """懒创建有界线程池：提交不阻塞，真实并行度由 _CONCURRENCY 信号量控制。"""
@@ -366,46 +390,16 @@ def _auto_discover_for_task(task: dict, operator: str = None) -> None:
                         task_id, _dexc)
 
 
-def submit_task_now(task_id: int, backup_type: str = None,
-                    operator: str = None) -> dict:
-    """异步提交一次备份（所有库型通用），API 立即返回受理结果。
-
-    多个任务可连续调用本函数同时发起：任务投递到有界线程池排队，真实并行度
-    仍由 max_concurrent_backups 控制。进程内按 task_id 去重，避免重复投递。
-    """
-    task = models.get_task(task_id, include_secret=True)
-    if not task:
-        _logger.warning("任务不存在: %s", task_id)
-        return {"accepted": False, "task_id": task_id, "error": "任务不存在"}
-    tid = int(task["id"])
-    with _RUNNING_LOCK:
-        if tid in _RUNNING_TASKS:
-            return {"accepted": False, "duplicate": True, "task_id": tid,
-                    "status": "running",
-                    "message": "任务已在并行执行队列中，请勿重复提交"}
-    lease_owner = _acquire_task_lease(tid)
-    if not lease_owner:
-        return {"accepted": False, "duplicate": True, "task_id": tid,
-                "status": "running", "message": "任务已被其他服务实例执行"}
-    with _RUNNING_LOCK:
-        _RUNNING_TASKS.add(tid)
-        _RUNNING_IDS[tid] = db.now_iso()
-    try:
-        # 自动发现放到 worker 内执行，批量提交时入口零阻塞
-        _backup_executor().submit(_bg_execute_backup, task, backup_type,
-                                  operator, True, lease_owner)
-    except Exception as exc:  # noqa: BLE001 —— 线程池拒绝等异常必须回滚去重标记
-        with _RUNNING_LOCK:
-            _RUNNING_TASKS.discard(tid)
-            _RUNNING_IDS.pop(tid, None)
-        _logger.exception("[concurrency] 任务 %s 提交失败", tid)
-        return {"accepted": False, "task_id": tid,
-                "message": f"提交并行队列失败: {exc}"[:200]}
-    _logger.info("[concurrency] 任务 %s 已提交并行队列(operator=%s)",
-                 tid, operator or "manual")
-    return {"accepted": True, "task_id": tid, "status": "running",
-            "async": True, "message": "已提交并行执行队列"}
-
+def submit_task_now(task_id: int, backup_type: str = None, operator: str = None) -> dict:
+    """Persist an execution request and let any service instance claim it."""
+    task=models.get_task(task_id, include_secret=True)
+    if not task: return {"accepted":False,"task_id":task_id,"error":"任务不存在"}
+    from core import task_queue
+    qid, duplicate=task_queue.enqueue(int(task_id), backup_type or task.get("backup_type") or "full", operator or "")
+    _ensure_queue_worker()
+    if duplicate:
+        return {"accepted":False,"duplicate":True,"task_id":int(task_id),"status":"running","queue_id":qid,"message":"任务已在持久化队列中"}
+    return {"accepted":True,"task_id":int(task_id),"queue_id":qid,"status":"queued","async":True,"message":"已进入持久化多实例执行队列"}
 
 def run_task_now(task_id: int, backup_type: str = None,
                  operator: str = None) -> Optional[dict]:
@@ -467,7 +461,7 @@ def run_task_now(task_id: int, backup_type: str = None,
 def _bg_execute_backup(task: dict, backup_type: str = None,
                        operator: str = None,
                        do_discover: bool = False,
-                       lease_owner: str = None) -> None:
+                       lease_owner: str = None, queue_id: int = None) -> None:
     """并行队列 worker：捕获所有异常，并在 finally 释放去重标记。"""
     tid = task.get("id")
     try:
@@ -486,6 +480,11 @@ def _bg_execute_backup(task: dict, backup_type: str = None,
                 _RUNNING_TASKS.discard(key)
                 _RUNNING_IDS.pop(key, None)
             _release_task_lease(key, lease_owner)
+            if queue_id:
+                try:
+                    from core import task_queue
+                    task_queue.complete(queue_id, True)
+                except Exception: pass
 
 
 def _normalize_backup_type(value):
@@ -523,6 +522,12 @@ def _execute_backup(task: dict, backup_type: str = None,
                          task.get("id"), guard["verdict"].get("message"))
     except Exception as _ge:  # noqa: BLE001
         _logger.debug("[source_guard] 决策跳过（不阻断备份）: %s", _ge)
+    from core import resource_budget
+    budget = resource_budget.check(task)
+    if not budget.get("ok"):
+        _logger.error("[resource_budget] 任务 %s 被阻断: %s", task.get("id"), budget.get("reason"))
+        return {"success": False, "status": "blocked", "message": budget.get("reason")}
+
     # 全局并发控制：限制同时执行的备份数量（缺省保守，不破坏旧串行行为）。
     # release 必须作用于 acquire 时拿到的那个信号量，配置热变更重建不串味。
     # 排队等待时长单独计时：平台并发上限配小时批量/组合任务的成员会在这里
@@ -2639,6 +2644,7 @@ def start_scheduler():
     _register_netdev_backup(_scheduler)
     _register_ai_plans(_scheduler)
     _scheduler.start()
+    _ensure_queue_worker()
     # 实时同步任务自动恢复（重启前处于 running 的实时任务重新拉起）
     _resume_realtime_sync_tasks()
     _logger.info("调度器已启动，已注册 %d 个任务", len(_scheduler.get_jobs()))

@@ -50,3 +50,8 @@
 - Default administrator password rotated to a generated value and marked must_change_password.
 - FTP backend registration and factory access now require AIDBM_ENABLE_INSECURE_FTP=true.
 - Service restarted successfully after the hardening changes.
+
+## P1 remediation applied
+
+- Asynchronous backup submissions now acquire a persistent per-task lease in the metadata database, preventing duplicate execution across service instances.
+- The lease is released in the worker finally path and expires after 24 hours for crash recovery.

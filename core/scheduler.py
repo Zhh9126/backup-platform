@@ -192,6 +192,27 @@ _RUNNING_IDS: dict = {}              # task_id -> 提交时间（可观测）
 _WAIT_LOCAL = threading.local()      # 每线程的排队等待秒数（drift 归因，见 _execute_backup）
 
 
+def _task_lease_name(task_id: int) -> str:
+    return "backup-task:%s" % int(task_id)
+
+
+def _acquire_task_lease(task_id: int):
+    """跨进程任务租约，防止多实例重复执行同一备份。"""
+    from core import lease as lease_mod
+    owner = lease_mod.owner_id()
+    result = lease_mod.acquire(name=_task_lease_name(task_id), owner=owner, ttl=86400)
+    return owner if result.get("acquired") else None
+
+
+def _release_task_lease(task_id: int, owner: str) -> None:
+    if owner:
+        try:
+            from core import lease as lease_mod
+            lease_mod.release(name=_task_lease_name(task_id), owner=owner)
+        except Exception:
+            _logger.warning("任务租约释放失败 task=%s", task_id, exc_info=True)
+
+
 def _backup_executor() -> ThreadPoolExecutor:
     """懒创建有界线程池：提交不阻塞，真实并行度由 _CONCURRENCY 信号量控制。"""
     global _BACKUP_EXECUTOR
@@ -362,12 +383,17 @@ def submit_task_now(task_id: int, backup_type: str = None,
             return {"accepted": False, "duplicate": True, "task_id": tid,
                     "status": "running",
                     "message": "任务已在并行执行队列中，请勿重复提交"}
+    lease_owner = _acquire_task_lease(tid)
+    if not lease_owner:
+        return {"accepted": False, "duplicate": True, "task_id": tid,
+                "status": "running", "message": "任务已被其他服务实例执行"}
+    with _RUNNING_LOCK:
         _RUNNING_TASKS.add(tid)
         _RUNNING_IDS[tid] = db.now_iso()
     try:
         # 自动发现放到 worker 内执行，批量提交时入口零阻塞
         _backup_executor().submit(_bg_execute_backup, task, backup_type,
-                                  operator, True)
+                                  operator, True, lease_owner)
     except Exception as exc:  # noqa: BLE001 —— 线程池拒绝等异常必须回滚去重标记
         with _RUNNING_LOCK:
             _RUNNING_TASKS.discard(tid)
@@ -440,7 +466,8 @@ def run_task_now(task_id: int, backup_type: str = None,
 
 def _bg_execute_backup(task: dict, backup_type: str = None,
                        operator: str = None,
-                       do_discover: bool = False) -> None:
+                       do_discover: bool = False,
+                       lease_owner: str = None) -> None:
     """并行队列 worker：捕获所有异常，并在 finally 释放去重标记。"""
     tid = task.get("id")
     try:
@@ -458,6 +485,7 @@ def _bg_execute_backup(task: dict, backup_type: str = None,
             with _RUNNING_LOCK:
                 _RUNNING_TASKS.discard(key)
                 _RUNNING_IDS.pop(key, None)
+            _release_task_lease(key, lease_owner)
 
 
 def _normalize_backup_type(value):

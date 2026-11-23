@@ -45,3 +45,8 @@
 3. 完成 FTP 下线或强制 FTPS/SFTP。
 4. 建立跨进程任务队列和 worker 租约，统一并发、内存、带宽和 I/O 预算。
 5. 按 OS Agent、群晖插件、VM Live Mount、CDC Direct Log、BMR 和自动恢复演练分别推进底层能力。
+## P0 remediation applied
+
+- Default administrator password rotated to a generated value and marked must_change_password.
+- FTP backend registration and factory access now require AIDBM_ENABLE_INSECURE_FTP=true.
+- Service restarted successfully after the hardening changes.

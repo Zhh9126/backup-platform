@@ -5,6 +5,7 @@
 提供 get_backend(type, config) 工厂函数，根据存储类型返回对应后端实例。
 """
 import logging
+import os
 import shutil
 from .base import StorageBackend
 from .local import LocalStorageBackend
@@ -24,7 +25,7 @@ BACKEND_REGISTRY: dict[type[StorageBackend]] = {
     "sftp": SFTPStorageBackend,
     # 2026-11-13：按「存储介质」补齐外挂/NFS 与 FTP 通道
     "mount": MountStorageBackend,       # 外挂介质 / NFS / CIFS 挂载点
-    "ftp": FTPStorageBackend,           # FTP / FTPS（纯标准库 ftplib）
+    # 明文 FTP 默认禁用，只有显式 AIDBM_ENABLE_INSECURE_FTP=true 才注册。
 }
 
 # Tier 显示名
@@ -60,6 +61,8 @@ def get_backend(storage_type: str, config: dict, logger: logging.Logger = None) 
     Raises:
         ValueError: 不支持的存储类型
     """
+    if storage_type.lower() == "ftp" and os.environ.get("AIDBM_ENABLE_INSECURE_FTP", "false").lower() != "true":
+        raise ValueError("FTP 默认禁用，请改用 SFTP/FTPS/对象存储，或显式设置 AIDBM_ENABLE_INSECURE_FTP=true")
     cls = BACKEND_REGISTRY.get(storage_type.lower())
     if not cls:
         raise ValueError(f"不支持的存储类型: {storage_type}（支持: {', '.join(BACKEND_REGISTRY)}）")
@@ -81,10 +84,11 @@ def get_backend(storage_type: str, config: dict, logger: logging.Logger = None) 
 
 
 def list_supported_types() -> list[dict]:
-    """返回所有支持的存储类型及其元信息。"""
-    return [
-        {"type": k, **v} for k, v in TYPE_META.items()
-    ]
+    """返回当前安全策略允许的存储类型。"""
+    meta = dict(TYPE_META)
+    if os.environ.get("AIDBM_ENABLE_INSECURE_FTP", "false").lower() != "true":
+        meta.pop("ftp", None)
+    return [{"type": k, **v} for k, v in meta.items()]
 
 
 def check_dependencies() -> dict[str, bool]:
@@ -99,7 +103,7 @@ def check_dependencies() -> dict[str, bool]:
         "tape": bool(shutil.which("tar")),
         "sftp": _HAS_SFTP_DEP,
         "mount": True,    # 纯 os/pathlib，无外部依赖
-        "ftp": True,      # 标准库 ftplib
+        "ftp": os.environ.get("AIDBM_ENABLE_INSECURE_FTP", "false").lower() == "true",
     }
     try:
         import minio

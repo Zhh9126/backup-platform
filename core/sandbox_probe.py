@@ -27,8 +27,8 @@ _PROBE_TIMEOUT = 8
 def _run(cmd, timeout=_PROBE_TIMEOUT):
     """执行命令，返回 (rc, stdout+stderr)。异常统一成 rc=-1。"""
     try:
-        p = subprocess.run(cmd, shell=isinstance(cmd, str),
-                           capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(["/bin/bash", "-c", cmd] if isinstance(cmd, str) else cmd,
+                           shell=False, capture_output=True, text=True, timeout=timeout)
         return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
     except FileNotFoundError:
         return -1, "命令不存在: %s" % cmd

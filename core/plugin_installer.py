@@ -23,7 +23,10 @@ import os
 import platform
 import re
 import shutil
-import ssl
+try:
+    import ssl
+except ImportError:
+    ssl = None
 import subprocess
 import threading
 import time
@@ -276,8 +279,8 @@ def _run_command(cmd: str, pid: str, host_key: str = "local",
     _append_log(pid, f"$ {cmd}", host_key=host_key)
     try:
         ret = subprocess.run(
-            cmd,
-            shell=True,
+            ["/bin/bash", "-c", cmd],
+            shell=False,
             capture_output=True,
             text=True,
             timeout=timeout,

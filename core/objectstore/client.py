@@ -24,7 +24,10 @@ import http.client
 import os
 import re
 import socket
-import ssl
+try:
+    import ssl
+except ImportError:
+    ssl = None
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET

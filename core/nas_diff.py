@@ -21,7 +21,10 @@ Isilon ChangelistCreate / 华为 Dorado diff_session）直接拿"变更文件列
 import base64
 import json
 import socket
-import ssl
+try:
+    import ssl
+except ImportError:
+    ssl = None
 import urllib.error
 import urllib.request
 

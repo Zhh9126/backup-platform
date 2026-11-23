@@ -127,7 +127,7 @@ def _collect_metadata(run):
 
 def _local_run(cmd,timeout=20):
     try:
-        return subprocess.run(cmd,shell=True,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=timeout).stdout[-200000:]
+        return subprocess.run(["/bin/bash", "-c", cmd],shell=False,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,timeout=timeout).stdout[-200000:]
     except Exception as exc:
         return "unavailable: "+str(exc)
 

@@ -30,7 +30,10 @@ import hashlib
 import http.client as http_client
 import json
 import os
-import ssl
+try:
+    import ssl
+except ImportError:
+    ssl = None
 import time
 import urllib.error
 import urllib.parse

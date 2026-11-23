@@ -6,7 +6,10 @@
 urllib 足够，且行为可控（可关闭证书校验、可拿到原始字节流）。
 """
 import json as _json
-import ssl
+try:
+    import ssl
+except ImportError:
+    ssl = None
 import urllib.error
 import urllib.parse
 import urllib.request

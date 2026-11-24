@@ -2697,11 +2697,14 @@ class MySQLEngine(BackupEngine):
         from core import table_extract
         started = time.time()
         renames = kwargs.get("table_renames") or None
+        skip_existing = bool(kwargs.get("skip_existing_tables"))
         logs.append(f"[表级恢复] 指定表: {','.join(sel_tables)}"
-                    + (f"；表改名: {renames}" if renames else ""))
+                    + (f"；表改名: {renames}" if renames else "")
+                    + ("；跳过已存在表" if skip_existing else ""))
         try:
             tmp_sql, found, notes = table_extract.slice_tables(
-                backup_path, sel_tables, renames=renames)
+                backup_path, sel_tables, renames=renames,
+                skip_existing=skip_existing)
         except table_extract.TableExtractError as e:
             logs.append(f"[表级恢复] 切片失败: {e}")
             return BackupResult(

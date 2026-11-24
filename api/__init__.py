@@ -143,7 +143,7 @@ from . import (tasks, records, restore, system, hosts, sync, inspection, deploy,
                 win_protect, synology, remote_pull, ransomware,
                 source_guard, scan_fs, dr_switch, screen, brand, runbook,
                 dr_inspection, host_tuning, bw_broker, chunk_store, sandbox, nas, recovery_center, test_records, os_backup,
-                dr_topology)  # noqa: E402,F401
+                dr_topology, agent_plugins, rag_backup)  # noqa: E402,F401
 
 # AI 助手（收费功能）：镜像/离线交付包中不含 core/ai_agent 与 api/ai_agent.py，
 # 这里必须容错注册——缺失时平台其余功能不受影响（2026-09-19 用户决定）。

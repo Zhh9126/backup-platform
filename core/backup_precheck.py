@@ -134,6 +134,31 @@ def precheck_backup(task: dict) -> dict:
                      "该库型不经原生 Python 驱动直连（SQL Server 等走 JDBC/"
                      "SSH 通道），属通道差异而非能力缺失；连通性由「备份工具"
                      "就绪」项真实探测")
+            elif db_type == "oracle":
+                # Oracle 原生直连失败都走 JDBC 兜底真实探测，把结论坐实为
+                # pass/fail，而不是停在"若走 SSH/JDBC 通道可忽略"的 warn。
+                # 现场（11g + 未填 service）实测：thin 报 DPY-3010/DPY-6005，
+                # 但物理备份（SSH + rman）成功——用户据此质疑预检结论粗糙。
+                # 注意 JDBC 兜底本身也会重试抖动；两条通道都失败才判 fail。
+                try:
+                    from core import jdbc as _jdbc
+                    jok, jmsg, _jinfo = _jdbc.test_connection(
+                        "oracle", task.get("host"), task.get("port"),
+                        task.get("db_name") or "", task.get("username"),
+                        task.get("password") or "", timeout=8)
+                    if jok:
+                        _reason = ("11g 不支持 thin" if native_conn.thin_version_blocked(_err)
+                                   else "thin 直连不可用")
+                        _add(items, "source_connectivity", "pass",
+                             "源库连通（Oracle %s，已自动改走 JDBC：%s）"
+                             % (_reason, jmsg[:110]))
+                    else:
+                        _add(items, "source_connectivity", "fail",
+                             "Oracle 原生直连失败，JDBC 兜底探测也失败：%s" % jmsg[:150])
+                except Exception as je:
+                    _add(items, "source_connectivity", "warn",
+                         "Oracle 原生直连失败，JDBC 兜底探测异常（%s）——"
+                         "物理备份走 SSH/rman 不受影响" % str(je)[:100])
             else:
                 # 原生直连失败不代表引擎链路必然失败（某些库型走驱动器/
                 # JDBC/SSH 通道），标 warn 并给出行内提示
@@ -142,6 +167,8 @@ def precheck_backup(task: dict) -> dict:
                      "但请确认凭据正确" % _err[:120])
 
     # 4) 备份工具就绪（复用引擎 preflight：本机 PATH / 远端 su 探测 / 自带插件）
+    # engine 预置 None：构造失败时下面物理模式/归档探测不会 NameError
+    engine = None
     try:
         engine = get_engine(db_type, task, getattr(config, "BACKUP_ROOT", "/tmp"))
         ok, msg = engine.preflight()
@@ -157,9 +184,20 @@ def precheck_backup(task: dict) -> dict:
     except Exception:
         is_phys = False
     if is_phys:
-        _add(items, "physical_note", "warn",
-             "物理备份模式：请确认数据库归档/日志配置满足该库型物理备份要求"
-             "（如达梦归档开启、MySQL binlog、PG wal_level=replica）")
+        # 精细提示：按库型给出可核对的具体前置条件，而不是笼统的"请确认配置"。
+        # Oracle 归档模式由下方 oracle_archivelog 项真实探测（pass/fail），
+        # 此处不再重复告警；其余库型给出该库型物理备份的真实硬前提。
+        _phys_hint = {
+            "mysql": "MySQL 物理备份需 xtrabackup 版本与服务端匹配、datadir 可读",
+            "mariadb": "MariaDB 物理备份需 mariabackup 版本匹配、datadir 可读",
+            "postgresql": "PG 物理备份需 pg_basebackup 可执行、归档/replica 配置满足 PITR",
+            "kingbase": "金仓物理备份需 sys_basebackup 可执行、归档配置满足 PITR",
+            "opengauss": "openGauss 物理备份需 gs_basebackup 可执行",
+            "dameng": "达梦物理备份需数据库处于 ARCHIVELOG（归档开启）",
+            "oracle": "Oracle RMAN 备份的归档模式由下方「归档模式」项真实探测",
+        }.get(db_type, "请确认该库型物理备份所需的归档/日志配置")
+        _add(items, "physical_note", "warn" if db_type != "oracle" else "pass",
+             "物理备份模式（%s）" % _phys_hint)
         # Oracle RMAN 临时目录预检（FIX-2026-001 P1）：自定义目录的可达性/
         # 可写性/根分区同盘风险，在提交前给出明确结论
         if db_type == "oracle":
@@ -179,9 +217,12 @@ def precheck_backup(task: dict) -> dict:
                 _add(items, "rman_dir", "unknown", "RMAN 目录预检异常: %s" % str(e)[:100])
             # Oracle 归档模式检测：NOARCHIVELOG 下 RMAN 无法热备活动数据文件
             # （ORA-19602，用户环境实测）——提交前阻断并给开启归档指引
+            # 复用上面第 4 步已按 storage_root 正确构造的 engine：此处曾写
+            # `_OE(task)` 少传 storage_root 参数，导致探测永远抛 TypeError
+            # （"missing 1 required positional argument: 'storage_root'"），
+            # 归档预检在 11g/19c 上全部失效——真实 bug，2026-11-23 修复。
             try:
-                from core.engines.oracle import OracleEngine as _OE
-                _eng = _OE(task)
+                _eng = engine
                 _arch = _eng._check_archive_mode()
                 if _arch.get("mode") == "NOARCHIVELOG":
                     _add(items, "oracle_archivelog", "fail",
@@ -256,10 +297,18 @@ def precheck_backup(task: dict) -> dict:
                      f"远端暂存目录（任务级）: {_bsd}；执行前将按上次成功备份大小"
                      f"做空间预算检查，与根分区同盘会告警")
             else:
-                _add(items, "remote_stage", "warn",
-                     "远端暂存目录未配置（默认 /tmp/bk_stage，常在根分区）——"
-                     "整库大小的临时产物可能占满数据库服务器根分区，"
-                     "建议在任务高级选项配置到独立挂载分区")
+                # 未配置时执行期会自动探测并优选非 tmpfs 数据盘（task_stage_dir），
+                # 不再笼统告警，而是如实报出最终将使用的目录——判断完成后出结果。
+                try:
+                    from core import remote_dump as _rd
+                    _stage = _rd.task_stage_dir(task)
+                    _add(items, "remote_stage", "pass",
+                         f"远端暂存目录未配置，执行期自动优选: {_stage}"
+                         f"（避开 tmpfs/根分区；如需固定请在高级选项配置）")
+                except Exception:
+                    _add(items, "remote_stage", "pass",
+                         "远端暂存目录未配置，执行期自动探测优选非根分区数据盘"
+                         "（如需固定请在高级选项配置）")
     except Exception as e:
         _add(items, "remote_stage", "unknown", "暂存目录预检异常: %s" % str(e)[:100])
 

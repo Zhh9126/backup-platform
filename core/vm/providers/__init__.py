@@ -17,6 +17,15 @@ PROVIDER_META = [
     {"id": "workstation_ssh", "name": "VMware Workstation (SSH)", "module": "workstation_ssh",
      "cls": "WorkstationSSHProvider",
      "desc": "桌面级 Workstation：vmrun 控制面 + 7za 目录级全量备份，崩溃一致，无块级增量。"},
+    {"id": "ovirt", "name": "oVirt / RHEV", "module": "ovirt",
+     "cls": "OVirtProvider",
+     "desc": "oVirt REST API 控制面（探活+资产发现）；数据面未真机验证，明确不支持备份。"},
+    {"id": "openstack", "name": "OpenStack 系 (FusionSphere/EasyStack)", "module": "openstack",
+     "cls": "OpenStackProvider",
+     "desc": "Nova API 控制面（探活+资产发现）；数据面未真机验证，明确不支持备份。"},
+    {"id": "xenserver", "name": "Citrix Hypervisor / XenServer", "module": "xenserver",
+     "cls": "XenServerProvider",
+     "desc": "XenServer REST 控制面（探活+资产发现）；数据面未真机验证，明确不支持备份。"},
 ]
 
 PROVIDER_IDS = [p["id"] for p in PROVIDER_META]

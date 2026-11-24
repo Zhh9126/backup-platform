@@ -145,6 +145,99 @@ def download_record(record_id):
     return send_file(safe_path, as_attachment=True)
 
 
+# ---- 归档内单文件浏览 / 下载 / 校验（对照容灾一体机需求「文件数据验证」）----
+def _archive_record(record_id):
+    """取记录并校验：存在、有产物、非隔离、路径合法。返回 (rec, path) 或 (None, response)。"""
+    rec = models.get_record(record_id)
+    if not rec or not rec.get("backup_path"):
+        return None, (jsonify({"error": "无备份文件可浏览"}), 404)
+    if rec.get("quarantined"):
+        return None, (jsonify({"error": "该备份产物已被防勒索隔离，禁止浏览/下载"}), 403)
+    safe_path = safe_download_path(rec["backup_path"])
+    if safe_path is None:
+        return None, (jsonify({"error": "备份路径不合法或文件不存在"}), 400)
+    return rec, safe_path
+
+
+@api_bp.route("/records/<int:record_id>/archive/files", methods=["GET"])
+@login_required
+def archive_list_files(record_id):
+    """列出备份归档内的文件成员（仅文件备份 tar.gz 产物支持）。"""
+    from core import archive_browser
+    _rec, path = _archive_record(record_id)
+    if _rec is None:
+        return path
+    try:
+        files = archive_browser.list_files(
+            path, prefix=request.args.get("prefix", ""),
+            limit=min(int(request.args.get("limit", 2000)), 5000))
+        return jsonify({"success": True, "record_id": record_id, "files": files,
+                        "total": len(files)})
+    except archive_browser.ArchiveBrowserError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@api_bp.route("/records/<int:record_id>/archive/file", methods=["GET"])
+@login_required
+def archive_read_file(record_id):
+    """读取归档内单个文件内容（预览；二进制以 base64 返回）。"""
+    import base64
+    from core import archive_browser
+    _rec, path = _archive_record(record_id)
+    if _rec is None:
+        return path
+    member = request.args.get("path", "")
+    try:
+        result = archive_browser.read_file(path, member)
+    except archive_browser.ArchiveBrowserError as e:
+        return jsonify({"error": str(e)}), 400
+    content = result.pop("content")
+    result["encoding"] = "base64"
+    result["content_b64"] = base64.b64encode(content).decode("ascii")
+    result["success"] = True
+    return jsonify(result)
+
+
+@api_bp.route("/records/<int:record_id>/archive/download", methods=["GET"])
+@login_required
+def archive_download_file(record_id):
+    """下载归档内单个文件（流式，无预览大小上限）。"""
+    import io
+    from core import archive_browser
+    _rec, path = _archive_record(record_id)
+    if _rec is None:
+        return path
+    member = request.args.get("path", "")
+    try:
+        # 下载走整文件读取：受归档总量约束但不受 UI 预览上限约束
+        result = archive_browser.read_file(path, member,
+                                           max_bytes=1024 * 1024 * 1024)
+    except archive_browser.ArchiveBrowserError as e:
+        return jsonify({"error": str(e)}), 400
+    if result["truncated"]:
+        return jsonify({"error": "单文件超过 1GB 下载上限"}), 400
+    return send_file(io.BytesIO(result["content"]), as_attachment=True,
+                     download_name=os.path.basename(member) or "file")
+
+
+@api_bp.route("/records/<int:record_id>/archive/verify", methods=["GET"])
+@login_required
+def archive_verify_file(record_id):
+    """校验归档内单个文件的 SHA256（?sha256=期望值可选，传入则比对）。"""
+    from core import archive_browser
+    _rec, path = _archive_record(record_id)
+    if _rec is None:
+        return path
+    member = request.args.get("path", "")
+    expect = request.args.get("sha256", "")
+    try:
+        result = archive_browser.verify_file(path, member, expect)
+    except archive_browser.ArchiveBrowserError as e:
+        return jsonify({"error": str(e)}), 400
+    result["success"] = True
+    return jsonify(result)
+
+
 @api_bp.route("/records/export", methods=["GET"])
 @login_required
 def export_records():

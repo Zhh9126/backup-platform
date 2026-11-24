@@ -840,16 +840,107 @@ def _resolve_config(db_type):
     return jar, cfg["class"], cfg["url"], cfg["probe"], cfg["list_sql"], cfg["filter"]
 
 
+_oracle_service_cache: dict = {}
+_oracle_service_lock = threading.RLock()
+
+
+def _oracle_service_via_ssh(host: str, port) -> str:
+    """按数据库地址匹配纳管 SSH，远端 ``lsnrctl status`` 探测真实 service。
+
+    133 Oracle 11g 现场实测：service=orcl11g 而非默认 ORCL，硬编码兜底会
+    报 DPY-6001（Service "ORCL" is not registered）。已纳管 SSH 时可直接
+    从监听读取，零安装（lsnrctl 随 Oracle 自带）、结果进程内缓存。
+    失败返回空串（调用方再退回 ORCL），不抛异常、不阻断测试。
+    """
+    key = (str(host or ""), int(port or 1521))
+    with _oracle_service_lock:
+        if key in _oracle_service_cache:
+            return _oracle_service_cache[key]
+    service = ""
+    client = None
+    try:
+        from core import remote_dump
+        # 构造最小 task 让 resolve_ssh_host 按 hostname 匹配纳管主机
+        sh = remote_dump.resolve_ssh_host({
+            "db_type": "oracle", "host": key[0], "port": key[1],
+            "extra_options": "{}"})
+        if sh:
+            client = remote_dump._connect_isolated(sh)
+            from core.engines.file import _ssh_exec_pipe
+            # 直接取 lsnrctl 全文，在 Python 侧用正则解析 Service "xxx"，
+            # 避免多层 shell 引号嵌套。lsnrctl 只在 oracle 用户 PATH 下，
+            # 用纳管主机的 db_os_user（默认 oracle）su 执行。
+            from core import remote_dump as _rd
+            os_user = (sh.get("db_os_user") or "oracle")
+            cmd = _rd._wrap_login(f"su - {os_user} -c 'lsnrctl status'")
+            out, _err, _rc = _ssh_exec_pipe(client, cmd, timeout=15)
+            text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+            import re as _re
+            m = _re.search(r'Service\s+"([^"]+)"', text)
+            if m:
+                candidates = _re.findall(r'Service\s+"([^"]+)"', text)
+                # 跳过 XDB 等系统 service，取第一个业务 service
+                for c in candidates:
+                    if not c.upper().endswith("XDB"):
+                        service = c
+                        break
+    except Exception:
+        service = ""
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+    with _oracle_service_lock:
+        _oracle_service_cache[key] = service
+    return service
+
+
+def _jdbc_db_arg(db_type: str, db) -> str:
+    """Oracle 的 service/SID 绝不能为空——空串会让 Easy Connect URL 变成
+    ``jdbc:oracle:thin:@//host:1521/``，ojdbc 直接报 ORA-12261（语法错误）。
+
+    service 优先级：用户填写 > 纳管 SSH 上 lsnrctl status 实测 > ORCL 默认。
+    133 Oracle 11g 实测 service=orcl11g，硬编码 ORCL 会报 DPY-6001。
+    其他库型（达梦 URL 模板无 {db}）保持原样。
+    """
+    val = "" if db is None else str(db).strip()
+    if str(db_type).lower() == "oracle" and not val:
+        # 注意：此处拿不到 host/port 上下文，由 connect/build_url 在调用前
+        # 先经 _resolve_oracle_service 注入；这里只做最后兜底。
+        return "ORCL"
+    return val
+
+
+def _resolve_oracle_service(host, port, db) -> str:
+    """解析 Oracle service：显式填写 > SSH 实测 > ORCL。"""
+    val = "" if db is None else str(db).strip()
+    if val:
+        return val
+    try:
+        discovered = _oracle_service_via_ssh(host, port)
+    except Exception:
+        discovered = ""
+    return discovered or "ORCL"
+
+
 def build_url(db_type, host, port, db):
     _, _, url_tpl, _, _, _ = _resolve_config(db_type)
-    return url_tpl.format(host=host, port=_norm_port(db_type, port), db=(db or ""))
+    if str(db_type).lower() == "oracle":
+        db = _resolve_oracle_service(host, port, db)
+    return url_tpl.format(host=host, port=_norm_port(db_type, port),
+                          db=_jdbc_db_arg(db_type, db))
 
 
 def connect(db_type, host, port, db, user, password, timeout=None):
     """建立 JDBC 连接并返回 connection（调用方负责 close）。"""
     jar, driver_class, url_tpl, _, _, _ = _resolve_config(db_type)
     _ensure_jvm()
-    url = url_tpl.format(host=host, port=_norm_port(db_type, port), db=(db or ""))
+    if str(db_type).lower() == "oracle":
+        db = _resolve_oracle_service(host, port, db)
+    url = url_tpl.format(host=host, port=_norm_port(db_type, port),
+                         db=_jdbc_db_arg(db_type, db))
     import jaydebeapi
     return jaydebeapi.connect(driver_class, url, [user or "", password or ""], jars=str(jar))
 

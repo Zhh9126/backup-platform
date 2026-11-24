@@ -4795,6 +4795,32 @@ window.I18N = (function () {
     "本条记录实际使用的备份方式：物理备份（数据文件/备份片级）/ 逻辑备份（导出 SQL、dmp 等）/ 自定义脚本 / 文件备份等": "The backup method actually used by this record: physical (data files/backup pieces) / logical (SQL export, dmp, etc.) / custom script / file backup"
   });
 
+  // ---- 自动补齐：英文模式残留中文（i18n 门禁扫描驱动） ----
+  Object.assign(EN, {
+    "RAG 知识库备份": "RAG Knowledge Base Backup",
+    "向量库快照只保住索引层——这里额外锁定 embedding 模型版本 / 向量维度 / 分块规则，固化质量基线，恢复前拦截配置漂移（防\"恢复了却静默答错\"）": "Vector DB snapshots only preserve the index layer — here we additionally lock the embedding model version / vector dimension / chunking rules, baseline the retrieval quality, and block configuration drift before restore (to prevent “restored but silently answering wrong”)",
+    "新建知识库": "New Knowledge Base",
+    "怎么备份 RAG：": "How to back up RAG: ",
+    "①向量索引任务（Qdrant/Chroma）保住 HNSW 二进制；②原始文档任务（文件/对象存储）保住可重建源；\n    ③": "1) Vector task (Qdrant/Chroma) preserves the HNSW binary; 2) source-document task preserves the rebuildable source;\n    ",
+    "本页锁定 embedding 配置指纹": "This page locks the embedding configuration fingerprint",
+    "——模型版本/维度/分块任一漂移，恢复后检索结果会变。备份前点「固化基线」，恢复前点「恢复校验」。": "— if model version / dimension / chunking drifts, retrieval results change after restore. Click “Baseline” before backup and “Precheck” before restore.",
+    "新建 RAG 知识库": "New RAG Knowledge Base",
+    "知识库名称 *": "Knowledge base name *",
+    "向量索引备份任务（Qdrant/Chroma）*": "Vector index backup task (Qdrant/Chroma) *",
+    "原始文档备份任务（文件/对象存储，可选）": "Source document backup task (file/object storage, optional)",
+    "Embedding 模型": "Embedding model",
+    "模型版本": "Model version",
+    "向量维度": "Vector dimension",
+    "距离度量": "Distance metric",
+    "分块大小(chunk_size)": "Chunk size (chunk_size)",
+    "重叠(overlap)": "Overlap (overlap)",
+    "分块策略": "Chunking strategy",
+    "严格版本校验（配置漂移时拒绝恢复，强烈建议开启）": "Strict version check (reject restore on config drift, strongly recommended)",
+    "如 text-embedding-3-large": "e.g. text-embedding-3-large",
+    "如 v2 / 2024-01": "e.g. v2 / 2024-01",
+    "如：客服知识库-prod": "e.g. support-kb-prod",
+  });
+
   var PREFIXES = [
     "加载任务失败：", "加载日志失败:", "读取失败：", "读取失败:", "加载失败：", "加载失败:",
     "保存失败：", "保存失败:", "删除失败：", "删除失败:", "连接失败：", "连接成功：", "连接成功!",
@@ -5297,6 +5323,33 @@ window.I18N = (function () {
     "增量追平（全量后自动追至最新）": "Incremental catch-up (auto-catch-up after full load)",
     "提交后立即执行：预检查 → 所选阶段顺序编排，进度与报告实时展示。勾选增量追平后，在全量开始前记录源端水位、全量完成后追平其间新增变更（DTS 不停机迁移语义）。": "Runs immediately after submission: precheck, selected phases in order, with live progress and reports. With incremental catch-up enabled, the source watermark is captured before the full load and changes made during it are caught up afterwards (DTS zero-downtime migration semantics).",
     "增量列（时间戳列如 update_time 或自增列 id）": "Incremental column (timestamp like update_time or auto-increment id)",
+  });
+
+  // 备份归档单文件浏览/下载/校验（容灾一体机需求「文件数据验证」）
+  Object.assign(EN, {
+    "浏览文件": "Browse Files",
+    "备份归档文件浏览": "Backup Archive Browser",
+    "按目录筛选，如 docs/": "Filter by directory, e.g. docs/",
+    "筛选": "Filter",
+    "下载": "Download",
+    "校验 SHA256": "Verify SHA256",
+    "选择左侧文件以预览内容（二进制以 Base64 显示）": "Select a file on the left to preview (binary shown as Base64)",
+    "请先选择文件": "Select a file first",
+    "加载归档失败: ": "Failed to load archive: ",
+    "读取中…": "Loading...",
+    "读取失败: ": "Failed to read: ",
+    "校验中…": "Verifying...",
+    "校验失败: ": "Verification failed: ",
+    "与期望值一致": "Matches expected value",
+    "与期望值不一致": "Does not match expected value",
+    "仅预览前": "Previewing only the first ",
+    "字节 base64，文件较大": " bytes (base64); file is large",
+    "第三台主机（可选 · 独立主机演练）": "Third host (optional · independent-host drill)",
+    "不指定（在源端临时库演练）": "None (drill in a temporary DB on the source host)",
+    "选择纳管主机后，演练库建在该独立主机上，不触碰源端生产主机；恢复、校验、销毁均在该主机完成。仅 MySQL/MariaDB 真实恢复演练支持。": "When a managed host is selected, the drill DB is created on that independent host without touching the production source; restore, verification and cleanup all run there. Supported for MySQL/MariaDB real-restore drills only.",
+    "统一插件能力（一个 Agent 支撑多块能力）": "Unified Plugin Capabilities (one Agent, multiple capabilities)",
+    "刷新插件能力": "Refresh Plugin Capabilities",
+    "点击「刷新插件能力」查看各 Agent 的 block-cdp / bmr / app-dr 支持状态。": "Click \"Refresh Plugin Capabilities\" to see each Agent's block-cdp / bmr / app-dr support status.",
   });
 
   return {

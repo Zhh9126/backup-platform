@@ -136,7 +136,7 @@ def test_full_chain_contract():
 
     mysql = _src("core/engines/mysql.py")
     # 表级切片必须排在跨主机分支之前（真机 170 暴露的吞表缺陷）
-    assert mysql.index("表级恢复（P0-1）优先") < mysql.index("# 1) 跨主机恢复")
+    assert mysql.index("表级恢复（P0-1）优先") < mysql.index("跨主机恢复：SFTP 推送")
     assert "renames=renames" in mysql
     assert "经跨主机通道推送切片 SQL" in mysql
 

@@ -2749,6 +2749,10 @@
       const actions = r.backup_path ? [
         `<a class="btn btn-sm btn-outline-secondary" href="/api/records/${r.id}/download">下载</a>`,
       ] : [];
+      // 文件备份产物支持归档内单文件浏览/下载/校验（对照容灾一体机需求）
+      if (r.backup_path && dbType === "file" && !r.quarantined) {
+        actions.push(`<button class="btn btn-sm btn-outline-info" onclick="openArchiveModal(${r.id})" title="浏览备份归档内的单个文件：查看/下载/校验 SHA256"><i class="bi bi-folder2-open"></i> 浏览文件</button>`);
+      }
       if (r.status === "failed" || r.status === "error") {
         actions.unshift(`<button class="btn btn-sm btn-danger" onclick="viewRecordLog(${r.id})" title="查看失败详情"><i class="bi bi-exclamation-triangle"></i> 日志</button>`);
       } else if (r.message && r.message.length > 0) {
@@ -3042,6 +3046,101 @@
     $("pitr_target_db").value = "";
     fillPitrObjectHostSelects();
     pitrModal.show();
+  };
+
+  // ---- 备份归档单文件浏览/下载/校验（文件备份 tar.gz）----
+  let archiveModal;
+  window.openArchiveModal = async (recordId) => {
+    const html = `
+      <div class="modal fade" id="archiveModal" tabindex="-1">
+        <div class="modal-dialog modal-xl">
+          <div class="modal-content">
+            <div class="modal-header py-2">
+              <h6 class="modal-title"><i class="bi bi-folder2-open me-1"></i>备份归档文件浏览（记录 ${recordId}）</h6>
+              <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body py-2">
+              <div class="d-flex align-items-center gap-2 mb-2">
+                <input type="text" class="form-control form-control-sm" id="archivePrefix" placeholder="按目录筛选，如 docs/">
+                <button class="btn btn-sm btn-outline-secondary" onclick="loadArchiveFiles(${recordId})">筛选</button>
+                <span class="text-muted small" id="archiveCount"></span>
+              </div>
+              <div class="row" style="min-height:240px">
+                <div class="col-md-5"><select class="form-select" id="archiveFileList" size="14" onchange="previewArchiveFile(${recordId})"></select></div>
+                <div class="col-md-7">
+                  <div class="d-flex gap-2 mb-2">
+                    <button class="btn btn-sm btn-outline-primary" onclick="downloadArchiveFile(${recordId})"><i class="bi bi-download me-1"></i>下载</button>
+                    <button class="btn btn-sm btn-outline-info" onclick="verifyArchiveFile(${recordId})"><i class="bi bi-fingerprint me-1"></i>校验 SHA256</button>
+                  </div>
+                  <pre id="archivePreview" class="bg-light p-2 small" style="max-height:360px;overflow:auto">选择左侧文件以预览内容（二进制以 Base64 显示）</pre>
+                  <div id="archiveVerify" class="small mt-2"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    document.getElementById("archiveModal")?.remove();
+    document.body.insertAdjacentHTML("beforeend", html);
+    archiveModal = new bootstrap.Modal(document.getElementById("archiveModal"));
+    archiveModal.show();
+    await loadArchiveFiles(recordId);
+  };
+
+  window.loadArchiveFiles = async (recordId) => {
+    const prefix = ($("archivePrefix")?.value || "").trim();
+    const sel = $("archiveFileList");
+    if (!sel) return;
+    sel.innerHTML = "";
+    try {
+      const d = await api("GET", `/api/records/${recordId}/archive/files?prefix=${encodeURIComponent(prefix)}`);
+      (d.files || []).forEach((f) => {
+        const opt = document.createElement("option");
+        opt.value = f.name;
+        opt.textContent = `${f.name} (${f.size} B)`;
+        sel.appendChild(opt);
+      });
+      if ($("archiveCount")) $("archiveCount").textContent = `共 ${d.total || 0} 个文件`;
+    } catch (e) {
+      toast("加载归档失败: " + (e.message || e), "danger");
+    }
+  };
+
+  window.previewArchiveFile = async (recordId) => {
+    const name = $("archiveFileList")?.value;
+    if (!name) return;
+    const pre = $("archivePreview");
+    if (pre) pre.textContent = "读取中…";
+    try {
+      const d = await api("GET", `/api/records/${recordId}/archive/file?path=${encodeURIComponent(name)}`);
+      if (pre) pre.textContent = d.truncated
+        ? `[仅预览前 ${d.content_b64.length} 字节 base64，文件较大]\n` + d.content_b64.slice(0, 2000)
+        : (d.encoding === "base64" ? d.content_b64 : d.content);
+      if ($("archiveVerify")) $("archiveVerify").textContent = `SHA256: ${d.sha256 || "(截断未计算)"}`;
+    } catch (e) {
+      if (pre) pre.textContent = "读取失败: " + (e.message || e);
+    }
+  };
+
+  window.downloadArchiveFile = (recordId) => {
+    const name = $("archiveFileList")?.value;
+    if (!name) { toast("请先选择文件", "warning"); return; }
+    location.href = `/api/records/${recordId}/archive/download?path=${encodeURIComponent(name)}`;
+  };
+
+  window.verifyArchiveFile = async (recordId) => {
+    const name = $("archiveFileList")?.value;
+    if (!name) { toast("请先选择文件", "warning"); return; }
+    const box = $("archiveVerify");
+    if (box) box.textContent = "校验中…";
+    try {
+      const d = await api("GET", `/api/records/${recordId}/archive/verify?path=${encodeURIComponent(name)}`);
+      if (box) box.innerHTML = `SHA256: <code>${esc(d.sha256)}</code> · 大小 ${d.size} B`
+        + (d.match === true ? ' · <span class="text-success">与期望值一致</span>'
+          : d.match === false ? ' · <span class="text-danger">与期望值不一致</span>' : '');
+    } catch (e) {
+      if (box) box.textContent = "校验失败: " + (e.message || e);
+    }
   };
 
   window.openObjectModal = (id) => {
@@ -6986,8 +7085,10 @@
   let drillModal;
   function drillTypeToggle() {
     const isSwitch = $("drill_type").value === "switch";
+    const isReal = $("drill_type").value === "real_restore";
     if ($("drillTaskRow")) $("drillTaskRow").style.display = isSwitch ? "none" : "";
     if ($("drillLinkRow")) $("drillLinkRow").style.display = isSwitch ? "" : "none";
+    if ($("drillTargetHostRow")) $("drillTargetHostRow").style.display = isReal ? "" : "none";
   }
   async function initDrills() {
     const dmEl = document.getElementById("drillModal");
@@ -7004,6 +7105,17 @@
         ? usable.map(l => '<option value="' + l.id + '">' + esc(l.name) + '（' + esc(l.primary_site || '') + ' → ' + esc(l.dr_site || '') + '）</option>').join("")
         : '<option value="">无可切换链路（请在容灾页配置主备连接）</option>';
     } catch (e) { $("drill_link_id").innerHTML = '<option value="">容灾链路加载失败</option>'; }
+    // 第三台主机演练：加载纳管 SSH 主机（排除受保护主机）
+    try {
+      const hosts = await api("GET", "/api/hosts");
+      const hs = Array.isArray(hosts) ? hosts : (hosts.hosts || hosts.data || []);
+      const usable = hs.filter(h => !h.protected);
+      if ($("drill_target_host")) {
+        $("drill_target_host").innerHTML = '<option value="">不指定（在源端临时库演练）</option>' +
+          usable.map(h => '<option value="' + h.id + '">' + esc(h.name || h.hostname) +
+            '（' + esc(h.hostname) + '）</option>').join("");
+      }
+    } catch (e) { /* 主机列表加载失败不阻断演练创建 */ }
     $("drill_type").onchange = drillTypeToggle;
     // 趋势/基线/排程 的任务下拉
     const tf = $("trendTaskFilter"), bt = $("baselineTask"), st = $("schTargets");
@@ -7030,6 +7142,11 @@
         data.link_id = lid; data.task_id = null;
       } else {
         data.task_id = Number($("drill_task_id").value) || null;
+        // 真实恢复演练可指定第三台独立主机（容灾一体机需求）
+        if ($("drill_type").value === "real_restore" && $("drill_target_host")) {
+          const thid = Number($("drill_target_host").value) || null;
+          if (thid) data.scenario = { target_host_id: thid };
+        }
       }
       if (!data.name) { toast("请输入演练名称", "warning"); return; }
       try { const r = await api("POST", "/api/drills", data); toast("已创建演练 " + r.id); drillModal.hide(); await loadDrills(); }
@@ -11403,6 +11520,157 @@
     if (!confirm("删除该保护计划？（成员备份任务不受影响）")) return;
     try { await api("DELETE", `/api/ai-plans/${id}`); toast("已删除"); await loadAiPlans(); }
     catch (e) { toast(e.message, "danger"); }
+  };
+
+  // ---- RAG 知识库备份：embedding 配置指纹 + 检索质量基线 ----
+  window.loadRagKbs = async function () {
+    const box = $("ragKbTable");
+    if (!box) return;
+    try {
+      const d = await api("GET", "/api/rag-kb");
+      const kbs = d.kbs || [];
+      if (!kbs.length) {
+        box.innerHTML = '<div class="empty-state"><i class="bi bi-diagram-3"></i>' +
+          '<div class="empty-title">还没有 RAG 知识库</div>' +
+          '锁定 embedding 模型版本/维度/分块规则，固化检索质量基线后再恢复</div>';
+        return;
+      }
+      box.innerHTML = '<table class="table table-sm align-middle mb-0"><thead><tr>' +
+        '<th>#</th><th>知识库</th><th>向量任务 / 文档任务</th><th>Embedding 配置</th>' +
+        '<th>配置指纹</th><th>基线 / 复核</th><th class="text-end">操作</th></tr></thead><tbody>' +
+        kbs.map((k, i) => {
+          const vTask = k.vector_task_id || "-";
+          const dTask = k.doc_task_id || "-";
+          const cfg = k.config || {};
+          const cfgText = [cfg.embed_model, cfg.embed_version,
+            cfg.embed_dim ? cfg.embed_dim + "维" : "",
+            cfg.distance_metric,
+            cfg.chunk_size ? `chunk=${cfg.chunk_size}/${cfg.chunk_overlap || 0}` : ""
+          ].filter(Boolean).map(esc).join(" · ");
+          const base = k.baseline;
+          const baseCell = base
+            ? `<div class="small">基线 ${esc((base.built_at || "").slice(0, 16))}</div>` +
+              `<span class="badge badge-ok">fp ${esc((base.fingerprint || "").slice(0, 10))}</span>`
+            : '<span class="badge badge-run">未固化基线</span>';
+          return `<tr><td>${i + 1}</td><td><b>${esc(k.name)}</b>` +
+            (k.strict_version ? '<div class="small text-muted">严格版本校验</div>' : "") + '</td>' +
+            `<td class="small">向量任务 ${esc(vTask)}<br>文档任务 ${esc(dTask)}</td>` +
+            `<td class="small">${cfgText || '<span class="text-muted">未配置</span>'}</td>` +
+            `<td class="small"><code>${esc((k.fingerprint || "").slice(0, 14))}</code></td>` +
+            `<td>${baseCell}</td>` +
+            `<td class="text-end"><div class="btn-row">` +
+            `<button class="btn btn-sm btn-outline-primary" onclick="ragProbe(${k.id})" title="探测当前 collection 元数据">探测</button>` +
+            `<button class="btn btn-sm btn-outline-success" onclick="ragBaseline(${k.id})">固化基线</button>` +
+            `<button class="btn btn-sm btn-outline-warning" onclick="ragPrecheck(${k.id})" title="恢复前配置漂移校验">恢复校验</button>` +
+            `<button class="btn btn-sm btn-outline-secondary" onclick="ragVerify(${k.id})">质量复核</button>` +
+            `<button class="btn btn-sm btn-outline-secondary" onclick="openRagKbModal(${k.id})">编辑</button>` +
+            `<button class="btn btn-sm btn-outline-danger" onclick="delRagKb(${k.id})">删除</button>` +
+            `</div></td></tr>`;
+        }).join("") + '</tbody></table>';
+    } catch (e) { toast(e.message, "danger"); }
+  };
+
+  window.openRagKbModal = async function (id) {
+    const msg = $("rag_kb_msg"); if (msg) msg.textContent = "";
+    let tasks = [];
+    try {
+      const d = await api("GET", "/api/tasks?limit=500");
+      tasks = (Array.isArray(d) ? d : (d.items || d.data || []));
+    } catch (e) { /* 任务列表失败仍允许手工输入 ID */ }
+    const fill = (elId, filter, selected) => {
+      const el = $(elId); if (!el) return;
+      const opts = tasks.filter(filter).map(t =>
+        `<option value="${t.id}" ${String(t.id) === String(selected) ? "selected" : ""}>${t.id} · ${esc(t.name || "")} [${esc(t.db_type || "")}]</option>`).join("");
+      el.innerHTML = '<option value="">— 无 —</option>' + opts;
+    };
+    fill("rag_vector_task", t => ["qdrant", "chroma"].includes(t.db_type), 0);
+    fill("rag_doc_task", t => ["file", "object_storage"].includes(t.db_type), 0);
+    if (id) {
+      const k = await api("GET", `/api/rag-kb/${id}`);
+      $("rag_name").value = k.name || "";
+      $("rag_vector_task").value = k.vector_task_id || "";
+      $("rag_doc_task").value = k.doc_task_id || "";
+      $("rag_embed_model").value = k.embed_model || "";
+      $("rag_embed_version").value = k.embed_version || "";
+      $("rag_embed_dim").value = k.embed_dim || "";
+      $("rag_distance").value = k.distance_metric || "";
+      $("rag_chunk_size").value = k.chunk_size || "";
+      $("rag_chunk_overlap").value = k.chunk_overlap || "";
+      $("rag_chunk_strategy").value = k.chunk_strategy || "";
+      $("rag_top_k").value = k.top_k || "";
+      $("rag_strict").checked = !!k.strict_version;
+    } else {
+      ["rag_name", "rag_embed_model", "rag_embed_version", "rag_embed_dim",
+       "rag_distance", "rag_chunk_size", "rag_chunk_overlap",
+       "rag_chunk_strategy", "rag_top_k"].forEach(x => { const el = $(x); if (el) el.value = ""; });
+      $("rag_strict").checked = true;
+    }
+    $("ragKbTitle").textContent = id ? "编辑 RAG 知识库" : "新建 RAG 知识库";
+    $("ragKbModal").dataset.kbId = id || "";
+    bootstrap.Modal.getOrCreateInstance($("ragKbModal")).show();
+  };
+
+  window.saveRagKb = async function () {
+    const id = $("ragKbModal").dataset.kbId;
+    const payload = {
+      name: $("rag_name").value.trim(),
+      vector_task_id: $("rag_vector_task").value,
+      doc_task_id: $("rag_doc_task").value,
+      embed_model: $("rag_embed_model").value.trim(),
+      embed_version: $("rag_embed_version").value.trim(),
+      embed_dim: $("rag_embed_dim").value,
+      distance_metric: $("rag_distance").value.trim(),
+      chunk_size: $("rag_chunk_size").value,
+      chunk_overlap: $("rag_chunk_overlap").value,
+      chunk_strategy: $("rag_chunk_strategy").value.trim(),
+      top_k: $("rag_top_k").value,
+      strict_version: $("rag_strict").checked,
+    };
+    try {
+      if (id) await api("PUT", `/api/rag-kb/${id}`, payload);
+      else await api("POST", "/api/rag-kb", payload);
+      bootstrap.Modal.getInstance($("ragKbModal")).hide();
+      toast("已保存"); await loadRagKbs();
+    } catch (e) { const m = $("rag_kb_msg"); if (m) m.textContent = e.message; }
+  };
+
+  window.delRagKb = async function (id) {
+    if (!confirm("删除该 RAG 知识库配置？（底层备份任务不受影响）")) return;
+    try { await api("DELETE", `/api/rag-kb/${id}`); toast("已删除"); await loadRagKbs(); }
+    catch (e) { toast(e.message, "danger"); }
+  };
+
+  window.ragProbe = async function (id) {
+    try { const d = await api("POST", `/api/rag-kb/${id}/probe`);
+      toast(`探测到 ${(d.collections || []).length} 个 collection${d.note ? " · " + d.note.slice(0, 60) : ""}`);
+    } catch (e) { toast(e.message, "danger"); }
+  };
+
+  window.ragBaseline = async function (id) {
+    try { await api("POST", `/api/rag-kb/${id}/baseline`);
+      toast("基线已固化（配置指纹 + 当前元数据）"); await loadRagKbs();
+    } catch (e) { toast(e.message, "danger"); }
+  };
+
+  window.ragPrecheck = async function (id) {
+    try {
+      const d = await api("POST", `/api/rag-kb/${id}/precheck`);
+      if (d.ok) toast("恢复校验通过：配置指纹一致，可继续恢复");
+      else toast("恢复校验未通过：" + (d.reason || "配置漂移"), "danger");
+    } catch (e) {
+      // 409 = strict 模式漂移拦截，后端 reason 在 e.data 里
+      const reason = (e.data && (e.data.reason || e.data.error)) || e.message;
+      toast("已拦截：" + reason, "danger");
+    }
+  };
+
+  window.ragVerify = async function (id) {
+    try {
+      const d = await api("POST", `/api/rag-kb/${id}/verify`);
+      toast(d.ok ? "质量复核通过（结构/规模与基线一致）" :
+        `发现 ${(d.diffs || []).length} 处偏差，详见列表`, d.ok ? "success" : "warning");
+      await loadRagKbs();
+    } catch (e) { toast(e.message, "danger"); }
   };
 
   // ---- 首次登录口令治理：强制改密 / 出厂弱口令提示 ----

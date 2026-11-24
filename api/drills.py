@@ -27,16 +27,18 @@ def create_drill():
     is_switch = str(data.get("drill_type") or "") == "switch"
     if not is_switch and not data.get("task_id"):
         return jsonify({"error": "task_id 必填"}), 400
-    if is_switch:
-        scenario = data.get("scenario") or {}
-        if isinstance(scenario, str):
-            try:
-                scenario = json.loads(scenario)
-            except Exception:
-                scenario = {}
-        scenario = dict(scenario or {})
-        if data.get("link_id"):
-            scenario["link_id"] = int(data["link_id"])
+    # scenario 统一支持 dict/JSON 串（切换演练 link_id、真实恢复演练
+    # target_host_id=第三台纳管主机）——models.create_drill 已做 dict 序列化
+    scenario = data.get("scenario") or {}
+    if isinstance(scenario, str):
+        try:
+            scenario = json.loads(scenario)
+        except Exception:
+            scenario = {}
+    scenario = dict(scenario or {})
+    if is_switch and data.get("link_id"):
+        scenario["link_id"] = int(data["link_id"])
+    if scenario:
         data["scenario"] = scenario
     drill_id = models.create_drill(data)
     return jsonify({"id": drill_id, "ok": True}), 201

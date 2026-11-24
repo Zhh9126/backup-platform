@@ -1923,6 +1923,30 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                     "created_at TEXT, updated_at TEXT)")
             except Exception:
                 pass
+            # RAG 知识库备份单元（embedding 配置指纹 + 检索质量基线）
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS rag_knowledge_bases ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "name TEXT NOT NULL, "
+                    "vector_task_id INTEGER, "
+                    "doc_task_id INTEGER DEFAULT 0, "
+                    "embed_model TEXT DEFAULT '', "
+                    "embed_version TEXT DEFAULT '', "
+                    "embed_dim INTEGER DEFAULT 0, "
+                    "distance_metric TEXT DEFAULT '', "
+                    "chunk_size INTEGER DEFAULT 0, "
+                    "chunk_overlap INTEGER DEFAULT 0, "
+                    "chunk_strategy TEXT DEFAULT '', "
+                    "top_k INTEGER DEFAULT 0, "
+                    "strict_version INTEGER DEFAULT 1, "
+                    "baseline TEXT DEFAULT '', "
+                    "last_verify TEXT DEFAULT '', "
+                    "enabled INTEGER DEFAULT 1, "
+                    "remark TEXT DEFAULT '', "
+                    "created_at TEXT, updated_at TEXT)")
+            except Exception:
+                pass
             for col, typedef in [
                 ("set_type", "TEXT DEFAULT 'full'"),
                 ("storage_tier", "INTEGER DEFAULT 1"),

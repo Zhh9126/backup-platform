@@ -26,6 +26,8 @@ def main():
     source = ROOT / "agent" / "backup_agent.py"
     subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
                     "--onefile", "--strip", "--name", "aidbm-agent",
+                    "--hidden-import", "plugins",  # 统一插件集随单文件打包
+                    "--hidden-import", "iso9660",  # BMR 内置 ISO9660 生成器
                     "--distpath", str(target),
                     "--workpath", str(ROOT / "build" / "agent"),
                     "--specpath", str(ROOT / "build" / "agent"),

@@ -1961,11 +1961,15 @@ def _remote_mongodb_dump_shell(task: dict, ssh_host: dict, compress: int) -> tup
     """mongodump 归档流的远端 shell。返回 (client, shell, compressed)。"""
     client = _connect(ssh_host)
     mongodump = _resolve_remote_bin(client, "mongodump")
+    pushed_tool = ""
+    tool_note = ""
     if not mongodump:
-        raise RuntimeError(
-            "远端主机未找到 mongodump，按数据库服务器零安装原则，"
-            "将回退平台服务端 mongodump 直连远程执行。"
-        )
+        # 远端零安装：从平台 ToolPack 推送 mongodump 到 /tmp 临时执行（用完清理），
+        # 不再要求用户去数据库服务器装 mongodb-database-tools。
+        from core import toolpack
+        mongodump, tool_note = toolpack.push_tool(client, "mongodump",
+                                                   label="MongoDB 逻辑备份")
+        pushed_tool = mongodump
     host = task.get("host") or "127.0.0.1"
     port = task.get("port") or 27017
     user = task.get("username") or ""
@@ -1979,23 +1983,34 @@ def _remote_mongodb_dump_shell(task: dict, ssh_host: dict, compress: int) -> tup
         auth_args += f" --password {shlex.quote(pw)}"
 
     db_args = f" --db {shlex.quote(db_name)}" if db_name else ""
+    # oplog 捕获（时点恢复前置）：mongodump --oplog 要求整库导出，与 --db 互斥。
+    # 显式开启时去掉 --db 并加 --oplog，产物内多出 oplog.bson，配合恢复侧
+    # --oplogReplay / --oplogLimit 做时间点恢复。
+    extra = _pg_family_parse_extra(task)
+    oplog_on = bool(extra.get("oplog")) or bool(task.get("oplog_capture"))
+    if oplog_on:
+        db_args = ""
+    oplog_arg = " --oplog" if oplog_on else ""
 
     # 导出格式（extra_options.dump_format）：archive(默认单文件归档) /
     # gzip(mongodump 自带 --gzip 压缩归档) / directory(--out 目录，远端打 tar.gz 流)
     from core import dump_format as _dfmt
-    spec = _dfmt.resolve("mongodb", _pg_family_parse_extra(task), compress=bool(compress))
-    base_shell = f"{mongodump} --host {shlex.quote(host)} --port {port}{auth_args}{db_args}"
+    spec = _dfmt.resolve("mongodb", extra, compress=bool(compress))
+    base_shell = (f"{mongodump} --host {shlex.quote(host)} --port {port}"
+                  f"{auth_args}{db_args}{oplog_arg}")
+    clean = toolpack.cleanup_suffix(pushed_tool) if pushed_tool else ""
     if spec.get("dir"):
         # 目录格式工作区：任务级暂存目录（整库解包落盘，/tmp 会撑爆根分区）
         work = (task_stage_dir(task)
                 + f"/.bk_mongo_{os.getpid()}_{int(time.time())}")
         shell = (f"set -o pipefail; rm -rf {work} && mkdir -p {work} && "
                  f"{base_shell} --out {work} && tar -C {work} -czf - .; RC=$?; "
-                 f"rm -rf {work}; exit $RC")
+                 f"rm -rf {work}" + (f"; rm -f {pushed_tool}" if pushed_tool else "") +
+                 f"; exit $RC")
         return client, shell, False
     if spec.get("value") == "gzip":
         # mongodump 自带 gzip：不再外挂 zstd，避免双重压缩
-        shell = base_shell + " --archive --gzip"
+        shell = base_shell + " --archive --gzip" + clean
         return client, shell, False
 
     shell = base_shell + " --archive"
@@ -2015,6 +2030,12 @@ def _remote_mongodb_dump_shell(task: dict, ssh_host: dict, compress: int) -> tup
         # MongoDB 真机实测：170 上没有 mongodump，平台却报 success、产物 13 B，
         # 恢复时才报"解压 zstd 失败"。pipefail 让上游失败立刻冒泡回退。
         shell = "set -o pipefail; " + shell + " | zstd -10 -c -"
+        # 推送工具的清理放在管道之后，用 PIPESTATUS 保留 mongodump 的真实 rc
+        if pushed_tool:
+            shell += (f"; _BPIPE=${{PIPESTATUS[0]}}; rm -f {pushed_tool}; "
+                      f"(exit $_BPIPE)")
+    elif pushed_tool:
+        shell += clean
     return client, shell, bool(compress)
 
 

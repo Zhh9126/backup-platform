@@ -21,20 +21,27 @@ def test_scan_fs_page_and_menu():
     # 用两栏卡片表达，原单句「不读裸块设备、不做扇区级数据雕刻」已并入列表项，
     # 断言随之对齐（能力描述本身没有放宽）。
     assert "只读扫描" in tpl and "拉回选中对象" in tpl
-    assert "Oracle 实例清单" in tpl
+    # 2026-11-24：页面按钮为「实例清单」（全库型，不只 Oracle）
+    assert "实例清单" in tpl
     assert "这是「特殊恢复」，不属于常规恢复链路" in tpl
     assert "不读裸块设备" in tpl and "不自动修复数据库一致性" in tpl
     base = _src("templates/base.html")
     # 2026-11-13 菜单改名：明确"特殊恢复"定位（原来的"无备份目录扫描"易被误读为常规恢复）
     assert 'href="/scan-fs"' in base
-    assert "无备份救援（特殊恢复）" in base
+    # 2026-11-24 口径统一：菜单与页面标题均为「特殊恢复」（另一个
+    # test_scan_fs_classify.py::test_page_and_menu_renamed 明确要求不含
+    # 「无备份救援（特殊恢复）」，此前本断言与之冲突导致门禁恒失败）
+    assert "特殊恢复" in base
+    assert "无备份救援（特殊恢复）" not in base
 
 
 def test_scan_fs_js_covers_all_three_endpoints():
     js = _src("static/js/scan_fs.js")
     assert "/api/scan-fs/scan" in js
     assert "/api/scan-fs/pull" in js
-    assert "/oracle-inventory" in js
+    # 实例清单走全库型 /api/scan-fs/instances（原 Oracle 专用 inventory 端点
+    # 保留兼容，但前端统一用全库型接口）
+    assert "/api/scan-fs/instances" in js
     assert "sha256" in js and "sf_filePager" in js
 
 

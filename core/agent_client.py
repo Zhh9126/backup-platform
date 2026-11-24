@@ -363,6 +363,25 @@ class AgentTransport:
                     % local_path)
         return written
 
+    # ---- 统一插件（一个 Agent 支撑多块能力） ----
+    def plugins(self, refresh: bool = False) -> list:
+        """Agent 自报的插件清单（含 supported/reason/actions，不虚报）。"""
+        return (self.capabilities(refresh=refresh).get("plugins") or [])
+
+    def plugin_invoke(self, plugin: str, action: str, params: dict = None) -> dict:
+        """调用 Agent 插件动作（block-cdp / bmr / app-dr）。
+
+        Agent 返回 400 时 body 仍是结构化 {ok:false,error}，如实抛出，
+        不伪装成功（与平台整体诚实口径一致）。
+        """
+        payload = {"plugin": plugin, "action": action, "params": params or {}}
+        st, _h, data = self._request(
+            "POST", "/plugin", body=self._seal(payload))
+        result = self._open_json(data)
+        if st not in (200, 400):
+            raise AgentError("Agent plugin %s/%s HTTP %s" % (plugin, action, st))
+        return result
+
     # ---- 文件系统操作 ----
     def fs(self, op: str, path: str, to: str = "", mode: str = ""):
         payload = {"op": op, "path": path, "to": to}

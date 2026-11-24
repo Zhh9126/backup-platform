@@ -60,6 +60,10 @@ cp "$SRC/scripts/offline/install.sh" "$BUNDLE/install.sh"
 sed -i "s|__BUNDLE_VERSION__|${VER}|g" "$BUNDLE/install.sh"
 chmod +x "$BUNDLE/install.sh"
 cp "$SRC/scripts/offline/healthcheck.sh" "$BUNDLE/tools/" 2>/dev/null || true
+# ToolPack 随包工具（平台侧烘焙，远端零安装推送执行）
+if [ -d "$SRC/tools" ]; then
+    cp -a "$SRC/tools/." "$BUNDLE/tools/"
+fi
 
 # ---------- 4) 数据库客户端 ToolPack 说明（按现场收集）----------
 cat > "$BUNDLE/clients/README.md" <<'EOF'

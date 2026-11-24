@@ -857,8 +857,15 @@ class OracleEngine(BackupEngine):
            改走 SSH + 远端 sqlplus（数据库自带，零客户端安装）。
         返回 {"mode": "ARCHIVELOG"|"NOARCHIVELOG"|"", "channel": ...}，失败带 error。
         """
-        from core.native_conn import thin_version_blocked
         err = ""
+        # service 未填时从纳管 SSH 的 lsnrctl 实测（133 11g = orcl11g，
+        # 硬编码 orcl 会报 DPY-6001 Service not registered）；与 JDBC/拉库同一口径。
+        try:
+            from core import jdbc as _jdbc
+            _service = _jdbc._resolve_oracle_service(
+                self.task.get("host"), self.task.get("port"), self.task.get("db_name"))
+        except Exception:
+            _service = self.task.get("db_name") or "orcl"
         try:
             import oracledb as _odb
             _kw = dict(
@@ -866,7 +873,7 @@ class OracleEngine(BackupEngine):
                 password=db.decrypt_secret(self.task.get("password") or ""),
                 host=self.task.get("host") or "127.0.0.1",
                 port=int(self.task.get("port") or 1521),
-                service_name=self.task.get("db_name") or "orcl")
+                service_name=_service)
             try:
                 # oracledb 4.x 无 login_timeout（cx_Oracle 才有的参数），
                 # 传错会抛 TypeError 并把「归档模式探测」整体打成失败——
@@ -883,11 +890,11 @@ class OracleEngine(BackupEngine):
                     "channel": "driver"}
         except Exception as e:
             err = str(e) or type(e).__name__
-            if not thin_version_blocked(err):
-                # 真实失败（密码错/服务名错/网络），不再兜底以免掩盖原因
-                return {"mode": "", "error": err[:160]}
 
-        # 11g：thin 不支持该服务端版本 → 远端 sqlplus 探测
+        # native 失败（11g thin 不支持 / service 猜错 / 网络抖动）→
+        # 远端 sqlplus 兜底：物理备份本就走 SSH+rman，同一通道一定可用。
+        # 旧逻辑只在 thin_version_blocked(err) 时才兜底，DPY-6005（service
+        # 未注册）被当"真实失败"直接返回，导致 133 11g 归档预检恒 unknown。
         mode = self._archive_mode_via_sqlplus()
         if mode:
             return {"mode": mode, "channel": "sqlplus"}
@@ -919,7 +926,12 @@ class OracleEngine(BackupEngine):
             sqlplus = self._resolve_oracle_tool(client, "sqlplus") or "sqlplus"
             user = self.task.get("username") or "system"
             pw = db.decrypt_secret(self.task.get("password") or "")
-            service = self.task.get("db_name") or "orcl"
+            try:
+                from core import jdbc as _jdbc
+                service = _jdbc._resolve_oracle_service(
+                    self.task.get("host"), self.task.get("port"), self.task.get("db_name"))
+            except Exception:
+                service = self.task.get("db_name") or "orcl"
             host = self._db_host_for_remote()
             port = int(self.task.get("port") or 1521)
             sql = ("whenever sqlerror exit 9\n"
@@ -2387,12 +2399,113 @@ class OracleEngine(BackupEngine):
             )
 
     def list_databases(self) -> list:
-        """列出可备份的数据库/实例。
+        """列出可备份的 schema（Oracle 的「库」即 schema/user）。
 
-        Oracle 列出用户/模式通常需要 sqlplus 等额外工具，此处按规范简化，
-        返回空列表（由平台在 UI 上提示用户手动填写 db_name / service）。
+        历史实现恒返回空列表，导致任务向导「拉取库列表」只能靠 JDBC 兜底；
+        而 JDBC 通道在 11g + 未填 service 时必失败（ORA-12261），用户看到
+        「原有连接方式未返回库列表 + JDBC 兜底失败」——实际物理备份却正常
+        （走 SSH + rman，不依赖直连）。本方法补齐「原有连接方式」这一路：
+
+        1. 纳管/任务 SSH 存在 → 远端 sqlplus ``select username from all_users``
+           （数据库自带客户端，零安装；11g/19c 通用）；
+        2. 无 SSH → 原生 oracledb 驱动查询（12c+；11g thin 不支持时放弃，
+           交给上层 JDBC 兜底，与既有契约一致）。
+
+        内置/组件 schema 用 native_conn.oracle_system_schema 过滤（11g 没有
+        ORACLE_MAINTAINED 列时同样干净）。任何异常返回 []，不阻断上层兜底。
         """
-        return []
+        from core.native_conn import oracle_system_schema
+        rows = []
+        # ---- 通道 1：SSH + 远端 sqlplus（11g 唯一可靠路径，物理备份同通道）----
+        from core import remote_dump
+        from core.engines.file import _ssh_exec_pipe
+        try:
+            ssh_host = remote_dump.resolve_ssh_host(self.task)
+        except Exception:
+            ssh_host = None
+        if ssh_host:
+            client = None
+            remote_sql = "/tmp/platform_list_schemas.sql"
+            try:
+                client = remote_dump._connect_isolated(ssh_host)
+                sqlplus = self._resolve_oracle_tool(client, "sqlplus") or "sqlplus"
+                # service 未填时以 / as sysdba 查 v$parameter，避免 ORCL 猜错
+                # （133 11g 现场实测 service=orcl11g，兜底 ORCL 报 DPY-6001）。
+                service = self._service_name() or "ORCL"
+                user = self.task.get("username") or "system"
+                pw = db.decrypt_secret(self.task.get("password") or "")
+                host = self._db_host_for_remote(ssh_host)
+                port = int(self.task.get("port") or 1521)
+                login = (f"{user}/{self._quote_password(pw)}@{host}:{port}/{service}"
+                         if self.task.get("db_name") or self._parse_extra().get("service")
+                         else "/ as sysdba")
+                sql = ("whenever sqlerror exit 9\n"
+                       "set pagesize 0 linesize 200 feedback off heading off echo off\n"
+                       f"connect {login}\n"
+                       "select username from all_users order by 1;\n"
+                       "exit\n")
+                sftp = client.open_sftp()
+                try:
+                    with sftp.open(remote_sql, "w") as f:
+                        f.write(sql)
+                    try:
+                        sftp.chmod(remote_sql, 0o644)
+                    except Exception:
+                        pass
+                finally:
+                    try:
+                        sftp.close()
+                    except Exception:
+                        pass
+                shell = remote_dump._wrap_login(
+                    f"su - {self._resolve_check_user()} -c "
+                    + shlex.quote(f"{sqlplus} -s -L /nolog @{remote_sql}"))
+                out, _err, rc = _ssh_exec_pipe(client, shell, timeout=60)
+                text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+                if rc == 0 or text.strip():
+                    rows = [ln.strip() for ln in text.splitlines()
+                            if ln.strip() and not ln.startswith(("ORA-", "SP2-", "ERROR"))]
+            except Exception as e:
+                self.logger.warning("[%s] 远端 sqlplus 拉 schema 列表失败: %s",
+                                    self.task_name, e)
+            finally:
+                if client is not None:
+                    try:
+                        client.exec_command(f"rm -f {remote_sql}")
+                    except Exception:
+                        pass
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+            if rows:
+                return [r for r in sorted(set(rows)) if not oracle_system_schema(r)]
+
+        # ---- 通道 2：原生 oracledb（12c+；11g thin 不支持则抛，交给上层兜底）----
+        try:
+            import oracledb as _odb
+            pw = db.decrypt_secret(self.task.get("password") or "")
+            kw = dict(user=self.task.get("username") or "system", password=pw,
+                      host=self.task.get("host") or "127.0.0.1",
+                      port=int(self.task.get("port") or 1521),
+                      service_name=self.task.get("db_name") or "ORCL")
+            try:
+                conn = _odb.connect(tcp_connect_timeout=8, **kw)
+            except TypeError:
+                conn = _odb.connect(**kw)
+            try:
+                cur = conn.cursor()
+                cur.execute("select username from all_users order by 1")
+                rows = [str(r[0]).strip() for r in cur.fetchall()]
+                cur.close()
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            rows = []
+        return [r for r in sorted(set(rows)) if r and not oracle_system_schema(r)]
 
     # ------------------------------------------------------------------ #
     # RMAN PITR (基于时间点的恢复，参照 oracle_backup_web_tool)

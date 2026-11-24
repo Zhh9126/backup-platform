@@ -83,6 +83,12 @@ def create_restore():
     for option in ("create_bucket", "restore_to_nas"):
         if option in data:
             restore_options[option] = data[option] is True or str(data[option]).lower() in ("1", "true", "yes")
+    # MongoDB oplog 时点恢复（需求恢复选项细化）：需备份时开启 --oplog
+    if data.get("oplog_replay") is not None:
+        restore_options["oplog_replay"] = (data["oplog_replay"] is True
+            or str(data["oplog_replay"]).lower() in ("1", "true", "yes"))
+    if data.get("oplog_limit") is not None:
+        restore_options["oplog_limit"] = str(data["oplog_limit"]).strip()
     if data.get("target_nas_path"):
         restore_options["target_nas_path"] = str(data["target_nas_path"]).strip()
     keys = data.get("restore_keys")
@@ -107,6 +113,7 @@ def create_restore():
             pitr_restore_dir=data.get("pitr_restore_dir"),
             tables=data.get("tables"),
             table_renames=data.get("table_renames"),
+            skip_existing_tables=bool(data.get("skip_existing_tables")),
             target_schema=data.get("target_schema"),
             restore_options=restore_options or None,
             # 目标库留空 = 原位覆盖源库，必须显式确认（见 run_restore_now）

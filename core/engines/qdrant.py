@@ -7,7 +7,7 @@
 
 实现方式（零安装零 agent，硬性约束）：
   Qdrant 提供原生 REST 快照 API（默认端口 6333），平台经 HTTP 直连：
-    备份：PUT  /collections/{c}/snapshots?wait=true     创建快照
+    备份：POST /collections/{c}/snapshots  {"wait":true} 创建快照（PUT 会 404）
           GET  /collections/{c}/snapshots/{name}        流式下载快照
           DELETE /collections/{c}/snapshots/{name}      清理远端快照
     恢复：POST /collections/{t}/snapshots/upload        multipart 上传恢复
@@ -124,10 +124,11 @@ class QdrantEngine(BackupEngine):
             ts = self._timestamp()
             local_path = os.path.join(out_dir, f"qdrant_{safe}_{ts}.snapshot")
             try:
-                # 1) 创建快照（wait=true 同步等完成）
-                _, body = _http("PUT", f"{base}/collections/{cname}/snapshots",
+                # 1) 创建快照（POST 是官方端点；wait=true 同步等完成）
+                # 注意：早期版本误用 PUT，Qdrant 1.x 返回 404（真机暴露）。
+                _, body = _http("POST", f"{base}/collections/{cname}/snapshots",
                                 headers=headers,
-                                data=json.dumps({"wait": "true"}).encode(),
+                                data=json.dumps({"wait": True}).encode(),
                                 timeout=_SNAPSHOT_TIMEOUT)
                 snap_name = (json.loads(body).get("result") or {}).get("name")
                 if not snap_name:
@@ -207,28 +208,85 @@ class QdrantEngine(BackupEngine):
                                         "且任务未配置 db_name/target_db）")
         base = self._base_url()
         headers = self._headers()
-        try:
-            body, ctype = _multipart_body("snapshot", base_name, backup_path)
-            _http("POST", f"{base}/collections/{target}/snapshots/upload",
-                  headers=dict(headers, **{"Content-Type": ctype}),
-                  data=body, timeout=_SNAPSHOT_TIMEOUT)
-        except Exception as e:
+
+        # 多集合快照：backup 时 backup_path 只指向首个快照，其余在
+        # <first>_manifest.json。恢复必须读 manifest 恢复全部，否则
+        # "备份了 N 个 collection、恢复只回来 1 个"是静默数据缺失。
+        pairs = []
+        manifest_path = backup_path + "_manifest.json"
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, encoding="utf-8") as mf:
+                    mf_data = json.load(mf)
+                pieces = mf_data.get("collections") or []
+                out_dir = os.path.dirname(backup_path)
+                for piece in pieces:
+                    fp = os.path.join(out_dir, piece.get("file") or "")
+                    if not os.path.isfile(fp):
+                        return BackupResult(
+                            success=False, status=BackupStatus.FAILED,
+                            duration_sec=round(time.time() - start, 2),
+                            message=f"清单引用的快照文件缺失: {piece.get('file')}")
+                    # 恢复前校验 sha256（清单里已记录，篡改/损坏必须拒绝）
+                    want = piece.get("sha256") or ""
+                    if want:
+                        got = db.sha256_file(fp)
+                        if want != got:
+                            return BackupResult(
+                                success=False, status=BackupStatus.FAILED,
+                                duration_sec=round(time.time() - start, 2),
+                                message=(f"快照 sha256 不匹配（{piece.get('collection')}）："
+                                         f"清单={want[:16]} 实测={got[:16]}"))
+                    # 多集合：目标名按"目标前缀 + 源集合后缀"映射，避免全部
+                    # 覆盖到同一个 target；单集合或 target 显式指定时保持原语义。
+                    src = piece.get("collection") or ""
+                    tgt = target if (len(pieces) == 1 or not src) else target
+                    if len(pieces) > 1 and target_collection:
+                        tgt = f"{target_collection}_{src}"
+                    pairs.append((src, tgt, fp))
+            except Exception as e:
+                return BackupResult(success=False, status=BackupStatus.FAILED,
+                                    duration_sec=round(time.time() - start, 2),
+                                    message=f"读取/校验快照清单失败: {str(e)[:200]}")
+        else:
+            pairs.append((src_collection, target, backup_path))
+
+        restored, errors = [], []
+        # Qdrant 官方：priority=snapshot 以快照内容为准覆盖目标 collection
+        UPLOAD_URL = (f"{base}/collections/{{t}}/snapshots/upload"
+                      "?priority=snapshot&wait=true")
+        for src, tgt, fp in pairs:
+            try:
+                bname = os.path.basename(fp)
+                body, ctype = _multipart_body("snapshot", bname, fp)
+                _http("POST", UPLOAD_URL.format(t=tgt),
+                      headers=dict(headers, **{"Content-Type": ctype}),
+                      data=body, timeout=_SNAPSHOT_TIMEOUT)
+                restored.append(tgt)
+            except Exception as e:
+                errors.append(f"{tgt}: {str(e)[:150]}")
+        if not restored:
             return BackupResult(success=False, status=BackupStatus.FAILED,
                                 duration_sec=round(time.time() - start, 2),
-                                message=f"Qdrant 快照恢复失败（{target}）: {str(e)[:200]}")
-        # 恢复后校验 collection 状态
-        status_info = ""
-        try:
-            _, body = _http("GET", f"{base}/collections/{target}",
-                            headers=headers)
-            res = (json.loads(body).get("result") or {})
-            status_info = f"status={res.get('status')} points={res.get('points_count')}"
-        except Exception:
-            pass
-        return BackupResult(success=True, status=BackupStatus.SUCCESS,
-                            duration_sec=round(time.time() - start, 2),
-                            message=f"Qdrant 快照已恢复到 collection「{target}」"
-                                    f"（{status_info or '状态未确认'}）")
+                                message="Qdrant 快照恢复全部失败: " + "；".join(errors)[:300])
+        # 恢复后逐集合校验状态
+        status_parts = []
+        for tgt in restored:
+            try:
+                _, body = _http("GET", f"{base}/collections/{tgt}",
+                                headers=headers)
+                res = (json.loads(body).get("result") or {})
+                status_parts.append(f"{tgt}:status={res.get('status')},"
+                                    f"points={res.get('points_count')}")
+            except Exception:
+                status_parts.append(f"{tgt}:状态未确认")
+        msg = (f"Qdrant 快照已恢复到 {len(restored)} 个 collection"
+               f"（{'、'.join(status_parts)}；priority=snapshot）")
+        if errors:
+            msg += f"；{len(errors)} 个失败: " + "；".join(errors)[:200]
+        return BackupResult(success=not errors,
+                            status=BackupStatus.SUCCESS if not errors else BackupStatus.FAILED,
+                            duration_sec=round(time.time() - start, 2), message=msg)
 
     # ---------------- 校验 ----------------
     def verify_record(self, record) -> BackupResult:
@@ -246,13 +304,44 @@ class QdrantEngine(BackupEngine):
             ok = any("storage" in m or "collection" in m for m in members)
             if not ok and members:
                 ok = True   # 版本差异：目录结构可能变化，能解析 tar 即视为结构有效
-            return BackupResult(success=bool(ok),
-                                message=f"Qdrant 快照校验通过：tar 可解析，"
-                                        f"含 {len(members)}+ 成员（{members[:3]}…）"
-                                if ok else "快照 tar 内未找到 collection 存储结构")
+            if not ok:
+                return BackupResult(success=False,
+                                    message="快照 tar 内未找到 collection 存储结构")
         except Exception as e:
             return BackupResult(success=False,
                                 message=f"快照不是有效归档: {str(e)[:200]}")
+        # 深度校验：清单里每个快照的 sha256 必须与实际文件一致（此前只查 tar 头，
+        # 产物被篡改/截断仍报"通过"）。无清单兼容老记录，如实标注未做哈希核对。
+        manifest_path = path + "_manifest.json"
+        if not os.path.isfile(manifest_path):
+            return BackupResult(success=True,
+                                message=(f"Qdrant 快照 tar 结构校验通过（{len(members)} 成员）；"
+                                         "无清单，未做 sha256 哈希核对（老记录兼容）"))
+        try:
+            with open(manifest_path, encoding="utf-8") as mf:
+                pieces = json.load(mf).get("collections") or []
+            out_dir = os.path.dirname(path)
+            mismatches, checked = [], 0
+            for piece in pieces:
+                want = piece.get("sha256") or ""
+                fp = os.path.join(out_dir, piece.get("file") or "")
+                if not want or not os.path.isfile(fp):
+                    mismatches.append(f"{piece.get('collection')}:文件缺失或无基线")
+                    continue
+                got = db.sha256_file(fp)
+                checked += 1
+                if want != got:
+                    mismatches.append(f"{piece.get('collection')}:sha 不符")
+            if mismatches:
+                return BackupResult(success=False,
+                                    message="Qdrant 快照完整性校验失败: "
+                                            + "；".join(mismatches)[:300])
+            return BackupResult(success=True,
+                                message=(f"Qdrant 快照校验通过：tar 结构有效 + "
+                                         f"{checked} 个 collection sha256 全部匹配"))
+        except Exception as e:
+            return BackupResult(success=False,
+                                message=f"读取快照清单校验失败: {str(e)[:200]}")
 
     # ---------------- 枚举 collections（任务表单拉库列表） ----------------
     def list_databases(self) -> list:

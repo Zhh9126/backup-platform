@@ -1362,6 +1362,16 @@ class BackupEngine:
                             and p not in seen):
                         cands.append(p)
                         seen.add(p)
+        # ToolPack 随包工具兜底（离线包 tools/<group>/bin，如 mongodb/bin/mongodump）
+        try:
+            from core import toolpack
+            for n in names:
+                p = toolpack.local_path(n)
+                if p and p not in seen:
+                    cands.append(p)
+                    seen.add(p)
+        except Exception:
+            pass
         if not cands:
             return names[0] if names else ""
         if len(cands) == 1:

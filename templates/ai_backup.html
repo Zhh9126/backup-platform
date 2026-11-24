@@ -22,6 +22,24 @@
   <div id="aiPlanTable" class="table-responsive"></div>
 </div>
 
+<div class="page-card mt-3">
+  <div class="page-head">
+    <div>
+      <h2 class="page-title"><i class="bi bi-diagram-3"></i> RAG 知识库备份</h2>
+      <div class="page-sub">向量库快照只保住索引层——这里额外锁定 embedding 模型版本 / 向量维度 / 分块规则，固化质量基线，恢复前拦截配置漂移（防"恢复了却静默答错"）</div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="openRagKbModal()"><i class="bi bi-plus-lg"></i> 新建知识库</button>
+      <button class="btn btn-outline-secondary" onclick="loadRagKbs()"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+    </div>
+  </div>
+  <div class="alert alert-light border small mb-3">
+    <b>怎么备份 RAG：</b>①向量索引任务（Qdrant/Chroma）保住 HNSW 二进制；②原始文档任务（文件/对象存储）保住可重建源；
+    ③<b>本页锁定 embedding 配置指纹</b>——模型版本/维度/分块任一漂移，恢复后检索结果会变。备份前点「固化基线」，恢复前点「恢复校验」。
+  </div>
+  <div id="ragKbTable" class="table-responsive"></div>
+</div>
+
 <!-- 新建/编辑计划 -->
 <div class="modal fade" id="aiPlanModal" tabindex="-1">
   <div class="modal-dialog modal-lg">
@@ -108,6 +126,63 @@
   </div>
 </div>
 
+<!-- RAG 知识库编辑 -->
+<div class="modal fade" id="ragKbModal" tabindex="-1">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="ragKbTitle">新建 RAG 知识库</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="mb-2">
+          <label class="form-label">知识库名称 *</label>
+          <input class="form-control" id="rag_name" placeholder="如：客服知识库-prod">
+        </div>
+        <div class="row g-2">
+          <div class="col-md-6">
+            <label class="form-label small">向量索引备份任务（Qdrant/Chroma）*</label>
+            <select class="form-select form-select-sm" id="rag_vector_task"></select>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label small">原始文档备份任务（文件/对象存储，可选）</label>
+            <select class="form-select form-select-sm" id="rag_doc_task"></select>
+          </div>
+        </div>
+        <div class="row g-2 mt-2">
+          <div class="col-md-4"><label class="form-label small">Embedding 模型</label>
+            <input class="form-control form-control-sm" id="rag_embed_model" placeholder="如 text-embedding-3-large"></div>
+          <div class="col-md-3"><label class="form-label small">模型版本</label>
+            <input class="form-control form-control-sm" id="rag_embed_version" placeholder="如 v2 / 2024-01"></div>
+          <div class="col-md-2"><label class="form-label small">向量维度</label>
+            <input class="form-control form-control-sm" id="rag_embed_dim" type="number" placeholder="1536"></div>
+          <div class="col-md-3"><label class="form-label small">距离度量</label>
+            <input class="form-control form-control-sm" id="rag_distance" placeholder="Cosine / Euclid / Dot"></div>
+        </div>
+        <div class="row g-2 mt-2">
+          <div class="col-md-3"><label class="form-label small">分块大小(chunk_size)</label>
+            <input class="form-control form-control-sm" id="rag_chunk_size" type="number" placeholder="512"></div>
+          <div class="col-md-3"><label class="form-label small">重叠(overlap)</label>
+            <input class="form-control form-control-sm" id="rag_chunk_overlap" type="number" placeholder="64"></div>
+          <div class="col-md-3"><label class="form-label small">分块策略</label>
+            <input class="form-control form-control-sm" id="rag_chunk_strategy" placeholder="recursive / fixed"></div>
+          <div class="col-md-3"><label class="form-label small">top-k</label>
+            <input class="form-control form-control-sm" id="rag_top_k" type="number" placeholder="5"></div>
+        </div>
+        <div class="form-check form-switch mt-2">
+          <input class="form-check-input" type="checkbox" id="rag_strict" checked>
+          <label class="form-check-label small" for="rag_strict">严格版本校验（配置漂移时拒绝恢复，强烈建议开启）</label>
+        </div>
+        <div class="text-danger small mt-2" id="rag_kb_msg"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-primary" onclick="saveRagKb()">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- 运行报告 -->
 <div class="modal fade" id="aiReportModal" tabindex="-1">
   <div class="modal-dialog modal-lg">
@@ -126,6 +201,7 @@
 <script>
 (async function () {
   await window.loadAiPlans();
+  if (window.loadRagKbs) await window.loadRagKbs();
 })();
 </script>
 {% endblock %}

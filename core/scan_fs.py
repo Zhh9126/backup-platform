@@ -480,48 +480,136 @@ def scan_instances(task: dict) -> dict:
 
 
 def pull_objects(task: dict, paths: list, dest_dir: str = "",
-                 max_bytes: int = 2 * 1024 ** 3) -> dict:
-    """按扫描清单经 SFTP 拉回平台暂存目录，并逐文件计算 sha256。"""
+                 max_bytes: int = 2 * 1024 ** 3,
+                 resume: bool = True, stable_root: bool = True) -> dict:
+    """按扫描清单经 SFTP 拉回平台暂存目录，逐文件 sha256 + 断点续传。
+
+    2026-11-24 完善（特殊恢复能力达标）：
+    - 旧实现静默 ``paths[:500]`` 截断，用户以为全拉回来了——现在超限
+      直接报错，由调用方分批；
+    - 加断点续传：固定目标路径 ``scan_fs_restore/<host>/<hash>__<name>.part``
+      + sidecar 记录远端 size/mtime，中断后同路径重跑从已传字节继续；
+    - ``ok`` 反映真实结果（全部失败=False），不再恒 True；
+    - 逐文件 sha256 落 sidecar，恢复前可核对完整性。
+    """
     import hashlib
+    import json as _json
     import time
 
+    MAX_FILES = 500
     paths = [str(p) for p in (paths or []) if str(p).startswith("/")]
     if not paths:
         raise ScanFSError("paths 不能为空且必须是绝对路径")
-    root = dest_dir or os.path.join(
-        str(os.environ.get("BACKUP_ROOT") or "/tmp"), "scan_fs_restore")
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    dest = os.path.join(root, stamp)
-    os.makedirs(dest, exist_ok=True)
+    if len(paths) > MAX_FILES:
+        raise ScanFSError(
+            "本次选择 %d 个文件，超过单次上限 %d——请分批拉回，"
+            "避免静默丢弃" % (len(paths), MAX_FILES))
+
+    # 稳定目标目录（默认按主机聚合，断点续传才有意义；旧的按时间戳目录
+    # 每次新建，.part 永远命中不了）
+    if stable_root:
+        host_tag = re.sub(r"[^A-Za-z0-9_.-]", "_",
+                          str((task or {}).get("host") or "host"))[:64]
+        root = dest_dir or os.path.join(
+            str(os.environ.get("BACKUP_ROOT") or "/tmp"),
+            "scan_fs_restore", host_tag)
+    else:
+        root = dest_dir or os.path.join(
+            str(os.environ.get("BACKUP_ROOT") or "/tmp"), "scan_fs_restore")
+    os.makedirs(root, exist_ok=True)
     cli = _client(task)
-    pulled, failures, total = [], [], 0
+    pulled, failures, total, resumed_count = [], [], 0, 0
+    sftp = None
     try:
         sftp = cli.open_sftp()
-        for src in paths[:500]:
+        for _idx, src in enumerate(paths):
             base = os.path.basename(src.rstrip("/")) or "object"
-            local = os.path.join(dest, f"{len(pulled):04d}__{base}")
+            digest_name = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
+            stem = f"{digest_name}__{base}"
+            final = os.path.join(root, stem)
+            part = final + ".part"
+            meta_path = final + ".meta.json"
             try:
                 st = sftp.stat(src)
                 if total + (st.st_size or 0) > max_bytes:
-                    failures.append({"path": src, "error": "超过本次拉取字节上限"})
+                    failures.append({
+                        "path": src,
+                        "error": "超过本次拉取字节上限 %d（本文件 %d B），"
+                                 "请调大 max_bytes 或分批" % (max_bytes, st.st_size or 0)})
                     continue
-                sftp.get(src, local)
+                offset = 0
+                meta = {}
+                if resume and os.path.isfile(meta_path):
+                    try:
+                        with open(meta_path, "r", encoding="utf-8") as mf:
+                            meta = _json.load(mf)
+                    except Exception:
+                        meta = {}
+                    if (meta.get("remote") == src
+                            and meta.get("size") == st.st_size
+                            and abs((meta.get("mtime") or 0) - (st.st_mtime or 0)) < 2
+                            and os.path.isfile(part)):
+                        offset = min(os.path.getsize(part), st.st_size or 0)
+                        resumed_count += 1
+                # 源未变且已完整落盘 → 直接复用（重算 sha 核对）
+                if (os.path.isfile(final)
+                        and meta.get("remote") == src
+                        and meta.get("size") == st.st_size
+                        and meta.get("sha256")):
+                    size = os.path.getsize(final)
+                    total += size
+                    pulled.append({"source": src, "local": final, "size": size,
+                                   "sha256": meta["sha256"], "cached": True})
+                    continue
+
+                # 流式续传：远端从 offset 开始读，本地 append，零整包内存
+                mode = "ab" if offset else "wb"
+                with open(part, mode) as fo:
+                    with sftp.open(src, "rb") as fi:
+                        fi.seek(offset)
+                        while True:
+                            chunk = fi.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            fo.write(chunk)
+                os.replace(part, final)
                 h = hashlib.sha256()
-                with open(local, "rb") as f:
+                with open(final, "rb") as f:
                     for chunk in iter(lambda: f.read(1024 * 1024), b""):
                         h.update(chunk)
-                size = os.path.getsize(local)
+                size = os.path.getsize(final)
+                if size != (st.st_size or 0):
+                    failures.append({
+                        "path": src,
+                        "error": "拉回大小不符: 本地 %d B / 远端 %d B" % (
+                            size, st.st_size or 0)})
+                    continue
                 total += size
-                pulled.append({"source": src, "local": local,
-                               "size": size, "sha256": h.hexdigest()})
+                sha = h.hexdigest()
+                with open(meta_path, "w", encoding="utf-8") as mf:
+                    _json.dump({"remote": src, "size": size,
+                                "mtime": st.st_mtime or 0, "sha256": sha,
+                                "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S")},
+                               mf, ensure_ascii=False)
+                pulled.append({"source": src, "local": final, "size": size,
+                               "sha256": sha, "cached": False,
+                               "resumed_from": offset if offset else None})
             except Exception as e:
                 failures.append({"path": src, "error": str(e)[:200]})
-        sftp.close()
     finally:
+        if sftp is not None:
+            try:
+                sftp.close()
+            except Exception:
+                pass
         try:
             cli.close()
         except Exception:
             pass
-    return {"ok": True, "dest": dest, "pulled": pulled,
-            "pulled_count": len(pulled), "bytes": total,
-            "failures": failures}
+    return {
+        "ok": bool(pulled) and not failures,
+        "dest": root, "pulled": pulled,
+        "pulled_count": len(pulled), "failed_count": len(failures),
+        "resumed_count": resumed_count, "bytes": total,
+        "failures": failures,
+    }

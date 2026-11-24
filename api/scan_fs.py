@@ -8,7 +8,7 @@ import json
 
 from flask import request, jsonify
 
-from auth import login_required
+from auth import login_required, permission_required
 from . import api_bp
 from core import models, oracle_discover, scan_fs
 
@@ -64,6 +64,7 @@ def scan_fs_instances():
 
 @api_bp.route("/scan-fs/pull", methods=["POST"])
 @login_required
+@permission_required("backup.task.manage")
 def scan_fs_pull():
     """按扫描清单把选定对象经 SFTP 拉回平台暂存目录。"""
     data = request.get_json(force=True, silent=True) or {}
@@ -72,7 +73,9 @@ def scan_fs_pull():
         return jsonify(scan_fs.pull_objects(
             task, paths=data.get("paths") or [],
             dest_dir=str(data.get("dest_dir") or ""),
-            max_bytes=int(data.get("max_bytes") or 2 * 1024 ** 3)))
+            max_bytes=int(data.get("max_bytes") or 2 * 1024 ** 3),
+            resume=bool(data.get("resume", True)),
+            stable_root=bool(data.get("stable_root", True))))
     except (ValueError, TypeError) as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 

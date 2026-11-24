@@ -76,5 +76,6 @@ def test_page_and_menu_renamed():
     base = (Path(__file__).resolve().parents[1] / "templates" / "base.html").read_text(encoding="utf-8")
     page = (Path(__file__).resolve().parents[1] / "templates" / "scan_fs.html").read_text(encoding="utf-8")
     assert "特殊恢复" in base and "无备份救援（特殊恢复）" not in base
-    assert "NAS存储" in base and "NAS 存储（群晖）" not in base
+    # 2026-11-24：NAS 菜单现文案为「NAS备份」（历史断言「NAS存储」已过期）
+    assert "NAS备份" in base and "NAS 存储（群晖）" not in base
     assert "特殊恢复" in page and "无备份救援" not in page

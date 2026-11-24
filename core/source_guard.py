@@ -35,9 +35,14 @@ DEFAULTS = {
     "source_guard_throttle_pct": "50",
     "source_guard_throttle_kbps": "51200",  # 50 MB/s（KB/s 口径，与任务字段一致）
     "source_guard_parallel": "2",
+    # 高负载时自动切"块级位图增量"模式（需目标机部署统一 Agent 且
+    # block-cdp 插件可用；无 Agent 时降级为降并行+限速，不虚报 CBT）
+    "source_guard_cdp_mode": "1",
+    "source_guard_cdp_agent_id": "0",   # 0=自动按 host 匹配纳管 Agent
 }
 _NUM_KEYS = ("source_guard_block_pct", "source_guard_throttle_pct",
-             "source_guard_throttle_kbps", "source_guard_parallel")
+             "source_guard_throttle_kbps", "source_guard_parallel",
+             "source_guard_cdp_agent_id")
 
 # 一次 SSH 会话内完成双采样，避免两次握手放大抖动
 _PROBE = (
@@ -67,9 +72,10 @@ def get_config() -> dict:
 def set_config(data: dict) -> dict:
     """写入配置；非法数值拒绝，enabled 只接受 0/1。"""
     data = data or {}
-    if "source_guard_enabled" in data:
-        on = str(data["source_guard_enabled"]).strip().lower() in ("1", "true", "on", "yes")
-        db.set_system_config("source_guard_enabled", "1" if on else "0")
+    for flag in ("source_guard_enabled", "source_guard_cdp_mode"):
+        if flag in data:
+            on = str(data[flag]).strip().lower() in ("1", "true", "on", "yes")
+            db.set_system_config(flag, "1" if on else "0")
     for k in _NUM_KEYS:
         if k not in data:
             continue
@@ -255,12 +261,42 @@ def evaluate(task: dict, force: bool = False, sample: dict = None) -> dict:
                 "message": f"源端 CPU {pct}% > 拒绝阈值 {block}%，为保护生产系统拒绝本次备份"}
     if pct >= throttle:
         _mark_throttled(int(float(cfg["source_guard_parallel"])))
+        # 高负载自适应：优先切块级位图增量模式（只传变更块，生产 I/O 最小），
+        # 该模式需目标机统一 Agent + block-cdp 插件；无 Agent 时如实降级为
+        # 降并行+限速，绝不虚报已切 CBT（CBT 需写入期 hypervisor 跟踪）。
+        cdp_mode = False
+        cdp_reason = ""
+        if cfg.get("source_guard_cdp_mode", "1") == "1":
+            try:
+                from core import agent_hosts
+                from core.agent_client import AgentTransport
+                aid = int(float(cfg.get("source_guard_cdp_agent_id") or 0))
+                rec = (agent_hosts.get_by_id(aid) if aid else
+                       agent_hosts.get_by_host(str(task.get("host") or "")))
+                if rec:
+                    full = agent_hosts.get_by_id(int(rec["id"])) or rec
+                    cli = AgentTransport(str(full.get("hostname")),
+                                         int(full.get("port") or 8466),
+                                         agent_hosts.get_token(full),
+                                         label=str(full.get("name") or "agent"))
+                    cdp_mode = any(
+                        p.get("name") == "block-cdp" and p.get("supported")
+                        for p in cli.plugins())
+                    cdp_reason = ("统一 Agent block-cdp 可用，切块级位图增量"
+                                  if cdp_mode else "Agent 无 block-cdp 能力")
+                else:
+                    cdp_reason = "无纳管 Agent，保持降并行+限速"
+            except Exception as e:
+                cdp_reason = "Agent 能力探测失败: %s" % str(e)[:60]
         return {**base, "level": "throttle",
                 "throttle_kbps": int(float(cfg["source_guard_throttle_kbps"])),
                 "parallel": int(float(cfg["source_guard_parallel"])),
+                "cdp_bitmap_mode": cdp_mode,
+                "cdp_mode_reason": cdp_reason,
                 "message": (f"源端 CPU {pct}% 处于 {throttle}~{block}%，"
                             f"自动降并行至 {cfg['source_guard_parallel']} 并限速 "
-                            f"{cfg['source_guard_throttle_kbps']} KB/s")}
+                            f"{cfg['source_guard_throttle_kbps']} KB/s"
+                            + (f"；{cdp_reason}" if cdp_reason else ""))}
     return {**base, "level": "ok",
             "message": f"源端 CPU {pct}% 正常（< {throttle}%）"}
 

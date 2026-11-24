@@ -55,7 +55,19 @@ try:
 except Exception:
     _HAS_AES = False
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"  # 1.3.0: 统一插件框架（block-cdp / bmr / app-dr 多能力单 Agent）
+
+# 统一插件集（与 backup_agent.py 一起打成单文件；离线可用、零外部依赖）
+try:
+    from plugins import describe as _plugin_describe, invoke as _plugin_invoke
+    _HAS_PLUGINS = True
+except Exception:
+    _HAS_PLUGINS = False
+    _plugin_describe = lambda state=None: []
+    def _plugin_invoke(name, action, params, state=None):
+        return {"ok": False, "error": "插件模块未随 Agent 打包"}
+
+
 MAX_BODY = 16 * 1024 * 1024      # 请求体上限（JSON/分块上传均远小于此）
 MAX_SYNC_OUT = 16 * 1024 * 1024          # /exec 同步输出上限（超出建议 exec-stream）
 CHUNK = 512 * 1024                        # 流式块大小
@@ -272,7 +284,11 @@ class Handler(BaseHTTPRequestHandler):
                     # 老版本插件不自报该特性时平台自动降级为大小校验。
                     "integrity": ["sha256"],
                     "features": ["exec", "exec-stream", "file-put", "file-get",
-                                 "cancel", "resume", "fs", "fs-digest"],
+                                 "cancel", "resume", "fs", "fs-digest", "plugin"],
+                    # 统一插件能力自报：一个 Agent 支撑多块能力（块级 CDP /
+                    # BMR / 应用整机），每项带 supported 与原因，不虚报
+                    "plugins": _plugin_describe(AgentState) if _HAS_PLUGINS else [],
+                    "plugin_api": "1.0" if _HAS_PLUGINS else "",
                 }
                 self._respond(200, caps)
                 return
@@ -300,6 +316,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._exec_stream()
             elif path == "/fs":
                 self._fs()
+            elif path == "/plugin":
+                self._plugin_invoke()
             else:
                 self._respond(404, {"error": "not found"})
         except (BrokenPipeError, ConnectionResetError):
@@ -571,6 +589,29 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(("%x\r\n" % len(data)).encode() + data + b"\r\n")
         else:
             self.wfile.write(b"0\r\n\r\n")
+
+    # ---------- 4.5) 统一插件路由（一个 Agent 多能力） ----------
+    def _plugin_invoke(self):
+        """POST /plugin {plugin, action, params} → 插件结果。
+
+        与 exec/fs 共用 token+envelope 认证；插件内部按路径白名单约束，
+        不支持的能力如实返回 unsupported，绝不伪装成功。
+        """
+        req = _open_envelope(AgentState.key, self._read_body())
+        name = str(req.get("plugin") or "")
+        action = str(req.get("action") or "")
+        params = req.get("params") or {}
+        if not name or not action:
+            self._respond(400, {"ok": False, "error": "plugin/action 必填"})
+            return
+        # 插件可能操作路径：统一做白名单前置校验（若带 path/out/device 等）
+        for k in ("path", "out", "device", "target_device"):
+            v = params.get(k)
+            if isinstance(v, str) and v and not v.startswith("/dev/"):
+                if not AgentState.path_allowed(v):
+                    raise PermissionError("插件参数 %s 路径不在白名单: %s" % (k, v))
+        result = _plugin_invoke(name, action, params, AgentState)
+        self._respond(200 if result.get("ok") else 400, result)
 
     # ---------- 5) 文件系统操作（remove/rename/mkdir） ----------
     def _fs(self):

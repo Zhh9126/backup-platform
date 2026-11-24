@@ -140,14 +140,24 @@ class MongoEngine(BackupEngine):
         ts = self._timestamp()
         target_dir = os.path.join(out_dir, ts)
 
+        # 本机工具解析：ToolPack 随包 mongodump（tools/mongodb/bin）兜底，
+        # 避免"平台未装 mongodb-database-tools"就误判失败。
+        mongodump_bin = self._resolve_local_tool("mongodump")
         cmd = [
-            "mongodump",
+            mongodump_bin,
             "--host", str(host),
             "--port", str(port),
             "--username", str(username),
             "--password", str(password),
-            "--db", str(db_name),
         ]
+        # oplog 时点恢复前置：显式开启时整库导出并加 --oplog（与 --db 互斥），
+        # 产物内多 oplog.bson，恢复侧用 --oplogReplay/--oplogLimit 回放。
+        opts = self._parse_extra_options()
+        oplog_on = bool(opts.get("oplog")) or bool(self.task.get("oplog_capture"))
+        if oplog_on:
+            cmd.append("--oplog")
+        else:
+            cmd += ["--db", str(db_name)]
         # Mongo 惯例：密码以 --password 参数明文传入命令行
         cmd = self._build_auth_args(cmd)
 
@@ -293,8 +303,9 @@ class MongoEngine(BackupEngine):
         else:
             restore_archive = backup_path
 
+        mongorestore_bin = self._resolve_local_tool("mongorestore")
         cmd = [
-            "mongorestore",
+            mongorestore_bin,
             "--host", str(host),
             "--port", str(port),
             "--username", str(username),
@@ -312,6 +323,36 @@ class MongoEngine(BackupEngine):
             cmd += ["--drop", "--archive=%s" % restore_archive]
         else:
             cmd += ["--db", str(target_db), "--drop", restore_archive]
+
+        # 恢复选项细化：oplog 时点恢复（需求「Mongo oplog 时点」）。
+        # mongodump --oplog 产物需 --oplogReplay；--oplogLimit 用 BSON timestamp
+        # "<seconds>:<ordinal>" 截断到指定时点。两者必须由调用方显式指定，
+        # 平台不猜测时点（诚实边界：需配合备份时开启 --oplog）。
+        oplog_replay = bool(kwargs.get("oplog_replay"))
+        oplog_limit = str(kwargs.get("oplog_limit") or "").strip()
+        if oplog_replay or oplog_limit:
+            # mongorestore 硬约束：--oplogReplay 不能与 --nsFrom/--nsTo 同用
+            # （官方报错 "cannot use --oplogReplay with namespace renames specified"）。
+            # 异名库 + 时点恢复是语义冲突，必须在构造命令前显式拒绝，而不是
+            # 发出一条必然失败的命令让用户看 rc=1。正确做法：恢复到源同名库
+            # 做 oplog 回放，需要异名时再在库内 rename collection。
+            if is_archive and target_db and db_name and target_db != db_name:
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path,
+                    message=("Mongo oplog 时点恢复不支持异名库：mongorestore 的 "
+                             "--oplogReplay 与 --nsFrom/--nsTo 互斥。请先恢复到"
+                             "源同名库 %s 做时点回放，再按需 rename collection；"
+                             "或将备份与恢复目标库设为同名。" % db_name))
+            if not re.match(r"^\d+(:\d+)?$", oplog_limit or "0"):
+                return BackupResult(
+                    success=False, status=BackupStatus.FAILED,
+                    backup_path=backup_path,
+                    message="oplog_limit 格式须为 <seconds> 或 <seconds>:<ordinal>"
+                            "（BSON 时间戳，如 1700000000:1）")
+            cmd.append("--oplogReplay")
+            if oplog_limit:
+                cmd += ["--oplogLimit", oplog_limit]
         cmd = self._build_auth_args(cmd)
 
         # 4. 执行命令（目录格式用完即清理临时解压目录）

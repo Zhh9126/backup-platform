@@ -105,6 +105,7 @@ SEGMENT_PERMS = {
     "agent": "agent.use",
     "agents": "agent.use",
     "ai-plans": "agent.use",
+    "rag-kb": "agent.use",
     "alerts": "alert.manage",
     "notify-config": "alert.manage",
     "logs": "system.settings",

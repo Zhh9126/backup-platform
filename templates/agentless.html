@@ -118,6 +118,13 @@
         </div>
       </div>
     </div>
+    <div class="mt-3 border-top pt-3">
+      <div class="d-flex justify-content-between align-items-center mb-2">
+        <div class="fw-bold"><i class="bi bi-puzzle me-1"></i>统一插件能力（一个 Agent 支撑多块能力）</div>
+        <button class="btn btn-sm btn-outline-info" onclick="loadAgentPlugins()">刷新插件能力</button>
+      </div>
+      <div id="agentPluginList" class="small text-muted">点击「刷新插件能力」查看各 Agent 的 block-cdp / bmr / app-dr 支持状态。</div>
+    </div>
   </div>
 </div>
 
@@ -203,6 +210,32 @@
     return d;
   }
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  // 统一 Agent 插件能力（block-cdp / bmr / app-dr，一个 Agent 多能力）
+  window.loadAgentPlugins = async function () {
+    const box = document.getElementById("agentPluginList");
+    if (!box) return;
+    box.innerHTML = "加载中…";
+    try {
+      const d = await api("GET", "/api/agent-plugins");
+      const agents = d.agents || [];
+      if (!agents.length) { box.innerHTML = "尚未纳管 Agent。"; return; }
+      box.innerHTML = agents.map(a => {
+        const plugins = (a.plugins || []).map(p => {
+          const badge = p.supported
+            ? '<span class="badge bg-success">支持</span>'
+            : '<span class="badge bg-secondary" title="' + esc(p.reason) + '">不支持</span>';
+          return '<div class="mb-1">' + badge + ' <b>' + esc(p.name) + '</b> v' +
+            esc(p.version) + ' <span class="text-muted">(' + esc((p.actions || []).join(", ")) + ')</span>' +
+            (p.supported ? '' : ' <span class="text-muted">' + esc(p.reason) + '</span>') + '</div>';
+        }).join("");
+        return '<div class="border rounded p-2 mb-2"><b>' + esc(a.name || a.hostname) +
+          '</b> <span class="text-muted">' + esc(a.hostname) + ':' + esc(a.port) +
+          ' · v' + esc(a.agent_version) + '</span>' +
+          (a.error ? '<div class="text-danger">' + esc(a.error) + '</div>' : plugins) + '</div>';
+      }).join("");
+    } catch (e) { box.textContent = "加载失败: " + e.message; }
+  };
 
   window.loadAll = async function () {
     const [tasks, caps] = await Promise.all([api("GET", "/api/v1/agentless/tasks"), api("GET", "/api/v1/capabilities")]);

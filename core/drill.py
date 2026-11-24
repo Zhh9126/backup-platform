@@ -261,6 +261,99 @@ def _drop_drill_db(task: dict, drill_db: str, password: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# 第三台主机恢复演练（容灾一体机需求：恢复到独立主机验证一致性，不碰生产源）
+# ---------------------------------------------------------------------------
+
+def _remote_mysql_exec(host_info: dict, sql: str, timeout: int = 30) -> tuple:
+    """在纳管主机上经 SSH 执行 mysql SQL（零安装：用目标机自带客户端）。
+
+    SQL 经 SFTP 写临时文件再重定向输入，避免多层引号嵌套（历史教训：
+    SSH 远端 SQL 引号嵌套必翻车）。返回 (stdout, stderr, rc)。
+    """
+    from core import remote_dump
+    from core.engines.file import _ssh_exec_pipe
+    import shlex as _shlex
+    client = remote_dump._connect_isolated(host_info)
+    rf = "/tmp/.aidbm_drill_%d.sql" % (int(time.time() * 1000) % 100000000)
+    try:
+        sftp = client.open_sftp()
+        try:
+            with sftp.open(rf, "w") as f:
+                f.write(sql)
+        finally:
+            sftp.close()
+        shell = ("bash -lc 'MYSQL=$(command -v mysql || ls /opt/mysql*/bin/mysql 2>/dev/null | head -1); "
+                 "\"$MYSQL\" --no-defaults -u%s -p%s < %s 2>&1'"
+                 % (_shlex.quote(str(host_info.get("username") or "root")),
+                    _shlex.quote(str(host_info.get("password") or "")), rf))
+        return _ssh_exec_pipe(client, shell, timeout=timeout)
+    finally:
+        try:
+            client.exec_command("rm -f %s" % rf)
+        except Exception:
+            pass
+        client.close()
+
+
+def _drill_verify_rows_remote(task: dict, host_info: dict, drill_db: str,
+                              password: str) -> tuple:
+    """跨主机演练校验：源库在源主机查、演练库在第三台主机查，逐表行数比对。"""
+    import pymysql
+    rows, issues = [], []
+    match_all = True
+    try:
+        conn = pymysql.connect(
+            host=str(task.get("host") or "127.0.0.1"),
+            port=int(task.get("port") or 3306),
+            user=str(task.get("username") or "root"),
+            password=password or "", charset="utf8mb4", connect_timeout=10)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema=%s AND table_type='BASE TABLE' ORDER BY table_name",
+                (task.get("db_name"),))
+            tables = [r[0] for r in cur.fetchall()]
+        with conn.cursor() as cur:
+            src_counts = {}
+            for t in tables:
+                cur.execute("SELECT COUNT(*) FROM `%s`.`%s`" % (
+                    task.get("db_name").replace("`", "``"), t.replace("`", "``")))
+                src_counts[t] = int(cur.fetchone()[0])
+        conn.close()
+
+        # 第三台主机：一次性 SQL 输出演练库逐表行数（按表名 TSV）
+        sql = ("SELECT table_name, table_rows FROM information_schema.tables "
+               "WHERE table_schema='%s' AND table_type='BASE TABLE';\n"
+               % drill_db.replace("'", "''"))
+        for t in tables:
+            sql += "SELECT '%s', COUNT(*) FROM `%s`.`%s`;\n" % (
+                t.replace("'", "''"), drill_db.replace("`", "``"),
+                t.replace("`", "``"))
+        out, err, rc = _remote_mysql_exec(host_info, sql, timeout=60)
+        text = out.decode("utf-8", "replace") if isinstance(out, bytes) else (out or "")
+        counts = {}
+        for line in text.splitlines():
+            parts = line.strip().split("\t")
+            if len(parts) >= 2 and parts[0]:
+                try:
+                    counts[parts[0]] = int(parts[1])
+                except ValueError:
+                    pass
+        for t in tables:
+            dcount = counts.get(t)
+            ok = (dcount == src_counts.get(t))
+            if not ok:
+                match_all = False
+            rows.append({"table": t, "source": src_counts.get(t),
+                         "drill": dcount if dcount is not None else "missing",
+                         "match": ok})
+    except Exception as e:
+        issues.append("跨主机行数校验异常: %s" % str(e)[:150])
+        match_all = False
+    return rows, match_all, issues
+
+
 def _run_real_restore_drill(d: dict, drill_id: int) -> dict:
     """真实恢复演练：真恢复到演练专用临时库 → 行数校验 → 评分 → 销毁。
 
@@ -275,6 +368,9 @@ def _run_real_restore_drill(d: dict, drill_id: int) -> dict:
     report_extra = {"mode": "real"}
     status = "failed"
     pw_plain = ""
+    # 第三台主机演练：scenario.target_host_id（纳管主机 ID）在 try 内解析
+    target_host_id = 0
+    target_host_info = None
     # 必须在外层 try 之前初始化：_pick_latest_restore_record / import scheduler
     # 等任一步抛异常都会走 except 兜底，那里要读 created_ok 决定是否销毁临时库。
     # 此前只在内层赋初值，早异常触发 UnboundLocalError 使演练永久 running（P1-11）。
@@ -309,6 +405,31 @@ def _run_real_restore_drill(d: dict, drill_id: int) -> dict:
         if not task.get("db_name"):
             return _finish(0, "failed", ["任务未指定源库（db_name）"], report_extra)
 
+        # 第三台主机演练：scenario.target_host_id=纳管主机 ID（独立于源端）
+        _scenario = d.get("scenario") or {}
+        if isinstance(_scenario, str):
+            try:
+                _scenario = json.loads(_scenario)
+            except Exception:
+                _scenario = {}
+        target_host_id = int(_scenario.get("target_host_id") or 0)
+        if target_host_id:
+            from core import ssh_hosts as _ssh_hosts
+            target_host_info = _ssh_hosts.get_host(target_host_id, include_secret=True)
+            if not target_host_info:
+                report_extra["mode"] = "real_remote"
+                return _finish(0, "failed",
+                               ["第三台主机（ID=%s）不存在" % target_host_id],
+                               report_extra)
+            if target_host_info.get("protected"):
+                return _finish(0, "failed",
+                               ["第三台主机已被标记为受保护资源，禁止作为演练目标"],
+                               report_extra)
+            report_extra.update({
+                "mode": "real_remote", "target_host_id": target_host_id,
+                "target_host": "%s:%s" % (target_host_info.get("hostname"),
+                                          target_host_info.get("port", 22))})
+
         rec, reason = _pick_latest_restore_record(task["id"])
         if not rec:
             return _finish(0, "failed", [reason], report_extra)
@@ -341,26 +462,39 @@ def _run_real_restore_drill(d: dict, drill_id: int) -> dict:
         try:
             import pymysql
             pw_plain = db.decrypt_secret(str(task.get("password") or ""))
-            conn = pymysql.connect(
-                host=str(task.get("host") or "127.0.0.1"),
-                port=int(task.get("port") or 3306),
-                user=str(task.get("username") or "root"),
-                password=pw_plain or "", charset="utf8mb4", connect_timeout=10)
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(f"CREATE DATABASE `{drill_db}` "
-                                "DEFAULT CHARSET utf8mb4")
-                conn.commit()
+            if target_host_info:
+                # 第三台主机通道：演练库建在独立主机，源端生产主机零触碰
+                _create_sql = ("CREATE DATABASE IF NOT EXISTS `%s` "
+                               "DEFAULT CHARSET utf8mb4;\n" % drill_db)
+                _out, _err, _rc = _remote_mysql_exec(
+                    target_host_info, _create_sql, timeout=30)
+                if _rc != 0 and b"ERROR" in (_err or b""):
+                    issues.append("第三台主机建演练库失败: %s" % str(_err)[:150])
+                    return _finish(0, "failed", issues, report_extra)
                 created_ok = True
-            finally:
-                conn.close()
+            else:
+                conn = pymysql.connect(
+                    host=str(task.get("host") or "127.0.0.1"),
+                    port=int(task.get("port") or 3306),
+                    user=str(task.get("username") or "root"),
+                    password=pw_plain or "", charset="utf8mb4", connect_timeout=10)
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(f"CREATE DATABASE `{drill_db}` "
+                                    "DEFAULT CHARSET utf8mb4")
+                    conn.commit()
+                    created_ok = True
+                finally:
+                    conn.close()
 
             # 2) 真实恢复（复用生产恢复通道，走 backup_records 审计）
             # drill_mode：禁止引擎执行 RESET MASTER / GTID 清理——演练恢复
             # 到临时库时不能把生产实例的 binlog 与主从状态一起清掉。
-            result = scheduler.run_restore_now(
-                rec["id"], target_db=drill_db, operator="drill-real",
-                drill_mode=True)
+            _restore_kw = dict(target_db=drill_db, operator="drill-real",
+                               drill_mode=True)
+            if target_host_id:
+                _restore_kw["target_host_id"] = target_host_id
+            result = scheduler.run_restore_now(rec["id"], **_restore_kw)
             rto = round(time.time() - rto_start, 1)
             restore_ok = bool(result) and result.get("status") == "success"
             report_extra["restore"] = {
@@ -373,8 +507,12 @@ def _run_real_restore_drill(d: dict, drill_id: int) -> dict:
                 return _finish(0, "failed", issues, report_extra)
 
             # 3) 数据校验（源库 vs 演练库逐表行数）
-            rows, match_all, v_issues = _drill_verify_rows(
-                task, drill_db, pw_plain)
+            if target_host_info:
+                rows, match_all, v_issues = _drill_verify_rows_remote(
+                    task, target_host_info, drill_db, pw_plain)
+            else:
+                rows, match_all, v_issues = _drill_verify_rows(
+                    task, drill_db, pw_plain)
             issues.extend(v_issues)
             report_extra["verify"] = {"match_all": match_all, "rows": rows}
             if not rows:
@@ -390,8 +528,19 @@ def _run_real_restore_drill(d: dict, drill_id: int) -> dict:
         finally:
             # 4) 演练完销毁（无论成败，finally 兜底）——但只销毁本次真正
             #    创建成功的库：CREATE 失败时该库可能属于另一场演练
-            cleanup_ok = (_drop_drill_db(task, drill_db, pw_plain)
-                          if created_ok else True)
+            if created_ok and target_host_info:
+                _drop_sql = "DROP DATABASE IF EXISTS `%s`;\n" % drill_db
+                try:
+                    _o, _e, _rc = _remote_mysql_exec(
+                        target_host_info, _drop_sql, timeout=30)
+                    cleanup_ok = (_rc == 0 and b"ERROR" not in (_e or b""))
+                except Exception as _ce:
+                    _logger.warning("[drill] 第三台主机演练库销毁失败 %s: %s",
+                                    drill_db, _ce)
+                    cleanup_ok = False
+            else:
+                cleanup_ok = (_drop_drill_db(task, drill_db, pw_plain)
+                              if created_ok else True)
             report_extra["cleanup_ok"] = cleanup_ok
         if not cleanup_ok:
             score -= 10
@@ -414,7 +563,13 @@ def _run_real_restore_drill(d: dict, drill_id: int) -> dict:
         # 演练库兜底销毁（异常路径）——同样只处理本次建成功的库
         try:
             if created_ok and report_extra.get("drill_db"):
-                _drop_drill_db(task or {}, report_extra["drill_db"], pw_plain)
+                if target_host_info:
+                    _remote_mysql_exec(
+                        target_host_info,
+                        "DROP DATABASE IF EXISTS `%s`;\n" % report_extra["drill_db"],
+                        timeout=30)
+                else:
+                    _drop_drill_db(task or {}, report_extra["drill_db"], pw_plain)
         except Exception:
             pass
         return _finish(0, "failed", issues, report_extra)

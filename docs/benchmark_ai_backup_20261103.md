@@ -63,11 +63,33 @@
 对权重文件勒索加密敏感）、池复制两地三中心（副本异地）、恢复演练真实化（落库+行数核对）、
 AI 保护计划的 drift 量化报告。
 
-## 五、诚实边界与后续
+## 五、2026-11-24 补齐：RAG 知识库语义层 + Qdrant 真机验证
 
-- **本轮未真机验证 Qdrant**（环境无法拉取镜像时如实标注；验证步骤：docker run qdrant →
-  建任务（host=127.0.0.1, port=6333）→ 备份 → 删 collection → 恢复 → points_count 核对）。
-- Milvus：需 milvus-backup 推送执行 + 真机 Milvus，未实现。
-- 向量索引检索质量演练（恢复后 top-k 对比）需嵌入模型与查询集在场，列为 P2。
-- 嵌入模型版本/分块规则不在向量库快照内（Qdrant 官方快照只含索引数据）——必须通过
-  保护计划把记录这些元数据的资产编入同一恢复单元，报告会强制提示该绑定关系。
+### RAG 知识库备份模块（`core/rag_backup.py` + `api/rag_backup.py` + `/ai_backup` 页）
+回答"怎么备份 RAG"：向量库快照只保住索引层，而一个能正确回答问题的 RAG 知识库还依赖三层快照**不包含**的配置——
+embedding 模型名/版本/向量维度、分块规则（chunk_size/overlap/strategy）、原始文档资产。本轮把这三件事做成一等公民：
+
+1. **RAG 知识库** = 向量索引备份任务 + 原始文档备份任务 + embedding 配置（知识库 = 可恢复单元）；
+2. **配置指纹**（sha256）：模型/版本/维度/距离/分块任一变化即变，恢复前比对基线，**strict 模式漂移直接 HTTP 409 拒绝**——
+   防止"恢复了向量快照却因模型版本不同而静默答错"（比不恢复更危险）；
+3. **备份基线** `build_baseline`：固化配置指纹 + 当前 collection 元数据（points 数/维度/距离）；
+4. **恢复前校验** `precheck_restore` + **恢复后质量复核** `verify_retrieval`：结构/规模偏差如实报告。
+
+### Qdrant 引擎真机验证 + 4 个真 bug 修复（`/root/e2e/e2e_rag_backup_1124.py` 22/22 PASS）
+真机 Qdrant 1.12.1 容器，两 collection 各 5 点中文 payload，全链路备份→删库→恢复→硬核对：
+
+- **修复 1（历史隐藏 bug）**：快照创建用 `PUT` 返回 HTTP 404，官方端点是 `POST /collections/{c}/snapshots {"wait":true}`——
+  此前从未真机测过 Qdrant 引擎，备份一直是失败态；
+- **修复 2**：多集合备份只返回首个快照路径，恢复也只恢复 1 个 → 改为读 `<first>_manifest.json` 逐个恢复全部；
+- **修复 3**：`verify_record` 只读 tar 头不校验 manifest sha256（篡改产物仍报通过）→ 补逐个 sha256 核对；
+- **修复 4**：文档声明的 `priority=snapshot` 未传 → 恢复 URL 显式带 `?priority=snapshot&wait=true`；
+- 硬证据：篡改快照被 sha 校验拒绝、恢复后两个目标 collection 各 5 点、`status=green`、`points_count` 一致、
+  payload「订单-中文-1」逐字节核对通过、strict 版本漂移被 409 拦截。
+
+### 诚实边界（更新）
+- **已真机验证**：Qdrant 快照备份/恢复/校验（原文档"未真机验证"项已关闭）；Chroma 目录快照仍按既有验证结论。
+- Milvus：需 milvus-backup 推送执行 + 真机 Milvus，仍未实现。
+- **检索质量 top-k 语义对比**（恢复后用固定查询集比对排序）仍未做——本轮 `verify_retrieval` 是**结构/规模复核**
+  （points 数/维度/距离），不是语义相关性评分；后者需 embedding 模型与查询集在场，列为 P2，不虚报。
+- 活跃写入一致性以 Qdrant WAL 官方语义为准，平台不停写。
+- 收费 AI 助手（core/ai_agent/ 等）未改；本轮均为普通功能，遵守不进 git/镜像约定照旧。

@@ -119,6 +119,13 @@
           <select class="form-select" id="drill_link_id"></select>
           <div class="form-text">切换演练要求链路已配置主备连接与复制账号（当前支持 MySQL/MariaDB）；演练将真实执行「冻结旧主 → 备库追平 → 换主 → DNS 牵引 → 写入探针 → 自动回切 → 恢复原拓扑」，全程 RTO 计时与评分。</div>
         </div>
+        <div class="mb-3" id="drillTargetHostRow" style="display:none;">
+          <label class="form-label">第三台主机（可选 · 独立主机演练）</label>
+          <select class="form-select" id="drill_target_host">
+            <option value="">不指定（在源端临时库演练）</option>
+          </select>
+          <div class="form-text">选择纳管主机后，演练库建在该独立主机上，不触碰源端生产主机；恢复、校验、销毁均在该主机完成。仅 MySQL/MariaDB 真实恢复演练支持。</div>
+        </div>
         <div class="mb-3">
           <label class="form-label">演练类型</label>
           <select class="form-select" id="drill_type">

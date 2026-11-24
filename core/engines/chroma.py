@@ -197,9 +197,26 @@ class ChromaEngine(BackupEngine):
             if not has_sqlite:
                 return BackupResult(success=False,
                                     message="快照内未找到 chroma.sqlite3（目录结构异常）")
-            return BackupResult(success=True,
-                                message=f"Chroma 快照校验通过：sqlite 元数据在位，"
-                                        f"HNSW 二进制{'在位' if has_hnsw else '未检出（可能为空库）'}，"
-                                        f"共 {len(names)} 个成员")
         except Exception as e:
             return BackupResult(success=False, message=f"快照不是有效归档: {str(e)[:200]}")
+        # 完整性深校验：清单 sha256 必须匹配（此前只读 tar 结构，篡改产物仍报通过）
+        manifest_path = path + ".manifest.json"
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, encoding="utf-8") as mf:
+                    want = (json.load(mf).get("sha256") or "").lower()
+                got = db.sha256_file(path).lower()
+                if want and want != got:
+                    return BackupResult(success=False,
+                                        message=(f"Chroma 快照 sha256 不匹配："
+                                                 f"清单={want[:16]} 实测={got[:16]}"))
+                integrity_note = f"，sha256 匹配（{got[:12]}）"
+            except Exception as e:
+                return BackupResult(success=False,
+                                    message=f"读取快照清单校验失败: {str(e)[:150]}")
+        else:
+            integrity_note = "，无清单未做哈希核对（老记录兼容）"
+        return BackupResult(success=True,
+                            message=f"Chroma 快照校验通过：sqlite 元数据在位，"
+                                    f"HNSW 二进制{'在位' if has_hnsw else '未检出（可能为空库）'}，"
+                                    f"共 {len(names)} 个成员{integrity_note}")

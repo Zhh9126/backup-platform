@@ -198,7 +198,32 @@ def _rename_lines(lines, old: str, new: str):
     return [_RE_RENAME_POS.sub(sub, line) for line in lines]
 
 
-def slice_tables(backup_path: str, tables: list, renames=None) -> tuple:
+def _skip_existing_lines(lines):
+    """把表段改写为「跳过已存在表」语义（恢复选项细化，2026-11-24）。
+
+    - 丢弃 ``DROP TABLE IF EXISTS``（绝不删目标已存在的表）；
+    - ``CREATE TABLE`` → ``CREATE TABLE IF NOT EXISTS``（结构已存在则保留）；
+    - ``INSERT INTO`` → ``INSERT IGNORE INTO``（主键/唯一键冲突的行跳过，
+      其余行照常写入；注意 IGNORE 也会吞掉严格模式下的类型错误，
+      报告里如实标注该语义）。
+
+    只作用于表级切片通道，不碰全实例/单库主恢复链路。
+    """
+    import re as _re
+    out = []
+    for line in lines:
+        if _re.match(r"^\s*DROP\s+TABLE\b", line, _re.IGNORECASE):
+            continue
+        line = _re.sub(r"^(\s*CREATE\s+(?:TEMPORARY\s+)?TABLE\b(?!\s+IF\s+NOT\s+EXISTS))",
+                       r"\1 IF NOT EXISTS", line, count=1, flags=_re.IGNORECASE)
+        line = _re.sub(r"^(\s*INSERT\s+)INTO\b", r"\1IGNORE INTO", line,
+                       count=1, flags=_re.IGNORECASE)
+        out.append(line)
+    return out
+
+
+def slice_tables(backup_path: str, tables: list, renames=None,
+                 skip_existing: bool = False) -> tuple:
     """从产物切片指定表，返回 (tmp_sql_path, found, notes)。
 
     tables 元素支持 ``db.table``（tar 必须带前缀或单库）与 ``table``。
@@ -227,6 +252,9 @@ def slice_tables(backup_path: str, tables: list, renames=None) -> tuple:
             want_map.setdefault("", set()).add(spec.lower())
 
     notes = []
+    if skip_existing:
+        notes.append("跳过已存在表：CREATE→IF NOT EXISTS、INSERT→IGNORE、"
+                     "已移除 DROP TABLE；IGNORE 会同时跳过严格模式类型错误")
     if rename_map:
         notes.append("表改名: " + ", ".join(
             f"{k}→{v}" for k, v in rename_map.items()))
@@ -254,9 +282,11 @@ def slice_tables(backup_path: str, tables: list, renames=None) -> tuple:
                     header_written = True
                 for t in picked:
                     new_name = rename_map.get(t.lower()) or ""
-                    out.writelines(
-                        _rename_lines(sections[t], t, new_name)
-                        if new_name else sections[t])
+                    seg = (_rename_lines(sections[t], t, new_name)
+                           if new_name else sections[t])
+                    if skip_existing:
+                        seg = _skip_existing_lines(seg)
+                    out.writelines(seg)
                     found.append({"schema": schema, "obj_name": t,
                                   "renamed_to": new_name})
 
@@ -313,6 +343,8 @@ def slice_tables(backup_path: str, tables: list, renames=None) -> tuple:
         raise
 
 
-def slice_to_temp(backup_path: str, tables: list, renames=None) -> tuple:
+def slice_to_temp(backup_path: str, tables: list, renames=None,
+                  skip_existing: bool = False) -> tuple:
     """slice_tables 的同义词（语义更直观：返回 (tmp_path, found, notes)）。"""
-    return slice_tables(backup_path, tables, renames=renames)
+    return slice_tables(backup_path, tables, renames=renames,
+                        skip_existing=skip_existing)

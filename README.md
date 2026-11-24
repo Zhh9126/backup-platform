@@ -15,7 +15,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 容灾切换 · 恢复演练 · 预校验 · 克隆（VDB） · 不可变备份 · 巡检 · 监控 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v2.4.6-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v3.0.0-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -25,7 +25,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 ---
 
-> **当前能力要点（2.4.6）**：在 v2.4.6 基础上追加工程化能力与容灾/连接兼容修复——
+> **当前能力要点（v3.0.0）**：在 v2.4.6 基础上追加工程化能力与容灾/连接兼容修复——
 > **跨实例持久化执行队列**（`task_execution_queue` 租约领取、重复提交合并、崩溃 24h 租约回收）、
 > **统一资源准入**（内存/备份盘空闲阈值 `AIDBM_MIN_FREE_MEMORY_MB` / `AIDBM_MIN_FREE_DISK_GB`，不足即如实阻断）、
 > **SQL Server 原生 CDC**（基于 `cdc.change_tables` 拉取行级变更、LSN 持久化、表过滤）、
@@ -33,7 +33,8 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 > **安全加固**（shell 执行路径收敛、FTP 默认关闭需 `AIDBM_ENABLE_INSECURE_FTP=true`、管理员首次口令轮换 + `must_change_password`），
 > 以及 shell 执行/任务租约/资源预算相关修复。
 >
-> **最新动态**：v2.4.6（2026-11-23，本次发布）在 v2.4.6 私有仓库增量之上补齐**容灾 P0/P1 缺陷修复**（切换后 active_role 翻转使自动监控跟随当前主、failover/failback 双向 fencing、提升失败硬中止、链路锁互斥、候选池判定与探测修复、审计操作人/权限分立）与**达梦 DM7 连接兼容**（旧版 dmPython 位置参数、`SELECT 1 FROM DUAL` 候选、双通道错误摘要）；
+> **最新动态**：v3.0.0（2026-11-24，本次发布）——从零全量离线镜像发布（含 AI 助手模块），关键修复 **SQL Server 2005 JDBC 逻辑备份兼容**（元数据改走 `INFORMATION_SCHEMA`/`sys.*`，不再依赖 2008 才有的 `sp_columns_100`）；
+> v2.4.6（2026-11-23）在私有仓库增量之上补齐**容灾 P0/P1 缺陷修复**（切换后 active_role 翻转使自动监控跟随当前主、failover/failback 双向 fencing、提升失败硬中止、链路锁互斥、候选池判定与探测修复、审计操作人/权限分立）与**达梦 DM7 连接兼容**（旧版 dmPython 位置参数、`SELECT 1 FROM DUAL` 候选、双通道错误摘要）；
 > v2.4.6（2026-11-20）已发布标签并产出离线包（`aidbm_2.4.6_offline.tar.gz`，VDB 快照 native 通道 + 恢复实测数据量 + 容灾域第二轮）；
 > v2.4.3 / v2.4.4 / v2.4.6 tag 均已打；私有仓库 2026-11-23 增量（上段 8 项）尚未打 tag，仅在私有仓库与本地工作区生效；
 > v2.4.0（2026-11-13）已发布（22 项业务/系统缺陷修复：保留链安全 / 拒绝假成功 / 恢复安全加固 / 演练隔离 / 并发去重 / 口令脱敏 / 离线包自动发布）；
@@ -416,7 +417,7 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
 docker pull ghcr.io/zhh9126/backup-platform:v2.4.6   # 固定版本（可回滚）
-# 当前最新版本：v2.4.6（2026-11-23，容灾 P0/P1 修复 / DM7 兼容 / 私有仓库工程化增量）
+# 当前最新版本：v3.0.0（2026-11-24，SQL Server 2005 兼容 / 从零全量离线镜像）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。

@@ -8,6 +8,7 @@
 instance/
 backups/
 logs/
+data/
 rt_logs/
 rt_files/
 cookies.txt

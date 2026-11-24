@@ -63,7 +63,7 @@ v2.2.0（2026-11-05）——近两个月主线：AI 大模型数据备份（v2.0
 
 | 能力域 | 覆盖范围 | 验证口径 |
 |---|---|---|
-| 数据库备份 | 20+ 库型：内置 10 引擎 + 国产 8 家（达梦/金仓/openGauss/磐维/瀚高/优炫/TiDB/OceanBase）+ 向量库（Qdrant/Chroma）+ 自定义适配器无限扩展 | 多库型真机矩阵（170/171 双机、129/168 Oracle/openGauss） |
+| 数据库备份 | 26 种内置引擎（含文件/对象存储/群晖 NAS）+ 虚拟机：MySQL/MariaDB/PostgreSQL/Oracle/Kingbase/openGauss/磐维/瀚高/优炫/TiDB/OceanBase/GaussDB/Vastbase/GreatDB/GoldenDB/达梦/SQL Server/Redis/MongoDB/Neo4j/向量库（Qdrant/Chroma）+ 通用 JDBC 兜底 + 自定义适配器无限扩展 | 多库型真机矩阵（170/171 双机、129/168 Oracle/openGauss） |
 | 数据恢复 | 异名库/异主机恢复、单表切片、PITR（binlog/WAL/LogMiner/dmrman）、事务级精准还原、应急接管 | 恢复后中文数据逐值硬核对，impdp/RMAN 真实校验 |
 | 数据迁移与同步 | 一站式迁移（预检→结构→全量→对象→校验）、多表并行、非表对象三批、实时轮询 CDC 水位续传 | 170/171 双机 7 条迁移链 + 6 条同步链 + realtime 闭环 |
 | 容灾（DR） | failover/failback 引擎（Fencing/GTID 分叉拦截/DNS 牵引）、自动切换策略、两地三中心池复制、真实恢复演练 | 三机真机 RTO 15s 级，切换期写入零丢失 |
@@ -71,7 +71,7 @@ v2.2.0（2026-11-05）——近两个月主线：AI 大模型数据备份（v2.0
 | 数据质量 | 恢复校验（策略化真恢复）、备份后自动校验、数据对比（银行校验体系）、坏块检测、克隆 VDB 秒级验证 | 三级别对比 9/9、坏块真机检测 |
 | 虚拟机 | KVM/PVE/ESXi/Hyper-V 整机备份、克隆、原位还原、TTL 回收 | libvirt 通道真机端到端（业务无停机） |
 | 智能运维 | 任务监控分诊、报表中心、巡检、数据价值挖掘（GB/T 43697 分级）、AI 助手（商业版）、AI 告警 | 失败分诊真机检出、报表导出三格式 |
-| 平台化 | RBAC（24 权限点/3 角色）、可插拔元数据库（SQLite/PG/MySQL）、完全离线交付、外部 API、Webhook 事件中心 | 全站冒烟 0 命中 5xx |
+| 平台化 | RBAC（25 权限点/6 角色，含三员分立）、可插拔元数据库（SQLite/PG/MySQL）、完全离线交付、外部 API、Webhook 事件中心 | 全站冒烟 0 命中 5xx |
 | 执行与资源治理（私有仓库增量） | 跨实例持久化任务队列（租约领取/重复合并/崩溃回收）、每任务执行租约防并发、统一内存与备份盘准入闸、SQL Server 原生 CDC、能力真实就绪探测 API | 队列 enqueue→claim→done 全链路实测；170/171 全库型 48/48 全绿 |
 
 ## 平台特色
@@ -85,8 +85,8 @@ v2.2.0（2026-11-05）——近两个月主线：AI 大模型数据备份（v2.0
 - **真实执行，如实失败**：所有备份/恢复/同步均为真实操作，连接失败或依赖缺失时任务**如实失败**并给出明确原因与修复指引，不做任何仿真兜底。
   > **唯一的例外（如实说明）**：CDC 链路保留了仿真降级通道（`core/cdc/simulated.py`），仅在 ① `DEMO_MODE=on`、② 任务标记 `demo_only`、③ `rt_mode=sample` 三种**用户显式要求演示**的情况下被选中；因能力不足（引擎未注册 / 依赖缺失 / 客户端缺失）的自动降级自 v1.4.10 起**默认禁止**（`RT_ALLOW_SIMULATED_FALLBACK`，默认 false），此类情况任务直接置 FAILED 并写 error 日志，不再产出仿真数据。
 - **迁移前预校验**：类型映射矩阵、数据级试写、字符集冲突、容量预估、主键/外键检查——结构或数据不合适在启动前拦截。
-- **可插拔数据库类型**：除内置 10 种引擎外，界面就能"新增一种数据库"——填脚本模板 + 能力声明，即刻获得与内置引擎同等的备份/恢复/调度/存储能力，无需改代码。
-- **多用户与权限管控**：24 个权限点 × 3 档内置角色（admin / operator / viewer），菜单按权限自动收敛，API 层二次校验，适配多人协作与运维审计要求。
+- **可插拔数据库类型**：除内置 26 种引擎外，界面就能"新增一种数据库"——填脚本模板 + 能力声明，即刻获得与内置引擎同等的备份/恢复/调度/存储能力，无需改代码。
+- **多用户与权限管控**：25 个权限点 × 3 档内置角色（admin / operator / viewer）+ 三员分立角色（系统管理员 / 安全保密管理员 / 审计管理员），菜单按权限自动收敛，API 层二次校验，适配多人协作与运维审计要求。
 - **容灾切换与自动监控**：failover/failback 全流程引擎（Fencing 防双写 → 备库提升 → DNS 牵引 → 解析回读验证 → 旧主以从库身份重加入），GTID 分叉检测拦截数据丢失风险；健康探测连续失败自动触发切换（可人工确认闸），RTO 实测 15s 级；两地三中心池复制编排（serial 级联 / parallel 扇出 / 逐站重试 / 副本分布视图 / 异地取回）。
 - **真实恢复演练**：不止元数据评估——真恢复到临时库 → 逐表行数校验 → 评分（100 分制，RPO 阈值扣分）→ 兜底销毁，支持 weekly/monthly/quarterly 排程；克隆服务可把备份拉起为可查询的虚拟数据库（VDB）。
 - **不可变备份（防勒索纵深）**：保留锁定（只许延长不许缩短、强制审计）→ 产物 chmod 写保护 → sha256 基线周期复检 → 删除路径四路拦截；叠加恢复点安全检测三查（体积突变/熵值/结构嗅探）。
@@ -105,7 +105,7 @@ v2.2.0（2026-11-05）——近两个月主线：AI 大模型数据备份（v2.0
 
 | 能力 | 说明 |
 |---|---|
-| 11 个数据库备份引擎 + 文件备份 | MySQL / MariaDB / PostgreSQL / Kingbase / DM / SQL Server / Oracle / openGauss / Redis / MongoDB / Neo4j + 文件（本地 + 远程 SSH 无 Agent）|
+| 26 种内置引擎 + 虚拟机 | MySQL / MariaDB / PostgreSQL / Kingbase / DM / SQL Server / Oracle / openGauss / 磐维 / 瀚高 / 优炫 / TiDB / OceanBase / GaussDB / Vastbase / GreatDB / GoldenDB / Redis / MongoDB / Neo4j / 向量库（Qdrant/Chroma）/ 群晖 NAS / 文件（本地 + 远程 SSH 无 Agent）/ 对象存储 + 通用 JDBC 兜底 |
 | **Windows 支持（零插件）** | Windows 文件备份：系统内置 OpenSSH + tar.exe 打包 → SFTP 断点续传拉取，恢复时 SFTP 推回 + tar.exe 解包，中文文件名全程保真（真机实证）；SQL Server on Windows：物理备份走 SSH（cmd + sqlcmd），逻辑备份走 JDBC 1433 直连免 SSH，真机双通道实证 |
 | 备份类型 | 全量 / 增量 / 差异（SQL Server）/ 快照 / 合成全量 / 组合（全量+增量双调度）|
 | MySQL 物理增量备份与增量链恢复 | XtraBackup 增量备份；恢复时基备 prepare → 逐层合并增量 → 临时实例校验，自动处理压缩产物与增量链 |
@@ -321,8 +321,9 @@ v2.2.0（2026-11-05）——近两个月主线：AI 大模型数据备份（v2.0
 | 能力 | 说明 |
 |---|---|
 | 多用户登录 | `users` 表 + PBKDF2-HMAC-SHA256（20 万次迭代，标准库实现，无第三方依赖，可离线打包）|
-| 权限点 | 24 个，覆盖概览 / 备份 / 恢复 / 数据对比 / 部署 / 灾备 / 运维 / 系统 |
+| 权限点 | 25 个，覆盖概览 / 备份 / 恢复 / 数据对比 / 部署 / 灾备 / 运维 / 系统 |
 | 内置角色 | `admin`（全部）/ `operator`（备份·恢复·同步·克隆·对比·部署·巡检·告警·日志·运维分析，21 项）/ `viewer`（只读，4 项）|
+| 三员分立角色 | `sys_admin`（系统管理员）/ `sec_admin`（安全保密管理员）/ `audit_admin`（审计管理员），满足等保三员管理要求 |
 | 附加权限 | 单用户可在角色基础上叠加权限点（`permissions` 字段，逗号分隔）|
 | 菜单按权限显示 | 侧边栏 25 个菜单带 `data-perm`，登录后按 `hasPerm()` 自动隐藏；API 层 `permission_required()` 二次校验，前端绕过仍返回 403 |
 | 账号治理 | 管理员重置密码 / 停用 / 删除（拒绝删除内置 admin 与最后一个启用的 admin）；用户自助改密（校验旧密码）；`must_change_password` 首登改密 |
@@ -646,10 +647,18 @@ docker build -t backup-platform:local .
 | Kingbase 金仓 | sys_dump、sys_basebackup | sys_restore / ksql | 兼容 PG 协议，默认端口 54321 |
 | openGauss / 磐维 | gs_dump、gs_basebackup | gs_restore / gsql | 兼容 PG 协议族，默认端口 26000（磐维 12800）；sha256 认证须 `-W` 显式传密，`gs_dump` 进度输出走落盘文件防污染 |
 | DM 达梦 | dexp、disql(联机 BACKUP) | dimp、dmrman(PITR) | 原生驱动缺失时自动降级 JDBC 通道（驱动随包） |
-| SQL Server | sqlcmd | sqlcmd | BACKUP/RESTORE DATABASE；SQLCMDPASSWORD 注入 |
+| SQL Server | 逻辑：JDBC 免 SSH（纯 1433）；物理/差异/日志：sqlcmd BACKUP DATABASE（SSH） | sqlcmd / JDBC 逻辑回放 | 双通道二选一；**2005 兼容**：元数据走 `INFORMATION_SCHEMA`/`sys.*`，不依赖 2008 才有的 `sp_columns_100`；SQLCMDPASSWORD 注入 |
 | Redis | redis-cli --rdb | （替换 rdb + 自动重启） | REDISCLI_AUTH 传密码 |
 | MongoDB | mongodump | mongorestore | --archive 流式拉回 |
 | Neo4j | neo4j-admin database dump / backup、APOC 导出 | neo4j-admin database load / restore、apoc.import.* | 三通道：离线 dump、企业版在线 backup（不停机、可增量）、APOC 在线导出（Cypher/JSON/CSV）；默认端口 7687 |
+| 瀚高 HighGo / 优炫 UXDB | 复用 PG 工具族（pg_dump/pg_basebackup） | pg_restore / psql | PG 内核国产库，按协议兼容层接入，默认端口 5866 / 5432 |
+| TiDB / OceanBase / GreatDB / GoldenDB | 复用 MySQL 工具族（mysqldump） | mysql | MySQL 协议兼容层；分布式存储层物理备份如实拒绝（xtrabackup 不适用于分布式层） |
+| GaussDB / Vastbase | 复用 PG 工具族 | 复用 PG 工具族 | 协议兼容层接入 |
+| 向量库 Qdrant / Chroma | 快照导出 | 集合级恢复 | 向量数据备份/恢复（v2.0.0 起版） |
+| 群晖 NAS（Synology） | 群晖备份通道 | 恢复 | NAS 数据保护场景 |
+| 通用 JDBC 兜底 | JDBC 元数据 + SELECT 导出 | INSERT 回放 | 长尾库型无 CLI 时的通用通道（Db2/ClickHouse 等），仅保证同方言恢复 |
+
+> **诚实边界（协议兼容层引擎）**：瀚高 / 优炫 / TiDB / OceanBase / GaussDB / Vastbase / GreatDB / GoldenDB 为**协议兼容层接入**（复用 PG/MySQL 引擎与工具族），**未逐库真机验证**；现场首次使用请先跑「预检 + 小库备份」确认。向量库、Redis、MongoDB 不支持增量（`supports_incremental=False`，如实回退全量）。
 
 ### 虚拟机备份支持矩阵（/vm）
 
@@ -659,6 +668,8 @@ docker build -t backup-platform:local .
 | KVM / libvirt | SSH + `virsh` | 快照/检查点 + 磁盘镜像导出 | 支持增量（`virsh backup-begin` 可用时） | 支持 |
 | VMware ESXi | SSH + `vim-cmd` | 关机/快照后打包 VM 目录（vmdk） | 依赖快照链，不支持时回退全量 | 支持 |
 | Hyper-V | SSH + PowerShell | `Export-VM` / 检查点导出 | 依赖检查点，不支持时回退全量 | 支持 |
+
+> **诚实边界**：oVirt / OpenStack / XenServer 三个 provider 仅实现**控制面（探活 + 资产发现）**，数据面备份未真机验证、**明确不支持备份**；ESXi/Hyper-V 无块级变更跟踪（CBT）时如实回退全量。KVM/libvirt 通道已真机端到端验证（外部快照 → blockcommit 回切业务无停机）。
 
 设计要点：**不新建平行调度体系**——每台受保护 VM 对应一条 `backup_tasks(db_type='vm')`，复用平台调度、保留策略、三级存储、生命周期与告警；恢复点（PIT）单独建链（全量 / 增量 / 合成全量），支持按时间点选择还原，并可对恢复点做自动恢复验证（拉起隔离 VM 后销毁）。
 
@@ -713,6 +724,15 @@ docker build -t backup-platform:local .
 - 默认账号请立即修改（首登会标记 `must_change_password`）；生产环境建议限制来源 IP
 
 ## 更新日志
+
+### v3.0.0（2026-11-24，已打 tag）
+
+> 从零全量离线镜像发布（python:3.11-slim-bookworm → apt/pip → 应用层），镜像与离线包均含 AI 助手模块。
+
+- **SQL Server 2005 JDBC 逻辑备份兼容**：元数据链路改走 `INFORMATION_SCHEMA` / `sys.identity_columns` / `sys.key_constraints`，不再调用 JDBC `DatabaseMetaData.getColumns()`——微软 mssql-jdbc 13.x 驱动对 getColumns 无条件执行 2008 才有的 `sp_columns_100`，导致 2005 实例备份报「找不到存储过程 sp_columns_100」。修复后 2005 与 2008+ 走同一条路径；物理备份 `COMPRESSION` 按版本自适应（major>=10 才启用）。
+- **版本号 2.4.6 → 3.0.0**：`config.PLATFORM_VERSION` 升级。
+- **从零全量构建**：镜像 1.7GB（含 AI 四件套 + 烘焙备份工具 + dmPython + JDBC 驱动 + JRE），`docker load` 回拉镜像 ID 一致，离线包 `aidbm_3.0.0_offline.tar.gz`（847M）。
+- 双仓推送：GitHub 公网 + Gitee（main + tag v3.0.0）；GHCR `v3.0.0` + `latest` 双推（digest `sha256:e84e1b481472…`）。
 
 ### v2.4.6（2026-11-23，已打 tag）
 

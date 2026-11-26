@@ -108,12 +108,14 @@ class TestToolRegistry(unittest.TestCase):
         self.assertIn("properties", result[0]["function"]["parameters"])
 
     def test_tools_description_for_prompt(self):
-        """工具描述段生成包含名称、描述和参数。"""
+        """工具描述段生成包含名称、描述和参数，并带分级授权标记。"""
         registry = create_default_registry()
         desc = registry.tools_description_for_prompt()
         self.assertIn("list_tasks", desc)
         self.assertIn("run_backup_task", desc)
-        self.assertIn("⚠需确认", desc)
+        # 分级授权：低风险工具标记"可直接执行"，条件确认工具标记"需用户确认"
+        self.assertIn("可直接执行", desc)
+        self.assertIn("需用户确认", desc)
 
     def test_empty_registry(self):
         """空注册表 list_all 返回空列表。"""
@@ -156,17 +158,24 @@ class TestToolSchemas(unittest.TestCase):
             self.assertIn(name, actual, f"工具 '{name}' 应在注册表中")
 
     def test_run_backup_task_schema(self):
-        """run_backup_task 有 required task_id。"""
+        """run_backup_task 低风险直接执行，支持 task_name/task_id 两种定位。"""
         tool = self._get_default_registry().get("run_backup_task")
-        self.assertTrue(tool.requires_confirm)
-        self.assertIn("task_id", tool.parameters.get("required", []))
+        # 备份为低风险操作，用户显式下达指令即直接执行（无需二次确认）
+        self.assertFalse(tool.requires_confirm)
+        props = tool.parameters.get("properties", {})
+        self.assertIn("task_name", props)
+        self.assertIn("task_id", props)
         self.assertEqual(tool.api_method, "POST")
         self.assertIn("{task_id}", tool.api_path)
 
     def test_run_inspection_schema(self):
-        """run_inspection 有 scope enum 和 requires_confirm。"""
+        """run_inspection 有 scope enum；quick 免确认、full 条件确认。"""
         tool = self._get_default_registry().get("run_inspection")
-        self.assertTrue(tool.requires_confirm)
+        # 条件确认：requires_confirm=False 但 confirm_if 对 full 返回 True
+        self.assertFalse(tool.requires_confirm)
+        self.assertTrue(callable(tool.confirm_if))
+        self.assertTrue(tool.confirm_if({"scope": "full"}))
+        self.assertFalse(tool.confirm_if({"scope": "quick"}))
         scope_prop = tool.parameters.get("properties", {}).get("scope", {})
         self.assertIn("enum", scope_prop)
         self.assertEqual(scope_prop["enum"], ["quick", "full"])
@@ -677,10 +686,11 @@ class TestDangerousConfirm(unittest.TestCase):
         self.sm = SessionManager()
 
     def test_run_backup_task_requires_confirm(self):
-        """run_backup_task 执行返回 needs_confirm。"""
+        """run_backup_task 为低风险操作，显式指令直接执行、不再拦截确认。"""
         result = self.executor.execute("run_backup_task", {"task_id": "1"}, {})
-        self.assertTrue(result.get("needs_confirm"))
-        self.assertEqual(result["tool_name"], "run_backup_task")
+        # 备份不再返回 needs_confirm；任务 1 不存在时本地执行器如实返回错误
+        self.assertFalse(result.get("needs_confirm", False))
+        self.assertIn("error", result)
 
     def test_run_inspection_requires_confirm(self):
         """run_inspection 执行返回 needs_confirm。"""
@@ -695,9 +705,10 @@ class TestDangerousConfirm(unittest.TestCase):
         self.assertFalse(result.get("needs_confirm", False))
 
     def test_confirm_reason_for_backup_task(self):
-        """run_backup_task 的确认提示包含任务 ID。"""
-        result = self.executor.execute("run_backup_task", {"task_id": "T-123"}, {})
-        self.assertIn("T-123", result.get("message", ""))
+        """备份确认文案（always_confirm 模式下）包含任务 ID。"""
+        tool = self.registry.get("run_backup_task")
+        reason = self.executor._build_confirm_reason(tool, {"task_id": "T-123"})
+        self.assertIn("T-123", reason)
 
     def test_confirm_reason_for_full_inspection(self):
         """全量巡检的确认提示包含'性能'。"""
@@ -711,12 +722,13 @@ class TestDangerousConfirm(unittest.TestCase):
         self.assertIn("未注册", result.get("error", ""))
 
     def test_missing_required_param_returns_error(self):
-        """缺少必填参数返回错误。"""
-        result = self.executor.execute("run_backup_task", {}, {})
-        # 由于 requires_confirm 先拦截，返回 needs_confirm
-        # 但从 _validate_args 角度看
-        validated = self.executor._validate_args(
-            self.registry.get("run_backup_task"), {})
+        """缺少必填参数返回错误（用带 required 的探针工具校验该逻辑）。"""
+        probe = Tool(name="probe", description="probe", parameters={
+            "type": "object",
+            "properties": {"task_id": {"type": "string"}},
+            "required": ["task_id"],
+        })
+        validated = self.executor._validate_args(probe, {})
         self.assertIn("error", validated)
         self.assertIn("task_id", validated["error"])
 
@@ -942,7 +954,7 @@ class TestEndToEnd(unittest.TestCase):
         agent = AIAgent(predictor, self.executor, self.sm)
         result = agent._call_model_with_messages([{"role": "user", "content": "test"}])
         self.assertFalse(result.get("ok"))
-        self.assertIn("未启用", result.get("error", ""))
+        self.assertIn("AI_MODEL_DISABLED", result.get("error", ""))
 
     def test_build_system_prompt_contains_tools(self):
         """system prompt 包含工具描述。"""
@@ -1034,8 +1046,12 @@ class TestExecutorDetails(unittest.TestCase):
         self.assertEqual(path, "/api/tasks")
 
     def test_validate_args_required_missing(self):
-        """缺少必填参数返回错误。"""
-        tool = self.registry.get("run_backup_task")
+        """缺少必填参数返回错误（用带 required 的探针工具校验该逻辑）。"""
+        tool = Tool(name="probe", description="probe", parameters={
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+            "required": ["x"],
+        })
         result = self.executor._validate_args(tool, {})
         self.assertIn("error", result)
 

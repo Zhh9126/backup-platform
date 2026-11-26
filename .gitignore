@@ -50,18 +50,8 @@ core/plugins/state/
 artifacts/
 packages/
 
-# ---- AI 智能助手（可选收费功能，不上传开源仓库；镜像/离线包包含） ----
-api/ai_agent.py
-core/ai_agent/
-docs/ai-agent-design.md
-docs/ai-agent-prd.md
-tests/test_ai_agent.py
-tests/test_ai_autonomous.py
-templates/agent.html
-static/js/ai-agent.js
-static/js/agent-render.js
-static/css/agent-render.css
-static/css/agent.css
+# ---- AI 智能助手：随私有仓库与镜像一并交付（2026-11-26 用户拍板） ----
+# （原排除条目已移除）
 
 # E2E 矩阵运行产物
 data/

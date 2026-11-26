@@ -15,7 +15,7 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 **备份 · 恢复 · PITR · 数据迁移 · 数据同步 · 数据对比 · 容灾切换 · 恢复演练 · 预校验 · 克隆（VDB） · 不可变备份 · 巡检 · 监控 · AI 告警**
 
-[![Version](https://img.shields.io/badge/Version-v3.0.0-0D9488)](#更新日志)
+[![Version](https://img.shields.io/badge/Version-v3.0.1-0D9488)](#更新日志)
 [![License](https://img.shields.io/badge/License-MIT-green)](#许可证)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED)](#docker-部署含离线运行)
@@ -25,18 +25,19 @@ Oracle · MySQL · MariaDB · PostgreSQL · Kingbase（金仓） · DM（达梦�
 
 ---
 
-> **当前能力要点（v3.0.0）**：在 v2.4.6 基础上追加工程化能力与容灾/连接兼容修复——
-> **跨实例持久化执行队列**（`task_execution_queue` 租约领取、重复提交合并、崩溃 24h 租约回收）、
-> **统一资源准入**（内存/备份盘空闲阈值 `AIDBM_MIN_FREE_MEMORY_MB` / `AIDBM_MIN_FREE_DISK_GB`，不足即如实阻断）、
-> **SQL Server 原生 CDC**（基于 `cdc.change_tables` 拉取行级变更、LSN 持久化、表过滤）、
-> **P1 能力真实就绪探测**（`GET /api/system/p1-capabilities`，只报实际依赖/运行时状态，不把规划能力说成可用）、
-> **安全加固**（shell 执行路径收敛、FTP 默认关闭需 `AIDBM_ENABLE_INSECURE_FTP=true`、管理员首次口令轮换 + `must_change_password`），
-> 以及 shell 执行/任务租约/资源预算相关修复。
+> **当前能力要点（v3.0.1）**：在 v3.0.0 基础上重点强化**文件备份链路**——
+> **传输级 CDC 去重**（对标 zbackup：Gear 滚动哈希内容定义分块 + 内容寻址全局块库，
+> 远端临时推 python3 分块脚本只拉缺失块，实测 20MB 改 512KB 实传 524KB、节省 97.4%，零安装用完即删）；
+> **文件形态保真**（稀疏文件 `tar --sparse` 保洞、uid/gid/inode/硬链接/空目录/软链元数据、目录 mtime）；
+> **多源路径全量+增量彻底修复**（快照/增量/删除清单同构、恢复目录树一致、布局变更自动回退全量）；
+> **SSH 传输健壮性**（握手并发治理+指数退避、断连续传自愈、可执行错误文案）；
+> 并修复隐藏文件前导点、克隆失败结构化、错误日志归因分析器增强。
 >
-> **最新动态**：v3.0.0（2026-11-24，本次发布）——从零全量离线镜像发布（含 AI 助手模块），关键修复 **SQL Server 2005 JDBC 逻辑备份兼容**（元数据改走 `INFORMATION_SCHEMA`/`sys.*`，不再依赖 2008 才有的 `sp_columns_100`）；
+> **最新动态**：v3.0.1（2026-11-26，本次发布）——zbackup 式 CDC 去重 + 稀疏/元数据保真 + 文件备份多源全量增量修复 + SSH 断连续传，AI 助手模块随私有仓库与镜像一并分发；
+> v3.0.0（2026-11-24）——从零全量离线镜像发布（含 AI 助手模块），关键修复 **SQL Server 2005 JDBC 逻辑备份兼容**（元数据改走 `INFORMATION_SCHEMA`/`sys.*`，不再依赖 2008 才有的 `sp_columns_100`）；
 > v2.4.6（2026-11-23）在私有仓库增量之上补齐**容灾 P0/P1 缺陷修复**（切换后 active_role 翻转使自动监控跟随当前主、failover/failback 双向 fencing、提升失败硬中止、链路锁互斥、候选池判定与探测修复、审计操作人/权限分立）与**达梦 DM7 连接兼容**（旧版 dmPython 位置参数、`SELECT 1 FROM DUAL` 候选、双通道错误摘要）；
-> v2.4.6（2026-11-20）已发布标签并产出离线包（`aidbm_2.4.6_offline.tar.gz`，VDB 快照 native 通道 + 恢复实测数据量 + 容灾域第二轮）；
-> v2.4.3 / v2.4.4 / v2.4.6 tag 均已打；私有仓库 2026-11-23 增量（上段 8 项）尚未打 tag，仅在私有仓库与本地工作区生效；
+> v2.4.6（2026-11-20）已发布标签并产出离线包（VDB 快照 native 通道 + 恢复实测数据量 + 容灾域第二轮）；
+> v2.4.3 / v2.4.4 / v2.4.6 tag 均已打；
 > v2.4.0（2026-11-13）已发布（22 项业务/系统缺陷修复：保留链安全 / 拒绝假成功 / 恢复安全加固 / 演练隔离 / 并发去重 / 口令脱敏 / 离线包自动发布）；
 > v2.3.11（2026-11-12）已发布（SQL Server 旧版 TLS/JDBC 兼容 / AI 模型超时与存储容量可读化 / 克隆服务小库真机验证 / 离线发布链路修复）；
 > v2.3.10（2026-11-12）已发布（170/171 五库型迁移同步全面真机验收 / 6 个真实缺陷修复 / 离线镜像包交付）；
@@ -70,14 +71,14 @@ v2.2.0（2026-11-05）——近两个月主线：AI 大模型数据备份（v2.0
 | 数据安全 | 不可变备份四层防护、恢复点安全检测（勒索启发式）、AES-256-GCM/SM4 加密、高危操作验证码、主机保护硬闸 | 删除路径四路拦截测试、篡改产物检出实证 |
 | 数据质量 | 恢复校验（策略化真恢复）、备份后自动校验、数据对比（银行校验体系）、坏块检测、克隆 VDB 秒级验证 | 三级别对比 9/9、坏块真机检测 |
 | 虚拟机 | KVM/PVE/ESXi/Hyper-V 整机备份、克隆、原位还原、TTL 回收 | libvirt 通道真机端到端（业务无停机） |
-| 智能运维 | 任务监控分诊、报表中心、巡检、数据价值挖掘（GB/T 43697 分级）、AI 助手（商业版）、AI 告警 | 失败分诊真机检出、报表导出三格式 |
+| 智能运维 | 任务监控分诊、报表中心、巡检、数据价值挖掘（GB/T 43697 分级）、AI 助手（自然语言驱动）、AI 告警 | 失败分诊真机检出、报表导出三格式 |
 | 平台化 | RBAC（25 权限点/6 角色，含三员分立）、可插拔元数据库（SQLite/PG/MySQL）、完全离线交付、外部 API、Webhook 事件中心 | 全站冒烟 0 命中 5xx |
 | 执行与资源治理（私有仓库增量） | 跨实例持久化任务队列（租约领取/重复合并/崩溃回收）、每任务执行租约防并发、统一内存与备份盘准入闸、SQL Server 原生 CDC、能力真实就绪探测 API | 队列 enqueue→claim→done 全链路实测；170/171 全库型 48/48 全绿 |
 
 ## 平台特色
 
 - **AI 原生**：AI 助手可自然语言驱动备份/巡检/查询，自动做根因分析、修复建议与告警降噪；预校验与类型映射由 AI 辅助，把"备份失效"和"异构不兼容"挡在发生之前。
-  > **版本说明（如实标注）**：AI 智能助手随**商业/离线交付版**内置（离线镜像开箱即用）；本开源仓库不含 AI 助手代码，页面自动隐藏相关入口，其余全部功能不受影响。
+  > **版本说明（如实标注）**：AI 智能助手随**商业/私有交付版**内置（离线镜像开箱即用，v3.0.1 起随私有仓库与镜像一并分发）；页面入口随能力探测自动收敛，不影响其余功能。
 - **恢复点安全检测（勒索防护）**：对标 Veeam Secure Restore——备份产物三查（体积突变 vs 历史中位数 / 熵值≈8.0 疑似勒索二次加密 / 结构嗅探+压缩可解性），离线无病毒库，**诚实标注"启发式检测、非病毒查杀"**；检测结论落库，可疑产物自动隔离并阻断恢复/下载，强制恢复需显式二次确认并留 critical 审计。
 - **备份/恢复预检**：发起前先探测"能不能成功"——备份预检（配置/SSH 通道/源库直连/备份工具/存储空间），恢复预检（产物 sha256 基线/结构/目标端可达/恢复工具/解包空间），逐项 pass/warn/fail，问题挡在执行前。
 - **服务端插件化，客户端零安装**：所有驱动/插件/工具只装在平台服务端；用户客户端机器与被管理的数据库服务器**什么都不安装**、无需任何 Agent。
@@ -114,7 +115,8 @@ v2.2.0（2026-11-05）——近两个月主线：AI 大模型数据备份（v2.0
 | 保留策略 | 按天数 + 按份数双重清理（GFS）|
 | **不可变备份四层防护** | 保留锁定（0=永久、只许延长、强制审计）→ 产物写保护 → sha256 基线周期复检 → 清理/保留/删除四路硬拦截；任务级 `retention_lock_days` 备份成功自动上锁，存储池级 `pool_policy.lock_days` 兜底 |
 | **池复制（两地三中心）** | 多站点编排（serial 级联中断 / parallel 扇出），逐站重试与副本日志；本地/MinIO/S3/磁带零新增通道；备份成功自动触发、副本分布视图、异地副本取回 |
-| **源端去重** | 文件级指纹（远端 sha256 清单）只传变更，实测第二轮节省 95.5%；rsync delta 增量拉取（DB 单文件通道）；失败安全回退流式 |
+| **源端去重 + 传输级 CDC** | 文件级指纹（远端 sha256 清单）只传变更，实测第二轮节省 95.5%；**传输级 CDC**（zbackup 式 Gear 滚动哈希内容定义分块 + 全局块库）：大文件内部变化只传变化块，实测 20MB 改 512KB 节省 97.4%（远端临时推 python3 分块脚本，零安装用完即删，无 python3 回退整文件）；rsync delta 增量拉取（DB 单文件通道）；失败安全回退流式 |
+| **文件形态保真** | 稀疏文件 `tar --sparse` 保洞（归档 200B 级）+ 恢复系统 tar 解包保稀疏语义；清单 v2 保真 uid/gid/inode/硬链接/空目录/软链/目录 mtime；多源路径全量+增量快照同构（布局变更自动回退全量），恢复目录树与源一致 |
 | **备份前坏块检测** | MySQL/MariaDB CHECK TABLE、Oracle fast（视图级）/full（RMAN VALIDATE CHECK LOGICAL）；corrupt 阻断备份，failed=检测失败如实区分 |
 | **Oracle 非归档应急热备** | sqlplus BEGIN/END BACKUP 热拷贝数据文件（SSH 通道，失败兜底 END BACKUP 防悬挂）|
 | **SQL 图表化监控** | 自定义 SQL 指标定时采集（多列结果智能取值），折线图呈现 |
@@ -417,8 +419,8 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 docker pull ghcr.io/zhh9126/backup-platform:latest
-docker pull ghcr.io/zhh9126/backup-platform:v2.4.6   # 固定版本（可回滚）
-# 当前最新版本：v3.0.0（2026-11-24，SQL Server 2005 兼容 / 从零全量离线镜像）
+docker pull ghcr.io/zhh9126/backup-platform:v3.0.1   # 固定版本（可回滚）
+# 当前最新版本：v3.0.1（2026-11-26，zbackup 式 CDC 去重 / 文件形态保真 / 多源全量增量修复）
 ```
 
 > v1.4.4 起镜像已内置全部运行依赖与备份工具（Python 原生驱动 / JDBC+JRE / xtrabackup / mariabackup 等），`docker run` 开箱即用，无需再外部挂载任何工具目录。
@@ -438,47 +440,41 @@ python tools/check_env.py
 {"registry-mirrors": ["https://docker.m.daocloud.io", "https://dockerproxy.com"]}
 ```
 
-> **离线交付包版本说明**：**v2.4.6 离线包由 tag 自动发布**（`aidbm_2.4.6_offline.tar.gz` 与 `.sha256`，
-> `manifest.json` 内含 4 个 RepoTag，可直接 `docker load`）。
-> GHCR 同步提供 `v2.4.6` / `2.4.6` / `2.4.6-r<run_number>` / `latest` / `community` 在线 tag。
-> **历史产物保留策略**：每个离线包约 1.3GB，发布流程在附件上传成功后会自动清理仅保留当前版本的
-> Release 附件，并清理 GHCR 历史版本 manifest（`latest` / `community` 与当前版本 tag 不动）。
-> **git tag 一律保留**，旧版本仍可用源码回溯；需要旧离线包请在对应 Release 被清理前自行归档。
+> **离线交付包版本说明**：当前交付包 **`aidbm_3.0.1_offline.tar.gz`**（约 978M，gzip 压缩完整镜像，
+> 含全部运行依赖与备份工具；随包 `.sha256` 校验文件，导入前可 `sha256sum -c` 核对）。
+> **历史产物保留策略**：每个离线包约 1GB，发布流程在新包产出后清理历史版本包与旧镜像 tag，
+> 仅保留当前版本；**git tag 一律保留**，旧版本仍可用源码回溯，需要旧离线包请在清理前自行归档。
 
 ### 离线导入
 
 ```bash
-# 交付包：aidbm_2.4.6_offline.tar.gz（gzip 压缩的完整镜像，含全部运行依赖与备份工具）
-docker load -i aidbm_2.4.6_offline.tar.gz
+# 交付包：aidbm_3.0.1_offline.tar.gz（gzip 压缩的完整镜像，含全部运行依赖与备份工具）
+docker load -i aidbm_3.0.1_offline.tar.gz
 
 # 导入后确认镜像名（离线环境不会自动去公网拉取）
 docker images | grep -E 'backup-platform|aidbm'
+# 包内镜像名为 aidbm:3.0.1；如需其它别名自行补 tag（同一镜像 ID，任选其一启动，全程零联网）：
+docker tag aidbm:3.0.1 aidbm:latest
 ```
 
-> **导入后可用 4 个镜像名（同一镜像 ID，任选其一启动，全程零联网）**：
-> `ghcr.io/zhh9126/backup-platform:v2.4.6`、`ghcr.io/zhh9126/backup-platform:latest`、
-> `aidbm:2.4.6`、`aidbm:latest`。
-> **v2.4.6 交付包已把这 4 个 tag 全部打进 `manifest.json` 的 `RepoTags`**，
-> `docker load` 时会输出 4 行 `Loaded image:`，直接 `docker run` 任一名字都不会访问公网。
->
 > 若遇到 `Unable to find image 'xxx' locally` 后跟着
 > `Get "https://registry-1.docker.io/v2/": context deadline exceeded`，
 > 说明**启动命令用的镜像名不在包内 tag 里**（Docker 找不到本地镜像就会去公网），
 > 不是包损坏。先 `docker images` 查实际 tag，或补一条：
 > ```bash
-> docker tag ghcr.io/zhh9126/backup-platform:v2.4.6 aidbm:2.4.6
+> docker tag aidbm:3.0.1 aidbm:latest
 > ```
 
 自行导出（有网机器上**先打齐 tag 再 save**，否则包内只带单个 tag）：
 
 ```bash
-docker pull ghcr.io/zhh9126/backup-platform:v2.4.6
-docker tag ghcr.io/zhh9126/backup-platform:v2.4.6 ghcr.io/zhh9126/backup-platform:latest
-docker tag ghcr.io/zhh9126/backup-platform:v2.4.6 aidbm:2.4.6
-docker tag ghcr.io/zhh9126/backup-platform:v2.4.6 aidbm:latest
-docker save ghcr.io/zhh9126/backup-platform:v2.4.6 ghcr.io/zhh9126/backup-platform:latest aidbm:2.4.6 aidbm:latest | gzip > aidbm_2.4.6_offline.tar.gz
-gzip -t aidbm_2.4.6_offline.tar.gz    # 必须输出 OK，否则包被截断不可交付
-sha256sum aidbm_2.4.6_offline.tar.gz > aidbm_2.4.6_offline.tar.gz.sha256
+docker pull ghcr.io/zhh9126/backup-platform:v3.0.1
+docker tag ghcr.io/zhh9126/backup-platform:v3.0.1 ghcr.io/zhh9126/backup-platform:latest
+docker tag ghcr.io/zhh9126/backup-platform:v3.0.1 aidbm:3.0.1
+docker tag ghcr.io/zhh9126/backup-platform:v3.0.1 aidbm:latest
+docker save ghcr.io/zhh9126/backup-platform:v3.0.1 ghcr.io/zhh9126/backup-platform:latest aidbm:3.0.1 aidbm:latest | gzip > aidbm_3.0.1_offline.tar.gz
+gzip -t aidbm_3.0.1_offline.tar.gz    # 必须输出 OK，否则包被截断不可交付
+sha256sum aidbm_3.0.1_offline.tar.gz > aidbm_3.0.1_offline.tar.gz.sha256
 ```
 
 ### 磁带库 / 可移动介质接入（离线容器部署）
@@ -522,7 +518,7 @@ docker run -d --name aidbm -p 8080:8080 \
   --device /dev/sg2:/dev/sg2:rwm \
   -v /opt/backup-platform/data:/data \
   -e BACKUP_ROOT=/data/backups -e TZ=Asia/Shanghai \
-  aidbm:2.4.6
+  aidbm:3.0.1
 ```
 
 离线安装脚本支持 `TAPE_DEVICES="/dev/tape/by-id/scsi-XXXX-nst /dev/sg2" ./install.sh`，
@@ -550,11 +546,11 @@ docker run -d --name backup-platform \
   -v backup-data:/data \
   -e BACKUP_ROOT=/data/backups \
   --restart unless-stopped \
-  ghcr.io/zhh9126/backup-platform:v2.4.6
+  aidbm:3.0.1
 ```
 
 > 离线环境请用**固定版本 tag**（不要用 `:latest` 指代"从公网拉最新"）。
-> 交付包内 `aidbm:2.4.6`、`aidbm:latest`、`ghcr.io/zhh9126/backup-platform:latest`
+> 交付包内 `aidbm:3.0.1` 与自行补的 `aidbm:latest` 别名
 > 均与上面这个镜像名指向同一个镜像 ID，替换使用完全等效。
 
 > **备份文件存在哪？** 镜像默认把备份产物写到容器内 `/data/backups`（布局 `<该路径>/<数据库类型>/<任务ID_任务名>/`）。
@@ -565,17 +561,17 @@ docker run -d --name backup-platform \
 
 ```bash
 # 1. 导入新版本镜像（把交付包拷入离线机器）
-docker load -i aidbm_2.4.6_offline.tar.gz
+docker load -i aidbm_3.0.1_offline.tar.gz
 
 # 2. 停止并删除旧容器（备份数据在 backup-data 卷中，不受影响）
 docker stop backup-platform
 docker rm backup-platform
 
 # 3. 用新版本镜像启动（命令与首次部署完全一致，仅换镜像 tag）
-docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   ghcr.io/zhh9126/backup-platform:v2.4.6
+docker run -d --name backup-platform   -p 8080:8080   -v backup-data:/data   -e BACKUP_ROOT=/data/backups   --restart unless-stopped   aidbm:3.0.1
 
 # 4.（可选）删除旧版本镜像释放空间
-docker rmi ghcr.io/zhh9126/backup-platform:v2.3.11
+docker rmi aidbm:3.0.0
 ```
 
 > 升级不丢数据：元数据库、备份产物、日志都在 `backup-data` 卷（`/data`），
@@ -590,7 +586,7 @@ docker stop backup-platform
 docker rm backup-platform
 
 # 2. 删除镜像
-docker rmi ghcr.io/zhh9126/backup-platform:v2.4.6
+docker rmi aidbm:3.0.1
 
 # 3.（谨慎）删除数据卷 —— 会清掉全部备份产物与元数据，操作前务必
 #    先把备份文件拷贝转移！
@@ -693,7 +689,7 @@ docker build -t backup-platform:local .
 典型操作：
 
 1. **数据库备份**：在「数据库备份」新建任务，填写连接、备份类型、调度、保留策略与存储目标。
-2. **文件备份**：在「文件备份」先纳管远程主机，再建文件任务；全量生成 `*_full.tar.gz`，增量基于源快照仅打包变化文件。
+2. **文件备份**：在「文件备份」先纳管远程主机，再建文件任务（支持多源路径）；全量生成 `*_full.tar.gz`，增量基于源快照仅打包变化文件；大文件自动走传输级 CDC 分块去重（只传变化块），稀疏文件/硬链接/空目录等形态保真。
 3. **数据同步**：新建同步任务（源/目标连接 + 表 + 字段映射 + 写入模式 + 同步模式），运行前自动执行迁移前预校验，也可点「预检」单独查看报告。
 4. **数据对比**：在「数据对比」新建对比任务（源/目标连接 + 表清单，支持跨名映射），报告逐行展示差异定位与修复指引。
 5. **数据库部署**：在「数据库部署」上传安装包，选择目标主机一键部署，实时查看安装日志。
@@ -724,6 +720,18 @@ docker build -t backup-platform:local .
 - 默认账号请立即修改（首登会标记 `must_change_password`）；生产环境建议限制来源 IP
 
 ## 更新日志
+
+### v3.0.1（2026-11-26，已打 tag）
+
+> 对标 zbackup 的传输级 CDC 去重 + 文件形态保真 + 文件备份全链路修复；AI 助手模块随私有仓库与镜像一并分发。离线包 `aidbm_3.0.1_offline.tar.gz`（978M）。
+
+- **传输级 CDC 去重（对标 zbackup）**：新增 `core/cdc_chunk.py`——Gear 滚动哈希内容定义分块（2K/8K/64K）+ 内容寻址全局块库 + 块级校验重组（远端分块脚本与平台逐块一致，单测锁定）。备份拉取时远端临时推 python3 分块脚本（零安装，用完即删），只拉块库缺失的块回平台重组：大文件内部变化只传变化块，实测 20MB 改 512KB 实传 524KB、命中 1504/1551 块、**节省 97.4%**；远端无 python3 自动回退整文件 SFTP。
+- **文件形态保真**：稀疏文件 `tar --sparse` 打包保洞（远端 tar 不识别该选项自动去掉重试）+ 恢复优先系统 tar 解包保稀疏语义（10MB 稀疏文件归档仅 200B）；清单 v2 补 uid/gid/inode/链接数、目录 mtime/mode、空目录、软链元数据、硬链接（恢复后同 inode）。
+- **文件备份修复**：多源路径（快照/增量/删除清单同构，恢复目录树与源一致；布局变更自动回退全量）；SSH 握手并发治理（同主机串行化 + 指数退避带抖动 + 可执行错误文案）；传输中断自愈（重连续传 + rc=-1 断连识别）；隐藏文件前导点 bug（`lstrip('./')` 误剥，全仓 5 处）；Windows 主机探测 cmd 语法。
+- **平台治理**：克隆失败 500→400 结构化；克隆预检补目标端客户端检查（本机目标缺 impdp/mysql 等时 fail 并给两条处置路径）；克隆列表补申请/完成时间列、申请人取当前登录用户；错误日志归因分析器多行堆栈归并 + 时间分布章节 + 4 类新特征；CDC 错误可执行化降噪；paramiko 全包静音。
+- **AI 助手模块纳入交付**：`.gitignore` 移除 AI 排除段，AI 智能助手随私有仓库与镜像一并分发（2026-11-26 起）。
+- **构建**：`.dockerignore` 瘦身（排除 `.docker-bake/`/`.venv314/` 等，镜像 1.91G）；`start.sh` 自适应定位项目目录。
+- **测试**：新增 `test_cdc_chunk` / `test_file_multisource` / `test_manifest_hidden` / `test_ssh_connect_backoff` / `test_ssh_probe_windows` / `test_clone_preflight_tools`；CDC 块一致性、多源增量、稀疏保真 E2E 实测通过。
 
 ### v3.0.0（2026-11-24，已打 tag）
 

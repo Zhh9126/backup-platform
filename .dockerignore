@@ -3,6 +3,14 @@
 .github
 .gitignore
 .venv/
+.venv314/
+.coverage
+.pytest_cache/
+__pycache__/
+# 烘焙工具目录（831M）：产物已在基座镜像 /opt/，目录本身不进镜像
+.docker-bake/
+matrix_report.json
+mixed_task.json
 
 # 运行时数据与敏感信息（绝不入镜像）
 instance/

@@ -1,5 +1,6 @@
 #!/bin/bash
-cd /root/CodeBuddy/20260826095855/backup-platform
+# 自适应工作目录：本地 systemd / 容器 / 手工执行都成立（不写死开发机路径）
+cd "$(dirname "$0")" || exit 1
 # JDK 仅 JDBC 可选兜底通道需要；直连走原生 Python 驱动，无 Java 也能运行
 [ -d /usr/lib/jvm/java-11-openjdk-11.0.23.0.9-2.el7_9.x86_64 ] && \
     export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-11.0.23.0.9-2.el7_9.x86_64

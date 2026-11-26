@@ -283,11 +283,23 @@ def precheck_backup(task: dict) -> dict:
     # 5.5) 远端暂存目录（FIX-2026-001 延伸，全库型）：备份会在数据库服务器
     # 本地写入整库大小的临时产物，默认 /tmp 常在根分区
     try:
+        # 达梦逻辑备份：若引擎判定会走 JDBC 通道（无 dexp/dimp），则在平台侧
+        # 直接写产物，数据库服务器（可能是 Windows 的 D:\...）不需要暂存目录
+        _dm_jdbc = False
+        if db_type == "dameng" and not is_phys and engine is not None:
+            try:
+                _dm_jdbc = (engine._logical_route()[0] == "jdbc")
+            except Exception:
+                _dm_jdbc = False
         if db_type == "sqlserver" and not is_phys:
             # JDBC 逻辑通道在平台侧直接生成 .sql.gz，不占用数据库服务器
             # 的暂存目录，该提示不适用
             _add(items, "remote_stage", "skip",
                  "JDBC 逻辑通道产物直接写平台侧，无需数据库服务器暂存目录")
+        elif _dm_jdbc:
+            _add(items, "remote_stage", "skip",
+                 "达梦 JDBC 逻辑导出通道产物直接写平台侧，"
+                 "无需数据库服务器（含 Windows 实例）暂存目录")
         else:
             _eo2 = task.get("extra_options")
             _extra2 = json.loads(_eo2) if isinstance(_eo2, str) else (_eo2 or {})
@@ -426,7 +438,22 @@ def precheck_restore(record: dict, target_host_info: dict = None,
 
     # 5) 恢复工具就绪
     tools = _RESTORE_TOOLS.get(db_type)
-    if not tools:
+    if str(path).endswith(".jsonl"):
+        # JDBC 逻辑产物（达梦 JDBC 通道等）：恢复在平台侧 JDBC 直连回放，
+        # 不需要 dimp/impdp 客户端——按真实连接探测即可，不能误报"缺工具"。
+        try:
+            from core import models as _models
+            _t = _models.get_task(record.get("task_id"), include_secret=True) or {}
+            _t.setdefault("db_type", db_type)
+            from core.engines.dameng_jdbc import DamengJDBCEngine
+            ok, msg = DamengJDBCEngine(
+                _t, getattr(config, "BACKUP_ROOT", "/tmp")).probe()
+            _add(items, "restore_tools", "pass" if ok else "fail",
+                 ("JDBC 逻辑产物恢复通道：%s（无需客户端工具）" % msg)[:200])
+        except Exception as e:                       # noqa: BLE001
+            _add(items, "restore_tools", "unknown",
+                 "JDBC 恢复通道探测异常: %s" % str(e)[:120])
+    elif not tools:
         _add(items, "restore_tools", "skip",
              "%s 无本机恢复工具要求（恢复在数据库服务器端执行）" % db_type)
     elif target_host_info:

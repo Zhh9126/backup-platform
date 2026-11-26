@@ -43,6 +43,35 @@ import core.db as db
 
 from .base import CDCDaemon
 
+
+def _actionable_cdc_error(exc: Exception) -> str:
+    """把抽取异常翻译成**可执行**的中文处置提示。
+
+    现场日志里出现过裸的 "Java Virtual Machine is not running"——看不出是平台
+    缺 JRE、JVM 崩了还是连接通道不对。这里按已知症状给出处置步骤。
+    """
+    raw = (str(exc) or type(exc).__name__).strip()
+    low = raw.lower()
+    if "java virtual machine is not running" in low or "jvm is not running" in low:
+        return ("JVM 未运行（Java Virtual Machine is not running）：平台侧 JDBC "
+                "通道不可用（Oracle 11g 的 LogMiner 依赖 JDBC 兜底）。"
+                "处置：① 确认平台已安装 JRE/JDK 8+ 并设置 JAVA_HOME；"
+                "② 首次启动失败常因内存不足或架构不匹配，看平台 error.log 里"
+                "JVM 启动堆栈；③ 重启平台进程让 JVM 重新初始化；"
+                "④ 或改用 oracledb thin 直连（仅支持 Oracle 12.1+）。原错误：%s"
+                % raw)
+    if "unsupported server version" in low or "thin mode" in low:
+        return ("当前 Oracle 版本不支持 thin 直连（需 12.1+）：%s。"
+                "处置：确保平台侧 JRE/JDBC 通道可用（见「数据库日常管理→驱动」"
+                "页注册 ojdbc 驱动），或升级到 oracledb 支持的版本。" % raw)
+    if "connection refused" in low or "could not connect" in low:
+        return ("源库连接失败：%s。处置：确认源库监听地址/端口/防火墙，"
+                "以及任务里配置的账号口令。" % raw)
+    if "timeout" in low or "timed out" in low:
+        return ("源库连接超时：%s。处置：确认网络可达与源库负载；"
+                "必要时调大该任务的数据源超时参数。" % raw)
+    return raw
+
 # 段文件名中不允许出现的字符（位点可能含 '/' 等）
 _UNSAFE_NAME_RE = re.compile(r"[^0-9A-Za-z]+")
 
@@ -109,6 +138,9 @@ class PollingLogMinerDaemon(CDCDaemon):
         self._pending_to: str = ""
         self._last_fetch_at: str = ""
         self._reconnect_rounds: int = _reconnect_rounds()
+        # 错误降噪：同一错误持续出现时只首次记 ERROR，其余降级为 WARNING
+        self._last_error_text: str = ""
+        self._same_error_rounds: int = 0
 
         self.position.setdefault(self.POSITION_KEY, "")
         self.position.setdefault(self.POSITION_END_KEY, "")
@@ -226,8 +258,20 @@ class PollingLogMinerDaemon(CDCDaemon):
         try:
             self._poll_once()
         except Exception as exc:
-            self.last_error = f"{self.display_name} 抽取失败: {exc}"
-            self.logger.error("[rt.cdc] task=%s %s", self.task_id, self.last_error)
+            msg = _actionable_cdc_error(exc)
+            self.last_error = f"{self.display_name} 抽取失败: {msg}"
+            # 降噪：同一错误连续出现时只记一次 ERROR，其余 WARNING（现场曾被
+            # 每轮一条 ERROR 堆栈刷满 error.log，真正的原因反而看不见了）。
+            if msg == self._last_error_text:
+                self._same_error_rounds += 1
+                if self._same_error_rounds % 20 == 0:
+                    self.logger.warning(
+                        "[rt.cdc] task=%s %s（同一错误已持续 %s 轮）",
+                        self.task_id, self.last_error, self._same_error_rounds)
+            else:
+                self._last_error_text = msg
+                self._same_error_rounds = 1
+                self.logger.error("[rt.cdc] task=%s %s", self.task_id, self.last_error)
         return super().tick()
 
     def _poll_once(self) -> str:

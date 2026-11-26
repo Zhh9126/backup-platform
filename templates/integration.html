@@ -1,0 +1,340 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar">
+  <div>
+    <div class="page-title"><i class="bi bi-plug text-primary me-2"></i>接口对接中心</div>
+    <div class="page-sub">平台主动拉取或推送日志，支持任意 HTTP(S) 接口（含另一台 AIDBM 平台）；JSONPath 提取、关键字过滤、告警命中，保存前可先测试</div>
+  </div>
+  <div class="d-flex flex-wrap gap-2">
+    <button class="btn btn-outline-secondary btn-sm" onclick="IT.loadAll()">
+      <i class="bi bi-arrow-clockwise"></i> 刷新
+    </button>
+    <button class="btn btn-outline-primary btn-sm" onclick="IT.openSourceHelp()">
+      <i class="bi bi-info-circle"></i> 对端如何对接本平台
+    </button>
+    <button class="btn btn-primary" onclick="IT.openTaskModal()">
+      <i class="bi bi-plus-lg"></i> 新建对接任务
+    </button>
+  </div>
+</div>
+
+<div class="row g-3 mb-3">
+  <div class="col-6 col-md-3">
+    <div class="page-card p-3">
+      <div class="text-muted small">对接任务</div>
+      <div class="fs-4 fw-bold" id="it_stat_tasks">0</div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="page-card p-3">
+      <div class="text-muted small">已启用</div>
+      <div class="fs-4 fw-bold text-success" id="it_stat_enabled">0</div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="page-card p-3">
+      <div class="text-muted small">今日采集条数</div>
+      <div class="fs-4 fw-bold" id="it_stat_today">0</div>
+    </div>
+  </div>
+  <div class="col-6 col-md-3">
+    <div class="page-card p-3">
+      <div class="text-muted small">累计告警命中</div>
+      <div class="fs-4 fw-bold text-danger" id="it_stat_alarms">0</div>
+    </div>
+  </div>
+</div>
+
+<div class="page-card p-3">
+  <ul class="nav nav-tabs mb-3" role="tablist">
+    <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tabItTasks" type="button">对接任务</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabItLogs" type="button">采集日志</button></li>
+    <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabItRuns" type="button">运行记录</button></li>
+  </ul>
+  <div class="tab-content">
+    <div class="tab-pane fade show active" id="tabItTasks">
+      <div class="table-responsive">
+        <table class="table table-sm table-hover align-middle">
+          <thead class="table-light">
+            <tr>
+              <th style="width:52px">#</th>
+              <th>任务名称</th>
+              <th style="width:96px">方向</th>
+              <th>接口地址</th>
+              <th style="width:130px">调度</th>
+              <th style="width:90px">状态</th>
+              <th style="width:170px">最近执行</th>
+              <th style="width:110px">成功 / 失败</th>
+              <th style="width:230px" class="text-end">操作</th>
+            </tr>
+          </thead>
+          <tbody id="itTaskRows">
+            <tr><td colspan="9" class="text-muted small">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="itTaskPager"></div>
+    </div>
+
+    <div class="tab-pane fade" id="tabItLogs">
+      <div class="d-flex flex-wrap gap-2 mb-2 align-items-center">
+        <select class="form-select form-select-sm" id="it_log_task" style="width:220px" onchange="IT.loadLogs(1)"></select>
+        <select class="form-select form-select-sm" id="it_log_level" style="width:130px" onchange="IT.loadLogs(1)">
+          <option value="">全部级别</option>
+          <option value="ERROR">ERROR</option>
+          <option value="WARN">WARN</option>
+          <option value="INFO">INFO</option>
+          <option value="DEBUG">DEBUG</option>
+        </select>
+        <input class="form-control form-control-sm" id="it_log_q" style="width:220px" placeholder="关键字（内容 / 来源）"
+               onkeydown="if(event.key==='Enter'){IT.loadLogs(1)}">
+        <div class="form-check form-switch">
+          <input class="form-check-input" type="checkbox" id="it_log_alerted" onchange="IT.loadLogs(1)">
+          <label class="form-check-label small" for="it_log_alerted">仅告警命中</label>
+        </div>
+        <button class="btn btn-sm btn-outline-secondary" onclick="IT.loadLogs(1)"><i class="bi bi-search"></i> 查询</button>
+        <button class="btn btn-sm btn-outline-success" onclick="IT.exportLogs()"><i class="bi bi-download"></i> 导出 CSV</button>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm table-hover align-middle">
+          <thead class="table-light">
+            <tr>
+              <th style="width:52px">#</th>
+              <th style="width:160px">时间</th>
+              <th style="width:86px">级别</th>
+              <th style="width:180px">来源任务</th>
+              <th style="width:120px">来源</th>
+              <th>内容</th>
+            </tr>
+          </thead>
+          <tbody id="itLogRows"><tr><td colspan="6" class="text-muted small">加载中…</td></tr></tbody>
+        </table>
+      </div>
+      <div id="itLogPager"></div>
+    </div>
+
+    <div class="tab-pane fade" id="tabItRuns">
+      <div class="table-responsive">
+        <table class="table table-sm table-hover align-middle">
+          <thead class="table-light">
+            <tr>
+              <th style="width:52px">#</th>
+              <th style="width:180px">开始时间</th>
+              <th>任务</th>
+              <th style="width:90px">方向</th>
+              <th style="width:80px">结果</th>
+              <th style="width:80px">HTTP</th>
+              <th style="width:150px">抓取 / 入库 / 推送</th>
+              <th style="width:90px">耗时</th>
+              <th>说明</th>
+            </tr>
+          </thead>
+          <tbody id="itRunRows"><tr><td colspan="9" class="text-muted small">加载中…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 新建 / 编辑 -->
+<div class="modal fade" id="itTaskModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="itTaskTitle">新建对接任务</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <div class="row g-3">
+          <div class="col-md-8">
+            <label class="form-label small">任务名称 <span class="text-danger">*</span></label>
+            <input class="form-control form-control-sm" id="it_name" placeholder="例如：192.168.163.247-备份平台日志采集">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label small">对接方向</label>
+            <select class="form-select form-select-sm" id="it_direction" onchange="IT.onDirectionChange()">
+              <option value="pull">主动拉取（平台定时调对端接口取日志）</option>
+              <option value="push">主动推送（平台把本平台日志推给对端）</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="d-flex align-items-center gap-2 mt-3 mb-1">
+          <div class="fw-bold small"><i class="bi bi-link-45deg"></i> 接口配置</div>
+          <button class="btn btn-sm btn-outline-primary" type="button" onclick="IT.applyPreset()">快速填充示例</button>
+          <span class="text-muted small">示例会按当前平台地址生成可直接用的配置</span>
+        </div>
+
+        <div class="row g-3">
+          <div class="col-md-12">
+            <label class="form-label small">接口地址 <span class="text-danger">*</span></label>
+            <input class="form-control form-control-sm" id="it_endpoint"
+                   placeholder="http://10.55.144.233:8080/api/v1/integration/log-source?since={{since}}&limit={{limit}}">
+            <div class="form-text">支持占位符 since（上次水位）与 limit（单次上限）</div>
+          </div>
+          <div class="col-md-3">
+            <label class="form-label small">请求方法</label>
+            <select class="form-select form-select-sm" id="it_method">
+              <option value="GET">GET</option>
+              <option value="POST">POST</option>
+              <option value="PUT">PUT</option>
+              <option value="PATCH">PATCH</option>
+            </select>
+          </div>
+          <div class="col-md-3">
+            <label class="form-label small">认证类型</label>
+            <select class="form-select form-select-sm" id="it_auth_type" onchange="IT.onAuthChange()">
+              <option value="none">无</option>
+              <option value="basic">Basic Auth</option>
+              <option value="bearer">Bearer Token</option>
+              <option value="header">自定义请求头</option>
+            </select>
+          </div>
+          <div class="col-md-3" id="it_auth_user_box" style="display:none">
+            <label class="form-label small">用户名</label>
+            <input class="form-control form-control-sm" id="it_auth_user" autocomplete="off">
+          </div>
+          <div class="col-md-3" id="it_auth_header_box" style="display:none">
+            <label class="form-label small">请求头名称</label>
+            <input class="form-control form-control-sm" id="it_auth_header" placeholder="X-Api-Key">
+          </div>
+          <div class="col-md-6" id="it_auth_secret_box" style="display:none">
+            <label class="form-label small">密码 / Token</label>
+            <input class="form-control form-control-sm" id="it_auth_secret" type="password" autocomplete="new-password">
+            <div class="form-text" id="it_auth_secret_hint">留空表示沿用已保存的密钥</div>
+          </div>
+          <div class="col-md-3">
+            <label class="form-label small">超时（秒）</label>
+            <input class="form-control form-control-sm" id="it_timeout" type="number" min="1" max="300" value="20">
+          </div>
+          <div class="col-md-3 d-flex align-items-end">
+            <div class="form-check form-switch">
+              <input class="form-check-input" type="checkbox" id="it_verify_tls">
+              <label class="form-check-label small" for="it_verify_tls">校验 TLS 证书</label>
+            </div>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label small">请求头（JSON）</label>
+            <input class="form-control form-control-sm" id="it_headers" value="{}">
+          </div>
+          <div class="col-md-6">
+            <label class="form-label small">请求体（POST / PUT 时生效）</label>
+            <textarea class="form-control form-control-sm" id="it_body" rows="2"
+                      placeholder="留空自动发送 JSON；可用 logs / since / limit 占位符"></textarea>
+          </div>
+        </div>
+
+        <div class="fw-bold small mt-4 mb-2"><i class="bi bi-funnel"></i> 解析与过滤</div>
+        <div class="row g-3">
+          <div class="col-md-3">
+            <label class="form-label small">解析类型</label>
+            <select class="form-select form-select-sm" id="it_parse_type">
+              <option value="json">JSON</option>
+              <option value="text">text（逐行）</option>
+            </select>
+          </div>
+          <div class="col-md-5">
+            <label class="form-label small">JSONPath 提取路径</label>
+            <input class="form-control form-control-sm" id="it_json_path" value="$.data.logs[*]">
+            <div class="form-text">支持 $、.字段、[n]、[a:b]、[*]；不支持递归下降 ..</div>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label small">字段映射（JSON，可留空）</label>
+            <input class="form-control form-control-sm" id="it_field_map"
+                   placeholder='{"message":"msg","level":"level","ts":"ts"}'>
+          </div>
+          <div class="col-md-4">
+            <label class="form-label small">包含关键字（逗号分隔）</label>
+            <input class="form-control form-control-sm" id="it_include" placeholder="ERROR,WARN">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label small">排除关键字（逗号分隔）</label>
+            <input class="form-control form-control-sm" id="it_exclude" placeholder="DEBUG,INFO">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label small">告警关键字（逗号分隔）</label>
+            <input class="form-control form-control-sm" id="it_alarm" placeholder="error,timeout,失败">
+          </div>
+          <div class="col-md-4">
+            <label class="form-label small">单次最多条数</label>
+            <input class="form-control form-control-sm" id="it_max_items" type="number" min="1" max="5000" value="500">
+          </div>
+        </div>
+
+        <div class="fw-bold small mt-4 mb-2"><i class="bi bi-clock"></i> 调度</div>
+        <div class="row g-3">
+          <div class="col-md-3">
+            <label class="form-label small">调度方式</label>
+            <select class="form-select form-select-sm" id="it_schedule_type" onchange="IT.onScheduleChange()">
+              <option value="cron">Cron</option>
+              <option value="interval">按间隔</option>
+              <option value="manual">仅手动</option>
+            </select>
+          </div>
+          <div class="col-md-4" id="it_cron_box">
+            <label class="form-label small">Cron 表达式</label>
+            <input class="form-control form-control-sm" id="it_cron" value="*/5 * * * *">
+          </div>
+          <div class="col-md-4" id="it_interval_box" style="display:none">
+            <label class="form-label small">间隔（分钟）</label>
+            <input class="form-control form-control-sm" id="it_interval" type="number" min="1" value="5">
+          </div>
+          <div class="col-md-3">
+            <label class="form-label small">任务状态</label>
+            <select class="form-select form-select-sm" id="it_enabled">
+              <option value="1">启用</option>
+              <option value="0">停用</option>
+            </select>
+          </div>
+        </div>
+
+        <div id="it_test_result" class="mt-3"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+        <button class="btn btn-outline-primary" id="itTestBtn" onclick="IT.testCurrent()">
+          <i class="bi bi-lightning-charge"></i> 测试（不保存）
+        </button>
+        <button class="btn btn-primary" onclick="IT.saveTask()"><i class="bi bi-save"></i> 保存任务</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 任务采集日志 -->
+<div class="modal fade" id="itLogModal" tabindex="-1">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="itLogTitle">采集日志</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body" id="itLogBody"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 对端对接说明 -->
+<div class="modal fade" id="itHelpModal" tabindex="-1">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">对端如何对接本平台</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body">
+        <p class="small mb-2">本平台内置日志对外拉取接口，任何带 Token 的系统都可按水位增量拉取</p>
+        <pre class="small p-2 bg-light border rounded" id="itHelpUrl"></pre>
+        <p class="small mb-2">鉴权方式二选一：创建 API Token 后用 Bearer 请求头，或用 AccessKey 签名</p>
+        <p class="small mb-2">返回结构：<code>{"success": true, "data": {"logs": [...], "count": N, "next_since": "..."}}</code></p>
+        <p class="small mb-2">在另一台 AIDBM 的接口对接中心新建任务：认证类型选 Bearer Token，JSONPath 填 <code>$.data.logs[*]</code></p>
+        <p class="small text-muted mb-0">日志写入时已脱敏（口令/密钥被掩码），可安全外发</p>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/integration.js?v=2026112501"></script>
+{% endblock %}

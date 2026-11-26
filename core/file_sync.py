@@ -196,11 +196,13 @@ def _flatten_manifest(manifest: dict, excludes: list = None) -> dict:
                        if i != idx] or not bn
         root_rel = prefix.lstrip("/") if clash else bn
         for rel, meta in (src.get("files") or {}).items():
-            path = f"{prefix}/{rel.lstrip('./')}"
+            # 只剥一次 './' 前缀：lstrip('./') 会把隐藏文件的前导点吃掉
+            key = rel[2:] if rel.startswith("./") else rel
+            path = f"{prefix}/{key}"
             if _excluded(path, excludes):
                 continue
             m = dict(meta)
-            m["local_rel"] = f"{root_rel}/{rel.lstrip('./')}"
+            m["local_rel"] = f"{root_rel}/{key}"
             out[path] = m
     return out
 
@@ -225,6 +227,20 @@ def sync_once(task_id: int, force: bool = False) -> dict:
         raise FileSyncError(f"同步任务不存在: {task_id}")
     task = _decorate(dict(row))
     started = time.time()
+    # Windows 主机：指纹扫描用的是 find+sha256sum+stat（Linux 语法），cmd /
+    # PowerShell 不认 —— 此前会一路跑到命令执行才报奇怪错误。如实拒绝并指路：
+    # 「文件备份」通道已支持 Windows（core/engines/win_file.py 的 PowerShell
+    # 指纹清单 + 增量）。
+    if task.get("ssh_host_id"):
+        from core import ssh_hosts as _sh
+        _h = _sh.get_host(int(task["ssh_host_id"]))
+        if _h and _sh._canon_os(_h.get("os_type")) == "windows":
+            raise FileSyncError(
+                "文件实时同步当前只支持 Linux/Unix 主机（指纹扫描用 "
+                "find+sha256sum+stat，Windows 的 cmd/PowerShell 不支持）。"
+                "Windows 主机请改用「文件备份」通道（已支持 Windows：PowerShell "
+                "指纹清单 + 全量/增量）；或把该主机的「操作系统」登记为实际类型"
+                "后重试。")
     client = _ssh_client(task)
     version_dir = None
     try:

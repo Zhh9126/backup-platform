@@ -50,6 +50,9 @@ SEGMENT_PERMS = {
     "vm": "backup.task.manage",
     "netdev": "backup.task.manage",
     "synology": "backup.task.manage",
+    # 接口对接中心（外联第三方接口，按系统设置权限校验）
+    "integration": "system.settings",
+    "integration-tasks": "system.settings",
     "win-protect": "backup.task.manage",
     "records": "backup.task.manage",
     "backup-cleanup": "backup.task.manage",

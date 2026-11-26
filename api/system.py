@@ -1159,8 +1159,10 @@ def logs():
     try:
         from core import logging_setup
         locations = logging_setup.log_locations()
+        dup_stats = logging_setup.dup_log_stats()
     except Exception:
         locations = {}
+        dup_stats = {}
     return jsonify({
         "ok": True,
         "logs": rows,
@@ -1169,6 +1171,8 @@ def logs():
         "log_dir": locations.get("log_dir", ""),
         "log_dir_source": locations.get("log_dir_source", ""),
         "error_log": locations.get("error_log", ""),
+        # 重复日志限频统计：抑制了多少条同类错误（排查「日志刷屏」时用）
+        "dup_suppress": dup_stats,
     })
 
 

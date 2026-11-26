@@ -94,6 +94,16 @@ class PostgresWALDaemon(CDCDaemon):
     DEFAULT_DB: str = "postgres"
     #: 流式接收客户端候选（按序探测，命中即用）
     RECEIVE_CLIENT_CANDIDATES: Tuple[str, ...] = ("pg_receivewal",)
+    #: 客户端安装目录扫描模板（占位符 %s = 客户端名）
+    CLIENT_SEARCH_GLOBS: Tuple[str, ...] = (
+        "/pgdb/pgsql/bin/%s",
+        "/usr/pgsql-*/bin/%s",
+        "/usr/local/pgsql/bin/%s",
+        "/usr/local/pgsql*/bin/%s",
+        "/opt/database/bin/%s",
+        "/opt/pg/*/bin/%s",
+        "/opt/pgsql*/bin/%s",
+    )
     #: 交互式 SQL 客户端候选（位点探测回退用）
     QUERY_CLIENT_CANDIDATES: Tuple[str, ...] = ("psql",)
     #: 承载密码的环境变量名（可给多个，全部注入）
@@ -124,23 +134,162 @@ class PostgresWALDaemon(CDCDaemon):
     def _resolve_client(cls) -> Tuple[str, str]:
         """在 :attr:`RECEIVE_CLIENT_CANDIDATES` 中定位流式接收客户端。
 
+        选取规则（2026-11-26 修正）：
+
+        1. **族优先**——按候选顺序取第一个"存在可用二进制"的族
+           （金仓必须用 ``sys_receivewal``，不能被 PG 的 ``pg_receivewal`` 顶替）；
+        2. **同族内版本择优**——同一族存在多套安装时取**主版本最高**的一套。
+
+        为什么要版本择优：流复制协议要求**客户端主版本 ≥ 服务端主版本**，
+        低版本客户端连高版本服务端会直接报
+        ``incompatible server version 16.9; client does not support streaming
+        from server versions newer than 14.12``（2026-11-26 实测：平台侧
+        /pgdb 是 14.12，而源库是 16.9，实时保护整条链路起不来）。
+
         Returns:
-            ``(可执行名, 原因)``。命中时原因为空串；未命中时可执行名为空串。
+            ``(可执行路径, 原因)``。命中时原因为空串；未命中时可执行名为空串。
         """
+        cands = cls._client_candidates()
+        if not cands:
+            return "", f"缺少客户端工具: {', '.join(cls.RECEIVE_CLIENT_CANDIDATES)}"
+        # 族优先：候选顺序即优先级
         for name in cls.RECEIVE_CLIENT_CANDIDATES:
-            if shutil.which(name):
-                return name, ""
-        # PATH 未命中 → 常见安装目录扫描（平台 PATH 不含 PG 客户端目录是常态；
-        # /pgdb/pgsql/bin 实测有 pg_receivewal）。返回绝对路径，调用方直接作 argv[0]。
+            same = [p for p in cands if os.path.basename(p) == name]
+            if not same:
+                continue
+            # 同族内版本择优（探测失败的按 (0,0) 排最后）
+            best = max(same, key=lambda p: cls._client_version(p))
+            return best, ""
+        return cands[0], ""
+
+    @classmethod
+    def _client_candidates(cls) -> List[str]:
+        """列出所有可用的流式接收客户端绝对路径（PATH 命中 + 安装目录扫描）。"""
+        out = []  # type: List[str]
+        for name in cls.RECEIVE_CLIENT_CANDIDATES:
+            which = shutil.which(name)
+            if which:
+                out.append(which)
         import glob as _glob
         for name in cls.RECEIVE_CLIENT_CANDIDATES:
-            for pat in ("/pgdb/pgsql/bin/%s", "/usr/pgsql-*/bin/%s",
-                        "/usr/local/pgsql/bin/%s", "/opt/database/bin/%s",
-                        "/opt/pg/*/bin/%s"):
-                hits = sorted(_glob.glob(pat % name))
-                if hits:
-                    return hits[-1], ""
-        return "", f"缺少客户端工具: {', '.join(cls.RECEIVE_CLIENT_CANDIDATES)}"
+            for pat in cls.CLIENT_SEARCH_GLOBS:
+                for hit in sorted(_glob.glob(pat % name)):
+                    if os.path.isfile(hit) and os.access(hit, os.X_OK):
+                        out.append(hit)
+        seen, uniq = set(), []
+        for p in out:
+            if p not in seen:
+                seen.add(p)
+                uniq.append(p)
+        return uniq
+
+    #: 客户端版本探测缓存（路径 → (主版本, 次版本)）
+    _CLIENT_VERSION_CACHE: dict = {}
+
+    @classmethod
+    def _client_version(cls, path: str) -> Tuple[int, int]:
+        """探测客户端主/次版本；探测失败返回 ``(0, 0)``。
+
+        ``pg_receivewal --version`` 输出形如
+        ``pg_receivewal (PostgreSQL) 14.12``；金仓的 ``sys_receivewal``
+        输出形如 ``sys_receivewal (KingbaseES V9) 9.0.0``，用同一正则取首个
+        ``主.次`` 即可（版本择优只关心相对高低）。
+        """
+        cached = cls._CLIENT_VERSION_CACHE.get(path)
+        if cached is not None:
+            return cached
+        ver = (0, 0)
+        try:
+            out = subprocess.run([path, "--version"], capture_output=True,
+                                 text=True, timeout=15)
+            text = (out.stdout or "") + " " + (out.stderr or "")
+            m = re.search(r"(\d+)\.(\d+)", text)
+            if m:
+                ver = (int(m.group(1)), int(m.group(2)))
+        except Exception:
+            ver = (0, 0)
+        cls._CLIENT_VERSION_CACHE[path] = ver
+        return ver
+
+    #: 客户端 libpq 目录探测缓存（客户端路径 → 可用 libpq 目录）
+    _CLIENT_LIB_CACHE: dict = {}
+
+    @classmethod
+    def _client_lib_dir(cls, client_path: str) -> str:
+        """推断客户端配套的 libpq 目录（**自验证**：候选目录必须真能加载）。
+
+        判定要点：
+
+        1. 优先用客户端**同目录树**下的 libpq（版本对齐，避免 ABI 串味）；
+        2. 候选目录必须**真的能加载**——只"存在 libpq.so\*"不够：2026-11-26
+           实测把 PG16 的 libpq（需 GLIBC_2.25）放到 CentOS7 平台，目录在、
+           文件在，客户端却直接起不来；而 PG16 的 pg_receivewal 本身只要
+           GLIBC≤2.14，配平台自带 libpq 14 完全可用（27 个 PQ 符号齐备）。
+           因此这里直接**跑一次客户端 --version** 做探针。
+        3. 探测失败则回落到平台自带 libpq（/pgdb/pgsql/lib，支持 SCRAM）。
+        """
+        fallback = "/pgdb/pgsql/lib"
+        if not client_path:
+            return fallback
+        cached = cls._CLIENT_LIB_CACHE.get(client_path)
+        if cached is not None:
+            return cached
+        chosen = fallback
+        try:
+            base = os.path.dirname(os.path.abspath(client_path))      # .../bin
+            cand = os.path.join(os.path.dirname(base), "lib")          # .../lib
+            if os.path.isdir(cand) and cand != fallback:
+                import glob as _glob
+                if _glob.glob(os.path.join(cand, "libpq.so*")):
+                    env = os.environ.copy()
+                    env["LD_LIBRARY_PATH"] = cand + ":" + fallback
+                    probe = subprocess.run([client_path, "--version"],
+                                           capture_output=True, text=True,
+                                           timeout=15, env=env)
+                    if probe.returncode == 0:
+                        chosen = cand
+        except Exception:
+            chosen = fallback
+        cls._CLIENT_LIB_CACHE[client_path] = chosen
+        return chosen
+
+
+    #: 客户端 stderr 英文报错 → 中文可执行提示（现场运维看不懂 libpq 英文报错）
+    _STDERR_HINTS = (
+        (re.compile(r"incompatible server version (\d+)\.(\d+); client does not support "
+                    r"streaming from server versions newer than (\d+)\.(\d+)"),
+         "流复制客户端主版本低于源库服务端版本（客户端 {2}.{3} < 服务端 {0}.{1}）："
+         "请在**平台侧**安装与服务端同主版本或更高的 pg_receivewal"
+         "（数据库服务器无需、也不应安装任何备份工具）"),
+        (re.compile(r"SCRAM authentication requires libpq version (\d+) or above"),
+         "平台侧 libpq 版本过低（需 ≥ {1}）导致 SCRAM 认证失败："
+         "请使用客户端自带的 libpq（平台会按客户端路径自动对齐）"),
+        (re.compile(r"no pg_hba\.conf entry.*"), 
+         "源库 pg_hba.conf 未放行该复制账号：请在源库为复制账号增加 host replication 授权"),
+        (re.compile(r"replication slot .* already exists"),
+         "复制槽已存在（如上次异常退出残留）：可在源库确认槽归属后复用或删除重建"),
+        (re.compile(r"password authentication failed for user"), 
+         "复制账号口令认证失败：请核对任务中的账号口令与源库口令有效期"),
+    )
+
+    @classmethod
+    def _translate_stderr(cls, text: str) -> str:
+        """把客户端英文报错翻译成中文可执行提示（未命中则原样返回）。"""
+        if not text:
+            return ""
+        for rx, tip in cls._STDERR_HINTS:
+            m = rx.search(text)
+            if m:
+                try:
+                    return tip.format(*m.groups())
+                except Exception:
+                    return tip
+        return text
+
+    def _read_stderr_tail(self, limit: int = 400) -> str:
+        """读取子进程 stderr 末尾，并翻译成中文可执行提示。"""
+        raw = super()._read_stderr_tail(limit)
+        return self._translate_stderr(raw) or raw
 
     @classmethod
     def _resolve_query_client(cls) -> str:
@@ -275,12 +424,21 @@ class PostgresWALDaemon(CDCDaemon):
         if self.password:
             for key in self.PASSWORD_ENV:
                 env[key] = str(self.password)
-        # 流复制客户端 libpq 版本对齐：/opt/database/bin 下的 pg_receivewal 16
-        # 链接系统老 libpq（<10，不支持 SCRAM）会报 "SCRAM authentication
-        # requires libpq version 10 or above"；用 /pgdb/pgsql/lib 的 libpq
-        # （14，支持 SCRAM，可连 PG16/金仓 V9）前置覆盖。
-        env["LD_LIBRARY_PATH"] = "/pgdb/pgsql/lib" + (
-            ":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+        # 流复制客户端 libpq 版本对齐：用**所选客户端自身配套**的 libpq，
+        # 避免"PG18 客户端 + PG14 libpq"这类 ABI 串味。早期实现固定写
+        # /pgdb/pgsql/lib（libpq 14，支持 SCRAM，可连 PG16/金仓 V9）；
+        # 链接系统老 libpq（<10）会报 "SCRAM authentication requires libpq
+        # version 10 or above"。
+        client, _reason = self._resolve_client()
+        lib_dir = self._client_lib_dir(client)
+        parts = [lib_dir]
+        if lib_dir != "/pgdb/pgsql/lib":
+            # 兜底：平台自带的 libpq（支持 SCRAM）作为第二顺位，
+            # 避免"客户端目录里没有 libpq"导致加载失败
+            parts.append("/pgdb/pgsql/lib")
+        if env.get("LD_LIBRARY_PATH"):
+            parts.append(env["LD_LIBRARY_PATH"])
+        env["LD_LIBRARY_PATH"] = ":".join(parts)
         return env
 
     def _ensure_slot(self) -> None:

@@ -248,32 +248,49 @@ def _file_store_dir(cycle_id: str | None = None) -> str:
 
 
 def _manifest_cmd(src_path: str) -> str:
-    """远端清单脚本（零 agent，只读）：文件 sha256 + 元数据 + 目录 + 链接。"""
+    """远端清单脚本（零 agent，只读）：文件 sha256 + 元数据 + 目录 + 链接。
+
+    2026-11-26 补元数据保真（zbackup 不管元数据，我们必须要）：
+    - 目录条目（含**空目录**）+ 其 mtime/mode/uid/gid；
+    - 文件条目补 uid/gid（此前只有 size/mtime/mode，恢复后属主丢失）。
+    """
     p = shlex.quote(src_path)
     return (
         f"cd {p} || {{ echo MANIFEST_CD_FAIL; exit 3; }}; "
         "find . -type f -print0 2>/dev/null | xargs -0 -r sha256sum 2>/dev/null; "
         "echo MSTAT; "
-        "find . -type f -print0 2>/dev/null | xargs -0 -r stat -c '%n|%s|%Y|%a' 2>/dev/null; "
+        "find . -type f -print0 2>/dev/null | xargs -0 -r stat -c '%n|%s|%Y|%a|%u|%g|%i|%h' 2>/dev/null; "
+        "echo MDIR; "
+        "find . -type d -print0 2>/dev/null | xargs -0 -r stat -c '%n|%Y|%a|%u|%g' 2>/dev/null; "
         "echo MLNK; "
         "find . -type l -print0 2>/dev/null | xargs -0 -r -n1 sh -c "
-        "'printf \"%s|%s\\n\" \"$1\" \"$(readlink \"$1\")\"' sh 2>/dev/null; "
+        "'printf \"%s|%s|%s\\n\" \"$1\" \"$(readlink \"$1\")\" "
+        "\"$(stat -c \"%Y|%a|%u|%g\" \"$1\")\"' sh 2>/dev/null; "
         "echo MDONE"
     )
 
 
 def parse_file_manifest(out: str, src_path: str) -> Dict:
-    """解析清单输出 → {"files": {rel: {sha,size,mtime,mode}}, "dirs": [..],
-    "links": {rel: target}}。rel 为相对源路径（'./' 开头，与 tar -C 语义一致）。
-    独立纯函数便于单测。"""
+    """解析清单输出 → ``{"files": {rel: {sha,size,mtime,mode,uid,gid}},
+    "dirs": {rel: {mtime,mode,uid,gid}}, "links": {rel: {target,mtime,mode,uid,gid}}}``。
+
+    rel 为相对源路径（'./' 开头，与 tar -C 语义一致）。独立纯函数便于单测。
+
+    元数据保真（2026-11-26）：目录含**空目录**与 mtime/mode/uid/gid，文件补
+    uid/gid，符号链接补自身 mtime/mode/uid/gid——恢复后属主、权限、时间戳
+    与源一致（zbackup 本身不备份元数据，这里是我们比它强的地方）。
+    """
     files: Dict[str, Dict] = {}
-    dirs: List[str] = []
-    links: Dict[str, str] = {}
+    dirs: Dict[str, Dict] = {}
+    links: Dict[str, Dict] = {}
     stage = "SUM"
     for line in (out or "").splitlines():
         line = line.rstrip("\r")
         if line == "MSTAT":
             stage = "STAT"
+            continue
+        if line == "MDIR":
+            stage = "DIR"
             continue
         if line == "MLNK":
             stage = "LNK"
@@ -285,23 +302,48 @@ def parse_file_manifest(out: str, src_path: str) -> Dict:
             h, path = line[:64], line[66:]
             if h == "MANIFEST_CD_FAIL" or path == "":
                 continue
-            files[path] = {"sha": h, "size": None, "mtime": 0, "mode": 0o644}
+            files[path] = {"sha": h, "size": None, "mtime": 0, "mode": 0o644,
+                           "uid": 0, "gid": 0}
         elif stage == "STAT" and "|" in line:
             parts = line.split("|")
-            if len(parts) == 4 and parts[0] in files:
+            if len(parts) >= 4 and parts[0] in files:
                 try:
-                    files[parts[0]].update({
-                        "size": int(parts[1]), "mtime": int(parts[2]),
-                        "mode": int(parts[3], 8) or 0o644})
+                    meta = {"size": int(parts[1]), "mtime": int(parts[2]),
+                            "mode": int(parts[3], 8) or 0o644}
+                    if len(parts) >= 6:
+                        meta["uid"] = int(parts[4])
+                        meta["gid"] = int(parts[5])
+                    if len(parts) >= 8:
+                        # inode + 链接数：识别硬链接（同 ino 多名 → tar 里只留
+                        # 一份内容 + LNKTYPE 硬链接条目，恢复后同 inode）
+                        meta["ino"] = int(parts[6])
+                        meta["nlink"] = int(parts[7])
+                    files[parts[0]].update(meta)
+                except ValueError:
+                    pass
+        elif stage == "DIR" and "|" in line:
+            parts = line.split("|")
+            if len(parts) >= 5:
+                try:
+                    dirs[parts[0]] = {"mtime": int(parts[1]),
+                                      "mode": int(parts[2], 8) or 0o755,
+                                      "uid": int(parts[3]), "gid": int(parts[4])}
                 except ValueError:
                     pass
         elif stage == "LNK" and "|" in line:
-            rel, _, target = line.partition("|")
-            if rel.startswith("./"):
-                links[rel] = target
-    if not files and not dirs:
-        # 至少要求命令跑通（目录可能真的为空——允许空清单，由调用方判断）
-        pass
+            parts = line.split("|")
+            if len(parts) < 2 or not parts[0].startswith("./"):
+                continue
+            meta = {"target": parts[1], "mtime": 0, "mode": 0o777,
+                    "uid": 0, "gid": 0}
+            if len(parts) >= 6:
+                try:
+                    meta.update({"mtime": int(parts[2]),
+                                 "mode": int(parts[3], 8) or 0o777,
+                                 "uid": int(parts[4]), "gid": int(parts[5])})
+                except ValueError:
+                    pass
+            links[parts[0]] = meta
     return {"files": files, "dirs": dirs, "links": links, "src_path": src_path}
 
 
@@ -318,9 +360,19 @@ def remote_file_manifest(exec_fn: Callable[[str], Tuple[str, str, int]],
         if r != 0:
             raise RuntimeError(f"远端清单获取失败（{p}）rc={r}: {(e or o or '')[-300:]}")
         part = parse_file_manifest(o, p)
-        part.pop("dirs", None)
+        # dirs 保留（v2：含空目录与元数据，build_tar_from_manifest 会用）
         sources.append(part)
     return {"sources": sources}
+
+
+def rel_key(rel: str) -> str:
+    """``'./a/b'`` → ``'a/b'``：只剥**一次** ``./`` 前缀。
+
+    绝不能用 ``lstrip("./")`` —— 那是"字符集合"剥离，会把隐藏文件的前导点
+    一起吃掉（``'./.hidden.txt'.lstrip('./')`` → ``'hidden.txt'``），导致
+    远端路径还原错、SFTP 拉取 ENOENT、恢复后文件名少一个点。
+    """
+    return rel[2:] if rel.startswith("./") else rel
 
 
 def _excluded(rel: str, excludes: List[str]) -> bool:
@@ -332,9 +384,26 @@ def _excluded(rel: str, excludes: List[str]) -> bool:
         if not ex:
             continue
         if fnmatch.fnmatch(base, ex) or fnmatch.fnmatch(rel, ex) \
-                or fnmatch.fnmatch(rel.lstrip("./"), ex):
+                or fnmatch.fnmatch(rel_key(rel), ex):
             return True
     return False
+
+
+CDC_MIN_FILE = 4 * 1024 * 1024      # ≥4MB 的文件才走传输级 CDC（脚本推送有开销）
+
+
+def _pull_one_cdc(client, sftp, remote_abs: str, local_path: str) -> Dict:
+    """大文件传输级 CDC：远端算块（临时脚本，用完即删）→ 只拉新块 → 平台重组。"""
+    from core import cdc_chunk
+
+    def _exec(cmd: str, timeout: int = 900):
+        _in, _out, _err = client.exec_command(cmd, timeout=timeout)
+        o = _out.read().decode("utf-8", "replace")
+        e = _err.read().decode("utf-8", "replace")
+        return o, e, _out.channel.recv_exit_status()
+
+    return cdc_chunk.pull_file_cdc(sftp, _exec, remote_abs, local_path,
+                                   cdc_chunk.ChunkStore())
 
 
 def pull_files_dedup(client, manifest: Dict, task_id=None,
@@ -353,6 +422,10 @@ def pull_files_dedup(client, manifest: Dict, task_id=None,
     hits = 0
     fetches = 0
     total = 0
+    # 传输级 CDC（大文件只传变化块）：远端算块边界（临时推 python3 脚本，用完
+    # 即删，零安装），平台只拉块库缺失的块。失败自动回退整文件 SFTP。
+    cdc_stats = {"used": 0, "blocks": 0, "hit_blocks": 0, "fetched_blocks": 0,
+                 "transferred": 0, "fallback": 0, "error": ""}
     try:
         for source in manifest["sources"]:
             src_root = (source.get("src_path") or "/").rstrip("/")
@@ -363,10 +436,28 @@ def pull_files_dedup(client, manifest: Dict, task_id=None,
                 sha = meta["sha"]
                 phys = os.path.join(store, sha[:2], sha)
                 if not os.path.isfile(phys):
-                    remote_abs = src_root + "/" + rel.lstrip("./")
+                    remote_abs = src_root + "/" + rel_key(rel)
                     os.makedirs(os.path.dirname(phys), exist_ok=True)
                     tmp = phys + ".part"
-                    sftp.get(remote_abs, tmp)
+                    fsize = int(meta.get("size") or 0)
+                    if fsize >= CDC_MIN_FILE:
+                        # 大文件走传输级 CDC（只拉块库缺失的块）
+                        try:
+                            cs = _pull_one_cdc(client, sftp, remote_abs, tmp)
+                            cdc_stats["used"] += 1
+                            cdc_stats["blocks"] += cs.get("blocks", 0)
+                            cdc_stats["hit_blocks"] += cs.get("hit_blocks", 0)
+                            cdc_stats["fetched_blocks"] += cs.get("fetched_blocks", 0)
+                            cdc_stats["transferred"] += cs.get("transferred_bytes", 0)
+                            transferred += int(cs.get("transferred_bytes") or 0)
+                        except Exception as _e:          # noqa: BLE001 —— 回退整文件
+                            cdc_stats["fallback"] += 1
+                            cdc_stats["error"] = str(_e) or type(_e).__name__
+                            sftp.get(remote_abs, tmp)
+                            transferred += fsize
+                    else:
+                        sftp.get(remote_abs, tmp)
+                        transferred += fsize
                     got = _file_sha256(tmp)
                     if got != sha:
                         try:
@@ -377,15 +468,16 @@ def pull_files_dedup(client, manifest: Dict, task_id=None,
                             f"文件 {rel} 传输后哈希不符"
                             f"（期望 {sha[:12]}…实得 {got[:12]}…）")
                     os.replace(tmp, phys)
-                    transferred += int(meta.get("size") or 0)
                     fetches += 1
                 else:
                     hits += 1
                 local_map[rel] = phys
             # 链接：目标字符串作为内容（哈希寻址），不 follow
-            for rel, target in source.get("links", {}).items():
+            for rel, meta in source.get("links", {}).items():
                 if _excluded(rel, excludes):
                     continue
+                # 清单 v2：links[rel] = {target, mtime, mode, uid, gid}
+                target = meta.get("target") if isinstance(meta, dict) else meta
                 data = target.encode("utf-8")
                 sha = _block_hash(data)
                 phys = os.path.join(store, sha[:2], sha)
@@ -409,7 +501,7 @@ def pull_files_dedup(client, manifest: Dict, task_id=None,
     return local_map, {"logical_bytes": total, "transferred_bytes": transferred,
                        "saved_bytes": saved, "ratio_pct": ratio,
                        "blocks": len(local_map), "hit_blocks": hits,
-                       "fetched_blocks": fetches}
+                       "fetched_blocks": fetches, "cdc": cdc_stats}
 
 
 def build_tar_from_manifest(manifest: Dict, local_map: Dict[str, str],
@@ -423,42 +515,72 @@ def build_tar_from_manifest(manifest: Dict, local_map: Dict[str, str],
 
     with tarfile.open(tar_path, "w:gz", compresslevel=compresslevel) as tf:
         for source in manifest["sources"]:
-            # 目录条目（含中间目录）：从文件/链接 rel 推导
-            dirs = set()
+            # 目录条目：清单里的真实目录（含**空目录** + mtime/mode/uid/gid）
+            # 优先；再从文件/链接路径推导中间目录兜底（旧清单无 MDIR 段）。
+            dirs: Dict[str, Dict] = {}
+            for rel, meta in (source.get("dirs") or {}).items():
+                if not _excluded(rel, excludes):
+                    dirs[rel] = meta
             rels = list(source["files"].keys()) + list(source.get("links", {}).keys())
             for rel in rels:
                 if _excluded(rel, excludes):
                     continue
-                parts = rel.lstrip("./").split("/")[:-1]
+                parts = rel_key(rel).split("/")[:-1]
                 acc = "."
                 for part in parts:
                     acc = f"{acc}/{part}"
-                    dirs.add(acc)
+                    dirs.setdefault(acc, {"mtime": 0, "mode": 0o755,
+                                          "uid": 0, "gid": 0})
             for d in sorted(dirs):
                 if _excluded(d, excludes):
                     continue
+                meta = dirs[d]
                 ti = tarfile.TarInfo(name=d)
                 ti.type = tarfile.DIRTYPE
-                ti.mode = 0o755
-                ti.mtime = 0
+                ti.mode = int(meta.get("mode") or 0o755) & 0o7777
+                ti.mtime = int(meta.get("mtime") or 0)
+                ti.uid = int(meta.get("uid") or 0)
+                ti.gid = int(meta.get("gid") or 0)
                 tf.addfile(ti)
-            for rel, target in source.get("links", {}).items():
+            for rel, meta in source.get("links", {}).items():
                 if _excluded(rel, excludes):
                     continue
+                is_dict = isinstance(meta, dict)
+                target = meta.get("target") if is_dict else meta
                 ti = tarfile.TarInfo(name=rel)
                 ti.type = tarfile.SYMTYPE
                 ti.linkname = target
-                ti.mode = 0o777
-                ti.mtime = 0
+                ti.mode = (int(meta.get("mode") or 0o777) & 0o7777) if is_dict else 0o777
+                ti.mtime = int(meta.get("mtime") or 0) if is_dict else 0
+                ti.uid = int(meta.get("uid") or 0) if is_dict else 0
+                ti.gid = int(meta.get("gid") or 0) if is_dict else 0
                 tf.addfile(ti)
+            seen_ino = {}          # ino → 第一个写出的成员名（硬链接指向它）
             for rel, meta in sorted(source["files"].items()):
                 if _excluded(rel, excludes):
                     continue
+                ino = meta.get("ino")
+                nlink = int(meta.get("nlink") or 1)
+                if ino and nlink > 1:
+                    # 硬链接：同 inode 的第二个名字写成 LNKTYPE 条目，
+                    # 恢复后 os.link 回同一 inode（否则会退化成两份独立副本）
+                    first = seen_ino.get(ino)
+                    if first:
+                        ti = tarfile.TarInfo(name=rel)
+                        ti.type = tarfile.LNKTYPE
+                        ti.linkname = first
+                        ti.size = 0
+                        ti.mtime = int(meta.get("mtime") or 0)
+                        tf.addfile(ti)
+                        continue
+                    seen_ino[ino] = rel
                 phys = local_map[rel]
                 ti = tarfile.TarInfo(name=rel)
                 ti.size = os.path.getsize(phys)
                 ti.mtime = int(meta.get("mtime") or 0)
                 ti.mode = int(meta.get("mode") or 0o644) & 0o7777
+                ti.uid = int(meta.get("uid") or 0)
+                ti.gid = int(meta.get("gid") or 0)
                 with open(phys, "rb") as f:
                     tf.addfile(ti, f)
     # 回读校验：tar 内每个常规文件的内容哈希必须与清单一致

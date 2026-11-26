@@ -167,6 +167,107 @@ class DamengEngine(BackupEngine):
 
         return ["FULL=Y"]
 
+    # ---------------- 逻辑通道选择（2026-11-25） ----------------
+    _LOGICAL_CHANNELS = ("auto", "tool", "jdbc")
+
+    def _logical_channel(self) -> str:
+        """任务级逻辑导出通道：auto（默认，先工具后 JDBC）/ tool / jdbc。"""
+        ch = str(self._parse_extra().get("logical_channel") or "auto").strip().lower()
+        return ch if ch in self._LOGICAL_CHANNELS else "auto"
+
+    def _jdbc_engine(self):
+        """达梦 JDBC 逻辑引擎（同一任务参数，平台侧零客户端）。"""
+        from core.engines.dameng_jdbc import DamengJDBCEngine
+        return DamengJDBCEngine(self.task, self.storage_root, self.logger)
+
+    def _jdbc_probe(self) -> tuple:
+        try:
+            return self._jdbc_engine().probe()
+        except Exception as e:                       # noqa: BLE001
+            return False, "%s: %s" % (type(e).__name__, str(e)[:200])
+
+    def _tools_ready(self) -> tuple:
+        """dexp/dimp 是否真的可执行（本机 → SSH 远端），实例内缓存。"""
+        cached = getattr(self, "_tools_ready_info", None)
+        if cached is not None:
+            return cached
+        ok, detail = self.check_client()
+        if ok:
+            info = (True, "本机 dexp/dimp 就绪")
+            self._tools_ready_info = info
+            return info
+        from core import remote_dump
+        try:
+            ssh = remote_dump.resolve_ssh_host(self.task)
+        except Exception:                            # noqa: BLE001
+            ssh = None
+        if ssh:
+            if str(ssh.get("os_type") or "").lower() == "windows":
+                # Windows 服务器的 dexp.exe 需要 cmd 通道执行，平台当前只对
+                # SQL Server 打通了 cmd 通道；这里不假装就绪，直接引导 JDBC。
+                info = (False,
+                        "数据库服务器为 Windows（%s），dexp.exe 需 Windows 命令"
+                        "通道执行，该组合暂未打通" % (ssh.get("host_key") or ""))
+                self._tools_ready_info = info
+                return info
+            ok2, msg2 = self._preflight_remote_logical(ssh)
+            info = ((True, "数据库服务器远端 dexp/dimp 就绪（%s）" %
+                     (ssh.get("host_key") or "")) if ok2 else (False, msg2))
+            self._tools_ready_info = info
+            return info
+        info = (False, "%s；且未配置 SSH 通道（平台机是 Linux，看不到 Windows "
+                       "实例上的 dexp.exe）" % detail)
+        self._tools_ready_info = info
+        return info
+
+    def _logical_route(self) -> tuple:
+        """决定逻辑备份走哪条通道：("tool"|"jdbc"|None, 说明)。"""
+        ch = self._logical_channel()
+        tool_ok, tool_msg = self._tools_ready()
+        if ch == "tool":
+            if tool_ok:
+                return "tool", tool_msg
+            return None, tool_msg + "（任务已固定为「客户端工具通道」，不会自动改用 JDBC）"
+        if ch == "jdbc":
+            jok, jmsg = self._jdbc_probe()
+            return ("jdbc", jmsg) if jok else (None, "JDBC 逻辑导出通道不可用：" + jmsg)
+        if tool_ok:
+            return "tool", tool_msg
+        jok, jmsg = self._jdbc_probe()
+        if jok:
+            # 工具失败原因写日志（预检弹窗只留 200 字，长文案会把关键结论截掉）
+            self.logger.warning("[%s] dexp/dimp 不可用：%s", self.task_name,
+                                str(tool_msg)[:300])
+            return "jdbc", ("未发现可用的 dexp/dimp，已自动改用 JDBC 逻辑导出"
+                            "通道（%s）" % jmsg)
+        return None, ("dexp/dimp 不可用（%s）；JDBC 逻辑导出通道也不可用（%s）"
+                      % (str(tool_msg)[:120], jmsg))
+
+    def preflight(self) -> tuple:
+        """前置检查：逻辑备份按通道选择判定，物理备份沿用基类。
+
+        2026-11-25 现场问题：达梦实例在 Windows 上，平台机（Linux）没有
+        dexp/dimp，旧逻辑直接报「缺少客户端工具」，而 JDBC 明明连得上。
+        现在 auto 模式下自动落到 JDBC 逻辑导出通道，不再误判为能力缺失。
+        """
+        if (self._parse_extra() or {}).get("custom_script"):
+            return super().preflight()
+        if self.backup_mode == BackupMode.PHYSICAL:
+            return super().preflight()
+        route, reason = self._logical_route()
+        if route == "tool":
+            return True, "逻辑备份通道：客户端工具（%s）" % reason
+        if route == "jdbc":
+            return True, ("逻辑备份通道：JDBC 逻辑导出（%s）。"
+                          "该通道导出表结构与数据，不含视图/存储过程/触发器/权限"
+                          "——需要完整对象请配置 dexp 客户端通道。" % reason)
+        return False, (
+            "达梦逻辑备份通道不可用：%s。可选处置：① 在任务高级选项把「逻辑导出"
+            "通道」设为 JDBC（并在【JDBC 驱动】页注册达梦驱动 jar）；② 为数据库"
+            "服务器启用 OpenSSH 并纳管为 SSH 主机（Linux 服务器），平台自动探测 "
+            "dexp；③ 在平台机安装达梦客户端并把 bin 目录填入「备份命令所在目录」。"
+            % reason)
+
     # ---------------- 备份 ----------------
     def backup(self, backup_type: BackupType) -> BackupResult:
         """达梦备份：按 backup_mode 分发物理(dmrman)/逻辑(dexp)。
@@ -185,6 +286,27 @@ class DamengEngine(BackupEngine):
                 lambda: self._backup_physical(backup_type),
                 "达梦 物理备份(dmrman)",
             )
+
+        # 逻辑备份：按通道选择（auto 先 dexp/dimp，缺失时自动改走 JDBC）
+        route, reason = self._logical_route()
+        if route is None:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message="达梦逻辑备份通道不可用：" + reason)
+        if route == "jdbc":
+            self.logger.warning("[%s] 达梦逻辑备份改用 JDBC 通道：%s",
+                                self.task_name, reason)
+            res = self._jdbc_engine().backup(backup_type)
+            if res and getattr(res, "success", False):
+                res.message = ("%s（通道：JDBC 逻辑导出；%s；仅含表结构与数据，"
+                               "不含视图/存储过程/权限）"
+                               % (res.message or "", reason))
+                res.detail_log = (getattr(res, "detail_log", "") or "") + \
+                    "\n[通道选择] %s" % reason
+            elif res is not None:
+                res.message = "达梦 JDBC 逻辑备份失败：%s" % (res.message or "")
+            return res
+
         return self._try_remote_then_local(
             lambda ssh_host: self._backup_logical_remote(ssh_host, backup_type),
             lambda: self._backup_logical_local(backup_type),
@@ -967,6 +1089,10 @@ class DamengEngine(BackupEngine):
           TIME '<target_time>'，默认恢复到独立目录（非破坏演练），可选覆盖原库
         - .dmp（逻辑导出，dimp）：表/schema/整库导入
         """
+        # ---- JDBC 逻辑产物（.jsonl）：平台侧直连回放，无需 dimp ----
+        if backup_path.endswith(".jsonl"):
+            return self._jdbc_engine().restore(backup_path, **kwargs)
+
         # ---- PITR 物理时点恢复（tar.gz 物理备份集 + target_time）----
         if backup_path.endswith(".tar.gz") or kwargs.get("target_time"):
             return self._restore_pitr(backup_path, **kwargs)
@@ -1132,6 +1258,9 @@ class DamengEngine(BackupEngine):
             return base_res
 
         backup_path = record.get("backup_path") or record.get("output_path") or ""
+        # JDBC 逻辑产物：JSONL 结构校验（不需要 dimp / SSH）
+        if backup_path.endswith(".jsonl"):
+            return self._jdbc_engine().verify_record(record, options)
         ssh_host = remote_dump.resolve_ssh_host(self.task)
         if not ssh_host:
             return BackupResult(

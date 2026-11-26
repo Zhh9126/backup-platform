@@ -158,4 +158,4 @@ def test_plugin_source_contract():
     assert '"integrity": ["sha256"]' in src
     assert 'elif op == "digest":' in src
     assert '"sha256": None, "skipped": "over_limit"' in src
-    assert 'VERSION = "1.2.0"' in src
+    assert 'VERSION = "1.4.0"' in src

@@ -525,7 +525,11 @@ def _execute_backup(task: dict, backup_type: str = None,
     from core import resource_budget
     budget = resource_budget.check(task)
     if not budget.get("ok"):
-        _logger.error("[resource_budget] 任务 %s 被阻断: %s", task.get("id"), budget.get("reason"))
+        # 资源保护阻断是**保护性拦截**（磁盘不足/配额超限），不是平台故障：
+        # 记 warning 而非 error——否则每次调度触发都会往 error.log 灌一条
+        # ERROR，把真正的错误淹没（实测出现过 0GB 可用时连续刷屏）。
+        _logger.warning("[resource_budget] 任务 %s 被阻断: %s",
+                        task.get("id"), budget.get("reason"))
         return {"success": False, "status": "blocked", "message": budget.get("reason")}
 
     # 全局并发控制：限制同时执行的备份数量（缺省保守，不破坏旧串行行为）。
@@ -2044,6 +2048,50 @@ def _file_sync_job_wrapper():
         _logger.error("调度文件实时同步异常: %s", e)
 
 
+def _register_integration(sched):
+    """接口对接中心：每个任务一个 job（cron / interval），逐个注册。
+
+    任务改动后 API 会调 reload_scheduler，这里必须可重入（replace_existing）。
+    """
+    from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.interval import IntervalTrigger
+    from core import integration
+    try:
+        tasks = integration.list_tasks(enabled_only=True)
+    except Exception as exc:  # noqa: BLE001
+        _logger.warning("[integration] 读取对接任务失败（忽略）：%s", exc)
+        return
+    for job in list(sched.get_jobs()):
+        if job.id.startswith("integration_"):
+            try:
+                sched.remove_job(job.id)
+            except Exception:
+                pass
+    registered = 0
+    for t in tasks:
+        stype = (t.get("schedule_type") or "cron").lower()
+        try:
+            if stype == "manual":
+                continue
+            if stype == "interval":
+                minutes = int(t.get("interval_minutes") or 0)
+                if minutes <= 0:
+                    continue
+                trig = IntervalTrigger(minutes=minutes)
+            else:
+                trig = CronTrigger.from_crontab((t.get("cron") or "*/5 * * * *").strip())
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("[integration] 任务 %s 调度表达式非法（%s）：%s",
+                            t.get("id"), t.get("cron"), exc)
+            continue
+        sched.add_job(integration.run_job_wrapper, trig, args=[int(t["id"])],
+                      id="integration_%d" % int(t["id"]), replace_existing=True,
+                      max_instances=1, coalesce=True, misfire_grace_time=120)
+        registered += 1
+    if registered:
+        _logger.info("[integration] 已注册 %d 个接口对接定时任务", registered)
+
+
 
 
 def _register_cleanup(sched):
@@ -2483,9 +2531,16 @@ def _register_rt_backup(sched) -> None:
             # 现在照常注册周期任务，由 rt_watchdog 周期重试接管。
             _logger.warning("[rt] RtSupervisor 未在本进程启动（总开关关闭或未抢到锁），"
                             "已注册看门狗，后续每 5 分钟尝试自愈接管")
-        _register_rt_periodic_jobs(sched)
     except Exception:
         _logger.exception("[rt] 调度集成 RtSupervisor 异常")
+    finally:
+        # 周期任务（看门狗/对账/健康检查）**必须**无条件注册：
+        # 2026-11-26 用户 Windows 平台实测——Supervisor 启动阶段抛异常时
+        # 原实现直接跳过注册 → 看门狗缺失 → 实时保护永久停摆且 UI 无提示。
+        try:
+            _register_rt_periodic_jobs(sched)
+        except Exception:
+            _logger.exception("[rt] 注册实时备份周期任务异常")
 
 
 # ------------------------- 网络设备自动备份调度 -------------------------
@@ -2647,6 +2702,7 @@ def start_scheduler():
     _register_file_sync(_scheduler)
     _register_netdev_backup(_scheduler)
     _register_ai_plans(_scheduler)
+    _register_integration(_scheduler)
     _scheduler.start()
     _ensure_queue_worker()
     # 实时同步任务自动恢复（重启前处于 running 的实时任务重新拉起）
@@ -2724,6 +2780,7 @@ def _reload_scheduler_locked():
     _register_file_sync(_scheduler)
     _register_netdev_backup(_scheduler)
     _register_ai_plans(_scheduler)
+    _register_integration(_scheduler)
     # RT 周期任务幂等重注册；Supervisor 主循环 tick 已保留，不重启守护
     if config.RT_BACKUP_ENABLED:
         _register_rt_periodic_jobs(_scheduler)

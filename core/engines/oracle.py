@@ -2343,7 +2343,11 @@ class OracleEngine(BackupEngine):
             if not self._client_available("impdp"):
                 self.logger.error("[%s] impdp 不可用，无法执行服务端恢复", self.task_name)
                 return BackupResult(success=False, status=BackupStatus.FAILED,
-                                   message="impdp 客户端不可用，无法执行服务端恢复")
+                                   message="impdp 客户端不可用，无法执行服务端恢复。"
+                                           "处置：① 把目标主机改成数据库服务器"
+                                           "（走 SSH，用服务器自带 impdp，平台零安装）；"
+                                           "② 或在平台侧安装 Oracle Instant Client，"
+                                           "并在任务「高级选项 → 工具路径」指定 bin 目录")
             # 形如 server-side:DATA_PUMP_DIR/xxx.dmp
             remainder = backup_path[len("server-side:"):]
             directory, _, dumpfile = remainder.rpartition("/")
@@ -2360,7 +2364,11 @@ class OracleEngine(BackupEngine):
             if not self._client_available("imp"):
                 self.logger.error("[%s] imp 不可用，无法执行本地恢复", self.task_name)
                 return BackupResult(success=False, status=BackupStatus.FAILED,
-                                   message="imp 客户端不可用，无法执行本地恢复")
+                                   message="imp 客户端不可用，无法执行本地恢复。"
+                                           "处置：① 把目标主机改成数据库服务器"
+                                           "（走 SSH，用服务器自带 impdp，平台零安装）；"
+                                           "② 或在平台侧安装 Oracle Instant Client，"
+                                           "并在任务「高级选项 → 工具路径」指定 bin 目录")
             if not os.path.exists(backup_path):
                 msg = f"本地备份文件不存在: {backup_path}"
                 self.logger.error("[%s] %s", self.task_name, msg)

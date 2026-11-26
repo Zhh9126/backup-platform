@@ -179,7 +179,7 @@ class JDBCLogicalEngine(BackupEngine):
                             if not batch:
                                 break
                             for row in batch:
-                                vals = [_encode(v) for v in row]
+                                vals = [self._encode_value(v) for v in row]
                                 f.write(json.dumps({"type": "row", "table": tname,
                                                     "values": vals},
                                                    ensure_ascii=False) + "\n")
@@ -203,6 +203,10 @@ class JDBCLogicalEngine(BackupEngine):
             original_size_bytes=size, duration_sec=round(time.time() - started, 2),
             message="JDBC 逻辑备份成功：%d 张表 / %d 行 / %.1f KB（%s 驱动）"
                     % (len(tables), rows_total, size / 1024.0, self._driver_type()))
+
+    def _encode_value(self, v):
+        """单值编码钩子：默认走通用 ``_encode``，子类可覆盖（如 Clob 取值）。"""
+        return _encode(v)
 
     _MYSQL_FAMILY = ("mysql", "mariadb", "greatdb", "goldendb", "tidb", "oceanbase")
 

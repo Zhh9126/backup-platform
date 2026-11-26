@@ -20,6 +20,45 @@ def _check(checks, item, ok, message, hard=True):
     return ok
 
 
+#: 各库型克隆所需的目标端客户端工具（**平台本机**克隆时必须在平台侧就绪）
+#: 远端克隆走 SSH 通道，由平台在目标机上自动解析，目标机零安装。
+_LOCAL_TOOL_NEEDS = {
+    "oracle": ("impdp", "imp"),
+    "mysql": ("mysql",),
+    "mariadb": ("mysql",),
+    "postgresql": ("psql", "pg_restore"),
+    "kingbase": ("ksql", "psql"),
+    "dameng": ("dimp",),
+    "opengauss": ("gsql", "gs_restore"),
+}
+
+#: 与引擎 _resolve_local_tool 同源的常见安装目录（预检独立进程运行，不引引擎）
+_COMMON_TOOL_DIRS = (
+    "/pgdb/pgsql/bin", "/usr/pgsql-*/bin", "/usr/local/pgsql/bin",
+    "/usr/local/mysql*/bin", "/opt/mysql*/bin", "/opt/pgsql*/bin",
+    "/usr/local/mariadb*/bin", "/opt/mariadb*/bin",
+    "/dm8/bin", "/dm*/bin", "/opt/dmdbms/bin", "/opt/dm*/bin",
+    "/home/dmdba/dmdbms/bin",
+)
+
+
+def local_tool_available(name: str) -> str:
+    """本机工具解析：PATH → 常见安装目录。返回可执行路径，找不到返回空串。"""
+    hit = shutil.which(name)
+    if hit:
+        return hit
+    import glob as _glob
+    for d in _COMMON_TOOL_DIRS:
+        for p in sorted(_glob.glob(os.path.join(d, name))):
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+    return ""
+
+
+def _is_local_target(target_host: str) -> bool:
+    return str(target_host or "127.0.0.1") in ("127.0.0.1", "localhost", "::1", "")
+
+
 def preflight(rec: dict, target_host: str = "127.0.0.1",
               target_port=None, target_password: str = None,
               note: str = "", clone_mode: str = "logical") -> dict:
@@ -133,7 +172,44 @@ def preflight(rec: dict, target_host: str = "127.0.0.1",
         _check(checks, "data_size", True, "活库克隆模式，无备份产物可估算",
                hard=False)
 
-    # 4) 平台暂存盘余量（克隆解包/导入需要落盘）
+    # 4) 目标端工具就绪（克隆失败的头号原因：目标端没有导入客户端）
+    #    - 目标主机 = 平台本机：导入动作在平台进程内执行，平台侧必须有对应客户端；
+    #    - 目标主机 = 其他机器：走 SSH 通道，由平台在目标机上自动解析工具
+    #      （数据库服务器零安装，符合产品红线）。
+    #    2026-11-26 实测：Oracle 克隆到 127.0.0.1 报「imp 客户端不可用」，
+    #    提交前预检本可以提前拦住并告诉用户要补什么。
+    tools = _LOCAL_TOOL_NEEDS.get(kind)
+    if tools:
+        if _is_local_target(target_host):
+            found = [(t, local_tool_available(t)) for t in tools]
+            missing = [t for t, p in found if not p]
+            if missing:
+                errors.append(
+                    "目标主机为平台本机，但平台侧缺少 %s 导入客户端（%s）"
+                    % (kind or "该库型", "、".join(missing)))
+                _check(checks, "target_tools", False,
+                       "平台侧缺少 %s。两种处置：① 把「目标主机」改成数据库服务器"
+                       "（走 SSH，用服务器自带导入工具，平台零安装）；② 在平台侧"
+                       "安装对应客户端，并在任务「高级选项 → 工具路径」指定 bin 目录"
+                       % "、".join(missing))
+            else:
+                _check(checks, "target_tools", True,
+                       "平台侧客户端就绪: " + "、".join(
+                           "%s@%s" % (t, os.path.dirname(p)) for t, p in found if p))
+        else:
+            try:
+                conn = socket.create_connection((str(target_host), 22), timeout=3)
+                conn.close()
+                _check(checks, "target_tools", True,
+                       "目标机 SSH 可达，导入工具由平台在目标机上自动解析"
+                       "（目标机无需安装任何备份工具）")
+            except OSError as e:
+                errors.append("目标主机 SSH 不可达: %s:22 (%s)" % (target_host, e))
+                _check(checks, "target_tools", False, "目标机 SSH 不可达")
+    else:
+        _check(checks, "target_tools", True, "该库型无特定客户端要求", hard=False)
+
+    # 5) 平台暂存盘余量（克隆解包/导入需要落盘）
     try:
         root = str(getattr(config, "BACKUP_ROOT", "/tmp") or "/tmp")
         os.makedirs(root, exist_ok=True)

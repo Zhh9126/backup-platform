@@ -1318,6 +1318,9 @@ class BackupEngine:
         "/pgdb/pgsql/bin", "/usr/pgsql-*/bin", "/usr/local/pgsql/bin",
         "/usr/local/mysql*/bin", "/opt/mysql*/bin", "/opt/pgsql*/bin",
         "/usr/local/mariadb*/bin", "/opt/mariadb*/bin",
+        # 达梦客户端（平台机装了 DM 客户端时 dexp/dimp/disql/dmrman 在此）
+        "/dm8/bin", "/dm*/bin", "/opt/dmdbms/bin", "/opt/dm*/bin",
+        "/home/dmdba/dmdbms/bin",
     )
 
     @staticmethod

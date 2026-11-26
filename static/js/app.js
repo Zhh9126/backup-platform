@@ -1736,6 +1736,7 @@
     if ($("t_chunk_store")) $("t_chunk_store").checked = false;
     if ($("t_backup_stage_dir")) $("t_backup_stage_dir").value = "";
     if ($("t_auto_discover")) $("t_auto_discover").checked = false;
+    if ($("t_logical_channel")) $("t_logical_channel").value = "";
     toggleSshFields();
   }
 
@@ -1759,6 +1760,8 @@
     if ($("t_hot_copy_tablespaces")) $("t_hot_copy_tablespaces").value = eo.hot_copy_tablespaces || "";
     if ($("t_bad_block_check")) $("t_bad_block_check").checked = !!eo.bad_block_check;
     if ($("t_bad_block_mode")) $("t_bad_block_mode").value = eo.bad_block_mode || "fast";
+    // 达梦逻辑导出通道：auto / tool / jdbc（留空=auto）
+    if ($("t_logical_channel")) $("t_logical_channel").value = eo.logical_channel || "";
   }
 
   // 备份产物导出格式：保存收集（写入 extra_options.dump_format）
@@ -1794,6 +1797,10 @@
     const rtd = ($("t_rman_temp_dir") && $("t_rman_temp_dir").value.trim()) || "";
     if (rtd) eo.rman_temp_dir = rtd;
     else delete eo.rman_temp_dir;
+    // 达梦逻辑导出通道：auto（默认）/ tool（仅 dexp、dimp）/ jdbc（免客户端）
+    const dmch = ($("t_logical_channel") && $("t_logical_channel").value) || "";
+    if (dmch) eo.logical_channel = dmch;
+    else delete eo.logical_channel;
     // 远端暂存目录（全库型；整库大小临时产物的落盘位置）
     const bsd = ($("t_backup_stage_dir") && $("t_backup_stage_dir").value.trim()) || "";
     if (bsd) eo.backup_stage_dir = bsd;
@@ -9504,10 +9511,14 @@
       ['源库原始体量（未压缩）', c.source_original_size_human || '-'],
       ['有效期至', c.expires_at || '不自动回收'],
       ['申请人 / 审批人', (c.requested_by || '-') + ' / ' + (c.approved_by || '-')],
-      ['创建时间', c.created_at || '-']
+      ['创建时间', c.created_at || '-'],
+      ['完成时间', c.updated_at || '-'],
+      ['失败原因 / 备注', (c.note || '-')]
     ];
     const body = rows.map(function (r) {
-      return '<tr><td class="text-muted" style="width:190px">' + esc(r[0]) + '</td><td>' + esc(r[1]) + '</td></tr>';
+      // 备注/失败原因可能多行：转义后保留换行，避免全糊成一行
+      const val = esc(r[1]).replace(/\n/g, '<br>');
+      return '<tr><td class="text-muted" style="width:190px">' + esc(r[0]) + '</td><td>' + val + '</td></tr>';
     }).join('');
     const note = c.data_note ? ('<div class="alert alert-info py-2 mt-2 mb-0" style="font-size:.8rem">' + esc(c.data_note) + '</div>') : '';
     const m = $("cloneDetailModal");
@@ -9522,6 +9533,15 @@
       } catch (e) { window.BKP.toast("实测失败: " + e.message, "danger"); }
     };
     bootstrap.Modal.getOrCreateInstance(m).show();
+  };
+
+  // 克隆时间列：紧凑显示 MM-DD HH:mm，完整时间在 title（列表宽度有限，
+  // 2026-11-26 用户反馈"克隆服务时间都没有"→ 补申请时间/完成时间两列）
+  window.cloneTimeCell = function (iso, label) {
+    if (!iso) return '<span class="text-muted">-</span>';
+    var full = window.BKP.fmtTime(iso);
+    var short = (full.length >= 16) ? full.slice(5, 16) : full;
+    return '<span title="' + esc(label) + '：' + esc(full) + '">' + esc(short) + '</span>';
   };
 
   window.loadClones = async function () {
@@ -9580,6 +9600,11 @@
             (vr.ok ? '✓ ' : '✗ ') + esc(vr.message) + '</div>'
           : '';
         if (c.status === 'creating') provisioning = true;
+        // 终态（ready/failed/expired/deleted）才有完成时间；否则显示进行中
+        const TERMINAL = ['ready', 'failed', 'expired', 'deleted'].indexOf(c.status) >= 0;
+        const doneCell = TERMINAL
+          ? cloneTimeCell(c.updated_at, window.T("完成时间"))
+          : '<span class="text-muted" title="' + window.T("尚未完成") + '">' + window.T("进行中") + '</span>';
         return '<tr>' +
           '<td>' + (pg.startNo + cii) + '</td>' +
           '<td>' + (c.task_name ? esc(c.task_name) + ' <span class="text-muted">(记录 ' + c.source_record_id + ')</span>' : (c.source_record_id != null ? c.source_record_id : '-')) + '</td>' +
@@ -9588,12 +9613,14 @@
           '<td>' + esc(c.target_host || '127.0.0.1') + '</td>' +
           '<td>' + badge + verifyHtml + '</td>' +
           '<td>' + esc(c.requested_by || '-') + '</td>' +
+          '<td>' + cloneTimeCell(c.created_at, window.T("申请时间")) + '</td>' +
+          '<td>' + doneCell + '</td>' +
           '<td>' + esc(c.expires_at || '-') + ttlBadge(c) + '</td>' +
           '<td>' + vdb + '</td>' +
           '<td>' + cloneSizeCell(c) + '</td>' +
           '<td class="text-end">' + (actions.join(' ') || '-') + '</td>' +
         '</tr>';
-      }).join("") || '<tr><td colspan="11" class="text-muted text-center">暂无克隆请求</td></tr>';
+      }).join("") || '<tr><td colspan="13" class="text-muted text-center">暂无克隆请求</td></tr>';
       Pager.attach("clones", $("cloneTable"), pg.page, pg.pages, pg.total, window.loadClones);
       // 有克隆正在拉起时每 3 秒自动刷新，直到终态
       if (provisioning) {

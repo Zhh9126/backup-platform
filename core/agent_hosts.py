@@ -16,6 +16,37 @@ def _now():
     return time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
 
+def _parse_matrix(raw) -> dict:
+    """解析落库的能力矩阵 JSON（脏数据不影响列表渲染）。"""
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_capabilities(agent_id: int, caps: dict) -> dict:
+    """比对 Agent 自报能力与平台期望清单，落库并返回矩阵。
+
+    平台侧维护期望清单（core/agent_capabilities.py）：装完逐项核对，
+    缺哪项、为什么缺都如实展示——「安装成功」不等于「能力齐全」。
+    """
+    from core import agent_capabilities
+    matrix = agent_capabilities.evaluate(caps)
+    try:
+        db.execute("UPDATE agent_hosts SET capabilities=?, capabilities_at=?, "
+                   "updated_at=? WHERE id=?",
+                   (json.dumps(matrix, ensure_ascii=False), _now(), _now(),
+                    int(agent_id)))
+    except Exception:
+        pass
+    return matrix
+
+
 def list_hosts(enabled_only: bool = False) -> list:
     rows = db.query("SELECT * FROM agent_hosts ORDER BY id")
     out = []
@@ -29,6 +60,7 @@ def list_hosts(enabled_only: bool = False) -> list:
             except Exception:
                 r["token_masked"] = "***"
         r.pop("token", None)
+        r["cap_matrix"] = _parse_matrix(r.get("capabilities"))
         out.append(r)
     return out
 
@@ -124,7 +156,7 @@ def get_token(rec: dict) -> str:
 
 
 def probe(agent_id: int) -> dict:
-    """健康探测 + 能力自报回写。返回 {ok, caps|error}。"""
+    """健康探测 + 能力自报回写 + 能力矩阵落库。返回 {ok, caps, matrix|error}。"""
     rec = get_by_id(agent_id)
     if not rec:
         return {"ok": False, "error": "注册记录不存在"}
@@ -139,7 +171,8 @@ def probe(agent_id: int) -> dict:
             "agent_version=?, last_check_at=?, updated_at=? WHERE id=?",
             ("online", caps.get("algo") or "", caps.get("version") or "",
              _now(), _now(), int(agent_id)))
-        return {"ok": True, "caps": caps}
+        matrix = save_capabilities(agent_id, caps)
+        return {"ok": True, "caps": caps, "matrix": matrix}
     except Exception as e:
         db.execute(
             "UPDATE agent_hosts SET last_status=?, last_check_at=?, "

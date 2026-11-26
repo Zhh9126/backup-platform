@@ -35,6 +35,8 @@ import threading
 import subprocess
 import shutil
 import hashlib
+import random
+import logging
 from typing import List, Dict, Tuple, Optional
 
 import config
@@ -112,6 +114,11 @@ MTIME_TOLERANCE = 5
 # 全局 SSH 连接池（线程安全）
 _ssh_pool: Dict[str, object] = {}
 _ssh_lock = threading.Lock()
+# 每个主机一把"建连锁"：同一台机器的 SSH 握手串行化（防 sshd MaxStartups 限流）
+_host_connect_locks: Dict[str, threading.Lock] = {}
+# SSH 握手超时（秒）：banner 阶段失败要快速失败重试，不能干等 60s
+_SSH_CONNECT_TIMEOUT = 30
+logger = logging.getLogger("core.engines.file")
 # PEM 内容私钥落盘的临时文件（host_key → 路径），连接池复用期间保留
 _tmp_key_files = {}
 
@@ -216,58 +223,92 @@ def _get_ssh_client(host_key: str, password: str = None,
     # 会依次尝试）；无 private_key 且无口令时才启用 agent/look_for_keys。
     no_password = not password and not key_file
 
+    # ---- 同主机握手串行化（2026-11-26）----
+    # 多个任务/线程同时对同一台机器建 SSH 连接时，sshd 的 MaxStartups 会把超出
+    # 配额的未认证连接直接丢弃 —— 客户端表现就是 "Error reading SSH protocol
+    # banner"（现场日志 21 次握手失败即此类）。同一主机的握手串行化后，后来者
+    # 直接复用池中连接，握手并发降到 1。
     with _ssh_lock:
-        existing = _ssh_pool.get(host_key)
-        # 已有连接但已断开的，丢弃以避免复用死连接
-        if existing:
-            try:
-                t = existing.get_transport()
-                if t is None or not t.is_active():
-                    _ssh_pool.pop(host_key, None)
-            except Exception:
+        host_lock = _host_connect_locks.get(host_key)
+        if host_lock is None:
+            host_lock = threading.Lock()
+            _host_connect_locks[host_key] = host_lock
+
+    with host_lock:
+        # 拿到锁后重查连接池：可能别的线程刚刚建好
+        with _ssh_lock:
+            existing = _ssh_pool.get(host_key)
+            if existing:
+                t = None
+                try:
+                    t = existing.get_transport()
+                except Exception:
+                    t = None
+                alive = False
+                if t is not None and t.is_active():
+                    try:
+                        t.send_ignore()
+                        alive = True
+                    except Exception:
+                        alive = False
+                if alive:
+                    return existing
+                # 不可用则移出连接池，后续重建
+                try:
+                    if t is not None:
+                        t.close()
+                    existing.close()
+                except Exception:
+                    pass
                 _ssh_pool.pop(host_key, None)
 
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    # 握手抖动重试：sshd 刚启动尚未就绪 / MaxStartups 瞬时限流 / 中间链路丢包，
-    # 都会表现为 "Error reading SSH protocol banner"（EOFError 或 SSHException），
-    # 属瞬时故障——192.168.220.168 环境 Oracle 11g 实测出现过，直接导致一次
-    # 恢复校验被判失败（重跑即通过）。这里短暂退避后重试，避免把抖动暴露成
-    # 任务失败。认证失败（AuthenticationException）不是瞬时故障，直接抛出不重试。
-    _auth_exc = paramiko.ssh_exception.AuthenticationException
-    _ssh_exc = paramiko.ssh_exception.SSHException
-    last_exc = None
-    for _attempt in (1, 2, 3):
-        try:
-            client.connect(
-                hostname, port=port, username=user,
-                password=password or None, timeout=60,
-                key_filename=key_file,
-                allow_agent=no_password, look_for_keys=no_password,
-            )
-            last_exc = None
-            break
-        except _auth_exc:
-            raise
-        except (_ssh_exc, OSError, EOFError) as _exc:
-            last_exc = _exc
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # 握手抖动重试：sshd 刚启动尚未就绪 / MaxStartups 瞬时限流 / 中间链路丢包，
+        # 都会表现为 "Error reading SSH protocol banner"（EOFError 或 SSHException），
+        # 属瞬时故障——192.168.220.168 环境 Oracle 11g 实测出现过，直接导致一次
+        # 恢复校验被判失败（重跑即通过）。这里退避后重试，避免把抖动暴露成
+        # 任务失败。认证失败（AuthenticationException）不是瞬时故障，直接抛出。
+        _auth_exc = paramiko.ssh_exception.AuthenticationException
+        _ssh_exc = paramiko.ssh_exception.SSHException
+        last_exc = None
+        for attempt in (1, 2, 3):
             try:
-                client.close()
-            except Exception:
-                pass
-            time.sleep(1.5 * _attempt)
-    if last_exc is not None:
-        raise last_exc
-    # 启用 TCP keepalive + SSH keepalive，降低中间 NAT/防火墙静默断连概率
-    try:
-        t = client.get_transport()
-        if t is not None:
-            t.set_keepalive(30)
-    except Exception:
-        pass
-    with _ssh_lock:
-        _ssh_pool[host_key] = client
-    return client
+                client.connect(
+                    hostname, port=port, username=user,
+                    password=password or None, timeout=_SSH_CONNECT_TIMEOUT,
+                    key_filename=key_file,
+                    allow_agent=no_password, look_for_keys=no_password,
+                )
+                last_exc = None
+                break
+            except _auth_exc as _e:
+                raise _ssh_auth_error(host_key, user, _e)
+            except (_ssh_exc, OSError, EOFError) as _exc:
+                last_exc = _exc
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                if attempt < 3:
+                    # 指数退避 + 抖动：多任务同时失败时避免同步重连（惊群效应）
+                    delay = min(2 ** attempt, 8) * (0.7 + random.random() * 0.6)
+                    logger.warning(
+                        "[%s] SSH 握手失败（第 %s/3 次）: %s；%.1fs 后重试",
+                        host_key, attempt, _exc_msg(_exc), delay)
+                    time.sleep(delay)
+        if last_exc is not None:
+            raise _ssh_connect_error(host_key, last_exc)
+        # 启用 TCP keepalive + SSH keepalive，降低中间 NAT/防火墙静默断连概率
+        try:
+            t = client.get_transport()
+            if t is not None:
+                t.set_keepalive(30)
+        except Exception:
+            pass
+        with _ssh_lock:
+            _ssh_pool[host_key] = client
+        return client
 
 
 def _remote_log_start(cmd: str, timeout: int, note: str = "",
@@ -346,9 +387,25 @@ def _ssh_exec(client, cmd: str, timeout: int = 30) -> Tuple[str, str, int]:
         raise RuntimeError("SSH transport dead")
     t0 = _remote_log_start(cmd, timeout, note="SSH 文本命令")
     _, sout, serr = client.exec_command(cmd, timeout=timeout)
-    out = sout.read().decode("utf-8", errors="replace")
-    err = serr.read().decode("utf-8", errors="replace")
-    rc = sout.channel.recv_exit_status()
+    try:
+        out = sout.read().decode("utf-8", errors="replace")
+        err = serr.read().decode("utf-8", errors="replace")
+        rc = sout.channel.recv_exit_status()
+        if rc == -1:
+            # 与数据通道一致：拿不到退出码 = 连接被中断。必须当瞬时故障抛出，
+            # 否则空输出会被上层当"命令成功但没结果"（例如远端 sha256 变成空串，
+            # 最终报成"分块拉取校验不一致"，掩盖真实断连原因）。
+            raise RuntimeError(
+                "SSH channel closed without exit status（命令未返回退出码，"
+                "连接可能已被中断）")
+    finally:
+        # 显式关闭通道：频繁短命令（探测/stat/sha/轮询）长时间累积未关闭的
+        # channel 会顶到 sshd 的 MaxSessions 上限，之后 open_session 一律被拒
+        # （表现为 "Failure"/连接不可用）。关闭失败不影响命令结果。
+        try:
+            sout.channel.close()
+        except Exception:
+            pass
     import time as _time
     _remote_log_end(rc, out, err, _time.time() - t0)
     return out, err, rc
@@ -438,7 +495,7 @@ def _ssh_exec_stream(client, cmd: str, *, out_file=None, timeout: int = 0,
     import time as _time
     # Agent 通道不支持 stdin（协议层就是 DEVNULL）→ 需要灌 stdin 的操作
     # （mysqldump 导入 / pg_restore COPY / impdp USERID）自动改走同机 SSH 通道
-    if input_data:
+    if input_data is not None:
         _agent_host = getattr(getattr(client, "t", None), "host", None)
         _agent_port = getattr(getattr(client, "t", None), "port", None)
         if _agent_host:
@@ -455,7 +512,7 @@ def _ssh_exec_stream(client, cmd: str, *, out_file=None, timeout: int = 0,
         raise RuntimeError("SSH transport dead")
     _tune_ssh_transport(client)
     in_len = 0
-    if input_data:
+    if input_data is not None:
         if isinstance(input_data, str):
             input_data = input_data.encode("utf-8")
         in_len = len(input_data)
@@ -487,8 +544,11 @@ def _ssh_exec_stream(client, cmd: str, *, out_file=None, timeout: int = 0,
         _tune_ssh_transport(client2)
         sess = t2.open_session()
         sess.exec_command(cmd)
-    if input_data:
-        sess.sendall(input_data)
+    if input_data is not None:
+        # 空 bytes 也必须 shutdown_write：``tar -T -`` 读 stdin 到 EOF 才开工，
+        # 不关写端会一直阻塞（表现为传输 0 B 卡死）。
+        if input_data:
+            sess.sendall(input_data)
         sess.shutdown_write()
     # 通道级超时安全网：循环里的 timeout 检查只在 recv_ready()/exit_status_ready()
     # 返回后的下一轮才生效；若底层 transport 读取线程停摆（池化长连接偶发），
@@ -596,6 +656,13 @@ def _ssh_exec_stream(client, cmd: str, *, out_file=None, timeout: int = 0,
         while sess.recv_stderr_ready():
             err += sess.recv_stderr(8192)
         rc = sess.recv_exit_status()
+        if rc == -1:
+            # 没拿到远端退出码 = 通道被异常关闭（对端断连/sshd 重启/NAT 掐断）。
+            # 必须转成可重试异常：否则会被当成"打包失败 rc=-1"直接判任务失败，
+            # 白白浪费已经完成的大部分传输。
+            raise RuntimeError(
+                "SSH channel closed without exit status（未收到远端退出码，"
+                "连接可能已被中断）")
     except Exception as e:
         try:
             sess.close()
@@ -703,6 +770,49 @@ def _noop_logger():
     return _NoopLogger()
 
 
+# 远端 tar 不支持 --sparse 的主机（BusyBox tar / 极老版本）：记住后不再带该选项
+_SPARSE_UNSUPPORTED: set = set()
+
+
+def _sparse_unsupported(err) -> bool:
+    """远端 tar 报错是否因为不认识 --sparse（BusyBox/老版本 tar）。"""
+    low = (err or "").decode("utf-8", "replace") if isinstance(err, bytes) else (err or "")
+    low = low.lower()
+    return "sparse" in low and any(k in low for k in (
+        "unrecognized", "invalid", "unknown", "illegal", "ambiguous"))
+
+
+def _exc_msg(exc) -> str:
+    """异常可读文案（空消息回落类型名——空原因的错误最让人抓瞎）。"""
+    return (str(exc) or type(exc).__name__).strip()
+
+
+def _ssh_auth_error(host_key: str, user: str, exc: Exception) -> Exception:
+    """认证失败：给可执行处置（账号/密码/私钥），此类不重试。"""
+    return RuntimeError(
+        "SSH 认证失败（%s，用户 %s）：%s。请核对平台「纳管主机」里该主机的"
+        "登录账号/密码或私钥；部分主机默认禁止 root 直连，需先放开 "
+        "PermitRootLogin 或改用普通账号。" % (host_key, user, _exc_msg(exc)))
+
+
+def _ssh_connect_error(host_key: str, exc: Exception) -> Exception:
+    """握手/网络失败：区分 banner 拒绝与超时，给可执行处置。"""
+    msg = _exc_msg(exc)
+    low = msg.lower()
+    if "banner" in low or isinstance(exc, EOFError):
+        hint = ("常见原因：sshd 的 MaxStartups 未认证连接数已满（同时发起太多"
+                "连接）、对端 sshd 未就绪/正在重启、或中间设备拦截了 SSH 握手。"
+                "处置：稍后重试；并发任务多时错开执行；必要时调大 "
+                "/etc/ssh/sshd_config 的 MaxStartups 后重启 sshd。")
+    elif "timed out" in low or "timeout" in low:
+        hint = ("常见原因：网络不通或被防火墙拦截、目标主机负载高、sshd 未启动。"
+                "处置：先确认 %s 的 22 端口可达，再重跑任务。" % host_key)
+    else:
+        hint = "请确认目标主机可达、sshd 正常运行后重跑任务。"
+    return RuntimeError("SSH 连接失败（%s，退避重试 3 次仍失败）：%s。%s"
+                        % (host_key, msg, hint))
+
+
 def _is_transient(err: BaseException) -> bool:
     """传输级瞬时异常（网络中断/SSH 会话断/超时）可重试；
     远端命令 rc!=0（tar 语法/权限/磁盘满）不是瞬时故障，不重试。"""
@@ -717,6 +827,14 @@ def _is_transient(err: BaseException) -> bool:
     if any(k in msg0 for k in ("no space left", "read-only file system",
                                "disk quota exceeded", "file too large")):
         return False
+    # 连接已死必须重试并**换新连接**：这是大文件传输中最常见的瞬时故障
+    # （中间防火墙/NAT 对长会话有时长上限，20GB 备份 10 分钟整必然撞上）。
+    # 此前 "SSH transport dead" 不在任何关键词里 → 被判非瞬时 → 不重试，
+    # 且死掉的池化连接从未被丢弃重建，用户现场 20GB 任务 10m43s 直接失败。
+    if "transport dead" in msg0 or ("transport" in msg0 and "ssh" in msg0):
+        return True
+    if "channel closed" in msg0 or "no exit status" in msg0:
+        return True
     if isinstance(err, (EOFError, socket.timeout, ConnectionError, TimeoutError)):
         return True
     name = type(err).__name__
@@ -724,25 +842,223 @@ def _is_transient(err: BaseException) -> bool:
         return True
     msg = msg0
     return any(k in msg for k in ("eof", "socket", "timeout", "connection",
-                                  "broken pipe", "reset by peer"))
+                                  "broken pipe", "reset by peer", "banner",
+                                  "ssh 连接失败"))
 
 
-def _remote_stage_stat(client, path: str) -> tuple:
-    """远端文件 (大小, sha256)。不存在返回 (0, "")。"""
+def _ensure_alive(client, host_key: str = ""):
+    """连接活性守卫：死连接透明重建，活连接原样返回。
+
+    连接池（_get_ssh_client）自带心跳探测：发一个 IGNORE 包，死了就丢弃
+    重建。这里补的是**长传输中途死亡**的场景——调用方手里攥着的 client
+    对象在传输过程中断掉后，后续每次调用都会在入口检查处抛
+    "SSH transport dead"，而连接池里的死对象永远不会被替换（重试用的
+    还是同一具尸体）。传入 host_key 即可在死连接时取回一个新连接。
+    """
+    try:
+        t = client.get_transport()
+        if t is not None and t.is_active():
+            t.send_ignore()
+            return client
+    except Exception:
+        pass
+    if not host_key:
+        return client
+    try:
+        client.close()
+    except Exception:
+        pass
+    return _get_ssh_client(host_key)
+
+
+def _drop_pooled(host_key: str) -> None:
+    """丢弃连接池里该主机的连接，下次 _get_ssh_client 必重新建连。
+
+    断连重试必须配合本函数：池里留着的就是那具尸体，重试用它会立刻再失败
+    （此前 staged/流式重试都踩过这个坑）。
+    """
+    if not host_key:
+        return
+    with _ssh_lock:
+        old = _ssh_pool.pop(host_key, None)
+    if old is not None:
+        try:
+            old.close()
+        except Exception:
+            pass
+
+
+def _remote_stage_stat(client, path: str, timeout: int = 0) -> tuple:
+    """远端文件 (大小, sha256)。不存在返回 (0, "")。
+
+    timeout 必须随文件大小缩放：20GB 的 sha256sum 在普通磁盘上要
+    2~5 分钟，固定 120s 会把「还在算哈希」误判成超时断连（用户现场
+    20GB 任务 10m43s 失败的直接诱因之一）。
+    """
     q = shlex.quote(path)
+    _t = timeout or 300
     out, _, _rc = _ssh_exec(
         client,
         "stat -c '%s' " % "%s" + q + " 2>/dev/null; "
         "sha256sum " + q + " 2>/dev/null | awk '{print $1}'",
-        timeout=120)
+        timeout=_t)
     lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
     size = int(lines[0]) if lines and lines[0].isdigit() else 0
     sha = lines[1] if len(lines) > 1 and len(lines[1]) == 64 else ""
     return size, sha
 
 
+def _sha_timeout_for(size: int) -> int:
+    """按大小估算 sha256sum 耗时上限（假设 40MB/s，下限 10 分钟）。"""
+    try:
+        return max(600, min(7200, int(size / (40 * 1024 * 1024)) * 60 + 300))
+    except Exception:
+        return 600
+
+
+def _remote_stage_size(client, path: str) -> int:
+    """远端文件大小（快速 stat，不碰 sha256）。"""
+    out, _, _rc = _ssh_exec(client, "stat -c '%%s' %s 2>/dev/null"
+                            % shlex.quote(path), timeout=60)
+    line = (out or "").strip().splitlines()
+    try:
+        return int(line[0]) if line and line[0].isdigit() else 0
+    except Exception:
+        return 0
+
+
+def _remote_stage_sha(client, path: str, size: int = 0) -> str:
+    """远端文件 sha256（超时按大小缩放）。"""
+    out, _, _rc = _ssh_exec(
+        client, "sha256sum %s 2>/dev/null | awk '{print $1}'" % shlex.quote(path),
+        timeout=_sha_timeout_for(size))
+    line = (out or "").strip().splitlines()
+    return line[0].strip() if line and len(line[0].strip()) == 64 else ""
+
+
+def _remote_pack_detached(client, cmd: str, stage_path: str, *, logger,
+                          label: str, host_key: str = "", ensure_alive=None,
+                          poll_interval: float = 10.0, max_wait: int = 28800,
+                          stall_limit: int = 900,
+                          progress_every: float = 30.0) -> tuple:
+    """远端打包**分离式后台执行 + 周期轮询**（大文件备份的关键改造）。
+
+    旧实现用一条阻塞的 _ssh_exec 把整段打包扛在一个 SSH 会话里：20GB 级
+    打包要十几分钟，而中间防火墙/NAT 对 SSH 长会话普遍有时长上限（用户
+    现场 192.168.163.247 的 20GB 任务 10 分钟整被掐断）——会话一断 sshd
+    给远端 shell 发 SIGHUP，tar 被杀、stage 残缺，任务以
+    "SSH transport dead" 失败。
+
+    改为 nohup 后台执行 + 轮询后：
+      - tar 脱离 SSH 会话运行，连接断了它照跑，重连后继续轮询即可；
+      - 每次轮询把 stage 增量打进日志，打包进度首次可见（此前 20GB 打包
+        十几分钟日志一条没有，用户只能干等）；
+      - 退出码落盘（.rc 文件）、完整性落盘（.ok 标记），跨断连可靠判定。
+
+    返回 (rc, out_tail, err_tail)；远端打包非零退出时 err_tail 带真实原因。
+    """
+    import base64 as _b64
+    log = logger
+    q_stage = shlex.quote(stage_path)
+    q_ok = shlex.quote(stage_path + ".ok")
+    q_rc = shlex.quote(stage_path + ".rc")
+    q_pid = shlex.quote(stage_path + ".pid")
+    script = ("( %s ) > %s 2>/tmp/aidbm_stage.err; rc=$?; echo $rc > %s; "
+              "[ $rc -eq 0 ] && touch %s" % (cmd, q_stage, q_rc, q_ok))
+    b64 = _b64.b64encode(script.encode("utf-8")).decode("ascii")
+    launch = ('nohup sh -c "$(printf %%s %s | base64 -d)" >/dev/null 2>&1 & '
+              'echo $! > %s; echo LAUNCHED' % (b64, q_pid))
+    cur = client
+    out, _e, _rc = _ssh_exec(cur, launch, timeout=30)
+    if "LAUNCHED" not in (out or ""):
+        raise RuntimeError("远端后台打包启动失败: %s" % (out or "")[:120])
+    log.info("[%s] [staged] 远端后台打包已启动（脱离 SSH 会话，断连不影响打包）",
+             label)
+
+    poll = ('if [ -f %s ]; then echo "DONE $(cat %s 2>/dev/null)"; '
+            'elif [ -f %s ]; then echo "RC $(cat %s 2>/dev/null)"; '
+            'else s=$(stat -c %%s %s 2>/dev/null || echo 0); echo "RUN $s"; fi'
+            % (q_ok, q_rc, q_rc, q_rc, q_stage))
+    t0 = time.time()
+    last_size = -1
+    last_progress_ts = time.time()
+    last_log_ts = 0.0
+    rc_stage = -1
+    out_tail = ""
+    err_tail = ""
+    polls = 0
+    while True:
+        # 小目录（几 KB~几十 MB）打包 1s 内就完成，固定等 poll_interval=10s 会让
+        # 每个小备份白等 10 秒；前 5 轮用 1s 轮询快速收尾，大目录再退避到
+        # poll_interval，减少对远端的无谓打扰。
+        polls += 1
+        time.sleep(min(poll_interval, 1.0) if polls <= 5 else poll_interval)
+        # 轮询连接死了就换新连接——远端 tar 在后台照跑，不受影响
+        cur = ensure_alive() if ensure_alive else _ensure_alive(cur, host_key)
+        try:
+            po, _, _ = _ssh_exec(cur, poll, timeout=60)
+        except Exception as e:                      # noqa: BLE001 - 轮询瞬时失败
+            if not _is_transient(e):
+                raise
+            log.warning("[%s] [staged] 打包轮询断连，重连后继续（远端打包不受影响）: %s",
+                        label, str(e)[:100])
+            continue
+        line = (po or "").strip().splitlines()
+        tag = line[0].split() if line else []
+        if not tag:
+            continue
+        if tag[0] == "DONE" or tag[0] == "RC":
+            rc_stage = int(tag[1]) if len(tag) > 1 and tag[1].lstrip("-").isdigit() else -1
+            try:
+                out_tail, err_tail, _ = _ssh_exec(
+                    cur, "tail -c 500 /tmp/aidbm_stage.err 2>/dev/null", timeout=30)
+            except Exception:
+                pass
+            break
+        # RUN <size>：进度上报 + 停滞判定
+        try:
+            cur_size = int(tag[1]) if len(tag) > 1 else 0
+        except ValueError:
+            cur_size = 0
+        now = time.time()
+        if cur_size != last_size:
+            last_size = cur_size
+            last_progress_ts = now
+        if now - last_log_ts >= progress_every:
+            last_log_ts = now
+            log.info("[%s] [staged] 远端打包进行中: 已写入 %s（%.0fs）",
+                     label, db.human_size(cur_size), now - t0)
+        if now - t0 > max_wait:
+            _ssh_exec(cur, "kill $(cat %s 2>/dev/null) 2>/dev/null; "
+                           "rm -f %s %s %s" % (q_pid, q_stage, q_ok, q_rc),
+                       timeout=30)
+            raise RuntimeError("远端打包超时（超过 %.0f 分钟），已终止后台任务"
+                               % (max_wait / 60))
+        if now - last_progress_ts > stall_limit:
+            _ssh_exec(cur, "kill $(cat %s 2>/dev/null) 2>/dev/null; "
+                           "rm -f %s %s %s" % (q_pid, q_stage, q_ok, q_rc),
+                       timeout=30)
+            raise RuntimeError("远端打包停滞（%d 秒无进展），已终止后台任务"
+                               % stall_limit)
+        try:
+            from core import cancel as _cancel_mod
+            _cancel_mod.check()
+        except RuntimeError:
+            _ssh_exec(cur, "kill $(cat %s 2>/dev/null) 2>/dev/null; "
+                           "rm -f %s %s %s" % (q_pid, q_stage, q_ok, q_rc),
+                       timeout=30)
+            raise
+    return rc_stage, out_tail, err_tail
+
+
 def _remote_stage_alive(client, path: str, max_age: int = 86400) -> bool:
-    """远端 stage 残件是否可复用（存在、非空、24h 内生成——防续到过期数据）。"""
+    """远端 stage 残件是否可复用（存在、非空、24h 内生成——防续到过期数据）。
+
+    复用前必须核对**完成标记**（stage_path + ".ok"）：tar 中途被打断
+    （断连/任务停止/远端 OOM）会留下非空但**不完整**的 stage 文件，
+    只看「存在且非空」会把残次品当宝贝复用，最后必然 sha 校验不一致，
+    白白拉完几十 GB 才报错。
+    """
     q = shlex.quote(path)
     # 注意：%Y 会被 Python 的 % 格式化误当格式符（unsupported format
     # character 'Y'），此前用 % 拼接导致本函数恒 False → stage 永不复用。
@@ -751,8 +1067,18 @@ def _remote_stage_alive(client, path: str, max_age: int = 86400) -> bool:
     try:
         parts = (out or "").split()
         size, mtime = int(parts[0]), int(parts[1])
-        return size > 0 and (time.time() - mtime) < max_age
     except (IndexError, ValueError):
+        return False
+    if not (size > 0 and (time.time() - mtime) < max_age):
+        return False
+    # 完成标记核对：打包命令成功收尾才会 touch 这个标记。缺标记 = 打包
+    # 被打断的残次品，不可复用（调用方负责清理后重打包）。
+    try:
+        ok_out, _, _ = _ssh_exec(
+            client, "test -f {m} && echo OK || echo NO".format(
+                m=shlex.quote(path + ".ok")), timeout=30)
+        return "OK" in (ok_out or "")
+    except Exception:
         return False
 
 
@@ -797,7 +1123,8 @@ def _load_resume_offset(part: str, sha_sidecar: str, sha_remote: str,
 def _staged_pull(client, cmd: str, out_path: str, *, stage_path: str,
                  rate_kbps: int = 0, chunk_mb: int = 64,
                  block_retries: int = 3, logger=None, label: str = "",
-                 part_path: str = "") -> dict:
+                 part_path: str = "", host_key: str = "",
+                 poll_interval: float = 10.0) -> dict:
     """分块校验式拉取（真·断点续传）。
 
     流程：远端执行 cmd 落盘 stage 文件 → 取大小/sha256 → 本地按块
@@ -814,30 +1141,54 @@ def _staged_pull(client, cmd: str, out_path: str, *, stage_path: str,
 
     返回 {written, rc, resume_from, staged: True}；
     远端磁盘不足抛 RuntimeError("STAGED_ENOSPC: ...") 由调用方回退流式。
+
+    host_key 传入后，长传输中途断连（20GB 级必备——中间设备对 SSH 长会话
+    有时长上限）会在块级重试时**透明换新连接**继续，而不是攥着死连接重试。
     """
     log = logger or _noop_logger()
     part = part_path or (out_path + ".part")
     sha_sidecar = part + ".sha"
     q_stage = shlex.quote(stage_path)
+    q_ok = shlex.quote(stage_path + ".ok")
+    q_rc = shlex.quote(stage_path + ".rc")
 
-    # 1) 远端打包落盘（24h 内 stage 残件直接复用——任务重跑续传不重打包）
-    size, sha_remote = _remote_stage_stat(client, stage_path)
-    if not (size > 0 and _remote_stage_alive(client, stage_path)):
-        out_s, err_s, rc_stage = _ssh_exec(
-            client,
-            "( %s ) > %s 2>/tmp/aidbm_stage.err; rc=$?; "
-            "tail -c 500 /tmp/aidbm_stage.err 2>/dev/null; exit $rc" % (cmd, q_stage),
-            timeout=7200)
+    def _live():
+        return _ensure_alive(client, host_key) if host_key else client
+
+    # 1) 远端打包落盘（带完成标记的 stage 残件直接复用——任务重跑续传不重打包）
+    # 先做轻量 stat + 标记核对，**可复用才算 sha256**——20GB 的哈希要算好几分钟，
+    # 不可复用时白算一遍纯属浪费（且旧的固定 120s 超时会在这里误判成断连）。
+    client = _live()          # 入口活性检查：死连接透明重建（后续复用新连接）
+    size = _remote_stage_size(client, stage_path)
+    reusable = size > 0 and _remote_stage_alive(client, stage_path)
+    sha_remote = _remote_stage_sha(_live(), stage_path, size) if reusable else ""
+    if not reusable:
+        # 打包被打断会留下无标记的残次 stage：先清掉（连同标记与错误暂存）
+        _ssh_exec(_live(), "rm -f %s %s %s /tmp/aidbm_stage.err"
+                  % (q_stage, q_ok, q_rc), timeout=30)
+        rc_stage, out_s, err_s = _remote_pack_detached(
+            _live(), cmd, stage_path, logger=log, label=label,
+            host_key=host_key, ensure_alive=_live,
+            poll_interval=poll_interval)
         if rc_stage != 0:
-            _ssh_exec(client, "rm -f %s /tmp/aidbm_stage.err" % q_stage, timeout=30)
+            _ssh_exec(_live(), "rm -f %s %s %s /tmp/aidbm_stage.err" % (q_stage, q_ok, q_rc),
+                      timeout=30)
             errtxt = ((err_s or "") + (out_s or "")).strip()[-300:]
             if "No space left" in errtxt or "ENOSPC" in errtxt:
                 raise RuntimeError("STAGED_ENOSPC: 远端落盘空间不足，回退流式传输")
             raise RuntimeError("远端打包落盘失败 rc=%s: %s" % (rc_stage, errtxt))
-        size, sha_remote = _remote_stage_stat(client, stage_path)
+        size = _remote_stage_size(_live(), stage_path)
         if size <= 0:
-            _ssh_exec(client, "rm -f %s" % q_stage, timeout=30)
+            _ssh_exec(_live(), "rm -f %s %s %s" % (q_stage, q_ok, q_rc), timeout=30)
             raise RuntimeError("远端 stage 文件为空")
+        sha_remote = _remote_stage_sha(_live(), stage_path, size)
+    if not sha_remote:
+        # 远端 sha256 取空 = 期间连接断了（命令没跑完/通道无退出码）。当成瞬时
+        # 故障抛出让调用方重连续传，绝不带着空哈希继续拉——那样只会在最后
+        # 报"校验不一致"，把真实原因（断连）掩盖掉。
+        raise RuntimeError(
+            "SSH channel closed without exit status"
+            "（远端 sha256 未取到，连接可能已被中断）")
     log.info("[%s] [staged] 远端归档就绪: %s（%s）",
              label, stage_path, db.human_size(size))
 
@@ -886,7 +1237,7 @@ def _staged_pull(client, cmd: str, out_path: str, *, stage_path: str,
                     # 向下取整会造成错位 → 拼接产物 sha 不一致。
                     want = min(chunk, size - offset)
                     blk = _ssh_exec_stream(
-                        client,
+                        _live(),
                         "tail -c +%d %s 2>/dev/null | head -c %d"
                         % (offset + 1, q_stage, want),
                         out_file=fh, timeout=0, rate_kbps=rate_kbps,
@@ -903,6 +1254,10 @@ def _staged_pull(client, cmd: str, out_path: str, *, stage_path: str,
                     log.warning("[%s] [staged] 块拉取失败（第 %s 次），%ss 后重试: %s",
                                 label, attempt, backoff, str(e)[:120])
                     time.sleep(backoff)
+                    # 连接已死 → 丢弃重建（重试用同一具尸体只会原地再死一次）
+                    if host_key and "transport dead" in str(e).lower():
+                        log.warning("[%s] [staged] SSH 连接已断，重连 %s 继续续传",
+                                    label, host_key)
                     # 追加文件截回块起点，避免半个块
                     fh.flush()
                     if os.path.getsize(part) > offset:
@@ -934,25 +1289,34 @@ def _staged_pull(client, cmd: str, out_path: str, *, stage_path: str,
             os.unlink(sha_sidecar)
     except OSError:
         pass
-    _ssh_exec(client, "rm -f %s /tmp/aidbm_stage.err" % q_stage, timeout=30)
+    try:
+        _ssh_exec(_live(), "rm -f %s %s /tmp/aidbm_stage.err" % (q_stage, q_ok),
+                  timeout=30)
+    except Exception:
+        pass    # 清理失败不影响产物正确性（下次打包前也会清）
     log.info("[%s] [staged] 校验一致，落盘完成: %s",
              label, db.human_size(size))
     return {"written": size, "rc": 0, "resume_from": resume_from, "staged": True}
 
 
 def _pull_stream_with_retry(client, cmd: str, out_path: str, *, attempts: int = 3,
-                            rate_kbps: int = 0, logger=None, label: str = "") -> dict:
+                            rate_kbps: int = 0, logger=None, label: str = "",
+                            host_key: str = "", timeout: int = 1800) -> dict:
     """流式拉取 + 瞬时故障退避重试 + .part 半成品保护。
 
     流式压缩产物无法字节级续传（gzip 丢前缀即损坏），网络中断只能重拉；
     但半成品写到 .part（成功才原子改名），不会污染正式产物。
+
+    timeout 默认 1800s——20GB 级 gzip 流在普通链路上远超 30 分钟，
+    传 host_key 时调用方可按需放宽。
     """
     log = logger or _noop_logger()
     part = out_path + ".part"
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
-            r = _ssh_exec_pipe_to_file(client, cmd, part, timeout=1800,
+            r = _ssh_exec_pipe_to_file(_ensure_alive(client, host_key), cmd, part,
+                                       timeout=timeout,
                                        label=label, resume=False,
                                        rate_kbps=rate_kbps)
             if r.get("rc") != 0:
@@ -1051,7 +1415,8 @@ def _get_remote_file_list(client, remote_path: str, excludes=None
         if len(parts) != 3:
             continue
         rel, sz, mt = parts
-        rel = rel.lstrip("./")
+        # 只剥一次 './' 前缀：lstrip("./") 会把隐藏文件的前导点一起吃掉
+        rel = rel[2:] if rel.startswith("./") else rel
         if _match_excludes(rel, excludes):
             continue
         try:
@@ -1162,15 +1527,18 @@ def _probe_remote_paths_windows(client, paths):
     return kinds
 
 
-def _build_tar_cmd(pairs, excludes=None) -> str:
+def _build_tar_cmd(pairs, excludes=None, sparse: bool = True) -> str:
     """按路径类型生成远程打包命令（GNU/BSD tar 通用）。
 
     - 目录：``-C <目录> .``（保持"备份目录内容"的既有语义）
     - 文件：``-C <父目录> <文件名>``（备份文件本身）
     多路径顺序拼接多个 -C。exclude 规则在这里真正生效——此前前端填的排除规则
     从未传给 tar，属于"界面有、实际不生效"的假功能。
+
+    ``sparse=True`` 加 ``--sparse``：稀疏文件（大洞）按稀疏语义入归档，产物
+    不被"展开成实占"撑大；远端 tar 不支持该选项时调用方会自动去掉重试。
     """
-    parts = ["tar", "-czf", "-"]
+    parts = ["tar", "--sparse", "-czf", "-"] if sparse else ["tar", "-czf", "-"]
     for ex in (excludes or []):
         ex = (ex or "").strip()
         if ex:
@@ -1181,6 +1549,81 @@ def _build_tar_cmd(pairs, excludes=None) -> str:
             parts += ["-C", path, "."]
         else:
             parts += ["-C", os.path.dirname(p) or "/", os.path.basename(p)]
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+# --------------------------------------------------------------------------- #
+# 多源路径统一布局（2026-11-26 修复）
+#
+# 旧实现把「第一个源路径」当成唯一基准：快照/清单只扫 pairs[0]，增量打包也用
+# pairs[0] 做 -C 基准；多个源路径时第二个源的文件既不进快照、也永远不参与增量，
+# 而且全量归档里两个源都用 ``-C <目录> .`` 打成 ``./…`` —— 同名文件互相覆盖，
+# 恢复出来只剩一个源的内容。用户反馈「多写两个源路径就不行」即此。
+#
+# 现统一为：单源保持历史布局（内容落在归档根，零行为变化）；多源时每个源用
+# 「去掉首个 / 的绝对路径」作前缀（``/log`` → ``log/…``、``/etc/my.cnf`` →
+# ``etc/my.cnf``），与本地→远程通道（``tar -C / -T``）一致。快照键、归档成员名、
+# 删除清单三者严格同构，全量/增量/恢复/镜像备份才能闭环。
+# --------------------------------------------------------------------------- #
+
+def _norm_src_path(path) -> str:
+    p = str(path or "").strip().replace("\\", "/").rstrip("/")
+    return p or "/"
+
+
+def _src_entries(pairs) -> List[dict]:
+    """[(路径, 'dir'|'file')] → 归档条目 [{path, kind, prefix}]。"""
+    entries, used = [], set()
+    multi = len(pairs) > 1
+    for path, kind in pairs:
+        p = _norm_src_path(path)
+        pref = ""
+        if multi:
+            if p == "/":
+                raise ValueError(
+                    "多源路径不支持根目录 /（会与其他源的文件互相覆盖）："
+                    "请改为具体子目录（如 /log、/etc）")
+            pref = p.lstrip("/")
+            base, n = pref, 1
+            while pref in used:            # 极端：/a 与 a/ 归一后同前缀
+                n += 1
+                pref = "%s__%d" % (base, n)
+            used.add(pref)
+        entries.append({"path": p, "kind": kind, "prefix": pref})
+    return entries
+
+
+def _entry_key(entry: dict, rel: str) -> str:
+    """条目内相对路径 → 归档唯一键（快照键 == 归档成员名）。"""
+    rel = str(rel or "").replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    rel = rel.lstrip("/")
+    pref = (entry.get("prefix") or "").strip("/")
+    if entry.get("kind") == SRC_KIND_FILE:
+        return pref or rel
+    return ("%s/%s" % (pref, rel)) if pref else rel
+
+
+def _snapshot_layout(entries) -> str:
+    """快照键布局指纹：布局变化时旧快照不可作为增量基准（键不同构）。"""
+    if len(entries) > 1:
+        return "v2multi:" + "|".join((e.get("prefix") or "") for e in entries)
+    return "legacy"
+
+
+def _build_tar_cmd_entries(entries, excludes=None, sparse: bool = True) -> str:
+    """多源打包命令：``tar -C / <前缀1> <前缀2> …``（成员名带源前缀，互不覆盖）。"""
+    parts = ["tar", "--sparse", "-czf", "-"] if sparse else ["tar", "-czf", "-"]
+    for ex in (excludes or []):
+        ex = (ex or "").strip()
+        if ex:
+            parts.append("--exclude=%s" % ex)
+    parts += ["-C", "/"]
+    for e in entries:
+        pref = (e.get("prefix") or "").strip("/")
+        if pref:
+            parts.append(pref)
     return " ".join(shlex.quote(p) for p in parts)
 
 
@@ -1198,6 +1641,22 @@ class FileBackupEngine(BackupEngine):
         self.snapshot_namespace: str = ""
         # 源端去重本轮统计（_tar_remote_to_local_dedup 写入，消息透出后清零）
         self._dedup_stats = None
+
+    @staticmethod
+    def _unique_archive_path(out_dir: str, stem: str, kind: str) -> str:
+        """产物名唯一化：同一秒内多次备份不能互相覆盖。
+
+        ``_timestamp()`` 只到秒，而「连续两次立即备份」/「全量+增量连着跑」完全
+        可能落在同一秒——重名时后一次直接覆盖前一次的产物（恢复链少一层，
+        数据静默丢失）。重名时追加序号：``<ts>__<task>_2__inc.tar.gz``。
+        """
+        cand = os.path.join(out_dir, "%s__%s.tar.gz" % (stem, kind))
+        n = 1
+        while (os.path.exists(cand) or os.path.exists(cand + ".zst")
+               or os.path.exists(cand + ".gz")):
+            n += 1
+            cand = os.path.join(out_dir, "%s_%d__%s.tar.gz" % (stem, n, kind))
+        return cand
 
     @staticmethod
     def _clean_path(path: str) -> str:
@@ -1271,9 +1730,13 @@ class FileBackupEngine(BackupEngine):
         if src_type == "local":
             kinds = _probe_local_paths(paths)
         elif self._ssh_host_is_windows(src.get("host") or ""):
-            kinds = _probe_remote_paths_windows(_get_ssh_client(src["host"]), paths)
+            kinds = _probe_remote_paths_windows(
+                _ensure_alive(_get_ssh_client(src["host"]),
+                              src.get("host") or ""), paths)
         else:
-            kinds = _probe_remote_paths(_get_ssh_client(src["host"]), paths)
+            kinds = _probe_remote_paths(
+                _ensure_alive(_get_ssh_client(src["host"]),
+                              src.get("host") or ""), paths)
 
         bad = {p: k for p, k in kinds.items() if k in ("missing", "other")}
         if bad:
@@ -1565,60 +2028,88 @@ class FileBackupEngine(BackupEngine):
             out_dir = self._output_dir()
         os.makedirs(out_dir, exist_ok=True)
         ts = self._timestamp()
-        archive_name = f"{ts}__{self.task_name}__full.tar.gz"
-        archive_path = os.path.join(out_dir, archive_name)
+        archive_path = self._unique_archive_path(
+            out_dir, "%s__%s" % (ts, self.task_name), "full")
 
         # 快照必须等于"归档里真实有什么"：用与打包**同一套**排除规则，
         # 否则会出现"包里没有、快照却记着"的假一致，恢复时静默缺文件。
-        # （多源任务仍以第一个源作为快照基准，与既有增量语义一致。）
-        base = pairs[0][0] if pairs else "/"
+        # 多源路径：逐个源扫描并按归档前缀合并。旧实现只扫 pairs[0]，第二个源
+        # 的文件永远进不了快照 → 增量永远不备它、恢复也漏（用户「多写两个源路径
+        # 就不行」的根因之一）。
+        entries = _src_entries(pairs)
+        multi = len(entries) > 1
+        base = entries[0]["path"] if entries else "/"
         sf = {}
         _win_hashes = None
         _win_scan_ok = False
         if src_type == "local":
-            sf = _get_local_file_list(base, self._excludes())
+            for ent in entries:
+                raw = _get_local_file_list(ent["path"], self._excludes()) or {}
+                for rel, meta in raw.items():
+                    sf[_entry_key(ent, rel)] = meta
             _win_scan_ok = True
         elif self._ssh_host_is_windows(src.get("host") or ""):
             # Windows 通道：PowerShell Get-ChildItem / Get-FileHash 指纹清单。
             # 失败时 **不保存空快照**，否则下次增量会把「清单没拿到」误判成
             # 「文件全被删了」并在恢复时真去删文件。
-            try:
-                from core.engines import win_file as _wf
-                _ex = self.extra or {}
-                client = _get_ssh_client(src["host"])
-                sf, _win_hashes, _wmeta = _wf.scan_windows(
-                    client, base, excludes=self._excludes(),
-                    hash_mode=bool(_ex.get("win_hash_verify")),
-                    max_files=int(_ex.get("win_max_files") or _wf.DEFAULT_MAX_FILES))
-                _win_scan_ok = True
-                if _wmeta.get("unreadable"):
-                    self.logger.warning("[%s] Windows 有 %s 个目录无权限已跳过",
-                                        self.task_name, _wmeta["unreadable"])
-            except Exception as e:
-                self.logger.warning("[%s] Windows 指纹清单获取失败，本次全量不建立增量基线: %s",
-                                    self.task_name, str(e) or type(e).__name__)
-                sf, _win_scan_ok = {}, False
+            if multi:
+                # win_file.scan_windows 只有单根语义：多源建基线必定漏源，
+                # 宁可如实不建基线（增量回退全量），也不留一个错的增量基准。
+                self.logger.warning(
+                    "[%s] Windows 通道指纹清单只支持单源路径，当前 %d 个源："
+                    "本次全量照常完成，但不建立增量基线（增量将如实回退全量）",
+                    self.task_name, len(entries))
+            else:
+                try:
+                    from core.engines import win_file as _wf
+                    _ex = self.extra or {}
+                    client = _ensure_alive(_get_ssh_client(src["host"]),
+                                           src.get("host") or "")
+                    sf, _win_hashes, _wmeta = _wf.scan_windows(
+                        client, base, excludes=self._excludes(),
+                        hash_mode=bool(_ex.get("win_hash_verify")),
+                        max_files=int(_ex.get("win_max_files") or _wf.DEFAULT_MAX_FILES))
+                    _win_scan_ok = True
+                    if _wmeta.get("unreadable"):
+                        self.logger.warning("[%s] Windows 有 %s 个目录无权限已跳过",
+                                            self.task_name, _wmeta["unreadable"])
+                except Exception as e:
+                    self.logger.warning("[%s] Windows 指纹清单获取失败，本次全量不建立增量基线: %s",
+                                        self.task_name, str(e) or type(e).__name__)
+                    sf, _win_scan_ok = {}, False
         else:
             try:
-                client = _get_ssh_client(src["host"])
-                sf = _get_remote_file_list(client, base, self._excludes()) or {}
+                client = _ensure_alive(_get_ssh_client(src["host"]),
+                                       src.get("host") or "")
+                for ent in entries:
+                    raw = _get_remote_file_list(client, ent["path"], self._excludes())
+                    if raw is None:
+                        raise RuntimeError("源 %s 文件清单获取失败" % ent["path"])
+                    for rel, meta in raw.items():
+                        sf[_entry_key(ent, rel)] = meta
                 _win_scan_ok = True
             except Exception as e:
-                self.logger.warning("[%s] 获取远程源文件列表失败: %s",
-                                    self.task_name, str(e) or type(e).__name__)
+                self.logger.warning(
+                    "[%s] 获取远程源文件列表失败（本次不建立增量基线，"
+                    "下次增量会回退全量）: %s",
+                    self.task_name, str(e) or type(e).__name__)
 
         # 根据源/目标组合选择打包器。本地源→本地目标走自管理(先进压缩)的
         # _tar_local；其余组合走原有原子写入包装（系统 tar 压缩）。
+        # 多源时统一走「成员名带源前缀」的打包器，避免两个源在归档根互相覆盖。
         if src_type == "local" and dst_type == "local":
-            self._tar_local(paths, archive_path, self._excludes())
+            if multi:
+                self._tar_entries_local(entries, archive_path, self._excludes())
+            else:
+                self._tar_local(paths, archive_path, self._excludes())
         else:
             def _writer(tmp_path: str):
                 if src_type == "local" and dst_type == "remote":
                     self._tar_local_to_remote(paths, dst, tmp_path)
                 elif src_type == "remote" and dst_type == "local":
-                    self._tar_remote_to_local(src, tmp_path)
+                    self._tar_remote_to_local(src, tmp_path, entries=entries)
                 elif src_type == "remote" and dst_type == "remote":
-                    self._tar_remote_to_remote(src, dst, tmp_path)
+                    self._tar_remote_to_remote(src, dst, tmp_path, entries=entries)
                 else:
                     raise ValueError(f"不支持的源/目标组合: {src_type}->{dst_type}")
             self._atomic_write_archive(_writer, archive_path)
@@ -1633,9 +2124,15 @@ class FileBackupEngine(BackupEngine):
         # Windows 通道现在有真实 PowerShell 指纹清单，只要清单获取成功就建立
         # 基线；失败（_win_scan_ok=False）时绝不保存空快照。
         if _win_scan_ok:
-            self._save_snapshot(sf, full_path=final, hashes=_win_hashes)
+            self._save_snapshot(sf, full_path=final, hashes=_win_hashes,
+                                layout=_snapshot_layout(entries))
 
         message = f"全量备份完成 | {len(paths)} 个源 | {db.human_size(size)}"
+        if multi:
+            # 明确告知归档布局：多源按「去掉首个 / 的绝对路径」作前缀，
+            # 恢复后得到同样层级的目录树（不再是两个源混在根目录）。
+            message += " | 多源前缀: %s" % ", ".join(
+                "%s/" % (e["prefix"] or "") for e in entries)
         ds_stats = getattr(self, "_dedup_stats", None)
         if ds_stats:
             if ds_stats.get("saved_bytes", 0) > 0:
@@ -1730,13 +2227,18 @@ class FileBackupEngine(BackupEngine):
         return h if isinstance(h, dict) else {}
 
     def _save_snapshot(self, snapshot: Dict[str, Tuple[int, int]], full_path: str = None,
-                       namespace: str = None, hashes: dict = None) -> None:
+                       namespace: str = None, hashes: dict = None,
+                       layout: str = None) -> None:
         """保存当前源文件状态快照，并在全量备份时记录对应的全量归档路径。"""
         path = self._snapshot_path(namespace)
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             meta = self._load_snapshot_meta(namespace)
             meta["files"] = snapshot
+            # 快照键布局（单源 legacy / 多源带前缀）：布局变了旧快照不可比，
+            # 增量据此判断是否需要回退全量重建基线（绝不把旧键当"已删除"）。
+            if layout:
+                meta["layout"] = layout
             # 记下本次快照使用的排除规则：下次增量据此判断"规则是否变化"，
             # 避免把规则变化误当成大量文件被删除。
             meta["excludes"] = [str(x) for x in (self._excludes() or [])]
@@ -1784,19 +2286,34 @@ class FileBackupEngine(BackupEngine):
             return BackupResult(
                 success=False, status=BackupStatus.FAILED,
                 message="源路径检查未通过: %s" % (str(e) or type(e).__name__))
-        base = pairs[0][0] if pairs else "/"
+        entries = _src_entries(pairs)
+        multi = len(entries) > 1
+        base = entries[0]["path"] if entries else "/"
         ex = self._excludes()
 
         # 1) 获取源文件列表（与打包同一套排除规则，保证"快照 == 归档里有什么"）
+        #    多源：逐源扫描并按归档前缀合并；键 == 归档成员名，增量打包直接用。
         _win = src_type != "local" and self._ssh_host_is_windows(src.get("host") or "")
         _win_hashes = None
+        keymap = {}          # 归档键 -> (源条目, 源内相对路径)
         if src_type == "local":
-            sf = _get_local_file_list(base, ex)
+            sf = {}
+            for ent in entries:
+                for rel, meta in (_get_local_file_list(ent["path"], ex) or {}).items():
+                    k = _entry_key(ent, rel)
+                    sf[k] = meta
+                    keymap[k] = (ent, rel)
         elif _win:
+            if multi:
+                self.logger.warning(
+                    "[%s] Windows 通道增量只支持单源路径（当前 %d 个源），"
+                    "本次回退全量（全量不建错误增量基线）", self.task_name, len(entries))
+                return self._full_transfer(src, dst)
             from core.engines import win_file as _wf
             _ex = self.extra or {}
             try:
-                client = _get_ssh_client(src["host"])
+                client = _ensure_alive(_get_ssh_client(src["host"]),
+                                       src.get("host") or "")
                 sf, _win_hashes, _wmeta = _wf.scan_windows(
                     client, base, excludes=ex,
                     hash_mode=bool(_ex.get("win_hash_verify")),
@@ -1805,17 +2322,37 @@ class FileBackupEngine(BackupEngine):
                 self.logger.warning("[%s] Windows 指纹清单获取失败，回退全量: %s",
                                     self.task_name, str(e) or type(e).__name__)
                 return self._full_transfer(src, dst)
+            keymap = {k: (entries[0], k) for k in sf}
         else:
-            client = _get_ssh_client(src["host"])
-            sf = _get_remote_file_list(client, base, ex)
-            if sf is None:
-                self.logger.warning("[%s] 远程源列表获取失败，回退全量", self.task_name)
-                return self._full_transfer(src, dst)
+            client = _ensure_alive(_get_ssh_client(src["host"]),
+                                   src.get("host") or "")
+            sf = {}
+            for ent in entries:
+                raw = _get_remote_file_list(client, ent["path"], ex)
+                if raw is None:
+                    self.logger.warning(
+                        "[%s] 远程源 %s 列表获取失败，回退全量",
+                        self.task_name, ent["path"])
+                    return self._full_transfer(src, dst)
+                for rel, meta in raw.items():
+                    k = _entry_key(ent, rel)
+                    sf[k] = meta
+                    keymap[k] = (ent, rel)
 
         # 2) 加载上次快照作为基准（无快照则回退全量）
         snapshot = self._load_snapshot()
         if not snapshot:
             self.logger.info("[%s] 无历史快照，回退到全量备份", self.task_name)
+            return self._full_transfer(src, dst)
+        # 快照布局变了（例如刚从「只跟第一个源」升级为多源带前缀）：旧键与新键
+        # 不同构，直接比对会把全部旧键判成「已删除」写进 .deleted.txt，恢复时
+        # 真去删文件。这种情况一律回退全量重建基线，不做删除判定。
+        _layout = _snapshot_layout(entries)
+        _snap_layout = self._load_snapshot_meta().get("layout")
+        if _snap_layout != _layout and (multi or _snap_layout):
+            self.logger.warning(
+                "[%s] 快照布局已变化（旧=%s 新=%s），本次回退全量重建基线",
+                self.task_name, _snap_layout or "legacy", _layout)
             return self._full_transfer(src, dst)
 
         # 3) 计算差异
@@ -1857,14 +2394,18 @@ class FileBackupEngine(BackupEngine):
             out_dir = self._output_dir()
         os.makedirs(out_dir, exist_ok=True)
         ts = self._timestamp()
-        archive_name = f"{ts}__{self.task_name}__inc.tar.gz"
-        archive_path = os.path.join(out_dir, archive_name)
+        archive_path = self._unique_archive_path(
+            out_dir, "%s__%s" % (ts, self.task_name), "inc")
 
         # 5) 生成仅含变化文件的增量归档（原子写入）。
         #    删除清单以 .deleted.txt 写入归档根部，恢复/合成时据此应用删除。
         try:
             if src_type == "local":
-                self._tar_files_with_deleted(base, changed, deleted, archive_path)
+                if multi:
+                    self._tar_keys_with_deleted(keymap, changed, deleted,
+                                                archive_path)
+                else:
+                    self._tar_files_with_deleted(base, changed, deleted, archive_path)
             elif _win:
                 # Windows 没有 tar -T 管道与 find：SFTP 逐文件拉到平台暂存，
                 # 平台侧用标准库 tarfile 打增量包（含 .deleted.txt）。
@@ -1880,8 +2421,15 @@ class FileBackupEngine(BackupEngine):
                 _wf.tar_changed(stage, ok_list, deleted, archive_path)
                 shutil.rmtree(stage, ignore_errors=True)
             else:
-                self._tar_remote_files(changed, src, archive_path)
-                self._append_deleted_manifest(archive_path, deleted)
+                if changed:
+                    self._tar_remote_files(changed, src, archive_path,
+                                           entries=entries, multi=multi)
+                    self._append_deleted_manifest(archive_path, deleted)
+                else:
+                    # 只有删除、没有变化文件：直接产出「仅含删除清单」的归档。
+                    # 不能跑 tar -T 空清单——远端 tar 会阻塞在读 stdin 上，
+                    # 传输 0 B 一直卡到超时（本轮 E2E 实测）。
+                    self._tar_manifest_only(archive_path, deleted)
 
             # 远程目标时，把生成的归档也推送过去
             if dst_type == "remote":
@@ -1891,7 +2439,8 @@ class FileBackupEngine(BackupEngine):
             return BackupResult(success=False, status=BackupStatus.FAILED, message=str(e))
 
         # 6) 保存新快照（作为下次增量基准）
-        self._save_snapshot(sf, hashes=_win_hashes if _win else None)
+        self._save_snapshot(sf, hashes=_win_hashes if _win else None,
+                            layout=_snapshot_layout(entries))
 
         final = self._final_archive_path(archive_path)
         size = os.path.getsize(final) if os.path.exists(final) else 0
@@ -1904,7 +2453,10 @@ class FileBackupEngine(BackupEngine):
             backup_path=final, size_bytes=size,
             original_size_bytes=original, compress_algo=algo, compress_ratio=ratio,
             checksum=checksum,
-            message=f"增量备份完成 | 变化={len(changed)} 删除={len(deleted)} | {db.human_size(size)}",
+            message=("增量备份完成 | 变化=%d 删除=%d | %s%s" % (
+                len(changed), len(deleted), db.human_size(size),
+                (" | 多源前缀: " + ", ".join("%s/" % (e["prefix"] or "")
+                                            for e in entries)) if multi else "")),
         )
 
     # ---------- 准 CDP 实时捕获复用入口（core/rt_backup/file_rt.py 调用） ----------
@@ -2019,6 +2571,20 @@ class FileBackupEngine(BackupEngine):
         if not paths:
             return BackupResult(success=False, status=BackupStatus.FAILED,
                                 message="未配置源路径(source_paths)")
+        try:
+            _pairs = self._resolve_src_pairs(src)
+        except RuntimeError as e:
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message="源路径检查未通过: %s" % (str(e) or type(e).__name__))
+        if len(_pairs) > 1:
+            # 实时捕获的扫描/打包仍按单根语义（list_source_files 只有 base），
+            # 多源会静默只捕获第一个源 —— 如实拒绝，引导拆分任务。
+            return BackupResult(
+                success=False, status=BackupStatus.FAILED,
+                message="实时文件捕获暂不支持多源路径（当前 %d 个源）："
+                        "请拆成每个源一个任务，或改用普通全量+增量任务"
+                        % len(_pairs))
         base = paths[0]
 
         # 1) 源文件状态：优先用 Watcher 传入的扫描结果
@@ -2050,7 +2616,8 @@ class FileBackupEngine(BackupEngine):
         out_dir = out_dir or self._output_dir()
         os.makedirs(out_dir, exist_ok=True)
         ts = tag or self._timestamp()
-        archive_path = os.path.join(out_dir, f"{ts}__{self.task_name}__inc.tar.gz")
+        archive_path = self._unique_archive_path(
+            out_dir, "%s__%s" % (ts, self.task_name), "inc")
 
         # 全部是删除时没有实体文件可打包，仍生成一个空 tar 以承载「删除」这一事实，
         # 保证恢复链上每个恢复点都有可校验的产物（R9 要求非空，故写入清单条目）。
@@ -2186,6 +2753,56 @@ class FileBackupEngine(BackupEngine):
             if os.path.exists(tmp_tar):
                 os.unlink(tmp_tar)
 
+    def _tar_entries_local(self, entries, archive_path: str, excludes=None):
+        """本地多源 → 本地归档：每个源的成员名带「去 / 的绝对路径」前缀。
+
+        单源仍走 :meth:`_tar_local`（内容落在归档根，历史布局不变）；多源此前
+        用 ``commonpath`` 相对名，导致同名文件互相覆盖、且与快照键不一致——
+        恢复出来只剩一个源的内容。现与远程通道（``tar -C / <前缀>``）统一。
+        """
+        algo = self._resolve_compress_algo()
+        suffix = "" if algo == "none" else (".zst" if algo == "zstd" else ".gz")
+        final_path = archive_path + suffix
+        parent = os.path.dirname(archive_path) or "."
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp_tar = tempfile.mkstemp(prefix=".tmp_", suffix=".tar", dir=parent)
+        os.close(fd)
+
+        def _ex_flt(ti):
+            if _match_excludes(str(ti.name or "").replace("\\", "/"), excludes):
+                return None
+            return ti
+
+        try:
+            with tarfile.open(tmp_tar, "w") as tf:
+                for ent in entries:
+                    p = ent["path"]
+                    if not os.path.exists(p):
+                        raise RuntimeError("本地源路径不存在: %s" % p)
+                    pref = (ent.get("prefix") or "").strip("/")
+                    if ent["kind"] == SRC_KIND_FILE:
+                        tf.add(p, arcname=pref or os.path.basename(p),
+                               filter=_ex_flt)
+                        continue
+                    root = pref or "."
+                    tf.add(p, arcname=root, recursive=False, filter=_ex_flt)
+                    for dirpath, _dirs, files in os.walk(p):
+                        for f in files:
+                            full = os.path.join(dirpath, f)
+                            rel = os.path.relpath(full, p).replace("\\", "/")
+                            arc = rel if root == "." else "%s/%s" % (root, rel)
+                            if _match_excludes(arc, excludes):
+                                continue
+                            tf.add(full, arcname=arc, filter=_ex_flt)
+            original = os.path.getsize(tmp_tar)
+            if os.path.exists(final_path):
+                os.unlink(final_path)
+            self._compress_file(tmp_tar, final_path, algo)
+            self._stash_original_size(final_path, original)
+        finally:
+            if os.path.exists(tmp_tar):
+                os.unlink(tmp_tar)
+
     def _tar_files(self, base_path: str, rel_files: List[str], archive_path: str) -> bool:
         """把 base_path 下指定相对路径的文件打包成归档（仅含这些文件，保持相对路径）。
 
@@ -2216,13 +2833,26 @@ class FileBackupEngine(BackupEngine):
                 os.unlink(tmp_tar)
         return True
 
-    def _tar_remote_files(self, changed: List[str], src: dict, archive_path: str) -> bool:
-        """远程源 → 本地增量归档：通过 tar -T 仅打包变化文件（原子写入）。"""
-        client = _get_ssh_client(src["host"])
+    def _tar_remote_files(self, changed: List[str], src: dict, archive_path: str,
+                          entries=None, multi: bool = False) -> bool:
+        """远程源 → 本地增量归档：通过 tar -T 仅打包变化文件（原子写入）。
+
+        多源（2026-11-26）：变化文件键本身就带源前缀（``log/a.txt``），统一走
+        ``-C / -T -``，成员名与快照键、删除清单严格同构。旧实现固定
+        ``-C <第一个源> -T -``，第二个源的变化文件根本打不进去（还会被当成
+        第一个源下的相对路径而报错/漏备）。
+        """
+        host_key = src.get("host") or ""
         pairs = self._resolve_src_pairs(src)
-        base = pairs[0][0] if pairs else "/"
+        ents = entries if entries is not None else _src_entries(pairs)
+        multi = bool(multi or len(ents) > 1)
+        base = ents[0]["path"] if ents else "/"
         ex = self._excludes()
-        if pairs and pairs[0][1] == SRC_KIND_FILE:
+        if not changed:
+            # 空清单跑 ``tar -T -`` 会让远端 tar 永远等在 stdin 上（0 B 卡死）
+            raise RuntimeError("内部错误：远程增量打包的变化文件列表为空"
+                               "（仅删除场景应走删除清单归档）")
+        if not multi and pairs and pairs[0][1] == SRC_KIND_FILE:
             # 源就是单个文件：它本身是最小单位，整体打包（无需 -T 列表）
             cmd = _build_tar_cmd(pairs, ex)
             payload = None
@@ -2231,9 +2861,11 @@ class FileBackupEngine(BackupEngine):
             for e in (ex or []):
                 if (e or "").strip():
                     parts.append("--exclude=%s" % e.strip())
-            parts += ["-C", base, "-T", "-"]
+            parts += (["-C", "/", "-T", "-"] if multi
+                      else ["-C", base, "-T", "-"])
             cmd = " ".join(shlex.quote(p) for p in parts)
             payload = "\n".join(changed).encode("utf-8")
+        client = _ensure_alive(_get_ssh_client(host_key), host_key)
         data, err, rc = _ssh_exec_pipe(client, cmd, input_data=payload)
         if rc != 0:
             raise RuntimeError(_tar_fail_msg("远程打包", rc, err, cmd))
@@ -2273,6 +2905,45 @@ class FileBackupEngine(BackupEngine):
                     full = os.path.join(base_path, rel_norm)
                     if os.path.exists(full) and os.path.isfile(full):
                         tf.add(full, arcname=rel_norm)
+                if deleted:
+                    self._add_text_entry(tf, ".deleted.txt", deleted)
+            original = os.path.getsize(tmp_tar)
+            if os.path.exists(final_path):
+                os.unlink(final_path)
+            self._compress_file(tmp_tar, final_path, algo)
+            self._stash_original_size(final_path, original)
+        finally:
+            if os.path.exists(tmp_tar):
+                os.unlink(tmp_tar)
+        return True
+
+    def _tar_keys_with_deleted(self, keymap, rel_files: List[str],
+                               deleted: List[str], archive_path: str) -> bool:
+        """本地多源增量：按「归档键」打包变化文件（成员名带源前缀）。
+
+        keymap: 归档键 -> (源条目, 源内相对路径)，由增量扫描阶段建立。归档成员名、
+        快照键、``.deleted.txt`` 三者严格同构——这是多源增量能正确恢复的前提。
+        """
+        algo = self._resolve_compress_algo()
+        suffix = "" if algo == "none" else (".zst" if algo == "zstd" else ".gz")
+        final_path = archive_path + suffix
+        parent = os.path.dirname(archive_path) or "."
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp_tar = tempfile.mkstemp(prefix=".tmp_", suffix=".tar", dir=parent)
+        os.close(fd)
+        try:
+            with tarfile.open(tmp_tar, "w") as tf:
+                for key in rel_files:
+                    hit = keymap.get(key)
+                    if not hit:
+                        continue
+                    ent, rel = hit
+                    if ent.get("kind") == SRC_KIND_FILE:
+                        full = ent["path"]
+                    else:
+                        full = os.path.join(ent["path"], str(rel).replace("/", os.sep))
+                    if os.path.exists(full) and os.path.isfile(full):
+                        tf.add(full, arcname=key)
                 if deleted:
                     self._add_text_entry(tf, ".deleted.txt", deleted)
             original = os.path.getsize(tmp_tar)
@@ -2419,6 +3090,8 @@ class FileBackupEngine(BackupEngine):
           staged 路径块级重试 3 次；半成品一律写 .part 原子改名。
         - 带宽限制：任务「流量控制」bandwidth_limit（KB/s）接线到
           平台侧限速（0=不限）。
+        - 长会话存活：大文件（10GB+）传输中途断连时**换新连接续跑**——
+          stage/残件都是断点，重跑只补缺口，不会从头再来。
         """
         extra = _get_extra(self.task)
         # 走 property：应用限速时段窗口 + 全局带宽仲裁（未配配额时与原值一致）
@@ -2426,36 +3099,75 @@ class FileBackupEngine(BackupEngine):
         staged = bool(extra.get("staged_pull", True))
         task_id = self.task.get("id") or "x"
         kind = "incr" if str(self.task.get("backup_type") or "") == "incremental" else "full"
-        stage = "/tmp/aidbm_stage_%s_%s.tar.gz" % (task_id, kind)
+        # stage 目录候选：/tmp 常常只有几个 GB，20GB 级备份必然 ENOSPC；
+        # 允许任务指定 stage_dir，ENOSPC 时再回退到源目录所在文件系统
+        # （源数据本身就在那里，通常放得下压缩产物）。写入源目录的 stage
+        # 必须从打包范围排除，否则下一轮会被打进包里。
+        stage_dir = str(extra.get("stage_dir") or "").strip() or "/tmp"
+        stage = "%s/aidbm_stage_%s_%s.tar.gz" % (stage_dir.rstrip("/"), task_id, kind)
+        pack_cmd = cmd
+        if stage_dir != "/tmp":
+            pack_cmd = "%s --exclude=%s" % (cmd, shlex.quote(os.path.basename(stage)))
         if staged:
             # 跨运行续传：残件用任务级稳定路径（带时间戳的产物名每次运行
             # 都不同，挂它旁边的 .part 重跑时找不到 → 续传失效）
             part_stable = os.path.join(
                 os.path.dirname(archive_path) or ".",
                 ".aidbm_part_%s_%s.tar.gz" % (task_id, kind))
-            try:
-                r = _staged_pull(client, cmd, archive_path,
-                                 stage_path=stage, part_path=part_stable,
-                                 rate_kbps=rate,
-                                 logger=self.logger, label=self.task_name)
-                if r.get("resume_from"):
-                    # 引擎 self.logger 不进操作日志——续传观测信息并入任务消息
-                    self._pull_note = (
-                        "断点续传: 从 %s 继续拉取（stage 残件复用）"
-                        % db.human_size(r["resume_from"]))
-                return r
-            except RuntimeError as e:
-                if "STAGED_ENOSPC" not in str(e):
+            for stage_attempt in (1, 2):
+                try:
+                    r = _staged_pull(_ensure_alive(client, src.get("host") or ""),
+                                     pack_cmd, archive_path,
+                                     stage_path=stage, part_path=part_stable,
+                                     rate_kbps=rate,
+                                     logger=self.logger, label=self.task_name,
+                                     host_key=src.get("host") or "")
+                    if r.get("resume_from"):
+                        # 引擎 self.logger 不进操作日志——续传观测信息并入任务消息
+                        self._pull_note = (
+                            "断点续传: 从 %s 继续拉取（stage 残件复用）"
+                            % db.human_size(r["resume_from"]))
+                    return r
+                except RuntimeError as e:
+                    es = str(e)
+                    if "STAGED_ENOSPC" in es and stage_attempt == 1 \
+                            and stage_dir == "/tmp":
+                        # /tmp 放不下 → 换源目录所在文件系统再试一次（源数据
+                        # 本身就在那里，通常放得下压缩产物）
+                        try:
+                            first_src = self._resolve_src_pairs(src)[0][0]
+                        except Exception:
+                            first_src = ""
+                        alt = os.path.dirname(first_src.rstrip("/")) if first_src else ""
+                        if alt and alt != "/":
+                            self.logger.warning(
+                                "[%s] 远端 /tmp 空间不足，改用源目录所在文件系统 "
+                                "%s 暂存归档后继续", self.task_name, alt)
+                            stage_dir = alt
+                            stage = "%s/aidbm_stage_%s_%s.tar.gz" % (
+                                stage_dir.rstrip("/"), task_id, kind)
+                            pack_cmd = "%s --exclude=%s" % (
+                                cmd, shlex.quote(os.path.basename(stage)))
+                            continue
+                        self.logger.warning(
+                            "[%s] 远端空间不足，staged 断点续传回退流式传输（可传 "
+                            "extra_options.staged_pull=false 关闭尝试）: %s",
+                            self.task_name, es[:160])
+                        break
+                    if _is_transient(e) and stage_attempt == 1:
+                        # 整体策略级重试：stage 与 .part 残件都在，重跑只补缺口
+                        self.logger.warning(
+                            "[%s] 传输中断（%s），换新连接整体续跑 staged 通道: %s",
+                            self.task_name, type(e).__name__, es[:140])
+                        time.sleep(3)
+                        continue
                     raise
-                self.logger.warning(
-                    "[%s] 远端空间不足，staged 断点续传回退流式传输（可传 "
-                    "extra_options.staged_pull=false 关闭尝试）: %s",
-                    self.task_name, str(e)[:160])
         return _pull_stream_with_retry(client, cmd, archive_path,
                                        rate_kbps=rate,
-                                       logger=self.logger, label=self.task_name)
+                                       logger=self.logger, label=self.task_name,
+                                       host_key=src.get("host") or "")
 
-    def _tar_remote_to_local(self, src: dict, archive_path: str):
+    def _tar_remote_to_local(self, src: dict, archive_path: str, entries=None):
         """远程 → 本地：SSH 端 tar 打包 → **流式落盘**到本地归档。
 
         全程不把产物读进内存：此前是整包 bytes 回内存，大目录会把平台内存撑爆
@@ -2463,46 +3175,106 @@ class FileBackupEngine(BackupEngine):
 
         任务开启 extra.source_dedup 时优先走**源端传输去重**通道（远端分块
         指纹，仅新块走网络）；任何失败安全回退本流式通道（正确性不受影响）。
+
+        连接健壮性（2026-11-26）：整个「打包 + 拉取」对**传输级瞬时故障**最多
+        重试 3 次，每次丢弃池内死连接重新建连；远端 stage（带 .ok 完成标记）会
+        被复用——重试只补缺口，不重新打包几十 GB。此前一步断连就直接以
+        "SSH transport dead" 判任务失败。
         """
         if self._ssh_host_is_windows(src.get("host") or ""):
             self._tar_windows_to_local(src, archive_path)
             return
-        if self.extra.get("source_dedup"):
-            try:
-                self._tar_remote_to_local_dedup(src, archive_path)
-                return
-            except Exception as e:  # noqa: BLE001 —— 去重失败不影响备份
-                self.logger.warning(
-                    "[%s] 源端去重通道失败，回退整包流式: %s",
-                    self.task_name, str(e) or type(e).__name__)
-                self._dedup_stats = None
-                try:
-                    if os.path.exists(archive_path):
-                        os.unlink(archive_path)
-                except OSError:
-                    pass
-        self.logger.info("[%s] [1/3] 连接远程主机: %s", self.task_name, src["host"])
-        client = _get_ssh_client(src["host"])
+        host_key = src.get("host") or ""
         pairs = self._resolve_src_pairs(src)
-        cmd = _build_tar_cmd(pairs, self._excludes())
+        ents = entries if entries is not None else _src_entries(pairs)
+        multi = len(ents) > 1
+        if self.extra.get("source_dedup"):
+            # 源端去重的清单按「源内相对路径」重建归档（成员名不带源前缀），
+            # 多源会互相覆盖且与快照键不同构 → 多源一律走标准打包通道。
+            if multi:
+                self.logger.warning(
+                    "[%s] 源端去重通道暂不支持多源路径（%d 个源），本次改用标准打包",
+                    self.task_name, len(ents))
+            else:
+                try:
+                    self._tar_remote_to_local_dedup(src, archive_path)
+                    return
+                except Exception as e:  # noqa: BLE001 —— 去重失败不影响备份
+                    self.logger.warning(
+                        "[%s] 源端去重通道失败，回退整包流式: %s",
+                        self.task_name, str(e) or type(e).__name__)
+                    self._dedup_stats = None
+                    try:
+                        if os.path.exists(archive_path):
+                            os.unlink(archive_path)
+                    except OSError:
+                        pass
+        _sparse = host_key not in _SPARSE_UNSUPPORTED
+        cmd = (_build_tar_cmd_entries(ents, self._excludes(), sparse=_sparse) if multi
+               else _build_tar_cmd(pairs, self._excludes(), sparse=_sparse))
 
-        self.logger.info("[%s] [2/3] 远程打包中: %s", self.task_name, cmd)
-        t0 = time.time()
-        r = self._pull_archive(client, cmd, archive_path, src)
-        elapsed = round(time.time() - t0, 1)
-        self.logger.info("[%s] SSH tar 完成, 耗时=%ss, rc=%s, size=%s",
-                         self.task_name, elapsed, r.get("rc"),
-                         db.human_size(r.get("written") or 0))
-        if r.get("rc") != 0:
+        self.logger.info("[%s] [2/3] 远程打包中(%d 个源): %s",
+                         self.task_name, len(ents), cmd)
+        attempts = 3 if host_key else 1
+        last_exc = None
+        for attempt in range(1, attempts + 1):
             try:
-                if os.path.exists(archive_path):
-                    os.unlink(archive_path)
-            except OSError:
-                pass
-            raise RuntimeError(_tar_fail_msg(
-                "远程打包", r.get("rc") or -1, r.get("err"), cmd,
-                extra="源主机: %s" % src["host"]))
-        self.logger.info("[%s] [3/3] 归档落盘完成: %s", self.task_name, archive_path)
+                client = _ensure_alive(_get_ssh_client(host_key), host_key)
+                t0 = time.time()
+                r = self._pull_archive(client, cmd, archive_path, src)
+                elapsed = round(time.time() - t0, 1)
+                self.logger.info("[%s] SSH tar 完成, 耗时=%ss, rc=%s, size=%s",
+                                 self.task_name, elapsed, r.get("rc"),
+                                 db.human_size(r.get("written") or 0))
+                if (r.get("rc") != 0 and "--sparse" in cmd
+                        and _sparse_unsupported(r.get("err"))):
+                    # BusyBox/老版本 tar 不认识 --sparse：记住并去掉重试
+                    # （稀疏语义退化为实占大小，但备份继续——比整单失败合理）
+                    _SPARSE_UNSUPPORTED.add(host_key)
+                    self.logger.warning(
+                        "[%s] 远端 tar 不支持 --sparse，已去掉该选项重试"
+                        "（稀疏文件将按实占大小入归档）", self.task_name)
+                    cmd = (_build_tar_cmd_entries(ents, self._excludes(), sparse=False)
+                           if multi else
+                           _build_tar_cmd(pairs, self._excludes(), sparse=False))
+                    r = self._pull_archive(client, cmd, archive_path, src)
+                if r.get("rc") != 0:
+                    try:
+                        if os.path.exists(archive_path):
+                            os.unlink(archive_path)
+                    except OSError:
+                        pass
+                    raise RuntimeError(_tar_fail_msg(
+                        "远程打包", r.get("rc") or -1, r.get("err"), cmd,
+                        extra="源主机: %s" % host_key))
+                self.logger.info("[%s] [3/3] 归档落盘完成: %s",
+                                 self.task_name, archive_path)
+                return
+            except Exception as e:                # noqa: BLE001 —— 传输级重试
+                last_exc = e
+                if attempt < attempts and _is_transient(e):
+                    self.logger.warning(
+                        "[%s] 远程文件传输中断（第 %s/%s 次）：%s；丢弃旧 SSH 连接"
+                        "重连后续传（远端 stage 会被复用，不重打包）",
+                        self.task_name, attempt, attempts, str(e)[:180])
+                    _drop_pooled(host_key)
+                    time.sleep(min(2 * attempt, 8))
+                    continue
+                raise self._remote_transfer_error(last_exc, host_key, attempt)
+
+    @staticmethod
+    def _remote_transfer_error(exc: Exception, host_key: str,
+                               attempts: int) -> Exception:
+        """传输级失败的最终错误信息：保留真实原因，并给出可执行处置。"""
+        base = str(exc) or type(exc).__name__
+        if not _is_transient(exc):
+            return exc if isinstance(exc, RuntimeError) else RuntimeError(base)
+        return RuntimeError(
+            "SSH 连接中断（主机 %s，自动重连重试 %s 次仍失败）：%s。"
+            "常见原因：网络设备/NAT 对 SSH 长会话有时长上限、链路抖动、"
+            "或对端 sshd 重启。可直接重跑任务——已完成的远端归档会被复用续传；"
+            "也可在任务高级选项把 stage_dir 指到源盘所在文件系统。"
+            % (host_key or "-", max(attempts, 1), base))
 
     def _ssh_host_is_windows(self, host_key: str) -> bool:
         """SSH 主机是否 Windows（ssh_hosts.os_type=windows）。"""
@@ -2620,7 +3392,8 @@ class FileBackupEngine(BackupEngine):
             stats["verified_files"])
         return stats
 
-    def _tar_remote_to_remote(self, src: dict, dst: dict, archive_path: str):
+    def _tar_remote_to_remote(self, src: dict, dst: dict, archive_path: str,
+                              entries=None):
         """远程 → 远程：源打包 → 本机临时文件（流式）→ SFTP 上传 → 目标解压。
 
         两处关键约束：
@@ -2630,7 +3403,9 @@ class FileBackupEngine(BackupEngine):
            大包会直接写满报 ENOSPC。
         """
         pairs = self._resolve_src_pairs(src)
-        cmd = _build_tar_cmd(pairs, self._excludes())
+        ents = entries if entries is not None else _src_entries(pairs)
+        cmd = (_build_tar_cmd_entries(ents, self._excludes())
+               if len(ents) > 1 else _build_tar_cmd(pairs, self._excludes()))
         client_src = _get_ssh_client(src["host"])
         dst_dir = (dst.get("path") or "/").rstrip("/") or "/"
 
@@ -3268,15 +4043,35 @@ class FileBackupEngine(BackupEngine):
             _, err = proc.communicate()
             if proc.returncode != 0:
                 raise RuntimeError(f"解压失败: {err.decode('utf-8','replace')[:200]}")
-            with tarfile.open(tmp_tar, "r:") as tf:
-                tf.extractall(dest, filter=self._restore_filter)
             try:
-                os.unlink(tmp_tar)
-            except OSError:
-                pass
+                self._extract_tar(tmp_tar, dest)
+            finally:
+                try:
+                    os.unlink(tmp_tar)
+                except OSError:
+                    pass
         else:
-            with tarfile.open(archive_path, "r:*") as tf:
-                tf.extractall(dest, filter=self._restore_filter)
+            self._extract_tar(archive_path, dest)
+
+    def _extract_tar(self, tar_path: str, dest: str) -> None:
+        """优先系统 tar 解包（保稀疏洞与硬链接），失败回退 Python tarfile。
+
+        Python tarfile 解包稀疏成员会把"洞"展开成实占（10MB 稀疏恢复成 10MB
+        实文件）；GNU tar 会还原稀疏语义。系统 tar 不可用/失败时回退 tarfile
+        （内容与大小仍一致，只是不保稀疏）。
+        """
+        import tarfile
+        import subprocess
+        if shutil.which("tar"):
+            try:
+                p = subprocess.run(["tar", "-xf", tar_path, "-C", dest],
+                                   capture_output=True, timeout=3600)
+                if p.returncode == 0:
+                    return
+            except Exception:                       # noqa: BLE001 —— 回退 tarfile
+                pass
+        with tarfile.open(tar_path, "r:*") as tf:
+            tf.extractall(dest, filter=self._restore_filter)
 
     @staticmethod
     def _dir_size(path: str) -> int:

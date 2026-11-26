@@ -156,14 +156,15 @@
           <a class="nav-link {% if page=='alert' %}active{% endif %}" href="/alert" title="智能告警" data-perm="alert.manage"><i class="bi bi-bell"></i> <span class="nav-label">智能告警</span></a>
           <a class="nav-link {% if page=='datamining' %}active{% endif %}" href="/datamining" title="数据价值挖掘" data-perm="alert.manage"><i class="bi bi-database-check"></i> <span class="nav-label">数据价值挖掘</span></a>
         </div>
-        <div class="nav-parent {% if page in ('settings','agentless','plugins','users','logs') %}active{% endif %}"
+        <div class="nav-parent {% if page in ('settings','agentless','plugins','users','logs','integration') %}active{% endif %}"
              id="sysNavParent" data-nav-group data-target="sysNavSub" role="button" tabindex="0"
-             title="系统设置：系统参数 / Agent 管理 / 备份插件 / 用户与权限 / 系统日志" data-perm="system.settings">
+             title="系统设置：系统参数 / Agent 管理 / 备份插件 / 用户与权限 / 系统日志 / 接口对接" data-perm="system.settings">
           <i class="bi bi-gear"></i> <span class="nav-label">系统设置</span>
           <i class="bi bi-chevron-down nav-caret"></i>
         </div>
         <div class="nav-sub" id="sysNavSub">
           <a class="nav-link {% if page=='settings' %}active{% endif %}" href="/settings" title="系统参数（备份根目录 / 调度 / 通知 / 安全）" data-perm="system.settings"><i class="bi bi-sliders"></i> <span class="nav-label">系统参数</span></a>
+          <a class="nav-link {% if page=='integration' %}active{% endif %}" href="/integration" title="接口对接中心：主动拉取 / 主动推送外部接口日志，JSONPath 提取、关键字过滤、告警命中，保存前可测试" data-perm="system.settings"><i class="bi bi-plug"></i> <span class="nav-label">接口对接中心</span></a>
           <a class="nav-link {% if page=='agentless' %}active{% endif %}" href="/agentless" title="Agent 管理：无 Agent（SSH 通道）与有 Agent（执行器插件）两种备份方式，插件一键安装到主机"><i class="bi bi-shield-check"></i> <span class="nav-label">Agent 管理</span></a>
           <a class="nav-link {% if page=='plugins' %}active{% endif %}" href="/plugins" title="备份依赖插件（一键安装 xtrabackup / percona / mariabackup 等）" data-perm="backup.plugins.manage"><i class="bi bi-plug"></i> <span class="nav-label">备份插件</span></a>
           <a class="nav-link {% if page=='users' %}active{% endif %}" href="/users" title="用户与角色管理（RBAC）" data-perm="users.manage"><i class="bi bi-people"></i> <span class="nav-label">用户管理</span></a>
@@ -248,11 +249,11 @@
   <!-- 首屏注入 META（数据库类型/显示名/默认端口）：必须在 bkp-core.js 之前，
        否则依赖 BKP.META 的下拉会被填成空（见 app.py context_processor 注释） -->
   <script>window.__BKP_META__ = {{ bkp_meta | default({}) | tojson }};</script>
-  <script src="/static/js/i18n.js?v=2026112402"></script>
+  <script src="/static/js/i18n.js?v=2026112602"></script>
   <script src="/static/js/bkp-core.js?v=2026112011"></script>
   <script src="/static/js/pager.js?v=2026111102"></script>
   <script src="/static/js/precheck.js?v=2026111301"></script>
-  <script src="/static/js/app.js?v=2026112401"></script>
+  <script src="/static/js/app.js?v=2026112603"></script>
   {% if has_ai_agent %}<script src="/static/js/ai-agent.js?v=2026111102"></script>{% endif %}
   <script>
     // 按权限隐藏菜单（每个 <a class="nav-link" data-perm="..."> 命中则可见）

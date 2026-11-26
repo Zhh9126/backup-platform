@@ -14,13 +14,33 @@
     <table class="table table-hover align-middle mb-0">
       <thead><tr>
         <th>#</th><th>源备份记录</th><th>源库类型</th><th>目标环境</th><th>目标主机</th><th>状态</th>
-        <th>申请人</th><th>到期</th><th>VDB 连接</th><th>数据量</th>
+        <th>申请人</th><th>申请时间</th><th>完成时间</th><th>到期</th><th>VDB 连接</th><th>数据量</th>
         <th class="text-end">操作</th>
       </tr></thead>
       <tbody id="cloneTable"></tbody>
     </table>
   </div>
 </div>
+
+<details class="card mb-3" open>
+  <summary class="card-header">克隆前置条件（目标端需要什么）</summary>
+  <div class="card-body small">
+    <p class="mb-2">克隆 = 把备份产物真实导入到目标实例并自动命名隔离（clone_N）。导入动作在目标端执行，因此目标端必须具备下表所列条件；提交前请先点「克隆预检」逐项核对。</p>
+    <div class="table-responsive">
+      <table class="table table-sm mb-2">
+        <thead><tr><th>源库类型</th><th>目标主机怎么选</th><th>目标端需要具备</th></tr></thead>
+        <tbody>
+          <tr><td>Oracle</td><td>选数据库服务器（如 192.168.163.195）</td><td>服务器已纳管 SSH，impdp 由平台自动解析（服务器零安装）</td></tr>
+          <tr><td>Oracle</td><td>平台本机 127.0.0.1</td><td>平台侧安装 Oracle Instant Client（impdp/imp/sqlplus）+ 本机有 Oracle 实例承载 CLONE_N schema</td></tr>
+          <tr><td>MySQL / MariaDB</td><td>任选</td><td>目标实例端口可达、账号有建库权限；平台侧零安装（走 SSH 或本机客户端）</td></tr>
+          <tr><td>PostgreSQL / Kingbase / openGauss</td><td>任选</td><td>目标实例端口可达；平台侧 psql/pg_restore（金仓 ksql）或目标机自动解析</td></tr>
+          <tr><td>达梦 DM8</td><td>任选</td><td>同实例独立 schema 克隆（dimp 或 dmPython 通道）</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="text-muted">常见失败「imp 客户端不可用 / impdp 客户端不可用」= 目标主机选了平台本机，但平台侧没有 Oracle 客户端：把目标主机改成数据库服务器即可，或在平台侧装 Instant Client 并配置工具路径。</div>
+  </div>
+</details>
 
 <details class="card mb-3">
   <summary class="card-header">数据库克隆能力</summary>
@@ -95,7 +115,7 @@
               <input class="form-control" id="c_target_host" list="c_target_host_options"
                      placeholder="默认本机 127.0.0.1，可填其他机器 IP">
               <datalist id="c_target_host_options"></datalist>
-              <div class="form-text">克隆库拉起位置：默认本机数据库实例。</div>
+              <div class="form-text">克隆库拉起位置。Oracle 建议直接填数据库服务器（走 SSH 用服务器自带 impdp，平台零安装）；填本机则平台侧需有 Oracle 客户端与本地实例。</div>
             </div>
             <div class="mb-3">
               <label class="form-label">目标实例密码</label>
@@ -109,7 +129,7 @@
             </div>
             <div class="mb-3">
               <label class="form-label">申请人</label>
-              <input class="form-control" id="c_requested_by" placeholder="默认 anonymous">
+              <input class="form-control" id="c_requested_by" placeholder="留空 = 当前登录用户">
             </div>
             <div class="mb-1">
               <label class="form-label">备注</label>

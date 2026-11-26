@@ -332,6 +332,70 @@ def get_last_probe_error() -> str:
     return _LAST_PROBE_ERROR
 
 
+# 工具 → 安装家族（用于按 OS 取内置目录候选；未列出走通用目录）
+_TOOL_FAMILY = {
+    "dexp": "dameng", "dimp": "dameng", "disql": "dameng", "dmrman": "dameng",
+    "sqlcmd": "sqlserver",
+}
+
+
+def windows_tool_candidates(tool: str, extra_paths: str = None) -> list:
+    """Windows 目标机的工具目录候选（任务 tool_path 优先，其次内置家族目录）。
+
+    现场常见截图：用户把安装目录下的 ``D:\\dmdbms\\tool``（管理工具目录，
+    只有 plugins/templates/workspace）填成工具路径——而 dexp.exe 在同级
+    ``bin`` 里。这里对 ``...\\tool`` 自动补同级 ``bin``，避免"路径好像是对的
+    但就是找不到命令"。
+    """
+    cands = []
+    for d in (re.split(r"[;,]", extra_paths) if extra_paths else []):
+        d = (d or "").strip().strip('"')
+        if not d:
+            continue
+        cands.append(d)
+        base = d.rstrip("\\/")
+        if base.lower().endswith("\\tool") or base.lower().endswith("/tool"):
+            cands.append(base[:-5] + "\\bin")
+    fam = _TOOL_FAMILY.get(str(tool or "").lower())
+    if fam:
+        try:
+            import config as _cfg
+            for d in (getattr(_cfg, "TOOL_DIRS_WINDOWS", {}) or {}).get(fam, []):
+                cands.append(d)
+        except Exception:                            # noqa: BLE001
+            pass
+    out, seen = [], set()
+    for d in cands:
+        key = d.lower().rstrip("\\/")
+        if key and key not in seen:
+            seen.add(key)
+            out.append(d)
+    return out
+
+
+def _resolve_remote_tool_windows(client, tool: str, extra_paths: str = None) -> str:
+    """Windows 目标机工具解析：``where`` → 任务 tool_path → 内置目录候选。"""
+    from core.engines.file import _ssh_exec_pipe
+
+    out, _err, rc = _ssh_exec_pipe(client, f"where {tool}", timeout=30)
+    text = out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out or "")
+    for line in text.splitlines():
+        line = line.strip()
+        if line.lower().endswith(".exe"):
+            return line
+    exe = f"{tool}.exe"
+    for d in windows_tool_candidates(tool, extra_paths):
+        path = "%s\\%s" % (d.rstrip("\\/"), exe)
+        out2, _e2, rc2 = _ssh_exec_pipe(
+            client, f'if exist "{path}" echo {path}', timeout=30)
+        if rc2 == 0:
+            text2 = (out2.decode("utf-8", "replace")
+                     if isinstance(out2, bytes) else str(out2 or "")).strip()
+            if exe.lower() in text2.lower():
+                return text2.splitlines()[0].strip()
+    return ""
+
+
 def remote_has_tool(ssh_host: dict, tool: str, check_user: str = None,
                     extra_paths: str = None) -> bool:
     """检查远程 SSH 主机上是否存在指定命令（独立连接，不污染连接池）。
@@ -348,20 +412,7 @@ def remote_has_tool(ssh_host: dict, tool: str, check_user: str = None,
         # 用 where 探测 + 任务级 tool_path（; 分隔，Windows 路径含冒号）
         # 逐目录 if exist 兜底（SQL Server Windows 主机纳管场景）。
         if str((ssh_host or {}).get("os_type") or "").lower() == "windows":
-            from core.engines.file import _ssh_exec_pipe
-            exe = f"{tool}.exe"
-            _o, _e, rc = _ssh_exec_pipe(client, f"where {tool}", timeout=30)
-            if rc == 0:
-                return True
-            for d in (re.split(r"[;,]", extra_paths) if extra_paths else []):
-                d = d.strip().strip('"')
-                if not d:
-                    continue
-                _o, _e, rc = _ssh_exec_pipe(
-                    client, f'if exist "{d}\\{exe}" exit /b 0', timeout=30)
-                if rc == 0:
-                    return True
-            return False
+            return bool(_resolve_remote_tool_windows(client, tool, extra_paths))
         tp_export = _tool_path_export(extra_paths)
         if check_user:
             inner = tp_export + f"command -v {shlex.quote(tool)} >/dev/null 2>&1"
@@ -868,6 +919,13 @@ def resolve_remote_tool(ssh_host: dict, tool: str, check_user: str = None,
     client = None
     try:
         client = _connect_isolated(ssh_host)
+        # Windows 目标机：bash 的 command -v / find 全部无效，走 where + tool_path
+        # + 内置目录候选（含 ...\tool → 同级 ...\bin 的自动修正）。
+        if str((ssh_host or {}).get("os_type") or "").lower() == "windows":
+            path = _resolve_remote_tool_windows(client, tool, extra_paths)
+            if path:
+                _remote_bin_cache[key] = path
+            return path
         tp_export = _tool_path_export(extra_paths)
         if check_user:
             from core.engines.file import _ssh_exec_pipe

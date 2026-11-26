@@ -189,10 +189,39 @@ def is_protected(host_id: int) -> bool:
     return bool(row and row.get("protected"))
 
 
+_WIN_ALIASES = ("windows", "win", "win32", "win64")
+
+
+def _canon_os(os_type: str) -> str:
+    """把登记的系统类型归一到 'windows' / 'linux' / ''（未知）。"""
+    ot = (os_type or "").strip().lower()
+    if ot in _WIN_ALIASES:
+        return "windows"
+    if ot in ("linux", "unix", "aix", "solaris", "hpux", "freebsd"):
+        return "linux"
+    return ""
+
+
+def _probe_scripts(os_type: str):
+    """按主机类型给探测命令（返回 [(命令, 类型)]，顺序=优先级）。
+
+    Windows 主机的默认 shell 可能是 cmd.exe 也可能是 PowerShell（用户可改），
+    因此 Windows 探测**显式 `cmd /c`**，不依赖任何 shell 方言语法——此前写死
+    `uname -a; id; echo __OK__`（Linux 语法），OpenSSH for Windows 不认识，
+    界面就报「连接已建立但命令执行异常」，把真正连通的主机标成离线。
+    """
+    linux = ("uname -a; id; echo __OK__", "linux")
+    windows = ('cmd /c "ver & echo %COMPUTERNAME% & echo __OK__"', "windows")
+    if _canon_os(os_type) == "windows":
+        return [windows]
+    # linux 或未标注：先按 Linux 探，失败兜底 Windows（未标注即自动识别）
+    return [linux, windows]
+
+
 def test_connection(host_id: int) -> dict:
     """
     对指定主机做一次真实 SSH 连通性探测（独立连接，不进全局池）。
-    返回 {ok, message, banner?}。
+    返回 {ok, message, banner?, os_type?}。
     """
     try:
         import paramiko
@@ -228,17 +257,55 @@ def test_connection(host_id: int) -> dict:
             connect_kwargs["password"] = password
         client.connect(**connect_kwargs)
 
-        stdin, stdout, stderr = client.exec_command(
-            "uname -a; id; echo __OK__", timeout=20)
-        out = stdout.read().decode("utf-8", errors="replace")
-        rc = stdout.channel.recv_exit_status()
-        ok = rc == 0 and "__OK__" in out
-        banner = out.strip().splitlines()[0] if out.strip() else ""
+        def _dec(raw: bytes, kind: str) -> str:
+            # Windows 控制台默认 GBK（cmd /c ver 的输出），Linux 是 UTF-8。
+            # 按 UTF-8 解出乱码会让 banner 看不懂，因此 Windows 优先 GBK。
+            try:
+                if kind == "windows":
+                    return raw.decode("gbk", errors="replace")
+                return raw.decode("utf-8", errors="replace")
+            except Exception:
+                return raw.decode("utf-8", errors="replace")
+
+        probes = _probe_scripts(host.get("os_type") or "")
+        ok = False
+        banner = ""
+        os_detected = ""
+        last_err = ""
+        for cmd, kind in probes:
+            try:
+                _in, _out, _err = client.exec_command(cmd, timeout=20)
+                out = _dec(_out.read(), kind)
+                err_text = _dec(_err.read(), kind)
+                rc = _out.channel.recv_exit_status()
+            except Exception as _e:                      # noqa: BLE001
+                last_err = str(_e) or type(_e).__name__
+                continue
+            if rc == 0 and "__OK__" in out:
+                ok = True
+                os_detected = kind
+                banner = (out.strip().splitlines() or [""])[0].strip()
+                break
+            line = (err_text or out or "").strip().splitlines()
+            last_err = (line[0][:160] if line else "rc=%s" % rc)
+
+        if ok:
+            msg = "连接成功（识别为 %s）" % ("Windows" if os_detected == "windows" else "Linux")
+            reg = _canon_os(host.get("os_type"))
+            if reg and os_detected and reg != os_detected:
+                msg += ("；登记的系统类型为 %s，建议在主机编辑里改为 %s"
+                        % (host.get("os_type"), os_detected))
+        else:
+            msg = ("连接已建立，但探测命令无法执行：%s。"
+                   "处置：① 若为 Windows 主机，请在主机编辑里把「操作系统」设为 "
+                   "Windows（探测命令会自动切到 cmd 语法）；② 若为 Linux，请确认 "
+                   "该账号的登录 shell 能执行 uname/id；③ 仍失败时查看操作日志"
+                   "中的完整输出。" % (last_err or "未知原因"))
         result = {
             "ok": ok,
-            "message": "连接成功" if ok else "连接已建立但命令执行异常",
+            "message": msg,
             "banner": banner,
-            "os_type": host.get("os_type"),
+            "os_type": os_detected or host.get("os_type"),
         }
     except Exception as e:
         result = {"ok": False, "message": f"连接失败: {e}"}

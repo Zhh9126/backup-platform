@@ -228,6 +228,24 @@ def resolve_log_dir() -> tuple:
     return fallback, "系统临时目录（兜底）"
 
 
+def running_under_pytest() -> bool:
+    """当前进程是否为 pytest 测试进程。
+
+    测试进程**不得**写入生产日志文件（logs/platform.log、logs/error.log、
+    logs/crash.log）——否则测试里的预期异常（mock 出来的失败、故意触发的
+    异常）会混进生产 error.log，把真实故障淹没（2026-11-26 实测：调度集成
+    用例的预期 Traceback 写进了平台 error.log）。
+
+    例外：调用方显式设置 ``LOG_DIR``（自带临时目录）或
+    ``AIDBM_ALLOW_PROD_LOG_IN_TEST=1`` 时，仍然按原语义写文件。
+    """
+    if os.environ.get("AIDBM_ALLOW_PROD_LOG_IN_TEST"):
+        return False
+    if os.environ.get("LOG_DIR"):
+        return False
+    return "pytest" in sys.modules or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
 def runtime_form() -> str:
     """运行形态描述：源码 / 单文件可执行程序 / Docker 容器。"""
     parts = []
@@ -263,6 +281,20 @@ def _rotating(path: Path, level: int, max_bytes: int, backup_count: int,
     h.setLevel(level)
     h.setFormatter(fmt)
     return h
+
+
+# 重复日志限频状态（多 handler 共享，全局唯一）
+_DUP_STATE = None
+_DUP_FILTER = None
+
+
+def dup_log_stats() -> dict:
+    """限频统计（诊断用）：已抑制 / 已放行 / 跟踪中的错误种类。"""
+    if _DUP_STATE is None:
+        return {"passed": 0, "suppressed": 0, "keys": 0, "enabled": False}
+    data = _DUP_STATE.stats()
+    data["enabled"] = True
+    return data
 
 
 # --------------------------------------------------------------------------- #
@@ -304,28 +336,60 @@ def init_logging(app_name: str = "AIDBM", console: bool = True,
         # paramiko 内部握手失败会把整段 Traceback 以 ERROR 打进平台日志
         # （不可达主机反复重试时单次约 20 行，实测刷出 188 次 3000+ 行噪音）。
         # 平台层已有握手重试与结构化错误上报，这里只静默第三方内部噪音。
-        logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
+        # 现场日志（2026-11-26 抽样）里 paramiko.transport 的 banner 堆栈占了
+        # 500 行中的 64 行——**整包**静音（含 paramiko.client/sftp 等子 logger），
+        # 避免第三方堆栈把平台自己的真实错误淹没。
+        for _pname in ("paramiko", "paramiko.transport", "paramiko.client",
+                       "paramiko.sftp", "paramiko.sftp_file", "paramiko.channel"):
+            logging.getLogger(_pname).setLevel(logging.CRITICAL)
 
         fmt = MaskingFormatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S")
 
-        try:
-            root.addHandler(_rotating(log_dir / "platform.log", level,
-                                      max_bytes, backup_count, fmt))
-        except Exception as e:
-            print(f"[日志] 无法写入 {log_dir}/platform.log: {e}", file=sys.stderr)
-        try:
-            # 错误日志独立留存：排查时先看这一份即可
-            root.addHandler(_rotating(log_dir / "error.log", logging.ERROR,
-                                      max_bytes, backup_count, fmt))
-        except Exception:
-            pass
+        # 重复日志限频：周期性失败（实时任务启动失败/链路探活失败）会反复
+        # 打出完全相同的 ERROR，实测 35% 的 error.log 行数来自同一个达梦
+        # 实时任务，一小时刷 736 行把真错误淹没。这里对 ERROR/CRITICAL 做
+        # 同类去重 + 指数退避窗口，重复越多抑制越久，窗口到期补一条汇总。
+        global _DUP_STATE, _DUP_FILTER
+        dup_enabled = str(getattr(config, "LOG_DUP_SUPPRESS", "1")).lower() not in (
+            "0", "false", "no", "off")
+        if dup_enabled:
+            from core.log_throttle import build_filter
+            _DUP_FILTER, _DUP_STATE = build_filter(
+                base_window=float(getattr(config, "LOG_DUP_WINDOW_SEC", 300) or 300),
+                max_window=float(getattr(config, "LOG_DUP_MAX_WINDOW_SEC", 3600) or 3600))
+        else:
+            _DUP_FILTER, _DUP_STATE = None, None
+
+        handlers = []
+        pytest_mode = running_under_pytest()
+        if not pytest_mode:
+            try:
+                handlers.append(_rotating(log_dir / "platform.log", level,
+                                          max_bytes, backup_count, fmt))
+            except Exception as e:
+                print(f"[日志] 无法写入 {log_dir}/platform.log: {e}", file=sys.stderr)
+            try:
+                # 错误日志独立留存：排查时先看这一份即可
+                handlers.append(_rotating(log_dir / "error.log", logging.ERROR,
+                                          max_bytes, backup_count, fmt))
+            except Exception:
+                pass
+        else:
+            # 测试进程不落生产日志文件（详见 running_under_pytest 注释）
+            print(f"[日志] 检测到 pytest 环境，跳过文件日志写入"
+                  f"（如需写入请设置 LOG_DIR 或 AIDBM_ALLOW_PROD_LOG_IN_TEST=1）",
+                  file=sys.stderr)
         if console:
             sh = logging.StreamHandler(stream=sys.stdout)
             sh.setLevel(level)
             sh.setFormatter(fmt)
-            root.addHandler(sh)
+            handlers.append(sh)
+        for h in handlers:
+            if _DUP_FILTER is not None:
+                h.addFilter(_DUP_FILTER)
+            root.addHandler(h)
 
         _install_crash_handlers(log_dir)
         _INITIALIZED = True
@@ -364,9 +428,10 @@ def _install_crash_handlers(log_dir: Path) -> None:
     # ① 段错误等硬崩溃：faulthandler 直接写文件（不经 logging，最可靠）
     try:
         import faulthandler
-        crash_file = open(log_dir / "crash.log", "a", encoding="utf-8", buffering=1)
-        faulthandler.enable(crash_file)
-        globals()["_FAULT_HANDLER_FILE"] = crash_file  # 持有引用，防被 GC 关闭
+        if not running_under_pytest():
+            crash_file = open(log_dir / "crash.log", "a", encoding="utf-8", buffering=1)
+            faulthandler.enable(crash_file)
+            globals()["_FAULT_HANDLER_FILE"] = crash_file  # 持有引用，防被 GC 关闭
     except Exception:
         pass
 

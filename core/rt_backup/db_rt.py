@@ -151,8 +151,10 @@ class DbRtCapture:
         try:
             started = bool(self.daemon.start())
         except Exception as exc:
+            # 失败原因统一收敛到 last_error，由下方 fallback 分支**只打一条**
+            # ERROR（含完整原因）。此前这里先打一条、fallback 再打一条，
+            # 同一件事两条日志——实时任务失败时日志量直接翻倍。
             self.last_error = f"启动日志流失败: {exc}"
-            self.logger.error("[rt.cdc] task=%s %s", self.task_id, self.last_error)
 
         if not started:
             self.last_error = self.last_error or self.daemon.last_error

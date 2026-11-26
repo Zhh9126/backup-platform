@@ -659,6 +659,12 @@ def create_app() -> Flask:
         """无 Agent 接入面板：任务本次通道/侵入等级 + 目标端免装取证。"""
         return render_template("agentless.html", page="agentless")
 
+    @app.route("/integration")
+    @login_required
+    def integration_page():
+        """接口对接中心：主动拉取 / 主动推送外部接口日志，含测试功能。"""
+        return render_template("integration.html", page="integration")
+
     @app.route("/alert")
     @login_required
     def alert_page():

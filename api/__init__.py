@@ -12,12 +12,17 @@ from . import contract  # noqa: E402  统一契约（错误码/分页/版本头�
 # 公开端点白名单（匿名可访问；当前除登录页外均为受保护 API）
 PUBLIC_API_PATHS = {"/api/meta", "/api/health"}
 
+# Agent 自更新端点：Agent 端没有浏览器会话，改用**每台 Agent 独立的注册令牌**
+# 鉴权（端点内部逐条校验令牌，不匹配即 401）。放行的是「会话闸」，令牌闸仍在，
+# 因此不构成匿名访问；暴露的内容仅是 Agent 自身的源码包与版本清单。
+AGENT_SELFUPDATE_PATHS = {"/api/agents/manifest", "/api/agents/download"}
+
 
 def _is_public_path(path: str) -> bool:
     """公开端点判定：/api/v1 与 /api 前缀视为同一端点。"""
     if path.startswith(contract.V1_PREFIX):
         path = contract.LEGACY_PREFIX + path[len(contract.V1_PREFIX):]
-    return path in PUBLIC_API_PATHS
+    return path in PUBLIC_API_PATHS or path in AGENT_SELFUPDATE_PATHS
 
 
 # 首次登录强制改密期间仍允许访问的端点（仅自助读/改密与元信息）
@@ -143,7 +148,7 @@ from . import (tasks, records, restore, system, hosts, sync, inspection, deploy,
                 win_protect, synology, remote_pull, ransomware,
                 source_guard, scan_fs, dr_switch, screen, brand, runbook,
                 dr_inspection, host_tuning, bw_broker, chunk_store, sandbox, nas, recovery_center, test_records, os_backup,
-                dr_topology, agent_plugins, rag_backup)  # noqa: E402,F401
+                dr_topology, agent_plugins, rag_backup, integration)  # noqa: E402,F401
 
 # AI 助手（收费功能）：镜像/离线交付包中不含 core/ai_agent 与 api/ai_agent.py，
 # 这里必须容错注册——缺失时平台其余功能不受影响（2026-09-19 用户决定）。

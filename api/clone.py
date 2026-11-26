@@ -14,7 +14,7 @@
 from flask import request, jsonify
 
 import core.clone_service as clone_mod
-from auth import login_required, verify_code_gate
+from auth import login_required, verify_code_gate, current_operator
 from . import api_bp
 
 _service = clone_mod.clone_service
@@ -60,7 +60,8 @@ def api_request_clone():
     data = request.get_json(silent=True) or {}
     source_record_id = data.get("source_record_id")
     target_env = data.get("target_env")
-    requested_by = data.get("requested_by") or "anonymous"
+    # 申请人默认取当前登录用户（此前一律落 anonymous，事后无法追溯）
+    requested_by = data.get("requested_by") or current_operator()
     if not source_record_id:
         return jsonify({"error": "source_record_id 必填"}), 400
     if not target_env:
@@ -98,6 +99,18 @@ def api_approve_clone(request_id):
         req = _service.approve_clone(request_id, approved_by=body.get("approved_by") or "admin")
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        # 克隆失败是**业务结果**（不支持的库型/拉起失败），不是服务器故障：
+        # 此前冒泡成 500「未处理异常」，现场只看到一坨堆栈，看不出真实原因。
+        msg = str(e) or type(e).__name__
+        try:
+            import core.db as _db
+            _db.add_log("WARNING", "clone",
+                        "克隆审批执行失败 request=%s: %s" % (request_id, msg))
+        except Exception:
+            pass
+        return jsonify({"error": msg, "error_type": type(e).__name__,
+                        "hint": "克隆拉起失败原因见 error 字段（详见克隆详情备注）"}), 400
     return jsonify({"ok": True, "request": req})
 
 
@@ -109,6 +122,9 @@ def api_reject_clone(request_id):
         req = _service.reject_clone(request_id, by=body.get("by") or "admin")
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        msg = str(e) or type(e).__name__
+        return jsonify({"error": msg, "error_type": type(e).__name__}), 400
     return jsonify({"ok": True, "request": req})
 
 

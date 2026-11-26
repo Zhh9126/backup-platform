@@ -85,7 +85,7 @@
         <div class="table-responsive">
           <table class="table table-sm table-hover align-middle mb-2">
             <thead><tr>
-              <th>主机</th><th>端口</th><th>通道模式</th><th>状态</th><th>版本/加密</th><th>最后检查</th><th>操作</th>
+              <th>主机</th><th>端口</th><th>通道模式</th><th>状态</th><th>版本/加密</th><th>能力</th><th>最后检查</th><th>操作</th>
             </tr></thead>
             <tbody id="agentRows"><tr><td colspan="7" class="text-muted small">加载中…</td></tr></tbody>
           </table>
@@ -111,8 +111,16 @@
             </button>
           </div>
           <div id="ai_result" class="small text-muted">
-            <div>安装目录只保留 aidbm-agent 单文件程序。预检兼容性后可先暂存，再按维护窗口安装或升级。</div>
-            <div>安装会校验 SHA256、版本及 AES 能力，启动失败回滚。配置与服务由系统目录管理。</div>
+            <div>统一发布物：一个包通吃所有架构与系统（不按 CPU 架构、发行版或数据库类型区分），装一次即具备全部能力</div>
+            <div>安装校验 SHA256 与版本，自动放行防火墙端口，失败保留现场便于排障</div>
+            <div>装完自动跟随平台版本：Agent 自行比对平台清单，平台升级后无需再手工重装</div>
+            <div>能力以目标机实际自报为准，缺项与原因在「能力」列如实展示</div>
+            <div class="input-group input-group-sm mt-2">
+              <span class="input-group-text">回连平台地址</span>
+              <input class="form-control" id="ai_platform_url" placeholder="留空=自动探测平台出口 IP">
+              <button class="btn btn-outline-secondary" onclick="savePlatformUrl()">保存</button>
+            </div>
+            <div class="text-muted mt-1">Agent 自更新要回连平台取新版本；浏览器在本机打开时自动探测到的地址可能目标机不可达，可在此显式指定</div>
             <div id="agentPackageInfo" class="mt-2"></div>
           </div>
         </div>
@@ -321,7 +329,7 @@
         if (prev) capSel.value = prev;
       }
       if (!(list || []).length) {
-        tb.innerHTML = '<tr><td colspan="7" class="text-muted small">暂无已注册执行器 —— 在右侧选择纳管主机一键安装</td></tr>';
+        tb.innerHTML = '<tr><td colspan="8" class="text-muted small">暂无已注册执行器 —— 在右侧选择纳管主机一键安装</td></tr>';
         return;
       }
       tb.innerHTML = list.map((a) => {
@@ -339,14 +347,27 @@
         return "<tr><td>" + esc(a.hostname) + "</td><td>" + esc(a.port) + "</td>" +
           '<td><span class="badge bg-light text-dark border">' + esc((a.transport || "auto").toUpperCase()) + "</span></td>" +
           "<td>" + st + reason + "</td><td class='small text-muted'>" + esc(a.agent_version || "-") + " / " + esc(a.enc_algo || "-") + "</td>" +
+          "<td>" + capBadge(a.cap_matrix) + "</td>" +
           "<td class='small text-muted'>" + esc((a.last_check_at || "-").replace("T", " ").slice(0, 19)) + "</td>" +
           '<td class="text-nowrap">' +
           '<button class="btn btn-sm btn-outline-success me-1" onclick="probeAgent(' + a.id + ')" title="探活">探活</button>' +
           '<button class="btn btn-sm btn-outline-danger" onclick="delAgent(' + a.id + ')" title="删除注册记录">删除</button></td></tr>';
       }).join("");
     } catch (e) {
-      tb.innerHTML = '<tr><td colspan="7" class="text-danger small">加载失败: ' + esc(String(e.message || e)) + "</td></tr>";
+      tb.innerHTML = '<tr><td colspan="8" class="text-danger small">加载失败: ' + esc(String(e.message || e)) + "</td></tr>";
     }
+  };
+
+  // 能力徽章：平台期望能力 vs Agent 实际自报（缺项带原因，不虚报）
+  window.capBadge = function (m) {
+    if (!m || !m.total) return '<span class="badge bg-light text-dark border">未采集</span>';
+    const full = m.ok >= m.total;
+    const cls = full ? "bg-success" : (m.ok > 0 ? "bg-warning" : "bg-danger");
+    const miss = (m.missing || []).map((x) => x.label + "（" + x.reason + "）").join("；");
+    return '<span class="badge ' + cls + '" title="' + esc(miss || "全部能力就绪") + '">' +
+      esc(m.ok) + "/" + esc(m.total) + " 能力</span>" +
+      (full ? "" : '<div class="small text-muted mt-1" style="max-width:200px">' +
+        esc((m.missing || []).map((x) => x.label).join("、")) + "</div>");
   };
 
   // ---------------- 备份插件能力自报 / 传输协商 ----------------
@@ -388,11 +409,35 @@
           "<tr><td>产物完整性</td><td>" + esc(n.integrity_algo || "-") + "</td><td>" +
             yn(n.integrity_check, "端到端 sha256 对账 + 落盘字节数硬校验", "仅落盘字节数硬校验（老插件诚实降级）") +
             '<span class="text-muted small ms-2">超过 ' + mb + 'MB 的产物如实跳过哈希，只做大小校验</span></td></tr>' +
-        "</tbody></table>";
+        "</tbody></table>" +
+        matrixHtml(r.matrix);
     } catch (e) {
       box.innerHTML = '<span class="text-danger small">读取失败：' + esc(String(e.message || e)) + "</span>";
     }
   };
+
+  // 能力矩阵：平台期望清单 vs 目标机实际自报（缺项带原因，不虚报）
+  function matrixHtml(m) {
+    if (!m || !m.total) return "";
+    const rows = [];
+    Object.keys(m.features || {}).forEach((k) => {
+      rows.push([k, m.features[k] ? "已具备" : "缺失", m.features[k] ? "" : "Agent 未自报该能力"]);
+    });
+    Object.keys(m.plugins || {}).forEach((k) => {
+      const p = m.plugins[k] || {};
+      rows.push([p.label || k, p.supported ? "已具备" : "不适用", p.reason || ""]);
+    });
+    const body = rows.map((r) =>
+      "<tr><td>" + esc(r[0]) + '</td><td><span class="badge bg-' +
+      (r[1] === "已具备" ? "success" : "secondary") + '">' + esc(r[1]) + "</span></td><td class='small text-muted'>" +
+      esc(r[2] || "-") + "</td></tr>").join("");
+    return '<div class="mt-3 border-top pt-2">' +
+      '<div class="d-flex align-items-center gap-2 mb-1"><b class="small">能力矩阵（平台期望 vs 目标机自报）</b>' +
+      capBadge(m) + "</div>" +
+      '<table class="table table-sm mb-0"><thead class="table-light"><tr>' +
+      "<th>能力项</th><th>状态</th><th>说明</th></tr></thead><tbody>" + body +
+      "</tbody></table></div>";
+  }
 
   function agentGuidance(msg) {
     if (/refused|Errno 111|连接失败|timed out/i.test(String(msg))) {
@@ -434,25 +479,44 @@
         { host_id: parseInt(hostId, 10), phase: phase,
           agent_port: parseInt(document.getElementById("ai_port").value || "8466", 10) });
       const ins = r.install || {}, pr = r.probe || {};
+      const modeText = r.mode === "python" ? "统一发布物（源码包）" : "兜底单文件 ELF";
       if (r.ok) {
         const phaseText = { precheck: "预检通过，可暂存或安装。",
                             stage: "暂存完成，可在维护窗口安装。", install: "安装成功，探活在线。" };
         box.innerHTML = '<span class="text-success">' + phaseText[phase] + '</span>' +
           '<div class="text-muted mt-1">' + esc(r.package.version) + ' · ' +
-          esc(r.package.arch) + ' · 单文件程序</div>';
+          esc(r.package.arch) + ' · ' + esc(modeText) + '</div>';
+        const t = r.target || {};
+        if (t.ARCH || t.PY) box.innerHTML += '<div class="text-muted">目标机：' +
+          esc(t.ARCH || "-") + ' · glibc ' + esc(t.GLIBC || "-") +
+          ' · python ' + esc(t.PY || "-") + (t.SELINUX && t.SELINUX !== "none" ? ' · SELinux ' + esc(t.SELINUX) : '') + '</div>';
+        if (r.mode_note) box.innerHTML += '<div class="text-muted">' + esc(r.mode_note) + '</div>';
+        if (r.platform_url) box.innerHTML += '<div class="text-muted">Agent 回连平台地址：' +
+          esc(r.platform_url) + '</div>';
+        const fw = r.firewall || {};
+        if (fw.actions && fw.actions.length) box.innerHTML +=
+          '<div class="text-success">' + esc(fw.actions.join("；")) + '</div>';
+        if (fw.warnings && fw.warnings.length) box.innerHTML +=
+          '<div class="text-warning">' + esc(fw.warnings.join("；")) + '</div>';
         if (r.cleanup && !r.cleanup.ok) box.innerHTML +=
           '<div class="text-warning">服务已更新，旧文件清理需重试。</div>';
       } else {
         let html = '<span class="text-danger">' +
-          (ins.ok ? '执行器已推送，但探活未通过' : '安装未完成：服务启动失败') + '：</span>';
+          (ins.ok ? '执行器已推送，但探活未通过' : '安装失败') + '：</span>';
+        if (r.error) html += '<div>' + esc(r.error) + '</div>';
         if (r.rolled_back) html += '<div class="text-muted">' + esc(r.rolled_back) + '</div>';
         const hint = r.hint || (r.details && r.details.hint) || "";
         if (hint) html += '<div class="mt-1">' + esc(hint) + '</div>';
-        if (pr.error || r.error) html += '<div class="mt-1">' +
-          esc(agentGuidance(pr.error || r.error)) + '</div>';
-        if (ins.diagnostics) html += '<details class="mt-2">' +
-          '<summary class="small">查看远端服务日志</summary>' +
-          '<pre class="small mt-1 p-2 bg-light border rounded" style="max-height:220px;overflow:auto;white-space:pre-wrap">' +
+        if (pr.local_listen === true) html +=
+          '<div class="mt-1 text-warning">目标机本地端口已监听 —— 问题在网络/防火墙（平台 → 目标机方向）</div>';
+        if (pr.local_listen === false) html +=
+          '<div class="mt-1 text-warning">目标机本地端口未监听 —— 问题在服务启动本身（看下面的 journalctl）</div>';
+        if (r.retained) html +=
+          '<div class="mt-1 text-muted">已保留安装现场：可在目标机执行 systemctl status aidbm-agent 查看；' +
+          '诊断文件 ' + esc(r.diagnostics_path || "/var/log/aidbm-agent-install.log") + '</div>';
+        if (ins.diagnostics) html += '<details class="mt-2" open>' +
+          '<summary class="small">查看远端服务日志（journalctl / 端口 / SELinux）</summary>' +
+          '<pre class="small mt-1 p-2 bg-light border rounded" style="max-height:280px;overflow:auto;white-space:pre-wrap">' +
           esc(ins.diagnostics) + '</pre></details>';
         box.innerHTML = html;
       }
@@ -465,15 +529,37 @@
     await window.loadAgents();
   };
 
+  // Agent 回连平台地址（自更新用）
+  window.savePlatformUrl = async function () {
+    const input = document.getElementById("ai_platform_url");
+    const url = (input.value || "").trim();
+    try {
+      await api("PUT", "/api/v1/agents/platform-url", { platform_url: url });
+      input.value = url;
+      alert("已保存。下次一键安装时生效（已装的 Agent 可重新安装以刷新回连地址）。");
+    } catch (e) {
+      alert("保存失败：" + (e.message || e));
+    }
+  };
+
   (async function init() {
     try {
+      const pu = await api("GET", "/api/v1/agents/platform-url");
+      const puInput = document.getElementById("ai_platform_url");
+      if (puInput && pu) {
+        puInput.value = pu.platform_url || "";
+        puInput.placeholder = "留空=自动探测（当前探测到 " + (pu.detected || "无") + "）";
+      }
+    } catch (e) { /* 未配置时不影响其他功能 */ }
+    try {
       const packages = await api("GET", "/api/v1/agents/packages");
-      const element = document.getElementById("agentPackageInfo");
-      if (element) element.innerHTML = (packages.packages || []).map(p =>
+      const element = document.getElementById("agentPackageInfo");      if (element) element.innerHTML = (packages.packages || []).map(p =>
         '<div>' + esc(p.version) + ' · ' + esc(p.arch) + ' · ' +
-        '<a href="/api/v1/agents/package?arch=' + encodeURIComponent(p.arch) + '">下载单文件 Agent</a>' +
+        (p.mode === "python" ? "统一发布物（一个包通吃所有架构与系统）" : "兜底单文件 ELF（构建时快照）") + ' · ' +
+        '<a href="/api/v1/agents/package?arch=' +
+        encodeURIComponent(p.mode === "python" ? "source" : p.arch) + '">下载</a>' +
         '<div class="text-muted text-break">SHA256 ' + esc(p.sha256) + '</div></div>'
-      ).join("") || "暂无发布包，请在平台构建对应架构。";
+      ).join("") || "暂无发布包：请确认平台 agent/ 源码目录存在，或运行 scripts/build_agent.py 构建 ELF 包。";
     } catch (e) {
       document.getElementById("agentPackageInfo").textContent = "发布包读取失败：" + e.message;
     }

@@ -23,7 +23,7 @@ else:
 # ---------- 产品标识 ----------
 # 产品正式名称与版本（对外 API 文档、健康检查、报告落款统一取这里，避免各处硬编码）。
 PLATFORM_NAME = os.environ.get("AIDBM_NAME", "AIDBM")
-PLATFORM_VERSION = os.environ.get("AIDBM_VERSION", "3.0.0")
+PLATFORM_VERSION = os.environ.get("AIDBM_VERSION", "3.0.1")
 
 # ---------- 路径 ----------
 BACKUP_ROOT = os.environ.get("BACKUP_ROOT", str(BASE_DIR / "backups"))
@@ -36,6 +36,17 @@ FULL_INSTANCE_WORK_DIR = os.environ.get("BP_WORK_DIR", "")
 INSTANCE_DIR = Path(os.environ.get("INSTANCE_DIR", str(BASE_DIR / "instance")))
 META_DB_PATH = os.environ.get("META_DB_PATH", str(INSTANCE_DIR / "meta.db"))
 LOG_DIR = Path(os.environ.get("LOG_DIR", str(BASE_DIR / "logs")))
+
+# ---------- 日志治理 ----------
+# 单文件上限与保留份数（轮转总量 = 两者相乘，日志目录最坏占用约 2 倍）
+LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", 20 * 1024 * 1024))
+LOG_BACKUP_COUNT = int(os.environ.get("LOG_BACKUP_COUNT", 10))
+# 重复错误限频：同一 logger + 同一消息模板在窗口内只留首条，窗口随重复次数
+# 指数增长（LOG_DUP_WINDOW_SEC -> LOG_DUP_MAX_WINDOW_SEC）。
+# 实测未限频时 35% 的 error.log 行数来自同一个实时任务，一小时刷 736 行。
+LOG_DUP_SUPPRESS = os.environ.get("LOG_DUP_SUPPRESS", "1")
+LOG_DUP_WINDOW_SEC = int(os.environ.get("LOG_DUP_WINDOW_SEC", 300))
+LOG_DUP_MAX_WINDOW_SEC = int(os.environ.get("LOG_DUP_MAX_WINDOW_SEC", 3600))
 
 # ---------- 元数据库后端（可插拔：sqlite / postgresql / mysql） ----------
 # 默认仍为 SQLite（零依赖离线交付）；可在设置页切换为 PostgreSQL/MySQL，
@@ -158,6 +169,25 @@ XTRABACKUP_24_PATH = os.environ.get("XTRABACKUP_24_PATH",
                                     "/opt/xtrabackup24/usr/bin/xtrabackup")
 MARIABACKUP_PATH = os.environ.get("MARIABACKUP_PATH",
                                   "/opt/mariabackup/usr/bin/mariabackup")
+
+# ---------- 客户端工具目录候选（按目标机操作系统区分） ----------
+# 现场场景：达梦 / SQL Server 实例跑在 Windows 上，工具在 D:\dmdbms\bin 之类的
+# 目录里而不在 PATH 中。平台探测远程工具时按 ssh_hosts.os_type 选用下表：
+#   - windows：cmd 语法 `where <tool>` → 任务级 tool_path → 下表目录（支持
+#     %DM_HOME% 之类 cmd 变量展开）；
+#   - linux：复用 remote_dump 的 command -v / glob / find 三级探测 + 下表目录。
+# 任务高级选项「备份命令所在目录」优先于这里（分号或冒号分隔均可）。
+TOOL_DIRS_WINDOWS = {
+    "dameng": [r"C:\dmdbms\bin", r"D:\dmdbms\bin", r"E:\dmdbms\bin",
+               r"%DM_HOME%\bin"],
+    "sqlserver": [r"C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn",
+                  r"C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\180\Tools\Binn",
+                  r"C:\Program Files\Microsoft SQL Server\110\Tools\Binn"],
+}
+TOOL_DIRS_LINUX = {
+    "dameng": ["/dm8/bin", "/opt/dmdbms/bin", "/home/dmdba/dmdbms/bin",
+               "/opt/dm/bin"],
+}
 
 # ---------- 登录安全（暴力破解防护） ----------
 LOGIN_MAX_FAILS = int(os.environ.get("LOGIN_MAX_FAILS", "5"))        # 连续失败次数上限

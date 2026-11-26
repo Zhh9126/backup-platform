@@ -71,11 +71,14 @@ def test_unknown_plugin_honest_failure():
 
 
 def test_agent_version_and_route():
-    """Agent 1.3.0 + /plugin 路由 + /capabilities 自报。"""
+    """Agent 1.4.0（统一发布物 + 自更新）+ /plugin 路由 + /capabilities 自报。"""
     import io
     src = io.open(os.path.join(os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))), "agent", "backup_agent.py"),
         encoding="utf-8").read()
-    assert 'VERSION = "1.3.0"' in src
+    assert 'VERSION = "1.4.0"' in src
     assert 'path == "/plugin"' in src
     assert '"plugins": _plugin_describe' in src
+    # 自更新能力必须自报（平台能力矩阵据此核对）
+    assert '"self-update"' in src
+    assert "start_from_env" in src

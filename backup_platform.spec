@@ -27,6 +27,10 @@ a = Analysis(
         (str(ROOT / 'templates'), 'templates'),
         (str(ROOT / 'static'), 'static'),
         (str(ROOT / 'core' / 'plugins'), 'core/plugins'),
+        # Agent 源码：一键安装的「Python 源码模式」直接从这里打包推送，
+        # 目标机只要有 python3 即可（统信 UOS / 麒麟 / 欧拉 / aarch64 等
+        # 没有预编译 ELF 发布包的系统靠它兜底）。缺了它打包版只能走 ELF。
+        (str(ROOT / 'agent'), 'agent'),
         (str(ROOT / 'drivers'), 'drivers'),
         (str(ROOT / 'requirements.txt'), '.'),
         # 离线自足：内嵌 JRE/JDK 目录（jlink 裁剪 JRE 或完整 JDK，

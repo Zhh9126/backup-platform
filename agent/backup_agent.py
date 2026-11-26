@@ -55,7 +55,7 @@ try:
 except Exception:
     _HAS_AES = False
 
-VERSION = "1.3.0"  # 1.3.0: 统一插件框架（block-cdp / bmr / app-dr 多能力单 Agent）
+VERSION = "1.4.0"  # 1.4.0: 统一发布物 + 自更新（装一次即可长期跟随平台版本）
 
 # 统一插件集（与 backup_agent.py 一起打成单文件；离线可用、零外部依赖）
 try:
@@ -284,7 +284,8 @@ class Handler(BaseHTTPRequestHandler):
                     # 老版本插件不自报该特性时平台自动降级为大小校验。
                     "integrity": ["sha256"],
                     "features": ["exec", "exec-stream", "file-put", "file-get",
-                                 "cancel", "resume", "fs", "fs-digest", "plugin"],
+                                 "cancel", "resume", "fs", "fs-digest", "plugin",
+                                 "self-update"],
                     # 统一插件能力自报：一个 Agent 支撑多块能力（块级 CDP /
                     # BMR / 应用整机），每项带 supported 与原因，不虚报
                     "plugins": _plugin_describe(AgentState) if _HAS_PLUGINS else [],
@@ -756,6 +757,12 @@ def main():
     enc = "AES-256-GCM" if _HAS_AES else "HMAC-SHA256(降级)"
     print("[agent] AIDBM Agent %s listening on %s:%d enc=%s allow=%s" % (
         VERSION, args.bind, args.port, enc, AgentState.allow_dirs), flush=True)
+    # 自更新线程（装一次即可长期跟随平台版本；未配置平台地址时静默不启用）
+    try:
+        from selfupdate import start_from_env as _start_selfupdate
+        _start_selfupdate()
+    except Exception as exc:  # noqa: BLE001
+        print("[agent] 自更新未启动: %s" % exc, flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

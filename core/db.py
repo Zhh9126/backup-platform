@@ -643,6 +643,8 @@ CREATE TABLE IF NOT EXISTS agent_hosts (
     enabled     INTEGER DEFAULT 1,
     enc_algo    TEXT DEFAULT '',           -- 最近一次能力自报的加密算法
     agent_version TEXT DEFAULT '',
+    capabilities TEXT,                     -- 能力矩阵 JSON（平台期望 vs Agent 自报比对结果）
+    capabilities_at TEXT,                  -- 能力矩阵采集时间
     last_status TEXT,
     last_check_at TEXT,
     created_at  TEXT,
@@ -1492,6 +1494,83 @@ CREATE TABLE IF NOT EXISTS tape_media (
     last_written_at TEXT, last_verified_at TEXT, offsite_since TEXT,
     note TEXT, created_at TEXT, updated_at TEXT
 );
+
+-- ===================== 接口对接中心（2026-11-25） =====================
+-- 定位：平台主动「拉」第三方/其它 AIDBM 的日志，或主动「推」本平台日志到
+-- 第三方接口。零外网依赖（标准库 urllib），凭据加密落库。
+CREATE TABLE IF NOT EXISTS integration_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name              TEXT NOT NULL,
+    direction         TEXT DEFAULT 'pull',   -- pull 主动拉取 / push 主动推送
+    enabled           INTEGER DEFAULT 1,
+    endpoint          TEXT DEFAULT '',       -- 接口地址（支持 {{since}} {{limit}}）
+    method            TEXT DEFAULT 'GET',
+    auth_type         TEXT DEFAULT 'none',   -- none / basic / bearer / header
+    auth_user         TEXT DEFAULT '',
+    auth_secret_enc   TEXT DEFAULT '',       -- 密码 / Token 密文
+    auth_header       TEXT DEFAULT '',       -- auth_type=header 时的请求头名
+    headers           TEXT DEFAULT '{}',     -- 额外请求头 JSON
+    body              TEXT DEFAULT '',       -- 请求体（{{logs}} {{since}} {{limit}}）
+    verify_tls        INTEGER DEFAULT 0,
+    timeout_sec       INTEGER DEFAULT 20,
+    parse_type        TEXT DEFAULT 'json',   -- json / text（逐行）
+    json_path         TEXT DEFAULT '$',      -- JSONPath（$.data.logs[*]）
+    field_map         TEXT DEFAULT '',       -- 字段映射 JSON
+    include_keywords  TEXT DEFAULT '',
+    exclude_keywords  TEXT DEFAULT '',
+    alarm_keywords    TEXT DEFAULT '',
+    schedule_type     TEXT DEFAULT 'cron',
+    cron              TEXT DEFAULT '*/5 * * * *',
+    interval_minutes  INTEGER DEFAULT 0,
+    max_items         INTEGER DEFAULT 500,
+    host_id           INTEGER,
+    last_run_at       TEXT,
+    last_status       TEXT DEFAULT '',
+    last_error        TEXT DEFAULT '',
+    last_fetched      INTEGER DEFAULT 0,
+    last_accepted     INTEGER DEFAULT 0,
+    success_count     INTEGER DEFAULT 0,
+    fail_count        INTEGER DEFAULT 0,
+    watermark         TEXT DEFAULT '',
+    created_at        TEXT,
+    updated_at        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS integration_logs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER,
+    ts          TEXT,
+    level       TEXT DEFAULT 'INFO',
+    source      TEXT DEFAULT '',
+    message     TEXT,
+    raw         TEXT,
+    fingerprint TEXT,
+    alerted     INTEGER DEFAULT 0,
+    created_at  TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_integration_logs_fp
+    ON integration_logs(task_id, fingerprint);
+CREATE INDEX IF NOT EXISTS idx_integration_logs_task
+    ON integration_logs(task_id, id);
+
+CREATE TABLE IF NOT EXISTS integration_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id     INTEGER,
+    trigger_by  TEXT DEFAULT 'manual',
+    direction   TEXT DEFAULT '',
+    started_at  TEXT,
+    finished_at TEXT,
+    status      TEXT DEFAULT '',
+    http_status INTEGER DEFAULT 0,
+    fetched     INTEGER DEFAULT 0,
+    accepted    INTEGER DEFAULT 0,
+    pushed      INTEGER DEFAULT 0,
+    duration_ms INTEGER DEFAULT 0,
+    message     TEXT DEFAULT '',
+    detail      TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_integration_runs_task
+    ON integration_runs(task_id, id);
 """
 
 # ------------------------- 连接与执行 -------------------------
@@ -1637,6 +1716,12 @@ def init_schema(conn=None, backend: str = None, close_conn: bool = None) -> None
                                  ("db_os_user", "TEXT")]:
                 try:
                     conn.execute(f"ALTER TABLE ssh_hosts ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass
+            # 迁移（Agent 统一发布物）：能力矩阵落库（装一次即可见能力全貌）
+            for col, typedef in [("capabilities", "TEXT"), ("capabilities_at", "TEXT")]:
+                try:
+                    conn.execute(f"ALTER TABLE agent_hosts ADD COLUMN {col} {typedef}")
                 except Exception:
                     pass
             # 迁移（FIX-2026-001 P2）：纳管唯一性从「IP/连接」下沉到「连接+库型」——

@@ -48,6 +48,151 @@ from .types import (
 _JOB_ID = "rt_supervisor_tick"
 
 
+# ==================================================================
+# 单实例锁：跨平台内核锁 + 跨平台 PID 存活探测
+# ==================================================================
+def _windows_pid_alive(pid: int) -> bool:
+    """Windows 下判断 PID 是否存活。
+
+    **绝不能用 ``os.kill(pid, 0)``**：Windows 上 CPython 的 ``os.kill`` 会走
+    ``TerminateProcess(handle, sig)``，即 ``os.kill(pid, 0)`` 等价于
+    **把持锁进程强杀**（退出码 0），会造成严重误伤；而在部分环境下它还会
+    直接抛 ``OSError [WinError 87]``（参数错误）→ 升级成 ``SystemError``
+    打断 RtSupervisor 启动（2026-11-26 用户 Windows 平台实测）。
+
+    这里改用内核 API：``OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`` +
+    ``GetExitCodeProcess``，``STILL_ACTIVE(259)`` 即视为存活。
+
+    Returns:
+        True=存活；False=确定不存在；无法判定时保守返回 True（宁可不清锁，
+        也不误杀/误判）。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes  # noqa: F401
+    except ImportError:  # pragma: no cover - 非 Windows
+        return True
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    except (AttributeError, OSError):  # pragma: no cover - 非 Windows / 缺 kernel32
+        return True
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ERROR_INVALID_PARAMETER = 87
+    STILL_ACTIVE = 259
+
+    try:
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    except Exception:  # pragma: no cover - 签名设置失败
+        return True
+
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        err = ctypes.get_last_error()
+        if err == ERROR_INVALID_PARAMETER:
+            # ERROR_INVALID_PARAMETER：该 PID 确实不存在
+            return False
+        # 其余（含 ACCESS_DENIED=5）→ 无法判定，保守视为存活
+        return True
+    try:
+        code = wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return code.value == STILL_ACTIVE
+        return True
+    except Exception:  # pragma: no cover
+        return True
+    finally:
+        try:
+            kernel32.CloseHandle(handle)
+        except Exception:  # pragma: no cover
+            pass
+
+
+def _pid_alive(pid: int) -> bool:
+    """跨平台判断 PID 是否存活（无法判定时保守返回 True）。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return True
+    if pid <= 0:
+        return True
+    if os.name == "nt":
+        return _windows_pid_alive(pid)
+    # Linux 优先用 /proc 判定，避免 os.kill 对其它用户进程的权限限制
+    if os.path.exists(f"/proc/{pid}"):
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _acquire_kernel_lock(path: str):
+    """尝试以操作系统内核文件锁抢占单实例锁。
+
+    内核锁在进程退出（含 SIGKILL / OOM / 断电）时由内核自动释放，天然免疫
+    「陈旧锁残留」与「PID 被复用」两类误判。
+
+    - POSIX：``fcntl.flock(fd, LOCK_EX|LOCK_NB)``
+    - Windows：``msvcrt.locking(fd, LK_NBLCK, 1)``（同样是内核字节范围锁）
+
+    Returns:
+        (fd, True)  获得锁，fd 需在释放时 close
+        (None, False) 已有其它进程持锁
+        (None, None) 平台/文件系统不支持内核锁 → 调用方回落 PID 启发式逻辑
+    """
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return None, None
+
+    if os.name == "nt":
+        try:
+            import msvcrt
+        except ImportError:  # pragma: no cover
+            os.close(fd)
+            return None, None
+        try:
+            if os.fstat(fd).st_size < 1:
+                # 保证可锁字节区间存在（空文件锁 byte 0 在部分 Windows 上会失败）
+                os.write(fd, b" ")
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            # 锁被占用或不可锁 → 视为「已有其它进程持锁」
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return None, False
+        return fd, True
+
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - 非 POSIX
+        os.close(fd)
+        return None, None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None, False
+    return fd, True
+
+
 @runtime_checkable
 class _RtWorker(Protocol):
     """实时捕获 worker 协议。
@@ -127,24 +272,15 @@ class RtSupervisor:
             self._last_error = f"创建锁目录失败: {exc}"
             return False
 
-        # 首选内核 flock：进程退出（含 SIGKILL/OOM）时内核自动释放，
+        # 首选内核文件锁：进程退出（含 SIGKILL/OOM）时内核自动释放，
         # 天然免疫「陈旧锁」与「PID 复用」两类误判。
         # 2026-11-14 实测：锁里记录的是已被 kill 的 PID，但该 PID 恰好被系统
         # 复用给别的进程，`_lock_owner_alive` 误判为存活 → 112 个实时任务
         # 全程停止捕获且新进程永久拒绝接管。基于 PID/mtime 的启发式天生不可靠。
-        try:
-            import fcntl
-            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                self.logger.info("[rt.supervisor] 已有活跃守护持有文件锁 %s，本进程不启动",
-                                 path.replace("\\", "/"))
-                return False
+        # 2026-11-26：Windows 平台无 fcntl，额外支持 msvcrt.locking 内核锁，
+        # 避免再次落到「残留锁 → os.kill 探测崩溃 → RtSupervisor 起不来」。
+        fd, state = _acquire_kernel_lock(path)
+        if state is True:
             try:
                 os.ftruncate(fd, 0)
                 os.write(fd, f"{os.getpid()}\n{db.now_iso()}\n".encode("utf-8"))
@@ -152,10 +288,12 @@ class RtSupervisor:
                 pass
             self._lock_fd = fd
             return True
-        except ImportError:                 # 非 POSIX：回落旧逻辑
-            pass
-        except OSError as exc:
-            self.logger.debug("[rt.supervisor] flock 不可用，回落独占创建：%s", exc)
+        if state is False:
+            self.logger.info("[rt.supervisor] 已有活跃守护持有内核文件锁 %s，本进程不启动",
+                             path.replace("\\", "/"))
+            return False
+        # state is None → 平台不支持内核锁，走下面的独占创建 + PID 启发式
+        self.logger.debug("[rt.supervisor] 当前平台不支持内核文件锁，回落独占创建：%s", path)
 
         for attempt in (1, 2):
             try:
@@ -189,16 +327,7 @@ class RtSupervisor:
             return True
         if pid <= 0:
             return True
-        # Linux 优先用 /proc 判定，避免 os.kill 对其它用户进程的权限限制
-        if os.path.exists(f"/proc/{pid}"):
-            return True
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        except OSError:
-            return True
-        return True
+        return _pid_alive(pid)
 
     def _clear_stale_lock(self, path: str) -> bool:
         """清理陈旧锁。
@@ -219,7 +348,11 @@ class RtSupervisor:
             age = time.time() - os.path.getmtime(path)
         except OSError:
             return False
-        owner_alive = self._lock_owner_alive(path)
+        try:
+            owner_alive = self._lock_owner_alive(path)
+        except Exception as exc:            # 存活探测异常不得升级为致命错误
+            self.logger.warning("[rt.supervisor] 锁持有者存活探测异常，按保守处理（不清锁）: %s", exc)
+            owner_alive = True
         if age < max(10, int(config.RT_LOCK_STALE_SEC)) and owner_alive:
             return False
         if owner_alive is False:
